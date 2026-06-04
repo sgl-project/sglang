@@ -368,7 +368,6 @@ class HiCacheFile(HiCacheStorage):
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
         self.tp_rank = tp_rank
-        self.is_mla_model = is_mla_model
         self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
@@ -460,28 +459,17 @@ class HiCacheFile(HiCacheStorage):
         fs = self._fs_stats()
         if fs is None:
             return True  # cannot probe -> permissive, fall back to OS errors
-        _, free = fs
-        attempts_left = len(self._lru)
-        while (
-            free - value_bytes < self.min_free_bytes and self._lru and attempts_left > 0
-        ):
-            outcome, freed = self._evict_one_lru_locked()
-            if outcome == "stop":
-                break
-            if outcome == "skipped":
-                attempts_left -= 1
-                continue
-            # "evicted" / "missing": an entry left the index. freed is the disk
-            # space actually reclaimed (0 if the file was already gone); tmpfs
-            # frees on unlink so we can credit it back to the free estimate.
-            free += freed
-            attempts_left = len(self._lru)
+        # tmpfs frees space on unlink, so credit reclaimed bytes back to the
+        # estimate rather than re-probing statvfs on every eviction.
+        free = fs[1]
+        self._evict_while(
+            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+        )
         # Re-probe: external writers may have changed free space meanwhile.
         fs = self._fs_stats()
         if fs is None:
             return True
-        _, free = fs
-        return free - value_bytes >= self.min_free_bytes
+        return fs[1] - value_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
@@ -511,14 +499,11 @@ class HiCacheFile(HiCacheStorage):
     def _evict_one_lru_locked(self) -> Tuple[str, int]:
         """Evict the single oldest evictable LRU entry. Caller holds _lock.
 
-        Single source of truth for the pop / skip-pending-write / unlink /
-        ``_total_bytes`` accounting shared by cap-based eviction
-        (`_evict_locked`) and free-space eviction (`_enforce_free_space_locked`).
-        Returns ``(outcome, freed_bytes)``:
+        The shared pop / skip-pending / unlink / ``_total_bytes`` step driven by
+        `_evict_while`. Returns ``(outcome, freed_bytes)``:
 
-        - ``("evicted", n)``: oldest file unlinked, ``n`` bytes reclaimed from disk.
-        - ``("missing", 0)``: file was already gone; ``_total_bytes`` corrected,
-          but no disk space was reclaimed.
+        - ``("evicted", n)``: oldest entry dropped from the index; ``n`` disk
+          bytes reclaimed (0 if the file was already gone).
         - ``("skipped", 0)``: oldest entry is an in-flight write; re-pinned at MRU
           so the writer is not evicted out from under itself.
         - ``("stop", 0)``: nothing evictable (empty index) or the unlink failed
@@ -534,41 +519,49 @@ class HiCacheFile(HiCacheStorage):
         tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
         try:
             os.remove(tensor_path)
-            self._total_bytes -= evict_size
-            return "evicted", evict_size
+            freed = evict_size
         except FileNotFoundError:
-            self._total_bytes -= evict_size
-            return "missing", 0
+            freed = 0  # file already gone; still drop the stale index entry
         except OSError as e:
             logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
             self._lru[evict_stem] = evict_size
             self._lru.move_to_end(evict_stem, last=False)
             return "stop", 0
+        self._total_bytes -= evict_size
+        return "evicted", freed
 
-    def _evict_locked(self, needed_bytes: int) -> None:
-        """Evict LRU entries until total + needed <= cap*ratio. Caller holds _lock."""
-        if self.max_size_bytes <= 0:
-            return
-        target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
-        evicted_count = 0
-        evicted_bytes = 0
+    def _evict_while(self, should_continue) -> int:
+        """Evict oldest non-pending entries while ``should_continue(reclaimed)``.
+
+        ``should_continue`` is passed the disk bytes reclaimed so far and returns
+        whether to keep evicting. In-flight writes are skipped; the loop is bounded
+        so it can't spin once every remaining entry is pending. Caller holds _lock.
+        Returns the total disk bytes reclaimed.
+        """
+        reclaimed = 0
         attempts_left = len(self._lru)
-        while self._total_bytes > target and self._lru and attempts_left > 0:
+        while self._lru and attempts_left > 0 and should_continue(reclaimed):
             outcome, freed = self._evict_one_lru_locked()
             if outcome == "stop":
                 break
             if outcome == "skipped":
                 attempts_left -= 1
                 continue
-            if outcome == "evicted":
-                evicted_count += 1
-                evicted_bytes += freed
-            # "evicted" / "missing": an entry left the index; reset the budget.
+            # An entry left the index; reset the skip budget and bank the bytes.
+            reclaimed += freed
             attempts_left = len(self._lru)
-        if evicted_count:
+        return reclaimed
+
+    def _evict_locked(self, needed_bytes: int) -> None:
+        """Evict LRU entries until total + needed <= cap*ratio. Caller holds _lock."""
+        if self.max_size_bytes <= 0:
+            return
+        target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
+        reclaimed = self._evict_while(lambda _: self._total_bytes > target)
+        if reclaimed:
             logger.debug(
-                f"HiCacheFile evicted {evicted_count} entries "
-                f"({evicted_bytes} bytes); now {self._total_bytes} bytes used"
+                f"HiCacheFile reclaimed {reclaimed} bytes; "
+                f"now {self._total_bytes} bytes used"
             )
 
     def _track_or_touch(self, suffixed_key: str, tensor_path: str) -> None:
@@ -648,10 +641,6 @@ class HiCacheFile(HiCacheStorage):
     ) -> bool:
         suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
-        tmp_path = (
-            f"{tensor_path}.tmp."
-            f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-        )
 
         # Fast path: same key already on disk. Refresh LRU and skip rewrite.
         if os.path.exists(tensor_path):
@@ -669,6 +658,7 @@ class HiCacheFile(HiCacheStorage):
         # Bytes provisionally added to _total_bytes so concurrent writers see
         # this allocation before the file is committed.
         reserved = 0
+        tmp_path = None
         try:
             value_bytes = value.numel() * value.element_size()
 
@@ -681,21 +671,18 @@ class HiCacheFile(HiCacheStorage):
 
             if self._eviction_enabled:
                 with self._lock:
-                    # Cap-based eviction.
+                    # Cap-based eviction: evict, then bail if still over cap.
                     if (
                         self.max_size_bytes > 0
                         and (self._total_bytes + value_bytes) > self.max_size_bytes
                     ):
                         self._evict_locked(value_bytes)
-                    if (
-                        self.max_size_bytes > 0
-                        and (self._total_bytes + value_bytes) > self.max_size_bytes
-                    ):
-                        logger.warning(
-                            f"HiCacheFile: no evictable space for {value_bytes} B "
-                            f"under cap {self.max_size_bytes} B; not caching {key}"
-                        )
-                        return False
+                        if (self._total_bytes + value_bytes) > self.max_size_bytes:
+                            logger.warning(
+                                f"HiCacheFile: no evictable space for {value_bytes} B "
+                                f"under cap {self.max_size_bytes} B; not caching {key}"
+                            )
+                            return False
                     # Free-space watermark.
                     if self.min_free_bytes > 0 and not self._enforce_free_space_locked(
                         value_bytes
@@ -716,6 +703,10 @@ class HiCacheFile(HiCacheStorage):
                     self._total_bytes += value_bytes
                     reserved = value_bytes
 
+            tmp_path = (
+                f"{tensor_path}.tmp."
+                f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+            )
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
             if reserved:
@@ -731,11 +722,11 @@ class HiCacheFile(HiCacheStorage):
                     self._pending_writes.discard(suffixed)
                     if cur is not None:
                         self._total_bytes -= cur
-            try:
-                if os.path.exists(tmp_path):
+            if tmp_path is not None:
+                try:
                     os.remove(tmp_path)
-            except OSError:
-                pass
+                except OSError:
+                    pass
             return False
 
     def batch_set(
