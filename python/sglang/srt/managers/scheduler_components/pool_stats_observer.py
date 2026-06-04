@@ -246,7 +246,7 @@ class SchedulerPoolStatsObserver:
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
-        mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
+        mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
         mamba_evictable_size = (
             self.tree_cache.mamba_evictable_size() if is_mamba_radix_cache else 0
         )
