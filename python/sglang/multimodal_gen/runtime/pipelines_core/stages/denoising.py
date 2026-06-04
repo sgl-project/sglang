@@ -10,14 +10,13 @@ import math
 import os
 import time
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
@@ -1476,16 +1475,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if accepts_var_kwargs:
             return kwargs
         return {k: v for k, v in kwargs.items() if k in param_names}
-
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
-        """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def _predict_noise_with_cfg(
         self,

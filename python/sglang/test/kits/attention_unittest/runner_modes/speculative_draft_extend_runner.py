@@ -226,10 +226,12 @@ def _make_eagle_draft_extend_v2_input(case, batch, *, device: str):
 
 
 def _set_draft_extend_v2_prefix_lens(batch, case, *, device: str):
-    prefix_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device=device)
-    batch.seq_lens = prefix_lens
-    batch.seq_lens_cpu = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu")
-    batch.seq_lens_sum = sum(case.prefix_lens)
+    # Production sets seq_lens = prefix + extend before init_forward_metadata
+    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
+    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
+    batch.seq_lens_sum = sum(seq_lens)
 
 
 def _prepare_draft_extend_batch(
@@ -289,6 +291,8 @@ def _run_draft_extend_cuda_graph_case(
     max_num_tokens=None,
     run_graph_eager: bool = True,
     compare_replay_to_graph_eager: bool = True,
+    pad_style: str = "small_real",
+    pad_num_tokens_per_bs: int | None = None,
 ):
     adapter = SpeculativeCudaGraphAdapter(
         build_fixture=build_fixture,
@@ -312,6 +316,8 @@ def _run_draft_extend_cuda_graph_case(
         compare_replay_to_graph_eager=compare_replay_to_graph_eager,
         atol=atol,
         rtol=rtol,
+        pad_style=pad_style,
+        pad_num_tokens_per_bs=pad_num_tokens_per_bs,
     )
     run_speculative_cuda_graph_case(
         testcase,
@@ -439,6 +445,7 @@ def run_dense_draft_extend_v2_cuda_graph_case(
     dtype: torch.dtype = DENSE_DEFAULT_DTYPE,
     device: str = DENSE_DEFAULT_DEVICE,
     cuda_graph_capture_batch_size: int = 4,
+    pad_style: str = "small_real",
 ):
     if not case.forward_mode.is_draft_extend_v2():
         raise ValueError("Draft-extend-v2 CUDA graph coverage expects DRAFT_EXTEND_V2.")
@@ -495,6 +502,8 @@ def run_dense_draft_extend_v2_cuda_graph_case(
         rtol=DENSE_RTOL,
         run_graph_eager=False,
         compare_replay_to_graph_eager=False,
+        pad_style=pad_style,
+        pad_num_tokens_per_bs=num_tokens_per_req,
     )
 
 
@@ -509,6 +518,7 @@ def run_mla_draft_extend_v2_cuda_graph_case(
     dtype: torch.dtype = MLA_DEFAULT_DTYPE,
     device: str = MLA_DEFAULT_DEVICE,
     cuda_graph_capture_batch_size: int = 4,
+    pad_style: str = "small_real",
 ):
     if not case.forward_mode.is_draft_extend_v2():
         raise ValueError("Draft-extend-v2 CUDA graph coverage expects DRAFT_EXTEND_V2.")
@@ -516,6 +526,7 @@ def run_mla_draft_extend_v2_cuda_graph_case(
         raise ValueError(
             "Draft-extend-v2 CUDA graph coverage uses a fixed token count per request."
         )
+    num_tokens_per_req = case.input_lens[0]
 
     _run_draft_extend_cuda_graph_case(
         testcase,
@@ -559,6 +570,8 @@ def run_mla_draft_extend_v2_cuda_graph_case(
         rtol=MLA_RTOL,
         run_graph_eager=False,
         compare_replay_to_graph_eager=False,
+        pad_style=pad_style,
+        pad_num_tokens_per_bs=num_tokens_per_req,
     )
 
 
@@ -1009,13 +1022,6 @@ class EagleDraftExtendCudaGraphRunnerAdapter:
     make_forward_batch: Callable[
         [Any, Any, Any, EagleDraftRunnerSettings], ForwardBatch
     ]
-    # Optional hook invoked with `(draft_extend_attn_backend, batch)` right
-    # before `graph_runner.replay(batch)`. DSV4 needs this to set the
-    # out-of-band `_replay_forward_batch` attribute that
-    # `DeepseekV4AttnBackend.init_forward_metadata_replay_cuda_graph` reads
-    # (the multi-step DECODE wrapper sets it internally, but the single-
-    # backend DRAFT_EXTEND path does not).
-    pre_replay: Callable[[Any, ForwardBatch], None] = None
     check_case: Callable[[Any, EagleDraftRunnerSettings], None] = (
         lambda _case, _settings: None
     )
@@ -1255,12 +1261,7 @@ def run_eagle_draft_extend_cuda_graph_runner_case(
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
         testcase.assertTrue(graph_runner.can_run(graph_batch))
-        if adapter.pre_replay is not None:
-            adapter.pre_replay(graph_backend, graph_batch)
         actual = graph_runner.replay(graph_batch)
-        if adapter.pre_replay is not None:
-            # Best-effort cleanup of any out-of-band state pre_replay set.
-            adapter.pre_replay(graph_backend, None)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -1404,9 +1405,12 @@ def _set_draft_extend_v2_prefix_lens(
     *,
     device: str,
 ) -> None:
-    batch.seq_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device=device)
-    batch.seq_lens_cpu = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu")
-    batch.seq_lens_sum = sum(case.prefix_lens)
+    # Production sets seq_lens = prefix + extend before init_forward_metadata
+    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
+    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
+    batch.seq_lens_sum = sum(seq_lens)
 
 
 def _make_dense_eagle_draft_extend_forward_batch(
@@ -1918,21 +1922,6 @@ def _dsv4_assert_draft_extend_outputs_close(actual, expected, settings) -> None:
         )
 
 
-def _dsv4_draft_extend_pre_replay(
-    draft_extend_attn_backend,
-    batch: ForwardBatch | None,
-) -> None:
-    """Set/clear the out-of-band `_replay_forward_batch` attribute that
-    `DeepseekV4AttnBackend.init_forward_metadata_replay_cuda_graph` reads.
-
-    The DSV4 multi-step DECODE wrapper sets this internally
-    (`deepseek_v4_backend.py:1231,1242`), but the single-backend DRAFT_EXTEND
-    path used by `_create_dsv4_prefill_backend` does not. Set before
-    `replay()` and clear afterwards to mimic the multi-step pattern.
-    """
-    draft_extend_attn_backend._replay_forward_batch = batch
-
-
 def run_dsv4_eagle_draft_extend_cuda_graph_runner_case(
     testcase,
     case: DSV4AttentionCase,
@@ -1985,7 +1974,6 @@ def run_dsv4_eagle_draft_extend_cuda_graph_runner_case(
         make_draft_inputs=_make_dsv4_draft_extend_inputs,
         prepare_replay_state=_prepare_dsv4_draft_extend_replay_state,
         make_forward_batch=_make_dsv4_eagle_draft_extend_forward_batch,
-        pre_replay=_dsv4_draft_extend_pre_replay,
         assert_outputs_close=_dsv4_assert_draft_extend_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(
