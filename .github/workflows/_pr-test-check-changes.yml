@@ -91,6 +91,7 @@ jobs:
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
+              - "python/sglang/srt/observability/**"
               - "python/sglang/jit_kernel/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
@@ -111,11 +112,16 @@ jobs:
           # `full=true` lifts the matrix-fanout throttle so each suite's
           # max_parallel = size. Conditions:
           #   1. Scheduled cron run.
-          #   2. pull_request event with the `high priority` label.
+          #   2. run_all_tests run (manual full dispatch / release) -- a full
+          #      run should mirror the cron's parallelism, not just its test set.
+          #   3. pull_request event with the `high priority` label.
           FULL=false
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             FULL=true
             echo "Scheduled run -> full parallelism"
+          elif [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            FULL=true
+            echo "run_all_tests -> full parallelism"
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
             FULL=true
             echo "high priority PR -> full parallelism"
