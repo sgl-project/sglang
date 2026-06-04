@@ -1893,10 +1893,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce. 
-            sidecar_pools = [
-                t.name for xfers in comp_xfers.values() for t in xfers
-            ]
+            # this prefetch actually transferred, in one all_reduce.
+            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
             packed = torch.tensor(
                 [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
                 dtype=torch.int,
