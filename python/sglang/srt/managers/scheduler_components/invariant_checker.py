@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -186,13 +185,6 @@ class SchedulerInvariantChecker:
 
     def self_check_during_busy(self):
         if self.get_last_batch() is None:
-            return
-
-        spec_topk = self.server_args.speculative_eagle_topk or 1
-        if spec_topk > 1:
-            warnings.warn(
-                "Runtime memory check (busy) is not supported when speculation topk > 1."
-            )
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
