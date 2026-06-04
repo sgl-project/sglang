@@ -108,6 +108,8 @@ elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
+
 def _fused_rmsnorm_fp8_per_token_quant(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -572,6 +574,7 @@ class LayerCommunicator:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=_dsa_needs_bf16,
+                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
                         )
                         if _dsa_needs_bf16:
                             hidden_states = (
@@ -617,6 +620,7 @@ class LayerCommunicator:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
                                 output_unquantized_inp1=_dsa_needs_bf16,
+                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
                             )
                         )
                         if _dsa_needs_bf16:

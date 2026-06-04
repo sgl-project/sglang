@@ -121,6 +121,8 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
 
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
+
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
     # tensor layout assumptions, so keep it disabled when either dependency is off.
@@ -151,6 +153,7 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         dtype_quant=torch.float8_e4m3fn,
         res1=None,
         output_unquantized_inp1=True,
+        transpose_scale=_use_aiter_bpreshuffle_gfx95,
     )
     return x_quant, x_bf16
 

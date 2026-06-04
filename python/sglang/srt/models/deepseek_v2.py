@@ -208,6 +208,8 @@ else:
 logger = logging.getLogger(__name__)
 
 
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -376,7 +378,7 @@ class DeepseekV2MLP(nn.Module):
                     swiglu_limit=self.swiglu_limit,
                     activation="silu",
                     dtype_quant=dtypes.fp8,
-                    transpose_scale=False,
+                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
                 )
                 x = (x_fp8, x_scale)
             else:
