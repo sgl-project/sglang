@@ -1182,11 +1182,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "format is experimental and subject to change."
             )
         self.group_size = group_size
-        if use_per_token_activation is None:
-            use_per_token_activation = (
-                envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-            )
-        self.use_per_token_activation = use_per_token_activation
+        self.use_per_token_activation = (
+            use_per_token_activation
+            or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+        )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
