@@ -252,3 +252,8 @@ Return a compact report with:
 
 If no code patch was needed, say why and include the benchmark evidence.
 If a patch was attempted but not enough, be explicit about the remaining gap.
+
+---
+
+## ⚠️ 規則（DECODE-THPT-RULE）：跑 benchmark 不能只看 e2e 結果
+禁止只看 bench 的 e2e 匯總數字（throughput / latency 那行）就下結論。**必須同時去看 server log 裡打印出來的 decode throughput（gen/decode token/s）**，確認它跟 e2e 結果一致，並把這個 decode thpt 數字一起記錄到 journal.md / PR description 裡。

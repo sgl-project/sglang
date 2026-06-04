@@ -32,6 +32,8 @@
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
+#include "fused_permute_quant.cuh"  // fused permute+nvfp4-quant (gate_up de-pad), used by bench_fused_permute_quant
+#include "fused_activation_quant.cuh"
 #include "nv_internal/tensorrt_llm/thop/utils.h"
 #include "tvm_ffi_utils.h"
 
@@ -2482,7 +2484,7 @@ class FP4BlockScaleLoraLauncher {
                     int64_t local_expert_offset, int64_t local_num_experts,
                     double routed_scaling_factor, int64_t routing_method_type,
                     int64_t tile_tokens_dim, bool norm_topk_prob, bool do_finalize,
-                    bool enable_pdl) {
+                    bool enable_pdl, bool use_fused_permute_quant) {
     namespace moe_ns = tensorrt_llm::kernels::trtllmgen_moe;
     auto device = hidden_states_.device();
     int dev_id = device.device_id;
@@ -2563,7 +2565,35 @@ class FP4BlockScaleLoraLauncher {
     Tensor hidden_fp4 = alloc_tensor({max_num_padded_tokens, hidden_size / 2}, dl_uint8, device);
     Tensor hidden_fp4_sf = alloc_tensor({hidden_sf_size}, dl_uint8, device);
     Tensor hidden_per_token_sf = alloc_tensor({max_num_padded_tokens}, dl_float32, device);
-    {
+    if (use_fused_permute_quant && tile < 128) {
+      // Invariants the fused kernel relies on (review hardening): hidden must be a multiple of the
+      // 16-wide PackedVec load, and top_k must fit the dedup per-token-scale write (threadIdx<topK
+      // over BLOCK_SIZE=512 threads). Both always hold for the supported models; check loudly.
+      TVM_FFI_ICHECK(hidden_size % 16 == 0)
+          << "fused permute+quant requires hidden_size % 16 == 0, got " << hidden_size;
+      TVM_FFI_ICHECK(top_k <= 512)
+          << "fused permute+quant dedup requires top_k <= BLOCK_SIZE(512), got " << top_k;
+      // ---- 3+4 FUSED ---- read UN-permuted hidden and scatter-write fp4 + swizzled block-sf +
+      // per-token-sf to the permuted positions in one kernel: de-pads (only num_tokens*top_k rows)
+      // and drops the bf16 permuted round-trip. Bitwise-identical to the plain permute->quant chain
+      // (else branch) for the valid rows. Gated to tile<128 (SWIZZLED_8x4) — the validated decode
+      // path; prefill (tile>=128, 128x4) keeps the plain chain.
+      // Padding rows of hidden_fp4/_sf are left UNwritten (fused touches only valid rows). Safe by
+      // the down-quant precedent: step-7 quant#2 likewise writes only valid rows (m=num_tokens*top_k
+      // + the map) and step-8 Gemm2 consumes it fine — both GEMMs bound work by num_non_exiting_ctas
+      // / total_num_padded_tokens / cta_idx_xy and never read padding rows.
+      // dedup=true: the per-token-grid variant (quantize each token once, scatter) — fewer reads and
+      // (with BLOCK_SIZE=512) faster than no-dedup at decode (3.71us vs 6.25us, bench).
+      float const gu_globalScaleInv = 1.f / 448.f / 6.f;
+      sgl_fused_permute_quant::invokeFusedPermuteNvfp4Quant<__nv_bfloat16>(
+          num_tokens, top_k, hidden_size, max_num_padded_tokens,
+          reinterpret_cast<__nv_bfloat16 const*>(hidden_bf16_ptr), gu_globalScaleInv,
+          static_cast<int32_t const*>(expanded_idx_to_permuted_idx.data_ptr()),
+          reinterpret_cast<uint8_t*>(hidden_fp4.data_ptr()),
+          reinterpret_cast<uint8_t*>(hidden_fp4_sf.data_ptr()),
+          reinterpret_cast<float*>(hidden_per_token_sf.data_ptr()), gu_sfLayout, /*dedup=*/true,
+          stream);
+    } else {
       // ---- 3) permute (gather) bf16 hidden -> [max_padded, hidden] (transient, freed at block end)
       Tensor permuted_hidden_bf16 =
           alloc_tensor({max_num_padded_tokens, hidden_size}, dl_bfloat16, device);
@@ -2652,38 +2682,13 @@ class FP4BlockScaleLoraLauncher {
       cudaStreamWaitEvent(stream, reinterpret_cast<cudaEvent_t>(lora_ready_event_), 0);
     }
 
-    // ---- 6) activation (LoRA-aware): SwiGLU on raw gate_up + gate_up_lora_delta pre-act ----
-    Tensor activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
-    {
-      moe::dev::activation::Data actData;
-      actData.mDtypeElt = btg::Dtype::Bfloat16;
-      actData.mUsePdl = false;
-      actData.mUseDeepSeekFp8 = false;
-      actData.inPtr = gate_up_bf16.data_ptr();
-      actData.interleavedGateUpInput = true;
-      actData.outPtr = activated_bf16.data_ptr();
-      actData.inDqSfsPtr = nullptr;
-      actData.outDqSfsPtr = nullptr;
-      actData.gateUpLoraDeltaPtr =
-          static_cast<cutlass::bfloat16_t const*>(gate_up_lora_delta_.data_ptr());
-      actData.activationLoraInputOutPtr =
-          static_cast<cutlass::bfloat16_t*>(activation_lora_input_.data_ptr());
-      actData.innerDim = gate_up_n;
-      actData.numTokens = num_tokens;
-      actData.topK = top_k;
-      actData.expandedIdxToPermutedIdx =
-          static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
-      actData.totalNumPaddedTokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
-      moe::dev::activation::run(actData, stream);
-    }
-
-    // ---- 7) NvFP4 quant of activated bf16 (already permuted) -> permuted fp4 + sf + per-token ----
-    // Mirrors the plain fp4 path's down-GEMM input quant EXACTLY (runner.cu invokeNvfp4QuantAnd
-    // PerTokenScale): the FC1 (post-SwiGLU) activation is bf16, quantized with the generic
-    // 1/448/6 global + a per-token scale, then the down GEMM applies output2_scales_scalar
-    // (g2_alphas). We pass m = num_tokens*top_k + the expanded->permuted map so only the valid
-    // (non-padding) permuted rows are quantized — the activation kernel leaves padding rows of
-    // `activated_bf16` uninitialized, and the quant kernel uses the remapped idx for read+write.
+    // ---- 6+7) activation (SwiGLU + LoRA) then NvFP4 per-token quant of the result ----
+    // Three modes, selected by env (read once per process; the JIT kernel has no Python->C++
+    // config channel). FUSE has priority over VEC:
+    //   SGLANG_OPT_FUSED_MOE_ACTIVATION_QUANT_FUSE=1 -> single fused kernel, activated_bf16 never
+    //                                                   materialized to HBM (~1.5x over the pair).
+    //   else SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC=1   -> vectorized activationKernelOpt + quant#2.
+    //   else (default)                                -> scalar activationKernel + quant#2.
     auto sfLayout = tile >= 128 ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                                 : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
     float const globalScaleInv = 1.f / 448.f / 6.f;
@@ -2692,13 +2697,63 @@ class FP4BlockScaleLoraLauncher {
     Tensor act_fp4 = alloc_tensor({max_num_padded_tokens, inter / 2}, dl_uint8, device);
     Tensor act_fp4_sf = alloc_tensor({act_sf_size}, dl_uint8, device);
     Tensor act_per_token_sf = alloc_tensor({max_num_padded_tokens}, dl_float32, device);
-    tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
-        num_tokens * top_k, inter,
-        reinterpret_cast<__nv_bfloat16 const*>(activated_bf16.data_ptr()), globalScaleInv,
-        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        reinterpret_cast<uint8_t*>(act_fp4.data_ptr()),
-        reinterpret_cast<uint8_t*>(act_fp4_sf.data_ptr()),
-        reinterpret_cast<float*>(act_per_token_sf.data_ptr()), sfLayout, stream);
+
+    auto envFlag = [](char const* name) {
+      char const* e = std::getenv(name);
+      return e != nullptr &&
+             (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+    };
+    static int const fuseActQuant = envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_QUANT_FUSE") ? 1 : 0;
+    static int const actOptMode = envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC") ? 1 : 0;
+
+    if (fuseActQuant) {
+      // Fused: gate_up (interleaved) + lora_delta -> act_fp4/sf/per_token + activation_lora_input,
+      // without materializing activated_bf16. inter must be a multiple of 16 (always true here).
+      flashinfer::sgl_fused_act_quant::launchFusedActivationQuant(
+          num_tokens * top_k, inter, gate_up_n,
+          reinterpret_cast<__nv_bfloat16 const*>(gate_up_bf16.data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(gate_up_lora_delta_.data_ptr()),
+          reinterpret_cast<__nv_bfloat16*>(activation_lora_input_.data_ptr()),
+          static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()), globalScaleInv,
+          reinterpret_cast<uint8_t*>(act_fp4.data_ptr()),
+          reinterpret_cast<uint8_t*>(act_fp4_sf.data_ptr()),
+          reinterpret_cast<float*>(act_per_token_sf.data_ptr()), sfLayout,
+          /*disableFp4FastMath=*/false, stream);
+    } else {
+      Tensor activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
+      {
+        moe::dev::activation::Data actData;
+        actData.mDtypeElt = btg::Dtype::Bfloat16;
+        actData.mUsePdl = false;
+        actData.mUseDeepSeekFp8 = false;
+        actData.inPtr = gate_up_bf16.data_ptr();
+        actData.interleavedGateUpInput = true;
+        actData.outPtr = activated_bf16.data_ptr();
+        actData.inDqSfsPtr = nullptr;
+        actData.outDqSfsPtr = nullptr;
+        actData.gateUpLoraDeltaPtr =
+            static_cast<cutlass::bfloat16_t const*>(gate_up_lora_delta_.data_ptr());
+        actData.activationLoraInputOutPtr =
+            static_cast<cutlass::bfloat16_t*>(activation_lora_input_.data_ptr());
+        actData.innerDim = gate_up_n;
+        actData.numTokens = num_tokens;
+        actData.topK = top_k;
+        actData.expandedIdxToPermutedIdx =
+            static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
+        actData.totalNumPaddedTokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
+        actData.actOptMode = actOptMode;
+        moe::dev::activation::run(actData, stream);
+      }
+      // quant#2: m = num_tokens*top_k + the expanded->permuted map so only valid (non-padding)
+      // permuted rows are quantized (padding rows of activated_bf16 are left uninitialized).
+      tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+          num_tokens * top_k, inter,
+          reinterpret_cast<__nv_bfloat16 const*>(activated_bf16.data_ptr()), globalScaleInv,
+          static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+          reinterpret_cast<uint8_t*>(act_fp4.data_ptr()),
+          reinterpret_cast<uint8_t*>(act_fp4_sf.data_ptr()),
+          reinterpret_cast<float*>(act_per_token_sf.data_ptr()), sfLayout, stream);
+    }
 
     // ---- 8) down GEMM: Gemm2::Runner(E2m1,E2m1,bf16, K=inter, N=hidden) ----
     // We run in per-token-activation mode (SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION), where
@@ -2802,7 +2857,7 @@ Array<Tensor> sgl_trtllm_fp4_block_scale_moe_lora(
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, int64_t act_type, TensorView output, Array<int64_t> config_index,
     bool norm_topk_prob, Optional<TensorView> routing_replay_out, TensorView gate_up_lora_delta,
-    TensorView activation_lora_input, int64_t lora_ready_event) {
+    TensorView activation_lora_input, int64_t lora_ready_event, bool use_fused_permute_quant) {
   auto activation_type = validateAndCastActivationType(act_type);
   TVM_FFI_ICHECK(isGatedActivation(activation_type))
       << "sgl_trtllm_fp4_block_scale_moe_lora currently supports gated (SwiGLU) activation only.";
@@ -2852,7 +2907,7 @@ Array<Tensor> sgl_trtllm_fp4_block_scale_moe_lora(
       output, lora_ready_event);
   return launcher.run(num_experts, top_k, intermediate_size, local_expert_offset, local_num_experts,
                       routed_scaling_factor.value_or(1.0), routing_method_type, tile_tokens_dim,
-                      norm_topk_prob, do_finalize, enable_pdl);
+                      norm_topk_prob, do_finalize, enable_pdl, use_fused_permute_quant);
 }
 
 // bf16 combine + down-lora-delta merge — NvFP4 analog of the FP8 finalize op.
@@ -3133,6 +3188,171 @@ Array<int64_t> sgl_trtllm_fp4_probe_gemm2(int64_t out_dim, int64_t k_dim,
   return {pt[0], pt[1], npt[0], npt[1]};
 }
 
+// ===== Standalone single-kernel runners (for the lora_moe_triton_prep testbeds) =====
+// Expose the in-op permute / NvFP4-quant / activation kernels (which otherwise only run inside
+// FP4BlockScaleLoraLauncher::run) so a self-contained bench/correctness script can drive them.
+// Each takes PRE-ALLOCATED in/out tensors and only builds the Data + launches the kernel (no
+// device alloc -> CUDA-graph-capture-safe timing). Data setup mirrors FP4BlockScaleLoraLauncher::run.
+int64_t bench_permute(
+    TensorView hidden_in,
+    TensorView idx_map,
+    TensorView total_pad,
+    TensorView permuted_out,
+    int64_t num_tokens,
+    int64_t top_k,
+    int64_t hidden_size) {
+  cudaStream_t stream = get_stream(hidden_in.device());
+  moe::dev::permute::Data d;
+  d.mDtypeElt = btg::Dtype::Bfloat16;
+  d.mUsePdl = false;
+  d.mUseDeepSeekFp8 = false;
+  d.inPtr = hidden_in.data_ptr();
+  d.outPtr = permuted_out.data_ptr();
+  d.inDqSfsPtr = nullptr;
+  d.outDqSfsPtr = nullptr;
+  d.expandedIdxToPermutedIdx = static_cast<int*>(idx_map.data_ptr());
+  d.hiddenDim = hidden_size;
+  d.numTokens = num_tokens;
+  d.topK = top_k;
+  d.totalNumPaddedTokens = static_cast<int*>(total_pad.data_ptr());
+  moe::dev::permute::run(d, stream);
+  return 0;
+}
+
+int64_t bench_nvfp4_quant(
+    TensorView in_bf16,
+    Optional<TensorView> idx_map,
+    TensorView out_fp4,
+    TensorView out_sf,
+    TensorView out_ptsf,
+    int64_t m,
+    int64_t n,
+    int64_t tile) {
+  cudaStream_t stream = get_stream(in_bf16.device());
+  auto sfLayout = tile >= 128 ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
+                              : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
+  float const gsi = 1.f / 448.f / 6.f;
+  int* map = idx_map.has_value() ? static_cast<int*>(idx_map.value().data_ptr()) : nullptr;
+  tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+      m,
+      n,
+      reinterpret_cast<__nv_bfloat16 const*>(in_bf16.data_ptr()),
+      gsi,
+      map,
+      reinterpret_cast<uint8_t*>(out_fp4.data_ptr()),
+      reinterpret_cast<uint8_t*>(out_sf.data_ptr()),
+      reinterpret_cast<float*>(out_ptsf.data_ptr()),
+      sfLayout,
+      stream);
+  return 0;
+}
+
+int64_t bench_activation(
+    TensorView gate_up,
+    TensorView lora_delta,
+    TensorView idx_map,
+    TensorView total_pad,
+    TensorView activated_out,
+    TensorView lora_input_out,
+    int64_t inner_dim,
+    int64_t num_tokens,
+    int64_t top_k,
+    int64_t grid_x_override,
+    int64_t opt_mode) {
+  cudaStream_t stream = get_stream(gate_up.device());
+  moe::dev::activation::Data d;
+  d.mDtypeElt = btg::Dtype::Bfloat16;
+  d.mUsePdl = false;
+  d.mUseDeepSeekFp8 = false;
+  d.inPtr = gate_up.data_ptr();
+  d.interleavedGateUpInput = true;
+  d.outPtr = activated_out.data_ptr();
+  d.inDqSfsPtr = nullptr;
+  d.outDqSfsPtr = nullptr;
+  d.gateUpLoraDeltaPtr = static_cast<cutlass::bfloat16_t const*>(lora_delta.data_ptr());
+  d.activationLoraInputOutPtr = static_cast<cutlass::bfloat16_t*>(lora_input_out.data_ptr());
+  d.innerDim = inner_dim;
+  d.numTokens = num_tokens;
+  d.topK = top_k;
+  d.expandedIdxToPermutedIdx = static_cast<int*>(idx_map.data_ptr());
+  d.totalNumPaddedTokens = static_cast<int*>(total_pad.data_ptr());
+  d.actGridXOverride = static_cast<int32_t>(grid_x_override);
+  d.actOptMode = static_cast<int32_t>(opt_mode);
+  moe::dev::activation::run(d, stream);
+  return 0;
+}
+
+// Fused permute + NvFP4-per-token-quant: reads UN-permuted bf16 hidden ([num_tokens, hidden]) and
+// scatter-writes fp4 + swizzled block-sf + per-token-sf to the permuted positions, replacing the
+// plain permuteKernel + nvfp4QuantAndPerTokenScale #1 pair. dedup!=0 picks the per-token-grid
+// (quantize once, scatter) variant; dedup==0 picks the per-pair-grid (re-quantize per pair) variant.
+int64_t bench_fused_permute_quant(
+    TensorView hidden_in,
+    TensorView idx_map,
+    TensorView out_fp4,
+    TensorView out_sf,
+    TensorView out_ptsf,
+    int64_t num_tokens,
+    int64_t top_k,
+    int64_t hidden_size,
+    int64_t maxpad,
+    int64_t tile,
+    int64_t dedup) {
+  cudaStream_t stream = get_stream(hidden_in.device());
+  auto sfLayout = tile >= 128 ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
+                              : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
+  float const gsi = 1.f / 448.f / 6.f;
+  sgl_fused_permute_quant::invokeFusedPermuteNvfp4Quant<__nv_bfloat16>(
+      static_cast<uint32_t>(num_tokens),
+      static_cast<uint32_t>(top_k),
+      static_cast<uint32_t>(hidden_size),
+      static_cast<int>(maxpad),
+      reinterpret_cast<__nv_bfloat16 const*>(hidden_in.data_ptr()),
+      gsi,
+      static_cast<int32_t const*>(idx_map.data_ptr()),
+      reinterpret_cast<uint8_t*>(out_fp4.data_ptr()),
+      reinterpret_cast<uint8_t*>(out_sf.data_ptr()),
+      reinterpret_cast<float*>(out_ptsf.data_ptr()),
+      sfLayout,
+      dedup != 0,
+      stream);
+  return 0;
+}
+
+// Standalone runner for the fused SwiGLU+LoRA activation -> NVFP4 per-token quant kernel
+// (FP4 MoE LoRA aggressive fusion). Mirrors step 6 (activation) + step 7 (quant#2) of
+// FP4BlockScaleLoraLauncher::run but skips materializing activated_bf16. Output is
+// bitwise-identical to bench_activation -> bench_nvfp4_quant(#2). disableFastMath is fixed to
+// the default (false) here, matching the testbed (no SGLANG fp4 fast-math env set).
+int64_t bench_fused_act_quant(
+    TensorView gate_up,         // interleaved gate/up [.., inner_dim] bf16, by permutedIdx
+    TensorView lora_delta,      // [num_tokens, top_k, inner_dim] bf16, by expandedIdx
+    TensorView idx_map,         // [num_tokens*top_k] int32 (expanded -> permuted, -1 = padding)
+    TensorView fp4_out,         // [.., inner_half/2] uint8
+    TensorView sf_out,          // swizzled e4m3 SF, uint8
+    TensorView ptsf_out,        // [..] float32 (per-token scale, by permutedIdx)
+    TensorView lora_input_out,  // [num_tokens, top_k, inner_half] bf16, by expandedIdx
+    int64_t inner_half,
+    int64_t inner_dim,
+    int64_t num_tokens,
+    int64_t top_k,
+    int64_t tile) {
+  cudaStream_t stream = get_stream(gate_up.device());
+  auto sfLayout = tile >= 128 ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
+                              : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
+  float const globalScaleInv = 1.f / 448.f / 6.f;
+  flashinfer::sgl_fused_act_quant::launchFusedActivationQuant(
+      static_cast<int>(num_tokens * top_k), static_cast<int>(inner_half),
+      static_cast<int>(inner_dim), reinterpret_cast<__nv_bfloat16 const*>(gate_up.data_ptr()),
+      reinterpret_cast<__nv_bfloat16 const*>(lora_delta.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(lora_input_out.data_ptr()),
+      static_cast<int32_t const*>(idx_map.data_ptr()), globalScaleInv,
+      reinterpret_cast<uint8_t*>(fp4_out.data_ptr()),
+      reinterpret_cast<uint8_t*>(sf_out.data_ptr()),
+      reinterpret_cast<float*>(ptsf_out.data_ptr()), sfLayout, /*disableFp4FastMath=*/false, stream);
+  return 0;
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -3151,6 +3371,11 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_block_scale_moe_lora_finalize,
                               sgl_trtllm_fp4_block_scale_moe_lora_finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_probe_unfused, sgl_trtllm_fp4_probe_unfused);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_probe_gemm2, sgl_trtllm_fp4_probe_gemm2);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_permute, bench_permute);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_nvfp4_quant, bench_nvfp4_quant);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_activation, bench_activation);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_fused_permute_quant, bench_fused_permute_quant);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_fused_act_quant, bench_fused_act_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
 

@@ -3,6 +3,8 @@ from typing import List, Optional, Union
 
 import torch
 
+from sglang.srt.environ import envs
+
 
 @functools.cache
 def get_sgl_trtllm_moe_sm100_module():
@@ -409,6 +411,7 @@ def trtllm_fp4_block_scale_routed_moe_lora(
         gate_up_lora_delta,
         activation_lora_input,
         lora_ready_event,
+        bool(envs.SGLANG_OPT_FUSED_PERMUTE_QUANT.get()),
     )
 
     return output if do_finalize else result

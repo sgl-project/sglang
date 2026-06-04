@@ -276,5 +276,70 @@ class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
         return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
+class TestFusedMergedAlignE2EWiring(CustomTestCase):
+    """SGLANG_OPT_LORA_FUSED_MERGED_ALIGN must be a drop-in: the fused align
+    kernel only changes the routing, so merged_experts_fused_moe_lora_add with
+    the flag off vs on must produce identical output (EP, single adapter, mixed
+    token_lora_mapping incl. masked -1)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA required")
+        cls.device = "cuda:0"
+
+    def test_flag_on_off_match(self):
+        """fused-align flag on vs off -> bitwise-identical e2e MoE-LoRA output."""
+        from sglang.srt.environ import envs
+        from sglang.srt.lora.triton_ops.virtual_experts import (
+            merged_experts_fused_moe_lora_add,
+        )
+
+        torch.manual_seed(0)
+        dev = self.device
+        num_tokens, top_k, num_experts = 8, 2, 64
+        local_num_experts, local_offset = 16, 16  # this rank owns [16, 32)
+        max_loras, rank, K, N = 1, 16, 64, 64
+        dt = torch.bfloat16
+
+        hidden = torch.randn(num_tokens, K, device=dev, dtype=dt)
+        lora_a = (
+            torch.randn(max_loras, num_experts, rank, K, device=dev, dtype=dt) * 0.05
+        )
+        lora_b = (
+            torch.randn(max_loras, num_experts, N, rank, device=dev, dtype=dt) * 0.05
+        )
+        topk_ids = torch.stack(
+            [torch.randperm(num_experts, device=dev)[:top_k] for _ in range(num_tokens)]
+        ).to(torch.int32)
+        topk_weights = torch.rand(num_tokens, top_k, device=dev, dtype=torch.float32)
+        tlm = torch.zeros(num_tokens, device=dev, dtype=torch.int32)
+        tlm[::3] = -1  # mask every 3rd token
+        base_out = torch.randn(num_tokens, N, device=dev, dtype=dt)
+
+        def run(flag):
+            out = base_out.clone()
+            with envs.SGLANG_OPT_LORA_FUSED_MERGED_ALIGN.override(flag):
+                merged_experts_fused_moe_lora_add(
+                    out,
+                    hidden,
+                    lora_a,
+                    lora_b,
+                    topk_ids,
+                    topk_weights,
+                    tlm,
+                    mul_routed_weight=True,
+                    experts_shared_outer_loras_a=False,
+                    experts_shared_outer_loras_b=False,
+                    routing_cache=None,
+                    local_expert_offset=local_offset,
+                    local_num_experts=local_num_experts,
+                )
+            return out
+
+        old, new = run(False), run(True)
+        torch.testing.assert_close(old, new, atol=0.0, rtol=0.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

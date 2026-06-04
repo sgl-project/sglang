@@ -123,6 +123,82 @@ __global__ void activationKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Vectorized bf16 SwiGLU+LoRA activation for the FP4-LoRA path (interleaved gate/up input).
+// Each thread processes 4 consecutive hidden pairs per step: one 128-bit load for the
+// interleaved gate/up, two 64-bit loads for the LoRA delta, and 64-bit stores. This raises
+// memory-level parallelism toward the HBM bandwidth roofline (vs the scalar activationKernel,
+// which does 1 element/thread with per-element scalar loads). Numerically identical to
+// activationKernel (same per-element float math + silu), so the testbed asserts bitwise
+// equality. Requires interleaved bf16 input and (innerDim/2) % 4 == 0 (run() guards this).
+__global__ void activationKernelOpt(
+    cutlass::bfloat16_t const* __restrict__ inPtr,                // interleaved gate/up GEMM1 output
+    cutlass::bfloat16_t* __restrict__ outPtr,                    // activated [.., innerDim/2]
+    cutlass::bfloat16_t const* __restrict__ gateUpLoraDeltaPtr,  // may be null
+    cutlass::bfloat16_t* __restrict__ activationLoraInputOutPtr,  // may be null
+    int const* __restrict__ expandedIdxToPermutedIdx,
+    int innerDim,
+    int numTokens,
+    int topK) {
+  int const innerHalf = innerDim / 2;
+  for (int tokenIdx = blockIdx.z; tokenIdx < numTokens; tokenIdx += gridDim.z) {
+    for (int k = blockIdx.y; k < topK; k += gridDim.y) {
+      int const expandedIdx = tokenIdx * topK + k;
+      int const permutedIdx = expandedIdxToPermutedIdx[expandedIdx];
+      for (int h = (threadIdx.x + blockDim.x * blockIdx.x) * 4; h < innerHalf;
+           h += blockDim.x * gridDim.x * 4) {
+        int64_t const liBase = (int64_t)expandedIdx * innerHalf + h;
+        if (permutedIdx == -1) {
+          if (activationLoraInputOutPtr != nullptr) {
+            *reinterpret_cast<int2*>(&activationLoraInputOutPtr[liBase]) = make_int2(0, 0);
+          }
+          continue;
+        }
+
+        // gate/up: 8 interleaved bf16 (g0,u0,...,g3,u3) via one 128-bit load.
+        int64_t const permBase = (int64_t)permutedIdx * innerDim + 2 * h;
+        int4 const rawGU = *reinterpret_cast<int4 const*>(&inPtr[permBase]);
+        cutlass::bfloat16_t const* gu = reinterpret_cast<cutlass::bfloat16_t const*>(&rawGU);
+
+        float gate[4], up[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          gate[j] = (float)gu[2 * j];      // even col 2k   -> x1 (gate)
+          up[j] = (float)gu[2 * j + 1];    // odd col  2k+1 -> x2 (up)
+        }
+
+        if (gateUpLoraDeltaPtr != nullptr) {
+          // delta is contiguous [gate | up] per expandedIdx row: up += delta[h], gate += delta[h+innerHalf].
+          int64_t const dBase = (int64_t)expandedIdx * innerDim + h;
+          int2 const rawUp = *reinterpret_cast<int2 const*>(&gateUpLoraDeltaPtr[dBase]);
+          int2 const rawGate = *reinterpret_cast<int2 const*>(&gateUpLoraDeltaPtr[dBase + innerHalf]);
+          cutlass::bfloat16_t const* dUp = reinterpret_cast<cutlass::bfloat16_t const*>(&rawUp);
+          cutlass::bfloat16_t const* dGate = reinterpret_cast<cutlass::bfloat16_t const*>(&rawGate);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            up[j] += (float)dUp[j];
+            gate[j] += (float)dGate[j];
+          }
+        }
+
+        __align__(8) cutlass::bfloat16_t res[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          res[j] = (cutlass::bfloat16_t)(silu(up[j]) * gate[j]);
+        }
+        int2 const packed = *reinterpret_cast<int2 const*>(res);
+
+        int64_t const outBase = (int64_t)permutedIdx * innerHalf + h;
+        *reinterpret_cast<int2*>(&outPtr[outBase]) = packed;
+        if (activationLoraInputOutPtr != nullptr) {
+          *reinterpret_cast<int2*>(&activationLoraInputOutPtr[liBase]) = packed;
+        }
+      }
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct Float4Max {
   __device__ __forceinline__ float4 operator()(float4 const& a, float4 const& b) const {
     float4 result;
@@ -419,9 +495,23 @@ void run(Data const& data, void* stream) {
 
     LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
                       DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
+  } else if (data.actOptMode == 1 && data.mDtypeElt == tg::Dtype::Bfloat16 &&
+             data.interleavedGateUpInput && (data.innerDim / 2) % 4 == 0) {
+    int const numThreads = 256;
+    int const innerHalf = data.innerDim / 2;
+    int const defaultGx = (innerHalf / 4 + numThreads - 1) / numThreads;
+    int const gridX = data.actGridXOverride > 0 ? data.actGridXOverride : defaultGx;
+    const dim3 grid(gridX, data.topK, std::min(8192, data.numTokens));
+
+    activationKernelOpt<<<grid, numThreads, 0, (cudaStream_t)stream>>>(
+        static_cast<cutlass::bfloat16_t const*>(data.inPtr),
+        static_cast<cutlass::bfloat16_t*>(data.outPtr), data.gateUpLoraDeltaPtr,
+        data.activationLoraInputOutPtr, data.expandedIdxToPermutedIdx, data.innerDim,
+        data.numTokens, data.topK);
   } else {
     int const numThreads = 256;
-    const dim3 grid(data.innerDim / 128, data.topK, std::min(8192, data.numTokens));
+    int const gridX = data.actGridXOverride > 0 ? data.actGridXOverride : (data.innerDim / 128);
+    const dim3 grid(gridX, data.topK, std::min(8192, data.numTokens));
 
     LAUNCH_ACTIVATION(data, activationKernel, 1, grid, numThreads, 0, stream);
   }

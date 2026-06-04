@@ -525,3 +525,8 @@ Use [references/framework-reference.md](references/framework-reference.md) when
 you need command templates, source links, or knob-family mappings. Use
 [references/example-plan.yaml](references/example-plan.yaml) as the starting
 point for a full cross-framework run plan.
+
+---
+
+## ⚠️ 規則（DECODE-THPT-RULE）：跑 benchmark 不能只看 e2e 結果
+禁止只看 bench 的 e2e 匯總數字（throughput / latency 那行）就下結論。**必須同時去看 server log 裡打印出來的 decode throughput（gen/decode token/s）**，確認它跟 e2e 結果一致，並把這個 decode thpt 數字一起記錄到 journal.md / PR description 裡。

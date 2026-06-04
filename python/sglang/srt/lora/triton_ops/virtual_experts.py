@@ -350,7 +350,6 @@ from sglang.srt.lora.trtllm_moe.specialized_expand import (  # noqa: E402,F401
 )
 
 
-
 def _align_block_size_jit(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -670,6 +669,49 @@ def _merged_experts_fused_moe_lora_add_impl(
             cached = routing_cache.get(cache_key)
             if cached is not None:
                 return cached
+
+        # Fused LoRA-local align: one kernel does inline virtual id + EP skip +
+        # compact (local experts) + single-block scatter, replacing the 3-kernel
+        # (_fused_virtual_topk_ids + moe_align + count_and_sort) pipeline. Only the
+        # supported per-expert single-adapter EP path; everything else falls back.
+        # Decode-only: the fused kernel's single-block scatter targets the small
+        # decode batch; prefill (>= 512 tokens) keeps the multi-block old path.
+        if (
+            envs.SGLANG_OPT_LORA_FUSED_MERGED_ALIGN.get()
+            and max_loras == 1
+            and not shared_outer
+            and ep_local
+            and topk_ids.shape[0] < 512
+        ):
+            from sglang.jit_kernel.moe_lora_merged_align import moe_lora_merged_align
+
+            (
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                token_lora_mask,
+                _vne,
+            ) = moe_lora_merged_align(
+                topk_ids,
+                token_lora_mapping,
+                num_experts,
+                shared_outer,
+                max_loras,
+                block_size,
+                local_expert_offset,
+                local_num_experts,
+                do_skip=True,
+                compact=True,
+            )
+            result = (
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                token_lora_mask,
+            )
+            if routing_cache is not None:
+                routing_cache[cache_key] = result
+            return result
 
         virtual_topk_ids, token_lora_mask, virtual_num_experts = (
             _fused_virtual_topk_ids(

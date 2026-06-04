@@ -1219,20 +1219,41 @@ def biased_grouped_topk_gpu(
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
-            return kimi_k2_moe_fused_gate(
-                gating_output.to(dtype=torch.float32),
-                # kimi_k2_moe_fused_gate requires input and bias to share a dtype;
-                # gating_output is upcast to fp32 above, so match the bias too.
-                (
+            if envs.SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE.get():
+                from sglang.jit_kernel.kimi_k2_moe_fused_gate import (
+                    kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
+                )
+
+                # The JIT kernel widens bf16/fp16 inputs to fp32 internally; the toggle
+                # lets us A/B bisect against the old host-upcast path.
+                use_bf16_input = envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
+            else:
+                # The AOT kernel requires fp32 input and bias.
+                _kimi_k2_moe_fused_gate = kimi_k2_moe_fused_gate
+                use_bf16_input = False
+                assert not envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
+
+            if use_bf16_input:
+                # Pass gating_output and correction_bias through untouched, dropping the
+                # two host-side elementwise upcast kernels.
+                _gi = gating_output
+                _cb = correction_bias
+            else:
+                _gi = gating_output.to(dtype=torch.float32)
+                _cb = (
                     correction_bias.to(dtype=torch.float32)
                     if correction_bias is not None
                     else correction_bias
-                ),
+                )
+            _ret = _kimi_k2_moe_fused_gate(
+                _gi,
+                _cb,
                 topk=topk,
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
+            return _ret
         elif (
             _is_cuda
             and num_expert_group == 1

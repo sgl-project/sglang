@@ -440,6 +440,12 @@ class Envs:
     # lora/trtllm_moe/lora_dispatch.py path-3 comment). Leaving it OFF for no-lora avoids the
     # ~9-13% per-token overhead on the no-lora base.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Fuse the gate_up permute + NvFP4 per-token quant into one kernel on the NvFP4 MoE-LoRA decode
+    # path: read UN-permuted hidden and scatter-write fp4 + block-sf + per-token-sf to the permuted
+    # positions, de-padding (only num_tokens*top_k rows) and dropping the bf16 permuted round-trip.
+    # Bitwise-identical to the plain permuteKernel + nvfp4QuantAndPerTokenScale chain; only takes
+    # effect for the decode (SWIZZLED_8x4 / tile<128) path — prefill keeps the plain chain.
+    SGLANG_OPT_FUSED_PERMUTE_QUANT = EnvBool(False)
     # Token-count ceiling for the trtllm-LoRA decode two-stream overlap (now ALWAYS-ON): decode batches
     # with <= this many tokens run two-stream; larger batches run single-stream. NOTE: the LoRA
     # two-stream (attention + gate_up) overlap and the permute-memset skip are now unconditional
@@ -458,6 +464,25 @@ class Envs:
     # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
     # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
     SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
+    # Use the vectorized activationKernelOpt (128-bit gate/up + 64-bit delta/store, 4 pairs/thread)
+    # instead of the scalar activationKernel in the FP4 MoE LoRA path. Bitwise-identical output,
+    # ~3.25x faster on the EP8 bs64 Kimi decode activation (13.9->4.3us, B200). Read C++-side via
+    # getenv in trtllm_fused_moe_kernel_launcher.cu (FP4BlockScaleLoraLauncher::run), since the JIT
+    # kernel has no Python->C++ config channel. Default OFF for A/B bisection; set =1 to enable.
+    SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC = EnvBool(False)
+    # Use the fused LoRA-local align kernel (moe_lora_merged_align) on the
+    # --lora-use-virtual-experts decode routing prep: one kernel computes the
+    # virtual expert id inline + EP-skips dropped slots + compacts to local
+    # experts + scatters in a single block, replacing the 3-kernel
+    # (_fused_virtual_topk_ids + moe_align + count_and_sort) pipeline. Only
+    # engaged for the supported per-expert single-adapter EP path; other cases
+    # fall back to the original path. Default off.
+    SGLANG_OPT_LORA_FUSED_MERGED_ALIGN = EnvBool(False)
+    # Aggressive fusion: compute the SwiGLU+LoRA activation AND the down-GEMM NVFP4 per-token quant
+    # in a single kernel, so the bf16 activation is never materialized to HBM (eliminates its write
+    # + quant#2's two reads, ~1.5x over the separate pair on EP8 bs64 Kimi decode). Takes priority
+    # over _VEC. Read C++-side via getenv in FP4BlockScaleLoraLauncher::run. Default OFF (A/B bisect).
+    SGLANG_OPT_FUSED_MOE_ACTIVATION_QUANT_FUSE = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
@@ -739,6 +764,13 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE = EnvBool(False)
+    # When the JIT kimi gate is used, feed bf16/fp16 router logits / correction bias
+    # straight in (widened to fp32 in-register) instead of upcasting on the host,
+    # dropping two elementwise cast kernels. Toggle off to A/B bisect against the
+    # old host-upcast path; bitwise-identical, so on by default.
+    SGLANG_OPT_KIMI_GATE_BF16_INPUT = EnvBool(True)
+    SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

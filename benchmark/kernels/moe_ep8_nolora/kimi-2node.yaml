@@ -1,0 +1,297 @@
+---
+# Headless Service for inter-pod DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mnnvl-kimi-${ID}-head
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: mnnvl-kimi-${ID}
+  ports:
+  - name: dist-init
+    port: 20000
+    targetPort: 20000
+---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: mnnvl-kimi-${ID}-compute-domain
+spec:
+  numNodes: 0
+  channel:
+    resourceClaimTemplate:
+      name: mnnvl-kimi-${ID}-cd-channel
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mnnvl-kimi-${ID}-0
+  labels:
+    app: mnnvl-kimi-${ID}
+    sglang-role: head
+spec:
+  hostname: mnnvl-kimi-${ID}-0
+  subdomain: mnnvl-kimi-${ID}-head
+  runtimeClassName: nvidia
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: mnnvl-kimi-${ID}
+        topologyKey: kubernetes.io/hostname
+  resourceClaims:
+  - name: imex-channel
+    resourceClaimTemplateName: mnnvl-kimi-${ID}-cd-channel
+  tolerations:
+  - key: "kubernetes.io/arch"
+    operator: "Equal"
+    value: "arm64"
+    effect: "NoSchedule"
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  containers:
+  - name: sglang
+    image: lmsysorg/sglang:dev-cu13
+    imagePullPolicy: Always
+    command:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      cat > /root/setup.sh <<'SETUP'
+      #!/bin/bash
+      set -o pipefail
+      log(){ echo "[setup $(date -u +%H:%M:%S)] $*"; }
+
+      log "ensuring numactl is present (used to keep page cache off HBM NUMA nodes)"
+      command -v numactl >/dev/null 2>&1 || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq numactl; } || true
+
+      log "installing hf_xet + hf_transfer download accelerators"
+      pip install --quiet "huggingface_hub[hf_xet,hf_transfer]" hf_xet hf_transfer || true
+
+      if [ -f "$HOME/.cargo/env" ]; then
+        grep -q 'cargo/env' ~/.bashrc 2>/dev/null || echo '. "$HOME/.cargo/env"' >> ~/.bashrc
+        . "$HOME/.cargo/env"
+      fi
+
+      if [ -d /root/sglang/.git ]; then
+        log "updating /root/sglang -> origin/main"
+        cd /root/sglang
+        git remote set-url origin https://github.com/sgl-project/sglang.git 2>/dev/null || true
+        git fetch origin main && git reset --hard origin/main
+      else
+        log "cloning sglang"
+        rm -rf /root/sglang && git clone https://github.com/sgl-project/sglang /root/sglang
+        cd /root/sglang
+      fi
+      log "pip install -e /root/sglang/python (a few minutes)"
+      cd /root/sglang && pip install -e python
+
+      mkdir -p /root/Kimi-K2.5-NVFP4 /root/kimi_k25_lora_alpha
+      if [ ! -f /root/Kimi-K2.5-NVFP4/config.json ]; then
+        log "downloading nvidia/Kimi-K2.5-NVFP4"
+        numactl --membind=0,1 hf download nvidia/Kimi-K2.5-NVFP4 --local-dir /root/Kimi-K2.5-NVFP4 & m=$!
+      fi
+      if [ ! -f /root/kimi_k25_lora_alpha/adapter_config.json ]; then
+        log "downloading jybsuper/kimi_k25_lora_alpha (private; needs HF_TOKEN)"
+        numactl --membind=0,1 hf download jybsuper/kimi_k25_lora_alpha --local-dir /root/kimi_k25_lora_alpha & l=$!
+      fi
+      [ -n "${m:-}" ] && wait $m
+      [ -n "${l:-}" ] && wait $l
+
+      touch /root/.setup-done
+      log "setup complete"
+      SETUP
+      chmod +x /root/setup.sh
+      ( /root/setup.sh > /root/setup.log 2>&1 ) &
+      sleep infinity
+    ports:
+    - name: dist-init
+      containerPort: 20000
+      protocol: TCP
+    env:
+    - name: PATH
+      value: "/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    - name: LD_LIBRARY_PATH
+      value: "/usr/local/nvidia/lib64"
+    - name: NVIDIA_DISABLE_REQUIRE
+      value: "true"
+    - name: MALLOC_TRIM_THRESHOLD_
+      value: "131072"
+    - name: HF_HUB_ENABLE_HF_TRANSFER
+      value: "1"
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: hf-token-yanbin
+          key: token
+          optional: true
+    resources:
+      requests:
+        nvidia.com/gpu: 4
+        memory: "800Gi"
+        cpu: "16"
+        ephemeral-storage: "100Gi"
+      limits:
+        nvidia.com/gpu: 4
+        memory: "1800Gi"
+        cpu: "64"
+        ephemeral-storage: "1200Gi"
+      claims:
+      - name: imex-channel
+    volumeMounts:
+    - name: shm
+      mountPath: /dev/shm
+    # Persist /root/.cache (flashinfer fp4_gemm autotune, triton/deep_gemm JIT, HF modules) across pod
+    # recreations so the ~17-21min cold autotune is paid once per node, not every launch.
+    - name: sglang-cache
+      mountPath: /root/.cache
+  volumes:
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 32Gi
+  - name: sglang-cache
+    hostPath:
+      path: /var/lib/sglang-cache
+      type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mnnvl-kimi-${ID}-1
+  labels:
+    app: mnnvl-kimi-${ID}
+    sglang-role: worker
+spec:
+  hostname: mnnvl-kimi-${ID}-1
+  subdomain: mnnvl-kimi-${ID}-head
+  runtimeClassName: nvidia
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: mnnvl-kimi-${ID}
+        topologyKey: kubernetes.io/hostname
+  resourceClaims:
+  - name: imex-channel
+    resourceClaimTemplateName: mnnvl-kimi-${ID}-cd-channel
+  tolerations:
+  - key: "kubernetes.io/arch"
+    operator: "Equal"
+    value: "arm64"
+    effect: "NoSchedule"
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  containers:
+  - name: sglang
+    image: lmsysorg/sglang:dev-cu13
+    imagePullPolicy: Always
+    command:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      cat > /root/setup.sh <<'SETUP'
+      #!/bin/bash
+      set -o pipefail
+      log(){ echo "[setup $(date -u +%H:%M:%S)] $*"; }
+
+      log "ensuring numactl is present (used to keep page cache off HBM NUMA nodes)"
+      command -v numactl >/dev/null 2>&1 || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq numactl; } || true
+
+      log "installing hf_xet + hf_transfer download accelerators"
+      pip install --quiet "huggingface_hub[hf_xet,hf_transfer]" hf_xet hf_transfer || true
+
+      if [ -f "$HOME/.cargo/env" ]; then
+        grep -q 'cargo/env' ~/.bashrc 2>/dev/null || echo '. "$HOME/.cargo/env"' >> ~/.bashrc
+        . "$HOME/.cargo/env"
+      fi
+
+      if [ -d /root/sglang/.git ]; then
+        log "updating /root/sglang -> origin/main"
+        cd /root/sglang
+        git remote set-url origin https://github.com/sgl-project/sglang.git 2>/dev/null || true
+        git fetch origin main && git reset --hard origin/main
+      else
+        log "cloning sglang"
+        rm -rf /root/sglang && git clone https://github.com/sgl-project/sglang /root/sglang
+        cd /root/sglang
+      fi
+      log "pip install -e /root/sglang/python (a few minutes)"
+      cd /root/sglang && pip install -e python
+
+      mkdir -p /root/Kimi-K2.5-NVFP4 /root/kimi_k25_lora_alpha
+      if [ ! -f /root/Kimi-K2.5-NVFP4/config.json ]; then
+        log "downloading nvidia/Kimi-K2.5-NVFP4"
+        numactl --membind=0,1 hf download nvidia/Kimi-K2.5-NVFP4 --local-dir /root/Kimi-K2.5-NVFP4 & m=$!
+      fi
+      if [ ! -f /root/kimi_k25_lora_alpha/adapter_config.json ]; then
+        log "downloading jybsuper/kimi_k25_lora_alpha (private; needs HF_TOKEN)"
+        numactl --membind=0,1 hf download jybsuper/kimi_k25_lora_alpha --local-dir /root/kimi_k25_lora_alpha & l=$!
+      fi
+      [ -n "${m:-}" ] && wait $m
+      [ -n "${l:-}" ] && wait $l
+
+      touch /root/.setup-done
+      log "setup complete"
+      SETUP
+      chmod +x /root/setup.sh
+      ( /root/setup.sh > /root/setup.log 2>&1 ) &
+      sleep infinity
+    ports:
+    - name: dist-init
+      containerPort: 20000
+      protocol: TCP
+    env:
+    - name: PATH
+      value: "/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    - name: LD_LIBRARY_PATH
+      value: "/usr/local/nvidia/lib64"
+    - name: NVIDIA_DISABLE_REQUIRE
+      value: "true"
+    - name: MALLOC_TRIM_THRESHOLD_
+      value: "131072"
+    - name: HF_HUB_ENABLE_HF_TRANSFER
+      value: "1"
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: hf-token-yanbin
+          key: token
+          optional: true
+    resources:
+      requests:
+        nvidia.com/gpu: 4
+        memory: "800Gi"
+        cpu: "16"
+        ephemeral-storage: "100Gi"
+      limits:
+        nvidia.com/gpu: 4
+        memory: "1800Gi"
+        cpu: "64"
+        ephemeral-storage: "1200Gi"
+      claims:
+      - name: imex-channel
+    volumeMounts:
+    - name: shm
+      mountPath: /dev/shm
+    # Persist /root/.cache (flashinfer fp4_gemm autotune, triton/deep_gemm JIT, HF modules) across pod
+    # recreations so the ~17-21min cold autotune is paid once per node, not every launch.
+    - name: sglang-cache
+      mountPath: /root/.cache
+  volumes:
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 32Gi
+  - name: sglang-cache
+    hostPath:
+      path: /var/lib/sglang-cache
+      type: DirectoryOrCreate
