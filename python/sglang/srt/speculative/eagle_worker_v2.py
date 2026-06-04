@@ -693,8 +693,10 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_req=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
+            # Draft-extend fills the whole tree width (num_draft_tokens) per req,
+            # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
