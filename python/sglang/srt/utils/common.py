@@ -2537,8 +2537,8 @@ def kill_itself_when_parent_died():
         PR_SET_PDEATHSIG = 1
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-    else:
-        # macOS / other platforms have no PR_SET_PDEATHSIG equivalent, so the
+    elif sys.platform == "darwin":
+        # macOS has no PR_SET_PDEATHSIG equivalent, so the
         # kernel will not signal this process when the parent dies; the worker
         # would be reparented to PID 1 and leak (holding GPU/host memory and
         # ports). Emulate PDEATHSIG with a daemon thread that polls the parent
@@ -2563,6 +2563,10 @@ def kill_itself_when_parent_died():
             daemon=True,
         )
         watcher.start()
+    else:
+        logger.warning(
+            "kill_itself_when_parent_died is only supported on linux and macOS."
+        )
 
 
 class UvicornAccessLogFilter(logging.Filter):
