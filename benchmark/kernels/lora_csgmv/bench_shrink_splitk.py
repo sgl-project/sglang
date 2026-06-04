@@ -298,18 +298,32 @@ def bench_us_rotated(calls, rep_ms: int) -> float:
     return float(ms) * 1e3 / len(calls)
 
 
+def touched_bytes_of(proj, topk_ids, ep) -> int:
+    """Bytes the kernel actually reads/writes per call: only OWNED routed (token,
+    expert) pairs touch weight rows / hidden rows / output rows (the EP -1 sentinel
+    blocks early-return before any load). Sizing rotation by the full global weight
+    (4x larger) silently under-rotates and lets L2 serve the hot expert rows."""
+    spec = PROJ[proj]
+    lo = ep["local_expert_offset"]
+    owned_mask = (topk_ids >= lo) & (topk_ids < lo + ep["local_num_experts"])
+    owned_pairs = int(owned_mask.sum().item())
+    unique_owned = int(topk_ids[owned_mask.bool()].unique().numel())
+    if spec["input_top_k"] > 1:
+        hidden_touched = topk_ids.shape[0] * spec["k"]  # per-token rows, all read
+    else:
+        hidden_touched = owned_pairs * spec["k"]  # per-(token,expert) rows
+    weight_touched = unique_owned * spec["n"] * spec["k"]
+    out_touched = owned_pairs * spec["n"]
+    return 2 * (hidden_touched + weight_touched + out_touched)
+
+
 def build_rotated_calls(args, proj, ep, config, device, dtype):
     topk_ids, tlm = make_routing_inputs(
         args.bs, ep, device, seed=args.seed, routing=args.routing, skew_a=args.skew_a
     )
     routing = build_ep_routing(topk_ids, tlm, ep, config["BLOCK_SIZE_M"])
     spec = PROJ[proj]
-    rows = args.bs if spec["input_top_k"] > 1 else args.bs * ep["top_k"]
-    group_bytes = 2 * (
-        rows * spec["k"]
-        + ep["num_experts"] * spec["n"] * spec["k"]
-        + args.bs * ep["top_k"] * spec["n"]
-    )
+    group_bytes = touched_bytes_of(proj, topk_ids, ep)
     num_groups = args.num_groups or auto_num_groups(
         group_bytes, args.l2_mult, args.min_groups, args.max_groups
     )
@@ -468,7 +482,7 @@ def main():
             f"K={spec['k']} E={ep['num_experts']}(local {ep['local_num_experts']}) "
             f"sorted={sorted_token_ids.shape[0]} padded={padded} SPLIT_K={split_k} "
             f"grid=({split_k * num_m_blocks},) groups={num_groups} "
-            f"({group_bytes * num_groups / 1e6:.0f} MB rotated): {us:.2f} us"
+            f"({group_bytes * num_groups / 1e6:.0f} MB touched rotated): {us:.2f} us"
         )
 
 

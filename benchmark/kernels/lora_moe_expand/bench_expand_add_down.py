@@ -287,17 +287,31 @@ def bench_us_rotated(calls, rep_ms: int) -> float:
     return float(ms) * 1e3 / len(calls)
 
 
+def touched_bytes_of(proj, topk_ids, ep, rank) -> int:
+    """Bytes the kernel actually reads/writes per call: only OWNED routed (token,
+    expert) pairs touch weight rows / intermediate rows / output rows (the EP -1
+    sentinel blocks never load weights). Sizing rotation by the full global weight
+    (4x larger) silently under-rotates and lets L2 serve the hot expert rows."""
+    spec = PROJ[proj]
+    lo = ep["local_expert_offset"]
+    owned_mask = (topk_ids >= lo) & (topk_ids < lo + ep["local_num_experts"])
+    owned_pairs = int(owned_mask.sum().item())
+    unique_owned = int(topk_ids[owned_mask.bool()].unique().numel())
+    inter_touched = owned_pairs * rank
+    weight_touched = unique_owned * spec["n"] * rank
+    if spec["fuse_sum_all_reduce"]:
+        out_touched = topk_ids.shape[0] * spec["n"]  # atomic-add per owned pair
+    else:
+        out_touched = owned_pairs * spec["n"]
+    return 2 * (inter_touched + weight_touched + out_touched)
+
+
 def build_rotated_calls(
     args, proj, ep, config, routing_pack, device, dtype, force_block_n=None
 ):
     topk_ids, topk_weights, routing = routing_pack
     spec = PROJ[proj]
-    group_bytes = 2 * (
-        args.bs * ep["top_k"] * spec["intermediate_cols"]
-        + ep["num_experts"] * spec["n"] * args.rank
-        + (args.bs if spec["fuse_sum_all_reduce"] else args.bs * ep["top_k"])
-        * spec["n"]
-    )
+    group_bytes = touched_bytes_of(proj, topk_ids, ep, args.rank)
     num_groups = args.num_groups or auto_num_groups(
         group_bytes, args.l2_mult, args.min_groups, args.max_groups
     )
@@ -371,7 +385,17 @@ def main():
                 inter, weight, out = make_gemm_inputs(
                     proj, bs, ep, args.rank, dtype, device
                 )
-                ref = ref_expand(proj, inter, weight, topk_ids, topk_weights, ep)
+                # down (fuse_sum) atomic-adds into an existing base in production (the
+                # real MoE output); use a non-zero base so an overwrite bug is caught.
+                base = (
+                    torch.randn_like(out) * 0.1
+                    if PROJ[proj]["fuse_sum_all_reduce"]
+                    else torch.zeros_like(out)
+                )
+                ref = (
+                    ref_expand(proj, inter, weight, topk_ids, topk_weights, ep)
+                    + base.float()
+                )
                 for block_m in [16, 32, 64]:
                     config = {
                         "BLOCK_SIZE_M": block_m,
@@ -380,7 +404,7 @@ def main():
                         "num_warps": 4,
                     }
                     routing = build_ep_routing(topk_ids, tlm, ep, block_m)
-                    out.zero_()
+                    out.copy_(base)
                     expand_call(
                         proj,
                         inter,
@@ -479,7 +503,7 @@ def main():
             f"E={ep['num_experts']}(local {ep['local_num_experts']}) "
             f"mul_routed={int(spec['mul_routed_weight'])} fuse_sum={int(spec['fuse_sum_all_reduce'])} "
             f"sorted={sorted_token_ids.shape[0]} padded={padded} block_m={block_m} grid=({grid},) "
-            f"groups={num_groups} ({group_bytes * num_groups / 1e6:.0f} MB rotated): {us:.2f} us"
+            f"groups={num_groups} ({group_bytes * num_groups / 1e6:.0f} MB touched rotated): {us:.2f} us"
         )
 
 

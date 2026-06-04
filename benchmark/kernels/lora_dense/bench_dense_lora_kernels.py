@@ -145,6 +145,9 @@ def ref_output(kernel, spec, x, weights, base_output, rank, scaling):
 
 
 def group_bytes_of(kernel, spec, s, rank) -> int:
+    # sgemm_a outputs are allocated inside the wrapper (graph-pool addresses may be
+    # reused across rotated calls during capture); they are <2% of the group bytes
+    # (e.g. 8KB of ~520KB at K=2048), so the L2-eviction sizing is unaffected.
     if kernel == "sgemm_a":
         return 2 * (
             s * spec["K"]
