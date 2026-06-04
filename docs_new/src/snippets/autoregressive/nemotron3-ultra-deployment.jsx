@@ -86,7 +86,8 @@ export const Nemotron3UltraDeployment = () => {
         { id: 'enabled',  label: 'Enabled',  default: false },
         { id: 'disabled', label: 'Disabled', default: true  }
       ],
-      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --disable-radix-cache' : null
+      // On Blackwell, the flashinfer default breaks the spec-v2 overlap scheduler, so override to trtllm_mha
+      commandRule: (value, state) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --mamba-scheduler-strategy extra_buffer' + (['b200', 'gb200', 'b300', 'gb300'].includes(state.hardware) ? ' \\\n  --attention-backend trtllm_mha' : '') : null
     },
     kvcache: {
       name: 'kvcache',
@@ -150,7 +151,8 @@ export const Nemotron3UltraDeployment = () => {
 
     const modelPath = MODEL_PATHS[model] || MODEL_PATHS['bf16'];
 
-    let cmd = 'python3 -m sglang.launch_server \\\n';
+    const specV2Env = values.mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 ' : '';
+    let cmd = `${specV2Env}python3 -m sglang.launch_server \\\n`;
     cmd += `  --model-path ${modelPath} \\\n`;
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp ${tp} \\\n`;
@@ -167,7 +169,7 @@ export const Nemotron3UltraDeployment = () => {
 
     for (const [key, option] of Object.entries(options)) {
       if (option.commandRule) {
-        const rule = option.commandRule(values[key]);
+        const rule = option.commandRule(values[key], values);
         if (rule) {
           cmd += `  ${rule} \\\n`;
         }
