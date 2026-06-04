@@ -117,6 +117,8 @@ def build_kv_only_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    enable_metrics: bool = False,
+    extra_metric_labels: Optional[dict[str, str]] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -154,6 +156,8 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=enable_metrics,
+        extra_metric_labels=extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -180,6 +184,8 @@ def build_hybrid_swa_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    enable_metrics: bool = False,
+    extra_metric_labels: Optional[dict[str, str]] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -236,6 +242,8 @@ def build_hybrid_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=enable_metrics,
+        extra_metric_labels=extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -283,6 +291,8 @@ def build_deepseek_v4_hicache_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    enable_metrics: bool = False,
+    extra_metric_labels: Optional[dict[str, str]] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     # TODO(hzh0425): Support PP for deepseek v4 with hicache
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
@@ -471,6 +481,8 @@ def build_deepseek_v4_hicache_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=enable_metrics,
+        extra_metric_labels=extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -497,6 +509,8 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    enable_metrics: bool = False,
+    extra_metric_labels: Optional[dict[str, str]] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
@@ -552,6 +566,8 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=enable_metrics,
+        extra_metric_labels=extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -577,6 +593,8 @@ def build_anchor_sidecar_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    enable_metrics: bool = False,
+    extra_metric_labels: Optional[dict[str, str]] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -622,6 +640,8 @@ def build_anchor_sidecar_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=enable_metrics,
+        extra_metric_labels=extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -665,6 +685,8 @@ class StackStrategy:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         enable_storage_metrics: bool = False,
+        enable_metrics: bool = False,
+        extra_metric_labels: Optional[dict[str, str]] = None,
     ) -> StackBuildResult:
         raise NotImplementedError
 
@@ -695,6 +717,8 @@ class _DeepSeekV4Strategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        enable_metrics=False,
+        extra_metric_labels=None,
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -715,6 +739,8 @@ class _DeepSeekV4Strategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         sidecars = [
             SidecarPoolSpec(
@@ -773,6 +799,8 @@ class _MambaStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        enable_metrics=False,
+        extra_metric_labels=None,
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -799,6 +827,8 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -849,6 +879,8 @@ class _SwaStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        enable_metrics=False,
+        extra_metric_labels=None,
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -874,6 +906,8 @@ class _SwaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -910,6 +944,8 @@ class _DsaStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        enable_metrics=False,
+        extra_metric_labels=None,
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
@@ -940,6 +976,8 @@ class _DsaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -991,6 +1029,8 @@ class _PlainKvStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        enable_metrics=False,
+        extra_metric_labels=None,
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
@@ -1014,6 +1054,8 @@ class _PlainKvStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1112,6 +1154,8 @@ def attach_hybrid_pool_to_unified_cache(
             prefetch_threshold=storage_prefetch_threshold,
             model_name=server_args.served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
+            enable_metrics=cache._enable_metrics_flag,
+            extra_metric_labels=cache.extra_metric_labels,
         )
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
@@ -1127,6 +1171,8 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     extra_config: dict,
     prefetch_threshold: int,
     enable_storage_metrics: bool,
+    enable_metrics: bool = False,
+    extra_metric_labels: Optional[dict[str, str]] = None,
     load_cache_event,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1163,6 +1209,8 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group
@@ -1219,6 +1267,8 @@ def attach_hybrid_pool_to_mamba_cache(
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_metrics=enable_metrics,
+            extra_metric_labels=extra_metric_labels,
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         mamba_cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
