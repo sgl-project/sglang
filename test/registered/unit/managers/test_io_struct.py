@@ -500,6 +500,46 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
 
+    def test_getitem_slices_list_session_params(self):
+        """Batch subrequests should receive only their own session params."""
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            session_params=[{"id": "session1"}, {"id": "session2"}],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].session_params, {"id": "session1"})
+        self.assertEqual(req[1].session_params, {"id": "session2"})
+
+    def test_getitem_slices_list_session_params_after_parallel_expand(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params={"n": 2},
+            rid=["id1", "id2"],
+            session_params=[{"id": "session1"}, {"id": "session2"}],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].session_params, {"id": "session1"})
+        self.assertEqual(req[1].session_params, {"id": "session2"})
+        self.assertEqual(req[2].session_params, {"id": "session1"})
+        self.assertEqual(req[3].session_params, {"id": "session2"})
+
+    def test_getitem_keeps_dict_session_params(self):
+        """A dict session_params value is request-scoped and shared."""
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            session_params={"id": "session1", "offset": 10},
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].session_params, {"id": "session1", "offset": 10})
+        self.assertEqual(req[1].session_params, {"id": "session1", "offset": 10})
+
     def test_getitem_method(self):
         """Test the __getitem__ method."""
         req = GenerateReqInput(
