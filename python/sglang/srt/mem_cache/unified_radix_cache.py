@@ -101,7 +101,6 @@ class UnifiedTreeNode:
         )
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
-        self.write_through_pending_id: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
