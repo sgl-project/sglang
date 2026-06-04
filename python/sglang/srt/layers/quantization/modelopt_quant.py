@@ -2173,6 +2173,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                 )  # k
 
+        if self._is_cutedsl_v2_standard:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                invalidate_cutedsl_cache,
+            )
+
+            invalidate_cutedsl_cache(layer)
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
