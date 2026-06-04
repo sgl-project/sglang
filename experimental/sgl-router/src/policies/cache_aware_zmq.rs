@@ -36,7 +36,9 @@
 use crate::config::CacheAwareConfig;
 
 use crate::discovery::ModelId;
-use crate::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
+use crate::policies::kv_events::{
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+};
 use crate::policies::{Policy, SelectionContext};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -243,7 +245,16 @@ impl Policy for CacheAwareZmqPolicy {
             );
             return Self::pick_min_load(workers);
         };
-        let block_hashes = compute_block_hashes(&tokens, block_size as usize);
+        // EAGLE-family workers hash KV blocks over token bigrams; the query
+        // hashes must match the worker's stored hashes or the tree lookup
+        // always misses (overlap stays 0). The oracle carries the worker-
+        // reported flag.
+        let is_bigram = self.block_size_oracle.is_bigram();
+        let block_hashes = if is_bigram {
+            compute_block_hashes_bigram(&tokens, block_size as usize)
+        } else {
+            compute_block_hashes(&tokens, block_size as usize)
+        };
         if block_hashes.is_empty() {
             return Self::pick_min_load(workers);
         }
@@ -251,6 +262,7 @@ impl Policy for CacheAwareZmqPolicy {
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
         tracing::debug!(
             model = %ctx.model(),
+            hashing = if is_bigram { "bigram" } else { "unigram" },
             n_blocks = block_hashes.len(),
             matched_blocks = matched.matched_blocks,
             match_rate,
@@ -588,6 +600,116 @@ mod tests {
             rendered.contains("sgl_router_overlap_blocks_count{model_id=\"tiny\"}"),
             "overlap must be recorded even on the below-threshold fallback; got:\n{rendered}"
         );
+    }
+
+    /// End-to-end bigram wiring (the fix that takes `overlap_blocks_sum` from
+    /// 0 to non-zero for EAGLE models): an EAGLE worker publishes its blocks
+    /// under BIGRAM hashes. Only a router whose oracle reports `is_bigram` —
+    /// and thus hashes its query with the bigram hasher — matches them, so
+    /// overlap is non-zero and it picks the cached worker. A unigram-hashing
+    /// router against the SAME tree matches nothing (overlap recorded as 0).
+    #[test]
+    fn bigram_routing_matches_only_with_bigram_hashing() {
+        fn overlap_sum(rendered: &str) -> f64 {
+            rendered
+                .lines()
+                .find(|l| l.starts_with("sgl_router_overlap_blocks_sum{model_id=\"tiny\"}"))
+                .and_then(|l| l.split_whitespace().last())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(-1.0)
+        }
+
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        // The EAGLE worker publishes BIGRAM block hashes.
+        let bigram_hashes = compute_block_hashes_bigram(&ids, block_size as usize);
+        assert!(!bigram_hashes.is_empty());
+        assert_ne!(
+            bigram_hashes,
+            compute_block_hashes(&ids, block_size as usize),
+            "bigram and unigram hashes must differ for this prefix"
+        );
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+
+        // Bigram-aware router (oracle.is_bigram == true): query hashes match
+        // the bigram tree -> overlap > 0 and it picks the matched worker w0.
+        {
+            let tree = Arc::new(HashTree::new());
+            tree.insert(
+                &KvWorkerId::new("http://w0:30000".into(), 0),
+                None,
+                &bigram_hashes,
+            );
+            let oracle = BlockSizeOracle::new();
+            oracle.try_set(block_size).unwrap();
+            oracle.set_bigram(true);
+            let metrics = MetricsRegistry::new();
+            let policy = CacheAwareZmqPolicy::new(
+                CacheAwareConfig {
+                    cache_threshold: 0.0,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                },
+                tree,
+                Arc::clone(&registry),
+                oracle,
+            )
+            .with_metrics(Arc::clone(&metrics));
+            let workers = vec![
+                worker("http://w0:30000", "tiny"),
+                worker("http://w1:30000", "tiny"),
+            ];
+            let ctx = SelectionContext::new(&model, Some(&body));
+            let chosen = policy.select(&workers, &ctx).expect("must pick");
+            assert_eq!(
+                chosen.url, "http://w0:30000",
+                "bigram-aware router must match w0's bigram-hashed prefix"
+            );
+            assert!(
+                overlap_sum(&metrics.render()) > 0.0,
+                "overlap_blocks_sum must be > 0 once the router hashes with bigram"
+            );
+        }
+
+        // Unigram router (default is_bigram == false) vs the SAME bigram tree:
+        // query hashes never match -> overlap recorded as 0.
+        {
+            let tree = Arc::new(HashTree::new());
+            tree.insert(
+                &KvWorkerId::new("http://w0:30000".into(), 0),
+                None,
+                &bigram_hashes,
+            );
+            let oracle = BlockSizeOracle::new();
+            oracle.try_set(block_size).unwrap();
+            let metrics = MetricsRegistry::new();
+            let policy = CacheAwareZmqPolicy::new(
+                CacheAwareConfig {
+                    cache_threshold: 0.0,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                },
+                tree,
+                Arc::clone(&registry),
+                oracle,
+            )
+            .with_metrics(Arc::clone(&metrics));
+            let workers = vec![
+                worker("http://w0:30000", "tiny"),
+                worker("http://w1:30000", "tiny"),
+            ];
+            let ctx = SelectionContext::new(&model, Some(&body));
+            let _ = policy.select(&workers, &ctx).expect("must pick");
+            assert_eq!(
+                overlap_sum(&metrics.render()),
+                0.0,
+                "unigram hashing matches nothing in a bigram tree -> overlap_sum == 0"
+            );
+        }
     }
 
     /// Two workers both hold the prefix; the lower-load one wins.
