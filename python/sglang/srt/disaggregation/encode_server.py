@@ -83,9 +83,64 @@ rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
-# publishes per-part metadata here under rid_lock + get_condition in mooncake backend;
+# Publishes per-part metadata here under rid_lock for mooncake backend;
 rid_to_meta: Dict[str, dict] = dict()
 rid_to_send_done: Dict[str, int] = dict()
+_send_cleanup_tasks: Dict[str, asyncio.Task] = dict()
+
+
+async def _publish_meta(req_id, nbytes, embedding_len, embedding_dim, error=None):
+    """Publish per-part encode metadata and wake meta-data waiters."""
+    meta = (
+        {"error": error}
+        if error is not None
+        else {
+            "embedding_size": nbytes,
+            "embedding_len": embedding_len,
+            "embedding_dim": embedding_dim,
+        }
+    )
+    async with rid_lock:
+        rid_to_meta[req_id] = meta
+    cond = await get_condition(req_id)
+    async with cond:
+        cond.notify_all()
+
+
+async def _cleanup_meta_state(req_id):
+    """Drop module-level meta rendezvous entries for req_id."""
+    async with rid_lock:
+        rid_to_meta.pop(req_id, None)
+        rid_to_send_done.pop(req_id, None)
+    async with cond_dict_lock:
+        rid_to_cond.pop(req_id, None)
+    task = _send_cleanup_tasks.pop(req_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def _note_send_done(req_id, receive_count):
+    """Count a completed /send; clean meta state at receive_count."""
+    async with rid_lock:
+        count = rid_to_send_done.get(req_id, 0) + 1
+        rid_to_send_done[req_id] = count
+    if count >= receive_count:
+        await _cleanup_meta_state(req_id)
+
+
+def _schedule_meta_cleanup(req_id, timeout):
+    """Arm a timeout fallback sweep for meta state."""
+
+    async def _cleanup_later():
+        await asyncio.sleep(timeout)
+        await _cleanup_meta_state(req_id)
+
+    old_task = _send_cleanup_tasks.pop(req_id, None)
+    if old_task is not None and not old_task.done():
+        old_task.cancel()
+    task = asyncio.create_task(_cleanup_later())
+    _send_cleanup_tasks[req_id] = task
+
 
 use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
 
@@ -1733,34 +1788,6 @@ class MMEncoder:
         task.add_done_callback(self.background_tasks.discard)
         return task
 
-    async def _publish_meta(
-        self, req_id, nbytes, embedding_len, embedding_dim, error=None
-    ):
-        """Publish per-part encode metadata and wake meta-data waiters."""
-        meta = (
-            {"error": error}
-            if error is not None
-            else {
-                "embedding_size": nbytes,
-                "embedding_len": embedding_len,
-                "embedding_dim": embedding_dim,
-            }
-        )
-        async with rid_lock:
-            rid_to_meta[req_id] = meta
-        cond = await get_condition(req_id)
-        async with cond:
-            cond.notify_all()
-
-    async def note_send_done(self, req_id: str, receive_count: int):
-        """Count a completed /send; release per-part state once all Language
-        ranks (receive_count) have transferred."""
-        async with rid_lock:
-            count = rid_to_send_done.get(req_id, 0) + 1
-            rid_to_send_done[req_id] = count
-        if count >= receive_count:
-            await self._cleanup_inflight_encode_state(req_id)
-
     async def _cleanup_inflight_encode_state(self, req_id: str):
         self.embedding_to_send.pop(req_id, None)
         # Release the rkey after all /send calls have completed.
@@ -1775,12 +1802,7 @@ class MMEncoder:
                         f"Shared-MR deregister failed for {req_id}: {dereg_err}"
                     )
         self._forward_ready_events.pop(req_id, None)
-        # Drop the meta entries
-        async with rid_lock:
-            rid_to_meta.pop(req_id, None)
-            rid_to_send_done.pop(req_id, None)
-        async with cond_dict_lock:
-            rid_to_cond.pop(req_id, None)
+        await _cleanup_meta_state(req_id)
         task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
         if task is not None and not task.done():
             task.cancel()
@@ -3309,6 +3331,9 @@ async def handle_encode_request(request: dict):
                 else HTTPStatus.INTERNAL_SERVER_ERROR
             )
             logger.error(f"DP worker error for req_id={req_id}: {result['_error']}")
+            # Publish error so decoder's /scheduler_receive_meta_data unblocks.
+            await _publish_meta(req_id, 0, 0, 0, error=result["_error"])
+            _schedule_meta_cleanup(req_id, ENCODER_REQ_TIMEOUT)
             return ORJSONResponse(
                 status_code=status_code,
                 content={
@@ -3322,7 +3347,22 @@ async def handle_encode_request(request: dict):
             f"[{req_id}] /encode completed in {elapsed:.3f}s, "
             f"modality={request.get('modality', 'image')}"
         )
-        return ORJSONResponse(content=result.get("content"))
+        content = result.get("content")
+        # Mooncake: worker returned metadata dict; publish it in the main
+        # process (where /scheduler_receive_meta_data reads rid_to_meta)
+        # and return None so master's encode() stops at its gate.
+        if isinstance(content, dict) and "embedding_size" in content:
+            await _publish_meta(
+                req_id,
+                content["embedding_size"],
+                content["embedding_len"],
+                content["embedding_dim"],
+            )
+            _schedule_meta_cleanup(
+                req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
+            )
+            return ORJSONResponse(content=None)
+        return ORJSONResponse(content=content)
     try:
 
         def start_background_send(req_id):
@@ -3369,8 +3409,10 @@ async def handle_encode_request(request: dict):
                         )
             # Publish the error to meta-data waiters and arm the cleanup sweep.
             if encoder.server_args.encoder_transfer_backend == "mooncake":
-                await encoder._publish_meta(req_id, 0, 0, 0, error=error_msg)
-                encoder._schedule_inflight_encode_cleanup(req_id)
+                await _publish_meta(req_id, 0, 0, 0, error=error_msg)
+                _schedule_meta_cleanup(
+                    req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
+                )
             return ORJSONResponse(
                 status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
@@ -3378,8 +3420,10 @@ async def handle_encode_request(request: dict):
         if encoder.server_args.encoder_transfer_backend == "mooncake":
             # Publish metadata for decoder ranks pulling via
             # /scheduler_receive_meta_data, and arm the lifetime sweep.
-            await encoder._publish_meta(req_id, nbytes, embedding_len, embedding_dim)
-            encoder._schedule_inflight_encode_cleanup(req_id)
+            await _publish_meta(req_id, nbytes, embedding_len, embedding_dim)
+            _schedule_meta_cleanup(
+                req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
+            )
             return ORJSONResponse(content=None)
         elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
             logger.info(f"{request['embedding_port'] = }")
@@ -3420,8 +3464,10 @@ async def handle_encode_request(request: dict):
         rid_to_err_msg[req_id] = error_msg
         # Ensure meta-data waiters are unblocked on unexpected errors.
         if encoder.server_args.encoder_transfer_backend == "mooncake":
-            await encoder._publish_meta(req_id, 0, 0, 0, error=error_msg)
-            encoder._schedule_inflight_encode_cleanup(req_id)
+            await _publish_meta(req_id, 0, 0, 0, error=error_msg)
+            _schedule_meta_cleanup(
+                req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
+            )
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={
@@ -3457,6 +3503,10 @@ async def handle_send_request(request: dict):
                 content=f"Encoder DP worker send error: {result['_error']}",
                 status_code=status_code,
             )
+        # Worker did the RDMA transfer + its own embedding cleanup.
+        # Count in main process for rid_to_meta release.
+        if encoder is not None:
+            await _note_send_done(request["req_id"], request.get("receive_count", 1))
         return ORJSONResponse(content=result.get("content"))
     await encoder.send(
         req_id=request["req_id"],
@@ -3465,7 +3515,7 @@ async def handle_send_request(request: dict):
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
-    await encoder.note_send_done(request["req_id"], request.get("receive_count", 1))
+    await _note_send_done(request["req_id"], request.get("receive_count", 1))
     return ORJSONResponse(content=None)
 
 
