@@ -35,9 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# At busy mem check level 1, keep the most recent messages in a ring buffer and
-# only flush them on a detected leak, instead of logging every iteration (which
-# is what level > 1 does).
+# Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
@@ -224,8 +222,7 @@ class SchedulerInvariantChecker:
             if swa_line:
                 logger.info(swa_line)
         elif level == 1:
-            # Quiet: buffer messages in a ring buffer and stay silent; only flush
-            # the most recent ones when a leak is actually detected.
+            # Quiet: buffer and stay silent; flush the recent ones only on a leak.
             self.recent_busy_msgs.append(full_line)
             if swa_line:
                 self.recent_busy_msgs.append(swa_line)
