@@ -18,9 +18,7 @@ from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CHANNELS,
     RAW_RGB_CONTENT_TYPE,
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     WEBP_FRAME_CONTENT_TYPE,
-    build_delta_gzip_raw_rgb_payload,
 )
 
 if TYPE_CHECKING:
@@ -139,8 +137,6 @@ class _TransportPayload:
     content_type: str
     payload: bytes
     metadata: dict[str, int | str | bool | list[int]]
-    last_raw_rgb_frame: bytes | None = None
-    last_event_id: int | None = None
 
 
 def _split_frame_batch(frames: list[bytes]) -> list[list[bytes]]:
@@ -241,6 +237,10 @@ def _pack_frame_batch_message(
     return msgspec.msgpack.encode(message)
 
 
+def _pack_frame_batch_header(header: RealtimeFrameBatchHeader) -> bytes:
+    return msgspec.msgpack.encode(header)
+
+
 def _build_transport_payload(
     transport_frames: list[bytes],
     *,
@@ -249,8 +249,6 @@ def _build_transport_payload(
     output_format: str | None,
     transport_quality: int | None,
     preview_max_width: int | None,
-    reference_frame: bytes | None,
-    event_id: int | None,
 ) -> _TransportPayload:
     payload_content_type = content_type
     payload_metadata: dict[str, int | str | bool | list[int]] = {}
@@ -302,35 +300,12 @@ def _build_transport_payload(
             "height": preview_height,
             "payload_lengths": [len(frame) for frame in encoded_frames],
         }
-    elif (
-        output_format == RAW_LOSSLESS_OUTPUT_FORMAT
-        and content_type == RAW_RGB_CONTENT_TYPE
-        and transport_frames
-    ):
+    elif content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
         raw_payload = b"".join(transport_frames)
         payload_metadata = {
             "raw_size": len(raw_payload),
             "encoding": RAW_LOSSLESS_OUTPUT_FORMAT,
         }
-    elif content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
-        raw_payload = build_delta_gzip_raw_rgb_payload(
-            transport_frames,
-            reference_frame=reference_frame,
-        )
-        payload_content_type = RAW_RGB_DELTA_GZIP_CONTENT_TYPE
-        payload_metadata = {
-            "raw_size": sum(len(frame) for frame in transport_frames),
-            "encoding": "delta-gzip",
-        }
-        if reference_frame is not None:
-            payload_metadata["delta_reference"] = "previous-frame"
-        return _TransportPayload(
-            content_type=payload_content_type,
-            payload=raw_payload,
-            metadata=payload_metadata,
-            last_raw_rgb_frame=transport_frames[-1],
-            last_event_id=event_id,
-        )
     else:
         raw_payload = b"".join(transport_frames)
 
@@ -457,15 +432,13 @@ async def _build_encoded_preview_payload(
 
 
 class RawRGBRealtimeOutputAdapter:
-    """send raw RGB over WebSocket using lossless transport compression"""
+    """send raw RGB over WebSocket using lossless transport"""
 
     def __init__(self) -> None:
-        self._last_raw_rgb_frame: bytes | None = None
-        self._last_event_id: int | None = None
+        pass
 
     def reset(self) -> None:
-        self._last_raw_rgb_frame = None
-        self._last_event_id = None
+        pass
 
     async def send(
         self,
@@ -556,9 +529,6 @@ class RawRGBRealtimeOutputAdapter:
                 if encoded_preview_payloads is not None:
                     transport_payload = encoded_preview_payloads[frame_batch_index]
                 else:
-                    reference_frame = self._last_raw_rgb_frame
-                    if event_id != self._last_event_id:
-                        reference_frame = None
                     if _should_build_payload_off_loop(
                         content_type=content_type,
                         output_format=output_format,
@@ -572,8 +542,6 @@ class RawRGBRealtimeOutputAdapter:
                             output_format=output_format,
                             transport_quality=transport_quality,
                             preview_max_width=preview_max_width,
-                            reference_frame=reference_frame,
-                            event_id=event_id,
                         )
                     else:
                         transport_payload = _build_transport_payload(
@@ -583,12 +551,7 @@ class RawRGBRealtimeOutputAdapter:
                             output_format=output_format,
                             transport_quality=transport_quality,
                             preview_max_width=preview_max_width,
-                            reference_frame=reference_frame,
-                            event_id=event_id,
                         )
-                    if transport_payload.last_raw_rgb_frame is not None:
-                        self._last_raw_rgb_frame = transport_payload.last_raw_rgb_frame
-                        self._last_event_id = transport_payload.last_event_id
                     stats["raw_payload_build_ms"] += timer.mark_ms()
 
                 header: RealtimeFrameBatchHeader = {
@@ -608,24 +571,32 @@ class RawRGBRealtimeOutputAdapter:
                 header.update(transport_payload.metadata)
 
                 if len(transport_payload.payload) >= FRAME_BATCH_PACK_OFFLOAD_BYTES:
-                    message_payload = await asyncio.to_thread(
-                        _pack_frame_batch_message,
-                        header,
-                        transport_payload.payload,
+                    header_payload = _pack_frame_batch_header(header)
+                    stats["header_pack_ms"] += timer.mark_ms()
+
+                    await ws.send_bytes(header_payload)
+                    stats["header_write_ms"] += timer.mark_ms()
+
+                    await ws.send_bytes(transport_payload.payload)
+                    stats["raw_write_ms"] += timer.mark_ms()
+
+                    stats["ws_payload_bytes"] += len(header_payload) + len(
+                        transport_payload.payload
                     )
                 else:
                     message_payload = _pack_frame_batch_message(
                         header,
                         transport_payload.payload,
                     )
-                stats["header_pack_ms"] += timer.mark_ms()
+                    stats["header_pack_ms"] += timer.mark_ms()
 
-                stats["header_write_ms"] += timer.mark_ms()
-                await ws.send_bytes(message_payload)
-                stats["raw_write_ms"] += timer.mark_ms()
+                    stats["header_write_ms"] += timer.mark_ms()
+                    await ws.send_bytes(message_payload)
+                    stats["raw_write_ms"] += timer.mark_ms()
+
+                    stats["ws_payload_bytes"] += len(message_payload)
 
                 stats["raw_bytes"] += sum(len(frame) for frame in transport_frames)
-                stats["ws_payload_bytes"] += len(message_payload)
                 stats["num_frames"] += len(transport_frames)
                 stats["num_batches"] += 1
                 stats["content_type"] = transport_payload.content_type
