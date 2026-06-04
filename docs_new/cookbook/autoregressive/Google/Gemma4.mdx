@@ -67,14 +67,31 @@ Gemma 4 is Google's next-generation family of open models, building on the Gemma
 
 ## 2. SGLang Installation
 
-Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main. Install it together with the matching transformers commit:
+Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main:
 
 ```bash Command
 # Install SGLang from main
 pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+```
 
-# Install transformers with Gemma 4 support (encoder-free unified family included)
-pip install 'git+https://github.com/huggingface/transformers.git@1423d22f7a3b62e8c70ad67b58ec25cd9b675897'
+### Docker (prebuilt dev image)
+
+Prebuilt development images bundle SGLang together with the matching transformers commit preinstalled, so no manual install is needed. All tags are multi-arch (`amd64` + `arm64`):
+
+| Tag | CUDA | Hardware |
+| --- | --- | --- |
+| `lmsysorg/sglang:dev-gemma-4-12B` | 13.0 | Default — amd64 (H200 / B200) + arm64 (GB200 / GB300) |
+| `lmsysorg/sglang:dev-cu13-gemma-4-12B` | 13.0 | Alias of the default tag |
+| `lmsysorg/sglang:dev-cu12-gemma-4-12B` | 12.9 | CUDA 12.x hosts |
+
+```bash Command
+docker run --gpus all --ipc=host --shm-size 32g \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 30000:30000 \
+  lmsysorg/sglang:dev-gemma-4-12B \
+  sglang serve --model-path google/gemma-4-12B-it \
+    --reasoning-parser gemma4 --tool-call-parser gemma4 \
+    --host 0.0.0.0 --port 30000
 ```
 
 For other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
