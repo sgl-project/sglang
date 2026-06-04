@@ -78,49 +78,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     # Delegation helpers
     # ------------------------------------------------------------------
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        mode = forward_batch.forward_mode
-
-        # Compute max_seqlen from CPU-side data so it is safe inside CUDA graphs.
-        if mode.is_extend() and not mode.is_decode():
-            # extend_seq_lens_cpu is a List[int]; seq_lens_cpu = prefix + extend
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        # extend_seq_lens_cpu is None for decode and TARGET_VERIFY cuda-graph
+        # views (even though is_extend() is True there), so branch on its presence.
+        if forward_batch.extend_seq_lens_cpu is not None:
             self._max_seqlen_q = int(max(forward_batch.extend_seq_lens_cpu))
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
         else:
-            # seq_lens_cpu is a CPU tensor – .max().item() is fine here
             self._max_seqlen_q = 1
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         pass
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs,
-        num_tokens,
-        req_pool_indices,
-        seq_lens,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-    ):
-        self._max_seqlen_q = 1
-        self._max_seqlen_k = int(seq_lens[:bs].max().item())
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs,
-        req_pool_indices,
-        seq_lens,
-        seq_lens_sum,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-        seq_lens_cpu,
-    ):
-        # seq_lens_cpu is a CPU tensor – safe to call .max().item() here.
-        self._max_seqlen_q = 1
-        self._max_seqlen_k = int(seq_lens_cpu[:bs].max().item())
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        pass
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -348,73 +322,23 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # delegate so the dense (FlashInfer) backend keeps its own eager init.
         self.sparse.init_forward_metadata(forward_batch)
         self.dense.init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        self.sparse.init_forward_metadata_out_graph(forward_batch, in_capture)
+        self.dense.init_forward_metadata_out_graph(forward_batch, in_capture)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        self.sparse.init_forward_metadata_in_graph(forward_batch)
+        self.dense.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.dense.init_cuda_graph_state(max_bs, max_num_tokens)
         self.sparse.init_cuda_graph_state(max_bs, max_num_tokens)
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs,
-        num_tokens,
-        req_pool_indices,
-        seq_lens,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-    ):
-        self.sparse.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
-        self.dense.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs,
-        req_pool_indices,
-        seq_lens,
-        seq_lens_sum,
-        encoder_lens,
-        forward_mode,
-        spec_info,
-        seq_lens_cpu,
-    ):
-        self.sparse.init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
-        )
-        self.dense.init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
-        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.sparse.get_cuda_graph_seq_len_fill_value()
