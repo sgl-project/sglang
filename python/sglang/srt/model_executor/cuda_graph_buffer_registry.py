@@ -288,9 +288,8 @@ class CudaGraphBufferRegistry:
         self.device = device
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
-        # When True, slot buffers are coalesced by name through the global
-        # ForwardInputBuffers pool, so a registry can share physical storage
-        # (and data_ptr) with the legacy DecodeInputBuffers during migration.
+        # Coalesce allocated slot buffers through the global pool; only applies
+        # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
 
@@ -470,6 +469,13 @@ class CudaGraphBufferRegistry:
         ``capture_hidden_mode`` / ``dp_*`` / ``lora_ids`` / ...). Slot
         fields are replaced with views into the registry buffers via
         ``dataclasses.replace`` — the template itself is not mutated.
+
+        NOTE: currently parked / unused. It is NOT a drop-in for the decode
+        replay path's ``build_replay_fb_view``: it returns the *padded*
+        out_cache_loc slot slice (vs the raw ``fb.out_cache_loc`` that path
+        keeps), does not recompute ``seq_lens_sum`` for the padded tail, and
+        does not split ``forward_mode`` vs ``actual_forward_mode``. Reconcile
+        those before wiring it into any replay path.
         """
         import dataclasses
 
@@ -519,9 +525,10 @@ def build_decode_registry(
     registered here — they are not per-replay FB copies (allocated and written
     elsewhere), so the runner keeps owning them.
 
-    When ``source`` is given, each slot adopts the same-named tensor off
-    ``source`` (e.g. a ``DecodeInputBuffers``) instead of allocating, so the
-    registry shares one physical allocation with that object.
+    When ``source`` is given (the decode buffer namespace from
+    ``_allocate_decode_buffers``), each slot adopts the same-named tensor off
+    it instead of allocating, so the registry shares one physical allocation
+    with that object. With ``source=None`` the registry allocates its own.
     """
     reg = CudaGraphBufferRegistry(
         device=device,
@@ -769,9 +776,10 @@ def build_prefill_registry(
     reset-only (``copy_from_fb=False``). ``mamba_track_*`` are bs-axis copies
     with no padding reset (bs is not padded on this path).
 
-    When ``source`` is given, each slot adopts the same-named tensor off
-    ``source`` (the ``PrefillInputBuffers``) instead of allocating, so the
-    registry shares one physical allocation (and ``data_ptr``) with it.
+    The piecewise / breakable runners pass ``source=None``, so the registry
+    allocates (and owns) these buffers directly; ``share_pool`` then coalesces
+    them through the process-wide pool. (A ``source`` object, if given, would be
+    adopted instead — one shared allocation with stable ``data_ptr``.)
     """
     reg = CudaGraphBufferRegistry(
         device=device,
