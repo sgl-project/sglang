@@ -1888,6 +1888,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self
         )
 
+        # CP KV-reshard: alloc_for_extend may have populated the batch-level
+        # transient-row bookkeeping. The disagg-prefill transfer-completion
+        # path frees this request's remote rows via req.cp_transient_state, but
+        # under overlap scheduling the batch object seen by
+        # process_batch_result no longer carries cp_transient_allocation.
+        # Attach the shared reference to each req now (a Req is long-lived and
+        # survives the handoff) so the deferred free actually fires.
+        if getattr(self, "cp_transient_allocation", None) is not None:
+            for _req in self.reqs:
+                _req.cp_transient_state = self.cp_transient_allocation
+
         # Set fields
         input_embeds = []
         all_replace_embeds: List[torch.Tensor] = []

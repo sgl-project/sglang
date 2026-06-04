@@ -581,7 +581,27 @@ def filter_kv_indices_for_cp_rank(
         return kv_indices, index_slice
 
     if getattr(kv_mgr.server_args, "enable_cp_kv_reshard", False):
-        # Position-based partition (reshard path).
+        # Two reshard transfer modes (see ``common/conn.py`` for the full
+        # rationale):
+        #
+        #   - Single-writer (default, ``enable_all_cp_ranks_for_transfer``
+        #     is False). Rank 0's pool holds the FULL KV between forward
+        #     and the post-transfer free (owned permanent rows + transient
+        #     peer slices kept alive by the deferred-free path), so rank 0
+        #     sends the entire chunk unchanged. Other CP ranks are dummies
+        #     and never reach this filter; if they do (defensive), they
+        #     return an empty slice.
+        #
+        #   - Multi-writer (opt-in,
+        #     ``enable_all_cp_ranks_for_transfer=True``). Each CP rank
+        #     sends only its position-partitioned slice in parallel and
+        #     decode aggregates via the staging buffer.
+        if not getattr(kv_mgr, "enable_all_cp_ranks_for_transfer", False):
+            if cp_rank == 0:
+                return kv_indices, index_slice
+            return kv_indices[:0], slice(index_slice.start, index_slice.start)
+
+        # Multi-writer: position-based partition.
         # ``total_request_pages`` is the partition basis; fall back to chunk
         # size if not provided so single-chunk requests still behave correctly.
         N = total_request_pages if total_request_pages is not None else len(kv_indices)

@@ -50,6 +50,12 @@ class CpTransientState:
     prefix_req_indices: Optional[torch.Tensor] = None
     prefix_position_indices: Optional[torch.Tensor] = None
     full_out_cache_loc: Optional[torch.Tensor] = None
+    # Persistent (out_cache_loc) rows that were written into req_to_token at
+    # non-owned EXTEND positions and then overwritten by transient rows. They
+    # hold no live KV under reshard (the model writes to full_out_cache_loc =
+    # owned + transient) and become orphaned; parallel to ``rows`` so the
+    # post-transfer free reclaims them, leaving only this rank's local pages.
+    displaced_rows: Optional[torch.Tensor] = None
 
     def has_transient_rows(self) -> bool:
         return self.rows is not None and self.rows.numel() > 0
@@ -65,6 +71,7 @@ class CpTransientState:
         self.prefix_req_indices = allocation.prefix_req_indices
         self.prefix_position_indices = allocation.prefix_position_indices
         self.full_out_cache_loc = allocation.full_out_cache_loc
+        self.displaced_rows = allocation.displaced_rows
 
     def clear_transient(self) -> None:
         self.rows = None
@@ -74,6 +81,7 @@ class CpTransientState:
         self.prefix_req_indices = None
         self.prefix_position_indices = None
         self.full_out_cache_loc = None
+        self.displaced_rows = None
 
 
 def compute_cp_non_owned_positions(
@@ -223,6 +231,18 @@ def cp_free_transient_for_request(
     positions = state.position_indices[mask]
     req_idxs = state.req_indices[mask]
     cp_free_transient_rows(req_to_token, allocator, rows, req_idxs, positions)
+    # Reclaim the orphaned out_cache_loc rows displaced by the transient rows
+    # at this request's non-owned extend positions. They hold no live KV and
+    # are referenced by nothing after the transfer (the cached radix node was
+    # sentinelized to slot-0 for non-owned pages at insert time), so freeing
+    # them leaves only this rank's local pages resident. Slot-0 / matched-prefix
+    # entries were zeroed at capture time.
+    displaced = getattr(state, "displaced_rows", None)
+    if displaced is not None:
+        disp = displaced[mask]
+        disp = disp[disp != 0]
+        if disp.numel() > 0:
+            allocator.free(disp)
     # Mark these slots so a second call (e.g. from leak-recovery on
     # scheduler exit) is a no-op.
     state.req_indices[mask] = -1
@@ -395,6 +415,7 @@ def cp_alloc_extend_transient(
     all_req_idxs: List[torch.Tensor] = []
     all_positions: List[torch.Tensor] = []
     all_is_prefix: List[torch.Tensor] = []
+    all_displaced: List[torch.Tensor] = []
     dropped: List[int] = []
 
     for s, owner in enumerate(cp_owner_per_pages):
@@ -432,12 +453,22 @@ def cp_alloc_extend_transient(
             dropped.append(s)
             continue
 
+        # Capture the out_cache_loc rows currently mapped at these non-owned
+        # positions BEFORE overwriting them with transient rows. Only the
+        # EXTEND-range (positions >= prefix_len) rows are this request's fresh
+        # out_cache_loc orphans; prefix-range positions point at shared/matched
+        # tree rows or slot-0 sentinels, which must never be freed — zero those
+        # so the post-transfer free skips them.
+        displaced = req_to_token[req_idxs, positions].to(dtype=torch.int64).clone()
+        displaced[positions < prefix_len] = 0
+
         req_to_token[req_idxs, positions] = rows.to(dtype=req_to_token.dtype)
 
         all_rows.append(rows)
         all_req_idxs.append(req_idxs)
         all_positions.append(positions)
         all_is_prefix.append(positions < prefix_len)
+        all_displaced.append(displaced)
 
     if all_rows:
         rows_cat = torch.cat(all_rows)
@@ -448,6 +479,7 @@ def cp_alloc_extend_transient(
         allocation.rows = rows_cat
         allocation.req_indices = req_idxs_cat
         allocation.position_indices = positions_cat
+        allocation.displaced_rows = torch.cat(all_displaced)
 
         if prefix_mask.any():
             allocation.prefix_rows = rows_cat[prefix_mask]

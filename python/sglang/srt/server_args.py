@@ -3312,16 +3312,17 @@ class ServerArgs:
                 f"{self.speculative_algorithm!r}."
             )
 
-        # KV-reshard sends each CP rank's slice as a separate writer, so the
-        # decode side must aggregate ``cp_size`` chunks per region before
-        # scatter. The staging-buffer path is the only one that exposes a
-        # writer-count gate (DecodeStagingHandler.num_writers_for); the
-        # non-staging path treats one arrival as the whole chunk and would
-        # scatter half-empty KV. Auto-enable the staging buffer when reshard
-        # is on so users don't have to also set
-        # ``SGLANG_DISAGG_STAGING_BUFFER`` by hand. Only valid for
-        # nixl/mooncake (the env-var validation below enforces that).
-        if self.disaggregation_transfer_backend in ("nixl", "mooncake"):
+        # Multi-writer reshard (each CP rank sends its slice separately)
+        # needs the decode-side staging buffer to aggregate ``cp_size``
+        # chunks per region before scatter. Only auto-enable when the user
+        # explicitly opted into multi-writer via
+        # ``SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1``; the default
+        # single-writer (rank-0-only) reshard path sends one stream and
+        # does not need the aggregator. Only valid for nixl/mooncake.
+        if (
+            self.disaggregation_transfer_backend in ("nixl", "mooncake")
+            and envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+        ):
             import os as _os
 
             if not envs.SGLANG_DISAGG_STAGING_BUFFER.is_set():

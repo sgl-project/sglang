@@ -661,7 +661,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # Attach the shared cp_transient state before enqueueing so
                 # the inflight handler can free this req's slice on
                 # Success/Failed (see model_runner.py:3181 deferred-free).
-                req.cp_transient_state = cp_transient_state
+                # Only set from the batch when present: under overlap
+                # scheduling this batch object may have lost
+                # cp_transient_allocation, but the req already carries the
+                # shared reference attached in ScheduleBatch.prepare_for_extend.
+                if cp_transient_state is not None:
+                    req.cp_transient_state = cp_transient_state
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]

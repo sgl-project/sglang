@@ -16,7 +16,10 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -505,10 +508,11 @@ def _cp_fill_remote_prefix_pool_rows(forward_batch, layer, cp_size: int) -> None
         _CP_PREFIX_GATHER_STATS["row_ct"] += int(state.prefix_rows.numel())
 
     attn_cp_rank = get_attention_cp_rank()
-    page_size = forward_batch.token_to_kv_pool.page_size
+    _kv_pool = get_token_to_kv_pool()
+    page_size = _kv_pool.page_size
     req_pool_indices_cpu = forward_batch.req_pool_indices.tolist()
-    req_to_token = forward_batch.req_to_token_pool.req_to_token
-    k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+    req_to_token = get_req_to_token_pool().req_to_token
+    k_buffer, v_buffer = _kv_pool.get_kv_buffer(layer.layer_id)
     cp_group = get_attention_cp_group()
     stream = torch.cuda.current_stream()
     device = req_to_token.device

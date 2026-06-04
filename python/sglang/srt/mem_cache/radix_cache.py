@@ -561,6 +561,28 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if cp_owner_per_page is not None:
             cp_owner_per_page = cp_owner_per_page[: len(radix_key) // self.page_size]
 
+        # CP KV-reshard: keep only this rank's LOCAL pages in the radix tree.
+        # Slot-0 sentinel the non-owned positions in the stored value so the
+        # cached node references only owned rows and the remote (transient) rows
+        # become reclaimable after the transfer. ``reshard_full`` preserves the
+        # complete (owned + transient) mapping so the req_to_token write-back
+        # below leaves the in-flight KV transfer able to read the full sequence.
+        reshard_nonowned = None
+        reshard_full = None
+        if (
+            cp_owner_per_page is not None
+            and getattr(self, "cp_attn_group", None) is not None
+        ):
+            owners_tok = cp_owner_per_page.to(device=values.device)
+            if self.page_size > 1:
+                owners_tok = owners_tok.repeat_interleave(self.page_size)
+            owners_tok = owners_tok[: values.numel()]
+            mask = owners_tok != self.cp_rank
+            if bool(mask.any()):
+                reshard_nonowned = mask
+                reshard_full = values.clone()
+                values[mask] = 0
+
         # Radix Cache takes one ref in memory pool
         result = self.insert(
             InsertParams(
@@ -573,9 +595,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        self.token_to_kv_pool_allocator.free(
-            _filter_pool_rows(kv_indices[req.cache_protected_len : new_prefix_len])
-        )
+        # Free duplicate rows already in the tree. Under reshard, free only the
+        # OWNED duplicates; the non-owned (transient) rows are reclaimed
+        # post-transfer by _release_cp_transient_for_req, so sentinel them out
+        # of the free set here to avoid a double free.
+        dup = kv_indices[req.cache_protected_len : new_prefix_len]
+        if reshard_nonowned is not None:
+            dup = dup.to(dtype=torch.int64).clone()
+            dup[reshard_nonowned[req.cache_protected_len : new_prefix_len]] = 0
+        self.token_to_kv_pool_allocator.free(_filter_pool_rows(dup))
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
@@ -587,9 +615,18 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             radix_key
         ), f"{len(new_indices)=}, {len(radix_key)=}"
 
+        # Under reshard the matched indices carry slot-0 for non-owned pages
+        # (the tree holds only local rows). Restore the request's transient
+        # (remote) rows in req_to_token so the in-flight transfer reads the full
+        # sequence; those rows are freed post-transfer.
+        write_indices = new_indices
+        if reshard_nonowned is not None:
+            write_indices = new_indices.clone()
+            m = reshard_nonowned[: write_indices.numel()]
+            write_indices[m] = reshard_full[: write_indices.numel()][m]
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(req.cache_protected_len, len(write_indices))),
+            write_indices[req.cache_protected_len :],
         )
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)

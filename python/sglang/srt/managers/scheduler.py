@@ -455,6 +455,26 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        # Activate the CP KV-reshard radix path (per-page owner population,
+        # slot-0 sentinel values for non-owned pages, rank-0 eviction
+        # consensus). Without this call ``cp_attn_group`` stays None, so
+        # ``cp_owner_per_page`` is never populated and reshard silently
+        # degenerates to full-KV CP (every rank stores the full KV, no
+        # per-rank saving). See RadixCache.enable_cp_consensus.
+        if (
+            getattr(self.server_args, "enable_cp_kv_reshard", False)
+            and self.server_args.attn_cp_size > 1
+            and not self.disable_radix_cache
+            and hasattr(self.tree_cache, "enable_cp_consensus")
+        ):
+            from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+            self.tree_cache.enable_cp_consensus(
+                get_attention_cp_group(),
+                self.ps.attn_cp_rank,
+                self.server_args.attn_cp_size,
+            )
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 

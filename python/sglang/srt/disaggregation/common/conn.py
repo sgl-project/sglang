@@ -123,15 +123,25 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
-        # CP KV-reshard implies "each CP rank sends only its slice" per
-        # DESIGN_kv_reshard.md §3 (contiguous, token-dim partition reusing
-        # page_indices_to_cp_rank_page_indices). The receiver therefore must
-        # query every CP rank to assemble the full KV. Auto-enable the flag
-        # when reshard is on so users don't also need to export
-        # SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.
+        # CP KV-reshard supports two transfer modes:
+        #
+        #   * Default (single-writer, rank-0-only).
+        #     Each CP rank's pool already holds the FULL KV between forward
+        #     and the post-transfer free (owned permanent rows + transient
+        #     peer-slice rows kept alive by the deferred-free path). Rank 0
+        #     sends the entire request from its pool; other CP ranks are
+        #     dummies and do not transfer. Decode talks to rank 0 only, so
+        #     no extra env var or staging-buffer aggregator is required.
+        #
+        #   * Multi-writer (opt-in via SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1
+        #     on both prefill and decode launches). Each CP rank sends its
+        #     position-partitioned slice in parallel and decode aggregates
+        #     them via the staging buffer (DESIGN_kv_reshard.md §3). Useful
+        #     when prefill has multiple NICs that can be saturated in
+        #     parallel across CP ranks; otherwise the rank-0-only mode is
+        #     simpler with the same memory footprint.
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
-            or getattr(server_args, "enable_cp_kv_reshard", False)
         )
 
         # bind zmq socket
