@@ -69,6 +69,11 @@ impl AppContext {
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
+        // Same rationale for the cache-aware-zmq policy's
+        // `sgl_router_overlap_blocks`: the metrics registry is built here,
+        // after the policy registry, so inject it now. No-op for policies
+        // that don't emit metrics.
+        policies.attach_metrics(Arc::clone(&metrics));
         Self {
             config,
             tokenizers,

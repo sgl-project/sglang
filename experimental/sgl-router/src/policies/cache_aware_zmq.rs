@@ -38,9 +38,10 @@ use crate::config::CacheAwareConfig;
 use crate::discovery::ModelId;
 use crate::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
 use crate::policies::{Policy, SelectionContext};
+use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Selection policy that scores candidates by tree-overlap with the
 /// request's prefix and falls back to load-based picking when the tree
@@ -59,6 +60,14 @@ pub struct CacheAwareZmqPolicy {
     /// degrades to min-load — the router cannot hash a prompt without
     /// a block size that matches what the worker publishes.
     block_size_oracle: Arc<BlockSizeOracle>,
+    /// Optional metrics sink. Set via [`Self::with_metrics`] by the policy
+    /// factory for the production policy; `None` in unit tests and
+    /// non-cache-aware call sites. When set, each cache-aware selection
+    /// records the prefix-overlap block count into
+    /// `sgl_router_overlap_blocks`. Set once via [`Self::with_metrics`]
+    /// (tests) or the `Policy::attach_metrics` hook (production, called by
+    /// `PolicyRegistry::attach_metrics` after the registry is built).
+    metrics: OnceLock<Arc<MetricsRegistry>>,
 }
 
 impl std::fmt::Debug for CacheAwareZmqPolicy {
@@ -82,7 +91,17 @@ impl CacheAwareZmqPolicy {
             tree,
             tokenizers,
             block_size_oracle,
+            metrics: OnceLock::new(),
         }
+    }
+
+    /// Attach a metrics sink so each cache-aware selection records the
+    /// prefix-overlap block count into `sgl_router_overlap_blocks`. Builder
+    /// form used by tests; production wiring goes through the
+    /// `Policy::attach_metrics` hook.
+    pub fn with_metrics(self, metrics: Arc<MetricsRegistry>) -> Self {
+        let _ = self.metrics.set(metrics);
+        self
     }
 
     /// Lowest-load worker — ties broken by stable iteration order (which
@@ -218,6 +237,10 @@ impl Policy for CacheAwareZmqPolicy {
         // has registered yet (oracle empty), cache-aware routing has no
         // ground truth to score against; fall back to min-load.
         let Some(block_size) = self.block_size_oracle.get() else {
+            tracing::debug!(
+                model = %ctx.model(),
+                "cache-aware-zmq: block size unknown (no worker page_size yet), falling back to min-load",
+            );
             return Self::pick_min_load(workers);
         };
         let block_hashes = compute_block_hashes(&tokens, block_size as usize);
@@ -234,7 +257,21 @@ impl Policy for CacheAwareZmqPolicy {
             cache_threshold = self.config.cache_threshold,
             "cache-aware-zmq match_prefix",
         );
+        // Record the matched overlap into `sgl_router_overlap_blocks` before
+        // the threshold branch, so the histogram captures the full
+        // distribution — including low-overlap selections that fall back to
+        // min-load. This is the quantitative signal that cache-aware routing
+        // is matching prefixes at all.
+        if let Some(m) = self.metrics.get() {
+            m.observe_overlap_blocks(ctx.model().0.as_str(), matched.matched_blocks as u64);
+        }
         if match_rate <= self.config.cache_threshold || matched.workers.is_empty() {
+            tracing::debug!(
+                model = %ctx.model(),
+                match_rate,
+                cache_threshold = self.config.cache_threshold,
+                "cache-aware-zmq: overlap below threshold, falling back to min-load",
+            );
             return Self::pick_min_load(workers);
         }
         // Among workers in the matched set, pick the lowest-load one.
@@ -245,7 +282,20 @@ impl Policy for CacheAwareZmqPolicy {
             .filter(|w| matched_urls.contains(w.url.as_str()))
             .min_by_key(|w| w.active_load())
             .map(Arc::clone);
-        best_matched.or_else(|| Self::pick_min_load(workers))
+        let chosen = best_matched.or_else(|| Self::pick_min_load(workers));
+        if let Some(w) = &chosen {
+            tracing::debug!(
+                model = %ctx.model(),
+                worker = %w.url,
+                matched_blocks = matched.matched_blocks,
+                "cache-aware-zmq: selected worker by cache overlap",
+            );
+        }
+        chosen
+    }
+
+    fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        let _ = self.metrics.set(metrics);
     }
 }
 
@@ -388,6 +438,156 @@ mod tests {
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
+    }
+
+    /// The cache-aware path records the matched prefix-overlap block count
+    /// into `sgl_router_overlap_blocks`. Regression: the metric was defined
+    /// but never observed in production, so the histogram stayed empty and
+    /// gave no signal that cache-aware routing was matching anything.
+    #[test]
+    fn records_overlap_blocks_metric() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        let hashes = compute_block_hashes(&ids, block_size as usize);
+        assert!(!hashes.is_empty());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+
+        let metrics = MetricsRegistry::new();
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let _ = policy.select(&workers, &ctx).expect("must pick");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("sgl_router_overlap_blocks_count{model_id=\"tiny\"}"),
+            "overlap_blocks histogram must be observed on a cache-aware selection; got:\n{rendered}"
+        );
+    }
+
+    /// Production wiring path: the policy is stored as `Arc<dyn Policy>` in a
+    /// `PolicyRegistry`, then `PolicyRegistry::attach_metrics` injects the
+    /// registry — exactly what `AppContext::with_active_load` does at startup.
+    /// Exercises trait dispatch (the default no-op vs the `CacheAwareZmqPolicy`
+    /// override) and the registry fan-out, neither of which the `with_metrics`
+    /// builder test covers.
+    #[test]
+    fn attach_metrics_via_registry_records_overlap() {
+        let tree = Arc::new(HashTree::new());
+        let toks = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = toks.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(!hashes.is_empty());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            toks,
+            oracle_for_tests(4),
+        );
+        let model = ModelId("tiny".into());
+        let registry = crate::policies::PolicyRegistry::default();
+        registry.insert(model.clone(), Arc::new(policy));
+
+        // The production injection point — not the `with_metrics` builder.
+        let metrics = MetricsRegistry::new();
+        registry.attach_metrics(Arc::clone(&metrics));
+
+        let chosen_policy = registry.get(&model).unwrap();
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let _ = chosen_policy.select(&workers, &ctx).expect("must pick");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("sgl_router_overlap_blocks_count{model_id=\"tiny\"}"),
+            "PolicyRegistry::attach_metrics must wire overlap recording through the trait; got:\n{rendered}"
+        );
+    }
+
+    /// The overlap observation is recorded *before* the cache-threshold branch,
+    /// so low-overlap selections that fall back to min-load are still counted.
+    /// `cache_threshold: 1.0` forces the fallback (match_rate is always <= 1.0)
+    /// even on a full prefix match; assert the histogram is still observed AND
+    /// the pick came from min-load (w1), not the cache-overlap worker (w0).
+    #[test]
+    fn overlap_recorded_even_when_selection_falls_back() {
+        let tree = Arc::new(HashTree::new());
+        let toks = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = toks.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(!hashes.is_empty());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+
+        let metrics = MetricsRegistry::new();
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 1.0, // match_rate <= 1.0 always -> always fall back
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            toks,
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        // Bump w0's load so min-load picks w1 — distinguishing a min-load
+        // fallback from the cache-overlap pick (which would be w0). Two guards
+        // mirror `empty_tree_falls_back_to_min_load` (below the imbalance
+        // threshold, so the cache-aware path is still reached).
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _g = w0.load_guard();
+        let _g2 = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "cache_threshold 1.0 must force a min-load fallback (w1), not the overlap worker (w0)"
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("sgl_router_overlap_blocks_count{model_id=\"tiny\"}"),
+            "overlap must be recorded even on the below-threshold fallback; got:\n{rendered}"
+        );
     }
 
     /// Two workers both hold the prefix; the lower-load one wins.
