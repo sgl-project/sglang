@@ -476,6 +476,43 @@ class Envs:
     # + quant#2's two reads, ~1.5x over the separate pair on EP8 bs64 Kimi decode). Takes priority
     # over _VEC. Read C++-side via getenv in FP4BlockScaleLoraLauncher::run. Default OFF (A/B bisect).
     SGLANG_OPT_FUSED_MOE_ACTIVATION_QUANT_FUSE = EnvBool(False)
+    # Overlap the MoE down-proj LoRA shrink (gemm A) + routing prep with the trtllm MoE
+    # finalize kernel: the op records a CUDA event right after GEMM2 (base down GEMM); the
+    # LoRA side stream waits on it and runs the shrink concurrent with finalize. The
+    # expand-add (gemm B) is NOT overlapped -- it writes the same output buffer finalize
+    # writes -- and stays on the main stream post-finalize with serial-path kernels and
+    # numerics. More conservative than the removed act_ready_event down-overlap (fork point
+    # is after GEMM2, not after activation). Default off.
+    SGLANG_OPT_LORA_DOWN_FINALIZE_OVERLAP = EnvBool(False)
+    # Overlap the MoE shared-expert add with the down-LoRA shrink (Qwen FP8 trtllm-lora dual-stream
+    # decode path). Instead of `final_hidden_states += shared_output` running on the main stream AFTER
+    # the whole alt-stream MoE+LoRA chain joins, the LoRA dispatch enqueues the add on the main stream
+    # right after the base-MoE finalize writes the output buffer — concurrent with the down-LoRA shrink
+    # (which only writes its own intermediate). The down-LoRA expand (atomic_add into the same output
+    # buffer) waits on the add via an event, so the two writers never run concurrently. See
+    # lora/trtllm_moe/shared_add_overlap.py. Default off.
+    SGLANG_OPT_LORA_SHARED_ADD_OVERLAP = EnvBool(False)
+    # Opt in to the single-adapter cuBLAS (F.linear) LoRA-A shrink fast path in sgemm_lora_a_fwd.
+    # Only takes effect when batch_info.single_adapter is set (eager, uniform 1-adapter batch); under
+    # CUDA graph single_adapter is None so this is a no-op. Default OFF (A/B bisect).
+    SGLANG_OPT_LORA_CUBLAS = EnvBool(False)
+    # Per-path opt-in for the cuBLAS LoRA fast paths. Each ORs with the master SGLANG_OPT_LORA_CUBLAS
+    # above, so the master still enables all paths; these allow isolating one path at a time (A/B
+    # bisect of the CUDA-graph decode correctness issue). Default OFF.
+    SGLANG_OPT_LORA_CUBLAS_A = EnvBool(False)  # sgemm_lora_a (LoRA-A shrink)
+    SGLANG_OPT_LORA_CUBLAS_B = EnvBool(False)  # sgemm_lora_b (generic LoRA-B: o_proj, down_proj)
+    SGLANG_OPT_LORA_CUBLAS_GATE_UP = EnvBool(False)  # gate_up_lora_b
+    SGLANG_OPT_LORA_CUBLAS_QKV = EnvBool(False)  # qkv_lora_b
+    SGLANG_OPT_LORA_CUBLAS_KV_B = EnvBool(False)  # kv_b_lora_absorbed (MLA absorbed)
+    # Fuse the FlashInfer routed-MoE topk pack ((id << 16) | bf16_bits(weight)) into the top-k
+    # gating softmax via the JIT topk_softmax_pack kernel (a port of the AOT topkGatingSoftmax
+    # fast path with a third output), removing the per-MoE-layer _pack_topk_kernel launch from
+    # the decode critical path. Engages only on the plain CUDA softmax routing path (no EPLB,
+    # no fused shared experts, no bias, pow-2 experts <= 512); the packed tensor rides on
+    # StandardTopKOutput.packed_topk_ids and is consumed by the sgl_flashinfer_trtllm FP8 LoRA
+    # dispatch, which otherwise falls back to the separate pack. Intended for Qwen3.5 FP8 LoRA
+    # serving; default off keeps the separate pack.
+    SGLANG_OPT_LORA_FUSED_TOPK_PACK = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

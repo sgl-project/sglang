@@ -58,6 +58,9 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
     from sglang.srt.layers.moe.utils import RoutingMethodType
     from sglang.srt.lora.lora_moe_runners import build_lora_hooks
     from sglang.srt.lora.triton_ops import merged_experts_fused_moe_lora_add
+    from sglang.srt.lora.trtllm_moe.shared_add_overlap import (
+        maybe_overlap_staged_shared_add,
+    )
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
@@ -148,10 +151,15 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
         device=hidden_states.device,
     )
 
-    packed_topk_ids = _pack_topk_for_flashinfer_routed(
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-    )
+    # SGLANG_OPT_LORA_FUSED_TOPK_PACK: the routed pack may already have been produced
+    # fused inside the gating kernel (StandardTopKOutput.packed_topk_ids) — including
+    # the padded-region id=-1 mask. Fall back to the separate pack otherwise.
+    packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
+    if packed_topk_ids is None:
+        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
     direct_down_output = None
     if use_virtual_lora_store:
@@ -204,6 +212,10 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
     )
     if use_virtual_lora_store:
         output = moe_result
+        # Shared-add overlap: the trtllm op above already finalized `output`, so the
+        # staged shared-expert add (if any) can run on the main stream concurrent with
+        # the down-LoRA shrink below; the expand waits on it via expand_wait_event.
+        shared_add_done = maybe_overlap_staged_shared_add(output)
         merged_experts_fused_moe_lora_add(
             output=output,
             hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
@@ -221,6 +233,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
+            expand_wait_event=shared_add_done,
         )
         return StandardCombineInput(hidden_states=output)
 

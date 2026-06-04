@@ -64,13 +64,6 @@ class LoRABatchInfo:
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
 
-    # CPU-side single-adapter info: when every request in the batch uses the
-    # same adapter slot with rank > 0, the slot index, rank, and scaling; else
-    # None. Computed from Python lists in prepare_lora_batch to avoid GPU sync.
-    uniform_weight_index: Optional[int] = None
-    uniform_rank: Optional[int] = None
-    uniform_scaling: Optional[float] = None
-
     # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
     # experts which map tokens to requests regardless of the dense-LoRA
     # backend's internal segmentation.  For the triton backend these are

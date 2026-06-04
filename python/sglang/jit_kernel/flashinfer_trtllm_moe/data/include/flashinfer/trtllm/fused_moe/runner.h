@@ -351,6 +351,12 @@ struct MoERunnerArgs {
   // instead of joining before the whole MoE op. nullptr = no wait (serial behavior).
   void* lora_ready_event = nullptr;
 
+  // Down-LoRA/finalize overlap: optional CUDA event (cudaEvent_t) the runner records on the
+  // MoE stream right after GEMM2 (the base down GEMM), before finalize. The LoRA side stream
+  // waits on it to run the down-proj LoRA shrink/expand concurrent with the finalize kernel.
+  // nullptr = no record (serial behavior).
+  void* gemm2_done_event = nullptr;
+
   // Output:
   void* output = nullptr;
   float* output_scale = nullptr;

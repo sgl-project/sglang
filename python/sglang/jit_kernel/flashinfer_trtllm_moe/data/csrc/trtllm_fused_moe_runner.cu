@@ -801,6 +801,12 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
              workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
              workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl);
 
+  // Down-LoRA/finalize overlap: signal "base down GEMM done" so the LoRA side stream can
+  // start the down-proj LoRA shrink/expand concurrent with the finalize below. 0 = no-op.
+  if (args.gemm2_done_event != nullptr) {
+    cudaEventRecord(static_cast<cudaEvent_t>(args.gemm2_done_event), stream);
+  }
+
   // Run finalize
   if (args.do_finalize) {
     // Run finalize

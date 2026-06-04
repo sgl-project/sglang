@@ -255,6 +255,11 @@ class StandardTopKOutput(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
+    # FlashInfer routed-MoE packed topk ((id << 16) | bf16_bits(weight)),
+    # produced fused inside the gating kernel when SGLANG_OPT_LORA_FUSED_TOPK_PACK=1
+    # (see jit_kernel/topk_softmax_pack.py). None on every other path; consumers
+    # fall back to _pack_topk_for_flashinfer_routed when absent.
+    packed_topk_ids: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -685,6 +690,8 @@ def fused_topk(
     renormalize: bool,
     correction_bias: Optional[torch.Tensor] = None,
     scoring_func: str = "softmax",
+    packed_out: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -706,6 +713,21 @@ def fused_topk(
                 renormalize,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
+            )
+        elif packed_out is not None:
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT
+            # kernel writes topk_weights/topk_ids AND the FlashInfer packed topk
+            # (with the padded-region id=-1 mask baked in via num_token_non_padded),
+            # eliminating the separate per-layer _pack_topk_kernel launch.
+            from sglang.jit_kernel.topk_softmax_pack import topk_softmax_pack
+
+            topk_softmax_pack(
+                topk_weights,
+                topk_ids,
+                packed_out,
+                gating_output,
+                renormalize,
+                num_token_non_padded=num_token_non_padded,
             )
         else:
             topk_softmax(
@@ -1479,6 +1501,10 @@ def select_experts(
 
     scoring_func = topk_config.scoring_func
 
+    # Set by the fused-gating+pack branch below (SGLANG_OPT_LORA_FUSED_TOPK_PACK);
+    # None everywhere else.
+    packed_topk = None
+
     (
         router_logits,
         correction_bias,
@@ -1570,6 +1596,30 @@ def select_experts(
                 renormalize=renormalize,
             )
         else:
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): only on
+            # the plain CUDA softmax path where the post-process is id-identity
+            # apart from the padded-region mask (which the kernel bakes into the
+            # packed tensor itself): no EPLB remap, no fused shared experts, no
+            # bias, pow-2 expert count, and no benchmark routing overrides.
+            if (
+                envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()
+                and _is_cuda
+                and not _use_aiter
+                and scoring_func == "softmax"
+                and correction_bias is None
+                and expert_location_dispatch_info is None
+                and num_fused_shared_experts == 0
+                and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+                and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            ):
+                num_experts = router_logits.shape[-1]
+                if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
+                    packed_topk = torch.empty(
+                        (hidden_states.shape[0], top_k),
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+
             # Qwen3MOE uses fused_topk
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
@@ -1578,6 +1628,8 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
+                packed_out=packed_topk,
+                num_token_non_padded=num_token_non_padded,
             )
     else:
         assert (
@@ -1641,7 +1693,7 @@ def select_experts(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits, packed_topk)
 
 
 # Register fake implementations for torch.compile support
