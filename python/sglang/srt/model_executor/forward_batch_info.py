@@ -486,8 +486,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # wrapper plans and view-context plans must keep this False — a
     # forward-path re-plan would clobber their metadata.
     forward_metadata_replan_equivalent: bool = False
+    # id() of the backend that pre-planned this batch, recorded only for
+    # replan_equivalent sites. Lets the forward path verify (debug) that a
+    # post-pad re-plan runs on the same backend that planned — the exact
+    # precondition replan_equivalent asserts. Plain int (no object ref);
+    # backends live for the process, so id() is stable.
+    forward_metadata_planner_id: Optional[int] = None
 
-    def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
+    def mark_forward_metadata_ready(
+        self, replan_equivalent: bool = False, planner=None
+    ):
         """Record that attention metadata was pre-planned for this batch.
 
         Call right next to the out-of-forward planning action
@@ -495,7 +503,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ``graph_runner.replay_prepare(fb)``). Records the batch shapes so
         staleness is detectable; pass ``replan_equivalent=True`` only when
         a forward-path re-plan is equivalent to the pre-plan (see field
-        docs).
+        docs), and ``planner`` = the backend that planned, so the re-plan
+        can verify it runs on that same backend.
         """
         self.forward_metadata_ready = True
         self.forward_metadata_planned_bs = self.batch_size
@@ -503,6 +512,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.input_ids.shape[0] if self.input_ids is not None else 0
         )
         self.forward_metadata_replan_equivalent = replan_equivalent
+        self.forward_metadata_planner_id = id(planner) if planner is not None else None
+
+    def assert_replan_backend(self, backend) -> None:
+        """Guard the replan_equivalent precondition at a forward-path re-plan.
+
+        When a replan_equivalent batch is re-planned post-pad, the backend
+        doing it must be the one that pre-planned the batch — else the opt-in
+        was unsound (the forward would plan different metadata than execution
+        consumes; cf. eagle_worker's draft-extend site, which uses a distinct
+        ``draft_extend_attn_backend`` and therefore does NOT opt in). No-op
+        for fresh batches and for sites that recorded no planner. ``assert``
+        so it is stripped under ``python -O``.
+        """
+        if self.forward_metadata_planner_id is not None:
+            assert id(backend) == self.forward_metadata_planner_id, (
+                "replan_equivalent batch is being re-planned by a different "
+                "backend than the one that planned it; this opt-in site is "
+                "not actually re-plan equivalent"
+            )
 
     def needs_forward_metadata_init(self) -> bool:
         """Single judgment point for whether the forward path must plan.

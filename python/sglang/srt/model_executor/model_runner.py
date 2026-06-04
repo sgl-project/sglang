@@ -3077,6 +3077,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # dispatch against the right backend for this forward.
                 pdmux_override = True
             else:
+                forward_batch.assert_replan_backend(self.attn_backend)
                 self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
@@ -3157,6 +3158,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
+            forward_batch.assert_replan_backend(self.attn_backend)
             self.attn_backend.init_forward_metadata(forward_batch)
 
         ctx = (

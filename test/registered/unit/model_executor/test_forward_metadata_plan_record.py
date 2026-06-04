@@ -79,6 +79,31 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         self.assertEqual(fb.forward_metadata_planned_bs, 4)
 
 
+class TestPlannerGuard(CustomTestCase):
+    def test_no_planner_recorded_is_a_no_op(self):
+        backend = object()
+        fb = _make_batch()
+        fb.mark_forward_metadata_ready(replan_equivalent=True)  # no planner
+        fb.assert_replan_backend(backend)  # must not raise
+        fb2 = _make_batch()  # fresh, unmarked
+        fb2.assert_replan_backend(backend)  # must not raise
+
+    def test_same_backend_passes(self):
+        backend = object()
+        fb = _make_batch()
+        fb.mark_forward_metadata_ready(replan_equivalent=True, planner=backend)
+        fb.assert_replan_backend(backend)  # same object -> ok
+
+    def test_different_backend_trips(self):
+        # The exact unsound opt-in: planned by A, re-planned by B (e.g. a
+        # site whose draft_extend backend differs from the runner backend).
+        planner, other = object(), object()
+        fb = _make_batch()
+        fb.mark_forward_metadata_ready(replan_equivalent=True, planner=planner)
+        with self.assertRaises(AssertionError):
+            fb.assert_replan_backend(other)
+
+
 class TestDeprecatedSkipKwargShim(CustomTestCase):
     def setUp(self):
         self._saved_warned = fbi._skip_attn_backend_init_warned
