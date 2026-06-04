@@ -64,6 +64,41 @@ sglang generate \
 
 In this example, `auto` will not re-enable FSDP. The same applies to parallelism; for example, `--enable-cfg-parallel false` keeps CFG parallelism disabled.
 
+## ERNIE Image
+
+`baidu/ERNIE-Image` and `baidu/ERNIE-Image-Turbo` use the native ERNIE Image text-to-image pipeline. Start with `--performance-mode auto`; switch to `speed` only when the full pipeline fits comfortably on the selected GPU(s), or to `memory` when you need lower peak GPU memory.
+
+Regular checkpoint:
+
+```bash
+sglang generate \
+  --model-path baidu/ERNIE-Image \
+  --prompt "A cinematic photo of a quiet lakeside cabin at sunrise" \
+  --performance-mode auto \
+  --save-output
+```
+
+Turbo checkpoint:
+
+```bash
+sglang generate \
+  --model-path baidu/ERNIE-Image-Turbo \
+  --prompt "A cinematic photo of a quiet lakeside cabin at sunrise" \
+  --performance-mode auto \
+  --save-output
+```
+
+Persistent server:
+
+```bash
+sglang serve \
+  --model-path baidu/ERNIE-Image-Turbo \
+  --performance-mode auto \
+  --port 30010
+```
+
+Treat FSDP, SP/Ulysses/Ring, and TP as explicit benchmark knobs for ERNIE Image. Do not assume they are faster than the default path until you have measured the target resolution, step count, and GPU type. If the checkpoint includes a PE component, the pipeline loads it automatically from `model_index.json`.
+
 ## Interpreting The Levers
 
 **No offload** keeps model components resident on GPU. It is usually fastest when memory is sufficient.
