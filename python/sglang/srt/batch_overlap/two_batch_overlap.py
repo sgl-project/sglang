@@ -767,6 +767,7 @@ class TboForwardBatchPreparer:
                 forward_metadata_planned_bs=None,
                 forward_metadata_planned_num_tokens=None,
                 forward_metadata_replan_equivalent=False,
+                forward_metadata_planner_id=None,
             )
         )
 

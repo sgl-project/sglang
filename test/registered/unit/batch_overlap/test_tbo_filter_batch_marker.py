@@ -61,10 +61,11 @@ class TestTboFilterBatchMarker(CustomTestCase):
 
     def test_pre_planned_parent_does_not_leak_ready_into_children(self):
         parent = _make_target_verify_batch(8)
-        parent.mark_forward_metadata_ready(replan_equivalent=True)
+        parent.mark_forward_metadata_ready(replan_equivalent=True, planner=object())
         child = _filter(parent, lo=0, hi=4)
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
+        self.assertIsNone(child.forward_metadata_planner_id)
 
 
 if __name__ == "__main__":
