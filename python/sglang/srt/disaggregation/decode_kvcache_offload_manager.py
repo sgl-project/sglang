@@ -63,6 +63,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
@@ -71,6 +72,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
             )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")
