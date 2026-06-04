@@ -596,7 +596,6 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
-            dcp_size=self.dcp_size,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
@@ -960,11 +959,6 @@ class CudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
-            dcp_kv_mask=(
-                buffers.dcp_kv_mask[:num_tokens]
-                if buffers.dcp_kv_mask is not None
-                else None
-            ),
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
