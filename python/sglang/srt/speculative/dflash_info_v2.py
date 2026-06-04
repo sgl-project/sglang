@@ -263,8 +263,10 @@ class DFlashDraftInputV2(SpecInput):
             # prepared req_to_token / KV allocation state.
             caller_stream.wait_stream(plan_stream)
 
+        # This request-side high-water mark is what release_kv_cache() uses to
+        # reclaim any DFLASH over-allocation if the request finishes later.
         for i, req in enumerate(batch.reqs):
-            req.kv_allocated_len = int(nxt_kv_lens_cpu_t[i])
+            req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
 
         # Preserve the lagging committed CPU view on the batch and carry the
         # tighter host-side planning bound separately from the full reserved
