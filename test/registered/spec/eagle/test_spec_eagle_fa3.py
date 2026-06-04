@@ -37,7 +37,7 @@ class TestEagleLlama2Fa3Page256(
     SpecPerfKit,
     SpecFeatureKit,
 ):
-    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256 (spec v1)."""
+    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256 (spec v1); busy-time pool check."""
 
     spec_topk = 5
     spec_steps = 8
@@ -45,6 +45,9 @@ class TestEagleLlama2Fa3Page256(
     page_size = 256
     chunked_prefill_size = 4096  # must be divisible by page_size (256)
     cuda_graph_max_bs = 5
+    env_overrides = EagleLlama2Base.env_overrides + (
+        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
+    )
 
 
 if __name__ == "__main__":
