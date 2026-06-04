@@ -16,6 +16,7 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.acceleration_policy import (
+    attention_autotune_config,
     attention_allows_cudnn_sdp,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -63,6 +64,7 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 # Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
 # USPAttention masked branch and fall back to SDPA.
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
+_LOCAL_ATTENTION_AUTOTUNE_CACHE: dict[tuple, str] = {}
 
 
 def build_varlen_mask_meta(
@@ -135,6 +137,7 @@ class UlyssesAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
+        self.causal = causal
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
 
@@ -304,6 +307,11 @@ class LocalAttention(nn.Module):
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = attention_allows_cudnn_sdp(extra_impl_args)
+        (
+            self.enable_attention_autotune,
+            self.attention_autotune_warmup,
+            self.attention_autotune_iters,
+        ) = attention_autotune_config(extra_impl_args)
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -316,8 +324,114 @@ class LocalAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
+        self.causal = causal
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
+
+    def _sdpa_forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        allow_cudnn_sdp: bool,
+    ) -> torch.Tensor:
+        q_ = q.transpose(1, 2)
+        k_ = k.transpose(1, 2)
+        v_ = v.transpose(1, 2)
+        attn_kwargs = {
+            "attn_mask": None,
+            "dropout_p": 0.0,
+            "is_causal": self.causal,
+            "scale": self.softmax_scale,
+        }
+        if q_.shape[1] != k_.shape[1]:
+            attn_kwargs["enable_gqa"] = True
+        sdpa_context = (
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            if allow_cudnn_sdp
+            else sdpa_kernel(
+                [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]
+            )
+        )
+        with sdpa_context:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                q_, k_, v_, **attn_kwargs
+            )
+        return output.transpose(1, 2)
+
+    def _can_autotune_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+        return (
+            self.enable_attention_autotune
+            and not torch.is_grad_enabled()
+            and q.device.type == "cuda"
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and q.dim() == 4
+            and k.dim() == 4
+            and v.dim() == 4
+            and q.shape[-1] <= 256
+        )
+
+    def _autotune_key(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple:
+        device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
+        capability = torch.cuda.get_device_capability(device_index)
+        return (
+            capability,
+            self.backend.name,
+            q.dtype,
+            tuple(q.shape),
+            tuple(k.shape),
+            tuple(v.shape),
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self.causal,
+        )
+
+    def _time_attention_candidate(self, fn) -> float:
+        for _ in range(self.attention_autotune_warmup):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(self.attention_autotune_iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / self.attention_autotune_iters
+
+    def _select_attention_backend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_metadata,
+    ) -> str:
+        key = self._autotune_key(q, k, v)
+        selected = _LOCAL_ATTENTION_AUTOTUNE_CACHE.get(key)
+        if selected is not None:
+            return selected
+
+        candidates = {
+            "native": lambda: self.attn_impl.forward(
+                q, k, v, attn_metadata=attn_metadata
+            ),
+            "sdpa_cudnn": lambda: self._sdpa_forward(q, k, v, True),
+            "sdpa_no_cudnn": lambda: self._sdpa_forward(q, k, v, False),
+        }
+        timings = {
+            name: self._time_attention_candidate(fn)
+            for name, fn in candidates.items()
+        }
+        selected = min(timings, key=timings.get)
+        _LOCAL_ATTENTION_AUTOTUNE_CACHE[key] = selected
+        return selected
 
     def forward(
         self,
@@ -378,8 +492,14 @@ class LocalAttention(nn.Module):
                     scale=self.softmax_scale,
                 ).transpose(1, 2)
 
-        output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
-        return output
+        if self._can_autotune_attention(q, k, v):
+            selected = self._select_attention_backend(q, k, v, ctx_attn_metadata)
+            if selected == "sdpa_cudnn":
+                return self._sdpa_forward(q, k, v, True)
+            if selected == "sdpa_no_cudnn":
+                return self._sdpa_forward(q, k, v, False)
+
+        return self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
 
 
 class USPAttention(nn.Module):

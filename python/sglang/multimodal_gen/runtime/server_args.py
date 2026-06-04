@@ -1118,7 +1118,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Experimental diffusion acceleration policy. Accepts a JSON/YAML path, "
                 "JSON string, or key=value pairs. Supported keys include "
                 "kernel_compile_policy=off|auto|force_torch_compile|force_fused "
-                "with kernel_compile_ops=op1,op2, and allow_cudnn_sdp=true."
+                "with kernel_compile_ops=op1,op2, allow_cudnn_sdp=true, "
+                "and attention_autotune=true."
             ),
         )
 

@@ -42,6 +42,19 @@ def _get_nested(config: Mapping[str, Any], *keys: str) -> Any:
     return value
 
 
+def _get_server_policy_configs() -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return addict.Dict(), addict.Dict()
+    return (
+        server_args.attention_backend_config or addict.Dict(),
+        server_args.acceleration_config or addict.Dict(),
+    )
+
+
 def configure_acceleration_policy(config: Mapping[str, Any]) -> None:
     kernel_policy = None
     for candidate in (
@@ -103,11 +116,7 @@ def attention_allows_cudnn_sdp(extra_impl_args: Mapping[str, Any]) -> bool:
     if "allow_cudnn_sdp" in extra_impl_args:
         return bool(extra_impl_args["allow_cudnn_sdp"])
 
-    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-
-    server_args = get_global_server_args()
-    attention_cfg = server_args.attention_backend_config or addict.Dict()
-    acceleration_cfg = server_args.acceleration_config or addict.Dict()
+    attention_cfg, acceleration_cfg = _get_server_policy_configs()
     policy = None
     for candidate in (
         attention_cfg.get("allow_cudnn_sdp"),
@@ -122,3 +131,57 @@ def attention_allows_cudnn_sdp(extra_impl_args: Mapping[str, Any]) -> bool:
             break
     policy = _normalize_policy(policy)
     return policy in {"auto", "on", "true", "1", "force"}
+
+
+def attention_autotune_config(extra_impl_args: Mapping[str, Any]) -> tuple[bool, int, int]:
+    attention_cfg: Mapping[str, Any] = addict.Dict()
+    acceleration_cfg: Mapping[str, Any] = addict.Dict()
+    if "attention_autotune" in extra_impl_args:
+        enabled = bool(extra_impl_args["attention_autotune"])
+    else:
+        attention_cfg, acceleration_cfg = _get_server_policy_configs()
+        enabled = False
+        for candidate in (
+            attention_cfg.get("attention_autotune"),
+            attention_cfg.get("autotune_attention"),
+            acceleration_cfg.get("attention_autotune"),
+            acceleration_cfg.get("autotune_attention"),
+            _get_nested(acceleration_cfg, "attention", "autotune"),
+        ):
+            if candidate is not None:
+                enabled = _normalize_policy(candidate) in {
+                    "auto",
+                    "on",
+                    "true",
+                    "1",
+                    "force",
+                }
+                break
+
+    warmup = int(
+        extra_impl_args.get(
+            "attention_autotune_warmup",
+            attention_cfg.get(
+                "attention_autotune_warmup",
+                acceleration_cfg.get(
+                    "attention_autotune_warmup",
+                    _get_nested(acceleration_cfg, "attention", "autotune_warmup")
+                    or 3,
+                ),
+            ),
+        )
+    )
+    iters = int(
+        extra_impl_args.get(
+            "attention_autotune_iters",
+            attention_cfg.get(
+                "attention_autotune_iters",
+                acceleration_cfg.get(
+                    "attention_autotune_iters",
+                    _get_nested(acceleration_cfg, "attention", "autotune_iters")
+                    or 10,
+                ),
+            ),
+        )
+    )
+    return enabled, warmup, iters

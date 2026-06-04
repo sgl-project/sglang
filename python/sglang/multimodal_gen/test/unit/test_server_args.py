@@ -173,6 +173,17 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             self.assertTrue(args.acceleration_config.allow_cudnn_sdp)
             self.assertEqual(os.environ[KERNEL_COMPILE_POLICY_ENV], "auto")
 
+    def test_acceleration_config_accepts_attention_autotune(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "acceleration_config": "attention_autotune=true,attention_autotune_iters=20",
+            }
+        )
+
+        self.assertTrue(args.acceleration_config.attention_autotune)
+        self.assertEqual(args.acceleration_config.attention_autotune_iters, 20)
+
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
             self._from_dict_without_model_resolution(

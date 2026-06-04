@@ -14,8 +14,21 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from sglang.multimodal_gen.runtime.acceleration_policy import (
     KERNEL_COMPILE_POLICY_ENV,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionImpl,
+    FlashAttentionMetadata,
+)
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    LocalAttention,
+    _LOCAL_ATTENTION_AUTOTUNE_CACHE,
+)
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    global_force_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def _time_cuda(fn: Callable[[], object], warmup: int, iters: int) -> float:
@@ -121,6 +134,90 @@ def bench_sdpa(args: argparse.Namespace) -> None:
         _emit("sdpa", policy, ms, args)
 
 
+def bench_attention_backends(args: argparse.Namespace) -> None:
+    dtype = _dtype(args.dtype)
+    q = torch.randn(
+        args.batch,
+        args.seq,
+        args.heads,
+        args.head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    q_sdpa = q.transpose(1, 2)
+    k_sdpa = k.transpose(1, 2)
+    v_sdpa = v.transpose(1, 2)
+    scale = args.head_dim**-0.5
+    flash = FlashAttentionImpl(
+        num_heads=args.heads,
+        head_size=args.head_dim,
+        causal=False,
+        softmax_scale=scale,
+        num_kv_heads=args.heads,
+    )
+    metadata = FlashAttentionMetadata(max_seqlen_q=args.seq, max_seqlen_k=args.seq)
+
+    policies = {
+        "fa": lambda: flash.forward(q, k, v, attn_metadata=metadata),
+        "sdpa_cudnn": lambda: _sdpa_with_backends(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ],
+        ).transpose(1, 2),
+        "sdpa_no_cudnn": lambda: _sdpa_with_backends(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ],
+        ).transpose(1, 2),
+    }
+    for policy, fn in policies.items():
+        ms = _time_cuda(fn, args.warmup, args.iters)
+        _emit("attention_backend", policy, ms, args)
+
+
+def bench_local_attention_autotune(args: argparse.Namespace) -> None:
+    dtype = _dtype(args.dtype)
+    q = torch.randn(
+        args.batch,
+        args.seq,
+        args.heads,
+        args.head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    metadata = FlashAttentionMetadata(max_seqlen_q=args.seq, max_seqlen_k=args.seq)
+    with global_force_attn_backend_context_manager(AttentionBackendEnum.FA):
+        layer = LocalAttention(
+            num_heads=args.heads,
+            head_size=args.head_dim,
+            num_kv_heads=args.heads,
+            attention_autotune=True,
+            attention_autotune_warmup=args.autotune_warmup,
+            attention_autotune_iters=args.autotune_iters,
+        ).cuda()
+    _LOCAL_ATTENTION_AUTOTUNE_CACHE.clear()
+    with torch.inference_mode(), set_forward_context(0, metadata):
+        layer(q, k, v)
+        selected = next(iter(_LOCAL_ATTENTION_AUTOTUNE_CACHE.values()))
+        ms = _time_cuda(lambda: layer(q, k, v), args.warmup, args.iters)
+    _emit("local_attention_autotune", selected, ms, args)
+
+
 def _sdpa_with_backends(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -133,7 +230,18 @@ def _sdpa_with_backends(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--op", choices=["all", "mul_add", "norm", "sdpa"], default="all")
+    parser.add_argument(
+        "--op",
+        choices=[
+            "all",
+            "mul_add",
+            "norm",
+            "sdpa",
+            "attention_backends",
+            "local_attention_autotune",
+        ],
+        default="all",
+    )
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--hidden", type=int, default=3072)
@@ -142,6 +250,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="bf16")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--autotune-warmup", type=int, default=3)
+    parser.add_argument("--autotune-iters", type=int, default=10)
     parser.add_argument(
         "--kernel-policies",
         nargs="+",
@@ -161,6 +271,10 @@ def main() -> None:
         bench_norm_scale_shift(args)
     if args.op in {"all", "sdpa"}:
         bench_sdpa(args)
+    if args.op in {"all", "attention_backends"}:
+        bench_attention_backends(args)
+    if args.op in {"all", "local_attention_autotune"}:
+        bench_local_attention_autotune(args)
 
 
 if __name__ == "__main__":
