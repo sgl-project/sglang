@@ -201,6 +201,12 @@ def bench_us_rotated(calls, rep_ms: int) -> float:
 
 
 def run_correctness(args, dtype, device) -> None:
+    """Validate both writeback paths: the atomic_add baseline AND the
+    SGLANG_OPT_LORA_QKV_B_STORE load+add+store path. Each is checked against the fp32
+    ref; the store path is additionally asserted bitwise-equal to the atomic path
+    (disjoint output tiles make both RMW orders produce identical bf16 results)."""
+    from sglang.srt.environ import envs
+
     cases = [
         ("decode-merged(e2e)", "merged", 64, False),
         ("decode-merged-shuffled", "merged", 64, True),
@@ -224,16 +230,22 @@ def run_correctness(args, dtype, device) -> None:
                 s, slice_dims, args.rank, dtype, device
             )
             ref = ref_qkv_b(x, w, output_offset, args.scaling, args.rank, base)
-            out = run_qkv_b(
-                x, w, bi, output_offset, max(slice_dims), base.clone(), n_slices
-            ).float()
-            err = float((out - ref).abs().max().item())
-            rel = err / float(ref.abs().max().item() + 1e-9)
-            ok = err <= args.tol
+            with envs.SGLANG_OPT_LORA_QKV_B_STORE.override(False):
+                out_atomic = run_qkv_b(
+                    x, w, bi, output_offset, max(slice_dims), base.clone(), n_slices
+                )
+            with envs.SGLANG_OPT_LORA_QKV_B_STORE.override(True):
+                out_store = run_qkv_b(
+                    x, w, bi, output_offset, max(slice_dims), base.clone(), n_slices
+                )
+            err_a = float((out_atomic.float() - ref).abs().max().item())
+            err_s = float((out_store.float() - ref).abs().max().item())
+            bitwise = torch.equal(out_atomic, out_store)
+            ok = err_a <= args.tol and err_s <= args.tol and bitwise
             failures += int(not ok)
             print(
                 f"{'PASS' if ok else 'FAIL'} {preset:<12s} {name:<24s} s={s:<4d} "
-                f"max_abs_err={err:.4e} rel={rel:.2e}"
+                f"atomic_err={err_a:.3e} store_err={err_s:.3e} bitwise={bitwise}"
             )
     if failures:
         raise SystemExit(1)
@@ -265,11 +277,20 @@ def main():
     ap.add_argument(
         "--no-pdl", action="store_true", help="disable PDL (see disable_pdl docstring)"
     )
+    ap.add_argument(
+        "--store",
+        action="store_true",
+        help="enable SGLANG_OPT_LORA_QKV_B_STORE (load+add+store writeback)",
+    )
     args = ap.parse_args()
     if args.no_pdl:
         import sglang.srt.lora.triton_ops.qkv_lora_b as _qkv
 
         disable_pdl([_qkv])
+    if args.store:
+        from sglang.srt.environ import envs
+
+        envs.SGLANG_OPT_LORA_QKV_B_STORE.set(True)
 
     device = "cuda"
     dtype = torch.bfloat16

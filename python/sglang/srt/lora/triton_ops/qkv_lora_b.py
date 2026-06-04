@@ -50,6 +50,7 @@ def _qkv_lora_b_kernel(
     # For fused output scaling
     scalings,
     ENABLE_PDL: tl.constexpr = False,
+    STORE_WRITEBACK: tl.constexpr = False,
 ):
     """
     This kernel packs 3 sgemms (q/k/v) into a single kernel. The multiplication
@@ -152,7 +153,14 @@ def _qkv_lora_b_kernel(
         + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
     )
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < n_size)
-    tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+    if STORE_WRITEBACK:
+        # The expand-add output tiles are disjoint across all programs in this launch
+        # (distinct s-rows / n-cols / slice / segment), so a plain read-add-write is
+        # correct and avoids the bf16 narrow-tile atomic (the dominant decode cost).
+        partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
+        tl.store(output_ptr, partial_sum, mask=output_mask)
+    else:
+        tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
 
 
 def _qkv_lora_b_cublas(
@@ -246,6 +254,7 @@ def qkv_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
+    store_writeback = envs.SGLANG_OPT_LORA_QKV_B_STORE.get()
     enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _qkv_lora_b_kernel[grid_b](
         x,
@@ -272,6 +281,7 @@ def qkv_lora_b_fwd(
         BLOCK_R,
         batch_info.scalings,
         ENABLE_PDL=enable_pdl,
+        STORE_WRITEBACK=store_writeback,
         **pdl_kwargs,
     )
 
