@@ -33,7 +33,6 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -43,11 +42,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
-)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     get_attention_tp_rank,
@@ -200,6 +194,10 @@ class NemotronHMoE(nn.Module):
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=1.0,
+            # Needed so the routed-experts capturer (rollout routing replay) indexes
+            # its per-layer buffer by this layer id; without it layer_id defaults to
+            # None and the capturer writes buffer[:, None, :] -> shape mismatch crash.
+            layer_id=layer_idx,
         )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts

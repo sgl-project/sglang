@@ -120,6 +120,8 @@ def _make_layer_communicator(
         post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
         # Keep residual+RMSNorm at the same per-token boundary as normal TP
         # execution. The DP gather should move already-normalized tokens into the
-        # global MLP/MoE TP layout, not change the residual-add boundary.
-        force_layernorm_after_dp_gather=False,
+        # global MLP/MoE TP layout, not change the residual-add boundary. With
+        # attn_tp_size > 1 this requires opting into layernorm-before-gather (the
+        # default for attn_tp_size > 1 is layernorm-after-gather).
+        force_layernorm_before_dp_gather=True,
     )
