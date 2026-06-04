@@ -383,10 +383,12 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Translate full-pool indices to SWA-pool indices for hybrid models
         if self.use_sliding_window_kv_pool:
+            # flash_attn_with_kvcache requires int32 page tables; the SWA index
+            # mapping is int64, so cast (matches flashattention_backend.py).
             metadata.swa_page_table = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     metadata.page_table
-                )
+                ).to(torch.int32)
             )
 
         if self.use_mla:
@@ -407,10 +409,12 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Translate full-pool indices to SWA-pool indices for hybrid models
         if self.use_sliding_window_kv_pool:
+            # flash_attn_with_kvcache requires int32 page tables; the SWA index
+            # mapping is int64, so cast (matches flashattention_backend.py).
             metadata.swa_page_table = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     metadata.page_table
-                )
+                ).to(torch.int32)
             )
 
         # Convert the page table to a strided format which is needed by FA3 API
@@ -542,7 +546,7 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                         metadata.page_table
-                    )
+                    ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -883,7 +887,7 @@ class XPUAttentionBackend(AttentionBackend):
                         page_table = (
                             self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 metadata.page_table
-                            )
+                            ).to(torch.int32)
                         )
 
                 cache_seqlens = metadata.cache_seqlens_int32
