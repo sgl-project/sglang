@@ -367,6 +367,11 @@ class LocalAttention(nn.Module):
     def _can_autotune_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
         return (
             self.enable_attention_autotune
+            and self.backend in (
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.FA2,
+                AttentionBackendEnum.TORCH_SDPA,
+            )
             and not torch.is_grad_enabled()
             and q.device.type == "cuda"
             and q.dtype in (torch.float16, torch.bfloat16)
