@@ -48,6 +48,11 @@ Gemma 4 is Google's next-generation family of open models, building on the Gemma
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~4B</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dense</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>12B</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dense</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>31B</td>
@@ -62,25 +67,17 @@ Gemma 4 is Google's next-generation family of open models, building on the Gemma
 
 ## 2. SGLang Installation
 
-Gemma 4 support requires [sgl-project/sglang#21952](https://github.com/sgl-project/sglang/pull/21952) and a specific transformers commit:
+Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main. Install it together with the matching transformers commit:
 
 ```bash Command
-# Install SGLang from main branch (after sglang#21952 is merged)
+# Install SGLang from main
 pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
-# Install transformers with Gemma 4 support
-pip install 'git+https://github.com/huggingface/transformers.git@91b1ab1fdfa81a552644a92fbe3e8d88de40e167'
-
-# Or use Docker AMD64
-docker pull lmsysorg/sglang:gemma4 # CUDA 12.9
-docker pull lmsysorg/sglang:cu13-gemma4 # CUDA 13
-
-# For ARM64 (GB200 / GB300)
-docker pull lmsysorg/sglang:dev-gemma4 # CUDA 12.9
-docker pull lmsysorg/sglang:dev-cu13-gemma4 # CUDA 13
+# Install transformers with Gemma 4 support (encoder-free unified family included)
+pip install 'git+https://github.com/huggingface/transformers.git@1423d22f7a3b62e8c70ad67b58ec25cd9b675897'
 ```
 
-For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+For other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
 ## 3. Model Deployment
 
@@ -93,6 +90,7 @@ For the full Docker setup and other installation methods, please refer to the [o
 ### 3.2 Configuration Tips
 
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
+- **Attention backend on Blackwell (B200/sm100)**: SGLang defaults to the `trtllm_mha` backend on sm100, which is fastest for text but applies *causal* attention to image tokens. For multimodal (image) workloads on B200, pass `--attention-backend triton` to restore bidirectional image-token attention and full vision quality. Text-only and audio workloads are unaffected by the default.
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
 - **Speculative Decoding (MTP)**: Each Gemma 4 variant ships with a paired `*-assistant` draft model that enables NEXTN multi-token prediction. Enable it via the selector above, or pass `--speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-<variant>-it-assistant --speculative-num-steps 5 --speculative-num-draft-tokens 6 --speculative-eagle-topk 1`. MTP can significantly reduce latency for interactive use cases. The 26B-A4B MoE model requires `--tp 2` when MTP is enabled.
 - Hardware requirements:
@@ -119,6 +117,11 @@ For the full Docker setup and other installation methods, please refer to the [o
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
@@ -182,6 +185,18 @@ sglang serve \
   --model-path google/gemma-4-E4B-it \
   --speculative-algorithm NEXTN \
   --speculative-draft-model-path google/gemma-4-E4B-it-assistant \
+  --speculative-num-steps 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-eagle-topk 1 \
+  --mem-fraction-static 0.85
+```
+
+```bash Command
+# Gemma 4 12B + MTP (~35% faster single-stream decode on H200)
+sglang serve \
+  --model-path google/gemma-4-12B-it \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path google/gemma-4-12B-it-assistant \
   --speculative-num-steps 5 \
   --speculative-num-draft-tokens 6 \
   --speculative-eagle-topk 1 \
@@ -497,6 +512,58 @@ Tool Call: get_weather
 ```
 
 </details>
+
+### 4.5 Audio Input
+
+The audio-capable Gemma 4 variants (`gemma-4-E2B-it`, `gemma-4-E4B-it`, `gemma-4-12B-it`) accept raw audio alongside text. Pass the waveform as a base64 `audio_url` data URI (16 kHz mono WAV works well):
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+with open("sample.wav", "rb") as f:
+    audio_b64 = base64.b64encode(f.read()).decode()
+
+response = client.chat.completions.create(
+    model="google/gemma-4-12B-it",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"}},
+                {"type": "text", "text": "Transcribe the speech in this audio exactly."},
+            ],
+        }
+    ],
+    max_tokens=256,
+    temperature=0,
+)
+
+print(response.choices[0].message.content)
+```
+
+<details>
+<summary>Example Output</summary>
+
+```text Output
+Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.
+```
+
+</details>
+
+For best ASR quality, use the recommended transcription prompt structure:
+
+```text Prompt
+Transcribe the following speech segment in {LANGUAGE} into {LANGUAGE} text.
+
+Follow these specific instructions for formatting the answer:
+* Only output the transcription, with no newlines.
+* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, and write 3 instead of three.
+```
+
+For speech translation (AST), ask for the transcription in the source language first, then the translation: *"Transcribe the following speech segment in {SOURCE_LANGUAGE}, then translate it into {TARGET_LANGUAGE}. ..."*
 
 ## 5. Benchmark
 
@@ -1033,6 +1100,201 @@ Median ITL (ms):                         29.31
 ==================================================
 ```
 
+#### gemma-4-12B-it (1x H200, TP=1)
+
+Server Launch Command:
+```bash Command
+sglang serve --model-path google/gemma-4-12B-it
+```
+
+**Latency Benchmark (Text)**
+
+```bash Command
+python3 -m sglang.bench_serving --backend sglang \
+  --host 0.0.0.0 --port 30000 \
+  --dataset-name random --num-prompts 10 --max-concurrency 1
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  38.66
+Total input tokens:                      6101
+Total generated tokens:                  4220
+Request throughput (req/s):              0.26
+Output token throughput (tok/s):         109.15
+Total token throughput (tok/s):          266.94
+Mean TTFT (ms):                          33.08
+Median TTFT (ms):                        33.71
+Mean TPOT (ms):                          9.02
+Median ITL (ms):                         9.19
+==================================================
+```
+
+**Latency Benchmark (Image)**
+
+```bash Command
+python3 -m sglang.bench_serving --backend sglang-oai-chat \
+  --host 0.0.0.0 --port 30000 \
+  --dataset-name image --image-count 2 --image-resolution 720p \
+  --random-input-len 128 --random-output-len 1024 \
+  --num-prompts 10 --max-concurrency 1
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  39.36
+Total input vision tokens:               5320
+Total generated tokens:                  4220
+Request throughput (req/s):              0.25
+Output token throughput (tok/s):         107.23
+Total token throughput (tok/s):          263.62
+Mean TTFT (ms):                          94.98
+Median TTFT (ms):                        97.33
+Mean TPOT (ms):                          9.08
+Median ITL (ms):                         9.17
+==================================================
+```
+
+**Throughput Benchmark (Text)**
+
+```bash Command
+python3 -m sglang.bench_serving --backend sglang \
+  --host 0.0.0.0 --port 30000 \
+  --dataset-name random --num-prompts 1000 --max-concurrency 100
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  130.44
+Total input tokens:                      512842
+Total generated tokens:                  510855
+Request throughput (req/s):              7.67
+Output token throughput (tok/s):         3916.46
+Total token throughput (tok/s):          7848.15
+Mean TTFT (ms):                          207.49
+Median TTFT (ms):                        76.95
+Mean TPOT (ms):                          24.38
+Median ITL (ms):                         17.89
+==================================================
+```
+
+**Throughput Benchmark (Image)**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  147.57
+Total input tokens:                      619609
+Total input vision tokens:               532000
+Total generated tokens:                  510855
+Request throughput (req/s):              6.78
+Output token throughput (tok/s):         3461.79
+Total token throughput (tok/s):          7660.54
+Mean TTFT (ms):                          438.40
+Median TTFT (ms):                        129.83
+Mean TPOT (ms):                          27.12
+Median ITL (ms):                         19.16
+==================================================
+```
+
+#### gemma-4-12B-it (1x B200, TP=1)
+
+Server Launch Command:
+```bash Command
+# Text/audio: the sm100 default (trtllm_mha) is fastest.
+# For image workloads add --attention-backend triton (bidirectional image attention).
+sglang serve --model-path google/gemma-4-12B-it --attention-backend triton
+```
+
+**Latency Benchmark (Text)**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  30.46
+Output token throughput (tok/s):         138.55
+Total token throughput (tok/s):          338.85
+Mean TTFT (ms):                          28.14
+Median TTFT (ms):                        29.74
+Mean TPOT (ms):                          7.08
+Median ITL (ms):                         7.26
+==================================================
+```
+
+**Latency Benchmark (Image)**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  31.43
+Total input vision tokens:               5320
+Total generated tokens:                  4220
+Request throughput (req/s):              0.32
+Output token throughput (tok/s):         134.26
+Total token throughput (tok/s):          329.57
+Mean TTFT (ms):                          115.51
+Median TTFT (ms):                        74.27
+Mean TPOT (ms):                          7.14
+Median ITL (ms):                         7.24
+==================================================
+```
+
+**Throughput Benchmark (Text)**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  92.94
+Request throughput (req/s):              10.76
+Output token throughput (tok/s):         5496.55
+Total token throughput (tok/s):          11014.49
+Mean TTFT (ms):                          120.89
+Median TTFT (ms):                        45.00
+Mean TPOT (ms):                          17.23
+Median ITL (ms):                         14.30
+==================================================
+```
+
+**Throughput Benchmark (Image)**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Max request concurrency:                 100
+Successful requests:                     998
+Benchmark duration (s):                  107.82
+Total input tokens:                      617971
+Total input vision tokens:               530936
+Total generated tokens:                  508951
+Request throughput (req/s):              9.26
+Output token throughput (tok/s):         4720.29
+Total token throughput (tok/s):          10451.68
+Mean TTFT (ms):                          425.89
+Median TTFT (ms):                        109.57
+Mean TPOT (ms):                          19.45
+Median ITL (ms):                         15.11
+==================================================
+```
+
+> **Performance tuning**: On B200, raising `--scheduler-recv-interval` to 16 lifted text throughput from 5497 to 5673 tok/s output (≈ +3%) at concurrency 100 with no accuracy change, by reducing the scheduler's per-step Python overhead. It is a safe, low-risk knob for high-concurrency serving.
+
 ### 5.2 Accuracy Benchmark
 
 **Test Environment:**
@@ -1077,6 +1339,14 @@ Median ITL (ms):                         29.31
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.902</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.825</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.810**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.784</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.888</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.946</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.861</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.859**</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
@@ -1132,6 +1402,13 @@ Median ITL (ms):                         29.31
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4672.030</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.431</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.052</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>55.105</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>6580.229</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.805</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.005</td>
@@ -1147,6 +1424,30 @@ Median ITL (ms):                         29.31
     </tr>
   </tbody>
 </table>
+
+> **Note**: These GSM8K numbers use the raw few-shot completion harness (`sglang.test.few_shot_gsm8k`). `gemma-4-12B-it` is reasoning-oriented and is under-elicited by raw few-shot prompting; with the chat template it scores **0.950** on the same 1319 GSM8K test questions (`sglang.test.run_eval --eval-name gsm8k`).
+
+#### gemma-4-12B-it with sgl-eval
+
+`gemma-4-12B-it` is reasoning-oriented and answers verbosely (step-by-step) rather than emitting a terse final line. Strict last-line `Answer: $LETTER` extraction (as in `sglang.test.run_eval`) therefore undercounts its correct answers. [sgl-eval](https://github.com/sgl-project/sgl-eval) — sgl-project's evaluation CLI, which uses robust answer extraction — gives a faithful score on the served model:
+
+| Benchmark | Examples | Accuracy |
+| --- | --- | --- |
+| MMLU | 2000 | **0.878** |
+| GSM8K | 1319 | **0.960** |
+
+Reproduce against a running server (`--base-url` points at your endpoint):
+
+```bash Command
+pip install git+https://github.com/sgl-project/sgl-eval
+
+# Sanity-check the endpoint
+sgl-eval ping --base-url http://localhost:30000/v1
+
+# Run the benchmarks (greedy, single-shot)
+sgl-eval run gsm8k --base-url http://localhost:30000/v1
+sgl-eval run mmlu  --base-url http://localhost:30000/v1 --num-examples 2000
+```
 
 #### MMMU
 
@@ -1169,6 +1470,10 @@ Median ITL (ms):                         29.31
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.396**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.683**</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
@@ -1194,6 +1499,12 @@ Median ITL (ms):                         29.31
 
 ```json Config
 {"Overall-Art and Design": {"num": 120, "acc": 0.458}, "Art": {"num": 30, "acc": 0.433}, "Art_Theory": {"num": 30, "acc": 0.567}, "Design": {"num": 30, "acc": 0.667}, "Music": {"num": 30, "acc": 0.167}, "Overall-Business": {"num": 150, "acc": 0.287}, "Accounting": {"num": 30, "acc": 0.233}, "Economics": {"num": 30, "acc": 0.467}, "Finance": {"num": 30, "acc": 0.133}, "Manage": {"num": 30, "acc": 0.3}, "Marketing": {"num": 30, "acc": 0.3}, "Overall-Science": {"num": 150, "acc": 0.28}, "Biology": {"num": 30, "acc": 0.333}, "Chemistry": {"num": 30, "acc": 0.133}, "Geography": {"num": 30, "acc": 0.4}, "Math": {"num": 30, "acc": 0.2}, "Physics": {"num": 30, "acc": 0.333}, "Overall-Health and Medicine": {"num": 150, "acc": 0.427}, "Basic_Medical_Science": {"num": 30, "acc": 0.4}, "Clinical_Medicine": {"num": 30, "acc": 0.533}, "Diagnostics_and_Laboratory_Medicine": {"num": 30, "acc": 0.4}, "Pharmacy": {"num": 30, "acc": 0.4}, "Public_Health": {"num": 30, "acc": 0.4}, "Overall-Humanities and Social Science": {"num": 120, "acc": 0.7}, "History": {"num": 30, "acc": 0.633}, "Literature": {"num": 30, "acc": 0.867}, "Sociology": {"num": 30, "acc": 0.733}, "Psychology": {"num": 30, "acc": 0.567}, "Overall-Tech and Engineering": {"num": 210, "acc": 0.324}, "Agriculture": {"num": 30, "acc": 0.533}, "Architecture_and_Engineering": {"num": 30, "acc": 0.3}, "Computer_Science": {"num": 30, "acc": 0.367}, "Electronics": {"num": 30, "acc": 0.133}, "Energy_and_Power": {"num": 30, "acc": 0.4}, "Materials": {"num": 30, "acc": 0.2}, "Mechanical_Engineering": {"num": 30, "acc": 0.333}, "Overall": {"num": 900, "acc": 0.396}}
+```
+
+**gemma-4-12B-it**
+
+```json Config
+{"Overall-Art and Design": {"num": 120, "acc": 0.667}, "Art": {"num": 30, "acc": 0.7}, "Art_Theory": {"num": 30, "acc": 0.867}, "Design": {"num": 30, "acc": 0.767}, "Music": {"num": 30, "acc": 0.333}, "Overall-Business": {"num": 150, "acc": 0.747}, "Accounting": {"num": 30, "acc": 0.767}, "Economics": {"num": 30, "acc": 0.767}, "Finance": {"num": 30, "acc": 0.633}, "Manage": {"num": 30, "acc": 0.7}, "Marketing": {"num": 30, "acc": 0.867}, "Overall-Science": {"num": 150, "acc": 0.647}, "Biology": {"num": 30, "acc": 0.6}, "Chemistry": {"num": 30, "acc": 0.633}, "Geography": {"num": 30, "acc": 0.567}, "Math": {"num": 30, "acc": 0.6}, "Physics": {"num": 30, "acc": 0.833}, "Overall-Health and Medicine": {"num": 150, "acc": 0.68}, "Basic_Medical_Science": {"num": 30, "acc": 0.667}, "Clinical_Medicine": {"num": 30, "acc": 0.633}, "Diagnostics_and_Laboratory_Medicine": {"num": 30, "acc": 0.267}, "Pharmacy": {"num": 30, "acc": 0.833}, "Public_Health": {"num": 30, "acc": 1.0}, "Overall-Humanities and Social Science": {"num": 120, "acc": 0.817}, "History": {"num": 30, "acc": 0.8}, "Literature": {"num": 30, "acc": 0.9}, "Sociology": {"num": 30, "acc": 0.8}, "Psychology": {"num": 30, "acc": 0.767}, "Overall-Tech and Engineering": {"num": 210, "acc": 0.6}, "Agriculture": {"num": 30, "acc": 0.467}, "Architecture_and_Engineering": {"num": 30, "acc": 0.667}, "Computer_Science": {"num": 30, "acc": 0.733}, "Electronics": {"num": 30, "acc": 0.567}, "Energy_and_Power": {"num": 30, "acc": 0.667}, "Materials": {"num": 30, "acc": 0.567}, "Mechanical_Engineering": {"num": 30, "acc": 0.533}, "Overall": {"num": 900, "acc": 0.683}}
 ```
 
 **gemma-4-31B-it**
@@ -1239,6 +1550,12 @@ Median ITL (ms):                         29.31
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.46</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Supported (see §4.5)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not Supported</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
@@ -1282,6 +1599,12 @@ Median ITL (ms):                         29.31
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>6.08%</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.8707s</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16.20</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Supported (see §4.5)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
