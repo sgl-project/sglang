@@ -1995,24 +1995,29 @@ class UnifiedRadixCacheSuite:
 
     # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
 
-    def _patch_tp_all_reduce(self, drop_swa: bool):
-        """Fake all_reduce so check_prefetch_progress runs the tp>1 path.
-
-        Single-process test, so there is no real peer. MIN calls (the packed
-        ``[full, *sidecars]`` sync) optionally have their last slot (SWA) forced
-        to 0 to simulate a peer rank that missed the SWA window. MAX calls (the
-        terminate vote) are left as identity. Returns the list of MIN tensor
-        sizes seen, to assert a single packed reduction.
-        """
+    def _patch_tp_all_reduce(self, tree, drop_swa: bool):
+        """Fake all_reduce so check_prefetch_progress runs the tp>1 path."""
         import torch.distributed as dist
 
         min_sizes = []
 
+        def swa_packed_index():
+            # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
+            # matches comp_xfers stored in ongoing_prefetch (one live entry).
+            for info in tree.ongoing_prefetch.values():
+                comp_xfers = info[-1]
+                names = [t.name for xfers in comp_xfers.values() for t in xfers]
+                if PoolName.SWA in names:
+                    return 1 + names.index(PoolName.SWA)
+            return None
+
         def fake(tensor, op=None, group=None):
             if op == dist.ReduceOp.MIN:
                 min_sizes.append(tensor.numel())
-                if drop_swa and tensor.numel() >= 2:
-                    tensor[-1] = 0
+                if drop_swa:
+                    idx = swa_packed_index()
+                    if idx is not None and idx < tensor.numel():
+                        tensor[idx] = 0
             return None
 
         p = mock.patch.object(dist, "all_reduce", side_effect=fake)
@@ -2091,7 +2096,7 @@ class UnifiedRadixCacheSuite:
 
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
-        min_sizes = self._patch_tp_all_reduce(drop_swa=True)
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=True)
         self._consume_prefetch(cons, seq, "drop")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2115,7 +2120,7 @@ class UnifiedRadixCacheSuite:
 
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
-        min_sizes = self._patch_tp_all_reduce(drop_swa=False)  # peer == local
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=False)  # peer == local
         self._consume_prefetch(cons, seq, "keep")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
