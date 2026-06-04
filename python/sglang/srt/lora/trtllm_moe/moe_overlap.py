@@ -155,10 +155,15 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         device=hidden_states.device,
     )
 
-    packed_topk_ids = _pack_topk_for_flashinfer_routed(
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-    )
+    # SGLANG_OPT_LORA_FUSED_TOPK_PACK: the routed pack may already have been produced
+    # fused inside the gating kernel (StandardTopKOutput.packed_topk_ids) — including
+    # the padded-region id=-1 mask. Fall back to the separate pack otherwise.
+    packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
+    if packed_topk_ids is None:
+        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         direct_down_output = torch.empty(

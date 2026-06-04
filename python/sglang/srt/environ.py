@@ -504,6 +504,15 @@ class Envs:
     SGLANG_OPT_LORA_CUBLAS_GATE_UP = EnvBool(False)  # gate_up_lora_b
     SGLANG_OPT_LORA_CUBLAS_QKV = EnvBool(False)  # qkv_lora_b
     SGLANG_OPT_LORA_CUBLAS_KV_B = EnvBool(False)  # kv_b_lora_absorbed (MLA absorbed)
+    # Fuse the FlashInfer routed-MoE topk pack ((id << 16) | bf16_bits(weight)) into the top-k
+    # gating softmax via the JIT topk_softmax_pack kernel (a port of the AOT topkGatingSoftmax
+    # fast path with a third output), removing the per-MoE-layer _pack_topk_kernel launch from
+    # the decode critical path. Engages only on the plain CUDA softmax routing path (no EPLB,
+    # no fused shared experts, no bias, pow-2 experts <= 512); the packed tensor rides on
+    # StandardTopKOutput.packed_topk_ids and is consumed by the sgl_flashinfer_trtllm FP8 LoRA
+    # dispatch, which otherwise falls back to the separate pack. Intended for Qwen3.5 FP8 LoRA
+    # serving; default off keeps the separate pack.
+    SGLANG_OPT_LORA_FUSED_TOPK_PACK = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
