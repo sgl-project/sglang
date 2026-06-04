@@ -7,10 +7,6 @@ Registry: nightly-perf-8-gpu-mi35x-glm51 suite
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from typing import List
 

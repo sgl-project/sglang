@@ -270,9 +270,6 @@ class FrozenKVMTPCudaGraphRunner:
         )
 
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
