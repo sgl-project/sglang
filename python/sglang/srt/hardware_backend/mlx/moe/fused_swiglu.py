@@ -374,6 +374,16 @@ def can_fuse(switch_mlp) -> bool:
         gate, QuantizedSwitchLinear
     ):
         return False
+    # Learned per-expert bias, added after the matmul in
+    # QuantizedSwitchLinear.__call__ as ``x + bias[indices]`` whenever
+    # ``"bias" in self``. This is the affine learned bias, distinct from the
+    # quant ``biases`` (zero-points) the kernel already consumes. The fused
+    # kernel recomputes the gate matmul in-register and has no slot for the
+    # learned bias, so a gate carrying one would silently drop it. up_proj runs
+    # its normal path (its bias, if any, is already in x_up), so only the gate
+    # is at risk: fall back to the unfused path when the gate has a learned bias.
+    if "bias" in gate:
+        return False
     if up.bits != 4 or up.group_size != 64 or up.mode != "affine":
         return False
     if gate.bits != 4 or gate.group_size != 64 or gate.mode != "affine":

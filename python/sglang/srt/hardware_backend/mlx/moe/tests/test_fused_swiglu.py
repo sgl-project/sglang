@@ -1,12 +1,16 @@
-"""Numerical equivalence test for the Path B fused swiglu kernel.
+"""Numerical equivalence and eligibility tests for the Path B fused swiglu kernel.
 
-Loads a small MoE model, runs the fused gate_qmv + silu + ×x_up kernel and
-compares against the unfused reference (``mx.gather_qmm`` + ``nn.silu(gate) * x_up``).
-Both the unsorted (small-batch) and sorted (large-batch) paths exercised
-through the patched SwitchGLU.__call__ are covered.
-
-Gated by SGLANG_MLX_TEST_MODEL like ``test_fused_switch_glu.py`` so CI hosts
-without an MLX model cache skip it.
+Two groups:
+  * Model-based equivalence (``@requires_model``): loads a small MoE model, runs
+    the fused gate_qmv + silu + ×x_up kernel against the unfused reference
+    (``mx.gather_qmm`` + ``nn.silu(gate) * x_up``) on both the unsorted and
+    sorted paths. Gated by SGLANG_MLX_TEST_MODEL so CI hosts without a model
+    cache skip them.
+  * Synthetic eligibility (no model, MLX only): the learned-bias fallback. The
+    fused kernel recomputes the gate matmul and has no slot for the per-expert
+    learned bias QuantizedSwitchLinear adds after the matmul, so ``can_fuse``
+    must exclude a gate carrying one, and the patch must leave such a layer
+    unfused. These run whenever MLX is importable.
 """
 
 import os
@@ -16,7 +20,8 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 
-pytestmark = pytest.mark.skipif(
+# Model-based tests need a real checkpoint; synthetic tests below do not.
+requires_model = pytest.mark.skipif(
     not os.environ.get("SGLANG_MLX_TEST_MODEL"),
     reason="Set SGLANG_MLX_TEST_MODEL to a HuggingFace model id to enable",
 )
@@ -29,6 +34,7 @@ def _max_rel_diff(a, b):
     return max_abs, max_abs / max(ref_max, 1e-9)
 
 
+@requires_model
 def test_fused_gate_qmv_silu_mul_matches_unfused():
     """Kernel output matches ``nn.silu(gate_qmv) * x_up`` within bf16 ULP."""
     import mlx.nn as nn
@@ -73,6 +79,7 @@ def test_fused_gate_qmv_silu_mul_matches_unfused():
         assert rel < 2e-2, f"B={B} TOPK={TOPK}: max_abs={max_abs:.3e} rel={rel:.2%}"
 
 
+@requires_model
 def test_patched_switchglu_matches_unpatched():
     """Full SwitchGLU forward equivalence on both sorted and unsorted paths."""
     from mlx_lm import load
@@ -108,3 +115,73 @@ def test_patched_switchglu_matches_unpatched():
         # The looser bound here absorbs cross-layer ULP propagation through
         # down_proj's quantized matmul.
         assert rel < 5e-2, f"full forward {label}: max_abs={max_abs:.3e} rel={rel:.2%}"
+
+
+# ---------------------------------------------------------------------------
+# Learned-bias fallback (synthetic, no model). Guards the regression where a
+# gate_proj carrying a learned per-expert bias gets fused: the kernel recomputes
+# the gate matmul and has no slot for the bias QuantizedSwitchLinear adds after
+# the matmul, so it would silently compute silu(gate_without_bias) * x_up.
+# can_fuse must exclude such a gate and the patch must leave it unfused.
+# ---------------------------------------------------------------------------
+def _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias):
+    """Small quantized SwitchGLU; gate carries a learned bias iff gate_bias.
+
+    in_dim=512 keeps K%512==0 and hidden%8==0, inside the Path B v1 regime, so
+    the bias-free build is genuinely fusion-eligible (the True control).
+    """
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    sw = SwitchGLU(in_dim, hidden, n_experts, bias=False)
+    sw.up_proj = sw.up_proj.to_quantized(group_size=64, bits=4, mode="affine")
+    sw.down_proj = sw.down_proj.to_quantized(group_size=64, bits=4, mode="affine")
+    gate = sw.gate_proj
+    if gate_bias:
+        # Learned per-expert bias (E, N), nonzero so dropping it would change
+        # the result. to_quantized copies it into the QuantizedSwitchLinear.
+        gate.bias = mx.random.normal((n_experts, hidden)) * 0.1
+    sw.gate_proj = gate.to_quantized(group_size=64, bits=4, mode="affine")
+    return sw
+
+
+def test_can_fuse_excludes_learned_gate_bias():
+    """can_fuse: False for a gate with a learned bias, True when bias-free."""
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import can_fuse
+
+    sw_free = _quantized_switch_glu(512, 64, 8, gate_bias=False)
+    sw_bias = _quantized_switch_glu(512, 64, 8, gate_bias=True)
+    assert "bias" not in sw_free.gate_proj
+    assert "bias" in sw_bias.gate_proj
+    assert can_fuse(sw_free) is True, "bias-free gate in regime should fuse"
+    assert can_fuse(sw_bias) is False, "gate with learned bias must fall back"
+
+
+def test_patch_falls_back_on_gate_bias():
+    """Patching a biased-gate SwitchGLU is a no-op; the forward stays bias-correct."""
+    import types
+
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
+        patch_switch_glu_with_fused_swiglu,
+    )
+
+    in_dim, hidden, n_experts, top_k, B = 512, 64, 8, 4, 2  # 2*4=8 < 64 -> unsorted
+    sw = _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias=True)
+
+    x = mx.random.normal((B, in_dim))
+    indices = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+    out_before = sw(x, indices)
+    mx.eval(out_before)
+
+    # Minimal model stand-in: the patch walks model.model.layers[*].mlp.switch_mlp.
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+
+    n_patched = patch_switch_glu_with_fused_swiglu(model)
+    assert n_patched == 0, "biased gate must not be patched"
+
+    out_after = sw(x, indices)
+    mx.eval(out_after)
+    d = mx.abs(out_before.astype(mx.float32) - out_after.astype(mx.float32))
+    diff = d.max().item()
+    assert diff == 0.0, f"forward changed after (no-op) patch: max|delta|={diff:.3e}"
