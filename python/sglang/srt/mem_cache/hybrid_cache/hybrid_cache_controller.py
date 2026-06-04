@@ -403,8 +403,6 @@ class HybridCacheController(BaseHiCacheController):
         finish_event = device_module.Event()
 
         token_count = int(host_indices.numel())
-        start_time_ns = time.perf_counter_ns()
-
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -428,7 +426,6 @@ class HybridCacheController(BaseHiCacheController):
                 finish_event=finish_event,
                 node_ids=op.node_ids,
                 token_count=token_count,
-                start_time_ns=start_time_ns,
             )
         )
 
@@ -487,8 +484,6 @@ class HybridCacheController(BaseHiCacheController):
         producer_event = self.layer_done_counter.events[producer_id]
 
         token_count = int(host_indices.numel())
-        start_time_ns = time.perf_counter_ns()
-
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
@@ -514,7 +509,6 @@ class HybridCacheController(BaseHiCacheController):
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
                 token_count=token_count,
-                start_time_ns=start_time_ns,
             )
         )
         return producer_id
