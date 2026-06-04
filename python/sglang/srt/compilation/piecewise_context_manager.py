@@ -30,6 +30,18 @@ def get_pcg_capture_stream():
     return _pcg_capture_stream
 
 
+def is_in_piecewise_cuda_graph_capture():
+    return _in_piecewise_cuda_graph and _pcg_capture_stream is not None
+
+
+def is_in_piecewise_cuda_graph_setup():
+    return (
+        _in_piecewise_cuda_graph
+        and _forward_context is not None
+        and _forward_context.num_tokens is None
+    )
+
+
 @contextmanager
 def enable_piecewise_cuda_graph_compile():
     global _in_pcg_torch_compile

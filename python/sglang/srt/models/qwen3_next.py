@@ -1140,6 +1140,18 @@ class Qwen3NextForCausalLM(nn.Module):
                 name = name.replace(".k_proj.k_scale", ".attn.k_scale")
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
+            elif name.endswith(".kv_scale"):
+                remapped_name = name.replace(".kv_scale", ".attn.k_scale")
+                if remapped_name in params_dict:
+                    name = remapped_name
+            elif name.endswith(".k_scale"):
+                remapped_name = name.replace(".k_scale", ".attn.k_scale")
+                if remapped_name in params_dict:
+                    name = remapped_name
+            elif name.endswith(".v_scale"):
+                remapped_name = name.replace(".v_scale", ".attn.v_scale")
+                if remapped_name in params_dict:
+                    name = remapped_name
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
