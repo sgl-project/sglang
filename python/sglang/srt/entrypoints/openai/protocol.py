@@ -43,6 +43,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
+from openai.types.responses.tool import Tool as OpenAIResponsesToolType
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -1286,12 +1287,7 @@ class ResponseReasoningParam(BaseModel):
     )
 
 
-class ResponseTool(BaseModel):
-    """Tool definition for responses."""
-
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
-    )
+ResponseTool: TypeAlias = OpenAIResponsesToolType
 
 
 ResponseInputOutputItem: TypeAlias = Union[

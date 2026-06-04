@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     Tool,
     UsageInfo,
 )
@@ -524,6 +525,42 @@ class TestParsedResponseFieldsProtocol(unittest.TestCase):
             reasoning_content = None
 
         self.assertIsInstance(MockFields(), ParsedResponseFields)
+
+
+class TestResponsesRequest(unittest.TestCase):
+    """Test Responses API protocol model"""
+
+    def test_responses_request_accepts_function_tool(self):
+        """Responses API accepts OpenAI function tool schemas."""
+        request = ResponsesRequest(
+            input="hello",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(request.tools[0].type, "function")
+        self.assertEqual(request.tools[0].name, "get_weather")
+
+    def test_responses_request_accepts_web_search_tool(self):
+        """Responses API accepts OpenAI web search tool schemas."""
+        request = ResponsesRequest(input="hello", tools=[{"type": "web_search"}])
+
+        self.assertEqual(request.tools[0].type, "web_search")
+
+    def test_responses_request_rejects_non_openai_tool_type(self):
+        """Responses API rejects tool types outside OpenAI's schema."""
+        with self.assertRaises(ValidationError):
+            ResponsesRequest(input="hello", tools=[{"type": "namespace"}])
 
 
 if __name__ == "__main__":
