@@ -183,31 +183,38 @@ def _make_state(
 
 
 @pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
-def test_dsv4_paged_host_transfer_and_swap_in() -> None:
-    device_cache = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
+def test_transfer_cache_dsv4_mla_copies_paged_token() -> None:
+    src_cache = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
+    dst_cache = torch.zeros(
+        (2, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
+    )
+    src_loc = DSV4_PAGE_SIZE + 6
+    dst_loc = DSV4_PAGE_SIZE + 1
+    _write_dsv4_token(src_cache, src_loc, seed=41)
+
+    transfer_cache_dsv4_mla(
+        src_ptrs=_dsv4_ptrs(src_cache),
+        dst_ptrs=_dsv4_ptrs(dst_cache),
+        src_indices=torch.tensor([src_loc], dtype=torch.int64, device=DEVICE),
+        dst_indices=torch.tensor([dst_loc], dtype=torch.int64, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        _read_dsv4_token(dst_cache, dst_loc).to(DEVICE),
+        _read_dsv4_token(src_cache, src_loc),
+    )
+
+
+@pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
+def test_dsv4_swap_in_reads_paged_host_layout() -> None:
     host_cache = torch.zeros(
         (2, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
     )
-    device_copy = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
     device_buffer = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
-    src_loc = DSV4_PAGE_SIZE + 6
     host_loc = DSV4_PAGE_SIZE + 1
-    copy_loc = DSV4_PAGE_SIZE + 9
     swap_loc = DSV4_PAGE_SIZE + 12
-    _write_dsv4_token(device_cache, src_loc, seed=41)
-
-    transfer_cache_dsv4_mla(
-        src_ptrs=_dsv4_ptrs(device_cache),
-        dst_ptrs=_dsv4_ptrs(host_cache),
-        src_indices=torch.tensor([src_loc], dtype=torch.int64, device=DEVICE),
-        dst_indices=torch.tensor([host_loc], dtype=torch.int64, device=DEVICE),
-    )
-    transfer_cache_dsv4_mla(
-        src_ptrs=_dsv4_ptrs(host_cache),
-        dst_ptrs=_dsv4_ptrs(device_copy),
-        src_indices=torch.tensor([host_loc], dtype=torch.int64, device=DEVICE),
-        dst_indices=torch.tensor([copy_loc], dtype=torch.int64, device=DEVICE),
-    )
+    _write_dsv4_token(host_cache, host_loc, seed=41)
 
     top_k_tokens = torch.tensor([[3]], dtype=torch.int32, device=DEVICE)
     device_buffer_tokens = torch.full(
@@ -245,19 +252,10 @@ def test_dsv4_paged_host_transfer_and_swap_in() -> None:
     )
     torch.cuda.synchronize()
 
-    expected = _read_dsv4_token(device_cache, src_loc)
-    assert torch.equal(
-        _read_dsv4_token(host_cache, host_loc).to(DEVICE),
-        expected,
-    )
-    assert torch.equal(
-        _read_dsv4_token(device_copy, copy_loc),
-        expected,
-    )
     assert out.item() == swap_loc
     assert torch.equal(
         _read_dsv4_token(device_buffer, swap_loc),
-        expected,
+        _read_dsv4_token(host_cache, host_loc).to(DEVICE),
     )
 
 

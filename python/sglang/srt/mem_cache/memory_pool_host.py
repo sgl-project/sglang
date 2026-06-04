@@ -2047,10 +2047,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
-            # DSV4 C4 token data is split inside a paged row:
-            # [value0..value63][scale0..scale63].  Non-page-aligned decode
-            # backups must copy one token's value and scale separately instead
-            # of treating the token as a contiguous byte range.
+            # Whole C4 pages can use the normal HiCache page-row copy below.
+            # Token-granular DSV4 C4 copy needs this helper because a token is
+            # not one contiguous byte range in the paged row:
+            # [value0..value63][scale0..scale63].
             transfer_cache_dsv4_mla(
                 src_ptrs=self.device_ptrs,
                 dst_ptrs=self.data_ptrs,
@@ -2109,9 +2109,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
-            # Same DSV4 C4 layout issue as backup: one token is split between
-            # the value and scale regions inside a paged row, so token-granular
-            # preload must use the DSV4 token-copy helper.
+            # Same DSV4 C4 layout issue as backup: this is token-granular
+            # preload, so it cannot use the normal HiCache page-row copy.
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
