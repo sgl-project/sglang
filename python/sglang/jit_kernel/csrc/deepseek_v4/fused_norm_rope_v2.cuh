@@ -324,7 +324,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 #ifndef USE_ROCM
         const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
 #else
-        const float other = __shfl_xor(data[i], mask, kWarpThreads);
+         const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
 #endif
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
