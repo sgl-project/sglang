@@ -1294,10 +1294,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         num_blocks: int,
     ) -> int:
         return (
-            2
-            * num_blocks
-            * c2ws_plucker_emb.numel()
-            * c2ws_plucker_emb.element_size()
+            2 * num_blocks * c2ws_plucker_emb.numel() * c2ws_plucker_emb.element_size()
         )
 
     @staticmethod
@@ -1307,11 +1304,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     ) -> bool:
         if not c2ws_plucker_emb.is_cuda:
             return True
-        required_bytes = (
-            CausalLingBotWorldTransformer3DModel._camera_modulation_cache_required_bytes(
-                c2ws_plucker_emb,
-                num_blocks,
-            )
+        required_bytes = CausalLingBotWorldTransformer3DModel._camera_modulation_cache_required_bytes(
+            c2ws_plucker_emb,
+            num_blocks,
         )
         free_bytes, _ = torch.cuda.mem_get_info(c2ws_plucker_emb.device)
         return free_bytes >= required_bytes + _CAMERA_MODULATION_CACHE_MIN_FREE_BYTES
@@ -1345,12 +1340,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         if cache.get("key") == cache_key:
             return cache["blocks"]
 
-        if (
-            c2ws_plucker_emb is None
-            or not self._camera_modulation_cache_has_memory(
-                c2ws_plucker_emb,
-                len(self.blocks),
-            )
+        if c2ws_plucker_emb is None or not self._camera_modulation_cache_has_memory(
+            c2ws_plucker_emb,
+            len(self.blocks),
         ):
             cache.clear()
             return None

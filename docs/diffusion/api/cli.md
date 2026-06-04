@@ -83,6 +83,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
+- `--acceleration-config {CONFIG}`: experimental diffusion acceleration policy, for example `kernel_compile_policy=auto,allow_cudnn_sdp=true`
 
 ### Sampling and output
 
@@ -252,6 +253,7 @@ Use `--backend diffusers` to force vanilla diffusers pipelines when no native SG
 | `--vae-tiling` and `--vae-slicing` | flag | Lower memory usage for VAE decode |
 | `--dit-precision` and `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision controls |
 | `--enable-torch-compile` | flag | Enable `torch.compile` |
+| `--acceleration-config` | `{CONFIG}` | Experimental framework-level acceleration policy |
 | `--cache-dit-config` | `{PATH}` | Cache-DiT config for diffusers pipelines |
 
 ### Example
