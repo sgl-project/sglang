@@ -1218,6 +1218,11 @@ class BailingMoELinearForCausalLM(nn.Module):
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale
 
+                    # fp8 backends store weight transposed as [in, out]; un-transpose
+                    # before channel_quant_to_tensor_quant which expects [out, in] to
+                    # match the [out, 1] per-channel scale.
+                    if weight.shape[0] != weight_scale.shape[0]:
+                        weight = weight.t()
                     w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
                     self_attn.w_scale = scale
 
