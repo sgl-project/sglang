@@ -233,7 +233,9 @@ def run_correctness(args, dtype, device) -> None:
         cases.append((f"{preset}/rank64", slice_dims, ("merged", 64, False), 64, 2.0))
         cases.append((f"{preset}/scaling1", slice_dims, ("merged", 64, False), 16, 1.0))
         # seg_len==0 / interspersed empty segments exercise the early-return branch.
-        cases.append((f"{preset}/seg0", slice_dims, ("multiseg", [0, 64, 0, 200]), 16, 2.0))
+        cases.append(
+            (f"{preset}/seg0", slice_dims, ("multiseg", [0, 64, 0, 200]), 16, 2.0)
+        )
     # Ragged column tail: slice dims NOT multiples of BLOCK_OUT=64, so the store path
     # must do partial masked stores -- the most likely place store/atomic could diverge.
     for tail_name, tail_dims in [

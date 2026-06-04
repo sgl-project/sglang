@@ -239,13 +239,25 @@ def verify(args, device) -> None:
         max_out = max(slice_dims)
         with envs.SGLANG_OPT_LORA_QKV_B_STORE.override(False):
             prod_atomic = qkv_lora_b_fwd(
-                x, w, bi, off, max_out, base_output=base.clone(),
-                n_slices=n_slices, output_offset_cpu=None,
+                x,
+                w,
+                bi,
+                off,
+                max_out,
+                base_output=base.clone(),
+                n_slices=n_slices,
+                output_offset_cpu=None,
             )
         with envs.SGLANG_OPT_LORA_QKV_B_STORE.override(True):
             prod_store = qkv_lora_b_fwd(
-                x, w, bi, off, max_out, base_output=base.clone(),
-                n_slices=n_slices, output_offset_cpu=None,
+                x,
+                w,
+                bi,
+                off,
+                max_out,
+                base_output=base.clone(),
+                n_slices=n_slices,
+                output_offset_cpu=None,
             )
         diag_atomic = run_diag(
             x, w, bi, off, max_out, base.clone(), n_slices, WB_ATOMIC, 16, 64, 4
