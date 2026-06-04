@@ -608,12 +608,12 @@ class C4Indexer(nn.Module):
         # rope-slice → hadamard rotation (Walsh-Hadamard matmul). The CUDA
         # `compute_q` uses tvm_ffi `fused_rope` + triton `rotate_activation`;
         # both are absent on NPU.
-        from sglang.srt.models.deepseek_v4 import _v4_rope_inplace_npu
+        from sglang.srt.models.deepseek_v4 import v4_rope_inplace_npu
 
         bs = q_lora.shape[0]
         q, _ = self.wq_b(q_lora)
         q = q.view(bs, self.n_local_heads, self.head_dim)
-        _v4_rope_inplace_npu(
+        v4_rope_inplace_npu(
             q[..., -self.rope_head_dim :],
             None,
             self.freqs_cis,

@@ -1083,7 +1083,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 kv_view = kv_view.unsqueeze(1)
             buf_flat[loc] = kv_view
             return
-        return compress_pool.set_key_buffer_fused(compress_layer_id, loc, kv)
+        compress_pool.set_key_buffer_fused(compress_layer_id, loc, kv)
 
     def translate_kv_loc_to_compress_state_loc(
         self,

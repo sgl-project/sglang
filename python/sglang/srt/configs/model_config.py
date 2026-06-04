@@ -645,12 +645,6 @@ class ModelConfig:
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
-            # DeepSeekV4Config exposes the SWA span as `window_size` (default
-            # 128); transformers' base PretrainedConfig has no `sliding_window`
-            # alias on V4. _get_sliding_window_size already covers the
-            # sliding_window_size / sliding_window / window_size fallback chain
-            # and was assigned on self at __init__ time, so reuse it instead of
-            # poking hf_config directly.
             self.window_size = (
                 self.sliding_window_size
                 if self.sliding_window_size is not None

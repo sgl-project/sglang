@@ -71,42 +71,6 @@ def _build_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
 _build_hadamard_matrix._cache = {}  # type: ignore[attr-defined]
 
 
-def _compute_c4_q_npu(
-    c4_indexer,
-    q_lora: torch.Tensor,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    """NPU equivalent of ``C4Indexer.compute_q``.
-
-    ``compute_q`` does:
-        q, _ = wq_b(q_lora)
-        q = q.view(-1, n_local_heads, head_dim)
-        fused_rope(q[..., -rope_head_dim:], None, freqs_cis, positions=...)
-        q = rotate_activation(q)            # triton hadamard_transform
-
-    On NPU, ``fused_rope`` is a tvm_ffi CUDA kernel and ``rotate_activation``
-    is a triton hadamard. Replace with ``_v4_rope_inplace_npu`` and a torch
-    Walsh-Hadamard matmul. Note: Sylvester ordering may not match the triton
-    kernel's ordering — final consumer (``npu_quant_lightning_indexer``) is
-    insensitive to the basis since both q and k are rotated by the same H.
-    """
-    from sglang.srt.models.deepseek_v4 import _v4_rope_inplace_npu
-
-    q, _ = c4_indexer.wq_b(q_lora)
-    q = q.view(-1, c4_indexer.n_local_heads, c4_indexer.head_dim)
-    _v4_rope_inplace_npu(
-        q[..., -c4_indexer.rope_head_dim :],
-        None,
-        c4_indexer.freqs_cis,
-        positions,
-    )
-    H = _build_hadamard_matrix(c4_indexer.head_dim, torch.float32, q.device)
-    scale = c4_indexer.head_dim**-0.5
-    q_f32 = q.to(torch.float32)
-    q_rotated = torch.matmul(q_f32, H) * scale
-    return q_rotated.to(torch.bfloat16)
-
-
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):

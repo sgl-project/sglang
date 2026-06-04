@@ -92,7 +92,7 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
 # Cache for the contiguous real/imag halves of each freqs_cis tensor used in
-# _v4_rope_inplace_npu. complex freqs_cis.real / freqs_cis.imag are strided
+# v4_rope_inplace_npu. complex freqs_cis.real / freqs_cis.imag are strided
 # views (stride=2 on the underlying interleaved real layout); on NPU,
 # `cos_half = freqs_cis.real[positions]` triggers an aclnnIndex over the
 # strided source and CANN materializes it via StridedSlice (1 of the
@@ -144,7 +144,7 @@ def get_fused_compressor_rope_cos_sin(
     ``repeat_interleave`` over a graph-input ``positions_cmp`` of fixed
     capture-time shape produce static-shape outputs. Identical to what the
     existing inplace_partial_rotary_mul fallback does at
-    :func:`_v4_rope_inplace_npu`, just without the inverse / 4D-view step.
+    :func:`v4_rope_inplace_npu`, just without the inverse / 4D-view step.
     """
     real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
     cos_half = real_contig.index_select(0, positions_cmp)
@@ -154,7 +154,7 @@ def get_fused_compressor_rope_cos_sin(
     return cos, sin
 
 
-def _v4_rope_inplace_npu(
+def v4_rope_inplace_npu(
     q_rope: torch.Tensor,
     kv_rope: Optional[torch.Tensor],
     freqs_cis: torch.Tensor,
@@ -542,6 +542,7 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
+        self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
         self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
 
     def _compute_q_a(
@@ -650,11 +651,12 @@ class MQALayer(nn.Module):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
             kv = self._compute_kv(x, positions, qkv_a=qkv_a)
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv,
-                forward_batch=forward_batch,
-            )
+            if self.overlap_store_cache:
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         del qkv_a
 
@@ -712,7 +714,7 @@ class MQALayer(nn.Module):
             # last qk_rope_head_dim of q and kv) with a torch fallback. The
             # interleaved pair convention here matches fused_rope's CUDA
             # source (consecutive even/odd indices form a complex pair).
-            _v4_rope_inplace_npu(
+            v4_rope_inplace_npu(
                 q[..., -self.qk_rope_head_dim :],
                 kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
                 self.freqs_cis,
@@ -734,11 +736,12 @@ class MQALayer(nn.Module):
                 torch.cuda.current_stream(),
             )
 
-        attn_backend.store_cache(
-            layer_id=self.layer_id,
-            swa_k=kv,
-            forward_batch=forward_batch,
-        )
+        if self.overlap_store_cache:
+            attn_backend.store_cache(
+                layer_id=self.layer_id,
+                swa_k=kv,
+                forward_batch=forward_batch,
+            )
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -799,11 +802,11 @@ class MQALayer(nn.Module):
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=False,
+            save_kv_cache=not self.overlap_store_cache,
         )
         o = o[:, tp_slice, :]
         if _is_npu:
-            _v4_rope_inplace_npu(
+            v4_rope_inplace_npu(
                 o[..., -self.qk_rope_head_dim :],
                 None,
                 self.freqs_cis,
