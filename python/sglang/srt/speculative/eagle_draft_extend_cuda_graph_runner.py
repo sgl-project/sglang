@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -27,8 +28,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.speculative.spec_utils import fast_topk
+from sglang.srt.speculative.spec_utils import fast_sample, fast_topk
 from sglang.srt.utils import (
     is_hip,
     require_attn_tp_gather,
@@ -120,6 +122,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+        if isinstance(
+            self.draft_extend_attn_backend,
+            TRTLLMHAAttnBackend,
+        ):
+            self.seq_len_fill_value = max(
+                self.seq_len_fill_value, self.num_tokens_per_bs
+            )
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
@@ -150,6 +159,13 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
+            if isinstance(
+                self.draft_extend_attn_backend,
+                TRTLLMHAAttnBackend,
+            ):
+                self.seq_len_fill_value = max(
+                    self.seq_len_fill_value, self.num_tokens_per_bs
+                )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
@@ -162,6 +178,18 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_accept_tokens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
+
+            sampling_bs = (
+                self.max_bs * self.num_tokens_per_bs
+                if self.forward_mode.is_draft_extend_v2()
+                else self.max_bs
+            )
+            self.temperatures = torch.ones((sampling_bs, 1), dtype=torch.float)
+
+            if self.forward_mode.is_draft_extend_v2():
+                self.repeat_idx = torch.arange(
+                    self.max_bs
+                ).repeat_interleave(self.num_tokens_per_bs)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -349,6 +377,31 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_accept_tokens=num_accept_tokens,
         )
 
+        if self.forward_mode.is_draft_extend_v2():
+            sampling_bs = bs * self.num_tokens_per_bs
+            sampling_info = SamplingBatchInfo(
+                temperatures=self.temperatures[:sampling_bs],
+                top_ps=torch.ones((sampling_bs,), dtype=torch.float),
+                top_ks=torch.full((sampling_bs,), -1, dtype=torch.int32),
+                min_ps=torch.zeros((sampling_bs,), dtype=torch.float),
+                is_all_greedy=False,
+                need_top_p_sampling=False,
+                need_top_k_sampling=False,
+                need_min_p_sampling=False,
+                vocab_size=self.model_runner.model_config.vocab_size,
+            )
+        else:
+            sampling_info = SamplingBatchInfo(
+                temperatures=self.temperatures[:bs],
+                top_ps=torch.ones((bs,), dtype=torch.float),
+                top_ks=torch.full((bs,), -1, dtype=torch.int32),
+                min_ps=torch.zeros((bs,), dtype=torch.float),
+                is_all_greedy=False,
+                need_top_p_sampling=False,
+                need_top_k_sampling=False,
+                need_min_p_sampling=False,
+                vocab_size=self.model_runner.model_config.vocab_size,
+            )
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -371,6 +424,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            sampling_info=sampling_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             padded_static_len=self.padded_static_len,
         )
@@ -386,6 +440,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
+            if self.forward_mode.is_draft_extend_v2():
+                ridx = self.repeat_idx[:sampling_bs]
+                self.temperatures[:sampling_bs].copy_(self.temperatures[ridx])
+
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
@@ -395,10 +453,13 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            # ROCm's argmax tie-breaks differently from CUDA's softmax+max
-            # path on FP8 logits, which corrupts MTP draft selection on AMD.
-            # Keep the fastpath CUDA-only.
-            if self.topk == 1 and not _is_hip:
+            if self.eagle_worker.server_args.speculative_use_rs:
+                probs = self.eagle_worker._renorm_draft_probs(
+                    ret.next_token_logits, forward_batch.sampling_info
+                )
+                ret.topk_p, ret.topk_index = fast_sample(probs, num_samples=1)
+                ret.draft_probs = probs
+            elif self.topk == 1 and not _is_hip:
                 ret.topk_index = torch.argmax(
                     ret.next_token_logits, dim=-1, keepdim=True
                 )
@@ -493,6 +554,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
+        if forward_batch.sampling_info is not None:
+            self.temperatures[:raw_bs].copy_(forward_batch.sampling_info.temperatures[:raw_bs])
+
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
@@ -574,4 +638,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             out.topk_p = out_copy.topk_p[:unpadding_bs]
             out.topk_index = out_copy.topk_index[:unpadding_bs]
+            if self.eagle_worker.server_args.speculative_use_rs:
+                out.draft_probs = out_copy.draft_probs[:unpadding_bs]
         return out

@@ -67,6 +67,13 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+    batch_size = probs.shape[0]
+    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    sample_p = probs.gather(1, sample_index)
+    return sample_p, sample_index
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()

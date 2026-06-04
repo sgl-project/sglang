@@ -55,6 +55,8 @@ if is_cuda() or is_musa():
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+
 
 def _draft_runner_of(worker):
     """Draft model_runner accessor that handles v1 / v2 worker naming.
@@ -84,6 +86,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+    draft_probs: torch.Tensor = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -376,8 +379,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
-            draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device=batch.device
+            draft_probs = (
+                torch.zeros(
+                    target_probs.shape, dtype=torch.float32, device=batch.device
+                )
+                if not get_global_server_args().speculative_use_rs
+                else self.draft_probs
             )
 
             # coins for rejection sampling
@@ -388,7 +395,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
-            tree_speculative_sampling_target_only(
+            sampling_fn = (
+                chain_speculative_sampling_triton
+                if get_global_server_args().speculative_use_rs
+                else tree_speculative_sampling_target_only
+            )
+            sampling_fn(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=num_correct_drafts,  # mutable
@@ -707,6 +719,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
+
+    draft_probs: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).
@@ -762,6 +776,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         dtype: Optional[torch.dtype],
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
+        vocab_size: int = 0,
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
@@ -772,6 +787,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            draft_probs=(
+                torch.empty((0, vocab_size), device=device, dtype=torch.float32)
+                if get_global_server_args().speculative_use_rs
+                else None
+            ),
             capture_hidden_mode=capture_hidden_mode,
         )
 
@@ -793,6 +813,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
+            if self.draft_probs is not None:
+                self.draft_probs = self.draft_probs[: len(new_indices)]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
@@ -800,6 +822,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
+            if self.draft_probs is not None:
+                self.draft_probs = self.draft_probs[new_indices]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
@@ -820,6 +844,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.draft_probs = spec_info.draft_probs
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -832,6 +857,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.draft_probs is not None and spec_info.draft_probs is not None:
+            self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
 
 @dataclass

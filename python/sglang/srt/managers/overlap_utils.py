@@ -66,16 +66,21 @@ def _gather_spec_extras(
     topk_index_buf: torch.Tensor,
     output_tokens_buf: torch.Tensor,
     hidden_states_buf: Optional[torch.Tensor],
+    draft_probs_buf: Optional[torch.Tensor] = None,
 ):
     """Compiled gather of spec extras. `hidden_states_buf` is None when the
-    build does not capture hidden states."""
+    build does not capture hidden states. `draft_probs_buf` is None when RS
+    is disabled."""
     topk_p = topk_p_buf[indices]
     topk_index = topk_index_buf[indices]
     bonus_tokens = output_tokens_buf[indices]
     hidden_states = (
         hidden_states_buf[indices] if hidden_states_buf is not None else None
     )
-    return topk_p, topk_index, bonus_tokens, hidden_states
+    draft_probs = (
+        draft_probs_buf[indices] if draft_probs_buf is not None else None
+    )
+    return topk_p, topk_index, bonus_tokens, hidden_states, draft_probs
 
 
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
@@ -182,6 +187,28 @@ class FutureMap:
                 device=self.device,
             )
 
+        if draft_input.draft_probs is not None:
+            draft_probs0 = draft_input.draft_probs[0]
+            self.draft_probs_buf = torch.empty(
+                (self.req_pool_size, *draft_probs0.shape),
+                dtype=draft_probs0.dtype,
+                device=self.device,
+            )
+
+    def resolve_future(self, batch: ScheduleBatch):
+        # seq_lens is already real on entry (SB +1 for non-spec;
+        # resolve_seq_lens_cpu pulled from buf for spec_v2). Only resolve
+        # input_ids tokens / spec extras here.
+        if self.spec_algo.is_none():
+            _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    batch.input_ids, self.output_tokens_buf, batch.req_pool_indices
+                )
+        else:
+            self._resolve_spec_extras(batch)
+
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
@@ -194,20 +221,25 @@ class FutureMap:
         hidden_states_buf = (
             self.hidden_states_buf if spec_need_hidden_states() else None
         )
+        draft_probs_buf = getattr(self, "draft_probs_buf", None)
         (
             draft_input.topk_p,
             draft_input.topk_index,
             draft_input.bonus_tokens,
             hidden_states,
+            draft_probs,
         ) = _gather_spec_extras(
             indices,
             self.topk_p_buf,
             self.topk_index_buf,
             self.output_tokens_buf,
             hidden_states_buf,
+            draft_probs_buf,
         )
         if hidden_states is not None:
             draft_input.hidden_states = hidden_states
+        if draft_probs is not None and draft_input.draft_probs is not None:
+            draft_input.draft_probs = draft_probs
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -294,3 +326,5 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
+        if draft_input.draft_probs is not None and hasattr(self, "draft_probs_buf"):
+            self.draft_probs_buf[indices] = draft_input.draft_probs

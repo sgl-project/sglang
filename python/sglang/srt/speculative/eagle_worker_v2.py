@@ -65,6 +65,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
+    fast_sample,
     generate_token_bitmask,
     load_token_map,
     record_stream_each,
@@ -96,6 +97,9 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+if is_cuda():
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 
 def _get_plan_stream(
@@ -136,6 +140,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Args for easy access
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
+        if self.server_args.speculative_use_rs:
+            assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -403,11 +409,13 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
+        # Run draft
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
             c.with_ops_outside_graph(
                 single_forward_indices=list(range(n_inner)),
                 maybe_inaccurate_forward_batch=forward_batch,
+
             )
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
@@ -416,7 +424,7 @@ class EagleDraftWorker(BaseDraftWorker):
         with canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
-                parent_list, top_scores_index, draft_tokens = (
+                parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.replay(forward_batch)
                 )
             else:
@@ -427,7 +435,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
-                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
                     forward_batch
                 )
 
@@ -493,6 +501,7 @@ class EagleDraftWorker(BaseDraftWorker):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
+            draft_probs=draft_probs,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -521,6 +530,8 @@ class EagleDraftWorker(BaseDraftWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+        if self.server_args.speculative_use_rs:
+            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         # Forward multiple steps
         scores = None
@@ -564,18 +575,21 @@ class EagleDraftWorker(BaseDraftWorker):
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.topk == 1 and not _is_hip:
-                # topk=1 → degenerate single-path tree; `topk_p` is unused
-                # downstream, so skip softmax and just argmax over logits.
-                # Gated to CUDA: on ROCm the argmax tie-break diverges from
-                # the softmax+max path on FP8 logits and corrupts MTP draft
-                # selection (DSV3.2 MTP GSM8K, see #26358).
+            if self.server_args.speculative_use_rs:
+                probs = self._renorm_draft_probs(
+                    logits_output.next_token_logits, forward_batch.sampling_info
+                )
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+                draft_probs_list.append(probs)
+            elif self.topk == 1 and not _is_hip:
                 topk_index = torch.argmax(
                     logits_output.next_token_logits, dim=-1, keepdim=True
                 )
                 topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             else:
-                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                probs = self._renorm_draft_probs(
+                    logits_output.next_token_logits, forward_batch.sampling_info
+                )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
@@ -602,10 +616,31 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_tokens = torch.cat(token_list, dim=1)
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens
+            draft_probs = (
+                torch.stack(draft_probs_list, dim=1)
+                if self.server_args.speculative_use_rs
+                else None
+            )
+            return parent_list, top_scores_index, draft_tokens, draft_probs
 
-        return organize_draft_results(
+        parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
+
+        draft_probs = (
+            torch.stack(draft_probs_list, dim=1)
+            if self.server_args.speculative_use_rs
+            else None
+        )
+        return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _renorm_draft_probs(
+        self, next_token_logits: torch.Tensor, sampling_info=None
+    ) -> torch.Tensor:
+        if not self.server_args.speculative_use_rs or not next_token_logits.size(0):
+            return torch.softmax(next_token_logits, dim=-1)
+        return torch.softmax(
+            next_token_logits / sampling_info.temperatures, dim=-1
         )
 
     def draft_extend(self):
@@ -680,10 +715,14 @@ class EagleDraftWorker(BaseDraftWorker):
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
-            probs, self.topk, dim=-1
+        probs = self._renorm_draft_probs(
+            logits_output.next_token_logits, batch.sampling_info
         )
+        if self.server_args.speculative_use_rs:
+            next_draft_input.topk_p, next_draft_input.topk_index = fast_sample(probs, num_samples=1)
+            next_draft_input.draft_probs = probs
+        else:
+            next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
@@ -770,16 +809,24 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        if self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
+        if self.server_args.speculative_use_rs:
+            probs = self._renorm_draft_probs(
+                draft_logits_output.next_token_logits, batch.sampling_info
+            )
+            ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
+            ret_draft_probs = probs
+        elif self.topk == 1 and not _is_hip:
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
         else:
-            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            probs = self._renorm_draft_probs(
+                draft_logits_output.next_token_logits, batch.sampling_info
+            )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -793,6 +840,8 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        if self.server_args.speculative_use_rs:
+            next_draft_input.draft_probs = ret_draft_probs
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -949,6 +998,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
+                    vocab_size=self.target_worker.model_config.vocab_size,
                 )
             with (
                 self.draft_worker.draft_tp_context(

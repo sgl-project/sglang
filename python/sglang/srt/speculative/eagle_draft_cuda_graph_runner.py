@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -27,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -54,6 +56,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     topk_p: torch.Tensor
     topk_index: torch.Tensor
+    draft_probs: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -143,6 +146,10 @@ class EAGLEDraftCudaGraphRunner:
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+            draft_probs = torch.zeros(
+                (self.max_bs, self.model_runner.model_config.vocab_size),
+                dtype=torch.float32,
+            )
             _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
             hidden_states = (
                 torch.zeros(
@@ -152,6 +159,8 @@ class EAGLEDraftCudaGraphRunner:
                 if _hidden_size is not None
                 else None
             )
+
+            self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -184,6 +193,7 @@ class EAGLEDraftCudaGraphRunner:
             extend_seq_lens=extend_seq_lens,
             topk_p=topk_p,
             topk_index=topk_index,
+            draft_probs=draft_probs,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -287,6 +297,7 @@ class EAGLEDraftCudaGraphRunner:
         )
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
+        draft_probs = buffers.draft_probs[:num_seqs]
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
@@ -319,8 +330,21 @@ class EAGLEDraftCudaGraphRunner:
         spec_info = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
+            draft_probs=draft_probs,
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
+        )
+
+        sampling_info = SamplingBatchInfo(
+            temperatures=self.temperatures[:num_seqs],
+            top_ps=torch.ones((num_seqs,), dtype=torch.float),
+            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
+            min_ps=torch.zeros((num_seqs,), dtype=torch.float),
+            is_all_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=self.model_runner.model_config.vocab_size,
         )
 
         # Forward batch
@@ -344,6 +368,7 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            sampling_info=sampling_info,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
             capture_hidden_mode=(
@@ -388,8 +413,10 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
-        parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
-        return parent_list, top_scores_index, draft_tokens
+        parent_list, top_scores_index, draft_tokens, draft_probs = (
+            t[:raw_bs] if t is not None else None for t in out
+        )
+        return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
@@ -457,12 +484,17 @@ class EAGLEDraftCudaGraphRunner:
         )
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+        if forward_batch.spec_info.draft_probs is not None:
+            buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+
+        if forward_batch.sampling_info is not None:
+            self.temperatures[:raw_bs].copy_(forward_batch.sampling_info.temperatures[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

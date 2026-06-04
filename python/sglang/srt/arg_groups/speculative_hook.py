@@ -370,6 +370,15 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
+    if server_args.speculative_use_rs:
+        if server_args.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--speculative-use-rs requires --speculative-eagle-topk=1."
+            )
+        logger.info(
+            "Rejection sampling is enabled for speculative decoding (speculative_use_rs=True)."
+        )
+
     if (
         server_args.speculative_eagle_topk == 1
         and server_args.speculative_num_draft_tokens

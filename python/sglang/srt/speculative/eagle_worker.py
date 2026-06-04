@@ -62,6 +62,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     draft_tp_context,
+    fast_sample,
     fast_topk,
     generate_token_bitmask,
     get_last_loc_large_page_size_large_top_k,
@@ -89,7 +90,11 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if is_cuda():
-    from sgl_kernel import segment_packbits  # noqa: F401
+    from sgl_kernel import (  # noqa: F401
+        segment_packbits,
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,8 @@ class EAGLEWorker(TpModelWorker):
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
+        if server_args.speculative_use_rs:
+            assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id
@@ -743,6 +750,7 @@ class EAGLEWorker(TpModelWorker):
             dtype=EagleDraftInput.dtype_for(self),
             topk=self.topk,
             capture_hidden_mode=capture_mode,
+            vocab_size=self.model_config.vocab_size,
         )
 
     def draft(self, batch: ScheduleBatch):
@@ -772,8 +780,8 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
         if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
+            parent_list, top_scores_index, draft_tokens, draft_probs = (
+                self.cuda_graph_runner.replay(forward_batch)
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
@@ -784,8 +792,8 @@ class EAGLEWorker(TpModelWorker):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
+            parent_list, top_scores_index, draft_tokens, draft_probs = (
+                self.draft_forward(forward_batch)
             )
 
         if batch.forward_mode.is_idle():
@@ -833,6 +841,7 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=target_capture_mode,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
+            draft_probs=draft_probs,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -862,6 +871,9 @@ class EAGLEWorker(TpModelWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+
+        if self.server_args.speculative_use_rs:
+            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         # Forward multiple steps
         scores = None
@@ -902,8 +914,15 @@ class EAGLEWorker(TpModelWorker):
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = self._renorm_draft_probs(
+                logits_output.next_token_logits, forward_batch.sampling_info
+            )
+
+            if self.server_args.speculative_use_rs:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+                draft_probs_list.append(probs)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -921,7 +940,12 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-        return parent_list, top_scores_index, draft_tokens
+        draft_probs = (
+            torch.stack(draft_probs_list, dim=1)
+            if self.server_args.speculative_use_rs
+            else None
+        )
+        return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
@@ -1138,7 +1162,9 @@ class EAGLEWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(
+            logits_output, forward_batch.spec_info, forward_batch.sampling_info
+        )
 
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch
@@ -1211,6 +1237,10 @@ class EAGLEWorker(TpModelWorker):
             topk_p = logits_output.topk_p
             topk_index = logits_output.topk_index
             hidden_states = logits_output.hidden_states
+            if self.server_args.speculative_use_rs:
+                draft_probs = logits_output.draft_probs
+            else:
+                draft_probs = None
         else:
             forward_batch.can_run_dp_cuda_graph = False
             attn_backend = None
@@ -1231,8 +1261,15 @@ class EAGLEWorker(TpModelWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             # Non-cuda-graph path: compute topk_p / topk_index inline.
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = self._renorm_draft_probs(
+                logits_output.next_token_logits, forward_batch.sampling_info
+            )
+            if self.server_args.speculative_use_rs:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+                draft_probs = probs
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                draft_probs = None
             hidden_states = logits_output.hidden_states
 
         maybe_detect_nan(
@@ -1251,6 +1288,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states=hidden_states,
             topk_p=topk_p,
             topk_index=topk_index,
+            draft_probs=draft_probs,
             capture_hidden_mode=next_decode_capture_mode,
         )
 
@@ -1267,11 +1305,31 @@ class EAGLEWorker(TpModelWorker):
         return next_draft_input
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self,
+        logits_output: LogitsProcessorOutput,
+        draft_input: EagleDraftInput,
+        sampling_info=None,
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        probs = self._renorm_draft_probs(logits_output.next_token_logits, sampling_info)
+        if self.server_args.speculative_use_rs:
+            draft_input.topk_p, draft_input.topk_index = fast_sample(
+                probs, num_samples=1
+            )
+            draft_input.draft_probs = probs
+        else:
+            draft_input.topk_p, draft_input.topk_index = fast_topk(
+                probs, self.topk, dim=-1
+            )
         draft_input.hidden_states = logits_output.hidden_states
+
+    def _renorm_draft_probs(
+        self, next_token_logits: torch.Tensor, sampling_info=None
+    ) -> torch.Tensor:
+        if not self.server_args.speculative_use_rs or not next_token_logits.size(0):
+            return torch.softmax(next_token_logits, dim=-1)
+        return torch.softmax(
+            next_token_logits / sampling_info.temperatures, dim=-1
+        )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
