@@ -62,14 +62,12 @@ MI35X_GPT_OSS_W4A8_MXFP4_MODELS = [
     ModelConfig(
         model_path="amd/gpt-oss-120b-w-mxfp4-a-fp8",
         tp_size=8,
-        # Measured ~0.525 on the MI35x host with this AITER MXFP4 + per-tensor
-        # FP8 activation path (200-question GSM8K few-shot completion, temp=0).
-        # The model produces correct chains-of-thought but, as a reasoning-tuned
-        # checkpoint, falls into greedy-decode repetition loops that corrupt
-        # the last-digit answer extractor (see the matching investigation log).
-        # 0.48 leaves ~4-5pp headroom below the measurement to absorb run-to-run
-        # variance while still flagging real kernel/quant regressions.
-        accuracy_threshold=0.48,
+        # Match the peer `openai/gpt-oss-120b` GSM8K threshold in
+        # `test_gpt_oss_eval_mi35x.py` (0.79). The AMD Quark W4A8 MXFP4-FP8
+        # checkpoint runs the same gate-up-INTERLEAVE AITER MoE path
+        # (`shuffle_weight_a16w4` + `shuffle_scale_a16w4` post-PR #27201)
+        # and measures ~0.855 on this host, comfortably above 0.79.
+        accuracy_threshold=0.79,
         timeout=900,
         other_args=[
             "--chunked-prefill-size",
