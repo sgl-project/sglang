@@ -9,7 +9,6 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.triton_ops.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
-    shapecap_dump,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -179,29 +178,10 @@ def sgemm_lora_a_fwd(
     K = weights.shape[-1]
     assert x.shape[-1] == K
 
-    shapecap_dump(
-        "sgemm_lora_a.entry",
-        x=x,
-        weights=weights,
-        S=S,
-        R=R,
-        K=K,
-        stack_num=stack_num,
-        bs=batch_info.bs,
-        max_len=batch_info.max_len,
-        use_cuda_graph=batch_info.use_cuda_graph,
-        single_adapter=batch_info.single_adapter,
-        permutation=batch_info.permutation,
-        seg_lens=batch_info.seg_lens,
-        lora_ranks=batch_info.lora_ranks,
-        has_out_alloc_stream=out_alloc_stream is not None,
-    )
-
     single_adapter = batch_info.single_adapter
     if single_adapter is not None:
         idx, rank = single_adapter
         if rank == R // stack_num:
-            shapecap_dump("sgemm_lora_a.path", path="F.linear", idx=idx, rank=rank)
             return F.linear(x, weights[idx])
 
     # Block shapes
@@ -246,17 +226,6 @@ def sgemm_lora_a_fwd(
     )
 
     enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
-    shapecap_dump(
-        "sgemm_lora_a.triton",
-        path="triton",
-        output=output,
-        grid=grid,
-        BLOCK_S=BLOCK_S,
-        BLOCK_K=BLOCK_K,
-        BLOCK_R=BLOCK_R,
-        split_k=split_k,
-        sorted_by_adapter=sorted_by_adapter,
-    )
     _sgemm_lora_a_kernel[grid](
         x,
         weights,

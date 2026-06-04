@@ -5,7 +5,6 @@ import triton.language as tl
 from sglang.srt.lora.triton_ops.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
-    shapecap_dump,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -160,27 +159,6 @@ def sgemm_lora_b_fwd(
 
     sorted_by_adapter = batch_info.permutation is not None
     enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
-    shapecap_dump(
-        "sgemm_lora_b.triton",
-        x=x,
-        weights=weights,
-        output=output,
-        base_output_is_none=base_output is None,
-        S=S,
-        N=N,
-        R=R,
-        grid=grid,
-        BLOCK_S=BLOCK_S,
-        BLOCK_N=BLOCK_N,
-        BLOCK_R=BLOCK_R,
-        bs=batch_info.bs,
-        max_len=batch_info.max_len,
-        use_cuda_graph=batch_info.use_cuda_graph,
-        sorted_by_adapter=sorted_by_adapter,
-        seg_lens=batch_info.seg_lens,
-        lora_ranks=batch_info.lora_ranks,
-        scalings=batch_info.scalings,
-    )
     _sgemm_lora_b_kernel[grid](
         x,
         weights,

@@ -11,10 +11,7 @@ import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
 from sglang.srt.environ import envs
-from sglang.srt.lora.triton_ops.kernel_utils import (
-    get_pdl_launch_metadata,
-    shapecap_dump,
-)
+from sglang.srt.lora.triton_ops.kernel_utils import get_pdl_launch_metadata
 
 
 @triton.jit
@@ -344,28 +341,6 @@ def _invoke_moe_lora_shrink_splitk(
     grid = (SPLIT_K * base_grid,)
 
     enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
-    shapecap_dump(
-        "moe_lora_shrink_splitk",
-        hidden_states=hidden_states,
-        weight=weight,
-        output=output,
-        topk_ids=topk_ids,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
-        top_k=top_k,
-        N=N,
-        K=K,
-        num_valid_tokens=topk_ids.numel(),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        SPLIT_K=SPLIT_K,
-        grid=grid,
-        num_warps=config.get("num_warps", 4),
-        num_stages=config.get("num_stages", 4),
-    )
     _moe_lora_shrink_splitk_kernel[grid](
         hidden_states,
         weight,
