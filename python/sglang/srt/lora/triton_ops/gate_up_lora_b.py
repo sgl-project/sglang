@@ -5,6 +5,11 @@ import triton.language as tl
 from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
 from sglang.srt.lora.utils import LoRABatchInfo
 
+# Minimum total_tokens * rank for the single-adapter cuBLAS path; below this
+# the Triton kernel is faster (crossover measured at output_dim=1536/GPU:
+# cuBLAS wins rank64 from S>=256 and rank16 only from S>=2048).
+_CUBLAS_MIN_S_RANK = 16384
+
 
 @triton.jit
 def _gate_up_lora_b_kernel(
@@ -137,6 +142,32 @@ def _gate_up_lora_b_kernel(
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
+def _gate_up_lora_b_cublas(
+    x: torch.Tensor,
+    gate_up_lora_b: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    output_dim: int,
+    base_output: torch.Tensor,
+) -> torch.Tensor:
+    """Single-adapter dense path: one cuBLAS addmm_ per gate/up slice.
+
+    The LoRA-A output is rank-packed (slice i at columns [i*rank, (i+1)*rank)),
+    matching the Triton kernel's K = min(K, rank) slice stride. Slices are
+    disjoint output regions, so in-place addmm_ writes never collide.
+    """
+    r = batch_info.uniform_rank
+    if base_output is None:
+        base_output = torch.zeros(
+            (x.shape[0], 2 * output_dim), device=x.device, dtype=x.dtype
+        )
+    w = gate_up_lora_b[batch_info.uniform_weight_index]
+    x_scaled = x[:, : 2 * r] * batch_info.uniform_scaling
+    for i in range(2):
+        lo, hi = i * output_dim, (i + 1) * output_dim
+        base_output[:, lo:hi].addmm_(x_scaled[:, i * r : (i + 1) * r], w[lo:hi, :r].t())
+    return base_output
+
+
 def gate_up_lora_b_fwd(
     x: torch.Tensor,
     gate_up_lora_b: torch.Tensor,
@@ -159,6 +190,15 @@ def gate_up_lora_b_fwd(
     input_dim = x.shape[1]
     r = gate_up_lora_b.shape[-1]
     assert input_dim == 2 * r
+
+    if (
+        batch_info.uniform_weight_index is not None
+        and not batch_info.use_cuda_graph
+        and s * batch_info.uniform_rank >= _CUBLAS_MIN_S_RANK
+    ):
+        return _gate_up_lora_b_cublas(
+            x, gate_up_lora_b, batch_info, output_dim, base_output
+        )
 
     BLOCK_S = 16
     BLOCK_R = 16
