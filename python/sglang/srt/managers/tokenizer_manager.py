@@ -385,7 +385,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.load_snapshot_reader = create_load_snapshot_reader(
             self.server_args,
             port_args,
-            caller="tokenizer",
+            caller="TokenizerManager",
         )
 
     def init_running_status(self):
