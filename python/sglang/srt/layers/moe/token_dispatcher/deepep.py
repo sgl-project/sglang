@@ -246,7 +246,9 @@ class DeepEPBuffer:
         # https://github.com/deepseek-ai/DeepEP/blob/e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8/csrc/deep_ep.cpp#L101-L114
         if is_flashinfer_available():
             from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
-            buffer_kwargs["use_fabric"] = is_mnnvl_fabric_supported(torch.cuda.current_device())
+
+            if is_mnnvl_fabric_supported(torch.cuda.current_device()):
+                buffer_kwargs["use_fabric"] = True
 
         cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return cls._buffer
