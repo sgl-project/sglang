@@ -204,11 +204,15 @@ class UMBPStore(HiCacheStorage):
         if "eviction_candidate_window" in extra:
             cfg.eviction.candidate_window = int(extra["eviction_candidate_window"])
         if "ssd_io_backend" in extra and UMBPIoBackend is not None:
-            backend = str(extra["ssd_io_backend"]).lower()
-            if backend in ("pthread", "posix"):
-                cfg.ssd.io.backend = UMBPIoBackend.PThread
-            elif backend in ("io_uring", "uring"):
+            backend = str(extra["ssd_io_backend"]).strip().lower()
+            if backend == "posix":
+                cfg.ssd.io.backend = UMBPIoBackend.Posix
+            elif backend == "io_uring":
                 cfg.ssd.io.backend = UMBPIoBackend.IoUring
+            else:
+                raise ValueError(
+                    "extra_config['ssd_io_backend'] must be one of: posix, io_uring"
+                )
         if "ssd_durability_mode" in extra and UMBPDurabilityMode is not None:
             durability = str(extra["ssd_durability_mode"]).lower()
             if durability in ("strict", "sync"):
@@ -217,10 +221,10 @@ class UMBPStore(HiCacheStorage):
                 cfg.ssd.durability.mode = UMBPDurabilityMode.Relaxed
         if "ssd_backend" in extra:
             ssd_backend = str(extra["ssd_backend"]).strip().lower()
-            if ssd_backend not in ("posix", "spdk", "spdk_proxy"):
+            if ssd_backend not in ("file", "spdk", "spdk_proxy"):
                 raise ValueError(
                     "extra_config['ssd_backend'] must be one of: "
-                    "posix, spdk, spdk_proxy"
+                    "file, spdk, spdk_proxy"
                 )
             cfg.ssd.ssd_backend = ssd_backend
         if "spdk_nvme_pci_addr" in extra:
