@@ -483,6 +483,7 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # DeepSeek MHA Optimization
