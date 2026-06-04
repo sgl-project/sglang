@@ -260,7 +260,14 @@ def auto_num_groups(
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     l2_bytes = getattr(props, "L2_cache_size", 128 * 1024 * 1024)
     need = math.ceil(l2_bytes * l2_mult / max(group_bytes, 1))
-    return max(min_groups, min(need, max_groups))
+    n = max(min_groups, min(need, max_groups))
+    if n * group_bytes < l2_mult * l2_bytes:
+        print(
+            f"WARNING: rotation footprint {n * group_bytes / 1e6:.0f} MB < "
+            f"{l2_mult:.1f} x L2 ({l2_mult * l2_bytes / 1e6:.0f} MB); raise "
+            f"--max-groups for full L2 eviction (small-shape kernel)"
+        )
+    return n
 
 
 def bench_us_rotated(calls, rep_ms: int) -> float:
