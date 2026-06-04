@@ -102,12 +102,25 @@ def production_config(num_experts, n, rank, bs, dtype):
         return 16, 1, 4
 
 
-def make_routing_inputs(bs, ep, device, seed=0):
-    """Random uniform top-k routing over the GLOBAL expert ids + per-token routing
-    weights + the all-zero (single adapter, slot 0) token->lora mapping."""
+def make_routing_inputs(bs, ep, device, seed=0, routing="uniform", skew_a=0.9):
+    """Top-k routing over the GLOBAL expert ids + per-token routing weights + the
+    all-zero (single adapter, slot 0) token->lora mapping. ``routing="skewed"`` draws
+    experts from a Zipf(skew_a) popularity (hot experts), which reproduces the e2e
+    num_tokens_post_padded range (measured decode bs64: 832..1312, median 1056)."""
     gen = torch.Generator(device=device).manual_seed(seed)
-    scores = torch.rand(bs, ep["num_experts"], generator=gen, device=device)
-    topk_ids = torch.topk(scores, k=ep["top_k"], dim=1).indices.to(torch.int32)
+    if routing == "skewed":
+        pop = torch.arange(
+            1, ep["num_experts"] + 1, dtype=torch.float32, device=device
+        ).pow(-skew_a)
+        pop = pop[torch.randperm(ep["num_experts"], generator=gen, device=device)]
+        topk_ids = (
+            torch.multinomial(
+                pop.expand(bs, -1), ep["top_k"], replacement=False, generator=gen
+            )
+        ).to(torch.int32)
+    else:
+        scores = torch.rand(bs, ep["num_experts"], generator=gen, device=device)
+        topk_ids = torch.topk(scores, k=ep["top_k"], dim=1).indices.to(torch.int32)
     topk_weights = (
         torch.rand(bs, ep["top_k"], generator=gen, device=device, dtype=torch.float32)
         * 0.9
@@ -321,6 +334,13 @@ def main():
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
+        "--routing",
+        choices=["uniform", "skewed"],
+        default="uniform",
+        help="skewed = Zipf(--skew-a) hot experts, matches e2e padded-token range",
+    )
+    ap.add_argument("--skew-a", type=float, default=0.9)
+    ap.add_argument(
         "--num-groups",
         type=int,
         default=0,
@@ -394,7 +414,7 @@ def main():
             "num_warps": num_warps,
         }
         topk_ids, topk_weights, tlm = make_routing_inputs(
-            args.bs, ep, device, seed=args.seed
+            args.bs, ep, device, seed=args.seed, routing=args.routing, skew_a=args.skew_a
         )
 
         if args.mode == "sweep":
@@ -449,6 +469,7 @@ def main():
             continue
 
         sorted_token_ids = routing[0]
+        padded = int(routing[2].item())  # actual aligned tokens (e2e decode: 832..1312)
         grid = triton.cdiv(sorted_token_ids.shape[0], block_m) * triton.cdiv(
             spec["n"], 128
         )
@@ -457,7 +478,7 @@ def main():
             f"BENCH moe_expand proj={proj} bs={args.bs} r={args.rank} N={spec['n']} "
             f"E={ep['num_experts']}(local {ep['local_num_experts']}) "
             f"mul_routed={int(spec['mul_routed_weight'])} fuse_sum={int(spec['fuse_sum_all_reduce'])} "
-            f"sorted={sorted_token_ids.shape[0]} block_m={block_m} grid=({grid},) "
+            f"sorted={sorted_token_ids.shape[0]} padded={padded} block_m={block_m} grid=({grid},) "
             f"groups={num_groups} ({group_bytes * num_groups / 1e6:.0f} MB rotated): {us:.2f} us"
         )
 
