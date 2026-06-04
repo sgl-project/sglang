@@ -74,12 +74,19 @@ def _build_routing(topk_ids, token_lora_mapping, num_experts, block_m):
 
 def _expand(intermediate, lora_b, topk_ids, topk_weights, routing, block_m):
     sorted_token_ids, expert_ids, num_tokens_post_padded = routing
-    lora_b_virtual = lora_b.reshape(lora_b.shape[0] * lora_b.shape[1], *lora_b.shape[2:])
+    lora_b_virtual = lora_b.reshape(
+        lora_b.shape[0] * lora_b.shape[1], *lora_b.shape[2:]
+    )
     n = lora_b.shape[2]
     bs = topk_ids.shape[0]
     # fuse_sum_all_reduce atomic-adds the top_k deltas into one row -> zero each call.
     output = torch.zeros(bs, n, dtype=intermediate.dtype, device=intermediate.device)
-    config = {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1, "num_warps": 4}
+    config = {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+    }
     _invoke_moe_lora_expand_add(
         intermediate,
         lora_b_virtual,
@@ -128,8 +135,13 @@ class TestMoeLoraExpandAddDown(CustomTestCase):
 
     def _check(self, bs, block_m):
         topk_ids, tkw, tlm, inter, lb = _make_inputs(
-            bs, self.NUM_EXPERTS, self.TOP_K, self.N, self.RANK,
-            torch.bfloat16, self.device,
+            bs,
+            self.NUM_EXPERTS,
+            self.TOP_K,
+            self.N,
+            self.RANK,
+            torch.bfloat16,
+            self.device,
         )
         routing = _build_routing(topk_ids, tlm, self.NUM_EXPERTS, block_m)
         out = _expand(inter, lb, topk_ids, tkw, routing, block_m).float()
