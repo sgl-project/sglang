@@ -27,7 +27,7 @@ class TestEagle3Page64(Eagle3Base, SpecAccuracyKit, SpecLogprobKit, SpecFeatureK
 
 
 class TestEagleLlama2Page4Topk1(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
-    """Llama-2 topk=1 + page_size=4; busy-time pool check."""
+    """Llama-2 topk=1 + page_size=4."""
 
     spec_topk = 1
     spec_tokens = 6
@@ -36,7 +36,7 @@ class TestEagleLlama2Page4Topk1(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit
 
 
 class TestEagleLlama2Page4Topk8(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
-    """Llama-2 topk>1 tree + page_size=4 (spec v1); busy-time pool check."""
+    """Llama-2 topk>1 tree + page_size=4 (spec v1)."""
 
     page_size = 4
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)

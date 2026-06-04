@@ -37,7 +37,7 @@ class TestEagleLlama2Fa3Page256(
     SpecPerfKit,
     SpecFeatureKit,
 ):
-    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256 (spec v1); busy-time pool check."""
+    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256 (spec v1)."""
 
     spec_topk = 5
     spec_steps = 8

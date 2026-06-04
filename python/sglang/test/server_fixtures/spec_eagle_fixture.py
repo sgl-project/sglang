@@ -67,9 +67,8 @@ class SpecEagleServerBase(CustomTestCase):
 
     # -- extras --
     # env_overrides: (env_var_obj, value) pairs applied only around launch.
-    # Declare ONLY this class's own overrides; the fixture merges them across the
-    # MRO (base first, derived last) so a subclass never restates a base's
-    # overrides -- single source of truth. Same env in base+derived: derived wins.
+    # Declare ONLY this class's own; _merged_env_overrides() unions them down the
+    # MRO (base first), so never restate a base's. Derived wins on a repeated env.
     env_overrides = ()
     extra_args = ()
 
@@ -110,8 +109,7 @@ class SpecEagleServerBase(CustomTestCase):
 
     @classmethod
     def _merged_env_overrides(cls):
-        # Merge env_overrides down the MRO (base first, derived last) so each
-        # class declares only its own; derived wins for a repeated env var.
+        # Base first so a derived class wins for a repeated env var.
         merged = []
         for klass in reversed(cls.__mro__):
             merged.extend(klass.__dict__.get("env_overrides", ()))
