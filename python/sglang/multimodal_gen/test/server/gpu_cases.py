@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -54,6 +55,53 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
+_IDEOGRAM4_JSON_PROMPT = json.dumps(
+    {
+        "high_level_description": (
+            "A golden retriever riding a skateboard down a sunny sidewalk."
+        ),
+        "style_description": {
+            "aesthetics": "warm, playful, vibrant",
+            "lighting": "bright afternoon sunlight, long soft shadows",
+            "photo": "shallow depth of field, eye-level, 85mm lens",
+            "medium": "photograph",
+            "color_palette": [
+                "#F5C542",
+                "#87CEEB",
+                "#4A4A4A",
+                "#FFFFFF",
+                "#2E8B57",
+            ],
+        },
+        "compositional_deconstruction": {
+            "background": (
+                "A sun-drenched suburban sidewalk lined with green hedges and "
+                "a white picket fence. Dappled light filters through overhead trees."
+            ),
+            "elements": [
+                {
+                    "type": "obj",
+                    "bbox": [200, 300, 800, 900],
+                    "desc": (
+                        "A golden retriever with a fluffy coat, standing on a red "
+                        "skateboard with all four paws. Its tongue is out and ears "
+                        "are flapping in the wind."
+                    ),
+                },
+                {
+                    "type": "obj",
+                    "bbox": [250, 750, 750, 950],
+                    "desc": (
+                        "A worn red skateboard with black wheels rolling along the "
+                        "concrete sidewalk."
+                    ),
+                },
+            ],
+        },
+    },
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
 
 
 # All test cases with clean default values
@@ -94,6 +142,21 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "ideogram4_fp8_t2i",
+        DiffusionServerArgs(
+            model_path="ideogram-ai/ideogram-4-fp8",
+        ),
+        DiffusionSamplingParams(
+            prompt=_IDEOGRAM4_JSON_PROMPT,
+            output_size="1024x1024",
+            output_format="png",
+            extras={"preset": "V4_QUALITY_48", "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i",

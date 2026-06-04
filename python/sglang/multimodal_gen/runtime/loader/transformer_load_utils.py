@@ -373,12 +373,15 @@ def resolve_transformer_quant_load_spec(
     model_cls: type[nn.Module],
     cls_name: str,
 ) -> TransformerQuantLoadSpec:
-    quant_config = _resolve_quant_config(
-        hf_config=hf_config,
-        server_args=server_args,
-        safetensors_list=safetensors_list,
-        component_model_path=component_model_path,
-    )
+    if getattr(model_cls, "handles_checkpoint_quantization", False):
+        quant_config = None
+    else:
+        quant_config = _resolve_quant_config(
+            hf_config=hf_config,
+            server_args=server_args,
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+        )
 
     if quant_config is not None:
         packed = getattr(model_cls, "packed_modules_mapping", None)

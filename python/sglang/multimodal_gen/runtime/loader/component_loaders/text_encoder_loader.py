@@ -246,6 +246,11 @@ class TextEncoderLoader(ComponentLoader):
         if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
+        post_diffusers_config_update = getattr(
+            encoder_config, "post_diffusers_config_update", None
+        )
+        if post_diffusers_config_update is not None:
+            post_diffusers_config_update()
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]

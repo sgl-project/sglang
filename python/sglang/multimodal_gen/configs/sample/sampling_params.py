@@ -107,9 +107,7 @@ class SamplingParams:
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    negative_prompt: str = (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     prompt_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_file_name: str | None = field(
@@ -198,12 +196,8 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    rollout_return_denoising_env: bool = (
-        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
-    )
-    rollout_return_dit_trajectory: bool = (
-        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
-    )
+    rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None
@@ -356,7 +350,7 @@ class SamplingParams:
             or self.seed < 0
         ):
             raise ValueError(
-                "seed must be a non-negative int or list of ints, " f"got {self.seed!r}"
+                f"seed must be a non-negative int or list of ints, got {self.seed!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -536,13 +530,13 @@ class SamplingParams:
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
+                "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
-                logger.debug(f"Setting `num_frames` to 1 for image generation model")
+                logger.debug("Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
         else:
@@ -1045,26 +1039,29 @@ class SamplingParams:
 
         # global switch: if True, allow overriding protected fields
         allow_override_protected = not user_params.no_override_protected_fields
-        for field in dataclasses.fields(user_params):
-            field_name = field.name
+        for field_info in dataclasses.fields(user_params):
+            field_name = field_info.name
             user_value = getattr(user_params, field_name)
             if hasattr(SamplingParams, field_name):
                 default_class_value = getattr(SamplingParams, field_name)
-            elif field.default is not dataclasses.MISSING:
-                default_class_value = field.default
-            elif field.default_factory is not dataclasses.MISSING:
-                default_class_value = field.default_factory()
+            elif field_info.default is not dataclasses.MISSING:
+                default_class_value = field_info.default
+            elif field_info.default_factory is not dataclasses.MISSING:
+                default_class_value = field_info.default_factory()
             else:
                 default_class_value = dataclasses.MISSING
 
-            is_user_modified = user_value != default_class_value or (
-                explicit_fields is not None and field_name in explicit_fields
-            )
+            if explicit_fields is not None:
+                is_user_modified = field_name in explicit_fields
+            else:
+                is_user_modified = user_value != default_class_value
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
+        if explicit_fields is not None:
+            self._explicit_fields = set(explicit_fields)
         self.__post_init__()
 
     @property
