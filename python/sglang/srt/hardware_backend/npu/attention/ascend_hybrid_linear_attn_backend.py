@@ -156,17 +156,18 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
+            # Dense full-bucket GDN intermediate-scratch indices (matches capture-time
+            # fill and the CUDA dense indexing). In graph mode padding rows are NOT
+            # trimmed, so a 0-padded tail would make every padded request's verify write
+            # alias real request 0's intermediate row 0; when req0 accepts 0 drafts the
+            # post-verify restore then reads a corrupted state -> garbage / repetition.
+            # Giving each (padded) row its own scratch index keeps real req0 row 0 clean.
             ssm_state_indices = torch.arange(
-                len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num,
+                bs * spec_info.draft_token_num,
                 dtype=torch.int32,
                 device=mamba_indices.device,
             )
-            self.state_indices_list_gdn[bs - 1][
-                : len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num
-            ].copy_(ssm_state_indices)
-            self.state_indices_list_gdn[bs - 1][
-                len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num :
-            ] = 0
+            self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -259,7 +260,10 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             dtype=torch.int64,
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
+        draft_token_num = intermediate_state_cache.shape[2]
 
+        # (1) Restore each verified request's OWN recurrent + conv state to the last
+        #     accepted step.
         move_intermediate_cache(
             ssm_states,
             intermediate_state_cache,
@@ -268,12 +272,48 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             last_steps,
         )
 
-        draft_token_num = intermediate_state_cache.shape[2]
+        # (2) Scatter the tracked states into the mamba prefix-cache (track) slots, the
+        #     same way CUDA does via fused_mamba_state_scatter_with_mask. Without this,
+        #     a mamba-track boundary crossed *inside* an MTP verify step is never saved,
+        #     so prefix reuse under --mamba-scheduler-strategy extra_buffer restores a
+        #     stale state -> garbage -> the MTP-only accuracy drop. The NPU conv path
+        #     keeps no per-step intermediate_conv_window cache, so reconstruct the
+        #     tracked conv window by copying the verify-time window from the OWN slot
+        #     (still intact here) and rolling the track slot back to its tracked step.
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+            track_dst = mamba_track_indices[:request_number].to(torch.int64)
+            track_steps = mamba_steps_to_track[:request_number].to(torch.int64)
+            move_intermediate_cache(
+                ssm_states,
+                intermediate_state_cache,
+                track_dst,
+                src_indices_tensor,
+                track_steps,
+            )
+            # Must copy BEFORE the own-slot rollback in (3) overwrites the per-step
+            # conv history; conv_state_rollback in (4) then trims it to the track step.
+            track_mask = track_steps >= 0
+            if track_mask.any():
+                conv_states[:, track_dst[track_mask]] = conv_states[
+                    :, dst_indices_tensor[track_mask]
+                ]
+
+        # (3) Roll the OWN conv slots back to their last accepted step.
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(
                 conv_states,
                 dst_indices_tensor,
                 last_steps,
+                draft_token_num,
+            )
+
+        # (4) Roll the TRACK conv slots back to their tracked step (-1 entries skipped).
+        if mamba_track_indices is not None:
+            conv_state_rollback(
+                conv_states,
+                track_dst,
+                track_steps,
                 draft_token_num,
             )
         return
