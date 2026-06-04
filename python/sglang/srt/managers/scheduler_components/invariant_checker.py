@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Deque,
     List,
     Optional,
     Tuple,
@@ -33,6 +35,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
+BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
@@ -52,6 +57,9 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
+    recent_busy_msgs: Deque[str] = field(
+        default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
+    )
 
     @staticmethod
     def _check_pool_invariant(
@@ -204,10 +212,24 @@ class SchedulerInvariantChecker:
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
 
-        if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            logger.info(f"[Mem Check (BUSY)] {full_msg}")
-            if swa_msg:
-                logger.info(f"[Mem Check (BUSY)] {swa_msg}")
+        level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+        full_line = f"[Mem Check (BUSY)] {full_msg}"
+        swa_line = f"[Mem Check (BUSY)] {swa_msg}" if swa_msg else None
+
+        if level > 1:
+            # Verbose: log every iteration.
+            logger.info(full_line)
+            if swa_line:
+                logger.info(swa_line)
+        elif level == 1:
+            # Quiet: buffer and stay silent; flush the recent ones only on a leak.
+            self.recent_busy_msgs.append(full_line)
+            if swa_line:
+                self.recent_busy_msgs.append(swa_line)
+            if full_leak or swa_leak:
+                for msg in self.recent_busy_msgs:
+                    logger.info(msg)
+
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 

@@ -27,6 +27,12 @@ class TestDeepseekR1MXFP4(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_R1_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        # Workaround: AITER custom all-gather corrupts CUDA-graph IPC buffer
+        # registration and triggers a decode-time "Memory access fault" on
+        # MI35x TP=8. Disable until the AITER-side fix lands (see PR body).
+        envs.SGLANG_USE_AITER_AG.set(False)
+
         other_args = [
             "--tp",
             "8",
@@ -89,6 +95,8 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
+        # Same AITER custom all-gather workaround as TestDeepseekR1MXFP4 above.
+        envs.SGLANG_USE_AITER_AG.set(False)
 
         other_args = [
             "--tp",
