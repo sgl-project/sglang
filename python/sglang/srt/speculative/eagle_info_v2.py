@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     set_mamba_track_indices_from_reqs,
 )
 from sglang.srt.managers.utils import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -498,10 +499,11 @@ class EagleVerifyInputV2Mixin:
 
 
 def move_accepted_tokens_to_target_kvcache(
-    self,
     batch: ScheduleBatch,
     accept_index: torch.Tensor,
     num_correct_drafts: torch.Tensor,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    speculative_num_draft_tokens: int,
 ):
     """
     Move accepted tokens (drafts + bonus) to the target KV cache.
@@ -513,7 +515,8 @@ def move_accepted_tokens_to_target_kvcache(
             seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
     """
     bs = len(batch.seq_lens)
-    size = bs * self.speculative_num_draft_tokens
+    size = bs * speculative_num_draft_tokens
+    device = batch.seq_lens.device
 
     # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
     maybe_detect_oob(
@@ -526,16 +529,16 @@ def move_accepted_tokens_to_target_kvcache(
     tgt_cache_loc = torch.zeros(
         size,
         dtype=torch.int64,
-        device=self.device,
+        device=device,
     )
-    accepted_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=self.device)
+    accepted_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
     assign_extend_cache_locs[(bs,)](
         batch.req_pool_indices,
-        self.req_to_token_pool.req_to_token,
+        batch.req_to_token_pool.req_to_token,
         batch.seq_lens,
         batch.seq_lens + num_correct_drafts + 1,
         tgt_cache_loc,
-        self.req_to_token_pool.req_to_token.shape[1],
+        batch.req_to_token_pool.req_to_token.shape[1],
         next_power_of_2(bs),
     )
     fill_accepted_out_cache_loc[(size,)](
@@ -544,6 +547,6 @@ def move_accepted_tokens_to_target_kvcache(
         accepted_out_cache_loc,
         next_power_of_2(size),
     )
-    self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accepted_out_cache_loc
     )

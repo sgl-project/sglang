@@ -18,12 +18,12 @@ from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
-    maybe_detect_nan,
     record_stream_each,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
+from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,8 @@ class NGRAMWorker:
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
         self._init_preallocated_tensors()
+
+        self.adaptive_controller = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -180,6 +182,10 @@ class NGRAMWorker:
                 self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
             )
 
+    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
+
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -210,8 +216,8 @@ class NGRAMWorker:
                 else []
             )
             check_token = self._efficient_concat_last_n(
-                req.origin_input_ids,
-                req.output_ids + prev_tokens,
+                list(req.origin_input_ids),
+                list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
             req_ids.append(req.rid)
@@ -321,7 +327,9 @@ class NGRAMWorker:
                 else []
             )
             put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids + prev_tokens, self.max_trie_depth
+                list(req.origin_input_ids),
+                list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
+                self.max_trie_depth,
             )
             batch_tokens.append(put_ids)
             i += 1
@@ -332,7 +340,7 @@ class NGRAMWorker:
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_each(batch.seq_lens, fwd_stream)
-        bs = len(batch.seq_lens)
+        bs = len(batch.reqs)
 
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         self._prepare_for_speculative_decoding(batch)
@@ -388,6 +396,9 @@ class NGRAMWorker:
             maybe_detect_nan(
                 logits_output.next_token_logits, "verify: target model logits"
             )
+            maybe_detect_inf(
+                logits_output.next_token_logits, "verify: target model logits"
+            )
             (
                 predict,
                 accept_lens,
@@ -396,20 +407,20 @@ class NGRAMWorker:
             new_seq_lens = batch.seq_lens + accept_lens
             verified_tokens = predict[accept_index].flatten()
             next_token_ids = verified_tokens
-            if on_publish is not None:
-                on_publish(new_seq_lens)
 
-            # copy kvcache will not use the new_seq_lens
+            # The KV mover expects drafts-only counts. NGRAM's
+            # accept_lens includes the bonus token, matching scheduler output.
+            num_correct_drafts_per_req = accept_lens - 1
             move_accepted_tokens_to_target_kvcache(
                 batch,
                 accept_index,
-                accept_lens,
+                num_correct_drafts_per_req,
                 self.token_to_kv_pool_allocator,
                 self.draft_token_num,
             )
             # TODO logprobs for ngram spec v2
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
+            if on_publish is not None:
+                on_publish(new_seq_lens)
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
@@ -439,8 +450,6 @@ class NGRAMWorker:
                 batch_result.can_run_cuda_graph,
             )
             new_seq_lens = batch.seq_lens.clone()
-            if on_publish is not None:
-                on_publish(new_seq_lens)
 
             verified_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32, device=self.device
@@ -448,15 +457,15 @@ class NGRAMWorker:
             verified_tokens[:, 0] = predict
             verified_tokens = verified_tokens.flatten()
             next_token_ids = predict
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
+
+            if on_publish is not None:
+                on_publish(new_seq_lens)
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
             server_args=self.server_args,
             draft_token_num=self.draft_token_num,
             new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
             verified_tokens=verified_tokens,
             accept_lens=accept_lens,
         )
@@ -468,4 +477,5 @@ class NGRAMWorker:
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
             next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
         )

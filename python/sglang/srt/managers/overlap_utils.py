@@ -271,6 +271,9 @@ class FutureMap:
         future_indices: torch.Tensor,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
+        if self.spec_algo.is_ngram():
+            # FIXME: remove once precomputed draft is supported.
+            return
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.

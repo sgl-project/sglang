@@ -20,7 +20,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -69,9 +68,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         retrieve_next_sibling: torch.Tensor = None,
         draft_token_num: int = -1,
         grammar: BaseGrammarObject = None,
-        future_indices: Optional[FutureIndices] = None,
+        future_indices: Optional[torch.Tensor] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
-        verify_done: Optional[torch.cuda.Event] = None,
         verified_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
     ):
@@ -93,7 +91,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         # Inputs for V2 overlap worker
         self.future_indices = future_indices
         self.new_seq_lens = new_seq_lens
-        self.verify_done = verify_done
         self.verified_tokens = verified_tokens
         self.accept_lens = accept_lens
 
@@ -524,6 +521,10 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         return logits_output, self.accept_tokens, num_correct_drafts
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.future_indices is not None:
+            self.future_indices = self.future_indices[new_indices]
+        if self.new_seq_lens is not None:
+            self.new_seq_lens = self.new_seq_lens[new_indices]
         self.verified_tokens = self.verified_tokens.reshape(-1, self.draft_token_num)[
             new_indices, :
         ]
@@ -531,6 +532,16 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.accept_lens = self.accept_lens[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
+        if self.future_indices is not None:
+            assert spec_info.future_indices is not None
+            self.future_indices = torch.cat(
+                (self.future_indices, spec_info.future_indices), dim=0
+            )
+        if self.new_seq_lens is not None:
+            assert spec_info.new_seq_lens is not None
+            self.new_seq_lens = torch.cat(
+                (self.new_seq_lens, spec_info.new_seq_lens), dim=0
+            )
         self.verified_tokens = torch.cat(
             (self.verified_tokens, spec_info.verified_tokens), dim=0
         )

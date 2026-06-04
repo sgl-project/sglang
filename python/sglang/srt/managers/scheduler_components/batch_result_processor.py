@@ -661,7 +661,7 @@ class SchedulerBatchResultProcessor:
                 for tok in next_token_id:
                     req.output_ids.append(tok)
                     kept_token_ids.append(tok)
-                    req.check_finished()
+                    req.update_finish_state()
                     if req.finished():
                         break
                 dropped_cnt = len(next_token_id) - len(kept_token_ids)
@@ -679,7 +679,7 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             if batch.spec_algorithm.is_none():
                 req.update_finish_state(new_accepted_len)
-            # else: already called check_finished per-token in the loop above
+            # else: already called update_finish_state per-token in the loop above
 
             self._handle_finished_req(req, i, logits_output)
 
