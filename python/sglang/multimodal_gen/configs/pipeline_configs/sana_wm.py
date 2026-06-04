@@ -324,3 +324,14 @@ class SanaWMPipelineConfig(PipelineConfig):
             1, 1, 1, 1, 1
         )
         return sf, None
+
+
+class SanaWMRealtimeConfig(SanaWMPipelineConfig):
+    """Realtime alias of the SANA-WM pipeline config.
+
+    Same numerics/fields as SanaWMPipelineConfig (our correct streaming pipeline);
+    exists so the realtime-serving registry can key adapters on a realtime config
+    class (matching the upstream/LingBot-World pattern) without renaming the base.
+    """
+
+    pass

@@ -54,6 +54,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
+    RealtimeInputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_text_encoding import (
+    RealtimeTextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
     LTX2AVLatentPreparationStage,
 )
@@ -95,6 +101,9 @@ __all__ = [
     "LTX2ImageEncodingStage",
     "TextEncodingStage",
     "LTX2TextConnectorStage",
+    # Realtime transport stages
+    "RealtimeInputValidationStage",
+    "RealtimeTextEncodingStage",
     # Hunyuan3D shape stages
     "Hunyuan3DShapeBeforeDenoisingStage",
     "Hunyuan3DShapeDenoisingStage",

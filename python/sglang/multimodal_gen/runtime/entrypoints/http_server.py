@@ -311,5 +311,19 @@ def create_app(server_args: ServerArgs):
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
 
+    # Only mount the realtime WebSocket transport when a realtime adapter is
+    # registered for the active pipeline (e.g. SANA-WM). Non-realtime pipelines
+    # keep the route surface unchanged.
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+        has_realtime_model_adapter,
+    )
+
+    if has_realtime_model_adapter(server_args):
+        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_video_api import (
+            router as realtime_video_router,
+        )
+
+        app.include_router(realtime_video_router)
+
     app.state.server_args = server_args
     return app

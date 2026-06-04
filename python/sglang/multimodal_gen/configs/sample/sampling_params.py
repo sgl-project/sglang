@@ -223,6 +223,12 @@ class SamplingParams:
     # Prompt enhancement (ErnieImage)
     use_pe: bool | None = None
 
+    # Realtime serving (camera-control session): per-chunk condition inputs
+    # (camera actions, intrinsics) and the latent frames-per-chunk size, threaded
+    # to the realtime stage. Empty/None for non-realtime requests.
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+    realtime_chunk_size: int | None = None
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
@@ -301,6 +307,11 @@ class SamplingParams:
     def apply_request_extra(self, req: Any) -> None:
         """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
         req.extra.update(self.build_request_extra())
+        # Realtime serving: thread per-chunk camera conditions + chunk size to the Req.
+        if self.condition_inputs:
+            req.condition_inputs.update(self.condition_inputs)
+        if self.realtime_chunk_size is not None:
+            req.realtime_chunk_size = self.realtime_chunk_size
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""

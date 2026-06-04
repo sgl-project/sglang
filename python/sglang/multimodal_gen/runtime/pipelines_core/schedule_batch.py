@@ -17,7 +17,7 @@ import pprint
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 
 import PIL.Image
 import torch
@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.utils import align_to
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
@@ -145,6 +146,20 @@ class Req:
     # Latent dimensions
     height_latents: list[int] | int | None = None
     width_latents: list[int] | int | None = None
+
+    # Realtime serving (camera-control session). condition_inputs carries
+    # {"camera_actions": [...]} / {"action": ...} for SANA-WM realtime.
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+    realtime_session_id: str | None = None
+    session: RealtimeSession | None = None
+    block_idx: int = 0
+    realtime_chunk_size: int | None = None
+    realtime_event_id: int | None = None
+    realtime_output_format: str | None = None
+    realtime_causal_sink_size: int | None = None
+    realtime_causal_kv_cache_num_frames: int | None = None
+    # return websocket-friendly raw RGB frame bytes instead of raw tensors
+    return_raw_frames: bool = False
 
     # Timesteps
     timesteps: torch.Tensor | None = None
@@ -392,6 +407,10 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    # Realtime: websocket-friendly raw RGB frame bytes (instead of tensors/files)
+    raw_frame_batches: list[list[bytes]] | None = None
+    raw_frame_content_type: str = "application/x-raw-rgb"
+    raw_frame_metadata: dict[str, Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None
@@ -400,3 +419,14 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+
+    def drop_payload_for_warmup(self) -> None:
+        self.output = None
+        self.audio = None
+        self.trajectory_timesteps = None
+        self.trajectory_latents = None
+        self.rollout_trajectory_data = None
+        self.trajectory_decoded = None
+        self.output_file_paths = None
+        self.raw_frame_batches = None
+        self.noise_pred = None

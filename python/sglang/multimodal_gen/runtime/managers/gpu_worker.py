@@ -53,6 +53,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.realtime.session import (
+    RealtimeSessionCache,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -63,6 +66,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
+)
+from sglang.multimodal_gen.runtime.utils.realtime_video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -118,6 +125,24 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+
+    def release_realtime_session(self, session_id: str) -> OutputBatch:
+        """release the session of a realtime connection"""
+        if not session_id:
+            return OutputBatch(
+                output={
+                    "released": False,
+                    "session_id": session_id,
+                    "reason": "empty_session_id",
+                }
+            )
+
+        released = self._realtime_sessions.release(session_id)
+        if released:
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+        return OutputBatch(output={"released": released, "session_id": session_id})
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -309,6 +334,7 @@ class GPUWorker:
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
+            self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
@@ -354,21 +380,13 @@ class GPUWorker:
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            # file-path-only responses avoid serializing generated tensors between
-            # scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only:
-                save_output_paths(output_batch)
-                output_batch.output = None
-                output_batch.audio = None
-                output_batch.audio_sample_rate = None
+            self._materialize_output_transport(output_batch, req, save_output_paths)
 
-                if torch.cuda.is_initialized():
-                    torch.cuda.empty_cache()
-
-            # Keep return_frames payloads off the scheduler's tensor ZMQ path.
-            self._materialize_frame_outputs_for_return(output_batch, req)
-
-            if torch.cuda.is_initialized() and output_batch.output is None:
+            if (
+                torch.cuda.is_initialized()
+                and output_batch.output is None
+                and not req.return_raw_frames
+            ):
                 torch.cuda.empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
@@ -402,6 +420,54 @@ class GPUWorker:
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
         return output_batch
+
+    def _materialize_output_transport(
+        self,
+        output_batch: OutputBatch,
+        req: Req,
+        save_output_paths: Callable[[OutputBatch], None],
+    ) -> None:
+        if req.return_raw_frames:
+            self._materialize_raw_frame_transport(output_batch, req)
+        elif req.save_output and req.return_file_paths_only:
+            self._materialize_file_path_transport(output_batch, save_output_paths)
+        elif req.return_frames:
+            self._materialize_frame_outputs_for_return(output_batch, req)
+
+    def _materialize_raw_frame_transport(
+        self, output_batch: OutputBatch, req: Req
+    ) -> None:
+        if self.rank != 0:
+            return
+        if output_batch.output is not None:
+            output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
+            (
+                output_batch.raw_frame_batches,
+                output_batch.raw_frame_metadata,
+            ) = build_raw_rgb_frame_batches(
+                output_batch.output,
+                req,
+                output_batch,
+                post_process_sample,
+            )
+            output_batch.output = None
+        output_batch.audio = None
+        output_batch.audio_sample_rate = None
+
+    def _materialize_file_path_transport(
+        self,
+        output_batch: OutputBatch,
+        save_output_paths: Callable[[OutputBatch], None],
+    ) -> None:
+        # file-path-only responses avoid serializing generated tensors between
+        # scheduler_client and gpu_worker.
+        save_output_paths(output_batch)
+        output_batch.output = None
+        output_batch.audio = None
+        output_batch.audio_sample_rate = None
+
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
 
     def _materialize_frame_outputs_for_return(
         self, output_batch: OutputBatch, req: Req
