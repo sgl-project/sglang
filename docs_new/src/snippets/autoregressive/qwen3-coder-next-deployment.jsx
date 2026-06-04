@@ -57,7 +57,6 @@ export const Qwen3CoderNextDeployment = () => {
 
   const generateCommand = (values) => {
     const { hardware, quantization } = values;
-    const isXeon = hardware === 'xeon';
 
     const hwConfig = modelConfigs.default[hardware];
     if (!hwConfig) {
@@ -71,7 +70,7 @@ export const Qwen3CoderNextDeployment = () => {
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
 
-    if (isXeon) {
+    if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     }
 
@@ -82,7 +81,9 @@ export const Qwen3CoderNextDeployment = () => {
 
     // Apply commandRule from all options
     Object.entries(options).forEach(([key, option]) => {
-      if (option.condition && !option.condition(values)) return;
+      if (option.condition && !option.condition(values)) {
+        return;
+      }
       if (option.commandRule && values[key]) {
         const additionalCmd = option.commandRule(values[key], values);
         if (additionalCmd) {

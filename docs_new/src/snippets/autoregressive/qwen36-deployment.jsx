@@ -22,14 +22,10 @@ export const Qwen36Deployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      getDynamicItems: (values) => {
-        const isXeon = values.hardware === 'xeon';
-        return [
-          { id: 'fp8', label: 'FP8', default: !isXeon, disabled: false,
-            disabledReason: '' },
-          { id: 'bf16', label: 'BF16', default: isXeon },
-        ];
-      },
+      items: [
+        { id: 'fp8', label: 'FP8', default: true },
+        { id: 'bf16', label: 'BF16', default: false },
+      ],
     },
     reasoning: {
       name: 'reasoning',
@@ -89,14 +85,14 @@ export const Qwen36Deployment = () => {
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon: { bf16: { tp: 3, mem: 0.8 }, fp8: { tp: 3, mem: 0.8 } },
+      xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
     },
     '27b': {
       baseName: '27B',
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon: { bf16: { tp: 6, mem: 0.8 }, fp8: { tp: 6, mem: 0.8 } },
+      xeon: { bf16: { tp: 6 },           fp8: { tp: 6 } },
     },
   };
 
@@ -196,8 +192,9 @@ export const Qwen36Deployment = () => {
     if (hardware === 'b200') {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
     }
-
-    cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;
+    if (hwConfig.mem !== undefined) {
+      cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;
+    }
     return cmd;
   };
 

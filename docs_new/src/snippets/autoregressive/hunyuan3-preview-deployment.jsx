@@ -51,7 +51,7 @@ export const Hunyuan3PreviewDeployment = () => {
     b200:  { tp: 8, mem: 0.9 },
     b300:  { tp: 4, mem: 0.9 },
     gb300: { tp: 4, mem: 0.9 },
-    xeon:  { tp: 6, mem: 0.9 }
+    xeon:  { tp: 6 }
   };
 
   const resolveItems = (option, values) => {
@@ -132,7 +132,7 @@ export const Hunyuan3PreviewDeployment = () => {
     }
 
     cmd += ' \\\n  --trust-remote-code';
-    cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
+    if (memFraction !== undefined) cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
 
     if (isBlackwell && !isXeon) cmd += ' \\\n  --attention-backend trtllm_mha';
     if (isXeon) cmd += ' \\\n  --device cpu \\\n  --disable-overlap-schedule';

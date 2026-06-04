@@ -23,13 +23,10 @@ export const Qwen3NextDeployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      getDynamicItems: (values) => {
-        const isXeon = values.hardware === 'xeon';
-        return [
-          { id: 'bf16', label: 'BF16', subtitle: 'Full Weights', default: true },
-          { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false, disabled: false, disabledReason: '' }
-        ];
-      }
+      items: [
+        { id: 'bf16', label: 'BF16', subtitle: 'Full Weights', default: true },
+        { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false }
+      ]
     },
     thinking: {
       name: 'thinking',
@@ -52,13 +49,11 @@ export const Qwen3NextDeployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
-      getDynamicItems: (values) => {
-        const isXeon = values.hardware === 'xeon';
-        return [
-          { id: 'disabled', label: 'Disabled', default: true },
-          { id: 'enabled', label: 'Enabled', default: false, disabled: isXeon, disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : '' }
-        ];
-      },
+      condition: (values) => values.hardware !== 'xeon',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'enabled', label: 'Enabled', default: false }
+      ],
       commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null
     },
     mambaCache: {
