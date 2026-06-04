@@ -265,9 +265,20 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
     def _video_resize_config(self):
         video_processor = self._processor.video_processor
         image_factor = video_processor.patch_size * video_processor.merge_size
-        max_size = video_processor.max_size
+        # Newer M3 video processors (transformers BaseVideoProcessor, Qwen2VL-style)
+        # express their resize budget as a max_pixels area, not the older
+        # max_size / _max_size_from_size per-dimension API. Derive an equivalent
+        # square (max_w, max_h) cap from max_pixels so the pre-resize never exceeds
+        # the HF processor's smart_resize area budget.
+        max_size = getattr(video_processor, "max_size", None)
         if max_size is None:
-            max_size = video_processor._max_size_from_size(video_processor.size)
+            max_pixels = getattr(video_processor, "max_pixels", None)
+            if max_pixels is not None:
+                side = int(math.isqrt(int(max_pixels)))
+                side -= side % image_factor
+                max_size = (side, side)
+            else:
+                max_size = video_processor._max_size_from_size(video_processor.size)
         assert max_size is not None, "video processor max_size is required"
         return image_factor, max_size
 
