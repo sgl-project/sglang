@@ -160,9 +160,6 @@ class HiCacheAck(NamedTuple):
     # Estimated total bytes moved for this operation.
     byte_count: int
 
-    # Host-side fallback timer start. Used only if device event elapsed_time is unavailable.
-    start_time_ns: int
-
 
 class StorageOperation:
     counter = 0
@@ -263,6 +260,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        self._warned_unknown_host_pool_bytes = False
 
         # init L1/L2 transfer metrics collection (device-host transfers triggered by write/load).
         self.enable_l1_l2_transfer_metrics = enable_metrics
@@ -732,8 +730,6 @@ class HiCacheController:
         finish_event = device_module.Event()
 
         token_count = int(host_indices.numel())
-        start_time_ns = time.perf_counter_ns()
-
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -762,7 +758,6 @@ class HiCacheController:
                 finish_event=finish_event,
                 node_ids=op.node_ids,
                 token_count=token_count,
-                start_time_ns=start_time_ns,
             )
         )
 
@@ -818,8 +813,6 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
 
         token_count = int(host_indices.numel())
-        start_time_ns = time.perf_counter_ns()
-
         producer_event.start_event.record()
 
         with device_module.stream(self.load_stream):
@@ -855,7 +848,6 @@ class HiCacheController:
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
                 token_count=token_count,
-                start_time_ns=start_time_ns,
             )
         )
         return producer_id
@@ -1315,12 +1307,31 @@ class HiCacheController:
         Handles both a normal HostKVCache and HostPoolGroup-style wrappers.
         """
         if hasattr(self.mem_pool_host, "entries"):
-            return sum(
-                int(entry.host_pool.size_per_token)
-                for entry in self.mem_pool_host.entries
-            )
+            bytes_per_token = 0
+            for entry in self.mem_pool_host.entries:
+                size_per_token = getattr(entry.host_pool, "size_per_token", None)
+                if size_per_token is None:
+                    self._warn_unknown_host_pool_bytes(entry.host_pool)
+                    continue
+                bytes_per_token += int(size_per_token)
+            return bytes_per_token
 
-        return int(getattr(self.mem_pool_host, "size_per_token", 0))
+        size_per_token = getattr(self.mem_pool_host, "size_per_token", None)
+        if size_per_token is None:
+            self._warn_unknown_host_pool_bytes(self.mem_pool_host)
+            return 0
+
+        return int(size_per_token)
+
+    def _warn_unknown_host_pool_bytes(self, host_pool) -> None:
+        if self._warned_unknown_host_pool_bytes:
+            return
+        self._warned_unknown_host_pool_bytes = True
+        logger.warning(
+            "Unable to estimate HiCache L1/L2 transfer bytes for host pool type %s: "
+            "missing size_per_token.",
+            type(host_pool).__name__,
+        )
 
     def _estimate_l1_l2_transfer_bytes(self, token_count: int) -> int:
         """Estimate total bytes moved for one L1<->L2 transfer operation."""
@@ -1328,9 +1339,13 @@ class HiCacheController:
         total = int(token_count) * bytes_per_token
 
         if self.has_draft and self.mem_pool_host_draft is not None:
-            total += int(token_count) * int(
-                getattr(self.mem_pool_host_draft, "size_per_token", 0)
+            draft_size_per_token = getattr(
+                self.mem_pool_host_draft, "size_per_token", None
             )
+            if draft_size_per_token is None:
+                self._warn_unknown_host_pool_bytes(self.mem_pool_host_draft)
+            else:
+                total += int(token_count) * int(draft_size_per_token)
 
         return total
 
@@ -1341,9 +1356,10 @@ class HiCacheController:
         finish_event: device_module.Event,
         node_ids: List[int],
         token_count: int,
-        start_time_ns: int,
     ) -> HiCacheAck:
-        block_count = int(token_count) // int(self.page_size)
+        block_count = (int(token_count) + int(self.page_size) - 1) // int(
+            self.page_size
+        )
         byte_count = self._estimate_l1_l2_transfer_bytes(token_count)
 
         return HiCacheAck(
@@ -1353,19 +1369,14 @@ class HiCacheController:
             token_count=int(token_count),
             block_count=block_count,
             byte_count=byte_count,
-            start_time_ns=start_time_ns,
         )
 
-    def _transfer_elapsed_us(self, ack: HiCacheAck) -> int:
-        """Return transfer duration in microseconds.
-
-        Prefer device event timing. Fall back to host elapsed time for devices/backends
-        that do not expose elapsed_time().
-        """
+    def _transfer_elapsed_us(self, ack: HiCacheAck) -> Optional[int]:
+        """Return device-event transfer duration in microseconds, when available."""
         try:
             return max(0, int(ack.start_event.elapsed_time(ack.finish_event) * 1000))
         except Exception:
-            return max(0, int((time.perf_counter_ns() - ack.start_time_ns) // 1000))
+            return None
 
     def record_l1_l2_transfer_complete(
         self,
@@ -1402,15 +1413,15 @@ class HiCacheController:
         if should_log:
             ts_us = time.time_ns() // 1000
             logger.debug(
-                "%s transfer complete ts_us=%d blocks=%d bytes=%d xfer_us=%d "
+                "%s transfer complete ts_us=%d blocks=%d bytes=%d xfer_us=%s "
                 "bandwidth=%.2fGB/s "
                 'src="%s" dst="%s"',
                 action,
                 ts_us,
                 ack.block_count,
                 ack.byte_count,
-                xfer_us,
-                ack.byte_count * 0.001 / xfer_us if xfer_us > 0 else 0,
+                xfer_us if xfer_us is not None else "unavailable",
+                ack.byte_count * 0.001 / xfer_us if xfer_us else 0,
                 src,
                 dst,
             )
@@ -1430,7 +1441,8 @@ class HiCacheController:
             totals["events"] += 1
             totals["blocks"] += ack.block_count
             totals["bytes"] += ack.byte_count
-            totals["xfer_us"] += xfer_us
+            if xfer_us is not None:
+                totals["xfer_us"] += xfer_us
 
             logger.debug(
                 '%s transfer cumulative direction="%s" total_events=%d '
@@ -1443,7 +1455,11 @@ class HiCacheController:
                 totals["blocks"],
                 totals["bytes"],
                 totals["xfer_us"],
-                totals["bytes"] * 0.001 / totals["xfer_us"] if totals["xfer_us"] > 0 else 0,
+                (
+                    totals["bytes"] * 0.001 / totals["xfer_us"]
+                    if totals["xfer_us"] > 0
+                    else 0
+                ),
                 src,
                 dst,
             )
