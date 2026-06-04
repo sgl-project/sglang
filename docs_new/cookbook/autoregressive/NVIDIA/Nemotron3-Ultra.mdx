@@ -35,12 +35,14 @@ Available model variants on HuggingFace:
 
 ## 2. SGLang Installation
 
-SGLang from the main branch is required for Nemotron3-Ultra. You can install from source and with a nightly docker.
+Nemotron3-Ultra support has not yet propagated to `lmsysorg/sglang:latest` or any stable release. Pull one of the two dedicated images below — matching your CUDA version — to get a runtime with Nemotron3-Ultra support.
 
 ```bash Command
+# CUDA 12 (H100 / H200 / B200)
+docker pull lmsysorg/sglang:dev-nemotron3-ultra
 
-# Or use Docker
-docker pull lmsysorg/sglang:v0.5.11
+# CUDA 13 (B200 / B300 / GB200 / GB300)
+docker pull lmsysorg/sglang:dev-cu13-nemotron3-ultra
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
