@@ -89,6 +89,58 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         pass
 
     # ------------------------------------------------------------------
+    # Resolution alignment  (Wan patch embedding requires even spatial dims)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        """Snap batch.height / batch.width to even multiples before progressive loop.
+
+        Wan's patch embedding is Conv3d(stride=(1,2,2)), so each progressive
+        stage latent must have even H and W.  At L levels of downsampling the
+        initial latent is H_lat//(2^L) × W_lat//(2^L); if either is odd the
+        patchification fails with a tensor size mismatch.
+
+        Fix: align batch.height/width down to the nearest multiple of
+        vae_scale_factor * 2^L * 2  (= vae_scale * align_unit) so that every
+        stage latent is guaranteed even.  For 480p L=1 this is a no-op (60 is
+        already divisible by 4).  For 720p L=1: 90→88 latent rows (704 px).
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
+            _PROGRESSIVE_MODES,
+        )
+
+        mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
+        if mode not in _PROGRESSIVE_MODES:
+            return super().forward(batch, server_args)
+
+        levels = int(getattr(batch, "progressive_levels", 1))
+        arch = server_args.pipeline_config.vae_config.arch_config
+        vae_scale = getattr(arch, "vae_scale_factor", None) or getattr(
+            arch, "spatial_compression_ratio", 8
+        )
+        # Each stage halves the spatial dims; Wan needs even dims at every stage.
+        # Required: H_lat divisible by 2^L * patch_spatial (= 2^L * 2).
+        align_pixels = vae_scale * (2**levels) * 2
+        h_aligned = (batch.height // align_pixels) * align_pixels
+        w_aligned = (batch.width // align_pixels) * align_pixels
+
+        if h_aligned != batch.height or w_aligned != batch.width:
+            logger.info(
+                "WanProgressiveDenoisingStage: aligning resolution %dx%d → %dx%d "
+                "so all progressive stage latents have even spatial dims (patch=2, L=%d)",
+                batch.height,
+                batch.width,
+                h_aligned,
+                w_aligned,
+                levels,
+            )
+            batch.height = h_aligned
+            batch.width = w_aligned
+
+        return super().forward(batch, server_args)
+
+    # ------------------------------------------------------------------
     # Initial noise  (must include the temporal dim T_lat)
     # ------------------------------------------------------------------
 
