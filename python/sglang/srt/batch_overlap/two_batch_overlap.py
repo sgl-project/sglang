@@ -761,6 +761,14 @@ class TboForwardBatchPreparer:
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
+                # TBO children start unplanned: each sub-batch's attention
+                # metadata is established by the TBO-aware init flow, so the
+                # plan marker / record must not carry over from the parent
+                # (a stale "ready" would wrongly skip the child's planning).
+                forward_metadata_ready=False,
+                forward_metadata_planned_bs=None,
+                forward_metadata_planned_num_tokens=None,
+                forward_metadata_replan_equivalent=False,
             )
         )
 
