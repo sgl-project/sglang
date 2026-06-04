@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanRMS_norm,
     WanUpsample,
     attention_block_forward,
+    causal_conv3d_cat_pad,
     match_conv3d_input_format,
     mid_block_forward,
     resample_forward,
@@ -329,12 +330,7 @@ class WanDistCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-
-        x = F.pad(x, padding)
+        x = causal_conv3d_cat_pad(x, cache_x, padding)
 
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)

@@ -6,6 +6,9 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
+if current_platform.is_cuda():
+    from sglang.jit_kernel.diffusion.triton.wan_vae_pad import fused_causal_conv3d_cat_pad
+
 
 def _channels_last_3d_supported_by_platform() -> bool:
     return hasattr(torch, "channels_last_3d") and (
@@ -126,6 +129,44 @@ class DupUp3D(nn.Module):
         return x
 
 
+def _can_fuse_causal_conv3d_cat_pad(
+    x: torch.Tensor,
+    cache_x: torch.Tensor | None,
+    padding: list[int],
+) -> bool:
+    if cache_x is None:
+        return False
+    if not current_platform.is_cuda() or not x.is_cuda:
+        return False
+    if not x.is_contiguous() or not cache_x.is_contiguous():
+        return False
+    width_left, width_right, height_top, height_bottom, depth_left, depth_right = (
+        padding
+    )
+    if width_left != width_right or height_top != height_bottom or depth_right != 0:
+        return False
+    if depth_left < cache_x.shape[2]:
+        return False
+    return bool(width_left or height_top)
+
+
+def causal_conv3d_cat_pad(
+    x: torch.Tensor,
+    cache_x: torch.Tensor | None,
+    padding: list[int],
+) -> torch.Tensor:
+    if cache_x is not None and padding[4] > 0:
+        if cache_x.device != x.device:
+            cache_x = cache_x.to(x.device)
+        if _can_fuse_causal_conv3d_cat_pad(x, cache_x, padding):
+            return fused_causal_conv3d_cat_pad(x, cache_x, padding)
+        x = torch.cat([cache_x, x], dim=2)
+        padding[4] -= cache_x.shape[2]
+    if any(padding):
+        x = F.pad(x, padding)
+    return x
+
+
 class WanCausalConv3d(nn.Conv3d):
     r"""
     A custom 3D causal convolution layer with feature caching support.
@@ -163,11 +204,7 @@ class WanCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+        x = causal_conv3d_cat_pad(x, cache_x, padding)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
         )  # casting needed if amp isn't supported
