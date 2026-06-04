@@ -1359,6 +1359,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             has_host = cur.component_data[ct].host_value is not None
 
             if has_device:
+                # cur just became a device leaf; let components re-apply their
+                # per-leaf invariants (SWA caps a long prefix to one window).
+                for component in self._components_tuple:
+                    component.on_became_leaf(cur)
                 self._update_evictable_leaf_sets(cur)
                 break
 

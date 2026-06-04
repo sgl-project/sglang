@@ -282,6 +282,10 @@ class SWAComponent(TreeComponent):
 
         self._maybe_split_leaf_for_swa_lock(node)
 
+    def on_became_leaf(self, node: UnifiedTreeNode) -> None:
+        # Re-apply the insert-time one-window cap when a long prefix becomes a leaf.
+        self._maybe_split_leaf_for_swa_lock(node)
+
     def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
         """Cap a fresh SWA leaf at one page-aligned window so locking it pins
         only one window of SWA pool, not the whole (long chunked-prefill) leaf.
