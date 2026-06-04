@@ -115,6 +115,47 @@ The generator currently picks values on the **conservative** side (mirroring an 
 - `max-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP currently requires `SGLANG_ENABLE_SPEC_V2=1`.
 
+**EPLB + DeepEP Waterfill (Experimental)**
+
+For recorded/static EPLB reproduction, first record an expert-distribution file by following
+[Capture expert selection distribution in MoE models](../../../docs/basic_usage/native_api.mdx#capture-expert-selection-distribution-in-moe-models).
+For reproduction runs, use the generated `expert_distribution_recorder_*.pt` as
+the initial expert location. **Please checkout to latest main branch for this feature.**
+
+For non-PD reproduction, use:
+
+```bash Command
+--moe-a2a-backend deepep \
+--deepep-mode auto \
+--init-expert-location /path/to/expert_distribution_recorder_*.pt \
+--enable-deepep-waterfill
+```
+
+For PD-Disagg reproduction, use `normal` mode on the prefill server and
+`low_latency` mode on the decode server. Add the same `--init-expert-location`
+flag to both commands:
+
+```bash Command
+# prefill
+--moe-a2a-backend deepep \
+--deepep-mode normal \
+--init-expert-location /path/to/expert_distribution_recorder_*.pt \
+--enable-deepep-waterfill
+
+# decode
+--moe-a2a-backend deepep \
+--deepep-mode low_latency \
+--init-expert-location /path/to/expert_distribution_recorder_*.pt \
+--enable-deepep-waterfill
+```
+
+You can also add `--ep-num-redundant-experts` and `--eplb-algorithm` to customize
+EPLB placement.
+
+MegaMoE is not supported with this DeepEP Waterfill recipe yet. Waterfill routes
+the shared expert through DeepEP for load balancing, so `--enable-deepep-waterfill`
+requires `--moe-a2a-backend deepep`.
+
 <a id="hopper-note" />
 
 **Hopper (H200) note**

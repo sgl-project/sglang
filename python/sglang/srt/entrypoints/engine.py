@@ -259,7 +259,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Enable tracing
         if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            process_tracing_init(
+                server_args.otlp_traces_endpoint,
+                "sglang",
+                trace_modules=server_args.trace_modules,
+            )
             thread_label = "Tokenizer"
             if server_args.disaggregation_mode == "prefill":
                 thread_label = "Prefill Tokenizer"
@@ -296,7 +300,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
-                logger.warning(
+                logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
                 return None
@@ -348,6 +352,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -399,6 +404,7 @@ class Engine(EngineScoreMixin, EngineBase):
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
@@ -462,6 +468,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -512,6 +519,7 @@ class Engine(EngineScoreMixin, EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
@@ -1317,7 +1325,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.11.post1",
+                "0.6.12",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
