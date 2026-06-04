@@ -154,7 +154,6 @@ class EmbeddingData:
             self.shape = embedding_shape
         else:
             self.shape = list(embedding.shape) if embedding is not None else None
-        self.cached_embedding = None
         self.error_msg = error_msg
         self.error_code = error_code
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
@@ -184,8 +183,7 @@ class EmbeddingData:
             error_code=self.error_code,
         )
         for key, value in self.__dict__.items():
-            # cached_embedding is a GPU tensor used only by mooncake's in-process
-            if key.startswith("_") or key in ("embedding", "cached_embedding"):
+            if key.startswith("_") or key in ("embedding",):
                 continue
             setattr(new_data, key, value)
         return new_data
@@ -753,7 +751,6 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 return
             response_json_list = [await r.json() for r in responses]
 
-            # Sort by part_idx
             embedding_sizes, response_sorted, total_bytes = (
                 _sort_responses_and_compute_total_bytes(
                     response_json_list, total_num_parts
@@ -813,20 +810,20 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
-                r = encode_requests_by_part[idx]
-                send_payload = {
-                    "req_id": r["req_id"],
-                    "part_idx": idx,
-                    "prefill_host": self.host_name,
-                    "embedding_port": self.embedding_port,
-                    "session_id": self.embeddings_engine.session_id,
-                    "buffer_address": offset + buffer_address,
-                    "receive_count": self.receive_count,
-                }
+                rj = response_sorted[idx]
+                rj.update(
+                    {
+                        "prefill_host": self.host_name,
+                        "embedding_port": self.embedding_port,
+                        "session_id": self.embeddings_engine.session_id,
+                        "buffer_address": offset + buffer_address,
+                        "receive_count": self.receive_count,
+                    }
+                )
                 send_tasks.append(
                     session.post(
-                        f"{self.encoder_urls[r['encoder_idx']]}/send",
-                        json=send_payload,
+                        f"{self.encoder_urls[encode_requests_by_part[idx]['encoder_idx']]}/send",
+                        json=rj,
                     )
                 )
                 offset += embedding_sizes[idx]
