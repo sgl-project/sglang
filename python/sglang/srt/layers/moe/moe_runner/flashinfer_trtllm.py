@@ -571,11 +571,15 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
 def _pack_topk_for_flashinfer_routed(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor
 ) -> torch.Tensor:
-    """Pack routed top-k tensors into FlashInfer's int32 format."""
-    packed_ids = topk_ids.to(torch.int32)
-    packed_weights = topk_weights.to(torch.bfloat16)
-    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    return packed
+    """Pack routed top-k tensors into FlashInfer's int32 format.
+
+    Single fused Triton launch (bit-identical to the prior elementwise
+    cast/shift/or cluster); collapses the per-MoE-layer pack kernels on the
+    decode critical path.
+    """
+    from sglang.jit_kernel.flashinfer_trtllm_moe.topk_pack import fused_pack_topk
+
+    return fused_pack_topk(topk_ids, topk_weights)
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -583,6 +587,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
+    use_sgl_kernel: bool = False,
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
@@ -663,7 +668,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 topk_weights=topk_output.topk_weights,
             )
 
-            output = trtllm_fp8_block_scale_routed_moe_wrapper(
+            if use_sgl_kernel:
+                from sglang.srt.layers.moe.sgl_flashinfer_trtllm_moe import (
+                    sgl_trtllm_fp8_block_scale_routed_moe_wrapper as fp8_routed_moe,
+                )
+            else:
+                fp8_routed_moe = trtllm_fp8_block_scale_routed_moe_wrapper
+
+            output = fp8_routed_moe(
                 topk_ids=packed_topk_ids,
                 routing_bias=None,
                 hidden_states=a_q,
@@ -697,7 +709,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-            output = trtllm_fp8_block_scale_moe_wrapper(
+            if use_sgl_kernel:
+                from sglang.srt.layers.moe.sgl_flashinfer_trtllm_moe import (
+                    sgl_trtllm_fp8_block_scale_moe_wrapper as fp8_moe,
+                )
+            else:
+                fp8_moe = trtllm_fp8_block_scale_moe_wrapper
+
+            output = fp8_moe(
                 routing_logits=router_logits,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
@@ -788,6 +807,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     return StandardCombineInput(hidden_states=output)
 
 
+# === sgl_flashinfer_trtllm LoRA dispatch lives in lora/trtllm_moe/ ===
+# Re-export so existing import sites continue to resolve; the body was
+# moved to keep this file focused on the non-LoRA trtllm paths.
+from sglang.srt.lora.trtllm_moe.lora_dispatch import (  # noqa: E402,F401
+    fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora,
+    fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora,
+)
+
+
 @dataclass
 class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP4 MoE kernels."""
@@ -872,7 +900,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    # Quantize hidden states to FP4
+    # Quantize hidden states to FP4. Per-token activation (env-gated, default off) is needed only
+    # for the NVFP4 LoRA decomposed-scale path (sgl_flashinfer_trtllm); no-lora keeps the cheaper
+    # per-tensor quant. Gate must match the input_scale==1 weight-prep in modelopt_quant.
     if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
         from flashinfer import SfLayout, nvfp4_quantize
 
@@ -1176,6 +1206,22 @@ def fused_experts_none_to_flashinfer_trtllm(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm: {type(quant_info)}"
+    )
+
+
+@register_fused_func("none", "sgl_flashinfer_trtllm")
+def fused_experts_none_to_sgl_flashinfer_trtllm(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        return fused_experts_none_to_flashinfer_trtllm_fp8(
+            dispatch_output, quant_info, runner_config, use_sgl_kernel=True
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for sgl_flashinfer_trtllm: {type(quant_info)}. "
+        "The copied backend currently supports the FP8 Qwen path only."
     )
 
 

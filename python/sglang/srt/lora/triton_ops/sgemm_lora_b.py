@@ -108,7 +108,7 @@ def _sgemm_lora_b_kernel(
             mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
             other=0.0,
         )
-        partial_sum += tl.dot(x_tile, w_tile)
+        partial_sum += tl.dot(x_tile.to(w_tile.dtype), w_tile)  # cast fused: split-K returns fp32, plain path bf16 (no-op)
 
         x_ptrs += BLOCK_K * x_stride_1
         w_ptrs += BLOCK_K * w_stride_2

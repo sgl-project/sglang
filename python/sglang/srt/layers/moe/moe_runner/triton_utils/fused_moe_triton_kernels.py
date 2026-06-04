@@ -379,6 +379,7 @@ def fused_moe_kernel(
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
+    MASK_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
 ):
@@ -441,10 +442,9 @@ def fused_moe_kernel(
 
     if filter_expert and off_experts == -1:
         # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
-        if not FUSE_ADD_TO_OUTPUT:
-            # skip the zero-write to preserve existing values.
+        if not FUSE_ADD_TO_OUTPUT and not FUSE_SUM_ALL_REDUCE:
+            # Write zeros only when this kernel owns the full output buffer.
+            # Direct-add modes must preserve the base output from another kernel.
             write_zeros_to_output(
                 c_ptr,
                 stride_cm,
@@ -616,6 +616,16 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
         existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
         tl.store(c_ptrs, existing + accumulator, mask=c_mask)
+    elif MASK_OUTPUT:
+        # Store a fresh output while zeroing rows whose request has no active LoRA.
+        offs_token_out = offs_token // ROUTER_TOPK
+        output_mask = tl.load(
+            add_mask_ptr + offs_token_out, mask=token_mask, other=False
+        )
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        accumulator = tl.where(output_mask[:, None], accumulator, 0.0)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
     elif FUSE_SUM_ALL_REDUCE:
         offs_token_out = offs_token // ROUTER_TOPK
         c_ptrs = (
@@ -731,6 +741,7 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
+    mask_output: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -807,6 +818,14 @@ def invoke_fused_moe_kernel(
         assert (
             add_output_mask is not None
         ), "add_output_mask required when fuse_add_to_output=True"
+    if mask_output:
+        assert (
+            not fuse_add_to_output
+        ), "mask_output and fuse_add_to_output are mutually exclusive"
+        assert (
+            not fuse_sum_all_reduce
+        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        assert add_output_mask is not None, "add_output_mask required when mask_output=True"
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -924,6 +943,7 @@ def invoke_fused_moe_kernel(
             filter_expert=filter_expert,
             swap_ab=swap_ab,
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
+            MASK_OUTPUT=mask_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             **config,

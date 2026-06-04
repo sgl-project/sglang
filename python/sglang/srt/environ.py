@@ -421,6 +421,15 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Split-K for the dense LoRA-A (shrink) GEMM. At decode the shrink grid is
+    # bs programs (one per sequence), far below the SM count, so the large-K
+    # reduction under-fills the GPU. Splitting K across SPLIT_K programs that
+    # accumulate via fp32 atomics recovers the idle SMs. fp32 (not bf16) atomics
+    # are mandatory here: bf16 atomic_add is an emulated CAS loop that contends
+    # and caps the win, while native fp32 atomics scale and are more accurate.
+    # Only helps at large K (>=~2-4K input dim) and low batch; the heuristic
+    # returns SPLIT_K=1 (original path) otherwise. Opt-in; default off is a no-op.
+    SGLANG_ENABLE_LORA_SHRINK_SPLIT_K = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -444,8 +453,30 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
-    # Enable per-token NVFP4 activation scaling path for FlashInfer TRT-LLM MoE.
+    # NVFP4 per-token activation scaling for the flashinfer-trtllm MoE. Default OFF (per-tensor,
+    # faster — main's behavior). Set =1 when serving NVFP4 LoRA on the sgl_flashinfer_trtllm
+    # backend: the decomposed LoRA scale composition needs w13/w2 input_scale==1 (see
+    # lora/trtllm_moe/lora_dispatch.py path-3 comment). Leaving it OFF for no-lora avoids the
+    # ~9-13% per-token overhead on the no-lora base.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Token-count ceiling for the trtllm-LoRA decode two-stream overlap (now ALWAYS-ON): decode batches
+    # with <= this many tokens run two-stream; larger batches run single-stream. NOTE: the LoRA
+    # two-stream (attention + gate_up) overlap and the permute-memset skip are now unconditional
+    # (their env gates were removed — proven useful). The down-proj overlap is DISABLED (load-triggered
+    # cuda-graph/NCCL race → decode garbage; see moe_overlap.py `_overlap_down`).
+    SGLANG_TWO_STREAM_MAX_TOKENS = EnvInt(256)
+    # Allocate the two-stream LoRA-A shrink OUTPUT buffer on the MAIN (consumer) stream instead of
+    # inside the side-stream context. A buffer allocated under `with torch.cuda.stream(side)` is tagged
+    # to the side stream, so the caching allocator can free/reuse it on the side stream's schedule —
+    # before the MAIN stream's LoRA-B expand (the real last consumer) finishes. Under cuda-graph replay
+    # (record_stream is a no-op during capture) that's a premature-reuse WAR → qwen3.5 mamba decode
+    # garbage with a single shared side stream. Set =1 to allocate the output on the consumer stream
+    # (as the MoE O1 path already does for gate_up_delta), making a single shared side stream graph-safe.
+    SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC = EnvBool(False)
+    # WIP (unstaged, test-only): tuned triton a_stage_config for the MoE LoRA shrink GEMM. Default off.
+    # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
+    # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
+    SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

@@ -121,6 +121,13 @@ class LoRAManager:
             num_tokens_per_bs=num_tokens_per_bs,
         )
 
+        # Pre-capture: create the LoRA two-stream side stream now (no-op unless
+        # SGLANG_LORA_TWO_STREAM=1) so the torch.cuda.Stream() driver call never
+        # lands inside a cuda-graph capture region.
+        from sglang.srt.lora.trtllm_moe import init_lora_two_stream_resources
+
+        init_lora_two_stream_resources(self.device)
+
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer
     ):

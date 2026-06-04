@@ -119,6 +119,7 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return (
             b.is_flashinfer_cutlass()
             or b.is_flashinfer_cutedsl()
+            or b.is_sgl_flashinfer_trtllm()
             or b.is_flashinfer_trtllm_routed()
         )
     except Exception:  # pragma: no cover - backend not initialized
