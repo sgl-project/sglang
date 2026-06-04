@@ -49,6 +49,18 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             and get_ulysses_parallel_world_size() > 1
         )
 
+    def _prepare_camera_modulation_cache_policy(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        if "lingbot_camera_modulation_cache_enabled" in batch.extra:
+            return
+        batch.extra["lingbot_camera_modulation_cache_enabled"] = bool(
+            server_args.performance_mode == "speed"
+            or self._causal_sequence_shard_enabled(batch)
+        )
+
     def _num_causal_cache_attention_heads(
         self,
         *,
@@ -265,6 +277,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        self._prepare_camera_modulation_cache_policy(batch, server_args)
+
         # --- Condition: take current chunk's slice ---
         condition_full = batch.image_latent
         assert condition_full is not None, (

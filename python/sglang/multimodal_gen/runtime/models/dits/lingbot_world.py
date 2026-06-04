@@ -1287,6 +1287,20 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             c2ws_plucker_emb.device.index,
         )
 
+    @staticmethod
+    def _camera_modulation_cache_enabled(
+        forward_batch,
+        *,
+        sequence_shard_enabled: bool,
+    ) -> bool:
+        if sequence_shard_enabled:
+            return True
+        extra = getattr(forward_batch, "extra", None)
+        return bool(
+            extra is not None
+            and extra.get("lingbot_camera_modulation_cache_enabled", False)
+        )
+
     def _get_camera_modulation_cache(
         self,
         forward_batch,
@@ -1393,9 +1407,13 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         c2ws_plucker_emb = self._prepare_c2ws_plucker_emb(
             hidden_states, c2ws_plucker_emb, forward_batch
         )
+        camera_modulation_cache_enabled = self._camera_modulation_cache_enabled(
+            forward_batch,
+            sequence_shard_enabled=sequence_shard_enabled,
+        )
         camera_modulation_cache_key = (
             self._camera_modulation_cache_key(c2ws_plucker_emb)
-            if c2ws_plucker_emb is not None
+            if camera_modulation_cache_enabled and c2ws_plucker_emb is not None
             else None
         )
         if sequence_shard_enabled:

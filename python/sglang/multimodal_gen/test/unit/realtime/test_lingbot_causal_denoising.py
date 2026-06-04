@@ -229,6 +229,63 @@ def test_lingbot_camera_modulation_cache_reuses_until_key_changes():
     assert reset == {}
 
 
+def test_lingbot_camera_modulation_cache_enabled_policy():
+    model = CausalLingBotWorldTransformer3DModel.__new__(
+        CausalLingBotWorldTransformer3DModel
+    )
+
+    assert not model._camera_modulation_cache_enabled(
+        SimpleNamespace(extra={}),
+        sequence_shard_enabled=False,
+    )
+    assert model._camera_modulation_cache_enabled(
+        SimpleNamespace(extra={}),
+        sequence_shard_enabled=True,
+    )
+    assert model._camera_modulation_cache_enabled(
+        SimpleNamespace(extra={"lingbot_camera_modulation_cache_enabled": True}),
+        sequence_shard_enabled=False,
+    )
+
+
+def test_lingbot_camera_modulation_cache_stage_policy(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
+        lingbot_world_causal_denoising as lingbot_denoising,
+    )
+
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    explicit = SimpleNamespace(
+        extra={"lingbot_camera_modulation_cache_enabled": False},
+        enable_sequence_shard=True,
+    )
+    stage._prepare_camera_modulation_cache_policy(
+        explicit,
+        SimpleNamespace(performance_mode="speed"),
+    )
+    assert explicit.extra["lingbot_camera_modulation_cache_enabled"] is False
+
+    speed = SimpleNamespace(extra={}, enable_sequence_shard=False)
+    stage._prepare_camera_modulation_cache_policy(
+        speed,
+        SimpleNamespace(performance_mode="speed"),
+    )
+    assert speed.extra["lingbot_camera_modulation_cache_enabled"] is True
+
+    monkeypatch.setattr(
+        lingbot_denoising,
+        "get_ulysses_parallel_world_size",
+        lambda: 2,
+    )
+    sequence_shard = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    stage._prepare_camera_modulation_cache_policy(
+        sequence_shard,
+        SimpleNamespace(performance_mode="auto"),
+    )
+    assert sequence_shard.extra["lingbot_camera_modulation_cache_enabled"] is True
+
+
 def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready():
     class _ConditionEmbedder:
         def __init__(self):
