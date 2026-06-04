@@ -68,7 +68,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
     const int32_t src_index = static_cast<int32_t>(src_indices[i]);
     const int32_t dst_index = static_cast<int32_t>(dst_indices[i]);
     for (uint32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
-      device::hisparse::transfer_item<device::hisparse::TransferDirection::DeviceToDevice>(
+      device::hisparse::transfer_item(
           /*dst_cache=*/dst_caches[layer_id],
           /*src_cache=*/src_caches[layer_id],
           /*dst_index=*/dst_index,
@@ -436,7 +436,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       // DSv4 path: page-padded device layout + page-padded host layout, K-only.
       // The host cache is pinned DRAM but uses the same row layout as the GPU C4
       // cache, so use the page-padded address calculation for both ends.
-      device::hisparse::transfer_item<device::hisparse::TransferDirection::DeviceToDevice>(
+      device::hisparse::transfer_item(
           /*dst_cache=*/device_buffer_k,
           /*src_cache=*/const_cast<void*>(host_cache_k),
           /*dst_index=*/static_cast<int32_t>(dst_loc),
