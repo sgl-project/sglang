@@ -11,13 +11,6 @@ permissions:
 
 jobs:
   sync:
-    # Only run on the canonical repository's main branch:
-    # - The repository guard stops every fork that has Actions enabled from
-    #   running this scheduled job and pushing the generated commit to its own
-    #   (unprotected) branch, which then leaks into contributors' pull requests.
-    # - The ref guard stops a stray manual `workflow_dispatch` on any other
-    #   branch from operating against a non-main ref. (Scheduled runs already
-    #   only ever run on the default branch.)
     if: github.repository == 'sgl-project/sglang' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
@@ -35,10 +28,6 @@ jobs:
         run: python docs_new/scripts/update_lmsys_sglang_blogs.py
 
       - name: Open or update pull request
-        # `main` is protected and cannot be pushed to directly, so propose the
-        # change through a pull request opened with the GitHub CLI (`gh`, which
-        # is pre-installed on the runner -- no third-party action). This step is
-        # a no-op when the generated cards are unchanged.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -51,7 +40,7 @@ jobs:
 
           BRANCH="auto/lmsys-blog-cards"
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Recreate the bot branch as "current main + card diff" and overwrite
           # any previous state, so the PR always shows a clean single-commit diff.
