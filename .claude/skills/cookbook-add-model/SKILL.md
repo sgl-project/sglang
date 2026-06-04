@@ -87,7 +87,9 @@ benchmarks (Phases 2 + 4); everything else is filling the template.
    `python -m sglang.launch_server` to `sglang serve` form.
 5. **Pre-flight**: `gh pr list --repo sgl-project/sglang --search "<model>"` (dup check).
 
-**Hardware reference** (matches the engine's `HARDWARE_CATALOG`):
+**Hardware reference** (the shared `HARDWARE_CATALOG` in `_deployment.jsx`). A GPU **not** in
+this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.hardware`
+(`{id,label,vram,vendor}`) — the engine merges it in; don't edit the engine catalog:
 
 | Platform | Vendor | VRAM | Docker image |
 |---|---|---|---|
@@ -123,7 +125,8 @@ benchmarks (Phases 2 + 4); everything else is filling the template.
 3. **Prune** to what the model supports (delete, don't stub) — using
    [references/authoring-reference.md](references/authoring-reference.md):
    - `supportedHardware` + the EXAMPLE cells: keep your tested families; **delete the
-     `mi*` ids + AMD example cell if no AMD recipe**, etc.
+     `mi*` ids + AMD example cell if no AMD recipe**, etc. A GPU not in the shared catalog
+     (e.g. RTX PRO 6000) → declare it in `config.hardware` and add its id here.
    - `playgroundFeatures` axes: delete `megamoe` (non-Blackwell-MoE), `hisparse`
      (non-DSA), `pdDisagg`/`router` (no PD), the `parsers` axis (no parsers), etc.
    - `quantizations` / `variants`: drop what the model doesn't ship; collapse `variants`

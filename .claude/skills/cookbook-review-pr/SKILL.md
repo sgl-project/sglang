@@ -43,7 +43,9 @@ than restating.
 - Single `export const config = { ... }` literal — **no** function calls, spreads,
   fragment refs, or IIFE (Mintlify re-evals at hydration → `ReferenceError`).
 - No `!(x in y)` anywhere (Mintlify AST walker crashes) — use `obj.key === undefined`.
-- `supportedHardware` ⊆ the `HARDWARE_CATALOG` keys in `_deployment.jsx`.
+- `supportedHardware` ⊆ `HARDWARE_CATALOG` (in `_deployment.jsx`) ∪ `config.hardware`. A
+  model-specific GPU the shared catalog lacks must be declared in `config.hardware`
+  (`{id,label,vram,vendor}`), **not** added to the engine catalog.
 - `placeholders` declares every `{{KEY}}` used in `curl` or any cell.
 - `modelNames` covers every cell (by `hw|variant|quant` triple or `variant|quant` pair).
 - `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).
@@ -56,7 +58,7 @@ than restating.
 - **No leftover `__TOKEN__`** — the config was stamped from the template and every
   placeholder is filled (`grep -rn '__[A-Z_]*__'` on the new config/benchmarks/MDX returns
   nothing).
-- **All-hardware considered**: every `supportedHardware` id has ≥1 cell OR is a deliberate
+- **All-hardware considered**: every `supportedHardware` id (from the catalog or `config.hardware`) has ≥1 cell OR is a deliberate
   greyed "coming soon"; AMD was pruned or kept on purpose (not a leftover template family).
 
 ### 3. Cells / 5-dim matrix

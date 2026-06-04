@@ -7,6 +7,14 @@ export const config = {
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
     "mi300x", "mi325x", "mi350x", "mi355x",
+    "rtx6000",
+  ],
+
+  // Model-specific GPUs the shared HARDWARE_CATALOG doesn't carry — the engine
+  // merges these in, so a model-specific GPU is config data, not an engine edit.
+  // RTX PRO 6000 (SM120 / Blackwell Desktop) is a workstation card, not datacenter.
+  hardware: [
+    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "nvidia" },
   ],
 
   variants: [
@@ -131,6 +139,7 @@ sgl-eval run aime25 \\
     b300:  "lmsysorg/sglang:latest",
     gb200: "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
+    rtx6000: "lmsysorg/sglang:latest",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -1178,6 +1187,26 @@ sgl-eval run aime25 \\
         "--tp 16",
         "--moe-runner-backend marlin",
         "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // RTX PRO 6000 (SM120 / Blackwell Desktop) — Flash + low-latency only
+    // (V4-Pro doesn't fit on 8× 96 GB); TP-only, Marlin MoE runner.
+    // ====================================================================
+    {
+      match: { hw: "rtx6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend marlin",
+        "--mem-fraction-static 0.70",
+        "--cuda-graph-max-bs 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

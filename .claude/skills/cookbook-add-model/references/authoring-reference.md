@@ -28,7 +28,8 @@ the full contract):
 | Field | Type | Purpose |
 |---|---|---|
 | `modelName` | string | Display label only. Not used for HF slug — see `modelNames`. |
-| `supportedHardware` | `string[]` | Which hw ids appear in the catalog. Subset of the keys in `HARDWARE_CATALOG` in `_deployment.jsx`. Listing an id makes its button appear; if no cell uses it, the engine greys it out automatically. |
+| `supportedHardware` | `string[]` | Which hw ids appear in the catalog. Subset of `HARDWARE_CATALOG` (in `_deployment.jsx`) ∪ `config.hardware`. Listing an id makes its button appear; if no cell uses it, the engine greys it out automatically. |
+| `hardware` | `{id,label,vram,vendor}[]` | Optional. GPUs the shared `HARDWARE_CATALOG` doesn't carry (workstation / desktop / future chips, e.g. RTX PRO 6000). The engine merges these into the catalog, so a model-specific GPU is config data — **no engine-catalog edit**. Also add the id to `supportedHardware`. |
 | `variants` | `{id, label, subtitle?}[]` | 2nd-dim option list. Use `default` / single-element if the model has no variant axis. |
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
 | `strategies` | `{id, label}[]` | 4th-dim option list. Common ids: `low-latency`, `balanced`, `high-throughput`. |

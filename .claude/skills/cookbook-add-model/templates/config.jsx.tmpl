@@ -28,6 +28,14 @@ export const config = {
     "mi300x", "mi325x", "mi350x", "mi355x",
   ],
 
+  // OPTIONAL — declare GPUs the shared HARDWARE_CATALOG (in _deployment.jsx) doesn't
+  // carry (workstation / desktop / future chips). The engine merges these in, so a
+  // model-specific GPU is config data, never an engine-catalog edit. Add the id to
+  // supportedHardware above too. Delete if you only use catalog GPUs.
+  // hardware: [
+  //   { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "nvidia" },
+  // ],
+
   // 2nd dim. Single-element `default` if the model has no variant axis; else list
   // real variants (e.g. {id:"flash",...},{id:"pro",...}) and key modelNames/
   // defaultAccuracy by them.

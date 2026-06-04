@@ -5,7 +5,10 @@
 //
 // Config fields the engine reads:
 //   modelName          display label
-//   supportedHardware  hw ids shown in the catalog (subset of HARDWARE_CATALOG)
+//   supportedHardware  hw ids shown in the catalog (subset of HARDWARE_CATALOG ∪ config.hardware)
+//   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
+//                      {id, label, vram, vendor}[] merged into the catalog at render
+//                      (so a model-specific GPU never needs an engine-catalog edit)
 //   variants/quantizations/strategies/nodesOptions  the 5-dim option lists
 //                      (nodesOptions id is `single` or `multi-N` → --nnodes N)
 //   cells              {match, verified?, env, flags}[] — one per
@@ -754,8 +757,20 @@ export const Deployment = ({ config, benchmarks }) => {
 
   const buildHardwareGroups = () => {
     const supported = new Set(config.supportedHardware);
+    // Effective catalog = shared common GPUs + the model's own `config.hardware`
+    // (model-specific / desktop / future GPUs the shared catalog doesn't carry).
+    // A model-specific GPU is therefore pure config data — no engine-catalog edit.
+    const catalog = {};
+    for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) catalog[vendor] = [...list];
+    for (const hw of (config.hardware || [])) {
+      const vendor = hw.vendor || "nvidia";
+      const list = catalog[vendor] || (catalog[vendor] = []);
+      const entry = { id: hw.id, label: hw.label, vram: hw.vram };
+      const i = list.findIndex((x) => x.id === hw.id);
+      if (i >= 0) list[i] = entry; else list.push(entry); // config overrides by id
+    }
     const groups = [];
-    for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
+    for (const [vendor, list] of Object.entries(catalog)) {
       const items = list.filter((hw) => supported.has(hw.id))
         .map((hw) => ({ id: hw.id, label: hw.label, subtitle: hw.vram }));
       if (items.length) groups.push({ label: vendor.toUpperCase(), items });
