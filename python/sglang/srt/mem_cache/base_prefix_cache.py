@@ -237,6 +237,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
+    def supports_fast_match_prefix(self) -> bool:
+        return False
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
