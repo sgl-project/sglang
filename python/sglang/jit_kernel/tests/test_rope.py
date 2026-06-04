@@ -104,7 +104,9 @@ def torch_impl_rope(
     rope_dim = min(q.shape[-1], cache_dim)
     # cos_sin_cache: [max_pos, cache_dim] — first half cos, second half sin
     cos = cos_sin_cache[positions, : rope_dim // 2].float()  # [T, rope_dim/2]
-    sin = cos_sin_cache[positions, cache_dim // 2 : cache_dim // 2 + rope_dim // 2].float()  # [T, rope_dim/2]
+    sin = cos_sin_cache[
+        positions, cache_dim // 2 : cache_dim // 2 + rope_dim // 2
+    ].float()  # [T, rope_dim/2]
 
     def _rotate(x: torch.Tensor) -> None:
         # x: [T, H, D] where D >= rope_dim; only the first rope_dim elements rotate.
@@ -164,7 +166,7 @@ def test_rope(
 ) -> None:
     if DEVICE is None:
         pytest.skip("No CUDA or XPU device available")
-        
+
     num_qo_heads = num_kv_heads * gqa_ratio
     q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
     k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
@@ -177,7 +179,7 @@ def test_rope(
     q_ref, k_ref = q.clone(), k.clone()
 
     sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
-    
+
     atol = rtol = 1e-2
     if DEVICE == "xpu":
         torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
@@ -192,7 +194,7 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     """Ensure both int32 and int64 position tensors work correctly."""
     if DEVICE is None:
         pytest.skip("No CUDA or XPU device available")
-        
+
     batch_size, num_qo_heads, num_kv_heads, rope_dim = 16384, 16, 2, 128
     is_neox = True
 
@@ -224,7 +226,7 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")
     if DEVICE is None:
         pytest.skip("No CUDA or XPU device available")
-        
+
     num_qo_heads, num_kv_heads = 8, 2
 
     q = torch.randn(batch_size, num_qo_heads, head_dim, device=DEVICE, dtype=DTYPE)
@@ -262,7 +264,7 @@ def test_fused_rope_store(
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
     if DEVICE is None:
         pytest.skip("No CUDA or XPU device available")
-        
+
     from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
 
     num_qo_heads = num_kv_heads * gqa_ratio

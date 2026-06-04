@@ -18,12 +18,11 @@ from typing import Any, List, Tuple
 import torch
 
 from .utils import (
-    CPPArgList,
     KERNEL_PATH,
+    CPPArgList,
     cache_once,
     make_cpp_args,
 )
-
 
 # Default SYCL compilation flags matching sgl-kernel-xpu
 DEFAULT_SYCL_CFLAGS = [
@@ -51,10 +50,16 @@ def _get_sycl_aot_flags() -> List[str]:
     """
     try:
         import torch
+
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             dev_name = torch.xpu.get_device_name(0).lower()
             # BMG (Arc B-series, Battlemage) — IP version 20
-            if "b580" in dev_name or "b570" in dev_name or "bmg" in dev_name or "battlemage" in dev_name:
+            if (
+                "b580" in dev_name
+                or "b570" in dev_name
+                or "bmg" in dev_name
+                or "battlemage" in dev_name
+            ):
                 # Note: Removed -cl-intel-enable-auto-large-GRF-mode as it's not supported in oneAPI 2025.3.3
                 return [
                     "-fsycl-targets=intel_gpu_bmg_g21",
@@ -64,75 +69,89 @@ def _get_sycl_aot_flags() -> List[str]:
     # Fallback: generic SPIR-V (runtime JIT to native ISA)
     return ["-fsycl-targets=spir64"]
 
+
 DEFAULT_SYCL_INCLUDE = [str(KERNEL_PATH / "include")]
+
 
 def _get_sgl_kernel_jit_path() -> pathlib.Path | None:
     """
     Get sgl-kernel's JIT kernel headers path.
-    
+
     Returns the path to sgl-kernel's jit_kernel directory if found, None otherwise.
     sgl-kernel-xpu is the required dependency for XPU JIT kernel support.
     """
     try:
         import sgl_kernel
-        
+
         # Get the sgl_kernel package path
         sgl_kernel_path = pathlib.Path(sgl_kernel.__file__).parent
-        
+
         # Check for JIT kernel headers in the package
         jit_kernel_path = sgl_kernel_path / "include" / "sgl_kernel" / "jit_kernel"
-        
+
         if jit_kernel_path.exists():
             return jit_kernel_path
     except ImportError:
         pass
-    
+
     return None
+
 
 def _resolve_sycl_kernel_path() -> pathlib.Path | None:
     """
     Resolve the path to SYCL JIT kernel headers.
-    
+
     Requires sgl-kernel-xpu to be installed. This is the XPU equivalent of
     requiring CUDA toolkit for CUDA JIT kernels.
-    
+
     Returns None if sgl-kernel-xpu is not installed, allowing deferred error handling.
     """
     sgl_kernel_path = _get_sgl_kernel_jit_path()
-    
+
     if sgl_kernel_path is not None:
         import logging
+
         logger = logging.getLogger(__name__)
         logger.info(f"Using JIT kernel headers from sgl-kernel: {sgl_kernel_path}")
         return sgl_kernel_path
-    
+
     return None
+
 
 # Get the SYCL kernel path (checks sgl-kernel first, then local)
 _SYCL_KERNEL_PATH = _resolve_sycl_kernel_path()
 
+
 def _get_pytorch_sycl_lib_path() -> str:
     """Get the directory containing PyTorch's libsycl.so.
-    
+
     Assumes a properly configured environment where PyTorch is installed
     with SYCL support in the standard location.
     """
     try:
-        import torch
         import pathlib
-        
+
+        import torch
+
         # Check standard torch/lib location
         torch_lib_path = pathlib.Path(torch.__file__).parent / "lib"
-        if (torch_lib_path / "libsycl.so").exists() or (torch_lib_path / "libsycl.so.8").exists():
+        if (torch_lib_path / "libsycl.so").exists() or (
+            torch_lib_path / "libsycl.so.8"
+        ).exists():
             return str(torch_lib_path)
     except Exception:
         pass
     return ""
 
+
 _PYTORCH_SYCL_LIB_PATH = _get_pytorch_sycl_lib_path()
 
 # Link against PyTorch's SYCL runtime to avoid ABI mismatch
-DEFAULT_LDFLAGS = [f"-L{_PYTORCH_SYCL_LIB_PATH}", f"-Wl,-rpath,{_PYTORCH_SYCL_LIB_PATH}"] if _PYTORCH_SYCL_LIB_PATH else []
+DEFAULT_LDFLAGS = (
+    [f"-L{_PYTORCH_SYCL_LIB_PATH}", f"-Wl,-rpath,{_PYTORCH_SYCL_LIB_PATH}"]
+    if _PYTORCH_SYCL_LIB_PATH
+    else []
+)
 
 
 def _compute_cache_key(cache_inputs: List[Any]) -> str:
@@ -208,15 +227,18 @@ class SYCLModule:
         self.module_name = module_name
         self._lib = ctypes.CDLL(str(so_path))
         self._functions = {}
-        self._configured_funcs = {}  # Cache for functions with configured argtypes/restype
+        self._configured_funcs = (
+            {}
+        )  # Cache for functions with configured argtypes/restype
 
     def __getattr__(self, name: str):
         """Dynamically load function from shared library."""
         if name.startswith("_"):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
 
         if name not in self._functions:
-            import ctypes
 
             # Try bare name first, then with _wrapper suffix
             for candidate in (name, f"{name}_wrapper"):
@@ -235,15 +257,15 @@ class SYCLModule:
 
     def get_function(self, func_name: str, argtypes: list, restype=None):
         """Get a ctypes function with configured argtypes and restype, with caching.
-        
+
         Args:
             func_name: Name of the exported C function
             argtypes: List of ctypes types for function arguments
             restype: Return type (defaults to None for void functions)
-        
+
         Returns:
             Configured ctypes function object
-        
+
         Example:
             func = module.get_function(
                 "my_kernel_fp32",
@@ -253,26 +275,26 @@ class SYCLModule:
         """
         # Use tuple of argtypes for cache key (lists aren't hashable)
         cache_key = (func_name, tuple(argtypes), restype)
-        
+
         if cache_key not in self._configured_funcs:
             func = getattr(self._lib, func_name)
             func.argtypes = argtypes
             func.restype = restype
             self._configured_funcs[cache_key] = func
-        
+
         return self._configured_funcs[cache_key]
 
 
 class _LRUModuleCache:
     """LRU cache for loaded SYCL modules to prevent unbounded memory growth."""
-    
+
     def __init__(self, maxsize: int = 128):
         self._cache: OrderedDict[str, SYCLModule] = OrderedDict()
         self._maxsize = maxsize
-    
+
     def _close_module(self, module: SYCLModule) -> None:
         """No-op to prevent unloading modules that are still referenced by cached wrappers.
-        
+
         Since wrapper classes (like XPURMSNormWrapper) are cached globally via @cache_once,
         they hold long-lived references to SYCLModule instances. Unloading a module that
         is still in use would cause AttributeError when calling kernel functions.
@@ -287,7 +309,7 @@ class _LRUModuleCache:
         # Move to end to mark as recently used
         self._cache.move_to_end(key)
         return self._cache[key]
-    
+
     def put(self, key: str, module: SYCLModule) -> None:
         """Add module to cache, evicting oldest if at capacity."""
         if key in self._cache:
@@ -304,7 +326,7 @@ class _LRUModuleCache:
                 self._close_module(evicted_module)
             # Add new entry
             self._cache[key] = module
-    
+
     def clear(self) -> None:
         """Clear all cached modules."""
         for module in self._cache.values():
@@ -320,7 +342,7 @@ _LOADED_MODULES_CACHE = _LRUModuleCache(maxsize=128)
 
 def clear_module_cache() -> None:
     """Clear the in-memory SYCL module cache.
-    
+
     Useful for testing or to free memory in long-lived processes.
     """
     _LOADED_MODULES_CACHE.clear()
@@ -428,9 +450,7 @@ def load_jit_sycl(
     ]
 
     # Resolve sycl_files to absolute paths for unambiguous cache keying
-    resolved_sycl_files = [
-        str((_SYCL_KERNEL_PATH / f).resolve()) for f in sycl_files
-    ]
+    resolved_sycl_files = [str((_SYCL_KERNEL_PATH / f).resolve()) for f in sycl_files]
 
     # Compute cache key from compilation-affecting inputs
     cache_key = _compute_cache_key(
@@ -482,7 +502,7 @@ def load_jit_sycl(
                 delete=False,
             ) as tmp_so_file:
                 tmp_so_path = pathlib.Path(tmp_so_file.name)
-            
+
             try:
                 # Build icpx command
                 cmd = ["icpx"]
@@ -531,10 +551,10 @@ def load_jit_sycl(
 
     # Load module from disk (first time for this cache key)
     module = SYCLModule(so_path, module_name)
-    
+
     # Store in in-memory cache for subsequent calls
     _LOADED_MODULES_CACHE.put(memory_cache_key, module)
-    
+
     return module
 
 

@@ -40,9 +40,7 @@ if _HAS_XPU:
         }
 
         if dtype not in dtype_map:
-            raise ValueError(
-                f"Unsupported dtype for XPU timestep_embedding: {dtype}"
-            )
+            raise ValueError(f"Unsupported dtype for XPU timestep_embedding: {dtype}")
 
         dtype_str = dtype_map[dtype]
 
