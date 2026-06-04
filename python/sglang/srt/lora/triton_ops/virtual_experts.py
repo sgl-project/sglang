@@ -293,10 +293,6 @@ def _moe_lora_shrink_splitk_kernel(
         a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
 
-    # All input reads are done; hint the runtime to launch the dependent kernel.
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
     accumulator = accumulator.to(c_ptr.dtype.element_ty)
 
     # Write output
@@ -307,6 +303,14 @@ def _moe_lora_shrink_splitk_kernel(
         tl.store(c_ptrs, accumulator, mask=c_mask)
     else:
         tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
+
+    # Hint the dependent kernel may launch AFTER the intermediate store, not after
+    # the reads: the immediate successor (the LoRA-B expand, when routing is cached
+    # and no align kernel sits between) reads this intermediate, so a reader must
+    # not be released before the write is visible. The cost is tiny (the store is a
+    # small [tokens, rank] write); it removes the shrink->expand PDL RAW race.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _invoke_moe_lora_shrink_splitk(
