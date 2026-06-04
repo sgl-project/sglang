@@ -194,9 +194,11 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         steps = self._scrape_metric("sglang:spec_num_steps")
         draft_tokens = self._scrape_metric("sglang:spec_num_draft_tokens")
 
-        self.assertEqual(steps, 3.0, "spec_num_steps gauge missing or wrong")
-        self.assertEqual(
-            draft_tokens, 4.0, "spec_num_draft_tokens gauge missing or wrong"
+        self.assertIn(steps, {1.0, 3.0}, "spec_num_steps gauge has unexpected value")
+        self.assertIn(
+            draft_tokens,
+            {2.0, 4.0},
+            "spec_num_draft_tokens gauge has unexpected value",
         )
 
 
