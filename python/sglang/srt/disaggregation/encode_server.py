@@ -1548,14 +1548,7 @@ class MMEncoder:
                     if "error" in result:
                         raise InternalError(f"VIT forward failed: {result['error']}")
                     embedding = result["embedding"]
-                    # Cache the embedding on mm_data so subsequent /send calls
-                    # from other decoder TP ranks can reuse it.
-                    mm_data.cached_embedding = embedding
 
-            # Retrieve cached embedding for duplicate /send calls from other
-            # decoder TP ranks.
-            if embedding is None:
-                embedding = mm_data.cached_embedding
             if embedding is None:
                 raise InternalError(
                     f"No embedding available for Mooncake GPU-direct transfer: {req_id}"
@@ -1767,9 +1760,7 @@ class MMEncoder:
             await self._cleanup_inflight_encode_state(req_id)
 
     async def _cleanup_inflight_encode_state(self, req_id: str):
-        mm_data = self.embedding_to_send.pop(req_id, None)
-        if mm_data is not None:
-            mm_data.cached_embedding = None
+        self.embedding_to_send.pop(req_id, None)
         # Release the rkey after all /send calls have completed.
         forward_state = self._forward_results.pop(req_id, None)
         if forward_state is not None:
