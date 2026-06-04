@@ -355,7 +355,7 @@ jobs:
   multimodal-gen-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
