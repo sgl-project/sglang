@@ -484,7 +484,7 @@ class TpModelWorker(BaseTpWorker):
             )
 
             if is_verify:
-                # Skip sampling and return logits for target forward
+                # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
             if (

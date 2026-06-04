@@ -374,8 +374,7 @@ def get_zmq_socket(
         port = socket.bind_to_random_port("tcp://*")
         return port, socket
     else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
+        if is_zmq_endpoint_ipv6(endpoint):
             socket.setsockopt(zmq.IPV6, 1)
 
         config_socket(socket, socket_type)
@@ -386,6 +385,17 @@ def get_zmq_socket(
             socket.connect(endpoint)
 
         return socket
+
+
+def is_zmq_endpoint_ipv6(endpoint: str) -> bool:
+    """Return whether a ZMQ TCP endpoint contains a bracketed IPv6 host."""
+    prefix = "tcp://["
+    if not endpoint.startswith(prefix):
+        return False
+    end = endpoint.find("]", len(prefix))
+    if end == -1:
+        return False
+    return is_valid_ipv6_address(endpoint[len(prefix) : end])
 
 
 def _is_ipv6(host: str) -> bool:

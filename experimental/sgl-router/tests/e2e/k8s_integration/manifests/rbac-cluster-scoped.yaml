@@ -1,0 +1,33 @@
+# Cluster-wide RBAC for the cross-namespace discovery test.
+# Distinct ServiceAccount/ClusterRole names to avoid collision with
+# the namespace-scoped Role in rbac.yaml used by the default router.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sgl-router-cluster
+  namespace: sgl-router-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sgl-router-cluster
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sgl-router-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sgl-router-cluster
+subjects:
+  - kind: ServiceAccount
+    name: sgl-router-cluster
+    namespace: sgl-router-test

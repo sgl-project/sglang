@@ -44,7 +44,8 @@ class Mxfp4Config(QuantizationConfig):
     """
     MXFP4 quantization config for diffusion models.
 
-    Supports online quantization from unquantized BF16/FP16 checkpoints.
+    Supports online quantization from unquantized BF16/FP16 checkpoints;
+    no-arg ``Mxfp4Config()`` selects that online (post-load) path.
     Note: MXFP4 requires ROCm and MI350+ (gfx95x).
     """
 

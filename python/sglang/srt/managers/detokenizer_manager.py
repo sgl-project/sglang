@@ -32,16 +32,13 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ConfigureLoggingReq,
     FreezeGCReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    configure_logger,
-    freeze_gc,
-    kill_itself_when_parent_died,
-)
+from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -71,6 +68,22 @@ class DecodeStatus:
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
+    decoded_text_len: int = dataclasses.field(init=False)
+    decoded_text_chunks: List[str] = dataclasses.field(default_factory=list)
+
+    def __post_init__(self):
+        self.decoded_text_len = len(self.decoded_text)
+
+    def append_decoded_text(self, text: str):
+        if text:
+            self.decoded_text_chunks.append(text)
+            self.decoded_text_len += len(text)
+
+    def get_decoded_text(self) -> str:
+        if self.decoded_text_chunks:
+            self.decoded_text += "".join(self.decoded_text_chunks)
+            self.decoded_text_chunks.clear()
+        return self.decoded_text
 
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
@@ -139,6 +152,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
+                (ConfigureLoggingReq, self.handle_configure_logging_req),
             ]
         )
 
@@ -190,42 +204,61 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         space_list: List[bool],
     ) -> List[str]:
         """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
+        n = len(ids_list)
+        if n == 0:
+            return []
+
+        # Empty token spans decode to "" but tokenizer.batch_decode (and the
+        # slow per-row decode_without_hf_kwargs path) still pays per-row
+        # overhead; under high-concurrency streaming this adds up. Filter
+        # empties out, decode the rest, then scatter back.
+        keep_idx: Optional[List[int]] = None
+        if not all(ids_list):
+            keep_idx = [i for i, ids in enumerate(ids_list) if ids]
+            if not keep_idx:
+                return [""] * n
+            ids_list = [ids_list[i] for i in keep_idx]
+            skip_list = [skip_list[i] for i in keep_idx]
+            space_list = [space_list[i] for i in keep_idx]
 
         if not getattr(self.tokenizer, "is_fast", False):
-            return [
+            decoded = [
                 decode_without_hf_kwargs(self.tokenizer, ids, skip)
                 for ids, skip in zip(ids_list, skip_list)
             ]
+        else:
+            # fast path: all rows share the same (skip, space) flags.
+            first_skip, first_space = skip_list[0], space_list[0]
+            if all(
+                s == first_skip and sp == first_space
+                for s, sp in zip(skip_list, space_list)
+            ):
+                decoded = self.tokenizer.batch_decode(
+                    ids_list,
+                    skip_special_tokens=first_skip,
+                    spaces_between_special_tokens=first_space,
+                )
+            else:
+                # Group indices by (skip, space) tuple and decode each group.
+                groups: Dict[Tuple[bool, bool], List[int]] = defaultdict(list)
+                for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
+                    groups[(skip, space)].append(idx)
 
-        # fast path
-        first_skip, first_space = skip_list[0], space_list[0]
-        if all(
-            s == first_skip and sp == first_space
-            for s, sp in zip(skip_list, space_list)
-        ):
-            return self.tokenizer.batch_decode(
-                ids_list,
-                skip_special_tokens=first_skip,
-                spaces_between_special_tokens=first_space,
-            )
+                decoded = [""] * len(ids_list)
+                for (skip, space), indices in groups.items():
+                    group_decoded = self.tokenizer.batch_decode(
+                        [ids_list[idx] for idx in indices],
+                        skip_special_tokens=skip,
+                        spaces_between_special_tokens=space,
+                    )
+                    for idx, text in zip(indices, group_decoded):
+                        decoded[idx] = text
 
-        # Group indices by (skip, space) tuple
-        groups: Dict[Tuple[bool, bool], List[int]]
-        groups = defaultdict(list)
-        for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
-            groups[(skip, space)].append(idx)
-
-        # Decode each group and collect results
-        results: List[str] = [""] * len(ids_list)
-        for (skip, space), indices in groups.items():
-            decoded = self.tokenizer.batch_decode(
-                [ids_list[idx] for idx in indices],
-                skip_special_tokens=skip,
-                spaces_between_special_tokens=space,
-            )
-            for idx, text in zip(indices, decoded):
-                results[idx] = text
-
+        if keep_idx is None:
+            return decoded
+        results = [""] * n
+        for i, text in zip(keep_idx, decoded):
+            results[i] = text
         return results
 
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
@@ -238,7 +271,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if rid not in self.decode_status:
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
-                    decode_ids=recv_obj.decode_ids[i],
+                    decode_ids=list(recv_obj.decode_ids[i]),
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
@@ -308,25 +341,36 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
-                # Streaming chunk: update the decode status
+                # Streaming. Invariant: sent_offset >= decoded_text_len. The
+                # gap (`pending`) is "printable but uncommitted" text emitted
+                # in a prior "�" recovery step; we skip it from this step's
+                # emission so we don't double-send.
+                pending = s.sent_offset - s.decoded_text_len
                 if new_text and not new_text.endswith("�"):
-                    s.decoded_text += new_text
+                    # Clean text: commit to decoded_text and advance offsets.
+                    s.append_decoded_text(new_text)
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
-                    new_text = ""
+                    s.sent_offset = s.decoded_text_len
+                    output_strs.append(new_text[pending:] if pending else new_text)
                 else:
-                    new_text = find_printable_text(new_text)
-            else:
-                if rid in self.decode_status:
-                    del self.decode_status[rid]
+                    # Incomplete UTF-8: emit the printable prefix only; do not
+                    # commit (token offsets stay so the next iteration retries
+                    # with more tokens).
+                    printable = find_printable_text(new_text)
+                    s.sent_offset = s.decoded_text_len + len(printable)
+                    output_strs.append(printable[pending:] if pending else printable)
+                continue
 
+            if rid in self.decode_status:
+                del self.decode_status[rid]
+
+            # Finished: materialize once, trim the matched stop, emit the tail.
             output_str = self.trim_matched_stop(
-                s.decoded_text + new_text,
+                s.get_decoded_text() + new_text,
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
-
-            # Incrementally send text.
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
@@ -396,7 +440,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
-            load=recv_obj.load,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
@@ -404,6 +447,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
         return None
+
+    def handle_configure_logging_req(self, recv_req: ConfigureLoggingReq):
+        if recv_req.log_level is not None:
+            logging.getLogger().setLevel(recv_req.log_level.upper())
 
 
 def is_health_check_request(rid: Optional[str]) -> bool:

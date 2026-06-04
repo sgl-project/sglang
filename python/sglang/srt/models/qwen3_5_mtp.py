@@ -16,6 +16,7 @@
 
 import copy
 import logging
+from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -23,6 +24,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -140,38 +142,55 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-
-        assert input_embeds is None
-        input_embeds = forward_batch.mm_input_embeds
+        exit_stack = ExitStack()
         if (
-            forward_batch.forward_mode.is_extend()
-            and forward_batch.contains_mm_inputs()
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            is_npu()
+            and self.quant_config is None
+            and get_global_server_args().quantization is not None
         ):
-            assert input_embeds is not None
-            input_embeds = torch.cat(
-                [input_embeds[:-1], self.model.embed_tokens(input_ids[-1].unsqueeze(0))]
+            # ascend mtp unquant
+            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
+            exit_stack.enter_context(
+                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
             )
 
-        if input_embeds is None:
-            input_embeds = self.model.embed_tokens(input_ids)
+        try:
+            assert input_embeds is None
+            input_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            ):
+                assert input_embeds is not None
+                input_embeds = torch.cat(
+                    [
+                        input_embeds[:-1],
+                        self.model.embed_tokens(input_ids[-1].unsqueeze(0)),
+                    ]
+                )
 
-        hidden_states = forward_batch.spec_info.hidden_states
+            if input_embeds is None:
+                input_embeds = self.model.embed_tokens(input_ids)
 
-        if not forward_batch.forward_mode.is_idle():
-            input_embeds = self.pre_fc_norm_embedding(input_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+            hidden_states = forward_batch.spec_info.hidden_states
 
-        hidden_states = self.fc(hidden_states)
+            if not forward_batch.forward_mode.is_idle():
+                input_embeds = self.pre_fc_norm_embedding(input_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-        with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                hidden_states,
-            )
+            hidden_states = self.fc(hidden_states)
+
+            with get_global_expert_distribution_recorder().disable_this_region():
+                hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    hidden_states,
+                )
+        finally:
+            exit_stack.close()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

@@ -95,6 +95,7 @@ export const GLM46VDeployment = () => {
         h200: { tp: 8 },
         b200: { tp: 8 },
         mi300x: { tp: 8 },
+        mi325x: { tp: 8 },
         mi355x: { tp: 8 }
       },
       '9b': {
@@ -103,6 +104,7 @@ export const GLM46VDeployment = () => {
         h200: { tp: 1 },
         b200: { tp: 1 },
         mi300x: { tp: 1 },
+        mi325x: { tp: 1 },
         mi355x: { tp: 1 }
       }
     };

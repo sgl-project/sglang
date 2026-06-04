@@ -6,11 +6,11 @@ the scheduler runs its CPU-side bookkeeping on the tokens of the
 older one.  The lazy-graph primitives live in
 ``hardware_backend/mlx/tp_worker.py`` and ``model_runner.py``.
 
-Each request's KV lives ina set of per-request, per-layer ``ContiguousKVCache``
-objects that the ``MLXAttentionWrapper`` mutates in place during the forward pass.
-Chained decodes reuse the same cache objects: step N+1's graph reads
-step N's lazy writes via MLX's dependency tracking, so the GPU runs
-both steps back-to-back with no idle gap.
+Each request's attention KV lives in per-request, per-layer
+``ContiguousAttentionKVCache`` objects that ``MLXAttentionWrapper`` mutates
+in place during the forward pass. Chained decodes reuse the same cache objects:
+step N+1's graph reads step N's lazy writes via MLX's dependency tracking, so
+the GPU runs both steps back-to-back with no idle gap.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional
 import mlx.core as mx
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,9 @@ class MlxPendingJob:
             time.  Decoupled from the live batch so
             ``process_batch_result`` can update request state without
             racing against the next scheduling decision.
+        schedule_batch: The full scheduler batch.  Unlike ``batch_copy``,
+            this keeps allocator/cache fields needed when a prefill batch
+            becomes the next running decode batch.
         reqs: Snapshot of ``batch.reqs`` at launch time.  The overlap
             loop uses this to check ``req.finished()`` on the previous
             step's request list without holding a reference to the
@@ -74,11 +78,26 @@ class MlxPendingJob:
     decode: Optional["MlxPendingDecode"]
     mode: str
     batch_copy: "ScheduleBatch"
+    schedule_batch: "ScheduleBatch"
     reqs: List[Req]
 
 
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
+
+    def _finalize_mlx_pending_job(self: "Scheduler", pending: MlxPendingJob):
+        result = self.tp_worker.finalize_mlx_result(
+            pending.prefills,
+            pending.extends,
+            pending.decode,
+            pending.mode,
+            pending.reqs,
+        )
+        if result.next_token_ids is not None:
+            pending.batch_copy.input_ids = result.next_token_ids
+            pending.schedule_batch.input_ids = result.next_token_ids
+        self.last_batch = pending.schedule_batch
+        self.process_batch_result(pending.batch_copy, result)
 
     @DynamicGradMode()
     def event_loop_overlap_mlx(self: "Scheduler"):
@@ -123,19 +142,14 @@ class SchedulerMlxOverlapMixin:
         pending_curr: Optional[MlxPendingJob] = None
         pending_next: Optional[MlxPendingJob] = None
 
-        def _finalize(pending: MlxPendingJob):
-            result = self.tp_worker.finalize_mlx_result(
-                pending.prefills,
-                pending.extends,
-                pending.decode,
-                pending.mode,
-                pending.reqs,
-            )
-            if result.next_token_ids is not None:
-                pending.batch_copy.input_ids = result.next_token_ids
-            self.process_batch_result(pending.batch_copy, result)
-
         def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
+            # Materialize batch.input_ids from CPU staging (prefill) or the
+            # FutureMap relay (decode) before the forward. With deferred input
+            # materialization, get_next_batch_to_run leaves input_ids unset; the
+            # CUDA paths call resolve_forward_inputs for this, but the MLX overlap
+            # loop must do it too, otherwise async_forward_batch_generation_mlx
+            # dereferences a None input_ids.
+            resolve_forward_inputs(batch, self.future_map)
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_forward_batch_generation_mlx(batch)
             )
@@ -146,6 +160,7 @@ class SchedulerMlxOverlapMixin:
                 decode=decode,
                 mode=mode,
                 batch_copy=batch.copy(),
+                schedule_batch=batch,
                 reqs=list(batch.reqs),
             )
 
@@ -164,6 +179,7 @@ class SchedulerMlxOverlapMixin:
                 decode=decode,
                 mode=mode,
                 batch_copy=prev.batch_copy.copy(),
+                schedule_batch=prev.schedule_batch,
                 reqs=prev.reqs,
             )
 
@@ -191,7 +207,7 @@ class SchedulerMlxOverlapMixin:
             # 2. Finalize/process on pending_curr's tokens.  (GPU is already
             #    executing pending_next at this point.)
             if pending_curr is not None:
-                _finalize(pending_curr)
+                self._finalize_mlx_pending_job(pending_curr)
                 self.result_queue.popleft()
                 pending_curr = None
 
@@ -208,8 +224,8 @@ class SchedulerMlxOverlapMixin:
             ):
                 pending_curr = pending_next
                 pending_next = None
-                self.cur_batch = pending_curr.batch_copy
-                self.last_batch = pending_curr.batch_copy
+                self.cur_batch = pending_curr.schedule_batch
+                self.last_batch = pending_curr.schedule_batch
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                     self.invariant_checker.self_check_during_busy()
                 continue
@@ -217,7 +233,7 @@ class SchedulerMlxOverlapMixin:
             # 4. Chain is broken. Finalise pending_next (if any), then
             #    schedule fresh.
             if pending_next is not None:
-                _finalize(pending_next)
+                self._finalize_mlx_pending_job(pending_next)
                 self.result_queue.popleft()
                 pending_next = None
             next_batch = self.get_next_batch_to_run()

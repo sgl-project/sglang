@@ -3,6 +3,9 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+from sglang.srt.layers.attention.fla.fused_recurrent import (
+    fused_recurrent_kda_packed_decode,
+)
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -238,6 +241,210 @@ class TestKDAGateChunkCumsum(unittest.TestCase):
         )
         self.assertLess(
             max_diff, 1e-3, f"max_diff={max_diff:.2e}, rel_diff={rel_diff:.2e}"
+        )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDAPackedDecode(unittest.TestCase):
+    """Verify ``fused_recurrent_kda_packed_decode`` matches the existing decode
+    path (split + unflatten + ``fused_sigmoid_gating_delta_rule_update``)."""
+
+    @staticmethod
+    def _make_inputs(B, H, HV, K, V, pool_size, dtype, device, seed=42):
+        torch.manual_seed(seed)
+        qkv_dim = 2 * H * K + HV * V
+        mixed_qkv = (
+            torch.randn(B, qkv_dim, dtype=dtype, device=device) * 0.1
+        ).contiguous()
+        a = (
+            torch.randn(B, HV * K, dtype=dtype, device=device) * 0.5 - 1.0
+        ).contiguous()
+        b = (torch.randn(B, HV, dtype=dtype, device=device) * 0.5).contiguous()
+        A_log = torch.randn(HV, dtype=torch.float32, device=device) * 0.2
+        dt_bias = torch.randn(HV * K, dtype=torch.float32, device=device) * 0.1
+        ssm_states = (
+            torch.randn(pool_size, HV, V, K, dtype=dtype, device=device) * 0.01
+        ).contiguous()
+        cache_indices = torch.arange(B, device=device, dtype=torch.int32)
+        return mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices
+
+    @staticmethod
+    def _run_baseline(
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, H, HV, K, V
+    ):
+        B = mixed_qkv.shape[0]
+        q_flat, k_flat, v_flat = torch.split(mixed_qkv, [H * K, H * K, HV * V], dim=-1)
+        q = q_flat.view(1, B, H, K)
+        k = k_flat.view(1, B, H, K)
+        v = v_flat.view(1, B, HV, V)
+        # The real backend passes query_start_loc = [0, 1, ..., B] so that
+        # each of the B tokens becomes its own length-1 sequence with an
+        # independent state; without this the kernel would share state.
+        cu_seqlens = torch.arange(B + 1, device=mixed_qkv.device, dtype=torch.int32)
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=True,
+        )
+
+    @staticmethod
+    def _run_packed(
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, HV, K, V
+    ):
+        B = mixed_qkv.shape[0]
+        out = mixed_qkv.new_empty(B, 1, HV, V)
+        fused_recurrent_kda_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=K**-0.5,
+            initial_state=ssm_states,
+            out=out,
+            ssm_state_indices=cache_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out.transpose(0, 1)
+
+    def _check(self, B, H, HV, K, V):
+        device = get_device()
+        dtype = torch.bfloat16
+        pool_size = B + 4
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
+            B, H, HV, K, V, pool_size, dtype, device
+        )
+        s_packed = ssm_states.clone()
+        s_baseline = ssm_states.clone()
+
+        o_packed = self._run_packed(
+            mixed_qkv, a, b, A_log, dt_bias, s_packed, cache_indices, HV, K, V
+        )
+        o_baseline = self._run_baseline(
+            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
+        )
+
+        torch.testing.assert_close(
+            o_packed.float(), o_baseline.float(), atol=2e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            s_packed[cache_indices].float(),
+            s_baseline[cache_indices].float(),
+            atol=2e-2,
+            rtol=1e-2,
+        )
+
+    def test_b1(self):
+        self._check(B=1, H=16, HV=16, K=128, V=128)
+
+    def test_b4(self):
+        self._check(B=4, H=16, HV=16, K=128, V=128)
+
+    def test_b32(self):
+        self._check(B=32, H=16, HV=16, K=128, V=128)
+
+    def test_b128(self):
+        self._check(B=128, H=16, HV=16, K=128, V=128)
+
+    def test_asymmetric_heads(self):
+        # Common KDA config with HV > H (grouped query).
+        self._check(B=8, H=8, HV=16, K=128, V=128)
+
+    def test_pad_slot(self):
+        """Entries with state_idx == -1 must produce zero output and skip state writeback."""
+        device = get_device()
+        dtype = torch.bfloat16
+        B, H, HV, K, V = 8, 16, 16, 128, 128
+        pool_size = B + 4
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
+            B, H, HV, K, V, pool_size, dtype, device
+        )
+        # Mark every other request as padded.
+        cache_indices = cache_indices.clone()
+        cache_indices[::2] = -1
+
+        s_packed = ssm_states.clone()
+        s_baseline = ssm_states.clone()
+        o_packed = self._run_packed(
+            mixed_qkv, a, b, A_log, dt_bias, s_packed, cache_indices, HV, K, V
+        )
+        o_baseline = self._run_baseline(
+            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
+        )
+        torch.testing.assert_close(
+            o_packed.float(), o_baseline.float(), atol=2e-2, rtol=1e-2
+        )
+
+    def test_production_shapes_through_dispatcher(self):
+        """Go through ``TritonKDAKernel.packed_decode`` with the exact tensor
+        shapes the KimiDeltaAttention model produces at decode time, so the
+        a/b/A_log/dt_bias reshape-normalization is unit-tested (not only E2E).
+
+        Production decode shapes (see kimi_linear.py forward + __init__):
+          - a (forget_gate): [B, HV*K]   (2D, not unflattened in decode)
+          - b (beta):        [1, B, HV]  (unsqueeze(0), pre-sigmoid)
+          - A_log:           [1, 1, HV, 1]
+          - dt_bias:         [HV*K]
+        """
+        from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+            TritonKDAKernel,
+        )
+
+        device = get_device()
+        dtype = torch.bfloat16
+        B, H, HV, K, V = 4, 16, 16, 128, 128
+        pool_size = B + 4
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
+            B, H, HV, K, V, pool_size, dtype, device
+        )
+
+        # Reshape the flat reference tensors into the production layouts.
+        b_prod = b.unsqueeze(0)  # [B, HV] -> [1, B, HV]
+        A_log_prod = A_log.view(1, 1, HV, 1)  # [HV] -> [1, 1, HV, 1]
+
+        kernel = TritonKDAKernel()
+        self.assertTrue(kernel.supports_packed_decode)
+
+        s_packed = ssm_states.clone()
+        out = kernel.packed_decode(
+            mixed_qkv,
+            a,
+            b_prod,
+            A_log=A_log_prod,
+            dt_bias=dt_bias,
+            scale=K**-0.5,
+            ssm_states=s_packed,
+            cache_indices=cache_indices,
+            num_v_heads=HV,
+            head_v_dim=V,
+        )
+
+        s_baseline = ssm_states.clone()
+        o_baseline = self._run_baseline(
+            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
+        )
+
+        # Dispatcher returns [1, B, HV, V], same layout as the baseline.
+        torch.testing.assert_close(
+            out.float(), o_baseline.float(), atol=2e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            s_packed[cache_indices].float(),
+            s_baseline[cache_indices].float(),
+            atol=2e-2,
+            rtol=1e-2,
         )
 
 

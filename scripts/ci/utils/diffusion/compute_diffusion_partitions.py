@@ -38,6 +38,12 @@ def _load_partitioning_helpers():
 PartitionItem, partition_items_by_lpt = _load_partitioning_helpers()
 
 SUITE_OUTPUT_NAMES = {"1-gpu": "1gpu", "2-gpu": "2gpu", "1-gpu-b200": "b200"}
+
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
+    SUITE_OUTPUT_NAMES = {"1-npu": "1npu", "2-npu": "2npu"}
+
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
 
@@ -261,7 +267,13 @@ def main():
         print(f"Error: Run suite not found: {run_suite_path}")
         sys.exit(1)
     try:
-        case_config_path = resolve_case_config_path(repo_root, run_suite_path)
+        if USE_NPU_CONFIGS:
+            case_config_path = (
+                repo_root
+                / "python/sglang/multimodal_gen/test/server/ascend/testcase_configs_npu.py"
+            )
+        else:
+            case_config_path = resolve_case_config_path(repo_root, run_suite_path)
     except (RuntimeError, FileNotFoundError) as exc:
         print(f"Error: {exc}")
         sys.exit(1)

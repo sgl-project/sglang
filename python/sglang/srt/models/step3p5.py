@@ -12,6 +12,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -225,6 +226,8 @@ class Step3p5MoEMLP(nn.Module):
             # router_logits: (batch * sequence_length, n_experts)
             router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if hasattr(topk_output, "to_standard"):
+            topk_output = topk_output.to_standard(layer_id=self.layer_id)
         if self.routed_scaling_factor != 1.0:
             topk_output = StandardTopKOutput(
                 topk_weights=topk_output.topk_weights * self.routed_scaling_factor,
@@ -794,6 +797,13 @@ class Step3p5ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.moe_num_experts,
+        )
+
     def __init__(
         self,
         config: Step3p5Config,
@@ -1019,7 +1029,13 @@ class Step3p5ForCausalLM(nn.Module):
                         )
                         loaded_params.add(actual_param_name)
 
-        print_params = set(params_dict.keys()) - loaded_params
+        # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
+        # are computed in process_weights_after_loading, not loaded from checkpoint.
+        print_params = {
+            p
+            for p in set(params_dict.keys()) - loaded_params
+            if "blockscale_swizzled" not in p
+        }
         assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
 
     def get_embed_and_head(self):

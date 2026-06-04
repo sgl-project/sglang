@@ -99,6 +99,7 @@ class ComposedPipelineBase(ABC):
         """
         self.server_args = server_args
         self._disagg_role = server_args.disagg_role
+        self.validate_disagg_role(self._disagg_role)
 
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
@@ -107,17 +108,26 @@ class ComposedPipelineBase(ABC):
         self.executor = executor or self.build_executor(server_args=server_args)
         self.component_residency_manager: ComponentResidencyManager | None = None
 
-        if required_config_modules is not None:
-            self._required_config_modules = required_config_modules
-
-        if self._required_config_modules is None:
+        base_required_config_modules = (
+            required_config_modules
+            if required_config_modules is not None
+            else self._required_config_modules
+        )
+        if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
+        self._required_config_modules = list(base_required_config_modules)
+        self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
         if self._disagg_role != RoleType.MONOLITHIC:
             original_modules = list(self._required_config_modules)
+            task_name = self.server_args.pipeline_config.task_type.name.lower()
             self._required_config_modules = filter_modules_for_role(
-                self._required_config_modules, self._disagg_role
+                self._required_config_modules,
+                self._disagg_role,
+                extra_allowed_modules=self._get_extra_allowed_modules_for_role(
+                    self._disagg_role, task_name
+                ),
             )
             skipped = set(original_modules) - set(self._required_config_modules)
             if skipped:
@@ -201,6 +211,44 @@ class ComposedPipelineBase(ABC):
         Initialize the pipeline.
         """
         return
+
+    def validate_disagg_role(self, role: RoleType) -> None:
+        """Validate whether the requested disaggregation role is supported."""
+        return
+
+    def _get_extra_allowed_modules_for_role(
+        self, role: RoleType, task_name: str
+    ) -> set[str]:
+        role_to_pipeline_modules: dict[RoleType, dict[str, set[str]]] = {
+            RoleType.ENCODER: {
+                "Flux2Pipeline": {"vae"},
+                "Flux2KleinPipeline": {"vae"},
+                "QwenImageEditPipeline": {"vae"},
+                "QwenImageEditPlusPipeline": {"vae"},
+                "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "GlmImagePipeline": {"vae", "transformer"},
+                "WanImageToVideoPipeline": {"vae"},
+                "WanImageToVideoDmdPipeline": {"vae"},
+                "MOVA": {"video_vae", "audio_vae"},
+                "MOVAPipeline": {"video_vae", "audio_vae"},
+            },
+            RoleType.DENOISER: {},
+            RoleType.DECODER: {},
+        }
+        extra_allowed_modules = set(
+            role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
+        )
+
+        if role == RoleType.DENOISER and task_name == "ti2v":
+            if self.pipeline_name in {
+                "WanImageToVideoPipeline",
+                "WanImageToVideoDmdPipeline",
+            }:
+                extra_allowed_modules.add("vae")
+            elif self.pipeline_name == "LTX2Pipeline":
+                extra_allowed_modules.update({"vae", "audio_vae"})
+
+        return extra_allowed_modules
 
     # --- Config-name → pipeline_config attribute mapping ---
     _CONFIG_ATTR_MAP: dict[str, str] = {
@@ -495,12 +543,46 @@ class ComposedPipelineBase(ABC):
             self.memory_usages,
             round(current_platform.get_available_gpu_memory(), 2),
         )
+        total_consumed_gb = sum(
+            usage
+            for usage in self.memory_usages.values()
+            if isinstance(usage, (int, float))
+        )
+        available_after_gb = current_platform.get_available_gpu_memory()
+        logger.debug(
+            "Module load summary: required_modules=%s loaded_modules=%s "
+            "memory_usages_gb=%s total_consumed_gb=%.2f "
+            "available_after_gb=%.2f",
+            list(required_modules),
+            list(loaded_components.keys()),
+            self.memory_usages,
+            total_consumed_gb,
+            available_after_gb,
+        )
 
         return loaded_components
 
     @staticmethod
     def _infer_stage_name(stage: PipelineStage) -> str:
         return stage.__class__.__name__
+
+    def _should_add_stage_for_role(
+        self,
+        role_affinity: RoleType,
+        stage_name: str,
+    ) -> bool:
+        if self._disagg_role == RoleType.MONOLITHIC:
+            return True
+        if role_affinity == self._disagg_role:
+            return True
+
+        logger.info(
+            "Disagg role=%s: skipping stage %s (affinity=%s)",
+            self._disagg_role.value,
+            stage_name,
+            role_affinity.value,
+        )
+        return False
 
     def _profile_stage_name(self, stage: PipelineStage, stage_name: str) -> str:
         class_name = stage.__class__.__name__
@@ -513,22 +595,13 @@ class ComposedPipelineBase(ABC):
     ) -> "ComposedPipelineBase":
 
         assert self.modules is not None, "No modules are registered"
-
-        # Filter stages based on disaggregation role
-        if self._disagg_role != RoleType.MONOLITHIC:
-            if stage.role_affinity != self._disagg_role:
-                if stage_name is None:
-                    stage_name = self._infer_stage_name(stage)
-                logger.info(
-                    "Disagg role=%s: skipping stage %s (affinity=%s)",
-                    self._disagg_role.value,
-                    stage_name,
-                    stage.role_affinity.value,
-                )
-                return self
-
         if stage_name is None:
             stage_name = self._infer_stage_name(stage)
+
+        # Filter stages based on disaggregation role
+        if not self._should_add_stage_for_role(stage.role_affinity, stage_name):
+            return self
+
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
@@ -537,6 +610,17 @@ class ComposedPipelineBase(ABC):
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self
+
+    def add_stage_factory(
+        self,
+        role_affinity: RoleType,
+        stage_factory: Callable[[], PipelineStage],
+        stage_name: str,
+    ) -> "ComposedPipelineBase":
+        assert self.modules is not None, "No modules are registered"
+        if not self._should_add_stage_for_role(role_affinity, stage_name):
+            return self
+        return self.add_stage(stage_factory(), stage_name)
 
     def add_stages(
         self, stages: list[PipelineStage | tuple[PipelineStage, str]]
@@ -579,12 +663,12 @@ class ComposedPipelineBase(ABC):
     def add_standard_timestep_preparation_stage(
         self,
         scheduler_key: str = "scheduler",
-        prepare_extra_kwargs: list[Callable] | None = [],
+        prepare_extra_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
         return self.add_stage(
             TimestepPreparationStage(
                 scheduler=self.get_module(scheduler_key),
-                prepare_extra_set_timesteps_kwargs=prepare_extra_kwargs,
+                prepare_extra_set_timesteps_kwargs=list(prepare_extra_kwargs or []),
             ),
         )
 
@@ -606,43 +690,57 @@ class ComposedPipelineBase(ABC):
         transformer_2_key: str | None = "transformer_2",
         scheduler_key: str = "scheduler",
         vae_key: str | None = "vae",
+        stage_name: str = "denoising_stage",
     ) -> "ComposedPipelineBase":
 
-        kwargs = {
-            "transformer": self.get_module(transformer_key),
-            "scheduler": self.get_module(scheduler_key),
-        }
+        def create_stage() -> PipelineStage:
+            kwargs = {
+                "transformer": self.get_module(transformer_key),
+                "scheduler": self.get_module(scheduler_key),
+            }
 
-        if transformer_2_key:
-            transformer_2 = self.get_module(transformer_2_key, None)
-            if transformer_2 is not None:
-                kwargs["transformer_2"] = transformer_2
+            if transformer_2_key:
+                transformer_2 = self.get_module(transformer_2_key, None)
+                if transformer_2 is not None:
+                    kwargs["transformer_2"] = transformer_2
 
-        if vae_key:
-            vae = self.get_module(vae_key, None)
-            if vae is not None:
-                kwargs["vae"] = vae
-                kwargs["pipeline"] = self
+            if vae_key:
+                vae = self.get_module(vae_key, None)
+                if vae is not None:
+                    kwargs["vae"] = vae
+                    kwargs["pipeline"] = self
 
-        return self.add_stage(DenoisingStage(**kwargs))
+            return DenoisingStage(**kwargs)
+
+        return self.add_stage_factory(
+            RoleType.DENOISER,
+            create_stage,
+            stage_name,
+        )
 
     def add_standard_decoding_stage(
         self,
         vae_key: str = "vae",
+        stage_name: str = "decoding_stage",
     ) -> "ComposedPipelineBase":
 
-        return self.add_stage(
-            DecodingStage(
+        def create_stage() -> PipelineStage:
+            return DecodingStage(
                 vae=self.get_module(vae_key),
                 pipeline=self,
                 component_name=vae_key,
-            ),
+            )
+
+        return self.add_stage_factory(
+            RoleType.DECODER,
+            create_stage,
+            stage_name,
         )
 
     def add_standard_t2i_stages(
         self,
         include_input_validation: bool = True,
-        prepare_extra_timestep_kwargs: list[Callable] | None = [],
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
 
         if include_input_validation:
@@ -671,7 +769,7 @@ class ComposedPipelineBase(ABC):
         prompt_text_encoder_key: str = "text_encoder",
         image_vae_key: str = "vae",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
-        prepare_extra_timestep_kwargs: list[Callable] | None = [],
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -696,7 +794,10 @@ class ComposedPipelineBase(ABC):
         self.add_stage(
             ImageVAEEncodingStage(
                 vae=self.get_module(image_vae_key),
-                **(image_vae_stage_kwargs or {}),
+                **{
+                    "component_name": image_vae_key,
+                    **(image_vae_stage_kwargs or {}),
+                },
             ),
         )
 
@@ -723,8 +824,9 @@ class ComposedPipelineBase(ABC):
         image_vae_encoding_position: Literal[
             "before_timestep", "after_latent"
         ] = "before_timestep",
-        prepare_extra_timestep_kwargs: list[Callable] | None = [],
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
         denoising_stage_factory: Callable[[], PipelineStage] | None = None,
+        denoising_stage_name: str = "denoising_stage",
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -750,7 +852,10 @@ class ComposedPipelineBase(ABC):
             self.add_stage(
                 ImageVAEEncodingStage(
                     vae=self.get_module(image_vae_key),
-                    **(image_vae_stage_kwargs or {}),
+                    **{
+                        "component_name": image_vae_key,
+                        **(image_vae_stage_kwargs or {}),
+                    },
                 )
             )
 
@@ -762,7 +867,10 @@ class ComposedPipelineBase(ABC):
             self.add_stage(
                 ImageVAEEncodingStage(
                     vae=self.get_module(image_vae_key),
-                    **(image_vae_stage_kwargs or {}),
+                    **{
+                        "component_name": image_vae_key,
+                        **(image_vae_stage_kwargs or {}),
+                    },
                 )
             )
         elif image_vae_encoding_position != "before_timestep":
@@ -773,7 +881,11 @@ class ComposedPipelineBase(ABC):
         if denoising_stage_factory is None:
             self.add_standard_denoising_stage()
         else:
-            self.add_stage(denoising_stage_factory())
+            self.add_stage_factory(
+                RoleType.DENOISER,
+                denoising_stage_factory,
+                denoising_stage_name,
+            )
 
         self.add_standard_decoding_stage()
         return self

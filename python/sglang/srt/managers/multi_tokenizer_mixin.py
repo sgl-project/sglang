@@ -50,6 +50,10 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     TokenizerWorkerRegistration,
 )
+from sglang.srt.managers.load_snapshot import (
+    create_load_snapshot_reader,
+    zmq_reader_owner,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -246,6 +250,9 @@ def _handle_output_by_index(output, i):
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            cached_tokens_details=_extract_field_by_index(
+                output, "cached_tokens_details", i
+            ),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -378,6 +385,19 @@ class MultiTokenizerRouter:
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
         )
+
+        # In multi-tokenizer mode the N TokenizerWorker processes cannot each
+        # bind the zmq PULL socket used for load snapshots, so the single
+        # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
+        # read SHM only. Drain it event-driven via the socket's fd instead of
+        # polling on a timer.
+        self.load_snapshot_reader = None
+        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
+            self.load_snapshot_reader = create_load_snapshot_reader(
+                server_args, port_args, caller="MultiTokenizerRouter"
+            )
+            self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
+
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
 
         # Worker IPC names for pause/continue broadcasting
@@ -387,6 +407,20 @@ class MultiTokenizerRouter:
 
     def _run_loop(self):
         self._loop.run_forever()
+
+    def _register_load_snapshot_reader(self):
+        """Drain zmq load snapshots into SHM whenever the PULL socket is readable.
+
+        zmq exposes an edge-triggered fd; ``poll()`` drains it until empty, which
+        also re-arms the fd, so TokenizerWorkers reading SHM stay up to date
+        without any timer.
+        """
+        assert self.load_snapshot_reader is not None
+        self._loop.add_reader(
+            self.load_snapshot_reader.fileno(), self.load_snapshot_reader.poll
+        )
+        # Drain anything already queued before the fd was registered.
+        self.load_snapshot_reader.poll()
 
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""

@@ -23,6 +23,7 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
+  "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "einops",
   "fastapi",
   "easydict",
@@ -62,7 +63,7 @@ dependencies = [
   "transformers==5.8.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.2.0",
+  "xgrammar==0.2.1",
   "smg-grpc-servicer>=0.5.0",
 ]
 

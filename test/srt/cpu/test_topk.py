@@ -10,13 +10,11 @@ from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.models.llama4 import Llama4MoE
 from sglang.test.test_utils import CustomTestCase
 
-torch.manual_seed(1234)
-
 
 # This is used by the Deepseek-V2 model
 class TestGroupedTopK(CustomTestCase):
     def _run_single_test(self, M, E, G, topk, topk_group, renormalize, dtype):
-        torch.manual_seed(1234)
+        torch.manual_seed(12)
 
         # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
         hidden_states = torch.randn(M, 100, dtype=dtype)

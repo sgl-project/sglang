@@ -216,9 +216,20 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = field(default=False, metadata={"batch_sig_exclude": True})
 
+    # return output file paths directly to client
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
     diffusers_kwargs: dict | None = None
+    max_sequence_length: int | None = None
+    flow_shift: float | None = None
+
+    # cosmos-related
+    use_duration_template: bool | None = None
+    use_resolution_template: bool | None = None
+    use_system_prompt: bool | None = None
+    use_guardrails: bool | None = None
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+    realtime_chunk_size: int | None = None
 
     # Prompt enhancement (ErnieImage)
     use_pe: bool | None = None
@@ -301,6 +312,10 @@ class SamplingParams:
     def apply_request_extra(self, req: Any) -> None:
         """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
         req.extra.update(self.build_request_extra())
+        if self.condition_inputs:
+            req.condition_inputs.update(self.condition_inputs)
+        if self.realtime_chunk_size is not None:
+            req.realtime_chunk_size = self.realtime_chunk_size
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
@@ -511,6 +526,7 @@ class SamplingParams:
             "wan" in pipeline_name_lower
             or "helios" in pipeline_name_lower
             or "joy" in pipeline_name_lower
+            or "cosmos3" in pipeline_name_lower
         ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")

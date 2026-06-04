@@ -35,7 +35,7 @@
 
 | Environment Variable | Default | Description |
 |----------------------|---------|-------------|
-| `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND` | not set | FlashInfer FP4 GEMM backend for generic NVFP4 fallback |
+| `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND` | not set | Optional FlashInfer FP4 GEMM backend override for diffusion NVFP4. When unset, SGLang defaults to `flashinfer_trtllm`. |
 
 ## Caching Acceleration
 

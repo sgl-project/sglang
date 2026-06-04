@@ -324,6 +324,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
         batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)
 
+        batch_info = self._add_moe_lora_info(forward_batch, batch_info)
+
         self.batch_info = batch_info
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
             self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)

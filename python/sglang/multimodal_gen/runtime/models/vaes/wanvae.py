@@ -863,6 +863,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
             )
 
         self.use_feature_cache = config.use_feature_cache
+        self._causal_decode_initialized = False
 
     def clear_cache(self) -> None:
 
@@ -882,6 +883,41 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self._enc_conv_num = _count_conv3d(self.encoder)
             self._enc_conv_idx = 0
             self._enc_feat_map = [None] * self._enc_conv_num
+
+    def reset_causal_decode_state(self) -> None:
+        """Reset decoder feature cache before a new causal video session."""
+        self._causal_decode_initialized = False
+        if self.use_feature_cache:
+            self.clear_cache()
+
+    def causal_decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latents while preserving decoder feature cache across chunks."""
+        if not self.use_feature_cache:
+            return self.decode(z)
+
+        is_first_chunk = not self._causal_decode_initialized
+        if is_first_chunk:
+            self.clear_cache()
+
+        iter_ = z.shape[2]
+        x = self.post_quant_conv(z)
+        outs = []
+        with forward_context(
+            feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
+        ):
+            for i in range(iter_):
+                feat_idx.set(0)
+                first_chunk.set(is_first_chunk and i == 0)
+                outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
+        out = torch.cat(outs, 2)
+
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+
+        out = out.float()
+        out = torch.clamp(out, min=-1.0, max=1.0)
+        self._causal_decode_initialized = True
+        return out
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
@@ -946,24 +982,22 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
+            outs = []
             with forward_context(
                 feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
             ):
+                out_chunks = []
                 for i in range(iter_):
                     feat_idx.set(0)
-                    if i == 0:
-                        first_chunk.set(True)
-                        out = self.decoder(x[:, :, i : i + 1, :, :])
-                    else:
-                        first_chunk.set(False)
-                        out_ = self.decoder(x[:, :, i : i + 1, :, :])
-                        out = torch.cat([out, out_], 2)
+                    first_chunk.set(i == 0)
+                    out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                out = torch.cat(out_chunks, 2) if len(out_chunks) > 1 else out_chunks[0]
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)
 
             out = out.float()
-            out = torch.clamp(out, min=-1.0, max=1.0)
+            out.clamp_(min=-1.0, max=1.0)
             self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)

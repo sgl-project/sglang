@@ -65,7 +65,7 @@ class KVCacheEventMixin:
                 if is_bigram:
                     page_tokens = [(raw[j], raw[j + 1]) for j in range(start, end)]
                 else:
-                    page_tokens = raw[start:end]
+                    page_tokens = list(raw[start:end])
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 

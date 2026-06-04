@@ -4,7 +4,7 @@ SGLang Diffusion is a high-performance inference framework for image and video g
 
 ## Key Features
 
-- Broad model support across Wan, Hunyuan, Qwen-Image, FLUX, Z-Image, GLM-Image, and more
+- Broad model support across Wan, Hunyuan, Cosmos3, Qwen-Image, FLUX, Z-Image, GLM-Image, and more
 - Fast inference with `sgl-kernel`, JIT kernels, scheduler improvements, and caching acceleration
 - Multiple interfaces: `sglang generate`, `sglang serve`, and an OpenAI-compatible API
 - Multi-platform support for NVIDIA, AMD, Intel XPU, Ascend, Apple Silicon, and Moore Threads

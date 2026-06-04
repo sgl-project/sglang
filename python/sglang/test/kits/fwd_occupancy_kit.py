@@ -41,7 +41,7 @@ class FwdOccupancyMixin:
     # in /server_info); silently skipped otherwise. EAGLE3 3/1/4 on
     # 5090 + Llama-3.1-8B measured ~2.0 in CI; 1.8 leaves a small
     # buffer while still catching silent fallback to vanilla (~1.0).
-    spec_accept_length_threshold: float = 1.8
+    fwd_occupancy_acc_length_threshold: float = 1.8
 
     # Warmup: one short request to fill cuda graphs + get the
     # device-timer past its first NaN window.
@@ -51,7 +51,9 @@ class FwdOccupancyMixin:
     # Measurement: one long single-batch request -- max_new_tokens must
     # span several decode_log_interval windows for enough samples.
     fwd_occupancy_max_new_tokens: int = 2048
-    fwd_occupancy_prompt: str = "Write a long, detailed, multi-paragraph story about "
+    fwd_occupancy_prompt: str = (
+        "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
+    )
 
     def _scrape_fwd_occupancy(self):
         """Max non-NaN gauge value across exposed labels (e.g. dp ranks);
@@ -202,8 +204,8 @@ class FwdOccupancyMixin:
             print(f"avg_spec_accept_length = {avg_accept:.3f}")
             self.assertGreater(
                 avg_accept,
-                self.spec_accept_length_threshold,
+                self.fwd_occupancy_acc_length_threshold,
                 f"avg_spec_accept_length={avg_accept:.3f} did not exceed "
-                f"threshold {self.spec_accept_length_threshold} -- spec "
+                f"threshold {self.fwd_occupancy_acc_length_threshold} -- spec "
                 "barely accepted, possibly degraded to vanilla decode",
             )

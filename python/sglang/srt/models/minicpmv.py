@@ -68,7 +68,7 @@ from sglang.srt.models.minicpmv_vit import (
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -936,7 +936,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -1102,7 +1102,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -1272,7 +1272,7 @@ class MiniCPMV4_5(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -1490,7 +1490,7 @@ class MiniCPMV4_6(MiniCPMBaseModel):
                 quant_config=quant_config,
                 prefix=prefix,
             )
-        return merger.to(device="cuda", dtype=torch.get_default_dtype())
+        return merger.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,

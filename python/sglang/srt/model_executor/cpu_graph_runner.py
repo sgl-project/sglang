@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import (
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -679,9 +680,6 @@ class CPUGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -693,43 +691,46 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
-        self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            None,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-        )
-        # Do infernence to avoid setting attr at runtime, e.g.,
-        # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
-        with torch.no_grad():
-            self.model_runner.tp_group.barrier()
-            self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                None,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
             )
-
-        # Run and capture
-        def run_once():
-            # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            logits_output_or_pp_proxy_tensors = forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
-            return logits_output_or_pp_proxy_tensors
-
-        with torch.no_grad():
-            for _ in range(2):
+            with torch.no_grad():
                 self.model_runner.tp_group.barrier()
-                out = run_once()
-            # Save the captured forward_batch
-            self.captured_forward_batches[bs] = forward_batch
-            return forward, out
+                self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
+
+            # Run and capture
+            def run_once():
+                # Clean intermediate result cache for DP attention
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
+                    None
+                )
+                logits_output_or_pp_proxy_tensors = forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
+                return logits_output_or_pp_proxy_tensors
+
+            with torch.no_grad():
+                for _ in range(2):
+                    self.model_runner.tp_group.barrier()
+                    out = run_once()
+                # Save the captured forward_batch
+                self.captured_forward_batches[bs] = forward_batch
+                return forward, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -785,6 +786,9 @@ class CPUGraphRunner:
         assert captured_forward_batch is not None
         captured_forward_batch.seq_lens.fill_(self.seq_len_fill_value)
         captured_forward_batch.out_cache_loc.zero_()
+        # Pair with seq_lens fill: padded rows must point at reserved
+        # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
+        captured_forward_batch.req_pool_indices.zero_()
         captured_forward_batch.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         captured_forward_batch.req_pool_indices[:raw_bs].copy_(
             forward_batch.req_pool_indices

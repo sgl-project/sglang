@@ -40,6 +40,7 @@ from sglang.srt.managers.schedule_batch import (
     flatten_nested_list,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -220,7 +221,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         mask_dtype: torch.dtype,
     ):
         """Prepare attention masks for multimodal inputs."""
-        if isinstance(forward_batch.attn_backend, TritonAttnBackend):
+        if isinstance(get_attn_backend(), TritonAttnBackend):
             assert forward_batch.forward_mode == ForwardMode.EXTEND
             bidirectional_attn_masks_list = []
             bidirectional_attn_mask_indptr = torch.zeros(
@@ -265,10 +266,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 bidirectional_attn_masks = torch.cat(
                     bidirectional_attn_masks_list, dim=0
                 )
-                forward_batch.attn_backend.forward_metadata.mask_indptr = (
+                get_attn_backend().forward_metadata.mask_indptr = (
                     bidirectional_attn_mask_indptr
                 )
-                forward_batch.attn_backend.forward_metadata.custom_mask = (
+                get_attn_backend().forward_metadata.custom_mask = (
                     bidirectional_attn_masks
                 )
 

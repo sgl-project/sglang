@@ -26,11 +26,13 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
+from array import array
 from unittest.mock import MagicMock
 
 import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
@@ -65,11 +67,11 @@ class MockReq:
     """Minimal mock Req with fields needed by cache_unfinished/finished_req."""
 
     def __init__(self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
-        self.fill_ids = list(fill_ids)
-        self.origin_input_ids = (
-            list(fill_ids[:-1]) if len(fill_ids) > 1 else list(fill_ids)
+        self.fill_ids = array("q", fill_ids)
+        self.origin_input_ids = array(
+            "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
-        self.output_ids = [fill_ids[-1]] if len(fill_ids) > 1 else []
+        self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
         self.req_pool_idx = req_pool_idx
         self.cache_protected_len = cache_protected_len
         self.last_node = last_node
@@ -99,7 +101,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         """Insert a prefix into the tree so future requests can match it."""
         cache.insert(
             InsertParams(
-                key=RadixKey(prefix_ids),
+                key=RadixKey(array("q", prefix_ids)),
                 value=torch.tensor(prefix_values, dtype=torch.int64),
             )
         )
@@ -119,7 +121,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self._populate_prefix(cache, prefix, prefix_vals)
 
         # Match prefix (simulates _match_prefix_and_lock in pop_preallocated)
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(prefix)))
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
         prefix_len = len(result.device_indices)
         self.assertEqual(prefix_len, 3)
@@ -164,7 +166,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         # No prefix in tree -- match returns root
         full_ids = [10, 20, 30]
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(full_ids)))
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", full_ids)))
+        )
         matched_node = result.last_device_node
         self.assertEqual(len(result.device_indices), 0)  # no match
         # matched_node is root
@@ -212,7 +216,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self._populate_prefix(cache, prefix, prefix_vals)
 
         # Match and lock
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(prefix)))
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
         prefix_len = len(result.device_indices)
 
@@ -256,7 +260,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         # No prefix in tree -- match returns root (simulates _match_prefix_and_lock)
         full_ids = [10, 20, 30]
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(full_ids)))
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", full_ids)))
+        )
         matched_node = result.last_device_node
         self.assertIs(matched_node, cache.root_node)
 
@@ -307,7 +313,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._match_prefix_and_lock = MagicMock(
-            return_value=(torch.arange(4, dtype=torch.int64), 4)
+            return_value=DecodePrefixMatch(
+                prefix_indices=torch.arange(4, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=req.last_node,
+            )
         )
         queue._pre_alloc = MagicMock(
             side_effect=AssertionError("_pre_alloc should not run")
@@ -356,7 +367,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self._populate_prefix(cache, prefix, prefix_vals)
 
         for iteration in range(5):
-            result = cache.match_prefix(MatchPrefixParams(key=RadixKey(prefix)))
+            result = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", prefix)))
+            )
             matched_node = result.last_device_node
             prefix_len = len(result.device_indices)
 

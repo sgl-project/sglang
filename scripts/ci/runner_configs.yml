@@ -17,7 +17,6 @@
 _anchors:
   default_install: &default scripts/ci/cuda/ci_install_dependency.sh
   deepep_install:  &deepep  scripts/ci/cuda/ci_install_deepep.sh
-  dsv4_install:    &dsv4    scripts/ci/cuda/ci_install_dsv4_dep.sh
 
 runner_configs:
   1-gpu-small:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 1-gpu-5090 }
@@ -26,8 +25,8 @@ runner_configs:
   4-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: $b200_runner }
   4-gpu-h100:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 4-gpu-h100 }
   8-gpu-h200:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h200 }
+  8-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b200 }
   8-gpu-h20:         { install: *deepep,  artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h20, rdma_devices: "mlx5_1,mlx5_2,mlx5_3,mlx5_4" }
   deepep-4-gpu-h100: { install: *deepep,  artifact_version: v4, install_timeout: "20", runs_on: 4-gpu-h100 }
-  deepep-8-gpu-h200: { install: *deepep,  artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h200-deepep }
-  dsv4-4-gpu-b200:   { install: *dsv4,    artifact_version: v6, install_timeout: "30", runs_on: $b200_runner }
-  dsv4-8-gpu-h200:   { install: *dsv4,    artifact_version: v4, install_timeout: "30", runs_on: 8-gpu-h200 }
+  deepep-4-gpu-b200: { install: *deepep,  artifact_version: v6, install_timeout: "20", runs_on: $b200_runner }
+  deepep-8-gpu-h200: { install: *deepep,  artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h200 }

@@ -387,14 +387,42 @@ class LayerNorm(CustomOp):
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy
 class FP32LayerNorm(nn.LayerNorm):
+    def _cached_fp32_param(
+        self, attr: str, param: torch.Tensor | None, device: torch.device
+    ) -> torch.Tensor | None:
+        if param is None:
+            return None
+
+        # Keep autograd semantics identical to the old path. The diffusion
+        # runtime enters here for inference, where grad is disabled.
+        if torch.is_grad_enabled():
+            return param.float().to(device=device)
+
+        key = (
+            param.data_ptr(),
+            param._version,
+            param.device,
+            device,
+            param.dtype,
+        )
+        cache = self.__dict__.get(attr)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+
+        fp32_param = param.detach().to(device=device, dtype=torch.float32)
+        self.__dict__[attr] = (key, fp32_param)
+        return fp32_param
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
         device = inputs.device
+        weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
+        bias = self._cached_fp32_param("_bias_fp32_cache", self.bias, device)
         return F.layer_norm(
             inputs.float(),
             self.normalized_shape,
-            self.weight.float().to(device=device) if self.weight is not None else None,
-            self.bias.float().to(device=device) if self.bias is not None else None,
+            weight,
+            bias,
             self.eps,
         ).to(origin_dtype)
 

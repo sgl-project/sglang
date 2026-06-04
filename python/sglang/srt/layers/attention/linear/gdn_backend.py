@@ -27,6 +27,11 @@ if not is_cpu():
     )
 
 if is_cuda():
+    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
+
+MAX_FUSED_QKV_SPLIT_DIM = 8192
+
+if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
     )
@@ -60,6 +65,7 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
 
+        cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
@@ -69,7 +75,8 @@ class GDNKernelDispatcher:
                 CuteDSLGDNKernel,
             )
 
-            self.decode_kernel = CuteDSLGDNKernel()
+            cutedsl_kernel = CuteDSLGDNKernel()
+            self.decode_kernel = cutedsl_kernel
         elif decode_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -85,10 +92,26 @@ class GDNKernelDispatcher:
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
-            raise ValueError(
-                "CuTe DSL backend only supports decode, not prefill. "
-                "Use --linear-attn-prefill-backend triton instead."
-            )
+            if not is_cuda():
+                raise ValueError("GDN CuTe DSL backend requires CUDA")
+            # Reuse the CuteDSL kernel if already created for decode
+            if cutedsl_kernel is None:
+                from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
+                    CuteDSLGDNKernel,
+                )
+
+                cutedsl_kernel = CuteDSLGDNKernel()
+            # The CuteDSL prefill kernel only exists on SM100+ (Blackwell).
+            # On SM90 (Hopper) fall back to Triton so users can pick
+            # `cutedsl` uniformly across hardware.
+            if cutedsl_kernel.supports_prefill:
+                self.extend_kernel = cutedsl_kernel
+            else:
+                rank0_log(
+                    "CuTe DSL GDN prefill is not supported on this GPU "
+                    "(requires SM100+). Falling back to Triton for prefill."
+                )
+                self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -105,9 +128,9 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer only when the selected FlashInfer kernel
-        # supports MTP verify. On SM100+ FlashInfer GDN decode is supported, but
-        # its MTP verify path is not, so keep Triton as the verify fallback.
+        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
+        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
+        # bf16-state adapter in FlashInferGDNKernel.
         if (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
@@ -426,16 +449,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        actual_seq_len = mixed_qkv.shape[0]
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if is_cuda() and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                mixed_qkv,
+                [layer.q_dim, layer.k_dim, layer.v_dim],
+                dim=-1,
+            )
+            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(

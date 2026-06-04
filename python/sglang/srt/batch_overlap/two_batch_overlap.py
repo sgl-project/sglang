@@ -14,7 +14,6 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
@@ -40,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
@@ -508,8 +508,10 @@ class TboForwardBatchPreparer:
                 f"forward_mode={batch.forward_mode}"
             )
 
-        assert isinstance(batch.attn_backend, TboAttnBackend)
-        attn_backend_child_a, attn_backend_child_b = batch.attn_backend.children
+        # Sanity check: the global attn_backend should be a TboAttnBackend
+        # whose children handle the two halves.
+        attn_backend = get_attn_backend()
+        assert isinstance(attn_backend, TboAttnBackend)
 
         [out_num_token_non_padded_a, out_num_token_non_padded_b] = (
             tbo_children_num_token_non_padded
@@ -525,7 +527,6 @@ class TboForwardBatchPreparer:
                 if is_enable_two_chunk
                 else batch.tbo_split_seq_index
             ),
-            output_attn_backend=attn_backend_child_a,
             out_num_token_non_padded=out_num_token_non_padded_a,
         )
         child_b = cls.filter_batch(
@@ -534,7 +535,6 @@ class TboForwardBatchPreparer:
             end_token_index=batch.input_ids.shape[0],
             start_seq_index=batch.tbo_split_seq_index,
             end_seq_index=batch.batch_size,
-            output_attn_backend=attn_backend_child_b,
             out_num_token_non_padded=out_num_token_non_padded_b,
         )
 
@@ -620,7 +620,6 @@ class TboForwardBatchPreparer:
         end_token_index: int,
         start_seq_index: int,
         end_seq_index: int,
-        output_attn_backend: AttentionBackend,
         out_num_token_non_padded: torch.Tensor,
     ):
         assert (
@@ -692,8 +691,6 @@ class TboForwardBatchPreparer:
             "is_extend_in_batch",
             "all_extend_in_batch",
             "return_logprob",
-            "req_to_token_pool",
-            "token_to_kv_pool",
             "can_run_dp_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
@@ -743,7 +740,6 @@ class TboForwardBatchPreparer:
                     else None
                 ),
                 extend_num_tokens=extend_num_tokens,
-                attn_backend=output_attn_backend,
                 num_token_non_padded=out_num_token_non_padded,
                 # TODO: handle it when we need TBO + DeepSeek V3.2
                 num_token_non_padded_cpu=None,
@@ -758,9 +754,7 @@ class TboForwardBatchPreparer:
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
                 # For logits and logprobs post processing, thus we do not care
-                temp_scaled_logprobs=False,
                 temperature=None,
-                top_p_normalized_logprobs=False,
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,

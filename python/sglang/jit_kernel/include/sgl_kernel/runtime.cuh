@@ -10,7 +10,38 @@
 
 #include <cstddef>
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#ifndef cudaOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+#endif
+#ifndef cudaDeviceGetAttribute
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#endif
+#ifndef cudaDevAttrMultiProcessorCount
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
+#endif
+#ifndef cudaDevAttrComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
+#endif
+#ifndef cudaRuntimeGetVersion
+#define cudaRuntimeGetVersion hipRuntimeGetVersion
+#endif
+#ifndef cudaOccupancyAvailableDynamicSMemPerBlock
+inline hipError_t
+cudaOccupancyAvailableDynamicSMemPerBlock(std::size_t* smem, const void* func, int num_blocks, int block_size) {
+  // HIP does not expose this directly; return max shared mem as conservative estimate
+  hipDeviceProp_t prop;
+  int device;
+  hipGetDevice(&device);
+  hipGetDeviceProperties(&prop, device);
+  *smem = prop.sharedMemPerBlock;
+  return hipSuccess;
+}
+#endif
+#endif
 
 namespace host::runtime {
 

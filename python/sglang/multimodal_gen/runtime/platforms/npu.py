@@ -69,6 +69,11 @@ class NPUPlatformBase(Platform):
         return True
 
     @classmethod
+    def inference_mode(cls):
+        # npu kernels in diffusion paths may need tensor version counters
+        return torch.no_grad()
+
+    @classmethod
     def is_full_nvlink(cls, physical_device_ids: list[int]) -> bool:
         logger.exception(
             "NVLink detection not possible, as context support was"
@@ -79,13 +84,16 @@ class NPUPlatformBase(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
         if empty_cache:
             torch.npu.empty_cache()
+
+        if device_id is None:
+            device_id = torch.npu.current_device()
 
         free_gpu_memory, _ = torch.npu.mem_get_info(device_id)
 

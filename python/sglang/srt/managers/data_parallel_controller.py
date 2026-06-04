@@ -36,8 +36,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -91,10 +91,14 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.last_timestamp = [0.0] * dp_size
 
-    def update_budget(self, load_update: WatchLoadUpdateReq):
-        """Update the budget."""
-        for load in load_update.loads:
+    def update_budget(self, loads):
+        """Update budget from shm snapshots, skipping stale reads."""
+        for load in loads:
+            if load.timestamp == self.last_timestamp[load.dp_rank]:
+                continue
+            self.last_timestamp[load.dp_rank] = load.timestamp
             self.total_requests[load.dp_rank] = (
                 load.num_running_reqs + load.num_waiting_reqs
             )
@@ -151,9 +155,19 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            LoadBalanceMethod.TOTAL_TOKENS,
+        )
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            server_args,
+            port_args,
+            caller="DataParallelController",
+        )
+        self._last_refresh_time = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -198,13 +212,30 @@ class DataParallelController:
         for worker in self.workers[:: self.control_message_step]:
             worker.send_pyobj(obj)
 
-    def handle_load_update_req(self, obj):
-        self.dp_budget.update_budget(obj)
-
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
 
-    def dispatching_with_trace(self, req: Req):
+    def refresh_load_budget(self):
+        # Throttle to at most once per 20ms.  When a burst of requests
+        # arrives, dispatching_with_trace() calls this before every
+        # dispatch.  Each call reads the latest scheduler snapshot and
+        # overwrites the speculative +1 increments that DPBudget.dispatch()
+        # added for previously dispatched requests in this burst.  Without
+        # throttling, the budget resets to the (stale) scheduler-reported
+        # value on every request, causing the entire burst to land on a
+        # single DP rank.  The 20ms interval lets the burst complete
+        # using speculative counters, then refreshes from the real
+        # scheduler load for the next batch.
+        now = time.perf_counter()
+        if now - self._last_refresh_time < 0.02:
+            return
+        self._last_refresh_time = now
+        self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
+
+    def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
+        if refresh_load_budget and self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
+
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
         req.time_stats.set_dp_dispatch_time()
@@ -212,12 +243,16 @@ class DataParallelController:
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
+        if self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
         for req in batch_req:
-            self.dispatching_with_trace(req)
+            self.dispatching_with_trace(req, refresh_load_budget=False)
 
     def dispatch_batch_embedding(self, batch_req: BatchTokenizedEmbeddingReqInput):
+        if self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
         for req in batch_req:
-            self.dispatching_with_trace(req)
+            self.dispatching_with_trace(req, refresh_load_budget=False)
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -228,7 +263,6 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
-                (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
@@ -244,6 +278,7 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.instance_id = port_args.instance_id
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -494,6 +529,7 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.instance_id = port_args.instance_id
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -631,7 +667,11 @@ def run_data_parallel_controller_process(
 
     configure_logger(server_args)
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill DP Controller"

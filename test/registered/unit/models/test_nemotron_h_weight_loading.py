@@ -35,7 +35,7 @@ class _FakeParam:
 class TestNemotronHWeightLoading(unittest.TestCase):
     def _make_minimal_model(self, named_parameters=()):
         model = object.__new__(NemotronHForCausalLM)
-        model.config = SimpleNamespace(n_routed_experts=2)
+        model.config = SimpleNamespace(n_routed_experts=2, max_n_routed_experts=2)
         model.model = SimpleNamespace()
         model.pp_group = _FakePPGroup()
         model.remap_prefix = {}

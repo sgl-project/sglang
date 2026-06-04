@@ -29,6 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
@@ -139,7 +140,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         output = torch.empty_like(hidden_states)
-        attn_backend = forward_batch.attn_backend
+        attn_backend = get_attn_backend()
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
         attn_backend.linear_attn_backend.forward(
@@ -147,6 +148,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
             layer_id=self.layer_idx,
             hidden_states=hidden_states,
             output=output,
+            forward_batch=forward_batch,
             use_triton_causal_conv=True,
         )
 

@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
@@ -39,7 +33,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -79,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -764,14 +758,24 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str, Optional[List[Dict]]]:
+    ) -> Tuple[bool, str, Optional[List[Dict]], Optional[str]]:
         self.auto_create_handle_loop()
         results = await self.check_weights_communicator(obj)
         success, message = FanOutCommunicator.merge_results(results)
         ranks: Optional[List[Dict]] = None
+        per_engine_checksum: Optional[str] = None
         if any(r.payload is not None for r in results):
-            ranks = [r.payload for r in results]
-        return success, message, ranks
+            ranks = []
+            for r in results:
+                if isinstance(r.payload, list):
+                    ranks.extend(r.payload)
+                else:
+                    ranks.append(r.payload)
+            h = hashlib.sha256()
+            for rank in ranks:
+                h.update(rank["per_gpu_checksum"].encode())
+            per_engine_checksum = h.hexdigest()
+        return success, message, ranks, per_engine_checksum
 
     async def slow_down(
         self: TokenizerManager,
@@ -809,41 +813,27 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         include: Optional[List[str]] = None,
         dp_rank: Optional[int] = None,
-    ) -> List[GetLoadsReqOutput]:
+    ) -> List[LoadSnapshot]:
         """
-        Get comprehensive load metrics for /v1/loads endpoint.
+        Get load snapshots for /v1/loads endpoint.
 
         Args:
             include: List of sections to include. Options: core, memory, spec, lora, disagg, queues, all
             dp_rank: Optional filter for specific DP rank
 
         Returns:
-            List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
+            List of LoadSnapshot, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        # Always request all sections from scheduler — watching mode shares
-        # results across concurrent callers, so we fetch full data and filter here.
-        req = GetLoadsReqInput(include=["all"], dp_rank=None)
-        results = await self.get_loads_communicator(req)
+        if dp_rank is not None and (dp_rank < 0 or dp_rank >= self.server_args.dp_size):
+            return []
 
-        # Filter by dp_rank if specified
+        reader = self.load_snapshot_reader
         if dp_rank is not None:
-            results = [r for r in results if r.dp_rank == dp_rank]
-
-        # Filter optional sections client-side (scheduler always returns all)
-        if include and "all" not in include:
-            include_set = set(include)
-            _section_attrs = {
-                "memory": "memory",
-                "spec": "speculative",
-                "lora": "lora",
-                "disagg": "disaggregation",
-                "queues": "queues",
-            }
-            for r in results:
-                for key, attr in _section_attrs.items():
-                    if key not in include_set:
-                        setattr(r, attr, None)
+            load = reader.read(dp_rank)
+            results = [load] if load is not None else []
+        else:
+            results = reader.read_all()
 
         return results
 

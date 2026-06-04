@@ -218,7 +218,7 @@ else
 fi
 
 # CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/sglang-data
+CACHE_HOST=/home/runner/temp-sglang-data
 if [[ -d "$CACHE_HOST" ]]; then
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
 else

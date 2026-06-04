@@ -6,10 +6,12 @@ import torch
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.concat_steps import (
     execute_token_aligner_concat_steps,
 )
+from sglang.srt.debug_utils.comparator.dims_spec import apply_dim_names
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-b-test-cpu")
 
 
 class TestExecuteConcat:
@@ -44,9 +46,9 @@ class TestExecuteConcat:
     def test_named_token_dim_nonzero(self) -> None:
         """Token dim at dim=1 (not dim=0) — concat and truncate along correct dim."""
         # shape [2, 3, 4]: dim0=batch, dim1=token, dim2=hidden
-        x_step0 = torch.randn(2, 3, 4).refine_names("b", "t", "h")
-        x_step1 = torch.randn(2, 5, 4).refine_names("b", "t", "h")
-        y_step0 = torch.randn(2, 6, 4).refine_names("b", "t", "h")
+        x_step0 = apply_dim_names(torch.randn(2, 3, 4), ["b", "t", "h"])
+        x_step1 = apply_dim_names(torch.randn(2, 5, 4), ["b", "t", "h"])
+        y_step0 = apply_dim_names(torch.randn(2, 6, 4), ["b", "t", "h"])
 
         result: Pair[torch.Tensor] = execute_token_aligner_concat_steps(
             tensor_of_step_pair=Pair(
@@ -61,8 +63,8 @@ class TestExecuteConcat:
 
     def test_named_dims_no_token_dim_fallback(self) -> None:
         """Named dims without t or s → fallback to dim 0."""
-        x = torch.randn(4, 8).refine_names("b", "h")
-        y = torch.randn(3, 8).refine_names("b", "h")
+        x = apply_dim_names(torch.randn(4, 8), ["b", "h"])
+        y = apply_dim_names(torch.randn(3, 8), ["b", "h"])
         result: Pair[torch.Tensor] = execute_token_aligner_concat_steps(
             tensor_of_step_pair=Pair(x={0: x}, y={0: y}),
         )
@@ -71,8 +73,8 @@ class TestExecuteConcat:
 
     def test_seq_dim_fallback(self) -> None:
         """Named dims with s but no t → uses s as token dim."""
-        x = torch.randn(2, 5, 4).refine_names("b", "s", "h")
-        y = torch.randn(2, 3, 4).refine_names("b", "s", "h")
+        x = apply_dim_names(torch.randn(2, 5, 4), ["b", "s", "h"])
+        y = apply_dim_names(torch.randn(2, 3, 4), ["b", "s", "h"])
         result: Pair[torch.Tensor] = execute_token_aligner_concat_steps(
             tensor_of_step_pair=Pair(x={0: x}, y={0: y}),
         )

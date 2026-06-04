@@ -281,3 +281,10 @@ The machine cannot directly access the HuggingFace server due to network restric
     --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     ...
   ```
+## 7. Unexpected type fp8
+
+### Cause
+FP8 model is not supported
+
+### Solution
+Replace model weights, e.g., switch Qwen/Qwen3.5-27B-FP8 to Eco-Tech/Qwen3.5-27B-w8a8-mtp.

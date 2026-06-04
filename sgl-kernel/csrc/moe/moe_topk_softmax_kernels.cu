@@ -696,6 +696,9 @@ void topkGatingSoftmaxKernelLauncher(
     case 256:
       LAUNCH_SOFTMAX(T, 256, WARPS_PER_TB);
       break;
+    case 512:
+      LAUNCH_SOFTMAX(T, 512, WARPS_PER_TB);
+      break;
     default: {
       TORCH_CHECK(
           softmax_workspace != nullptr,
@@ -751,7 +754,7 @@ void topk_softmax(
   const int topk = static_cast<int>(topk_weights.size(-1));
 
   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
-  const bool needs_workspace = !is_pow_2 || num_experts > 256;
+  const bool needs_workspace = !is_pow_2 || num_experts > 512;
   const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
