@@ -31,7 +31,6 @@ def ref_context_attention(q_packed, k_packed, v_packed, b_seq_len, is_causal):
     """
     num_q_heads = q_packed.shape[1]
     num_kv_heads = k_packed.shape[1]
-    head_dim = q_packed.shape[2]
     outputs = []
     offset = 0
     for seq_len in b_seq_len:
