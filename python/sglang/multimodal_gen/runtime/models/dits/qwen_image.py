@@ -640,7 +640,7 @@ class QwenImageCrossAttention(nn.Module):
 
         # Scaled dot product attention
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
