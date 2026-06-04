@@ -1,0 +1,383 @@
+# Config metadata for auditing and cluster safety.
+meta:
+  # Schema version label for auditing; keep empty unless you enforce schema checks.
+  schema_version: ""
+  # Free-form description for operators and change tracking.
+  description: "Example config file for TensorCast Store Daemon"
+  # Cluster identity token to prevent split-brain when talking to Global Store.
+  cluster_token: ""
+
+# gRPC server settings.
+server:
+  # Control-plane listen socket for the gRPC API.
+  listen:
+    # Bind host for gRPC; use 0.0.0.0 to expose all NICs or a specific interface to fence access.
+    host: 0.0.0.0
+    # gRPC listen port; this is the port advertised to Global Store regardless of advertise.port.
+    port: 50052
+  # Advertised address for Global Store registration; set when auto-detect might pick a non-routable IP.
+  advertise:
+    # Routable host that clients and Global Store should dial; avoid loopback and link-local.
+    # If empty or non-routable, the daemon resolves in order: listen.host (routable),
+    # route IP toward Global Store, then default interface IP.
+    host: null # automatically resolve
+  # Dedicated P2P listen socket; use a separate NIC/port to isolate data-plane traffic.
+  p2p_listen:
+    # Bind host for P2P transfers; often set to the RDMA or high-bandwidth interface.
+    host: 0.0.0.0
+    # P2P port; must be non-zero when high_availability.enabled is true.
+    port: 65090
+  # Optional default root for relative disk_path values.
+  # When empty, disk materialization accepts absolute disk_path only.
+  storage_path: ""
+  # StoreEngine I/O worker threads; tune for disk/P2P parallelism vs CPU contention.
+  num_threads: 16
+  # gRPC server channel args and TLS.
+  grpc:
+    # Max concurrent HTTP/2 streams; 0 uses gRPC default.
+    max_concurrent_streams: 0
+    # Keepalive ping interval; set 0s to disable periodic pings.
+    keepalive_time: 30s
+    # Keepalive timeout before terminating a dead connection.
+    keepalive_timeout: 10s
+    # Close idle connections after this duration; 0s disables.
+    max_connection_idle: 10m
+    # Hard connection max age; 0s disables.
+    max_connection_age: 0s
+    # Disable Nagle when true; set true for low-latency RPCs.
+    tcp_nodelay: false
+    # Enable SO_REUSEPORT for listener load balancing.
+    so_reuseport: false
+    tls:
+      # Enable TLS for the daemon gRPC server.
+      enabled: false
+      # PEM-encoded server certificate.
+      cert_file: ""
+      # PEM-encoded private key for cert_file.
+      key_file: ""
+      # Optional client CA bundle for mTLS; empty disables client cert checks.
+      client_ca_file: ""
+
+# StoreEngine and data-plane memory/transfer tuning.
+engine:
+  # UMA chunk granularity; larger chunks reduce metadata but make eviction/leases coarser.
+  artifact_chunk_bytes: 256MB
+  # Default depth for StreamingPinnedBuffer instances created by StoreEngine.
+  streaming_buffer_chunks: 8
+  # Enable external target verification for MaterializeIntoTarget (off by default).
+  enable_external_target_verification: false
+  # Enable memfd-backed UMA CPU allocations for zero-copy CPU tensor materialization.
+  cpu_shared_memory:
+    enabled: true
+  # Memory tiers define stable/preemptible behavior; tune for DRAM pressure and HA telemetry.
+  memory_tiers:
+    # When false, CPU chunks stay resident (no preemptible marking); use for stability or debugging.
+    enable_preemptible: false
+    # Stable budget in bytes; must fit in host DRAM minus total pinned pools (sum(pinned_memory.classes[].pool_bytes)) or startup fails.
+    stable_bytes: 128GB
+    # Cap for preemptible pool; ignored when enable_preemptible=false (0 means no preemptible budget).
+    preemptible_limit_bytes: 0
+    # Reclaim target ratio for preemptible pressure; lower values reclaim more aggressively.
+    preemptible_low_watermark_ratio: 0.4
+
+# Promotion policy for P2P routing.
+promotion:
+  # Promotion controls whether the daemon will "export" newly materialized
+  # replicas to become P2P-routable sources in the Global Store (i.e., publish
+  # `export_state=EXPORTABLE` + transport metadata).
+  #
+  # IMPORTANT: Promotion is only attempted when the *client request* asks for
+  # it via `export_policy` (SDK `GetArtifactOptions.export_policy`):
+  # - `never` (default): do not attempt promotion for this materialize.
+  # - `auto`: allow policy-driven promotion (if the daemon policy permits).
+  # - `force`: request an immediate promotion attempt (still gated by daemon policy).
+  #
+  # Policy values:
+  # - PROMOTION_POLICY_NEVER:
+  #     Never promote; replicas remain presence-only and are not P2P targets.
+  # - PROMOTION_POLICY_ON_MATERIALIZE:
+  #     Promote after any successful materialize when `export_policy` is `auto` or `force`.
+  # - PROMOTION_POLICY_ON_HOTNESS:
+  #     Promote only when `export_policy=force` (conservative default; treat "force" as
+  #     the caller's "this is hot" signal; `auto` does not promote).
+  # - PROMOTION_POLICY_ON_POLICY:
+  #     Currently behaves like ON_MATERIALIZE (promote on `auto`/`force`); reserved for
+  #     future policy-based gating beyond the request signal.
+  policy: PROMOTION_POLICY_ON_MATERIALIZE
+  # Require verification metadata before exporting.
+  require_verified: false
+  # Bounded drain timeout before forced demotion.
+  demotion_drain_timeout: 30s
+
+# Unified pinned memory configuration for all daemon-side pinned usage.
+pinned_memory:
+  # Phase 1 fixed-allocation: total pinned bytes is derived as sum(classes[].pool_bytes).
+  # Startup fail-fast: before allocating pinned pools, the daemon checks current available memory and
+  # exits early if insufficient. Required bytes = pinned_total + engine.memory_tiers.stable_bytes + headroom,
+  # where headroom = min(10% * (pinned_total + stable_bytes), 10GiB).
+  # Deadline for pinned slice acquisition under pressure.
+  allocation_timeout: 30s
+  classes:
+    - name: engine
+      slice_bytes: 256MB
+      # 8 GPUs * streaming_buffer_chunks(8) = 64 slices required at startup.
+      # 64 * 256MB = 16GB minimum engine pinned pool.
+      pool_bytes: 16GB
+    - name: comm_gpu
+      slice_bytes: 16MB
+      pool_bytes: 8GB
+      rdma_preregister: true
+    - name: comm_cpu
+      slice_bytes: 16MB
+      pool_bytes: 4GB
+      rdma_preregister: true
+
+# Post-seal policies for assembly -> mi2 alias resolution.
+post_seal:
+  # When true, migrate selected assembly views under the sealed mi2_id.
+  migrate_views: false
+  # When true, only migrate views that require transforms (e.g., transpose).
+  migrate_transpose_only: false
+  # When true, allow safe reuse of CGID-scoped view replicas after sealing.
+  reuse_views_if_safe: false
+  # When true, retire CGID-scoped piece replicas after sealing.
+  retire_pieces: false
+
+# Capability token keys (daemon-issued capability envelope).
+capability_tokens:
+  active:
+    # Token version id; rotate by incrementing version and moving old key to previous.
+    version: 1
+    # Secret bytes (base64-encoded in YAML/JSON).
+    secret: ""
+  previous: []
+
+# Retention handle settings (control-plane only; requires capability_tokens).
+retention_handles:
+  # When true, daemon issues retention handles for local stable DRAM.
+  enabled: false
+  # Default TTL when caller does not specify ttl_ms.
+  default_ttl: 10m
+  # Maximum allowed TTL for any handle (issuer clamp).
+  max_ttl: 24h
+
+# Capability directory publishing (Global Store capability flags).
+capability_directory:
+  enabled: true
+
+# Global Store registration and heartbeat coordination.
+high_availability:
+  # When true, the daemon registers with Global Store and emits heartbeats/sync; requires p2p_listen.port.
+  enabled: true
+  # Global Store endpoints; keep the first entry as the primary registration target.
+  global_store_endpoints:
+    -
+      # Host for Global Store gRPC; must be reachable from the daemon.
+      host: 127.0.0.1
+      # Port for Global Store gRPC.
+      port: 50051
+  # Heartbeat cadence; keep comfortably below Global Store worker_policy.heartbeat_timeout.
+  heartbeat_interval: 10s
+  # Chunk inventory sync cadence; set 0s to disable sync thread.
+  periodic_sync_interval: 30s
+  # Retry attempts for HA registration/requests; currently uses GlobalStoreClient defaults.
+  max_retries: 3
+  # Backoff between registration retries; currently not wired in the daemon.
+  registration_retry_delay: 500ms
+# Background cleanup, eviction, and TTL scheduling.
+lifecycle:
+  # GPU memory fraction that triggers eviction when periodic eviction is enabled; lower values evict earlier.
+  gpu_memory_limit_fraction: 0.75
+  # Enable background eviction loop; disable if you want strictly demand-driven eviction.
+  enable_periodic_eviction: false
+  # Eviction poll cadence; smaller improves responsiveness but increases background work.
+  eviction_loop_interval: 1s
+  # Legacy alias for eviction_loop_interval; 0s keeps eviction_loop_interval in effect.
+  eviction_check_interval: 0s
+  # PID liveness polling interval used when pidfd is unavailable; shorter detects dead clients faster.
+  proc_check_interval: 5s
+  # Sweep interval for session TTL cleanup; keep below sessions_ttl for timely reclamation.
+  sessions_sweep_interval: 10s
+  # Sweep interval for transport lock expiry; keep below locks_ttl to avoid stale locks.
+  locks_sweep_interval: 10s
+  # Sweep interval for verification tracker cleanup/timeouts; smaller reduces tail latency on failures.
+  verification_sweep_interval: 500ms
+  # Session TTL; must exceed client keepalive cadence to avoid premature eviction.
+  sessions_ttl: 60s
+  # Transport lock TTL; long enough for worst-case transfers but short enough to recover from leaks.
+  locks_ttl: 120s
+  # Local-only Unix domain socket for handle FD handoff and lease release.
+  handle_leases:
+    # Optional override. Leave empty to let the daemon auto-select
+    # <daemon_state_dir>/local_handle.sock for same-pod/local SDKs.
+    # daemon_state_dir defaults to:
+    #   $TENSORCAST_HOME/hosts/<host_id>/sessions/<session_id>/session
+    #   (or ~/.tensorcast/hosts/<host_id>/sessions/<session_id>/session)
+    # Auto-discovery relies on TENSORCAST_INSTANCE (CLI/SDK-launched daemon).
+    # If TENSORCAST_INSTANCE is not set, the daemon falls back to:
+    #   $TENSORCAST_HOME/hosts/<host_id>/runtime/daemons/<daemon_id>/local_handle.sock
+    # If the selected socket path exceeds AF_UNIX limits, the daemon falls back to:
+    #   $TENSORCAST_HOME/uds/lh-<hash>.sock
+    # Set explicitly when daemon and client SDK run in different pods and need a shared path.
+    # Socket path must have a daemon-owned parent directory (not world-writable); create the directory beforehand.
+    local_handle_socket_path: ""
+    # Handle lease TTL as a crash-safety fallback; live clients release leases when tensors are freed.
+    # Set to 0s to disable TTL (leases rely on explicit release and PID-exit cleanup).
+    ttl: 0s
+    # Best-effort guardrail: limit lease-bearing handle mints per second (0 => unlimited).
+    max_mints_per_second: 0
+
+# Communicator transport configuration (TCP/RDMA).
+communicator:
+  # Enable RDMA transport; requires RDMA-capable NICs and correct kernel/driver setup.
+  enable_rdma: True
+  # Example tuning block (defaults shown below); adjust per workload.
+  stager:
+    # Stage CPU tensors for RDMA; disable only if you rely on direct GPU RDMA paths.
+    stage_cpu_for_rdma: true
+    # Buffers per flow; more buffers increase overlap but require a larger pool.
+    buffers_per_flow: 16
+    # Cap concurrent in-flight segments; 0 inherits buffers_per_flow.
+    max_window_segments: 0
+    # Cap concurrent GPU channels so pool sizing is predictable (8 for 8-GPU defaults; 0 = auto).
+    expected_gpu_channels: 8
+  rdma:
+    # Outstanding WRs per QP; increase for bandwidth, decrease to reduce CPU/latency.
+    outstanding_wr: 64
+    # ACK TTL; increase on high-latency fabrics to avoid premature cleanup.
+    ack_ttl_ms: 30000
+    # QP tuning; adjust only if you understand fabric QoS/timeouts.
+    traffic_class: 186
+    qp_timeout: 20
+    qp_retry: 7
+    # Multi-QP configuration for high-throughput scenarios
+    qp_count: 1  # Number of QPs per transport (1-16, default: 1)
+    bonding_balance: false  # Enable LAG port balancing (default: false)
+    # Reuse preregistered stable local MRs for read_plan target windows when available.
+    # Disable only for A/B or debugging request-scoped MR registration behavior.
+    enable_stable_local_mr_reuse: true
+    # Slot-aligned MR reuse chunk size for stable local backing.
+    stable_local_mr_reuse_chunk_slots: 32
+    # Async all-rail chunk prewarm. Unset or 0 disables; values >0 enable one
+    # prewarm job per visible rail on a bounded communicator-local worker pool.
+    stable_local_mr_reuse_prewarm_workers: 1
+  transport:
+    # TCP connections per peer; more lanes help bandwidth but add CPU overhead.
+    tcp_conn_count: 8
+    # Connect timeout; increase when handshakes are slow or firewalled.
+    connect_timeout_sec: 10
+    # TOS/DSCP value; keep 0 unless fabric QoS is configured.
+    tcp_tos: 0
+    # Allow SO_REUSEPORT on listeners; disable if OS load balancing is undesirable.
+    so_reuseport: true
+  affinity:
+    # Reserved for future CPU pinning policies.
+    enable: false
+  simple_numa:
+    # NIC/GPU locality mapping for multi-socket nodes.
+    enable: false
+    # Example topology mapping:
+    # nodes:
+    #   - id: 0
+    #     nics: ["mlx5_0", "mlx5_1"]
+    #     gpus: [0, 1]
+    #     is_default: true
+    nodes: []
+
+# Logging and tracing configuration (best-effort).
+observability:
+  # Logging output and verbosity controls.
+  logging:
+    # Minimum severity emitted; higher levels reduce noise at the cost of debugging detail.
+    level: INFO
+    # Optional plain-text logfile; empty logs only to stderr.
+    file: ""
+    # When true, include trace/span IDs in logs (if tracing is enabled).
+    otel_context_enabled: false
+    # Optional enriched sink file with trace/span IDs; leave empty to disable.
+    sink_file: ""
+    # VLOG verbosity level; 0 disables VLOG.
+    vlog_level: 0
+  # OpenTelemetry export settings.
+  otel:
+    # Enable OTLP export; when false, other OTel settings are ignored.
+    enabled: false
+    # Collector endpoint; must be reachable from the daemon host.
+    exporter_otlp_endpoint: http://127.0.0.1:4317
+    # Transport protocol for OTLP; aliases like "grpc" or "http/protobuf" are normalized.
+    exporter_protocol: grpc
+    # Stable logical service name for grouping traces/metrics across nodes.
+    service_name: tensorcast-store-daemon
+    # Sampler name for Python OTel SDK; C++ currently ignores this field.
+    sampler: parentbased_traceidratio
+    # Sampler argument (ratio for traceidratio); keep 1.0 for full sampling.
+    sampler_arg: "1.0"
+  otel_cxx:
+    # Disable the C++ SDK when embedding in C++ processes.
+    sdk_disabled: false
+    # Force insecure OTLP gRPC; set true when using non-TLS collectors.
+    exporter_insecure: false
+    # Static OTLP headers (e.g., auth tokens).
+    exporter_headers: {}
+    # Emit spans to stdout for debugging.
+    console_exporter: false
+  tracing:
+    # Chrome trace output directory; empty disables.
+    chrome_trace_dir: ""
+
+# Compatibility toggles for legacy behavior.
+compatibility:
+  # Require explicit disk_path for confirm RPCs; reserved for legacy clients.
+  confirm_requires_disk_path: false
+  # Status to return on verification timeouts; set OK or DEADLINE when wired.
+  verification_timeout_status: VERIFICATION_TIMEOUT_STATUS_UNSPECIFIED
+  # Evict replicas on dead PID detection; reserved until wired.
+  evict_on_dead_pid: false
+  # Auto-register disk loads; reserved until wired.
+  auto_register_disk_loads: false
+  # Force full-digest verification on load; reserved until wired.
+  force_full_digest_on_load: false
+
+# Debug-only toggles; keep disabled in production unless explicitly needed.
+debug:
+  # CUDA debug toggles used for tests and local runs.
+  cuda:
+    # Same-process CUDA IPC fallback for tests; breaks real IPC semantics across processes.
+    enable_same_process_ipc_fallback: false
+
+# Byte-artifact routing and payload transport defaults. Primarily used for distributed KV store
+byte_artifact_routing:
+  # Number of routing shards used for authority fanout.
+  # Recommended: 2N shards for N TensorCast daemons in the cluster
+  shard_count: 8
+  # How long route resolution can be reused before forcing a refresh.
+  route_staleness_budget: 5s
+  # Lease TTL for published byte-artifact routes.
+  lease_ttl: 30s
+  # Keepalive cadence for refreshing active route leases.
+  keepalive_interval: 10s
+  # Worker-directory cache freshness budget used before refetching active workers.
+  worker_directory_staleness_budget: 30s
+  payload_transport:
+    # Per-transport chunk size limit used when segmenting payloads.
+    max_chunk_bytes: 1048576
+    # Batch transport protocol revision.
+    # v2 uses P2P communicator, v1 uses gRPC developed at early ages. Use v2
+    batch_transport_protocol_version: 2
+    # Use communicator/materialize source export paths when available.
+    communicator_source_enabled: true
+    # Allow host-memory export for direct-write-capable CPU paths.
+    host_memory_export_enabled: true
+    # 0 means no payload-size cap
+    max_batch_payload_bytes: 0
+    # 0 means no per-batch item-count cap
+    max_batch_items: 0
+    source_publish_prereg:
+      # Pre-register publish-time exports so later batch_get can reuse them directly.
+      enabled: true
+      # Keep preregistered exports alive long enough for the delayed consumer phase.
+      ttl: 60s
+      # Cap live preregistered export entries to avoid unbounded retention.
+      max_live_entries: 4096
+      # Cap total bytes retained by live preregistered exports.
+      max_live_bytes: 17179869184
