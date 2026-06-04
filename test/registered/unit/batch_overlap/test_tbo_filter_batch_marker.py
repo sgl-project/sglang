@@ -1,15 +1,8 @@
-"""Regression: TBO filter_batch must handle ForwardBatch's attention plan
-marker fields.
+"""Regression: TBO filter_batch resets the attention plan marker on children.
 
-`TboForwardBatchPreparer.filter_batch` ends with a completeness guard that
-raises for any ForwardBatch field that is non-None but absent from the child
-``output_dict``. The plan marker added by the skip_attn_backend_init refactor
-(`forward_metadata_ready` etc.) defaults to ``False`` — non-None — so an
-unhandled marker crashes TBO cuda-graph capture (DP + spec + TBO).
-The children must be reset to "unplanned" so each sub-batch is planned by the
-TBO-aware init flow.
-
-Pure dataclass logic — CPU only.
+filter_batch's completeness guard raises for any non-None ForwardBatch field
+missing from the child dict; the plan marker defaults to False (non-None) and
+crashed TBO cuda-graph capture until reset. CPU-only.
 """
 
 import unittest
@@ -59,8 +52,6 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 class TestTboFilterBatchMarker(CustomTestCase):
     def test_filter_batch_resets_plan_marker_on_children(self):
-        # Default marker (forward_metadata_ready=False) is non-None and would
-        # trip the completeness guard if unhandled.
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
         self.assertEqual(child.batch_size, 4)
         self.assertFalse(child.forward_metadata_ready)
@@ -69,8 +60,6 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertFalse(child.forward_metadata_replan_equivalent)
 
     def test_pre_planned_parent_does_not_leak_ready_into_children(self):
-        # Even if the parent was marked, children must start unplanned — a
-        # stale "ready" would wrongly skip the child's own planning.
         parent = _make_target_verify_batch(8)
         parent.mark_forward_metadata_ready(replan_equivalent=True)
         child = _filter(parent, lo=0, hi=4)
