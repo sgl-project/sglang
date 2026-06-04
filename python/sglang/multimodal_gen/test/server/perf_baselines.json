@@ -751,7 +751,8 @@
             },
             "expected_e2e_ms": 961.86,
             "expected_avg_denoise_ms": 57.95,
-            "expected_median_denoise_ms": 64.35
+            "expected_median_denoise_ms": 64.35,
+            "estimated_full_test_time_s": 59.9
         },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
@@ -874,7 +875,8 @@
             },
             "expected_e2e_ms": 28350.2,
             "expected_avg_denoise_ms": 672.19,
-            "expected_median_denoise_ms": 679.16
+            "expected_median_denoise_ms": 679.16,
+            "estimated_full_test_time_s": 117.6
         },
         "qwen_image_t2i_cache_dit_enabled": {
             "stages_ms": {
@@ -1454,7 +1456,8 @@
             },
             "expected_e2e_ms": 11816.27,
             "expected_avg_denoise_ms": 982.57,
-            "expected_median_denoise_ms": 1118.83
+            "expected_median_denoise_ms": 1118.83,
+            "estimated_full_test_time_s": 77.0
         },
         "wan2_2_i2v_a14b_2gpu": {
             "stages_ms": {
@@ -2654,6 +2657,206 @@
             "expected_avg_denoise_ms": 1325.11,
             "expected_median_denoise_ms": 1547.31,
             "estimated_full_test_time_s": 363.2
+        },
+        "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 98.3
+        },
+        "cosmos3_nano_t2i": {
+            "stages_ms": {
+                "Cosmos3ImagePreprocessStage": 0.01,
+                "Cosmos3TokenizationStage": 155.89,
+                "Cosmos3LatentPreparationStage": 0.15,
+                "Cosmos3TimestepPreparationStage": 0.64,
+                "Cosmos3DenoisingStage": 846.85,
+                "Cosmos3DecodingStage": 12.14
+            },
+            "denoise_step_ms": {
+                "0": 58.61,
+                "1": 21.71,
+                "2": 44.31,
+                "3": 22.05,
+                "4": 21.79,
+                "5": 21.78,
+                "6": 21.79,
+                "7": 22.25,
+                "8": 22.59,
+                "9": 22.73,
+                "10": 22.75,
+                "11": 22.71,
+                "12": 24.63,
+                "13": 22.43,
+                "14": 21.97,
+                "15": 22.74,
+                "16": 22.93,
+                "17": 22.74,
+                "18": 22.68,
+                "19": 22.55,
+                "20": 22.52,
+                "21": 22.37,
+                "22": 22.29,
+                "23": 22.45,
+                "24": 22.63,
+                "25": 22.64,
+                "26": 22.53,
+                "27": 22.48,
+                "28": 22.41,
+                "29": 22.18,
+                "30": 22.19,
+                "31": 22.48,
+                "32": 22.68,
+                "33": 22.65,
+                "34": 22.37
+            },
+            "expected_e2e_ms": 1019.02,
+            "expected_avg_denoise_ms": 24.13,
+            "expected_median_denoise_ms": 22.52,
+            "estimated_full_test_time_s": 65.0
+        },
+        "cosmos3_nano_t2v": {
+            "stages_ms": {
+                "Cosmos3ImagePreprocessStage": 0.01,
+                "Cosmos3TokenizationStage": 152.97,
+                "Cosmos3LatentPreparationStage": 0.17,
+                "Cosmos3TimestepPreparationStage": 0.64,
+                "Cosmos3DenoisingStage": 294.92,
+                "Cosmos3DecodingStage": 47.82,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 89.22,
+                "1": 61.52,
+                "2": 85.06,
+                "3": 58.08
+            },
+            "expected_e2e_ms": 499.70,
+            "expected_avg_denoise_ms": 73.47,
+            "expected_median_denoise_ms": 73.29,
+            "estimated_full_test_time_s": 65.0
+        },
+        "flux_2_t2i_customized_vae_path": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 574.4
+        },
+        "wan2_2_t2v_a14b_teacache_2gpu": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 253.9
+        },
+        "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 55.4
+        },
+        "mova_360p_tp2": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 160.2
+        },
+        "mova_360p_ring1_uly2": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 236.8
+        },
+        "zimage_image_t2i_2_gpus_non_square": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 67.9
+        },
+        "flux1_modelopt_fp8_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 50.3
+        },
+        "flux2_modelopt_fp8_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 498.1
+        },
+        "wan22_modelopt_fp8_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 89.5
+        },
+        "hunyuanvideo_modelopt_fp8_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 64.3
+        },
+        "qwen_image_modelopt_fp8_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 65.5
+        },
+        "qwen_image_edit_modelopt_fp8_ti2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 73.7
+        },
+        "flux1_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 71.2
+        },
+        "flux2_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 592.3
+        },
+        "wan22_modelopt_nvfp4_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 181.8
         }
     }
 }

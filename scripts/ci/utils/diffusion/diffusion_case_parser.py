@@ -16,6 +16,7 @@ Usage:
 
 import ast
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -43,6 +44,17 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 # Paths relative to repository root
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
+
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
+    BASELINE_REL_PATH = (
+        "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
+    )
+    CASE_LIST_TO_SUITE = {
+        "ONE_NPU_CASES": "1-npu",
+        "TWO_NPU_CASES": "2-npu",
+    }
 
 
 @dataclass
