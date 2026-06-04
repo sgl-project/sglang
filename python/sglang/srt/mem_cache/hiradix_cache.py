@@ -799,7 +799,7 @@ class HiRadixCache(RadixCache):
     def _replace_pending_write_through_node(
         self, old_node: TreeNode, new_nodes: List[TreeNode]
     ) -> None:
-        ack_id = old_node.write_through_pending_id
+        ack_id = getattr(old_node, "write_through_pending_id", None)
         if ack_id is None:
             return
 
@@ -824,17 +824,21 @@ class HiRadixCache(RadixCache):
             node.write_through_pending_id = ack_id
         self.ongoing_write_through[ack_id] = (lock_node, backup_len, updated_nodes)
 
-    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> None:
-        lock_node, backup_len, publish_nodes = self.ongoing_write_through.pop(ack_id)
+    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> bool:
+        pending = self.ongoing_write_through.pop(ack_id, None)
+        if pending is None:
+            return False
+
+        lock_node, backup_len, publish_nodes = pending
         for node in publish_nodes:
-            if node.write_through_pending_id == ack_id:
+            if getattr(node, "write_through_pending_id", None) == ack_id:
                 node.write_through_pending_id = None
-            # DMA confirmed -- block is now on host.
             self._record_store_event(node, medium=StorageMedium.CPU)
         if self.enable_storage:
             self.write_backup_storage(lock_node, backup_len)
         if release_lock:
             self.dec_lock_ref(lock_node)
+        return True
 
     def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
         # Recover pre-split data via walk-and-concat if node was split.
@@ -916,11 +920,9 @@ class HiRadixCache(RadixCache):
                     ack.finish_event.synchronize()
                     matched = False
                     for ack_id in ack.node_ids:
-                        if ack_id in self.ongoing_write_through:
-                            self._finish_write_through_ack(
-                                ack_id, release_lock=False
-                            )
-                            matched = True
+                        matched |= self._finish_write_through_ack(
+                            ack_id, release_lock=False
+                        )
                     if matched:
                         self.cache_controller.record_l1_l2_transfer_complete(
                             direction="offload",
@@ -949,11 +951,12 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+
             matched = False
             for ack_id in ack.node_ids:
-                if ack_id in self.ongoing_write_through:
-                    self._finish_write_through_ack(ack_id, release_lock=True)
-                    matched = True
+                matched |= self._finish_write_through_ack(
+                    ack_id, release_lock=True
+                )
             if matched:
                 self.cache_controller.record_l1_l2_transfer_complete(
                     direction="offload",
@@ -977,7 +980,6 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             ack = self.cache_controller.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
-            # ensure completion of loading, before recording transfer completion and updating cache state
             self.cache_controller.record_l1_l2_transfer_complete(
                 direction="onboard",
                 ack=ack,

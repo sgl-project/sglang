@@ -379,23 +379,34 @@ class HiMambaRadixCache(MambaRadixCache):
             # write to host if the node is not backuped
             self.write_backup(node)
 
+    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> bool:
+        backuped_node = self.ongoing_write_through.pop(ack_id, None)
+        if backuped_node is None:
+            return False
+
+        self._record_store_event(backuped_node, medium=StorageMedium.CPU)
+        if release_lock:
+            self.dec_lock_ref(backuped_node)
+        if self.enable_storage:
+            self.write_backup_storage(backuped_node)
+        return True
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 for ack in self.cache_controller.ack_write_queue:
                     ack.finish_event.synchronize()
-                    self.cache_controller.record_l1_l2_transfer_complete(
-                        direction="offload",
-                        ack=ack,
-                    )
+                    matched = False
                     for ack_id in ack.node_ids:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
-                        self._record_store_event(
-                            backuped_node, medium=StorageMedium.CPU
+                        matched |= self._finish_write_through_ack(
+                            ack_id, release_lock=False
                         )
-                        if self.enable_storage:
-                            self.write_backup_storage(backuped_node)
+                    if matched:
+                        self.cache_controller.record_l1_l2_transfer_complete(
+                            direction="offload",
+                            ack=ack,
+                        )
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -423,18 +434,16 @@ class HiMambaRadixCache(MambaRadixCache):
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
 
-            # Record the L1->L2 transfer completion for this write-back operation.
-            self.cache_controller.record_l1_l2_transfer_complete(
-                direction="offload",
-                ack=ack,
-            )
-
+            matched = False
             for ack_id in ack.node_ids:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
-                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                matched |= self._finish_write_through_ack(
+                    ack_id, release_lock=True
+                )
+            if matched:
+                self.cache_controller.record_l1_l2_transfer_complete(
+                    direction="offload",
+                    ack=ack,
+                )
             finish_count -= 1
 
     def loading_check(self):
@@ -446,8 +455,6 @@ class HiMambaRadixCache(MambaRadixCache):
                 # the KV cache loading is still ongoing
                 break
 
-            # ensure completion of loading, before recording transfer completion and updating cache state
-            ack.finish_event.synchronize()
             self.cache_controller.record_l1_l2_transfer_complete(
                 direction="onboard",
                 ack=ack,

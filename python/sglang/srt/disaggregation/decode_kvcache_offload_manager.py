@@ -221,19 +221,13 @@ class DecodeKVCacheOffloadManager:
         while finish_count > 0:
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
-            self.cache_controller.record_l1_l2_transfer_complete(
-                direction="offload",
-                ack=ack,
-            )
+            matched = False
             for ack_id in ack.node_ids:
-                (
-                    req,
-                    host_indices,
-                    incremental_tokens,
-                    start_time,
-                    start,
-                    end,
-                ) = self.ongoing_offload.pop(ack_id)
+                entry = self.ongoing_offload.pop(ack_id, None)
+                if entry is None:
+                    continue
+                matched = True
+                req, host_indices, incremental_tokens, start_time, start, end = entry
 
                 self._mark_offload_finished(req.rid)
                 prior_hash = (
@@ -251,6 +245,11 @@ class DecodeKVCacheOffloadManager:
                     state = self.offloaded_state.get(req.rid)
                     start_offset = state.prefill_len if state is not None else start
                     self._release_finished_req(req, start_offset)
+            if matched:
+                self.cache_controller.record_l1_l2_transfer_complete(
+                    direction="offload",
+                    ack=ack,
+                )
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, start_offset: int):

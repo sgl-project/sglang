@@ -92,6 +92,7 @@ class UnifiedTreeNode:
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
+        self.write_through_pending_id: Optional[int] = None
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
         )
@@ -1643,8 +1644,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             updated_nodes,
         )
 
-    def _finish_write_through_ack(self, ack_id: int) -> None:
-        lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+    def _finish_write_through_ack(self, ack_id: int) -> bool:
+        pending = self.ongoing_write_through.pop(ack_id, None)
+        if pending is None:
+            return False
+
+        lock_node, lock_params, publish_nodes = pending
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
@@ -1656,6 +1661,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node in publish_nodes:
                 self.write_backup_storage(node)
+        return True
 
     def load_back(
         self,
@@ -2353,9 +2359,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     ack.finish_event.synchronize()
                     matched = False
                     for ack_id in ack.node_ids:
-                        if ack_id in self.ongoing_write_through:
-                            self._finish_write_through_ack(ack_id)
-                            matched = True
+                        matched |= self._finish_write_through_ack(ack_id)
                     if matched:
                         cc.record_l1_l2_transfer_complete(
                             direction="offload",
@@ -2381,11 +2385,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+
             matched = False
             for ack_id in ack.node_ids:
-                if ack_id in self.ongoing_write_through:
-                    self._finish_write_through_ack(ack_id)
-                    matched = True
+                matched |= self._finish_write_through_ack(ack_id)
             if matched:
                 self.cache_controller.record_l1_l2_transfer_complete(
                     direction="offload",
@@ -2413,7 +2416,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
-            # ensure completion of loading, before recording transfer completion and updating cache state
             self.cache_controller.record_l1_l2_transfer_complete(
                 direction="onboard",
                 ack=ack,
