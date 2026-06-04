@@ -289,44 +289,26 @@ class EAGLEDraftCudaGraphRunner:
         topk_index = buffers.topk_index[:num_seqs]
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            global_num_tokens = buffers.global_num_tokens_gpu
-            global_dp_buffer_len = num_tokens * self.dp_size
-            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu,
+                dtype=torch.int32,
+                device=buffers.input_ids.device,
             )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
             global_num_tokens = buffers.global_num_tokens_gpu
-            global_dp_buffer_len = num_tokens
             global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
         else:
-            global_num_tokens = None
             global_dp_buffer_len = None
+            global_num_tokens = None
             global_num_tokens_for_logprob = None
 
         capture_mode = (
@@ -370,14 +352,14 @@ class EAGLEDraftCudaGraphRunner:
         )
 
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+            self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
 
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
 
@@ -392,8 +374,8 @@ class EAGLEDraftCudaGraphRunner:
             return ret
 
         with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
-            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-                forward_batch
+            self.draft_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=True
             )
             self.deepep_adapter.capture(is_extend_in_batch=False)
             self._capture_init(run_once)
@@ -509,9 +491,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            forward_batch, bs
-        )
+        # forward_batch.batch_size was overwritten to bs above when padding.
+        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph

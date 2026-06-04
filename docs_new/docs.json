@@ -1102,6 +1102,7 @@
                   "cookbook/diffusion/intro",
                   {
                     "group": "Cosmos",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Cosmos/Cosmos3"
                     ]
@@ -1139,6 +1140,12 @@
                     ]
                   },
                   {
+                    "group": "ERNIE-Image",
+                    "pages": [
+                      "cookbook/diffusion/Ernie-Image/Ernie-Image"
+                    ]
+                  },
+                  {
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
@@ -1146,6 +1153,7 @@
                   },
                   {
                     "group": "LingBot World",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World"
                     ]
