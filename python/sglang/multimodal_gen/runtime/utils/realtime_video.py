@@ -243,7 +243,9 @@ def _tensor_sample_to_nchw_rgb_tensor(sample: torch.Tensor) -> torch.Tensor:
     elif sample.dim() == 4:
         frames = sample.permute(1, 0, 2, 3)
     else:
-        raise ValueError(f"Unexpected realtime tensor sample shape: {tuple(sample.shape)}")
+        raise ValueError(
+            f"Unexpected realtime tensor sample shape: {tuple(sample.shape)}"
+        )
 
     if frames.shape[1] == 1:
         frames = frames.repeat(1, 3, 1, 1)
