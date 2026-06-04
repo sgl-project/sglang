@@ -2,6 +2,10 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+    FluxProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -85,8 +89,25 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
 
         self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
         self.add_standard_latent_preparation_stage()
-        self.add_standard_denoising_stage()
+        self._add_flux_denoising_stage(server_args)
         self.add_standard_decoding_stage()
+
+    def _add_flux_denoising_stage(
+        self, server_args: ServerArgs, stage_name: str = "denoising_stage"
+    ) -> None:
+        if server_args.progressive_mode in ("dct", "dct_rewind"):
+            self.add_stage_factory(
+                RoleType.DENOISER,
+                lambda: FluxProgressiveDenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                    pipeline=self,
+                    vae=self.get_module("vae", None),
+                ),
+                stage_name,
+            )
+        else:
+            self.add_standard_denoising_stage(stage_name=stage_name)
 
 
 EntryClass = FluxPipeline
