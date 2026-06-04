@@ -27,9 +27,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
-from sglang.multimodal_gen.runtime.acceleration_policy import (
-    configure_acceleration_policy,
-)
 from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
     DisaggArgsMixin,
     add_disagg_cli_args,
@@ -138,7 +135,6 @@ class ServerArgs(DisaggArgsMixin):
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
-    acceleration_config: addict.Dict | dict[str, Any] | str | None = None
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -348,7 +344,6 @@ class ServerArgs(DisaggArgsMixin):
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
-        self._adjust_acceleration_config()
         self._adjust_warmup()
         self._adjust_network_ports()
         # adjust parallelism before attention backend
@@ -520,12 +515,8 @@ class ServerArgs(DisaggArgsMixin):
         )
 
     def _adjust_attention_backend(self):
-        if isinstance(self.attention_backend, str):
-            normalized_backend = self.attention_backend.strip().lower()
-            if normalized_backend == "auto":
-                self.attention_backend = None
-            elif normalized_backend in ["fa3", "fa4"]:
-                self.attention_backend = "fa"
+        if self.attention_backend in ["fa3", "fa4"]:
+            self.attention_backend = "fa"
         self.component_attention_backends = (
             self._normalize_component_attention_backends(
                 self.component_attention_backends
@@ -948,18 +939,6 @@ class ServerArgs(DisaggArgsMixin):
         if self.disable_autocast is None:
             self.disable_autocast = not self.pipeline_config.enable_autocast
 
-    def _adjust_acceleration_config(self):
-        if self.acceleration_config is None:
-            self.acceleration_config = addict.Dict()
-        elif isinstance(self.acceleration_config, str):
-            self.acceleration_config = addict.Dict(
-                self._parse_attention_backend_config(self.acceleration_config)
-            )
-        else:
-            self.acceleration_config = addict.Dict(self.acceleration_config)
-        if self.acceleration_config:
-            configure_acceleration_policy(self.acceleration_config)
-
     def _parse_attention_backend_config(self, config_str: str) -> dict[str, Any]:
         """parse attention backend config from string."""
         if not config_str:
@@ -1081,17 +1060,6 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.cache_dit_config,
             help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
-        )
-        parser.add_argument(
-            "--acceleration-config",
-            type=str,
-            default=ServerArgs.acceleration_config,
-            help=(
-                "Experimental diffusion acceleration policy. Accepts a JSON/YAML path, "
-                "JSON string, or key=value pairs. Supported keys include "
-                "kernel_compile_policy=off|auto|force_torch_compile|force_fused "
-                "and allow_cudnn_sdp=true."
-            ),
         )
 
         # HuggingFace specific parameters
