@@ -44,9 +44,9 @@ def _get_symmetric_barrier_tensors(
             barrier_flag_multicast,
             barrier_handle,
         )
-    barrier_flag_local, barrier_flag_multicast, _barrier_handle = _SYMMETRIC_BARRIER_TENSORS[
-        cache_key
-    ]
+    barrier_flag_local, barrier_flag_multicast, _barrier_handle = (
+        _SYMMETRIC_BARRIER_TENSORS[cache_key]
+    )
     return group.size(), barrier_flag_local, barrier_flag_multicast
 
 

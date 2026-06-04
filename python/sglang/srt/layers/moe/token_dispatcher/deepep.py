@@ -913,8 +913,7 @@ class _DeepEPDispatcherImplLowLatencyFusedCombine(_DeepEPDispatcherImplLowLatenc
         if not _FUSED_GROUPED_GEMM_COMBINE_LOGGED_ACTIVE:
             _FUSED_GROUPED_GEMM_COMBINE_LOGGED_ACTIVE = True
             logger.info(
-                "fused grouped GEMM combine active: local_tokens=%s, "
-                "group_size=%s",
+                "fused grouped GEMM combine active: local_tokens=%s, " "group_size=%s",
                 hidden_states.shape[0],
                 dist.get_world_size(group=self.group),
             )
