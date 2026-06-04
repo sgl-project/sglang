@@ -2539,9 +2539,7 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             dtype
             for dtype in (
                 getattr(torch, "float8_e4m3fn", None),
-                getattr(torch, "float8_e4m3fnuz", None),
                 getattr(torch, "float8_e5m2", None),
-                getattr(torch, "float8_e5m2fnuz", None),
             )
             if dtype is not None
         }
