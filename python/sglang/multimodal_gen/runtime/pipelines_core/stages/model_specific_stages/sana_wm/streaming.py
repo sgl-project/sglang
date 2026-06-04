@@ -4,8 +4,7 @@
 Drives the DiT's chunk-causal ``forward_long`` autoregressively: the video is
 generated chunk-by-chunk, each chunk denoised with a short self-forcing schedule
 while a rolling per-block KV cache carries recurrent GDN state (and a softmax
-K/V concat-window) across chunks. Ports the reference NVlabs
-``SelfForcingFlowEulerSampler`` (minimal-sanawm/scheduler.py).
+K/V concat-window) across chunks.
 
 Key differences from the dense ``SanaWMDenoisingStage`` (one-shot bidirectional):
   * a fresh ``FlowMatchEulerDiscreteScheduler(shift=1.0)`` with explicit sigmas
@@ -67,12 +66,7 @@ _SANAWM_FORK_DUMP_DIR = _os.environ.get("SANAWM_FORK_DUMP_DIR")
 class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
     """Autoregressive self-forcing streaming variant of SanaWMDenoisingStage."""
 
-    # ----------------------------------------------------------------- #
-    # Chunk schedule + KV cache: thin static delegators to the dedicated
-    # SanaWMSelfForcingScheduler. Kept as static methods so the CPU tests and
-    # SanaWMRealtimeSession call sites are unchanged; the logic now lives in
-    # runtime/models/schedulers/scheduling_sana_wm_self_forcing.py.
-    # ----------------------------------------------------------------- #
+    # Chunk schedule + KV cache: delegate to SanaWMSelfForcingScheduler.
     @staticmethod
     def _autoregressive_segments(total_frames: int, num_frame_per_block: int) -> list[int]:
         return SanaWMSelfForcingScheduler.create_autoregressive_segments(
@@ -151,7 +145,7 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
                 "SANA-WM streaming does not support CFG parallel; run replicated."
             )
 
-        # --- text conditioning (mirror the dense stage) ---
+        # --- text conditioning ---
         pos_embeds = _to_device_dtype(
             _first_tensor(pcfg.get_pos_prompt_embeds(batch)), device=device, dtype=target_dtype
         )

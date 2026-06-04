@@ -2,13 +2,9 @@
 """SANA-WM self-forcing flow-Euler chunk scheduler.
 
 Owns the autoregressive chunk segmentation and the per-block KV-cache
-accumulation / eviction used by streaming (self-forcing) SANA-WM generation —
-the ``SelfForcingFlowEulerSampler`` machinery from the reference
-(minimal-sanawm/scheduler.py), factored out of ``SanaWMStreamingDenoisingStage``
-into a dedicated scheduler module (mirrors the upstream layout). The
-model-calling denoise loop stays in the stage.
+accumulation / eviction used by streaming (self-forcing) SANA-WM generation;
+the model-calling denoise loop stays in the stage.
 
-Pure relocation of our existing logic — no behavior change:
   * segmentation FRONT-LOADS the remainder into chunk 0;
   * the KV accumulator concatenates softmax cache slots on **dim=1** (our
     ``(B, N, H, D)`` softmax cache layout);
@@ -70,7 +66,7 @@ class SanaWMSelfForcingScheduler:
         self.config = config or SanaWMSelfForcingSamplerConfig()
 
     # ----------------------------------------------------------------- #
-    # Chunk schedule + KV cache accumulation (port of scheduler.py:201-404)
+    # Chunk schedule + KV cache accumulation
     # ----------------------------------------------------------------- #
     @staticmethod
     def create_autoregressive_segments(

@@ -2,9 +2,7 @@
 """SANA-WM DiT building blocks (components).
 
 Reusable primitives, RoPE / UCPE camera geometry, GDN scan kernels, embedders,
-FFN, and the SANA-WM attention modules. Split out of ``sana_wm.py`` (which keeps
-``SanaWMBlock`` + ``SanaWMTransformer3DModel``) to mirror the upstream two-file
-layout. Pure code relocation out of sana_wm.py -- no behavior change.
+FFN, and the SANA-WM attention modules.
 """
 
 import math
@@ -82,13 +80,13 @@ def _log_sana_wm_triton_cam_gdn_fallback(reason: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Small primitives (RMSNorm, ShortConvolution) -- shapes match upstream
-# parameter names exactly so the released checkpoint loads cleanly.
+# Small primitives (RMSNorm, ShortConvolution). Parameter names/shapes match
+# the released checkpoint so it loads cleanly.
 # ---------------------------------------------------------------------------
 
 
 class _RMSNorm(nn.Module):
-    """RMSNorm matching upstream signature ``RMSNorm(dim, scale_factor=1.0, eps=1e-6)``.
+    """RMSNorm with signature ``RMSNorm(dim, scale_factor=1.0, eps=1e-6)``.
 
     Parameter name: ``weight`` (shape ``(dim,)``).
     """
@@ -115,10 +113,8 @@ class _RMSNorm(nn.Module):
 class _ShortConvolution(nn.Module):
     """Depth-wise causal Conv1d along the temporal axis.
 
-    Mirrors FLA's ``ShortConvolution(hidden_size, kernel_size=K)``:
-      * weight shape: ``(hidden_size, 1, K)`` (groups=hidden_size)
-
-    Input is ``(B, T, C)``.  Causal padding of ``K-1`` on the left.
+    Weight shape ``(hidden_size, 1, K)`` (groups=hidden_size). Input is
+    ``(B, T, C)`` with causal padding of ``K-1`` on the left.
     """
 
     def __init__(self, hidden_size: int, kernel_size: int) -> None:
@@ -144,8 +140,7 @@ def _bidirectional_short_conv(
     conv: _ShortConvolution,
 ) -> torch.Tensor:
     """Forward + backward causal pass with shared kernel, minus the shared
-    center tap.  Equivalent to a symmetric (non-causal) filter, matching
-    upstream's ``BidirectionalGDN._bidirectional_causal_conv_1d``.
+    center tap.  Equivalent to a symmetric (non-causal) filter.
     """
     y_fwd, _ = conv(x)
     y_bwd, _ = conv(x.flip(1))
@@ -166,7 +161,7 @@ def _temporal_short_conv_cached(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Chunk-causal short conv on K for streaming `forward_long` (cache slot 4).
 
-    Mirrors the reference ``_temporal_conv_cached``: the FORWARD (causal) pass
+    The FORWARD (causal) pass
     prepends the previous chunk's last ``kernel-1`` frames so it stays continuous
     across chunks; the BACKWARD pass (when ``bidirectional``) is recomputed
     intra-chunk; the shared center tap is subtracted. The last ``kernel-1`` input
@@ -177,7 +172,7 @@ def _temporal_short_conv_cached(
     T, H, W = HW
     S = H * W
     pad = conv.kernel_size - 1
-    # (B, N, C) -> (B*S, T, C), same layout as `_temporal_short_conv`.
+    # (B, N, C) -> (B*S, T, C).
     xt = x.view(B, T, S, C).permute(0, 2, 1, 3).contiguous().reshape(B * S, T, C)
 
     if prefix is not None:
@@ -203,7 +198,7 @@ def _temporal_short_conv_cached(
 
 
 # ---------------------------------------------------------------------------
-# 3D RoPE -- ``WanRotaryPosEmbed`` from upstream sana_blocks.py
+# 3D RoPE
 # ---------------------------------------------------------------------------
 
 
@@ -228,9 +223,9 @@ class WanRotaryPosEmbed(nn.Module):
         self._init_freqs_buffer()
 
     def _init_freqs_buffer(self) -> None:
-        # Extracted so SanaWMTransformer3DModel.post_load_weights can re-run
-        # it: this is a persistent=False buffer, so it is not in the upstream
-        # checkpoint and stays on meta after FSDP weight load.
+        # This is a persistent=False buffer, so it is not in the checkpoint and
+        # stays on meta after FSDP weight load; post_load_weights re-runs this
+        # to rematerialize it.
         h_dim = w_dim = 2 * (self.attention_head_dim // 6)
         t_dim = self.attention_head_dim - h_dim - w_dim
 
@@ -256,8 +251,8 @@ class WanRotaryPosEmbed(nn.Module):
         # `fhw[0]` is either an int frame count (dense; positions 0..T-1) or a
         # `(start, end)` tuple selecting GLOBAL frame positions for a streaming
         # chunk. `frame_index`, when given, supplies per-token global frame
-        # positions directly and overrides `fhw[0]`. Mirrors the reference
-        # WanRotaryPosEmbed so chunk-by-chunk RoPE stays at absolute positions.
+        # positions directly and overrides `fhw[0]`, so chunk-by-chunk RoPE
+        # stays at absolute positions.
         fspec, pph, ppw = fhw
         freqs = self._freqs.to(device)
         d = self.attention_head_dim
@@ -289,8 +284,7 @@ def _slice_rope_to_current_chunk(
     """Defensive no-op: keep the trailing ``current_tokens`` of a RoPE table.
 
     ``forward_long`` builds ``freqs`` windowed to exactly the chunk, so this is
-    a no-op there; it only trims if a caller hands in a wider table (mirrors the
-    reference ``_slice_rope_to_current_chunk``)."""
+    a no-op there; it only trims if a caller hands in a wider table."""
     if rotary_emb is None or rotary_emb.shape[-2] == current_tokens:
         return rotary_emb
     return rotary_emb[..., -current_tokens:, :]
@@ -321,8 +315,7 @@ def _apply_rotary_emb_bhnd(
 
 
 # ---------------------------------------------------------------------------
-# UCPE block-diagonal apply primitives (mirror upstream
-# diffusion/model/nets/sana_camctrl_blocks.py)
+# UCPE block-diagonal apply primitives
 # ---------------------------------------------------------------------------
 
 
@@ -366,7 +359,7 @@ def _sana_wm_chunk_index_from_chunk_size(
     chunk_size: int,
     strategy: str = "uniform",
 ) -> list[int]:
-    """Return upstream-style temporal chunk start indices."""
+    """Return temporal chunk start indices."""
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}.")
     if T <= 0:
@@ -473,8 +466,8 @@ def _sana_wm_sdpa(
         k_sdpa = F.pad(k_sdpa, (0, pad_size))
         v_sdpa = F.pad(v_sdpa, (0, pad_size))
 
-    # CUDA SDPA cannot use flash kernels for fp32; SANA's reference code casts
-    # to bf16 on that path and casts the output back to the caller dtype.
+    # CUDA SDPA cannot use flash kernels for fp32; cast to bf16 on that path
+    # and cast the output back to the caller dtype.
     if q_sdpa.device.type == "cuda" and q_sdpa.dtype == torch.float32:
         q_sdpa = q_sdpa.bfloat16()
         k_sdpa = k_sdpa.bfloat16()
@@ -494,10 +487,9 @@ def _sana_wm_sdpa(
 
 
 def _sana_wm_padded_scale(head_dim: int) -> float:
-    """Softmax scale matching the reference's ``sdpa_with_head_padding``: it pads
-    the head dim to 128 (or 256) and lets SDPA use the *padded*-dim default scale.
-    For SANA-WM's head_dim=112 this is 1/sqrt(128), NOT 1/sqrt(112) — the reference
-    never passes an explicit scale after padding, so we replicate that here."""
+    """Softmax scale for the head-padding SDPA path: pad the head dim to 128
+    (or 256) and let SDPA use the *padded*-dim default scale. For SANA-WM's
+    head_dim=112 this is 1/sqrt(128), NOT 1/sqrt(112)."""
     if head_dim in (32, 64, 128, 256) or head_dim >= 256:
         return head_dim**-0.5
     pad_to = 128 if head_dim <= 128 else 256
@@ -1115,10 +1107,8 @@ class GLUMBConvTemp(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Frame-gate and DeltaNet update rule (torch port of upstream
-# torch_chunk_sana_gdn / torch_recurrent_sana_gdn).  Inference path uses
-# the recurrent form for simplicity and clarity; chunk-parallel form is
-# numerically equivalent.
+# Frame-gate and DeltaNet update rule. The recurrent and chunk-parallel forms
+# are numerically equivalent.
 # ---------------------------------------------------------------------------
 
 
@@ -1160,8 +1150,7 @@ def _gdn_scan_forward(
     eps: float = 1e-6,
     return_components: bool = False,
 ) -> torch.Tensor:
-    """Causal recurrent GDN scan over T (mirrors
-    ``torch_recurrent_sana_gdn``).  Tensors are in (B, H, D, N=T*S) layout.
+    """Causal recurrent GDN scan over T. Tensors are in (B, H, D, N=T*S) layout.
     """
     B, H, D, N = q.shape
     T = beta.shape[2]
@@ -1215,12 +1204,10 @@ def _gdn_scan_forward(
 
 
 # ---------------------------------------------------------------------------
-# Streaming (autoregressive) state-carrying scans — the foundation of the
-# SANA-WM streaming `forward_long` path (S1). These mirror the reference
-# `recurrent_gdn_cached` / `recurrent_delta_cached`: a forward-only recurrence
-# that SEEDS its state from a prior chunk and RETURNS the final state, so a long
-# video can be generated chunk-by-chunk while remaining numerically identical to
-# the monolithic forward scan. Additive; #26153's dense path is untouched.
+# Streaming (autoregressive) state-carrying scans for the `forward_long` path:
+# a forward-only recurrence that SEEDS its state from a prior chunk and RETURNS
+# the final state, so a long video can be generated chunk-by-chunk while
+# remaining numerically identical to the monolithic forward scan.
 # ---------------------------------------------------------------------------
 
 
@@ -1241,7 +1228,7 @@ def _gdn_scan_forward_stateful(
 ):
     """Main-branch GDN causal scan that carries KV/Z state across chunks.
 
-    Identical recurrence to ``_gdn_scan_forward`` but the state is seeded from
+    The state is seeded from
     ``init_state_kv``/``init_state_z`` (None → zeros, i.e. the first chunk) and,
     when ``return_state`` is set, the final ``(state_kv, state_z)`` is returned so
     the next chunk continues the recurrence. Tensors are ``(B, H, D, N=T*S)``.
@@ -1301,10 +1288,9 @@ def _single_path_delta_scan_forward_stateful(
     init_state_kv: Optional[torch.Tensor] = None,
     return_state: bool = False,
 ):
-    """Camera-branch (numerator-only) delta-rule scan that carries state across chunks.
-
-    Identical recurrence to ``_single_path_delta_scan_forward`` with a seedable /
-    returnable ``state_kv`` for chunked autoregressive generation.
+    """Camera-branch (numerator-only) delta-rule scan that carries state across
+    chunks via a seedable / returnable ``state_kv`` for chunked autoregressive
+    generation.
     """
     B, H, D, N = q_rot.shape
     T = beta.shape[2]
@@ -1351,9 +1337,8 @@ def _gdn_chunk_scan_forward(
 ) -> torch.Tensor:
     """Chunk-scan form of SANA GDN.
 
-    This mirrors upstream ``torch_chunk_sana_gdn`` algebraically, but computes
-    W/U per chunk instead of materializing all temporal transitions at once.
-    That keeps peak memory closer to the recurrent path on long videos.
+    Computes W/U per chunk instead of materializing all temporal transitions at
+    once, keeping peak memory closer to the recurrent path on long videos.
     """
     B, H, D, N = q.shape
     T = beta.shape[2]
@@ -1432,9 +1417,8 @@ def _gdn_chunk_scan_forward(
 
 
 def _flip_and_shift(x: torch.Tensor, dim: int, shift_val: float = 0.0) -> torch.Tensor:
-    """``flip_and_shift`` helper from upstream: flip along ``dim`` then shift
-    by one with ``shift_val`` filling the head.  Used for the backward pass
-    of bidirectional GDN."""
+    """Flip along ``dim`` then shift by one with ``shift_val`` filling the head.
+    Used for the backward pass of bidirectional GDN."""
     x_flipped = x.flip(dim)
     idx = [slice(None)] * x.ndim
     idx[dim] = slice(0, 1)
@@ -1456,8 +1440,7 @@ def _gdn_scan_bidirectional(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Bidirectional GDN: forward (inclusive) + backward (exclusive) scan,
-    summed in numerator/denominator space (mirrors upstream
-    ``BidirectionalGDN.forward``).
+    summed in numerator/denominator space.
     """
     def run_scan(
         q_in: torch.Tensor,
@@ -1553,13 +1536,12 @@ def _single_path_delta_scan_forward(
     beta: torch.Tensor,
     decay: torch.Tensor,
 ) -> torch.Tensor:
-    """Numerator-only camera delta-rule recurrence from SANA-WM upstream.
+    """Numerator-only camera delta-rule recurrence.
 
-    This is intentionally separate from ``_gdn_scan_forward``. The
-    SANA-WM camera branch in ``BidirectionalGDNUCPESinglePathLiteLA`` does not
-    use the GDN denominator path; using the main-branch GDN recurrence here
-    changes the latent distribution substantially once camera conditioning is
-    enabled.
+    This is intentionally separate from ``_gdn_scan_forward``: the SANA-WM
+    camera branch does not use the GDN denominator path; reusing the
+    main-branch GDN recurrence here changes the latent distribution
+    substantially once camera conditioning is enabled.
     """
     B, H, D, N = q_rot.shape
     T = beta.shape[2]
@@ -1605,7 +1587,7 @@ def _single_path_delta_chunk_scan_forward(
     decay: torch.Tensor,
     chunk_size: Optional[int] = 21,
 ) -> torch.Tensor:
-    """Chunk-scan form of the SANA-WM camera single-path delta rule."""
+    """Chunk-scan form of the camera single-path delta rule."""
     B, H, D, N = q_rot.shape
     T = beta.shape[2]
     S = N // T
@@ -1672,11 +1654,8 @@ def _single_path_delta_scan_bidirectional(
     HW: Tuple[int, int, int],
     chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Bidirectional single-path camera scan.
-
-    Mirrors upstream ``BidirectionalGDNUCPESinglePathLiteLA``: inclusive
-    forward scan plus exclusive backward scan with ``flip_and_shift`` on K/V,
-    beta, and decay.
+    """Bidirectional single-path camera scan: inclusive forward scan plus
+    exclusive backward scan with ``flip_and_shift`` on K/V, beta, and decay.
     """
     scan_forward = (
         _single_path_delta_chunk_scan_forward
@@ -1733,14 +1712,11 @@ def _single_path_delta_scan_bidirectional(
 
 
 # ---------------------------------------------------------------------------
-# Chunk-causal cached scans — the per-chunk combiners used by the streaming
-# `forward_long` path. They mirror the reference `recurrent_gdn_cached` /
-# `recurrent_delta_cached`: the FORWARD (inclusive) pass carries recurrent state
-# across chunks (via the `_stateful` scans above); the BACKWARD (exclusive) pass
-# is recomputed intra-chunk and stateless (identical `_flip_and_shift` to the
-# bidirectional scans). So a single chunk with no carried state reduces exactly
-# to `_gdn_scan_bidirectional` / `_single_path_delta_scan_bidirectional`, while a
-# sequence processed chunk-by-chunk stays continuous in the forward direction.
+# Chunk-causal cached scans for the streaming `forward_long` path: the FORWARD
+# (inclusive) pass carries recurrent state across chunks; the BACKWARD
+# (exclusive) pass is recomputed intra-chunk and stateless. A single chunk with
+# no carried state reduces exactly to the bidirectional scans, while a sequence
+# processed chunk-by-chunk stays continuous in the forward direction.
 # ---------------------------------------------------------------------------
 
 
@@ -1759,10 +1735,9 @@ def _gdn_scan_cached(
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Chunk-causal main-branch GDN scan for streaming `forward_long`.
 
-    Mirrors the reference ``recurrent_gdn_cached``: the forward pass seeds/returns
-    ``(state_kv, state_z)`` so chunks stay continuous; the backward pass is
-    intra-chunk and stateless (same flip/shift as ``_gdn_scan_bidirectional``).
-    Returns ``(out, (state_kv, state_z))``.
+    The forward pass seeds/returns ``(state_kv, state_z)`` so chunks stay
+    continuous; the backward pass is intra-chunk and stateless. Returns
+    ``(out, (state_kv, state_z))``.
     """
     (num_fwd, den_fwd), (state_kv, state_z) = _gdn_scan_forward_stateful(
         q,
@@ -1829,9 +1804,8 @@ def _single_path_delta_scan_cached(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunk-causal camera single-path delta scan for streaming `forward_long`.
 
-    Mirrors the reference ``recurrent_delta_cached``: forward pass carries
-    ``state_kv`` across chunks; backward pass is intra-chunk/stateless. Returns
-    ``(out, state_kv)``.
+    The forward pass carries ``state_kv`` across chunks; the backward pass is
+    intra-chunk/stateless. Returns ``(out, state_kv)``.
     """
     out_fwd, state_kv = _single_path_delta_scan_forward_stateful(
         q_rot,
@@ -1879,10 +1853,9 @@ def _downscale_to_reference_rms(
 ) -> torch.Tensor:
     """Clamp UCPE-transformed channel RMS to the pre-transform envelope.
 
-    SANA-WM's released checkpoint uses the PostUCPERenorm camera variant.
     The UCPE matrices include translations that can inflate transformed Q/K/V
-    magnitudes; upstream downscales per (batch, head, token) before the camera
-    recurrence so inference stays on the training distribution.
+    magnitudes; downscale per (batch, head, token) before the camera recurrence
+    so inference stays on the training distribution.
     """
     ref_rms = ref.square().mean(dim=2, keepdim=True).add(eps).sqrt()
     transformed_rms = transformed.square().mean(dim=2, keepdim=True).add(eps).sqrt()
@@ -1891,9 +1864,8 @@ def _downscale_to_reference_rms(
 
 
 # ---------------------------------------------------------------------------
-# SANA-WM attention block: main GDN (or softmax) + UCPE camera branch
-# (single SinglePath module; cam branch shares ``proj`` / ``output_gate``
-# with the main branch).
+# SANA-WM attention block: main GDN (or softmax) + UCPE camera branch. The cam
+# branch shares ``proj`` / ``output_gate`` with the main branch.
 # ---------------------------------------------------------------------------
 
 
@@ -1901,8 +1873,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     """Bidirectional GDN main branch + UCPE camera branch (single-path
     output: ``main + out_proj_cam(cam_raw)`` then shared output gate +
     shared output projection).
-
-    Parameter naming follows upstream exactly so the checkpoint loads.
     """
 
     def __init__(
@@ -1949,7 +1919,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 f"{self.gdn_backend}. Expected one of auto, torch, triton."
             )
 
-        # Main branch: fused QKV + output proj (shared with cam branch)
+        # Fused QKV + output proj (proj shared with cam branch).
         self.qkv = nn.Linear(in_dim, 3 * out_dim, bias=False)
         self.proj = nn.Linear(out_dim, out_dim, bias=True)
 
@@ -1964,7 +1934,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             self.q_norm_cam = nn.Identity()
             self.k_norm_cam = nn.Identity()
 
-        # GDN-specific (also held by softmax variant for state_dict compat)
+        # Also held by the softmax variant for state_dict compat.
         self.beta_proj = nn.Linear(in_dim, heads, bias=True)
         self.gate_proj = nn.Linear(in_dim, heads, bias=True)
         self.A_log = nn.Parameter(torch.log(torch.empty(heads).uniform_(0, 16)))
@@ -1992,8 +1962,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.conv_kernel_size = conv_kernel_size
         self.k_conv_only = k_conv_only
 
-        # Camera branch -- separate QKV + zero-init output proj, plus a
-        # separate ShortConvolution for K.  Both branches share ``proj``.
+        # Camera branch: separate QKV + zero-init output proj + separate K
+        # ShortConvolution. Both branches share ``proj``.
         self.q_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
         self.k_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
         self.v_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
@@ -2011,10 +1981,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         else:
             self.conv_k_cam = self.conv_q_cam = self.conv_v_cam = None
 
-        # Softmax-variant blocks (every Nth block, controlled by softmax_main)
-        # route attention through SGLang's pluggable backend (FA3 / FlashInfer /
-        # Triton / SDPA). GDN blocks compute attention via _gdn_scan_bidirectional
-        # and don't go through this path.
+        # Softmax-variant blocks route attention through SGLang's pluggable
+        # backend (FA3 / FlashInfer / Triton / SDPA). GDN blocks compute
+        # attention via the scan path and don't go through this.
         if softmax_main:
             self.softmax_attn = LocalAttention(
                 num_heads=heads,
@@ -2042,7 +2011,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         B, N, C = x.shape
         T, H, W = HW
         S = H * W
-        # Move T into the time axis: (B, T, S, C) -> (B*S, T, C)
+        # (B, T, S, C) -> (B*S, T, C): T onto the time axis for the conv.
         y = x.view(B, T, S, C).permute(0, 2, 1, 3).contiguous().reshape(B * S, T, C)
         if bidirectional:
             y = _bidirectional_short_conv(y, conv)
@@ -2361,7 +2330,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim).contiguous()
         q, k, v = qkv.unbind(2)
 
-        # Short conv on K only.
         if self.conv_k is not None:
             k = self._temporal_short_conv(
                 k.reshape(B, N, C), self.conv_k, HW, bidirectional=True
@@ -2460,8 +2428,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             k = k.reshape(B, N, self.heads, self.dim)
         q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
         k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
-        # RoPE primitives are written for (B, H, N, D); LocalAttention takes
-        # (B, N, H, D). Permute for RoPE, then transpose back at the call site.
+        # RoPE primitives use (B, H, N, D); LocalAttention takes (B, N, H, D).
         q = q.permute(0, 2, 1, 3)  # (B, H, N, D)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
@@ -2487,8 +2454,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             out = self.softmax_attn(q_in, k_in, v_in)
         out = out.reshape(B, N, C)
 
-        # Compute the gates anyway -- they are needed by the cam branch and
-        # also exist in the softmax variant's state dict.
+        # Gates are needed by the cam branch and also exist in the softmax
+        # variant's state dict.
         beta, decay = _compute_frame_gates(
             x,
             HW,
@@ -2536,7 +2503,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         k_scale = (self.dim**-0.5) * (S**-0.5)
         k = k * k_scale
 
-        # Move to (B, H, N, D) for UCPE application then back to (B, H, D, N)
+        # (B, H, N, D) for UCPE apply, then back to (B, H, D, N) for the scan.
         q_bhnd = q.permute(0, 2, 1, 3)
         k_bhnd = k.permute(0, 2, 1, 3)
         v_bhnd = v.permute(0, 2, 1, 3)
@@ -2587,7 +2554,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 chunk_size=scan_chunk_size,
             )
         out = out.to(dtype)
-        # apply inverse UCPE projection on output
         out_bhnd = out.permute(0, 1, 3, 2)
         out_bhnd = apply_o(out_bhnd)
         return out_bhnd.permute(0, 2, 1, 3).reshape(B, N, C)
@@ -2701,19 +2667,19 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         else:
             combined = main_raw
 
-        # Shared output gate + shared output projection. Upstream evaluates
-        # the SiLU gate in fp32 and multiplies before casting for proj.
+        # Shared output gate + shared output projection. The SiLU gate is
+        # evaluated in fp32 and multiplied before casting for proj.
         gate = F.silu(self.output_gate(x).to(torch.float32))
         combined = combined * gate
         return self.proj(combined.to(self.proj.weight.dtype))
 
     # ------------------------------------------------------------------ #
-    # Streaming `forward_long`: chunk-causal cached variants of the four
-    # dense branch methods + a dispatcher. Each takes a per-block 10-slot
-    # `kv_cache` list (mutated in place) + `save_kv_cache`. GDN/cam scans carry
-    # recurrent state (slots 0/1/2); softmax blocks use a concat-window (slots
-    # 0/1 main, 2/3 cam); short-conv prefix (slot 4); type flag (slot 6). A
-    # single chunk with an empty cache reduces to the dense bidirectional path.
+    # Streaming `forward_long`: chunk-causal cached branch methods + dispatcher.
+    # Each takes a per-block 10-slot `kv_cache` list (mutated in place) +
+    # `save_kv_cache`. GDN/cam scans carry recurrent state (slots 0/1/2);
+    # softmax blocks use a concat-window (slots 0/1 main, 2/3 cam); short-conv
+    # prefix (slot 4); type flag (slot 6). A single chunk with an empty cache
+    # reduces to the dense bidirectional path.
     # ------------------------------------------------------------------ #
 
     def _main_branch_gdn_cached(
@@ -2731,7 +2697,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim).contiguous()
         q, k, v = qkv.unbind(2)
 
-        # Short conv on K (cached forward prefix + intra-chunk backward).
+        # Cached forward prefix + intra-chunk backward short conv on K.
         if self.conv_k is not None:
             k, new_prefix = _temporal_short_conv_cached(
                 k.reshape(B, N, C),
@@ -2749,7 +2715,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             x, HW, self.heads, self.beta_proj, self.gate_proj, self.dt_bias, self.A_log
         )
 
-        # Bypass the Triton fast path -- it carries no state.
+        # Bypass the Triton fast path: it carries no state.
         q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
         k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
         q = F.relu(q)
@@ -2803,7 +2769,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
         q, k, v = qkv.unbind(2)
-        if self.conv_k is not None:  # softmax blocks have conv_k=None, kept for safety
+        if self.conv_k is not None:  # softmax blocks have conv_k=None
             k, new_prefix = _temporal_short_conv_cached(
                 k.reshape(B, N, C),
                 self.conv_k,
@@ -2873,8 +2839,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         k = k.reshape(B, N, self.heads, self.dim)
         v = v.reshape(B, N, self.heads, self.dim)
 
-        # Cam K short conv stays bidirectional/uncached (matches the reference,
-        # whose cam branch uses the non-cached temporal conv; slot 4 is main-K).
+        # Cam K short conv stays bidirectional/uncached; slot 4 is main-K only.
         if self.conv_k_cam is not None:
             k = self._temporal_short_conv(
                 k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True
@@ -2902,9 +2867,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
-        # (RMS downscale removed to match the official cam branch: full post-UCPE
-        # q/k/v feed the scan; inflation is computed from full post-UCPE K vs
-        # pre-UCPE K and absorbed only into beta.)
+        # No RMS downscale here: full post-UCPE q/k/v feed the scan; inflation
+        # is computed from full post-UCPE K vs pre-UCPE K and absorbed only into
+        # beta.
         pre_ucpe_k_norm = torch.linalg.vector_norm(
             k_pre_dn.float(), dim=2, keepdim=True
         ).clamp_min(1e-6)
@@ -2919,7 +2884,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
 
         dtype = q_dn.dtype
-        # Bypass the Triton cam scan -- it carries no state.
+        # Bypass the Triton cam scan: it carries no state.
         out, cam_state = _single_path_delta_scan_cached(
             q_dn.float(),
             k_dn.float(),
@@ -2970,8 +2935,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
-        # (RMS downscale removed to match the official softmax cam branch:
-        # full post-UCPE q/k/v feed SDPA directly.)
+        # No RMS downscale here: full post-UCPE q/k/v feed SDPA directly.
         q_dn = q_proj.permute(0, 1, 3, 2)
         k_dn = k_proj.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
@@ -3035,8 +2999,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Cross-attention (text conditioning) -- upstream MultiHeadCrossAttention,
-# stored as ``cross_attn.{q_linear, kv_linear, proj, q_norm, k_norm}``.
+# Cross-attention (text conditioning). Stored as
+# ``cross_attn.{q_linear, kv_linear, proj, q_norm, k_norm}``.
 # ---------------------------------------------------------------------------
 
 
@@ -3057,9 +3021,8 @@ class MultiHeadCrossAttention(nn.Module):
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
-        # Cross-attention dispatched through SGLang's pluggable backend.
-        # The padding-mask path falls back to SDPA internally; the unmasked
-        # path can pick FA3 / FlashInfer / etc.
+        # Padding-mask path falls back to SDPA internally; the unmasked path
+        # can pick FA3 / FlashInfer / etc.
         self.attn = LocalAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
@@ -3076,7 +3039,7 @@ class MultiHeadCrossAttention(nn.Module):
         q = self.q_linear(x)
         kv = self.kv_linear(cond).view(B, -1, 2, D)
         k, v = kv.unbind(2)
-        # LocalAttention takes (B, N, H, D); skip the legacy BHND transpose.
+        # LocalAttention takes (B, N, H, D).
         q = self.q_norm(q).view(B, N, self.num_heads, self.head_dim)
         k = self.k_norm(k).view(B, -1, self.num_heads, self.head_dim)
         v = v.view(B, -1, self.num_heads, self.head_dim)

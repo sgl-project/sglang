@@ -15,11 +15,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-# Components split out of this module (sana_wm_components.py). Imported here so
-# SanaWMBlock / SanaWMTransformer3DModel below resolve them, AND re-exported for
-# back-compat: tests/stages import these names from this module path. The four
-# mutable ``_SANA_WM_TRITON_*`` fallback globals stay private to the components
-# module (mutated there, read nowhere else). Pure relocation -- no behavior change.
+# Re-exported for back-compat: callers import these names from this module path.
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # noqa: F401
     BidirectionalGDNUCPESinglePathLiteLA,
     CaptionEmbedder,
@@ -84,10 +80,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
 )
 
 logger = init_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Transformer block
-# ---------------------------------------------------------------------------
 
 
 class SanaWMBlock(nn.Module):
@@ -264,8 +256,7 @@ class SanaWMBlock(nn.Module):
         save_kv_cache: bool,
     ) -> Tuple[torch.Tensor, list]:
         """Streaming counterpart of ``forward``: threads the per-block 10-slot
-        ``kv_cache`` through the cached attention + FFN. Mirrors the reference
-        ``SanaWMBlock.forward`` cache plumbing."""
+        ``kv_cache`` through the cached attention + FFN."""
         B = x.shape[0]
         if t.dim() == 2:
             num_frames = None
@@ -336,11 +327,6 @@ class SanaWMBlock(nn.Module):
         return x, kv_cache
 
 
-# ---------------------------------------------------------------------------
-# Top-level model
-# ---------------------------------------------------------------------------
-
-
 class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """SANA-WM 2.6B TI2V world model.
 
@@ -381,8 +367,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             arch, "timestep_norm_scale_factor", 1.0
         )
 
-        # --- Embedders (upstream names: x_embedder, t_embedder, t_block,
-        # y_embedder, attention_y_norm, raymap_embedder, plucker_embedder) ---
+        # --- Embedders ---
         self.x_embedder = PatchEmbedMS3D(
             self.patch_size,
             arch.in_channels,
@@ -767,10 +752,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> Tuple[torch.Tensor, list]:
         """Streaming autoregressive forward over a chunk of latent frames.
 
-        Mirrors the reference ``forward_long``: RoPE / camera / plücker are
-        windowed to the chunk's GLOBAL frame range ``[start_f, end_f)`` and a
-        per-block 10-slot ``kv_cache`` carries recurrent state / concat-windows
-        across chunks. Returns ``(out, new_cache)``.
+        RoPE / camera / plücker are windowed to the chunk's GLOBAL frame range
+        ``[start_f, end_f)`` and a per-block 10-slot ``kv_cache`` carries
+        recurrent state / concat-windows across chunks. Returns ``(out, new_cache)``.
         """
         if encoder_hidden_states is None:
             raise ValueError("SANA-WM forward_long requires encoder_hidden_states.")
@@ -792,7 +776,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         x = self.x_embedder(hidden_states.to(dtype=self.x_embedder.proj.weight.dtype))
 
         # --- 2. Timestep AdaLN-single: force the framewise (B, 1, T) path so
-        # blocks always apply per-frame modulation (matches the reference). ---
+        # blocks always apply per-frame modulation. ---
         if timestep.dim() == 1:
             timestep = timestep[:, None, None].expand(-1, 1, T)
         elif timestep.dim() == 2:

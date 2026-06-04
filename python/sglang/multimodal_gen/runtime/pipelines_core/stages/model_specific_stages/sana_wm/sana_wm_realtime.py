@@ -23,9 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 
-# Our (correct, official-matching) numerics: the incremental stage-1 session, the
-# chunked LTX-2 refiner runner, and the causal-VAE chunk decode. These replace
-# mickqian's divergent split-DiT sampler / refiner.
+# Incremental stage-1 session, chunked LTX-2 refiner runner, and causal-VAE chunk decode.
 from .realtime import (
     SanaWMRealtimeSession,
 )
@@ -215,9 +213,9 @@ class SanaWMStreamingState(BaseRealtimeState):
         # refined_full accumulates sink + refined frames across steps (refiner path).
         self.refined_full: torch.Tensor | None = None
         self.rollover_first_latent: torch.Tensor | None = None
-        # Our incremental stage-1 session (replaces mickqian's sampler iterator).
+        # Incremental stage-1 session.
         self.session: SanaWMRealtimeSession | None = None
-        # This step's camera tensors for session.step (replaces sampler kwargs).
+        # This step's camera tensors for session.step.
         self.raymap: torch.Tensor | None = None
         self.chunk_plucker: torch.Tensor | None = None
         self.stage1_chunks = 0
@@ -289,7 +287,7 @@ class SanaWMRealtimeStage(PipelineStage):
         self.model_path = model_path
         # When the pipeline loads the LTX-2 refiner sub-modules it injects a
         # configured refiner stage here; we reuse its loaded transformer / text
-        # encoder to drive OUR RefinerChunkRunner. None -> stage-1-only output.
+        # encoder to drive the RefinerChunkRunner. None -> stage-1-only output.
         self.refiner_stage = refiner_stage
         self.first_frame_latent_cache = None
 
@@ -561,7 +559,7 @@ class SanaWMRealtimeStage(PipelineStage):
         latents: torch.Tensor,
         server_args: ServerArgs,
     ) -> torch.Tensor:
-        """De-normalize latents before VAE decode, mirroring DecodingStage."""
+        """De-normalize latents before VAE decode."""
         scaling_factor, shift_factor = server_args.pipeline_config.get_decode_scale_and_shift(
             latents.device, latents.dtype, self.vae
         )
@@ -606,7 +604,7 @@ class SanaWMRealtimeStage(PipelineStage):
         seed: int,
         fps: float,
     ) -> RefinerChunkRunner:
-        """Build OUR chunked LTX-2 refiner runner from the loaded refiner stage.
+        """Build the chunked LTX-2 refiner runner from the loaded refiner stage.
 
         Encodes the prompt through the refiner's Gemma-3, wraps the unwrapped
         diffusers LTX-2 refiner transformer in ``_RefinerCore``, and constructs the
@@ -743,7 +741,7 @@ class SanaWMRealtimeStage(PipelineStage):
         state.refiner_block_size = num_frame_per_block
         state.refiner_kv_max_frames = DEFAULT_REFINER_KV_MAX_FRAMES
 
-        # OUR incremental stage-1 session (replaces SelfForcingFlowEulerSampler).
+        # Incremental stage-1 session.
         session = SanaWMRealtimeSession(
             transformer,
             denoising_step_list=_as_int_tuple(
@@ -771,8 +769,8 @@ class SanaWMRealtimeStage(PipelineStage):
                 batch.seed[0] if isinstance(batch.seed, list) else batch.seed
             )),
             # Front-loaded autoregressive segmentation (chunk 0 carries the
-            # remainder) so the chunk boundaries / KV / camera windowing match
-            # the offline/official streaming path instead of uniform blocks.
+            # remainder) so the chunk boundaries / KV / camera windowing align
+            # instead of using uniform blocks.
             total_latent_frames=latent_t,
         )
         state.session = session
@@ -803,7 +801,7 @@ class SanaWMRealtimeStage(PipelineStage):
                 seed=int(batch.extra.get("sana_wm_refiner_seed", batch.seed)),
                 fps=float(batch.fps),
             )
-            # refined buffer seeds the sink frame(s) (unrefined, per the official).
+            # refined buffer seeds the sink frame(s) (left unrefined).
             state.refined_full = first_latent.detach().clone()
             state.use_refiner = True
             logger.info(
@@ -899,7 +897,7 @@ class SanaWMRealtimeStage(PipelineStage):
 
         # Refine the freshly generated stage-1 chunk, carrying sink/history KV.
         # ``refined_full`` holds sink frame(s) + all refined frames so far, so its
-        # length is the next block's start (mirrors the engine's ``_refined``).
+        # length is the next block's start.
         start_f = state.refined_full.shape[2]
         clean = state.session.latents[:, :, start_f:end_f].contiguous()
         sink_seed = (
