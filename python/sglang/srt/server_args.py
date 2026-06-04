@@ -2425,7 +2425,8 @@ class ServerArgs:
         elif model_arch in ["KimiLinearForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
-                support_mamba_cache=False,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
             )
         elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
             self._handle_mamba_radix_cache(

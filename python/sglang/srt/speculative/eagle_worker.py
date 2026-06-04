@@ -1002,6 +1002,7 @@ class EAGLEWorker(TpModelWorker):
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
+            or self.target_worker.model_runner.kimi_linear_config is not None
         ):
             self._mamba_verify_update(
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
