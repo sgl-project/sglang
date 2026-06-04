@@ -764,11 +764,9 @@ class MultiLayerEagleWorker(TpModelWorker):
                     self.mtp_model_runner(step).attn_backend.init_forward_metadata(
                         forward_batch
                     )
-                    # Planned with this step runner's own backend: a
-                    # forward-path re-plan is equivalent, so allow a
-                    # post-pad re-plan if DP padding reshapes the batch.
-                    # The per-step re-mark re-records padded shapes, so
-                    # later steps don't re-plan again.
+                    # Own-backend plan -> re-plan equivalent; allow post-pad
+                    # re-plan. The per-step re-mark re-records padded shapes,
+                    # so later steps skip.
                     forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
                 logits_output = (
                     self.mtp_model_runner(step).forward(forward_batch).logits_output

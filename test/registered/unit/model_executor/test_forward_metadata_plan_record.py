@@ -50,8 +50,7 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         self.assertEqual(fb.forward_metadata_planned_num_tokens, 7)
 
     def test_reshape_without_opt_in_keeps_skipping(self):
-        # Multi-step wrapper regimes must never be auto-re-planned: a
-        # forward-path re-plan would clobber their per-step metadata.
+        # Wrapper regimes must never auto-re-plan (would clobber per-step metadata).
         fb = _make_batch(bs=2)
         fb.mark_forward_metadata_ready()
         fb.batch_size = 4  # DP padding reshapes the batch
@@ -70,8 +69,7 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         self.assertTrue(fb.needs_forward_metadata_init())
 
     def test_remark_re_records_padded_shapes(self):
-        # Per-step loops re-mark after each plan; the second mark must
-        # snapshot the padded shapes so later steps skip again.
+        # Per-step loops re-mark each plan; the re-mark must snapshot padded shapes.
         fb = _make_batch(bs=2)
         fb.mark_forward_metadata_ready(replan_equivalent=True)
         fb.batch_size = 4
@@ -97,8 +95,7 @@ class TestDeprecatedSkipKwargShim(CustomTestCase):
         self.assertTrue(fb.needs_forward_metadata_init())
 
     def test_true_maps_onto_marker_and_warns(self):
-        # Mapped, not ignored: True-callers relied on planning being
-        # skipped; a no-op would silently re-plan multi-step metadata.
+        # Mapped, not ignored: a no-op would silently re-plan multi-step metadata.
         fb = _make_batch()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -116,8 +113,7 @@ class TestDeprecatedSkipKwargShim(CustomTestCase):
         self.assertEqual(len(caught), 1)
 
     def test_warns_once_per_process(self):
-        # Hot-loop guard: external callers passing the kwarg every
-        # forward must not pay warnings.warn repeatedly.
+        # Hot-loop guard: per-forward callers must not pay warnings.warn repeatedly.
         fb = _make_batch()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")

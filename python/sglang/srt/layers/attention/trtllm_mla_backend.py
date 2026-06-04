@@ -956,12 +956,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_decode_metadata
         )
 
-        # Backstop for stale metadata (batch padded by prepare_mlp_sync_batch
-        # after planning). Equivalent-replan pre-plan sites now opt into
-        # replan_equivalent and get re-planned centrally post-pad; this local
-        # re-plan only still fires for regimes that cannot opt in — wrapper
-        # (multi-step) plans and multi_layer_eagle_worker_v2's
-        # skip-without-pre-plan paths. Remove once those are fixed.
+        # Backstop: re-plan if the batch was padded after planning. Only
+        # fires for regimes that cannot opt into replan_equivalent (wrapper
+        # plans, mlv2's skip-without-pre-plan paths); remove once fixed.
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
@@ -1061,13 +1058,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or self.forward_decode_metadata
             )
 
-            # Backstop for stale metadata (batch padded by
-            # prepare_mlp_sync_batch after planning). Equivalent-replan
-            # pre-plan sites now opt into replan_equivalent and get
-            # re-planned centrally post-pad; this local re-plan only still
-            # fires for regimes that cannot opt in — wrapper (multi-step)
-            # plans and multi_layer_eagle_worker_v2's skip-without-pre-plan
-            # paths. Remove once those are fixed.
+            # Backstop: re-plan if the batch was padded after planning.
+            # Only fires for regimes that cannot opt into replan_equivalent
+            # (wrapper plans, mlv2's skip-without-pre-plan paths); remove
+            # once fixed.
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
                 self.init_forward_metadata(forward_batch)
