@@ -184,6 +184,8 @@ jobs:
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
+              - "python/sglang/srt/observability/**"
+              - "python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
