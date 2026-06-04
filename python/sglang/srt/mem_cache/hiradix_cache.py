@@ -104,6 +104,7 @@ class HiRadixCache(RadixCache):
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
+        self.pp_group = params.pp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
@@ -145,14 +146,13 @@ class HiRadixCache(RadixCache):
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
+                pp_group=self.pp_group,
                 write_policy=server_args.hicache_write_policy,
                 io_backend=server_args.hicache_io_backend,
                 storage_backend=server_args.hicache_storage_backend,
                 prefetch_threshold=prefetch_threshold,
                 model_name=server_args.served_model_name,
                 storage_backend_extra_config=extra_config,
-                pp_rank=self.pp_rank,
-                pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
             )
         self._apply_storage_runtime_config(
@@ -175,6 +175,7 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -205,6 +206,71 @@ class HiRadixCache(RadixCache):
                 waited = True
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
+
+    def _reap_completed_async_work(self):
+        """
+        Poll outstanding async work and reap completed ones.
+
+        Must be called in the scheduler thread.
+        """
+        count = 0
+        while count < len(self.work_list) and self.work_list[count].is_completed():
+            count += 1
+        if count > 0:
+            logger.debug(f"Reap {count} completed async work")
+            self.work_list = self.work_list[count:]
+
+    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+        """
+        Synchronize data across all TP and PP ranks.
+
+        In particular, "tp_reduce_op" is performed on all TP ranks of the first PP rank,
+        and then the result is propagated to all following PP ranks.
+
+        Must be called in the scheduler thread.
+        """
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(data, tp_reduce_op)
+        self._pp_sync(data)
+
+    def _pp_sync(self, data: torch.Tensor) -> None:
+        """
+        Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
+
+        The following diagram illustrates the behavior of _pp_sync.
+
+        time  | pp0                     | pp1                     | pp2
+        ------|-------------------------|-------------------------|-----------------------------
+        0     | _pp_sync(data=1) starts | _pp_sync(data=?) starts | _pp_sync(data=?) starts
+        1     | _pp_sync(data=1) ends   |                         |
+        2     |                         | _pp_sync(data=1) ends   |
+        3     |                         |                         | _pp_sync(data=1) ends
+
+        _pp_sync requires no synchronization point among ranks. The following case may also happen.
+
+        time  | pp0                     | pp1                     | pp2
+        ------|-------------------------|-------------------------|-----------------------------
+        0     | _pp_sync(data=1) starts |                         |
+        1     | _pp_sync(data=1) ends   |                         |
+        2     |                         | _pp_sync(data=?) starts |
+        3     |                         | _pp_sync(data=1) ends   |
+        4     |                         |                         | _pp_sync(data=?) starts
+        5     |                         |                         | _pp_sync(data=1) ends
+        """
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        if self.pp_rank > 0:
+            torch.distributed.recv(
+                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+            )
+        if self.pp_rank + 1 < self.pp_size:
+            # Make a copy of data, so that the caller is safe to modify `data` after this call.
+            # This is cheap, as _pp_sync is not to be used for transmitting large data.
+            copy_of_data = data.clone()
+            send_work = torch.distributed.isend(
+                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+            )
+            self.work_list.append(send_work)
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -855,15 +921,17 @@ class HiRadixCache(RadixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        # Keep cache state transitions identical across CPxTP participants.
-        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
 
-        finish_count = int(queue_size.item())
+        if finish_count > 0:
+            logger.debug(f"Process {finish_count} write back operations")
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
@@ -873,18 +941,24 @@ class HiRadixCache(RadixCache):
 
     def loading_check(self):
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
-                # the KV cache loading is still ongoing
-                break
-            finish_count += 1
-            # no need to sync across TP workers as batch forwarding is synced
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
+
+        if finish_count > 0:
+            logger.debug(f"Process {finish_count} load operations")
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            finish_event.synchronize()
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
-
-        # ACK until all events are processed
-        del self.cache_controller.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete."""
@@ -1209,6 +1283,7 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        self._reap_completed_async_work()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
