@@ -1436,6 +1436,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             if _use_dp_reduce_scatterv:
+                hidden_states.fill_(0)
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
