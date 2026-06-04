@@ -28,7 +28,6 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
-import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -72,10 +71,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-
-# Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
-# ForwardBatch.apply_deprecated_skip_attn_backend_init.
-_skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 
@@ -524,33 +519,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.batch_size != self.forward_metadata_planned_bs
             or num_tokens != self.forward_metadata_planned_num_tokens
         )
-
-    def apply_deprecated_skip_attn_backend_init(
-        self, skip_attn_backend_init: Optional[bool]
-    ) -> None:
-        """Map the deprecated ``skip_attn_backend_init`` kwarg onto the marker.
-
-        Mapped, not ignored: callers passing True relied on planning being
-        skipped — ignoring the flag would silently re-plan and corrupt
-        pre-planned multi-step draft metadata. Warns once per process (a
-        module flag, not the warnings filter, so the hot decode loop never
-        pays warnings.warn per forward).
-        """
-        if skip_attn_backend_init is None:
-            return
-        global _skip_attn_backend_init_warned
-        if not _skip_attn_backend_init_warned:
-            _skip_attn_backend_init_warned = True
-            warnings.warn(
-                "skip_attn_backend_init is deprecated and will be removed; "
-                "pre-planners should call "
-                "ForwardBatch.mark_forward_metadata_ready() after planning "
-                "instead. The flag is mapped onto the marker for now.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-        if skip_attn_backend_init:
-            self.mark_forward_metadata_ready()
 
     @classmethod
     def init_new(

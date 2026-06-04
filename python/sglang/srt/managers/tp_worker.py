@@ -450,7 +450,6 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
-        skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -461,9 +460,6 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-
-        # Deprecated kwarg: pre-planners mark the batch themselves now.
-        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)

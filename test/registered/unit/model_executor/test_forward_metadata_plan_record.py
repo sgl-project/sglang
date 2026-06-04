@@ -1,22 +1,18 @@
 """Unit tests for the ForwardBatch attention plan marker / plan record.
 
-Covers the contract behind ``skip_attn_backend_init`` deprecation:
+Covers the contract behind the ``skip_attn_backend_init`` removal:
   * fresh batches need planning; marked batches don't
   * the plan record (planned bs / num tokens) snapshots mark-time shapes
   * reshape after marking triggers a re-plan only for sites that opted
     into ``replan_equivalent``; re-marking re-records the new shapes
-  * the deprecated kwarg shim maps explicit values onto the marker
-    (mapped, not ignored) and warns once per process
 
 Pure dataclass logic — CPU only.
 """
 
 import unittest
-import warnings
 
 import torch
 
-import sglang.srt.model_executor.forward_batch_info as fbi
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -77,50 +73,6 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         fb.mark_forward_metadata_ready(replan_equivalent=True)
         self.assertFalse(fb.needs_forward_metadata_init())
         self.assertEqual(fb.forward_metadata_planned_bs, 4)
-
-
-class TestDeprecatedSkipKwargShim(CustomTestCase):
-    def setUp(self):
-        self._saved_warned = fbi._skip_attn_backend_init_warned
-        fbi._skip_attn_backend_init_warned = False
-
-    def tearDown(self):
-        fbi._skip_attn_backend_init_warned = self._saved_warned
-
-    def test_none_is_a_silent_no_op(self):
-        fb = _make_batch()
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            fb.apply_deprecated_skip_attn_backend_init(None)
-        self.assertTrue(fb.needs_forward_metadata_init())
-
-    def test_true_maps_onto_marker_and_warns(self):
-        # Mapped, not ignored: a no-op would silently re-plan multi-step metadata.
-        fb = _make_batch()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            fb.apply_deprecated_skip_attn_backend_init(True)
-        self.assertFalse(fb.needs_forward_metadata_init())
-        self.assertEqual(len(caught), 1)
-        self.assertTrue(issubclass(caught[0].category, DeprecationWarning))
-
-    def test_false_warns_but_does_not_mark(self):
-        fb = _make_batch()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            fb.apply_deprecated_skip_attn_backend_init(False)
-        self.assertTrue(fb.needs_forward_metadata_init())
-        self.assertEqual(len(caught), 1)
-
-    def test_warns_once_per_process(self):
-        # Hot-loop guard: per-forward callers must not pay warnings.warn repeatedly.
-        fb = _make_batch()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            fb.apply_deprecated_skip_attn_backend_init(True)
-            fb.apply_deprecated_skip_attn_backend_init(True)
-            _make_batch().apply_deprecated_skip_attn_backend_init(False)
-        self.assertEqual(len(caught), 1)
 
 
 if __name__ == "__main__":

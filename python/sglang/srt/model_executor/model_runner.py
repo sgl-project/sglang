@@ -3234,14 +3234,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: Optional[bool] = None,  # deprecated
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # Deprecated kwarg: pre-planners mark the batch themselves now.
-        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
-
         self.forward_pass_id += 1
 
         # Try msprob debugger
