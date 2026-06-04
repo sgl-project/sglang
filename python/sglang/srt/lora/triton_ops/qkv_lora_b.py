@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.lora.triton_ops.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
@@ -170,13 +169,13 @@ def _qkv_lora_b_cublas(
     come from the pinned CPU copy (no GPU sync); slices are disjoint output
     regions, so in-place addmm_ writes never collide.
     """
-    r = qkv_lora_b.shape[-1]
+    r = batch_info.uniform_rank
     if base_output is None:
         base_output = torch.zeros(
             (x.shape[0], qkv_lora_b.shape[-2]), device=x.device, dtype=x.dtype
         )
-    w = qkv_lora_b[0]
-    x_scaled = x[:, : n_slices * r] * batch_info.scalings[0]
+    w = qkv_lora_b[batch_info.uniform_weight_index]
+    x_scaled = x[:, : n_slices * r] * batch_info.uniform_scaling
     offsets = output_offset_cpu.tolist()
     for i in range(n_slices):
         lo, hi = offsets[i], offsets[i + 1]
@@ -219,7 +218,8 @@ def qkv_lora_b_fwd(
 
     if (
         output_offset_cpu is not None
-        and (envs.SGLANG_OPT_LORA_CUBLAS.get() or envs.SGLANG_OPT_LORA_CUBLAS_QKV.get())
+        and batch_info.uniform_weight_index is not None
+        and not batch_info.use_cuda_graph
         and batch_info.max_len >= _CUBLAS_MIN_MAX_LEN
     ):
         return _qkv_lora_b_cublas(

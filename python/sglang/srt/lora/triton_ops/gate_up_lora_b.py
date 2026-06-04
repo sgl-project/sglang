@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.lora.triton_ops.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
@@ -171,13 +170,13 @@ def _gate_up_lora_b_cublas(
     matching the Triton kernel's K = min(K, rank) slice stride. Slices are
     disjoint output regions, so in-place addmm_ writes never collide.
     """
-    r = gate_up_lora_b.shape[-1]
+    r = batch_info.uniform_rank
     if base_output is None:
         base_output = torch.zeros(
             (x.shape[0], 2 * output_dim), device=x.device, dtype=x.dtype
         )
-    w = gate_up_lora_b[0]
-    x_scaled = x[:, : 2 * r] * batch_info.scalings[0]
+    w = gate_up_lora_b[batch_info.uniform_weight_index]
+    x_scaled = x[:, : 2 * r] * batch_info.uniform_scaling
     for i in range(2):
         lo, hi = i * output_dim, (i + 1) * output_dim
         base_output[:, lo:hi].addmm_(x_scaled[:, i * r : (i + 1) * r], w[lo:hi, :r].t())
@@ -208,8 +207,10 @@ def gate_up_lora_b_fwd(
     assert input_dim == 2 * r
 
     if (
-        envs.SGLANG_OPT_LORA_CUBLAS.get() or envs.SGLANG_OPT_LORA_CUBLAS_GATE_UP.get()
-    ) and s * r >= _CUBLAS_MIN_S_RANK:
+        batch_info.uniform_weight_index is not None
+        and not batch_info.use_cuda_graph
+        and s * batch_info.uniform_rank >= _CUBLAS_MIN_S_RANK
+    ):
         return _gate_up_lora_b_cublas(
             x, gate_up_lora_b, batch_info, output_dim, base_output
         )
