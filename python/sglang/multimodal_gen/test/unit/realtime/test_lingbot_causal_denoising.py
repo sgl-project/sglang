@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
 )
 from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
     CausalLingBotWorldTransformer3DModel,
+    LingBotWorldCamConditioner,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
@@ -194,6 +195,38 @@ def test_lingbot_i2v_model_input_writer_reuses_buffer():
     assert second.shape == (1, 36, 3, 2, 2)
     assert torch.equal(second[:, :16], latents + 3.0)
     assert torch.equal(second[:, 16:], condition)
+
+
+def test_lingbot_camera_conditioner_accepts_cached_modulation():
+    conditioner = LingBotWorldCamConditioner(dim=4)
+    hidden_states = torch.randn(1, 3, 4)
+    c2ws_plucker_emb = torch.randn(1, 3, 4)
+
+    direct = conditioner(hidden_states, c2ws_plucker_emb)
+    cached_modulation = conditioner.prepare_modulation(c2ws_plucker_emb)
+    cached = conditioner(hidden_states, c2ws_plucker_emb, cached_modulation)
+
+    assert torch.equal(cached, direct)
+
+
+def test_lingbot_camera_modulation_cache_reuses_until_key_changes():
+    model = CausalLingBotWorldTransformer3DModel.__new__(
+        CausalLingBotWorldTransformer3DModel
+    )
+    batch = SimpleNamespace(extra={})
+    c2ws_plucker_emb = torch.randn(1, 3, 4)
+
+    cache_key = model._camera_modulation_cache_key(c2ws_plucker_emb)
+    cache = model._get_camera_modulation_cache(batch, cache_key)
+    scale_shift = (torch.ones(1), torch.zeros(1))
+    cache[0] = scale_shift
+
+    reused = model._get_camera_modulation_cache(batch, cache_key)
+    assert reused[0] is scale_shift
+
+    changed_key = model._camera_modulation_cache_key(torch.randn(1, 4, 4))
+    reset = model._get_camera_modulation_cache(batch, changed_key)
+    assert reset == {}
 
 
 def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready():

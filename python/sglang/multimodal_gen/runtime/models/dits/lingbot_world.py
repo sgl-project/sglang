@@ -132,8 +132,21 @@ class LingBotWorldCamConditioner(nn.Module):
         self.cam_scale_layer = nn.Linear(dim, dim)
         self.cam_shift_layer = nn.Linear(dim, dim)
 
+    def prepare_modulation(
+        self, c2ws_plucker_emb: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        c2ws_hidden_states = self.cam_injector(c2ws_plucker_emb)
+        c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
+        return (
+            self.cam_scale_layer(c2ws_hidden_states),
+            self.cam_shift_layer(c2ws_hidden_states),
+        )
+
     def forward(
-        self, hidden_states: torch.Tensor, c2ws_plucker_emb: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        c2ws_plucker_emb: torch.Tensor | None,
+        camera_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if c2ws_plucker_emb is None:
             return hidden_states
@@ -142,10 +155,9 @@ class LingBotWorldCamConditioner(nn.Module):
                 "c2ws_plucker_emb shape must match hidden_states shape, "
                 f"got {tuple(c2ws_plucker_emb.shape)} vs {tuple(hidden_states.shape)}"
             )
-        c2ws_hidden_states = self.cam_injector(c2ws_plucker_emb)
-        c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
-        cam_scale = self.cam_scale_layer(c2ws_hidden_states)
-        cam_shift = self.cam_shift_layer(c2ws_hidden_states)
+        if camera_modulation is None:
+            camera_modulation = self.prepare_modulation(c2ws_plucker_emb)
+        cam_scale, cam_shift = camera_modulation
         return (1.0 + cam_scale) * hidden_states + cam_shift
 
 
@@ -930,6 +942,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         current_start: int = 0,
         cache_start: int | None = None,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        camera_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
         update_cache_only: bool = False,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
@@ -983,7 +996,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             hidden_states, attn_output, gate_msa, residual_zero, residual_zero
         )
         hidden_states = self.cam_conditioner(
-            hidden_states.to(orig_dtype), c2ws_plucker_emb
+            hidden_states.to(orig_dtype), c2ws_plucker_emb, camera_modulation
         )
         norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
             orig_dtype
@@ -1261,6 +1274,36 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
 
         return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
+    @staticmethod
+    def _camera_modulation_cache_key(
+        c2ws_plucker_emb: torch.Tensor,
+    ) -> tuple:
+        return (
+            c2ws_plucker_emb.data_ptr(),
+            tuple(c2ws_plucker_emb.shape),
+            tuple(c2ws_plucker_emb.stride()),
+            c2ws_plucker_emb.dtype,
+            c2ws_plucker_emb.device.type,
+            c2ws_plucker_emb.device.index,
+        )
+
+    def _get_camera_modulation_cache(
+        self,
+        forward_batch,
+        cache_key: tuple | None,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
+        if cache_key is None:
+            return None
+        cache = self._get_request_cache(forward_batch, "lingbot_camera_modulation")
+        if cache is None:
+            return None
+
+        if cache.get("key") != cache_key:
+            cache.clear()
+            cache["key"] = cache_key
+            cache["blocks"] = {}
+        return cache["blocks"]
+
     def _prepare_cached_time_embeddings(
         self,
         *,
@@ -1350,6 +1393,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         c2ws_plucker_emb = self._prepare_c2ws_plucker_emb(
             hidden_states, c2ws_plucker_emb, forward_batch
         )
+        camera_modulation_cache_key = (
+            self._camera_modulation_cache_key(c2ws_plucker_emb)
+            if c2ws_plucker_emb is not None
+            else None
+        )
         if sequence_shard_enabled:
             sp_rank = get_sp_parallel_rank()
             seq_shard_splits = list(forward_batch.sequence_shard_splits)
@@ -1361,6 +1409,12 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 c2ws_plucker_emb = _sequence_shard_tensor(
                     c2ws_plucker_emb, seq_shard_splits, sp_rank
                 )
+                camera_modulation_cache_key = (
+                    camera_modulation_cache_key,
+                    "sequence_shard",
+                    sp_rank,
+                    tuple(seq_shard_splits),
+                )
             frame_stride = post_patch_height * post_patch_width
             token_start = start_frame * frame_stride + sum(seq_shard_splits[:sp_rank])
             freqs_cis = self._prepare_cached_rope_for_sequence_shard(
@@ -1371,6 +1425,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 post_patch_width=post_patch_width,
                 device=hidden_states.device,
             )
+        camera_modulation_cache = self._get_camera_modulation_cache(
+            forward_batch, camera_modulation_cache_key
+        )
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self._prepare_condition_embeddings(
@@ -1394,6 +1451,14 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         )
 
         for block_index, block in enumerate(self.blocks):
+            camera_modulation = None
+            if camera_modulation_cache is not None and c2ws_plucker_emb is not None:
+                camera_modulation = camera_modulation_cache.get(block_index)
+                if camera_modulation is None:
+                    camera_modulation = block.cam_conditioner.prepare_modulation(
+                        c2ws_plucker_emb
+                    )
+                    camera_modulation_cache[block_index] = camera_modulation
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -1405,6 +1470,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 current_start=current_start,
                 cache_start=cache_start,
                 c2ws_plucker_emb=c2ws_plucker_emb,
+                camera_modulation=camera_modulation,
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
             )
