@@ -223,9 +223,9 @@ def pre_permute_standard_to_aiter(
 
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
         # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
-        assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1, (
-            "apply_router_weight_on_input requires topk=1"
-        )
+        assert (
+            topk_weights.dim() == 2 and topk_weights.shape[-1] == 1
+        ), "apply_router_weight_on_input requires topk=1"
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
