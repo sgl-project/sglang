@@ -806,7 +806,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
-                    if self.server_args.language_only:
+                    if self.server_args.language_only and obj.need_wait_for_mm_inputs:
                         logger.warning(
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
@@ -1102,7 +1102,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
-                mm_data_mooncake=obj.mm_data_mooncake,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
