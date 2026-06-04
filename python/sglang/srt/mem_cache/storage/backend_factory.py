@@ -162,7 +162,7 @@ class StorageBackendFactory:
             return backend_class(storage_config)
         elif backend_name == "nixl":
             return backend_class(storage_config)
-        elif backend_name in ("mooncake", "ascend_memcache"):
+        elif backend_name == "mooncake":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "aibrix":
@@ -184,6 +184,8 @@ class StorageBackendFactory:
         elif backend_name == "eic":
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "simm":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "ascend_memcache":
             return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
