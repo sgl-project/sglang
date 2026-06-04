@@ -534,10 +534,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     self.draft_runner_list[step].attn_backend.init_forward_metadata(
                         forward_batch
                     )
-                    # Own-backend plan -> re-plan equivalent; allow post-pad
-                    # re-plan. The per-step re-mark re-records padded shapes,
-                    # so later steps skip.
-                    forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
+                    # Planned pre-pad; do NOT opt into post-pad re-plan — a
+                    # DP-padded re-plan breaks DSA's indexer schedule_meta
+                    # (see #27091). Use the marked pre-pad metadata as-is.
+                    forward_batch.mark_forward_metadata_ready()
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
