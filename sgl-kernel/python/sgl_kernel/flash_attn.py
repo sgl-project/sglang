@@ -223,6 +223,7 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         sinks,
+        None,  # sparse_mask_fine
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -311,6 +312,7 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         sinks=sinks,
+        sparse_mask_fine=None,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out

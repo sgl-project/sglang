@@ -682,8 +682,7 @@ std::vector<at::Tensor> mha_fwd_sparse(
     const double softmax_scale,
     bool is_causal,
     const double softcap,
-    const bool return_softmax,
-    std::optional<at::Generator> gen_);
+    const bool return_softmax);
 
 std::vector<at::Tensor> mha_varlen_fwd_sparse(
     at::Tensor& q,        // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
@@ -706,8 +705,7 @@ std::vector<at::Tensor> mha_varlen_fwd_sparse(
     const bool zero_tensors,
     bool is_causal,
     const double softcap,
-    const bool return_softmax,
-    c10::optional<at::Generator> gen_);
+    const bool return_softmax);
 }  // namespace flash
 
 void convert_vertical_slash_indexes(

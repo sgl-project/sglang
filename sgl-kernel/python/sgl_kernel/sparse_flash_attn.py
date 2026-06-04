@@ -196,7 +196,6 @@ def sparse_attn_func(
         causal,
         softcap,
         return_attn_probs and dropout_p > 0,
-        None,
     )
     return (out, softmax_lse) if return_softmax_lse else out
 
@@ -288,6 +287,5 @@ def sparse_attn_varlen_func(
         causal,
         softcap,
         return_attn_probs and dropout_p > 0,
-        None,
     )
     return (out, softmax_lse) if return_softmax_lse else out
