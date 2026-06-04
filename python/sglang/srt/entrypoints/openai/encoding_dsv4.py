@@ -7,7 +7,6 @@ with tool calling, thinking mode, and quick instruction task support.
 """
 
 import copy
-import html
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -151,33 +150,29 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     P_dsml_strs = []
 
     raw_arguments = tool_call["arguments"]
-    if isinstance(raw_arguments, dict):
-        arguments = raw_arguments
-    elif isinstance(raw_arguments, str):
+    if isinstance(raw_arguments, str):
         try:
             arguments = json.loads(raw_arguments)
         except json.JSONDecodeError as err:
             raise ValueError(
-                "tool_calls[].function.arguments must be a JSON object string."
+                "tool_calls[].function.arguments must be a JSON object, "
+                "but got a non-JSON string."
             ) from err
     else:
-        raise ValueError(
-            "tool_calls[].function.arguments must be a JSON object string."
-        )
+        arguments = raw_arguments
 
     if not isinstance(arguments, dict):
         raise ValueError(
-            "tool_calls[].function.arguments must decode to a JSON object, "
+            "tool_calls[].function.arguments must be a JSON object, "
             f"but got {type(arguments).__name__}."
         )
 
     for k, v in arguments.items():
-        raw_value = v if isinstance(v, str) else to_json(v)
         p_dsml_str = p_dsml_template.format(
             dsml_token=dsml_token,
-            key=html.escape(k, quote=True),
+            key=k,
             is_str="true" if isinstance(v, str) else "false",
-            value=html.escape(raw_value, quote=False),
+            value=v if isinstance(v, str) else to_json(v),
         )
         P_dsml_strs.append(p_dsml_str)
 
