@@ -411,9 +411,9 @@ Content:
 ### 5.1 Speed Benchmark
 
 **Test Environment:**
-- Hardware: B200 (8x)
-- Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
-- Tensor Parallelism: 8
+- Hardware: GB200 (4x)
+- Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
+- Tensor Parallelism: 4
 - SGLang Version: main branch
 
 - Model Deployment Command:
@@ -422,7 +422,7 @@ Content:
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
   --trust-remote-code \
-  --tp 8 \
+  --tp 4 \
   --max-running-requests 1024 \
   --host 0.0.0.0 \
   --port 5000
@@ -433,7 +433,7 @@ python3 -m sglang.launch_server \
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 5000 \
   --model nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
   --dataset-name random \
