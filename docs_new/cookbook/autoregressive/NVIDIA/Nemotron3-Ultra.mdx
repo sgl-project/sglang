@@ -75,7 +75,7 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
 - **DP attention**:
 
-    By default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the toggle above, or `--dp <N> --enable-dp-attention`) instead runs attention as `N` data-parallel groups: each DP rank serves its own slice of the requests with its own KV cache, while the MoE layers stay tensor-parallel. This raises throughput under high concurrency, at the cost of higher latency on small, low-concurrency batches — keep it disabled for latency-sensitive serving. `--dp` must divide `--tp`.
+    By default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the toggle above, or `--dp <N> --enable-dp-attention`) instead runs attention as `N` data-parallel groups: each DP rank serves its own slice of the requests with its own KV cache. `--dp` must divide `--tp`.
 
 - **FP8 KV cache**:
 
