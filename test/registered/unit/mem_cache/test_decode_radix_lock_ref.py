@@ -413,7 +413,10 @@ class TestDecodeMambaLockRefScenarios(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
 
         server_args = ServerArgs(model_path="dummy", page_size=1)
         from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -441,7 +444,9 @@ class TestDecodeMambaLockRefScenarios(unittest.TestCase):
         full_attention_layer_ids = list(
             range(global_interval - 1, num_layers, global_interval)
         )
-        mamba_layers = [i for i in range(num_layers) if i not in full_attention_layer_ids]
+        mamba_layers = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
 
         with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
             shape = Mamba2StateShape.create(
@@ -564,7 +569,9 @@ class TestDecodeMambaLockRefScenarios(unittest.TestCase):
             )
         )
 
-        self.assertGreaterEqual(len(result_skip.device_indices), len(result_normal.device_indices))
+        self.assertGreaterEqual(
+            len(result_skip.device_indices), len(result_normal.device_indices)
+        )
         self.assertEqual(len(result_skip.device_indices), 5)
 
     def test_skip_mamba_match_split_by_divergent_suffix(self):
@@ -871,7 +878,6 @@ class TestDecodeMambaLockRefScenarios(unittest.TestCase):
         queue._allocatable_mamba_budgets = MagicMock(return_value=5)
 
         # Need to mock kv_manager for the state_types iteration
-        from unittest.mock import PropertyMock
 
         queue.kv_manager = MagicMock()
         queue.kv_manager.kv_args.state_types = []
