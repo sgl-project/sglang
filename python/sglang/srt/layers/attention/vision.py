@@ -108,9 +108,11 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 @dataclasses.dataclass
 class SingletonCache:
     data: Any = None
+    _max_seqlen: Optional[int] = None
 
     def set_data(self, value: Any) -> None:
         self.data = value
+        self._max_seqlen = None
 
     def get_data(self) -> Optional[Any]:
         return self.data
@@ -155,6 +157,21 @@ def resolve_seqlens(
         resolved_seqlens, torch.Tensor
     ), "cu_seqlens must be a torch.Tensor"
     return resolved_seqlens
+
+
+def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
+    """Return max segment length, caching it on a stable carrier so the
+    device->host sync (.item()) happens once per forward instead of once per layer.
+    """
+    if isinstance(source, SingletonCache) or isinstance(source, torch.Tensor):
+        cached = getattr(source, "_max_seqlen", None)
+        if cached is None:
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            cached = int(seq_lens.max().item())
+            source._max_seqlen = cached
+        return cached
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    return int(seq_lens.max().item())
 
 
 class VisionSdpaAttention(nn.Module):
@@ -823,10 +840,11 @@ class VisionIntelXPUAttention(nn.Module):
         window_size = kwargs.get("window_size", (-1, -1))
         s_aux = kwargs.get("s_aux", None)
 
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens_source = cu_seqlens
+        cu_seqlens = resolve_seqlens(cu_seqlens_source, bsz, seq_len, device=q.device)
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+
         fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
