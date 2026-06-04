@@ -67,20 +67,19 @@ class HiSparseCoordinator:
         )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
-            host_size_tokens = (
-                self.token_to_kv_pool_allocator.size_full // self.compress_ratio
-            )
+            page_size = self.mem_pool_device.page_size
             num_host_pages = (
-                host_size_tokens + self.mem_pool_device.page_size - 1
-            ) // self.mem_pool_device.page_size
+                self.token_to_kv_pool_allocator.size_full // self.compress_ratio
+                + page_size
+                - 1
+            ) // page_size
             self.mem_pool_host = DeepSeekV4PagedHostPool(
                 pool_name="dsv4_hisparse_c4",
                 device_buffers=self.mem_pool_device.kv_buffer,
                 item_bytes=self.mem_pool_device.bytes_per_page_padded,
-                num_host_pages=num_host_pages + 1,
-                slot_page_size=self.mem_pool_device.page_size,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
                 layout="layer_first",
-                reserve_page_zero=True,
             )
             self.item_size_bytes = (
                 self.mem_pool_device.kv_cache_total_dim
@@ -192,8 +191,6 @@ class HiSparseCoordinator:
         device_capacity = device_allocator.size
         device_tokens = device_capacity - device_allocator.available_size()
         host_capacity = self.mem_pool_host.size
-        if getattr(self.mem_pool_host, "reserve_page_zero", False):
-            host_capacity -= self.mem_pool_host.page_size
         host_tokens = host_capacity - self.mem_pool_host.available_size()
         return HiSparseTokenStats(
             device_tokens=device_tokens,
@@ -219,18 +216,13 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        self.mem_pool_host.alloc_paged_token_slots(
+        host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
             req.req_pool_idx,
             0,
             prefill_len,
         )
-        host_transfer_len = self._host_transfer_len(prefill_len)
-        host_transfer_indices = self.req_to_host_pool[
-            req.req_pool_idx, :host_transfer_len
-        ]
-        device_transfer_indices = self._device_indices_for_transfer(device_indices)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -239,15 +231,15 @@ class HiSparseCoordinator:
             start_event.wait(self.write_staging_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
-                host_transfer_indices,
-                device_transfer_indices,
+                host_indices,
+                device_indices,
                 io_backend="kernel",
             )
             finish_event.record()
-            if host_transfer_indices.is_cuda:
-                host_transfer_indices.record_stream(self.write_staging_stream)
-            if device_transfer_indices.is_cuda:
-                device_transfer_indices.record_stream(self.write_staging_stream)
+            if host_indices.is_cuda:
+                host_indices.record_stream(self.write_staging_stream)
+            if device_indices.is_cuda:
+                device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
@@ -289,38 +281,11 @@ class HiSparseCoordinator:
             return kv_allocated_len // self.compress_ratio
         return kv_allocated_len
 
-    def _host_transfer_len(self, host_len: int) -> int:
-        if self.is_dsv4_hisparse:
-            return ((host_len + self.page_size - 1) // self.page_size) * self.page_size
-        return host_len
-
-    def _device_indices_for_transfer(
-        self, device_indices: torch.Tensor
-    ) -> torch.Tensor:
-        if not self.is_dsv4_hisparse:
-            return device_indices
-        num_tokens = device_indices.numel()
-        transfer_len = self._host_transfer_len(num_tokens)
-        if transfer_len == num_tokens:
-            return device_indices
-        if num_tokens == 0:
-            return device_indices
-        pad_len = transfer_len - num_tokens
-        pad_offsets = torch.arange(
-            1,
-            pad_len + 1,
-            dtype=device_indices.dtype,
-            device=device_indices.device,
-        )
-        pad_indices = device_indices[-1] + pad_offsets
-        return torch.cat([device_indices, pad_indices])
-
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
         n = self.host_token_len(req.kv_allocated_len)
-        transfer_n = self._host_transfer_len(n)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :transfer_n]
-        device_locs = self.req_to_device_buffer[req.req_pool_idx, :transfer_n]
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
+        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 
         if self.is_dsv4_hisparse:
             self.mem_pool_host.load_to_device_all_layer(

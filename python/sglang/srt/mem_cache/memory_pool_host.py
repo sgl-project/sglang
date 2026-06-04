@@ -1889,7 +1889,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
-        reserve_page_zero: bool = False,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
@@ -1906,7 +1905,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.size_per_token = item_bytes
         self.start_layer = 0
         self.end_layer = self.layer_num
-        self.reserve_page_zero = reserve_page_zero
         self.lock = threading.RLock()
 
         self.device_buffers = device_buffers
@@ -2063,8 +2061,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
-        start = self.slot_page_size if self.reserve_page_zero else 0
-        self.free_slots = torch.arange(start, self.size, dtype=torch.int64)
+        self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
     def available_size(self):
         return len(self.free_slots)

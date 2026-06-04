@@ -105,8 +105,8 @@ class TestDeepSeekV4HiSparseCoordinatorHostPool(unittest.TestCase):
             num_tokens=host_len,
         )
 
-        self.assertEqual(host_indices[:3].cpu().tolist(), [64, 65, 66])
-        self.assertEqual((host_indices.cpu().numpy()[::64] // 64).tolist(), [1, 2])
+        self.assertEqual(host_indices[:3].cpu().tolist(), [0, 1, 2])
+        self.assertEqual((host_indices.cpu().numpy()[::64] // 64).tolist(), [0, 1])
         self.assertEqual(int(coordinator.req_to_host_pool_allocated_len[0]), 128)
         allocated = coordinator.mem_pool_host.allocated_host_indices(
             coordinator.req_to_host_pool, 0, host_len
