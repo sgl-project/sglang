@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
 

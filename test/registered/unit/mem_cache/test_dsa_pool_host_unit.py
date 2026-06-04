@@ -4,9 +4,11 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
-    ALLOC_MEMORY_FUNCS,
     DSAIndexerPoolHost,
     MLATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.tensor_allocator import (
+    ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
