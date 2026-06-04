@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -13,8 +14,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory, is_musa
+from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +349,7 @@ class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
             self.a[:m],
             self.b,
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
         )
 
 
@@ -450,3 +452,63 @@ def _deep_gemm_execution_hook(
     if m > 0:
         _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield
+
+
+def pp_parallel_deep_gemm_warmup(model_runner) -> None:
+    """Run per-PP-rank dummy DECODE+EXTEND forwards so each rank's
+    DeepGEMM JIT compiles in parallel instead of serially via the warmup
+    /generate flowing through the pipeline. Opt-in via
+    SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.
+    """
+    # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
+    # cover the brackets real /generate hits (smallest decode shape,
+    # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
+    # to attn_cp_size for DSA prefill CP's seq_len % cp_size == 0 assert.
+    n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+    block_m = 64
+    cp = max(model_runner.attn_cp_size, 1)
+    batch_sizes = sorted(
+        {
+            ceil_align(bs, cp)
+            for bs in (
+                1,
+                2 * block_m,
+                max(n_sms // 8, 2) * block_m,
+                max(n_sms // 4, 4) * block_m,
+                n_sms * block_m,
+            )
+        }
+    )
+
+    # In PD, prefill-only nodes never decode (indexer would OOM at large
+    # bs) and decode-only nodes never extend.
+    disagg_mode = model_runner.server_args.disaggregation_mode
+    run_decode = model_runner.is_generation and disagg_mode != "prefill"
+    run_extend = disagg_mode != "decode"
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup start "
+        "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
+        model_runner.pp_rank,
+        model_runner.tp_rank,
+        batch_sizes,
+        disagg_mode,
+    )
+
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for bs in batch_sizes:
+            if run_decode:
+                model_runner._dummy_run(
+                    batch_size=bs, forward_mode_override=ForwardMode.DECODE
+                )
+            if run_extend:
+                model_runner._dummy_run(
+                    batch_size=bs, forward_mode_override=ForwardMode.EXTEND
+                )
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
+        time.perf_counter() - t0,
+        model_runner.pp_rank,
+    )

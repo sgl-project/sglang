@@ -196,9 +196,17 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
-    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
+    # Controls weight-file ordering for load-time I/O optimization.
+    #   -1 : no sorting, no staggering; preserves original file order.
+    #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
+    #   k>0: sort files and stagger per-rank order with factor k.
+    #        Files are processed in groups of (tp_size * k), and rank r starts each
+    #        group at offset (r * k), improving multi-rank I/O concurrency while
+    #        keeping access relatively ordered.
+    SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -236,21 +244,29 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
+    SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
+    SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
+    # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
+    SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
+    # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
+    SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
@@ -319,6 +335,7 @@ class Envs:
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
+    SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
@@ -338,6 +355,11 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
+    # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
+    # "use_direct_io": false key in --hicache-storage-backend-extra-config.
+    SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
@@ -371,7 +393,13 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_AG = EnvBool(True)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Select the gate/up tile layout for AITER MoE: True -> interleave
+    # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
+    # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
+    # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
+    SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -455,6 +483,7 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
@@ -546,6 +575,9 @@ class Envs:
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # For pre-tokenized (list[int]) multimodal prompts,
+    # preserve the user's original tokens to avoid retokenization drift.
+    SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
 
     # VLM Item CUDA IPC Transport
@@ -597,6 +629,11 @@ class Envs:
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # Crash diagnostics
+    SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
+    SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
+    SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
 
     # Encoder gRPC
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
@@ -667,9 +704,9 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 
     # SWA radix cache
-    SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
@@ -715,6 +752,13 @@ class Envs:
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
+    # Replicate the input embedding across TP ranks instead of sharding it
+    # along the vocab dimension (saves an all-reduce/all-gather in the embed
+    # lookup at the cost of replicated embedding weights). Drives both the
+    # target and every draft that shares its embedding (see
+    # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
+    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
+    SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
@@ -731,9 +775,11 @@ class Envs:
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
+    SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
@@ -745,6 +791,24 @@ class Envs:
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+
+    # ===================================================================
+    # KV-Canary / Token-Oracle (testing-only)
+    # ===================================================================
+    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
+    SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
+    SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
+    SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
+    SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
+    SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
 
 envs = Envs()
