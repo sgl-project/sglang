@@ -160,6 +160,28 @@ def _apply_qwen3_qk_norm_rope(
     )
 
 
+def _apply_qwen3_rope_from_cache(
+    q: torch.Tensor, k: torch.Tensor, cos_sin_cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seq_len = q.shape[:2]
+    half = q.shape[-1] // 2
+    cos = cos_sin_cache[:, :half].view(batch_size, seq_len, 1, half).to(q.dtype)
+    sin = cos_sin_cache[:, half:].view(batch_size, seq_len, 1, half).to(q.dtype)
+
+    q1 = q[..., :half]
+    q2 = q[..., half:]
+    q_out = torch.empty_like(q)
+    q_out[..., :half] = q1 * cos - q2 * sin
+    q_out[..., half:] = q2 * cos + q1 * sin
+
+    k1 = k[..., :half]
+    k2 = k[..., half:]
+    k_out = torch.empty_like(k)
+    k_out[..., :half] = k1 * cos - k2 * sin
+    k_out[..., half:] = k2 * cos + k1 * sin
+    return q_out, k_out
+
+
 # -----------------------------------------------------------------------------
 # Cosmos3 Timestep Embedder
 # -----------------------------------------------------------------------------
@@ -358,15 +380,13 @@ class Cosmos3CausalAttention(nn.Module):
         ]
         v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
-        q, k = _apply_qwen3_qk_norm_rope(
-            q,
-            k,
-            self.norm_q,
-            self.norm_k,
-            self.head_dim,
-            cos_sin_cache,
-            rope_cache_positions,
+        q = F.rms_norm(
+            q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
         )
+        k = F.rms_norm(
+            k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+        )
+        q, k = _apply_qwen3_rope_from_cache(q, k, cos_sin_cache)
 
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2),
