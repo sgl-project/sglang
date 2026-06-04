@@ -41,7 +41,7 @@
 /python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong
 /python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
-/python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu
+/python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/managers/scheduler_pp_mixin.py @ShangmingCai @XucSh
 /python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @chanh @fortunecookiee
