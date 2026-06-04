@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import abc
+import json
 import logging
 import threading
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -29,6 +31,13 @@ from sglang.jit_kernel.hicache import (
 )
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
+)
+from sglang.srt.mem_cache.host_shared_slot_state import (
+    HostSharedPageSlotSnapshot,
+    HostSharedPageSlotState,
+    HostSharedPageSlotStateError,
+    HostSharedPageSlotToken,
+    HostSharedPageSlotTracker,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -92,6 +101,26 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+    def close(self) -> None:
+        """Release allocator-owned resources."""
+
+    @property
+    def binding(self) -> Any | None:
+        return None
+
+    def ensure_host_registration(self, tensor: torch.Tensor, pin_memory: bool) -> None:
+        if pin_memory:
+            cudart = torch.cuda.cudart()
+            n_bytes = tensor.numel() * tensor.element_size()
+            rc = cudart.cudaHostRegister(tensor.data_ptr(), n_bytes, 0)
+            if int(rc) != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister failed (rc={int(rc)}, "
+                    f"{cudart.cudaGetErrorString(rc)}) for ptr={tensor.data_ptr():#x} "
+                    f"size={n_bytes}; host buffer is not pinned and device transfers "
+                    f"may silently return stale data."
+                )
 
 
 class HiSparseHostPoolMixin:
@@ -157,7 +186,12 @@ class HiSparseHostPoolMixin:
         return host_indices[host_indices >= 0]
 
 
-def get_allocator_from_storage(allocator_type):
+def get_allocator_from_storage(
+    allocator_type: str,
+    allocator_config: dict[str, Any] | str | None = None,
+    *,
+    layout: str | None = None,
+) -> HostTensorAllocator:
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -172,6 +206,27 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
+    elif allocator_type == "tensorcast":
+        raw_payload = allocator_config
+        if isinstance(raw_payload, str):
+            raw_payload = json.loads(raw_payload)
+        from sglang.srt.mem_cache.storage.tensorcast_store.config import (
+            tensorcast_host_allocator_config_from_extra_config,
+        )
+        from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
+            TensorcastHostTensorAllocator,
+        )
+
+        resolved_config = tensorcast_host_allocator_config_from_extra_config(
+            raw_payload if isinstance(raw_payload, dict) else None
+        )
+        if resolved_config is None:
+            return HostTensorAllocator()
+        if layout != "page_blob_direct":
+            raise ValueError(
+                "TensorCast allocator-backed host residency requires --hicache-mem-layout=page_blob_direct"
+            )
+        return TensorcastHostTensorAllocator(resolved_config)
     else:
         return HostTensorAllocator()
 
@@ -188,17 +243,7 @@ def alloc_with_host_register(
     CudaHostRegister only applies when pin_memory=True.
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
-        cudart = torch.cuda.cudart()
-        n_bytes = buffer.numel() * buffer.element_size()
-        rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
-        if int(rc) != 0:
-            raise RuntimeError(
-                f"cudaHostRegister failed (rc={int(rc)}, "
-                f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-                f"size={n_bytes}; host buffer is not pinned and device transfers "
-                f"may silently return stale data."
-            )
+    allocator.ensure_host_registration(buffer, pin_memory)
     return buffer
 
 
@@ -237,13 +282,18 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        allocator_config: dict[str, Any] | str | None = None,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = get_allocator_from_storage(
+            allocator_type,
+            allocator_config,
+            layout=layout,
+        )
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -282,6 +332,10 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    @property
+    def host_region_binding(self) -> Any | None:
+        return self.allocator.binding
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -351,6 +405,10 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self.page_slot_tracker = HostSharedPageSlotTracker(
+            page_size=self.page_size,
+            page_num=self.page_num,
+        )
 
     def available_size(self):
         return len(self.free_slots)
@@ -370,8 +428,104 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        self._retire_released_page_slots(indices)
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
+
+    def _retire_released_page_slots(self, indices: torch.Tensor) -> None:
+        if indices.numel() == 0 or indices.numel() % self.page_size != 0:
+            return
+        retire_tokens: list[HostSharedPageSlotToken] = []
+        for offset in range(0, indices.numel(), self.page_size):
+            page_start = int(indices[offset].item())
+            slot_index = self.page_slot_tracker.slot_index_for_page_start(page_start)
+            snapshot = self.page_slot_tracker.snapshot(slot_index)
+            if snapshot.state == HostSharedPageSlotState.SLOT_FREE:
+                continue
+            if snapshot.state in {
+                HostSharedPageSlotState.SLOT_RESIDENT,
+                HostSharedPageSlotState.SLOT_INVALID,
+            }:
+                retire_tokens.append(self.page_slot_tracker.current_token(slot_index))
+                continue
+            raise HostSharedPageSlotStateError(
+                "cannot free host page slots while they are reserved or in flight"
+            )
+        if retire_tokens:
+            self.page_slot_tracker.retire_slots(retire_tokens)
+
+    def _slot_indices_from_page_starts(
+        self, page_starts: torch.Tensor | Sequence[int]
+    ) -> tuple[int, ...]:
+        if isinstance(page_starts, torch.Tensor):
+            normalized_page_starts = tuple(int(value) for value in page_starts.tolist())
+        else:
+            normalized_page_starts = tuple(int(value) for value in page_starts)
+        return tuple(
+            self.page_slot_tracker.slot_index_for_page_start(page_start)
+            for page_start in normalized_page_starts
+        )
+
+    @synchronized
+    def slot_tokens_for_page_starts(
+        self, page_starts: torch.Tensor | Sequence[int]
+    ) -> tuple[HostSharedPageSlotToken, ...]:
+        return tuple(
+            self.page_slot_tracker.current_token(slot_index)
+            for slot_index in self._slot_indices_from_page_starts(page_starts)
+        )
+
+    @synchronized
+    def describe_page_slot(self, page_start: int) -> HostSharedPageSlotSnapshot:
+        slot_index = self.page_slot_tracker.slot_index_for_page_start(int(page_start))
+        return self.page_slot_tracker.snapshot(slot_index)
+
+    @synchronized
+    def reserve_page_slots(
+        self,
+        page_starts: torch.Tensor | Sequence[int],
+        logical_keys: Sequence[str] | None = None,
+    ) -> tuple[HostSharedPageSlotToken, ...]:
+        slot_indices = self._slot_indices_from_page_starts(page_starts)
+        return self.page_slot_tracker.reserve_slots(slot_indices, logical_keys)
+
+    @synchronized
+    def mark_page_get_inflight(
+        self, slot_tokens: Sequence[HostSharedPageSlotToken]
+    ) -> None:
+        self.page_slot_tracker.mark_get_inflight(slot_tokens)
+
+    @synchronized
+    def commit_page_get_success(
+        self,
+        slot_tokens: Sequence[HostSharedPageSlotToken],
+        logical_keys: Sequence[str] | None = None,
+    ) -> None:
+        self.page_slot_tracker.commit_get_success(slot_tokens, logical_keys)
+
+    @synchronized
+    def fail_page_get(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        self.page_slot_tracker.fail_get(slot_tokens)
+
+    @synchronized
+    def begin_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        self.page_slot_tracker.begin_put(slot_tokens)
+
+    @synchronized
+    def finish_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        self.page_slot_tracker.finish_put(slot_tokens)
+
+    @synchronized
+    def mark_page_slots_invalid(
+        self, slot_tokens: Sequence[HostSharedPageSlotToken]
+    ) -> None:
+        self.page_slot_tracker.mark_invalid(slot_tokens)
+
+    @synchronized
+    def retire_page_slots(
+        self, slot_tokens: Sequence[HostSharedPageSlotToken]
+    ) -> tuple[HostSharedPageSlotToken, ...]:
+        return self.page_slot_tracker.retire_slots(slot_tokens)
 
 
 class MHATokenToKVPoolHost(HostKVCache):
@@ -387,6 +541,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        allocator_config: dict[str, Any] | str | None = None,
     ):
         super().__init__(
             device_pool,
@@ -397,12 +552,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            allocator_config,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
-
         if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
@@ -410,19 +565,40 @@ class MHATokenToKVPoolHost(HostKVCache):
             v_transposed = self.v_buffer.transpose(0, 1)
             self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
             self.v_data_refs = [v_transposed[i] for i in range(self.layer_num)]
+            self.k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.k_data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+            self.v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.v_data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+        elif self.layout == "page_blob_direct":
+            # page_blob_direct manages backing memory at the slot level; per-layer
+            # refs are not needed (and not safe to compute as contiguous slices).
+            self.k_data_refs = []
+            self.v_data_refs = []
+            self.k_data_ptrs = torch.empty(
+                (0,), dtype=torch.uint64, device=self.device_pool.device
+            )
+            self.v_data_ptrs = torch.empty(
+                (0,), dtype=torch.uint64, device=self.device_pool.device
+            )
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
+            self.k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.k_data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+            self.v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.v_data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -443,6 +619,15 @@ class MHATokenToKVPoolHost(HostKVCache):
             dims = (
                 2,
                 self.page_num,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+        elif self.layout == "page_blob_direct":
+            dims = (
+                self.page_num,
+                2,
                 self.layer_num,
                 self.page_size,
                 self.head_num,
@@ -474,10 +659,14 @@ class MHATokenToKVPoolHost(HostKVCache):
 
     @property
     def k_buffer(self):
+        if self.layout == "page_blob_direct":
+            return self.kv_buffer.select(1, 0)
         return self.kv_buffer[0]
 
     @property
     def v_buffer(self):
+        if self.layout == "page_blob_direct":
+            return self.kv_buffer.select(1, 1)
         return self.kv_buffer[1]
 
     def load_to_device_per_layer(
@@ -564,7 +753,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.k_buffer, self.v_buffer],
                     dst_ptrs=[
@@ -579,7 +768,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
+            if self.layout in ["page_first_direct", "page_blob_direct"]:
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
                     transfer_kv_dim_exchange(
@@ -677,7 +866,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
                     dst_ptrs=[self.k_buffer, self.v_buffer],
@@ -688,7 +877,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
+            if self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
@@ -709,7 +898,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
-        elif self.layout in ["page_first_direct", "page_head"]:
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
+        elif self.layout == "page_blob_direct":
+            real_index = index // self.page_size
+            data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :, :]
+        elif self.layout == "page_head":
             real_index = index // self.page_size
             data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
         else:
@@ -748,6 +943,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
                 data_page.reshape(
                     2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
+                )
+            )
+        elif self.layout == "page_blob_direct":
+            real_index = index // self.page_size
+            self.kv_buffer[real_index : real_index + 1, :, :, :, :, :] = (
+                data_page.reshape(
+                    1, 2, self.layer_num, self.page_size, self.head_num, self.head_dim
                 )
             )
         elif self.layout == "page_head":
@@ -845,6 +1047,23 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
+        elif self.layout == "page_blob_direct":
+            element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.head_num
+                * self.head_dim
+            )
+            page_blob_size = 2 * element_size
+            for index in range(0, len(indices), self.page_size):
+                page_index = indices[index] // self.page_size
+                page_base_ptr = kv_buffer_data_ptr + page_index * page_blob_size
+                k_ptr = page_base_ptr
+                v_ptr = page_base_ptr + element_size
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+            element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct", "page_head"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
@@ -909,6 +1128,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        allocator_config: dict[str, Any] | str | None = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -920,6 +1140,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            allocator_config,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
@@ -930,13 +1151,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # This swaps strides without copying data
             transposed = self.kv_buffer.transpose(0, 1)
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
+            self.data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
+        elif self.layout == "page_blob_direct":
+            # page_blob_direct manages backing memory at the slot level; per-layer
+            # refs are not needed (and not safe to compute as contiguous slices).
+            self.data_refs = []
+            self.data_ptrs = torch.empty(
+                (0,), dtype=torch.uint64, device=self.device_pool.device
+            )
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
+            self.data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -974,6 +1207,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.kv_cache_dim,
             )
         elif self.layout == "page_first_direct":
+            dims = (
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_cache_dim,
+            )
+        elif self.layout == "page_blob_direct":
             dims = (
                 self.page_num,
                 self.layer_num,
@@ -1083,7 +1324,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.kv_buffer],
                     dst_ptrs=[device_pool.kv_buffer[layer_id]],
@@ -1171,7 +1412,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
+            elif self.layout in ["page_first_direct", "page_blob_direct"]:
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.kv_buffer,
                     dst_ptrs=[self.kv_buffer],
@@ -1205,7 +1446,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
             data_page = self.kv_buffer[index : index + self.page_size, :, :, :]
-        elif self.layout == "page_first_direct":
+        elif self.layout in ["page_first_direct", "page_blob_direct"]:
             real_index = index // self.page_size
             data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :]
         else:
@@ -1242,7 +1483,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 1,
                 self.kv_cache_dim,
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ["page_first_direct", "page_blob_direct"]:
             real_index = index // self.page_size
             self.kv_buffer[real_index : real_index + 1, :, :, :, :] = data_page.reshape(
                 1,
@@ -1273,7 +1514,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_blob_direct"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr

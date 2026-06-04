@@ -2153,6 +2153,26 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+                logger.debug(
+                    "HiCache storage prefetch considered for rid=%s backuped=%s "
+                    "prefix_tokens=%d host_hit_tokens=%d new_input_tokens=%d "
+                    "last_hash=%s",
+                    req.rid,
+                    last_host_node.backuped,
+                    len(req.prefix_indices),
+                    req.host_hit_length,
+                    len(new_input_tokens),
+                    last_hash,
+                )
+            else:
+                logger.debug(
+                    "HiCache storage prefetch skipped for rid=%s because last_host_node.backuped=%s "
+                    "prefix_tokens=%d host_hit_tokens=%d",
+                    req.rid,
+                    last_host_node.backuped,
+                    len(req.prefix_indices),
+                    req.host_hit_length,
+                )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2553,14 +2573,15 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
+        if self.enable_hierarchical_cache:
+            # Keep HiCache background IO progressing even when no new prefill batch is admitted.
+            self.tree_cache.check_hicache_events()
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
