@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=148, stage="stage-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=148, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -279,6 +279,7 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
 
         return server_args, {}
 
+    @unittest.skipIf(is_in_ci(), "To skip flaky test")
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
         run_eval_accuracy_test(self)

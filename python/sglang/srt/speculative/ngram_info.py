@@ -172,7 +172,7 @@ class NgramVerifyInput(SpecInput):
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
+                req.update_finish_state()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
@@ -465,6 +465,8 @@ class NgramVerifyInput(SpecInput):
 
         batch.seq_lens.add_(self.num_accept_tokens)
         batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
+        # Keep seq_lens_sum in sync; attn backends size kv_indices from it.
+        batch.seq_lens_sum += int(num_accept_tokens_cpu.sum())
 
         return logits_output, self.accept_tokens, num_correct_drafts
 

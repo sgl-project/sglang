@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import hashlib
+import logging
+import traceback
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Tuple
+
+import torch
+
+from sglang.srt.constants import (
+    GPU_MEMORY_ALL_TYPES,
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
+from sglang.srt.managers.io_struct import (
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
+    GetWeightsByNameReqInput,
+    GetWeightsByNameReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _get_draft_model_runner(draft_worker):
+    # EAGLEWorker (v1): draft_model_runner property -> self.model_runner
+    runner = getattr(draft_worker, "draft_model_runner", None)
+    if runner is not None:
+        return runner
+    # EAGLEWorkerV2: _draft_worker.draft_runner
+    inner = getattr(draft_worker, "_draft_worker", None)
+    if inner is not None:
+        runner = getattr(inner, "draft_runner", None)
+        if runner is not None:
+            return runner
+    return None
+
+
+def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
+    merged_checksums = dict(target["checksums"])
+    for name, chk in draft["checksums"].items():
+        merged_checksums[f"draft.{name}"] = chk
+    h = hashlib.sha256()
+    for name in sorted(merged_checksums):
+        h.update(name.encode())
+        h.update(merged_checksums[name].encode())
+    target["checksums"] = merged_checksums
+    target["per_gpu_checksum"] = h.hexdigest()
+    return target
+
+
+@dataclass(kw_only=True, slots=True)
+class SchedulerWeightUpdaterManager:
+    tp_worker: Any
+    draft_worker: Any
+    tp_cpu_group: Any
+    memory_saver_adapter: Any
+    flush_cache: Callable[..., bool]
+    is_fully_idle: Callable[..., bool]
+    offload_tags: set = field(default_factory=set)
+    stashed_model_static_state: Any = None
+
+    def flush_cache_after_weight_update(self, recv_req) -> None:
+        if recv_req.flush_cache:
+            flush_cache_success = self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
+            )
+            assert flush_cache_success, "Cache flush failed after updating weights"
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        """In-place update of the weights from disk."""
+        success, message = self.tp_worker.update_weights_from_disk(recv_req)
+        tp_success = success
+        if success and self.draft_worker is not None:
+            success, message = self.draft_worker.update_weights_from_disk(recv_req)
+        if tp_success:
+            self.flush_cache_after_weight_update(recv_req)
+        if not success:
+            logger.error(message)
+        return UpdateWeightFromDiskReqOutput(success, message, 0)
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        """Initialize the online model parameter update group."""
+        success, message = self.tp_worker.init_weights_update_group(recv_req)
+        return InitWeightsUpdateGroupReqOutput(success, message)
+
+    def destroy_weights_update_group(
+        self,
+        recv_req: DestroyWeightsUpdateGroupReqInput,
+    ):
+        """Destroy the online model parameter update group."""
+        success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+        return DestroyWeightsUpdateGroupReqOutput(success, message)
+
+    def update_weights_from_distributed(
+        self,
+        recv_req: UpdateWeightsFromDistributedReqInput,
+    ) -> Tuple[bool, str]:
+        """Update the online model parameter."""
+        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+        if success:
+            self.flush_cache_after_weight_update(recv_req)
+        else:
+            logger.error(message)
+        return UpdateWeightsFromDistributedReqOutput(success, message)
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        """Update the online model parameter from tensors."""
+        if recv_req.disable_draft_model:
+            worker = self.tp_worker
+        else:
+            worker = self.draft_worker or self.tp_worker
+        success, message = worker.update_weights_from_tensor(recv_req)
+        if success:
+            self.flush_cache_after_weight_update(recv_req)
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromTensorReqOutput(success, message)
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update the online model parameter from IPC for checkpoint-engine integration."""
+        success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+        tp_success = success
+        if success and self.draft_worker is not None:
+            success, message = self.draft_worker.update_weights_from_ipc(recv_req)
+        if tp_success:
+            self.flush_cache_after_weight_update(recv_req)
+        if not success:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromIPCReqOutput(success, message)
+
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        parameter = self.tp_worker.get_weights_by_name(recv_req)
+        return GetWeightsByNameReqOutput(parameter)
+
+    def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        assert (
+            self.is_fully_idle()
+        ), "release_memory_occupation should be called only when server is idle."
+
+        tags = recv_req.tags
+
+        if tags is None or len(tags) == 0:
+            tags = GPU_MEMORY_ALL_TYPES
+
+        for tag in tags:
+            self.offload_tags.add(tag)
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            self.flush_cache()
+
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self.stashed_model_static_state = _export_static_state(
+                self.tp_worker.model_runner.model
+            )
+            torch.distributed.barrier(self.tp_cpu_group)
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+        torch.get_device_module().synchronize()
+
+        return ReleaseMemoryOccupationReqOutput()
+
+    def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        tags = recv_req.tags
+
+        if tags is None or len(tags) == 0:
+            tags = GPU_MEMORY_ALL_TYPES
+
+        for tag in tags:
+            self.offload_tags.remove(tag)
+
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            torch.distributed.barrier(self.tp_cpu_group)
+            _import_static_state(
+                self.tp_worker.model_runner.model,
+                self.stashed_model_static_state,
+            )
+            del self.stashed_model_static_state
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+        return ResumeMemoryOccupationReqOutput()
+
+    def check_weights(self, recv_req: CheckWeightsReqInput):
+        try:
+            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+
+            if self.draft_worker is not None:
+                draft_runner = _get_draft_model_runner(self.draft_worker)
+                if draft_runner is not None:
+                    draft_payload = draft_runner.check_weights(action=recv_req.action)
+                    if payload is not None and draft_payload is not None:
+                        payload = _merge_checksum_payloads(payload, draft_payload)
+
+            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+            if tp_size > 1 and payload is not None:
+                all_payloads = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    all_payloads, payload, group=self.tp_cpu_group
+                )
+                payload = all_payloads
+            return CheckWeightsReqOutput(
+                success=True, message="Success.", payload=payload
+            )
+        except Exception as e:
+            logger.warning(f"check_weights see error: {e}")
+            traceback.print_exc()
+            return CheckWeightsReqOutput(success=False, message=f"{e}")
+
+    def save_remote_model(self, params):
+        url = params["url"]
+
+        self.tp_worker.model_runner.save_remote_model(url)
+
+        if self.draft_worker is not None:
+            draft_url = params.get("draft_url", None)
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
+            self.draft_worker.model_runner.save_remote_model(draft_url)
+
+    def save_sharded_model(self, params):
+        self.tp_worker.model_runner.save_sharded_model(
+            path=params["path"],
+            pattern=params["pattern"],
+            max_size=params["max_size"],
+        )
+
+
+def _export_static_state(model):
+    return dict(
+        buffers=[
+            (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
+        ]
+    )
+
+
+def _import_static_state(model, static_params):
+    with torch.inference_mode():
+        self_named_buffers = dict(model.named_buffers())
+        for name, tensor in static_params["buffers"]:
+            self_named_buffers[name][...] = tensor
