@@ -699,7 +699,7 @@ class Cosmos3LanguageModel(nn.Module):
         hidden = self.embed_tokens(text_ids)
         mask_3d = text_mask.unsqueeze(-1)
         cos_sin_cache, rope_cache_positions = self.rotary_emb.build_rope_cache_inputs(
-            position_ids
+            position_ids, cache_dtype=hidden.dtype
         )
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -1080,7 +1080,9 @@ class Cosmos3OmniTransformer(CachableDiT):
                     3, batch_size, self.sp_size, local_seq_len
                 )[:, :, self.sp_rank, :]
             self.cached_gen_rope_inputs[cache_key] = (
-                self.language_model.rotary_emb.build_rope_cache_inputs(vis_pos_ids)
+                self.language_model.rotary_emb.build_rope_cache_inputs(
+                    vis_pos_ids, cache_dtype=hidden_gen.dtype
+                )
             )
 
         cos_sin_gen, gen_rope_cache_positions = self.cached_gen_rope_inputs[cache_key]

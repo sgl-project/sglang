@@ -151,16 +151,15 @@ class Qwen3VLTextRotaryEmbedding(torch.nn.Module):
 
     @torch.no_grad()
     def build_rope_cache_inputs(
-        self, position_ids: torch.Tensor
+        self, position_ids: torch.Tensor, *, cache_dtype: torch.dtype | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         freqs = self._compute_interleaved_freqs(position_ids)
-        cos_sin_cache = torch.cat(
-            (
-                freqs.cos() * self.attention_scaling,
-                freqs.sin() * self.attention_scaling,
-            ),
-            dim=-1,
-        ).reshape(-1, self.head_dim)
+        cos = freqs.cos() * self.attention_scaling
+        sin = freqs.sin() * self.attention_scaling
+        if cache_dtype is not None and cache_dtype != torch.float32:
+            cos = cos.to(cache_dtype).float()
+            sin = sin.to(cache_dtype).float()
+        cos_sin_cache = torch.cat((cos, sin), dim=-1).reshape(-1, self.head_dim)
         cos_sin_cache = cos_sin_cache.contiguous()
         cache_positions = torch.arange(
             cos_sin_cache.shape[0], device=cos_sin_cache.device, dtype=torch.long
