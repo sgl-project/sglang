@@ -303,9 +303,9 @@ def build_decode_streams(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _prefill_lengths_kernel(
-    positions_ptr,  # [T] int32
-    chunk_start_ptr,  # [T] int32
-    page_idx_ptr,  # [T, Wc] int32 (front-packed, -1 padded)
+    positions_ptr,  # [T] int
+    chunk_start_ptr,  # [T] int
+    page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
     prefix_len_ptr,  # [T] int32 out
     extend_len_ptr,  # [T] int32 out
     win: tl.constexpr,
@@ -313,13 +313,10 @@ def _prefill_lengths_kernel(
     HAS_COMPRESS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One program per token. Writes prefix_len (= prefix_swa_count + n_comp)
-    and extend_len (= extend_count). Folds the prior host clamp/sub/min/max +
-    ``(page_idx>=0).sum(1)`` chain into one launch. The per-token formulas match
-    ``_build_prefill_indices_kernel`` exactly (so indptr deltas stay consistent)."""
+    """Per token: write extend/prefix segment lengths"""
     t = tl.program_id(0)
-    pos = tl.load(positions_ptr + t)
-    cs = tl.load(chunk_start_ptr + t)
+    pos = tl.load(positions_ptr + t).to(tl.int32)
+    cs = tl.load(chunk_start_ptr + t).to(tl.int32)
     tpic = pos - cs
     swa_low = tl.maximum(pos - win + 1, 0)
     extend_count = tl.minimum(tpic + 1, win)
@@ -339,40 +336,28 @@ def _prefill_lengths_kernel(
 
 @triton.jit
 def _build_prefill_indices_kernel(
-    positions_ptr,  # [T] int32
-    chunk_start_ptr,  # [T] int32
-    cu_q_ptr,  # [T] int32
-    state_slot_ptr,  # [T] int32
-    page_idx_ptr,  # [T, Wc] int32 (front-packed, -1 padded)
-    pre_indptr_ptr,  # [T+1] int32 (ragged prefix sum, prefix stream)
-    ext_indptr_ptr,  # [T+1] int32 (ragged prefix sum, extend stream)
-    pre_out_ptr,  # [>= pre_indptr[T]] int32
-    ext_out_ptr,  # [>= ext_indptr[T]] int32
+    positions_ptr,  # [T] int
+    chunk_start_ptr,  # [T] int
+    cu_q_ptr,  # [T] int
+    state_slot_ptr,  # [T] int
+    page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
+    pre_indptr_ptr,  # [T+1] int32 (prefix stream ragged indptr)
+    ext_indptr_ptr,  # [T+1] int32 (extend stream ragged indptr)
+    pre_out_ptr,  
+    ext_out_ptr,
     swa_pages,
-    ring_stride,  # SWA ring per-slot stride / modulo (win_with_spec)
+    ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One program per token. Writes two ragged segments:
-
-      prefix = [SWA prior-chunk ring (prefix_swa_count)] ++
-               [swa_pages + compressed slot (nc)]
-      extend = [current-chunk kv rows (extend_count)]
-
-    Per-token quantities (mirror the prior torch build):
-      token_pos_in_chunk = pos - chunk_start
-      swa_low            = max(pos - win + 1, 0)
-      extend_count       = min(token_pos_in_chunk + 1, win)
-      prefix_swa_count   = min(max(chunk_start - swa_low, 0), win)
-    ``nc`` is recovered from the prefix indptr delta minus prefix_swa_count.
-    """
+    """Per token: write extend rows + prefix (SWA ring slots ++ swa_pages+compressed slots) as two ragged segments"""
     t = tl.program_id(0)
-    pos = tl.load(positions_ptr + t)
-    cs = tl.load(chunk_start_ptr + t)
-    cuq = tl.load(cu_q_ptr + t)
-    s = tl.load(state_slot_ptr + t)
+    pos = tl.load(positions_ptr + t).to(tl.int32)
+    cs = tl.load(chunk_start_ptr + t).to(tl.int32)
+    cuq = tl.load(cu_q_ptr + t).to(tl.int32)
+    s = tl.load(state_slot_ptr + t).to(tl.int32)
 
     tpic = pos - cs
     swa_low = tl.maximum(pos - win + 1, 0)
@@ -403,7 +388,7 @@ def _build_prefill_indices_kernel(
         for off in tl.range(0, Wc, BLOCK):
             j = off + tl.arange(0, BLOCK)
             m = j < nc
-            pi = tl.load(page_idx_ptr + t * Wc + j, mask=m, other=0)
+            pi = tl.load(page_idx_ptr + t * Wc + j, mask=m, other=0).to(tl.int32)
             tl.store(pre_out_ptr + cbase + j, pi + swa_pages, mask=m)
 
 
@@ -420,44 +405,35 @@ def build_prefill_indices(
     c128_page_indices: Optional[torch.Tensor],
     c4_sparse_page_indices: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Ragged-packed prefill indices in one Triton launch.
-
-    Returns ``(kv_indices_prefix, kv_indptr_prefix, kv_indices_extend,
-    kv_indptr_extend)``. Replaces the prior ~10 torch ops (arange/clamp/where/
-    cat/reshape/...). Buffers keep the fixed worst-case capacities
-    (prefix ``T*(win+Wc)``, extend ``T*win``) for CUDA-graph shape stability;
-    the indptrs are true prefix sums so the prefill kernel scans only the real
-    per-token entries in each of the two KV sources.
-    """
+    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr)."""
     device = state_slot.device
     T = state_slot.shape[0]
-    pos_i = positions.to(torch.int32).contiguous()
-    cs_i = chunk_start.to(torch.int32).contiguous()
-    cuq_i = cu_q.to(torch.int32).contiguous()
-    ss_i = state_slot.to(torch.int32).contiguous()
+    assert positions.is_contiguous() and chunk_start.is_contiguous()
+    assert cu_q.is_contiguous() and state_slot.is_contiguous()
 
     if compress_ratio == 0:
         page_idx = None
     elif compress_ratio == 128:
         assert c128_page_indices is not None
-        page_idx = c128_page_indices[:T].to(torch.int32).contiguous()
+        page_idx = c128_page_indices[:T]
     elif compress_ratio == 4:
         assert c4_sparse_page_indices is not None
-        page_idx = c4_sparse_page_indices[:T].to(torch.int32).contiguous()
+        page_idx = c4_sparse_page_indices[:T]
     else:
         raise ValueError(f"bad compress_ratio {compress_ratio}")
 
     has_compress = page_idx is not None
+    if has_compress:
+        assert page_idx.is_contiguous()
     Wc = page_idx.shape[1] if has_compress else 0
 
     block = min(1024, triton.next_power_of_2(max(win, Wc, 1)))
-    # Per-token segment lengths in one kernel, then cumsum -> ragged indptrs.
     prefix_len = torch.empty(T, dtype=torch.int32, device=device)
     extend_len = torch.empty(T, dtype=torch.int32, device=device)
     _prefill_lengths_kernel[(T,)](
-        pos_i,
-        cs_i,
-        page_idx if has_compress else pos_i,  # dummy ptr when no compress
+        positions,
+        chunk_start,
+        page_idx if has_compress else positions,  # dummy ptr when no compress
         prefix_len,
         extend_len,
         win=win,
@@ -473,11 +449,11 @@ def build_prefill_indices(
     kv_indices_extend = torch.empty(T * win, dtype=torch.int32, device=device)
 
     _build_prefill_indices_kernel[(T,)](
-        pos_i,
-        cs_i,
-        cuq_i,
-        ss_i,
-        page_idx if has_compress else ss_i,  # dummy ptr when no compress
+        positions,
+        chunk_start,
+        cu_q,
+        state_slot,
+        page_idx if has_compress else state_slot,  # dummy ptr when no compress
         kv_indptr_prefix,
         kv_indptr_extend,
         kv_indices_prefix,
