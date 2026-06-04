@@ -69,6 +69,11 @@ class NPUPlatformBase(Platform):
         return True
 
     @classmethod
+    def inference_mode(cls):
+        # npu kernels in diffusion paths may need tensor version counters
+        return torch.no_grad()
+
+    @classmethod
     def is_full_nvlink(cls, physical_device_ids: list[int]) -> bool:
         logger.exception(
             "NVLink detection not possible, as context support was"

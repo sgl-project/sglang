@@ -55,7 +55,6 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = 0
         self.page_size = page_size
-        self.swa_loc = None
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
@@ -159,15 +158,10 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
-    def set_swa_loc(self, loc: torch.Tensor):
-        self.swa_loc = loc
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
-
-        # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
-        # since the last item of full_to_swa_index_mapping is -1.
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def set_kv_buffer(
         self,
@@ -182,12 +176,7 @@ class SWAKVPool(BaseSWAKVPool):
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            if self.swa_loc is not None:
-                loc = self.swa_loc
-            else:
-                if self.full_to_swa_index_mapping is not None:
-                    loc = self.translate_loc_from_full_to_swa(loc)
-
+            loc = self.translate_loc_from_full_to_swa(loc)
             self.swa_kv_pool.set_kv_buffer(
                 None,
                 loc,
@@ -372,8 +361,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-        self.clear()
         self._kvcache = kvcache
+        self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
@@ -549,6 +538,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
             alloc_swa_indices
         )
+        if swa_tail_len < extend_num_tokens:
+            self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
         return alloc_full_indices
 
     def alloc_decode(

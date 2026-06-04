@@ -22,7 +22,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     vae_precision: str = "bf16"
 
     should_use_guidance: bool = False
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
 
     vae_tiling: bool = False
 
