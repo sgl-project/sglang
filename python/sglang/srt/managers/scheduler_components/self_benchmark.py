@@ -12,7 +12,7 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.common import (
@@ -21,8 +21,8 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     release_kv_cache,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
