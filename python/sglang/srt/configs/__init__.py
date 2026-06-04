@@ -7,6 +7,12 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.gemma4_unified import (
+    Gemma4UnifiedAudioConfig,
+    Gemma4UnifiedConfig,
+    Gemma4UnifiedTextConfig,
+    Gemma4UnifiedVisionConfig,
+)
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
@@ -45,6 +51,10 @@ __all__ = [
     "ChatGLMConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
+    "Gemma4UnifiedConfig",
+    "Gemma4UnifiedTextConfig",
+    "Gemma4UnifiedVisionConfig",
+    "Gemma4UnifiedAudioConfig",
     "LongcatFlashConfig",
     "MultiModalityConfig",
     "KimiVLConfig",

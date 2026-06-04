@@ -133,7 +133,7 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config.model_type == "multi_modality":
             _set_architectures(config, "MultiModalityCausalLM")
 
-        if config.model_type in ("gemma4", "gemma4_assistant"):
+        if config.model_type in ("gemma4", "gemma4_assistant", "gemma4_unified"):
             # Gemma4 configs use base attributes for SWA layers and `global_*`
             # variants for full-attention layers.  SGLang expects the opposite:
             # base = full-attention, `swa_*` = sliding-window overrides.
