@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMRealtimeStage,
+    SanaWMTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
     default_sana_wm_refiner_dtype,
@@ -22,6 +23,17 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 
 DEFAULT_SANA_WM_TEXT_ENCODER = "Efficient-Large-Model/gemma-2-2b-it"
+
+
+class SanaWMRealtimeTextEncodingStage(RealtimeTextEncodingStage, SanaWMTextEncodingStage):
+    """Realtime text encoding that uses SANA-WM's prompt processing (NOT the bare base).
+
+    MRO: ``RealtimeTextEncodingStage.forward`` (per-session cache) calls ``super().forward``,
+    which under this MRO resolves to ``SanaWMTextEncodingStage.forward`` — applying the
+    chi_prompt prefix + official 300-token prompt window — instead of the generic
+    ``TextEncodingStage.forward``. Without this the realtime prompt embeds diverge from the
+    batch path, shifting the DiT cross-attention conditioning every chunk.
+    """
 
 
 class SanaWMRealtimePipeline(SanaWMTwoStagePipeline):
@@ -83,7 +95,7 @@ class SanaWMRealtimePipeline(SanaWMTwoStagePipeline):
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(RealtimeInputValidationStage())
         self.add_stage(
-            RealtimeTextEncodingStage(
+            SanaWMRealtimeTextEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
                 tokenizers=[self.get_module("tokenizer")],
             )

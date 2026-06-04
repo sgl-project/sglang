@@ -693,6 +693,10 @@ class SanaWMRealtimeStage(PipelineStage):
             generator=generator,
         )
         latents[:, :, :1] = first_latent
+        if __import__("os").environ.get("SANAWM_RT_DUMP_DIR"):  # parity harness (no-op in prod)
+            _d = __import__("os").environ["SANAWM_RT_DUMP_DIR"]
+            __import__("pathlib").Path(_d).mkdir(parents=True, exist_ok=True)
+            torch.save(latents.detach().float().cpu(), f"{_d}/noise_buffer.pt")
 
         cond = batch.prompt_embeds[0].to(device=device, dtype=weight_dtype)
         cond_mask = (

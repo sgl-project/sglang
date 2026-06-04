@@ -127,6 +127,8 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
             init_latents = latents.clone()
             B, C, total_frames, H, W = latents.shape
 
+        _fdump("init_noise", init_latents)  # parity harness: seeded pre-noise (cond @ frame 0)
+
         sampler_cfg = SanaWMSelfForcingSamplerConfig.from_pipeline_config(pcfg)
         num_frame_per_block = sampler_cfg.num_frame_per_block
         num_cached_blocks = sampler_cfg.num_cached_blocks

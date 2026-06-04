@@ -282,6 +282,13 @@ class SanaWMRealtimeSession:
         else:
             self.latents = torch.cat([self.latents, chunk_lat], dim=2)
             new_frames = chunk_lat
+        _rt_dump = __import__("os").environ.get("SANAWM_RT_DUMP_DIR")
+        if _rt_dump:  # parity harness (no-op in production): per-chunk stage-1 latent
+            __import__("pathlib").Path(_rt_dump).mkdir(parents=True, exist_ok=True)
+            torch.save(
+                chunk_lat.detach().float().cpu(),
+                f"{_rt_dump}/stage1_{self.chunk_idx:03d}_{start_f}_{end_f}.pt",
+            )
         self.chunk_idx += 1
 
         if decode and self.vae is not None and hasattr(self.vae, "decode_chunk"):
