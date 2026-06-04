@@ -355,10 +355,20 @@ def is_sbo_enabled() -> bool:
     return IS_SBO_ENABLED
 
 
-def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+def use_rank_local_fused_shared_experts() -> bool:
+    """Whether fused shared experts need one physical slot per EP rank."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+    if b.is_deepep() or b.is_mooncake() or b.is_mori():
+        return True
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return False
+    return (
+        b.is_megamoe()
+        and server_args is not None
+        and server_args.enable_deepep_waterfill
+    )
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:

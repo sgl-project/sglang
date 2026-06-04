@@ -106,9 +106,9 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
-    is_deepep_class_backend,
     is_sbo_enabled,
     is_tbo_enabled,
+    use_rank_local_fused_shared_experts as is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
