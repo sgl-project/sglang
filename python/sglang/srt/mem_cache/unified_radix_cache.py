@@ -2215,14 +2215,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if len(self.ongoing_write_through) == 0:
-            return
-
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if len(self.ongoing_write_through) > 0:
+            for _, finish_event, ack_list in cc.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
 
         # Keep cache state transitions identical across CPxTP participants.
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")

@@ -850,15 +850,17 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Unconditional all_reduce to prevent NCCL op sequence divergence.
+        # ongoing_write_through can differ across ranks because loading_check
+        # processes DMA completions independently (no cross-rank sync), which
+        # causes lock_ref → evictable_size → evict decision divergence over time.
+        # Empty ranks pass finish_count=0; MIN yields 0, no entries processed.
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if len(self.ongoing_write_through) > 0:
+            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         # Keep cache state transitions identical across CPxTP participants.
         self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
