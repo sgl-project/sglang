@@ -324,7 +324,7 @@ def _should_build_payload_off_loop(
 ) -> bool:
     if content_type != RAW_RGB_CONTENT_TYPE or not transport_frames:
         return False
-    return output_format in ENCODED_PREVIEW_FORMATS
+    return output_format in ENCODED_PREVIEW_FORMATS or output_format is None
 
 
 def _is_encoded_preview_transport(
