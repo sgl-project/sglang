@@ -27,7 +27,7 @@ Architecture and key features:
 
 **Supported GPUs:**
 - **BF16:** 16×H100, 16×H200, 8×B200/B300
-- **NVFP4:** 4×GB200/B200/GB300
+- **NVFP4:** 4/8×B200/B300, 4×GB200/GB300
 
 Available model variants on HuggingFace:
 - [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16)
@@ -70,7 +70,7 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
     To set tp size, use `--tp <4|8|16>`. Recommended pairings:
     - BF16: `--tp 16` on H100/H200, `--tp 8` on B200/B300
-    - NVFP4: `--tp 4` on GB200/B200/GB300
+    - NVFP4: `--tp 4` or `--tp 8` on B200/B300, `--tp 4` on GB200/GB300
 
 - **Multi-node BF16 on H100**:
 

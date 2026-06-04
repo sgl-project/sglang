@@ -13,6 +13,9 @@ export const Nemotron3UltraDeployment = () => {
     { model: 'bf16',  hardware: 'b200',  tp: '8'  },
     { model: 'bf16',  hardware: 'b300',  tp: '8'  },
     { model: 'nvfp4', hardware: 'b200',  tp: '4'  },
+    { model: 'nvfp4', hardware: 'b200',  tp: '8'  },
+    { model: 'nvfp4', hardware: 'b300',  tp: '4'  },
+    { model: 'nvfp4', hardware: 'b300',  tp: '8'  },
     { model: 'nvfp4', hardware: 'gb200', tp: '4'  },
     { model: 'nvfp4', hardware: 'gb300', tp: '4'  },
   ];
