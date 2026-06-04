@@ -1041,6 +1041,10 @@ class ServerArgs:
         # Handle context parallelism.
         self._handle_context_parallelism()
 
+        from sglang.srt.layers.cp.strategy import init_cp_strategy
+
+        init_cp_strategy(self)
+
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
