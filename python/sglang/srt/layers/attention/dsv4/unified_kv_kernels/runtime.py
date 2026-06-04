@@ -37,7 +37,6 @@ from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.store import _scatter_rows
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +108,70 @@ def store_swa_into_unified(
     )
 
 
+# ---------------------------------------------------------------------------
+# compressed KV scatter
+# ---------------------------------------------------------------------------
+@triton.jit
+def _scatter_rows_kernel(
+    src_ptr,
+    loc_ptr,
+    valid_ptr,
+    dst_ptr,
+    dst_base,
+    n_rows,
+    D: tl.constexpr,
+    HAS_VALID: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """per row: scatter src[row] -> dst[dst_base+loc], skipping invalid / loc<0 rows."""
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    if HAS_VALID:
+        is_valid = tl.load(valid_ptr + row) != 0
+        if not is_valid:
+            return
+
+    loc = tl.load(loc_ptr + row)
+    if loc < 0:
+        return
+
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < D
+    vals = tl.load(src_ptr + row * D + offs, mask=mask, other=0.0)
+    tl.store(dst_ptr + (dst_base + loc) * D + offs, vals, mask=mask)
+
+
+def _scatter_rows(
+    src: torch.Tensor,
+    loc: torch.Tensor,
+    dst: torch.Tensor,
+    *,
+    dst_base: int = 0,
+    valid: Optional[torch.Tensor] = None,
+) -> None:
+    assert src.is_contiguous() and loc.is_contiguous()
+    if valid is not None:
+        assert valid.is_contiguous()
+    n_rows, head_dim = src.shape
+    block_d = triton.next_power_of_2(head_dim)
+    _scatter_rows_kernel[(n_rows,)](
+        src,
+        loc,
+        valid if valid is not None else loc,
+        dst,
+        dst_base,
+        n_rows,
+        D=head_dim,
+        HAS_VALID=valid is not None,
+        BLOCK_D=block_d,
+        num_warps=8,
+    )
+
+
 def store_compressed_into_unified(
     *,
-    kv_compressed: torch.Tensor,  # [N, head_dim] (bf16-castable)
+    kv_compressed: torch.Tensor,  # [N, head_dim]
     out_loc: torch.Tensor,  # [N] int  == c128_out_loc / c4_out_loc
     unified_kv: torch.Tensor,  # [pages, head_dim] bf16
     swa_pages: int,
@@ -120,7 +180,7 @@ def store_compressed_into_unified(
     """Scatter compressed KV into unified_kv compress region at swa_pages+out_loc."""
     _scatter_rows(
         kv_compressed.to(unified_kv.dtype),
-        out_loc.to(torch.int32),
+        out_loc,
         unified_kv,
         dst_base=swa_pages,
         valid=valid,
@@ -131,9 +191,7 @@ def store_compressed_into_unified(
 # Ragged indptr helper (shared by the decode streams + prefill builders)
 # ---------------------------------------------------------------------------
 def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
-    """[N] int32 per-token lengths -> [N+1] int32 indptr (true prefix sum,
-    indptr[0]=0). Two kernels: a single cumsum (kept in int32) + a leading-0
-    pad — no host-side cast/clamp/reduce chain."""
+    """[N] int32 per-token lengths -> [N+1] int32 indptr"""
     return F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
 
 
@@ -151,18 +209,6 @@ def decode(
     )
 
 
-# ---------------------------------------------------------------------------
-# Amortized decode index build (once per forward, unified_kv-style 3 streams).
-#
-# Per layer only ONE compress_ratio is active, but the SWA prefix is
-# layer-invariant and the HCA tail is layer-invariant (block-table derived), so
-# the dense (swa) + HCA streams are built ONCE per forward. The CSA tail depends
-# on the per-layer indexer top-k, so the csa stream's SWA prefix is built once
-# and its compress tail is filled per-c4-layer by ``fill_compress_tail`` (Phase
-# C). All three per-token lengths come straight from SGLang metadata (no length
-# kernels): swa_len = swa_topk_lengths, hca_len = c128_topk_lengths_clamp1,
-# csa_len = c4_sparse_topk_lengths.
-# ---------------------------------------------------------------------------
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
     write_v4_paged_decode_indices,
 )
@@ -170,29 +216,23 @@ from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode_indices im
 
 @triton.jit
 def _fill_compress_tail_kernel(
-    indices_ptr,  # [*] int32 — ragged stream buffer (in/out)
-    indptr_ptr,  # [N+1] int32 — stream indptr
-    prefix_len_ptr,  # [N] int32 — per-token SWA-prefix count (tail offset)
-    page_idx_ptr,  # [N, Wc] int32 — front-packed compress page ids, -1 padded
-    valid_len_ptr,  # [N] int32 — per-token compress entry count
+    indices_ptr,  # [*] int32 (out)
+    indptr_ptr,  # [N+1] int32
+    prefix_len_ptr,  # [N] int
+    page_idx_ptr,  # [N, Wc] int
+    valid_len_ptr,  # [N] int
     swa_pages,
     Wc: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One program per token: write ``valid_len`` compressed slots
-    (``swa_pages + page_idx``) into the stream tail at
-    ``indices[indptr[t] + prefix_len[t] : + valid_len[t]]``."""
+    """Per token: write valid_len compressed slots (swa_pages+page_idx, -1 for empty) into the stream tail at indptr[t]+prefix_len[t]."""
     t = tl.program_id(0)
-    cbase = tl.load(indptr_ptr + t) + tl.load(prefix_len_ptr + t)
-    nc = tl.load(valid_len_ptr + t)
+    cbase = tl.load(indptr_ptr + t) + tl.load(prefix_len_ptr + t).to(tl.int32)
+    nc = tl.load(valid_len_ptr + t).to(tl.int32)
     for off in tl.range(0, Wc, BLOCK):
         j = off + tl.arange(0, BLOCK)
         m = j < nc
-        pi = tl.load(page_idx_ptr + t * Wc + j, mask=m, other=-1)
-        # Reserved length (nc) may exceed the actual front-packed valid count
-        # (the metadata `*_topk_lengths` are clamped to >=1, so a 0-committed
-        # early token reserves one slot whose page_idx is -1). Preserve -1 so
-        # the sparse-attn kernel skips it instead of reading swa_pages-1.
+        pi = tl.load(page_idx_ptr + t * Wc + j, mask=m, other=-1).to(tl.int32)
         slot = tl.where(pi >= 0, pi + swa_pages, -1)
         tl.store(indices_ptr + cbase + j, slot, mask=m)
 
@@ -206,18 +246,17 @@ def fill_compress_tail(
     valid_len: torch.Tensor,
     swa_pages: int,
 ) -> None:
-    """Fill the compress tail of a ragged stream (HCA in Phase B, CSA per c4
-    layer in Phase C). ``page_indices`` already encodes the unified compress
-    slot (block*k_per_block + slot); we only add ``swa_pages``."""
     N, Wc = page_indices.shape
     if N == 0:
         return
+    assert prefix_len.is_contiguous() and page_indices.is_contiguous()
+    assert valid_len.is_contiguous()
     _fill_compress_tail_kernel[(N,)](
         indices,
         indptr,
-        prefix_len.to(torch.int32),
-        page_indices.to(torch.int32),
-        valid_len.to(torch.int32),
+        prefix_len,
+        page_indices,
+        valid_len,
         swa_pages,
         Wc=Wc,
         BLOCK=min(1024, triton.next_power_of_2(max(Wc, 1))),
@@ -227,37 +266,24 @@ def fill_compress_tail(
 
 def build_decode_streams(
     *,
-    state_slot: torch.Tensor,  # [N] int — per-token SWA ring slot (req_pool_indices)
-    positions: torch.Tensor,  # [N] int — global token position
-    swa_len: torch.Tensor,  # [N] int — min(seq_len, win)
-    hca_len: torch.Tensor,  # [N] int — committed HCA entries
-    csa_len: torch.Tensor,  # [N] int — committed CSA entries (capped to index_topk)
-    c128_page_indices: torch.Tensor,  # [N, Wc128] int32 — HCA tail source
-    csa_width: int,  # Wc4 — CSA stream tail capacity
-    win: int,  # SWA attention window length (per-token prefix count cap)
-    cs: int,  # SWA ring per-slot stride / modulo (win_with_spec)
+    state_slot: torch.Tensor,  # [N] int
+    positions: torch.Tensor,  # [N] int 
+    swa_len: torch.Tensor,  # [N] int 
+    hca_len: torch.Tensor,  # [N] int 
+    csa_len: torch.Tensor,  # [N] int
+    c128_page_indices: torch.Tensor,  # [N, Wc128] int32 
+    csa_width: int,  
+    win: int,  # SWA attention window length
+    cs: int,  # SWA ring per-slot stride
     swa_pages: int,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Build the three ragged decode index streams ONCE per forward.
-
-    Returns ``(swa_i, swa_p, hca_i, hca_p, csa_i, csa_p)``:
-      - swa: SWA ring slots only (ratio-0 layers).
-      - hca: SWA prefix + committed HCA tail (ratio-128 layers) — fully built.
-      - csa: SWA prefix built; CSA tail RESERVED (sized via ``csa_len``) and
-        filled per c4 layer by ``fill_compress_tail`` (Phase C).
-    The SWA prefix for all three is written in one launch via the vendored
-    ``write_v4_paged_decode_indices`` (ring stride ``cs`` = win_with_spec; the
-    per-token prefix count stays ``min(seq_len, win)``).
-    """
     device = state_slot.device
     N = state_slot.shape[0]
-    state_slot = state_slot.to(torch.int32).contiguous()
-    positions = positions.to(torch.int32).contiguous()
-    swa_len = swa_len.to(torch.int32)
-    hca_len = hca_len.to(torch.int32)
-    csa_len = csa_len.to(torch.int32)
+    assert state_slot.is_contiguous() and positions.is_contiguous()
+    state_slot = state_slot.to(torch.int32)
+    positions = positions.to(torch.int32)
     Wc128 = c128_page_indices.shape[1]
 
     swa_p = _lengths_to_indptr(swa_len)
@@ -269,8 +295,6 @@ def build_decode_streams(
     csa_i = torch.empty(N * (win + csa_width), dtype=torch.int32, device=device)
 
     if N > 0:
-        # SWA prefix -> all three streams in one kernel. batch_id = arange(N)
-        # (decode is 1 token/seq); ring stride = cs (win_with_spec).
         batch_id = torch.arange(N, dtype=torch.int32, device=device)
         write_v4_paged_decode_indices(
             state_slot_per_seq=state_slot,
@@ -286,7 +310,6 @@ def build_decode_streams(
             win=win,
             cs=cs,
         )
-        # HCA tail is layer-invariant — fill now.
         fill_compress_tail(
             indices=hca_i,
             indptr=hca_p,
