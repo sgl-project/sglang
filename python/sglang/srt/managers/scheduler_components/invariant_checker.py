@@ -35,9 +35,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# When busy mem check is verbose (level > 1), keep the most recent messages in a
-# ring buffer and only flush them on a detected leak, instead of logging every
-# iteration.
+# At busy mem check level 1, keep the most recent messages in a ring buffer and
+# only flush them on a detected leak, instead of logging every iteration (which
+# is what level > 1 does).
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
@@ -214,16 +214,24 @@ class SchedulerInvariantChecker:
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
 
-        # At verbose level (> 1), buffer per-iteration messages in a ring buffer
-        # and stay silent; only flush them when a leak is detected below.
-        if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            self.recent_busy_msgs.append(f"[Mem Check (BUSY)] {full_msg}")
-            if swa_msg:
-                self.recent_busy_msgs.append(f"[Mem Check (BUSY)] {swa_msg}")
+        level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+        full_line = f"[Mem Check (BUSY)] {full_msg}"
+        swa_line = f"[Mem Check (BUSY)] {swa_msg}" if swa_msg else None
 
-        if full_leak or swa_leak:
-            for msg in self.recent_busy_msgs:
-                logger.info(msg)
+        if level > 1:
+            # Verbose: log every iteration.
+            logger.info(full_line)
+            if swa_line:
+                logger.info(swa_line)
+        elif level == 1:
+            # Quiet: buffer messages in a ring buffer and stay silent; only flush
+            # the most recent ones when a leak is actually detected.
+            self.recent_busy_msgs.append(full_line)
+            if swa_line:
+                self.recent_busy_msgs.append(swa_line)
+            if full_leak or swa_leak:
+                for msg in self.recent_busy_msgs:
+                    logger.info(msg)
 
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
