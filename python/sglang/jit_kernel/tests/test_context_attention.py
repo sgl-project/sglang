@@ -9,6 +9,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+    context_attention_fwd,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
@@ -79,10 +82,6 @@ DTYPE_LIST = [torch.float16]
 @pytest.mark.parametrize("is_causal", [True, False])
 @pytest.mark.parametrize("dtype", DTYPE_LIST)
 def test_context_attention_fwd(seq_config, head_dim, num_heads, is_causal, dtype):
-    from sglang.srt.layers.attention.triton_ops.prefill_attention import (
-        context_attention_fwd,
-    )
-
     b_seq_len_list, max_input_len = seq_config
     num_q_heads, num_kv_heads = num_heads
 
