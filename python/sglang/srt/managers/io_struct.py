@@ -1136,22 +1136,22 @@ class BatchTokenIDOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: Optional[List[float]]
-    input_token_logprobs_idx: Optional[List[int]]
-    output_token_logprobs_val: Optional[List[float]]
-    output_token_logprobs_idx: Optional[List[int]]
-    input_top_logprobs_val: Optional[List[List]]
-    input_top_logprobs_idx: Optional[List[List]]
-    output_top_logprobs_val: Optional[List[List]]
-    output_top_logprobs_idx: Optional[List[List]]
-    input_token_ids_logprobs_val: Optional[List[List]]
-    input_token_ids_logprobs_idx: Optional[List[List]]
-    output_token_ids_logprobs_val: Optional[List[List]]
-    output_token_ids_logprobs_idx: Optional[List[List]]
-    output_token_entropy_val: Optional[List[float]]
+    input_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    input_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    output_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    input_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    input_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    output_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    input_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    input_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    output_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: Optional[List[List[float]]]
+    output_hidden_states: Optional[List[Optional[List[Optional[float]]]]]
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
@@ -1201,22 +1201,22 @@ class BatchStrOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: Optional[List[float]]
-    input_token_logprobs_idx: Optional[List[int]]
-    output_token_logprobs_val: Optional[List[float]]
-    output_token_logprobs_idx: Optional[List[int]]
-    input_top_logprobs_val: Optional[List[List]]
-    input_top_logprobs_idx: Optional[List[List]]
-    output_top_logprobs_val: Optional[List[List]]
-    output_top_logprobs_idx: Optional[List[List]]
-    input_token_ids_logprobs_val: Optional[List[List]]
-    input_token_ids_logprobs_idx: Optional[List[List]]
-    output_token_ids_logprobs_val: Optional[List[List]]
-    output_token_ids_logprobs_idx: Optional[List[List]]
-    output_token_entropy_val: Optional[List[float]]
+    input_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    input_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    output_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    input_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    input_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    output_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    input_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    input_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
+    output_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: Optional[List[List[float]]]
+    output_hidden_states: Optional[List[Optional[List[Optional[float]]]]]
 
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
