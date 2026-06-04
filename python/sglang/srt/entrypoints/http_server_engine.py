@@ -1,6 +1,6 @@
 import multiprocessing
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 import torch
@@ -86,11 +86,15 @@ class HttpServerEngineAdapter(EngineBase):
         response.raise_for_status()
         return response.json()
 
-    def begin_weight_update(self, selector: str = "all"):
-        return self._make_request("begin_weight_update", {"selector": selector})
+    def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
+        return self._make_request(
+            "begin_weight_update", {"selector": selector, "sync_base": sync_base}
+        )
 
-    def end_weight_update(self):
-        return self._make_request("end_weight_update")
+    def end_weight_update(self, expected_lora_checksums: Optional[Dict] = None):
+        return self._make_request(
+            "end_weight_update", {"expected_lora_checksums": expected_lora_checksums}
+        )
 
     def update_weights_from_tensor(
         self,
