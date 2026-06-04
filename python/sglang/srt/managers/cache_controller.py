@@ -1436,14 +1436,18 @@ class HiCacheController:
                 xfer_us=xfer_us,
             )
 
-        if should_log:
-            totals = self.hicache_l1_l2_transfer_totals[direction]
-            totals["events"] += 1
-            totals["blocks"] += ack.block_count
-            totals["bytes"] += ack.byte_count
-            if xfer_us is not None:
-                totals["xfer_us"] += xfer_us
+        # Accumulate totals whenever transfer observation is active. This keeps
+        # cumulative debug logs consistent if DEBUG logging is enabled after metrics
+        # collection has already been running, while preserving the fully-disabled
+        # early-exit path above.
+        totals = self.hicache_l1_l2_transfer_totals[direction]
+        totals["events"] += 1
+        totals["blocks"] += ack.block_count
+        totals["bytes"] += ack.byte_count
+        if xfer_us is not None:
+            totals["xfer_us"] += xfer_us
 
+        if should_log:
             logger.debug(
                 '%s transfer cumulative direction="%s" total_events=%d '
                 "total_blocks=%d total_bytes=%d total_xfer_us=%d "
