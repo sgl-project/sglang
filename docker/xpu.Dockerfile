@@ -50,6 +50,6 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip install --no-cache-dir --no-deps xgrammar==0.1.33 && \
+    pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
 CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]
