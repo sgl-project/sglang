@@ -35,8 +35,11 @@ __all__ = ["QuarkW4A8MXFp4MoE"]
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
-    from aiter.utility.fp4_utils import e8m0_shuffle
+    # Mirror the native MXFP4 path's gate-up-aware shuffle imports
+    # (added on the native path by PR #27201). Both w13 and w2 use the
+    # `_a16w4` family so the AITER `gate_mode=INTERLEAVE` kernel reads
+    # the bytes in the expected layout.
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 OCP_MX_BLOCK_SIZE = 32
 
@@ -237,29 +240,45 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Pre-shuffle weight scales
-        s0, s1, _ = layer.w13_weight_scale.shape
-        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        # layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
-        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        # Gate-up-aware preshuffle for weights and scales, mirroring the
+        # native MXFP4 path post-PR #27201 (`Mxfp4MoEMethod` in
+        # `python/sglang/srt/layers/quantization/mxfp4.py:792-832`) and the
+        # vLLM reference (`vllm/model_executor/layers/fused_moe/oracle/mxfp4.py`).
+        # The Quark loader (`_load_quark_experts_weights` in
+        # `python/sglang/srt/models/gpt_oss.py`) already writes the
+        # SEPARATED-layout `[g0..g_{N-1}, u0..u_{N-1}]` buffer per expert,
+        # which is exactly the starting state the native path is in after
+        # its post-load `.view(e, n//2, 2, k).permute(0, 2, 1, 3)` step.
+        # The `_a16w4` shuffles then reorganize this into the gate/up
+        # tile-interleaved layout the AITER `gate_mode=INTERLEAVE` kernel
+        # reads (`flydsl_moe1_*` + CK `preshuffle_on` families).
+        shuffled_w13_scale = shuffle_scale_a16w4(
+            layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+            self.num_experts,
+            True,  # gate_up
+        )
+        shuffled_w2_scale = shuffle_scale_a16w4(
+            layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+            self.num_experts,
+            False,
+        )
 
-        s0, s1, _ = layer.w2_weight_scale.shape
-        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        # layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
-        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
-
-        # Pre-shuffle weight
         if _is_shuffle_moe_mxfp4:
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
+            layer.w13_weight.data = shuffle_weight_a16w4(
+                layer.w13_weight.contiguous(), 16, True
             )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
+            layer.w2_weight.data = shuffle_weight_a16w4(
+                layer.w2_weight.contiguous(), 16, False
             )
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+
+        layer.w13_weight_scale = torch.nn.Parameter(
+            shuffled_w13_scale, requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            shuffled_w2_scale, requires_grad=False
+        )
 
         # Static FP8 MoE kernels consume a single activation scale. Use the
         # maximum if expert-local checkpoint scales differ.

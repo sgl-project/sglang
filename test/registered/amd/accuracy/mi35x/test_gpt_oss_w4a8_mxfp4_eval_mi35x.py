@@ -82,13 +82,16 @@ MI35X_GPT_OSS_W4A8_MXFP4_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        # AITER MXFP4 fused-MoE for gpt-oss uses the SEPARATED gate/up tile
-        # layout (matches `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
-        # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4 callers default
-        # to INTERLEAVE, so opt out explicitly here.
+        # AITER MXFP4 fused-MoE for gpt-oss uses the gate/up-INTERLEAVE
+        # tile layout (matches `Mxfp4MoEMethod` post-PR #27201 and the
+        # `QuarkW4A8MXFp4MoE.process_weights_after_loading` shuffle, both of
+        # which use `shuffle_weight_a16w4` + `shuffle_scale_a16w4`). The
+        # `flydsl_moe1_*_fp4` / CK `preshuffle_on` kernels dispatched in
+        # this mode are the well-tested family; the legacy SEPARATED
+        # FlyDSL fp4x2 path is numerically broken (see PR #27201).
         env_vars={
             "SGLANG_USE_AITER": "1",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
         },
     ),
 ]
