@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
-from tvm_ffi.module import Module
 
 from sglang.jit_kernel.utils import (
     cache_once,
@@ -14,6 +13,9 @@ from sglang.jit_kernel.utils import (
 
 from .utils import make_name
 
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
 
 @cache_once
 def _jit_compress_norm_rope_module(
@@ -23,11 +25,16 @@ def _jit_compress_norm_rope_module(
     page_size: int,
 ) -> Module:
     args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
+    if head_dim == 128:
+        cuda_wrappers.append(
+            ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
+        )
     return load_jit(
         make_name(f"fused_norm_rope_v2"),
         *args,
         cuda_files=[f"deepseek_v4/fused_norm_rope_v2.cuh"],
-        cuda_wrappers=[("forward", f"FusedNormRopeKernel<{args}>::forward")],
+        cuda_wrappers=cuda_wrappers,
     )
 
 
@@ -331,12 +338,16 @@ def compress_norm_rope_store(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    use_fp4: bool = False,
 ) -> None:
+    if use_fp4:
+        assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
         kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
     )
-    module.forward(
+    fn = module.forward_fp4 if use_fp4 else module.forward
+    fn(
         kv,
         plan[1],
         norm_weight,

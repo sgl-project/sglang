@@ -19,7 +19,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="stage-b-kernel-benchmark-1-gpu-large",
+    suite="base-b-kernel-benchmark-1-gpu-large",
     disabled="requires multi-GPU, self-skips in CI",
 )
 

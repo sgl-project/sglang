@@ -88,8 +88,6 @@ class WanT2V480PConfig(PipelineConfig):
     vae_precision: str = "fp32"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
 
-    # WanConfig-specific added parameters
-
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
@@ -97,7 +95,6 @@ class WanT2V480PConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
-            auto_dit_layerwise_offload_high_memory_disable_gb=130,
         )
 
 
@@ -148,7 +145,6 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
-            auto_dit_layerwise_offload_high_memory_disable_gb=130,
         )
 
 

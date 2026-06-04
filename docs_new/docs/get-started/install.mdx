@@ -9,7 +9,7 @@ keywords:
 ---
 You can install SGLang using one of the methods below.
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../hardware-platforms/amd_gpu), [Intel Xeon CPUs](../hardware-platforms/cpu_server), [Google TPU](../hardware-platforms/tpu), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../hardware-platforms/nvidia_jetson), [Ascend NPUs](../hardware-platforms/ascend-npus/ascend_npu), and [Intel XPU](../hardware-platforms/xpu).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../hardware-platforms/amd_gpu), [Apple Metal](../hardware-platforms/apple_metal), [Intel Xeon CPUs](../hardware-platforms/cpu_server), [Google TPU](../hardware-platforms/tpu), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../hardware-platforms/nvidia_jetson), [Ascend NPUs](../hardware-platforms/ascend-npus/ascend_npu), and [Intel XPU](../hardware-platforms/xpu).
 
 <Note>
 Prerequisites: Python 3.10 or higher.
@@ -25,6 +25,16 @@ pip install uv
 uv pip install sglang
 ```
 
+The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+```
+
 ### Quick fixes to common problems
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
@@ -34,7 +44,7 @@ uv pip install sglang
 
 ```bash Command
 # Use the last release branch
-git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.12 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
