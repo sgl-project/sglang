@@ -539,6 +539,19 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
 
+    def test_getitem_preserves_return_prompt_token_ids(self):
+        """Batch subrequests must keep the prompt-token-id return flag."""
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            return_prompt_token_ids=True,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertTrue(req[0].return_prompt_token_ids)
+        self.assertTrue(req[1].return_prompt_token_ids)
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")
