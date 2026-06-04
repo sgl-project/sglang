@@ -956,9 +956,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_decode_metadata
         )
 
-        # Backstop: re-plan if the batch was padded after planning. Only
-        # fires for regimes that cannot opt into replan_equivalent (wrapper
-        # plans, mlv2's skip-without-pre-plan paths); remove once fixed.
+        # Backstop: metadata was built pre-pad (marked) and DP padding then
+        # grew the batch. The marker path deliberately does not re-plan
+        # post-pad (DSA can't rebuild on a padded batch, see #27091), so this
+        # local re-plan catches the size mismatch.
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
@@ -1058,10 +1059,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or self.forward_decode_metadata
             )
 
-            # Backstop: re-plan if the batch was padded after planning.
-            # Only fires for regimes that cannot opt into replan_equivalent
-            # (wrapper plans, mlv2's skip-without-pre-plan paths); remove
-            # once fixed.
+            # Backstop: metadata was built pre-pad (marked) and DP padding
+            # then grew the batch. The marker path deliberately does not
+            # re-plan post-pad (DSA can't rebuild on a padded batch, see
+            # #27091), so this local re-plan catches the size mismatch.
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
                 self.init_forward_metadata(forward_batch)

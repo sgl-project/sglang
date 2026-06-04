@@ -259,9 +259,12 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
-            # Own-backend plan, no special context -> a forward-path re-plan
-            # is equivalent, so allow post-pad re-plan on DP-padding reshape.
-            forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
+            # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
+            # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
+            # (the `_batch_size == batch_size` assertion, see #27091); the
+            # marked pre-pad metadata is used as-is, matching the proven
+            # skip_attn_backend_init=True behavior.
+            forward_batch.mark_forward_metadata_ready()
         return forward_batch
 
 
