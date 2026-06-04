@@ -513,15 +513,6 @@ class Envs:
     # dispatch, which otherwise falls back to the separate pack. Intended for Qwen3.5 FP8 LoRA
     # serving; default off keeps the separate pack.
     SGLANG_OPT_LORA_FUSED_TOPK_PACK = EnvBool(False)
-    # Gate_up MoE-LoRA shrink dead-half elimination (1-adapter virtual-experts decode). The merged
-    # gate_up LoRA-A is [E, 2*rank, K] but the rank-specialized expand (GATED_A_HALF=0) reads ONLY
-    # the first `rank` shrink columns [0:rank] for BOTH the gate and up output halves (the gated
-    # split that read [rank:2*rank] was removed as wrong vs cutlass). So the shrink's [rank:2*rank]
-    # output is never consumed: computing only the first `rank` columns (slice lora_a_virtual to
-    # [.., :rank, :]) yields a numerically identical [0:rank] while halving the dominant LoRA-A
-    # weight read. Engages only when lora_a rank-dim == 2 * lora_b rank-dim (the gated gate_up case).
-    # Default OFF for A/B bisection; set =1 to enable. Down-proj (rank-dim == lora_b rank) is a no-op.
-    SGLANG_OPT_LORA_MOE_SHRINK_DEAD_HALF = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

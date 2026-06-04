@@ -862,29 +862,6 @@ def _merged_experts_fused_moe_lora_add_impl(
     num_experts_b = lora_b.shape[1]
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
 
-    # Dead-half: the gated gate_up shrink weight has 2*rank rows ([gate_A; up_A] merged) but the
-    # rank-specialized expand consumes only the first `rank` shrink columns for both output halves.
-    # Producing only those `rank` columns (slice the shrink weight + narrow the intermediate) is
-    # numerically identical and halves the dominant LoRA-A read. Engages only for the gated case
-    # (lora_a rank-dim == 2 * lora_b rank-dim) under the single-adapter env opt-in.
-    expand_rank = lora_b.shape[2]
-    shrink_dead_half = (
-        envs.SGLANG_OPT_LORA_MOE_SHRINK_DEAD_HALF.get()
-        and max_lora_rank == 2 * expand_rank
-    )
-    if shrink_dead_half:
-        lora_a_virtual = lora_a_virtual[:, :expand_rank, :]
-        shrink_out_rank = expand_rank
-        # A caller-provided overlap buffer must already be narrowed to the consumed width,
-        # else the `view(-1, shrink_out_rank)` below would reinterpret its rows. Overlap
-        # allocation paths are off in the single-adapter decode this opt targets.
-        assert (
-            intermediate_buffer is None
-            or intermediate_buffer.shape[-1] == expand_rank
-        ), "dead-half requires a None or expand_rank-wide intermediate_buffer"
-    else:
-        shrink_out_rank = max_lora_rank
-
     intermediate = intermediate_buffer
     if stage != "expand":
         a_stage_config = _get_shrink_stage_config(
@@ -914,7 +891,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         intermediate_shape = [
             token_lora_mapping.shape[0],
             topk_ids.shape[1],
-            shrink_out_rank,
+            max_lora_rank,
         ]
         intermediate_split_k = _get_moe_lora_shrink_split_k(
             lora_a_virtual, sorted_token_ids, a_stage_config
@@ -947,7 +924,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         _invoke_moe_lora_shrink_splitk(
             hidden_states,
             lora_a_virtual,
-            intermediate.view(-1, shrink_out_rank),
+            intermediate.view(-1, max_lora_rank),
             topk_ids,
             sorted_token_ids,
             expert_ids,
@@ -983,9 +960,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
-    # Dead-half narrows the shrink output to `expand_rank` columns; the intermediate the expand
-    # reads is exactly that width (expand consumes [0:expand_rank], so this is the full tensor).
-    intermediate_flat = intermediate.view(-1, shrink_out_rank)
+    intermediate_flat = intermediate.view(-1, max_lora_rank)
     # Shared-add overlap: the expand below adds into the SAME output buffer the
     # overlapped shared-expert add (enqueued on the main stream by the LoRA
     # dispatch) is writing — wait for it here, right before the expand launch,
