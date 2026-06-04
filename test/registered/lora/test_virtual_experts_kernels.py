@@ -37,6 +37,7 @@ from sglang.srt.lora.triton_ops.virtual_experts import (
     _align_block_size_torch,
     _fused_virtual_topk_ids,
     fused_sanitize_expert_ids,
+    merged_experts_fused_moe_lora_add,
 )
 
 
@@ -274,6 +275,67 @@ class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
         )
         expert_ids = fused_sanitize_expert_ids(expert_ids, num_experts)
         return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+
+class TestMergedExpertsGatedGateUpLoRA(CustomTestCase):
+    """Gated gate_up MoE-LoRA expand must use up_A for the up half, gate_A for gate.
+
+    Regression for the bug where the virtual-experts expand contracted only the
+    first `rank` shrink columns (gate_A) and fed them to BOTH output halves, so
+    the up-projection LoRA delta was computed from gate_A and up_A was dropped.
+    Builds independently-initialized gate_A != up_A and checks both output halves
+    against a plain-PyTorch PEFT reference (gate = x@gate_A^T@gate_B^T,
+    up = x@up_A^T@up_B^T).
+    """
+
+    def test_up_half_uses_up_a(self):
+        """Gated gate_up LoRA: gate and up halves each match their own A/B vs PEFT."""
+        torch.manual_seed(0)
+        device, dtype = "cuda", torch.bfloat16
+        E, top_k, K, inter, r, bs = 8, 4, 256, 128, 16, 16
+        gen = torch.Generator(device=device).manual_seed(0)
+
+        def rnd(*shape):
+            return torch.randn(*shape, generator=gen, device=device, dtype=dtype) * 0.1
+
+        gate_a, up_a = rnd(E, r, K), rnd(E, r, K)  # independent: gate_A != up_A
+        gate_b, up_b = rnd(E, inter, r), rnd(E, inter, r)
+        # Stacked buffers as the loader builds them: lora_a rank-dim = 2r, lora_b N = 2*inter.
+        lora_a = torch.empty(1, E, 2 * r, K, device=device, dtype=dtype)
+        lora_a[0, :, 0:r, :], lora_a[0, :, r : 2 * r, :] = gate_a, up_a
+        lora_b = torch.empty(1, E, 2 * inter, r, device=device, dtype=dtype)
+        lora_b[0, :, 0:inter, :], lora_b[0, :, inter : 2 * inter, :] = gate_b, up_b
+
+        hidden = rnd(bs, K)
+        topk_ids = torch.topk(
+            torch.rand(bs, E, generator=gen, device=device), k=top_k, dim=1
+        ).indices.to(torch.int32)
+        topk_weights = torch.ones(bs, top_k, device=device, dtype=torch.float32)
+        tlm = torch.zeros(bs, device=device, dtype=torch.int32)
+
+        output = torch.zeros(bs, top_k, 2 * inter, device=device, dtype=dtype)
+        merged_experts_fused_moe_lora_add(
+            output, hidden, lora_a, lora_b, topk_ids, topk_weights, tlm,
+            False, False, False,
+        )
+
+        xf = hidden.float()
+        gate_a_f, up_a_f = gate_a.float(), up_a.float()
+        gate_b_f, up_b_f = gate_b.float(), up_b.float()
+        for m in range(bs):
+            for k in range(top_k):
+                e = int(topk_ids[m, k].item())
+                gate_ref = (xf[m] @ gate_a_f[e].t()) @ gate_b_f[e].t()
+                up_ref = (xf[m] @ up_a_f[e].t()) @ up_b_f[e].t()
+                got = output[m, k].float()
+                torch.testing.assert_close(
+                    got[:inter], gate_ref, rtol=2e-2, atol=2e-3,
+                    msg=f"gate half mismatch (m={m}, k={k}, e={e})",
+                )
+                torch.testing.assert_close(
+                    got[inter:], up_ref, rtol=2e-2, atol=2e-3,
+                    msg=f"up half mismatch (m={m}, k={k}, e={e}) -- up must use up_A",
+                )
 
 
 if __name__ == "__main__":
