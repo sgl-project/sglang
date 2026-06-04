@@ -1321,6 +1321,33 @@ class ServerArgs:
     ] = False
     forward_pass_metrics_worker_id: A[str, Arg(help=argparse.SUPPRESS)] = ""
     forward_pass_metrics_ipc_name: A[Optional[str], Arg(help=argparse.SUPPRESS)] = None
+    benchmark_mode: A[
+        Optional[Literal["prefill", "decode", "agg"]],
+        Arg(
+            help="Run a scheduler-local self-benchmark on startup and write ForwardPassMetrics results to --benchmark-output-path.",
+            choices=["prefill", "decode", "agg"],
+        ),
+    ] = None
+    benchmark_prefill_granularity: A[
+        int, "Number of ISL sample points for self-benchmark prefill sweep."
+    ] = 16
+    benchmark_decode_length_granularity: A[
+        int, "Number of context length sample points for self-benchmark decode sweep."
+    ] = 6
+    benchmark_decode_batch_granularity: A[
+        int, "Number of batch size sample points per decode context length."
+    ] = 6
+    benchmark_warmup_iterations: A[
+        int,
+        "Number of warmup forward passes before collecting benchmark data.",
+    ] = 5
+    benchmark_output_path: A[str, "Path to write self-benchmark results JSON."] = (
+        "/tmp/benchmark_results.json"
+    )
+    benchmark_timeout: A[
+        int,
+        "Timeout in seconds for external callers waiting on benchmark output.",
+    ] = 300
     enable_trace: A[bool, "Enable opentelemetry trace"] = False
     trace_modules: A[
         str,
@@ -3277,6 +3304,11 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+
+        # Self-benchmark publishes its results through the forward-pass-metrics
+        # pipeline, so benchmark mode implies the metrics are enabled.
+        if self.benchmark_mode is not None:
+            self.enable_forward_pass_metrics = True
 
         # Handle ModelScope model downloads
         if envs.SGLANG_USE_MODELSCOPE.get():

@@ -956,7 +956,7 @@ class SchedulerMetricsReporter:
         Falls back to monotonic clock when DeviceTimer is not enabled.
         """
         if not self.scheduler.enable_fpm:
-            return
+            return None
 
         from sglang.srt.observability.forward_pass_metrics import (
             ForwardPassMetrics,
@@ -967,7 +967,7 @@ class SchedulerMetricsReporter:
             wall_time = self.scheduler._fpm_gpu_time_acc
             self.scheduler._fpm_gpu_time_acc = 0.0
             if wall_time == 0.0:
-                return
+                return None
         else:
             wall_time = max(0.0, time.monotonic() - batch.fpm_start_time)
 
@@ -979,6 +979,7 @@ class SchedulerMetricsReporter:
             queued_requests=self._build_queued_request_metrics(),
         )
         self.scheduler._fpm_publisher.publish(fpm)
+        return fpm
 
     def _shutdown_fpm(self):
         """Shut down the FPM publisher thread."""
