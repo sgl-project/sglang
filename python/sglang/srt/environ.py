@@ -492,6 +492,18 @@ class Envs:
     # buffer) waits on the add via an event, so the two writers never run concurrently. See
     # lora/trtllm_moe/shared_add_overlap.py. Default off.
     SGLANG_OPT_LORA_SHARED_ADD_OVERLAP = EnvBool(False)
+    # Opt in to the single-adapter cuBLAS (F.linear) LoRA-A shrink fast path in sgemm_lora_a_fwd.
+    # Only takes effect when batch_info.single_adapter is set (eager, uniform 1-adapter batch); under
+    # CUDA graph single_adapter is None so this is a no-op. Default OFF (A/B bisect).
+    SGLANG_OPT_LORA_CUBLAS = EnvBool(False)
+    # Per-path opt-in for the cuBLAS LoRA fast paths. Each ORs with the master SGLANG_OPT_LORA_CUBLAS
+    # above, so the master still enables all paths; these allow isolating one path at a time (A/B
+    # bisect of the CUDA-graph decode correctness issue). Default OFF.
+    SGLANG_OPT_LORA_CUBLAS_A = EnvBool(False)  # sgemm_lora_a (LoRA-A shrink)
+    SGLANG_OPT_LORA_CUBLAS_B = EnvBool(False)  # sgemm_lora_b (generic LoRA-B: o_proj, down_proj)
+    SGLANG_OPT_LORA_CUBLAS_GATE_UP = EnvBool(False)  # gate_up_lora_b
+    SGLANG_OPT_LORA_CUBLAS_QKV = EnvBool(False)  # qkv_lora_b
+    SGLANG_OPT_LORA_CUBLAS_KV_B = EnvBool(False)  # kv_b_lora_absorbed (MLA absorbed)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

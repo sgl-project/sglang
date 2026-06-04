@@ -1,7 +1,6 @@
 import functools
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -178,11 +177,17 @@ def sgemm_lora_a_fwd(
     K = weights.shape[-1]
     assert x.shape[-1] == K
 
-    single_adapter = batch_info.single_adapter
-    if single_adapter is not None:
-        idx, rank = single_adapter
-        if rank == R // stack_num:
-            return F.linear(x, weights[idx])
+    if envs.SGLANG_OPT_LORA_CUBLAS.get() or envs.SGLANG_OPT_LORA_CUBLAS_A.get():
+        # Honor out_alloc_stream like the Triton path below: under SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC
+        # the shrink output must be allocated on the MAIN (consumer) stream so the caching allocator
+        # frees/reuses it on the consumer's schedule (cuda-graph WAR). F.linear has no out=, so
+        # allocate explicitly and matmul into it.
+        if out_alloc_stream is not None:
+            with torch.cuda.stream(out_alloc_stream):
+                output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+        else:
+            output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+        return torch.matmul(x, weights[0].transpose(-2, -1), out=output)
 
     # Block shapes
     BLOCK_S = 16

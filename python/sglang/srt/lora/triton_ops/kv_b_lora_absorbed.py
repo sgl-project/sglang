@@ -48,6 +48,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.lora.triton_ops.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
@@ -74,23 +75,6 @@ from sglang.srt.lora.utils import LoRABatchInfo
 # ---------------------------------------------------------------------------
 
 _BLOCK_S = 16
-
-
-def _dense_1adapter(batch_info: LoRABatchInfo):
-    """(slot, rank, scaling) for the single-adapter cuBLAS path, else None.
-
-    cuBLAS beats the SGMM kernels in every measured regime for step_a_q
-    (per-head bmm), step_b_q, and step_a_v (one flattened (S*H, .) GEMM each)
-    -- with one adapter the head axis multiplies GEMM M by H, so there is no
-    small-M regime. step_b_v stays Triton (bmm + add_ loses there).
-    """
-    if batch_info.use_cuda_graph or batch_info.uniform_weight_index is None:
-        return None
-    return (
-        batch_info.uniform_weight_index,
-        batch_info.uniform_rank,
-        batch_info.uniform_scaling,
-    )
 
 
 def _num_segments(batch_info: LoRABatchInfo) -> int:
@@ -268,12 +252,10 @@ def step_a_q_fwd(
     S, H, qk_nope_dim = q_nope.shape
     rank = B_buf.shape[-1]
 
-    dense = _dense_1adapter(batch_info)
-    if dense is not None:
-        wi, r, _ = dense
+    if envs.SGLANG_OPT_LORA_CUBLAS.get() or envs.SGLANG_OPT_LORA_CUBLAS_KV_B.get():
         # (S,H,r) view of a (H,S,r)-contiguous bmm result; step_b_q's dense
         # path flattens in (h,s) order, so the chain needs no copies.
-        w_kc = B_buf[wi].view(H, full_K_per_head, -1)[:, :qk_nope_dim, :r]
+        w_kc = B_buf[0].view(H, full_K_per_head, -1)[:, :qk_nope_dim, :]
         return torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
 
     block_n = triton.next_power_of_2(rank)  # output N == rank -> one tile
@@ -482,21 +464,19 @@ def step_b_q_fwd(
     S, H, rank = q_lora_a.shape
     kv_lora_rank = A_buf.shape[-1]
 
-    dense = _dense_1adapter(batch_info)
-    if dense is not None:
-        wi, r, scaling = dense
+    if envs.SGLANG_OPT_LORA_CUBLAS.get() or envs.SGLANG_OPT_LORA_CUBLAS_KV_B.get():
         # Flatten (S,H) in whichever order base_output's storage allows
         # without a copy (the absorbed q path passes a transpose view of a
         # (H,S,kv)-contiguous bmm result). x is small; reshape may copy it.
         base2d = x2d = None
         if base_output.is_contiguous():
             base2d = base_output.view(-1, kv_lora_rank)
-            x2d = q_lora_a[..., :r].reshape(-1, r)
+            x2d = q_lora_a[..., :rank].reshape(-1, rank)
         elif base_output.transpose(0, 1).is_contiguous():
             base2d = base_output.transpose(0, 1).view(-1, kv_lora_rank)
-            x2d = q_lora_a[..., :r].transpose(0, 1).reshape(-1, r)
+            x2d = q_lora_a[..., :rank].transpose(0, 1).reshape(-1, rank)
         if base2d is not None:
-            base2d.addmm_(x2d, A_buf[wi, :r, :], alpha=scaling)
+            base2d.addmm_(x2d, A_buf[0, :, :], alpha=batch_info.scalings[0])
             return base_output
 
     num_segments = _num_segments(batch_info)
@@ -697,12 +677,12 @@ def step_a_v_fwd(
     S, H, kv_lora_rank = attn_output.shape
     rank = A_buf.shape[1]
 
-    dense = _dense_1adapter(batch_info)
-    if dense is not None and attn_output.is_contiguous():
-        wi, r, _ = dense
-        return torch.mm(attn_output.view(-1, kv_lora_rank), A_buf[wi, :r, :].t()).view(
-            S, H, r
-        )
+    if (
+        envs.SGLANG_OPT_LORA_CUBLAS.get() or envs.SGLANG_OPT_LORA_CUBLAS_KV_B.get()
+    ) and attn_output.is_contiguous():
+        return torch.mm(
+            attn_output.view(-1, kv_lora_rank), A_buf[0, :rank, :].t()
+        ).view(S, H, rank)
 
     block_n = triton.next_power_of_2(rank)
     out = torch.empty((S, H, rank), device=attn_output.device, dtype=attn_output.dtype)

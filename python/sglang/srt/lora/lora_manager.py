@@ -343,24 +343,6 @@ class LoRAManager:
             lora_ranks[wi] > 0 for wi in weight_indices
         )
 
-        active_indices = set(weight_indices)
-        uniform_weight_index = (
-            active_indices.pop() if len(active_indices) == 1 else None
-        )
-        if uniform_weight_index is not None and lora_ranks[uniform_weight_index] > 0:
-            uniform_rank = lora_ranks[uniform_weight_index]
-            uniform_scaling = scalings[uniform_weight_index]
-        else:
-            uniform_weight_index = uniform_rank = uniform_scaling = None
-        for info in (
-            self.lora_backend.batch_info,
-            getattr(self.lora_backend, "sgemm_batch_info", None),
-        ):
-            if info is not None:
-                info.uniform_weight_index = uniform_weight_index
-                info.uniform_rank = uniform_rank
-                info.uniform_scaling = uniform_scaling
-
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.
