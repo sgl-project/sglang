@@ -81,14 +81,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
-        # extend_seq_lens_cpu is None for decode and TARGET_VERIFY cuda-graph
-        # views (even though is_extend() is True there), so branch on its presence.
-        if forward_batch.extend_seq_lens_cpu is not None:
-            self._max_seqlen_q = int(max(forward_batch.extend_seq_lens_cpu))
-            self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
+        # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_lens is not None:
+            self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
-            self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         pass
