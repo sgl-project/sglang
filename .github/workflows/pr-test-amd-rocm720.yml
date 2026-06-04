@@ -181,13 +181,12 @@ jobs:
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
+              - "python/sglang/srt/observability/**"
               - "python/sglang/jit_kernel/diffusion/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
-              - "python/sglang/srt/observability/**"
-              - "python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd-rocm720:
