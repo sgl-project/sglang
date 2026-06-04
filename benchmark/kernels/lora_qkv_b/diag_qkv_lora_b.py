@@ -36,21 +36,20 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.qkv_lora_b import qkv_lora_b_fwd
 from sglang.srt.lora.triton_ops.kernel_utils import (
     _resolve_token_positions,
-    get_pdl_launch_metadata,
 )
+from sglang.srt.lora.triton_ops.qkv_lora_b import qkv_lora_b_fwd
 
 # Reuse the validated testbed helpers (same shapes / batch_info / rotation).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_qkv_lora_b import (  # noqa: E402
     PRESETS,
-    make_merged_decode_batch_info,
-    make_inputs,
-    ref_qkv_b,
     auto_num_groups,
     bench_us_rotated,
+    make_inputs,
+    make_merged_decode_batch_info,
+    ref_qkv_b,
 )
 
 WB_ATOMIC = 0
@@ -163,8 +162,17 @@ def _qkv_diag_kernel(
 
 
 def run_diag(
-    x, w, batch_info, output_offset, max_out, base_output, n_slices,
-    writeback: int, block_s: int, block_out: int, num_warps: int,
+    x,
+    w,
+    batch_info,
+    output_offset,
+    max_out,
+    base_output,
+    n_slices,
+    writeback: int,
+    block_s: int,
+    block_out: int,
+    num_warps: int,
     enable_pdl: bool = False,
 ):
     s = x.shape[0]
@@ -177,15 +185,28 @@ def run_diag(
     )
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _qkv_diag_kernel[grid](
-        x, w, base_output, r, max_out,
-        x.stride(0), x.stride(1),
-        w.stride(0), w.stride(1), w.stride(2),
-        base_output.stride(0), base_output.stride(1),
-        batch_info.seg_lens, batch_info.seg_indptr,
-        batch_info.weight_indices, batch_info.lora_ranks,
-        output_offset, batch_info.permutation,
+        x,
+        w,
+        base_output,
+        r,
+        max_out,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        w.stride(2),
+        base_output.stride(0),
+        base_output.stride(1),
+        batch_info.seg_lens,
+        batch_info.seg_indptr,
+        batch_info.weight_indices,
+        batch_info.lora_ranks,
+        output_offset,
+        batch_info.permutation,
         batch_info.permutation is not None,
-        block_s, block_out, triton.next_power_of_2(r),
+        block_s,
+        block_out,
+        triton.next_power_of_2(r),
         batch_info.scalings,
         writeback,
         ENABLE_PDL=enable_pdl,
@@ -206,12 +227,27 @@ def verify(args, device) -> None:
         x, w, off, base = make_inputs(s, slice_dims, args.rank, dtype, device, seed=1)
         max_out = max(slice_dims)
         prod = qkv_lora_b_fwd(
-            x, w, bi, off, max_out, base_output=base.clone(),
-            n_slices=n_slices, output_offset_cpu=None,
+            x,
+            w,
+            bi,
+            off,
+            max_out,
+            base_output=base.clone(),
+            n_slices=n_slices,
+            output_offset_cpu=None,
         )
         diag = run_diag(
-            x, w, bi, off, max_out, base.clone(), n_slices,
-            WB_ATOMIC, 16, 64, 4,
+            x,
+            w,
+            bi,
+            off,
+            max_out,
+            base.clone(),
+            n_slices,
+            WB_ATOMIC,
+            16,
+            64,
+            4,
         )
         ref = ref_qkv_b(x, w, off, args.scaling, args.rank, base)
         bitwise = torch.equal(prod, diag)
@@ -222,8 +258,17 @@ def verify(args, device) -> None:
         )
         # load_add_store on disjoint tiles must also equal ref (probe sanity).
         las = run_diag(
-            x, w, bi, off, max_out, base.clone(), n_slices,
-            WB_LOAD_ADD_STORE, 16, 64, 4,
+            x,
+            w,
+            bi,
+            off,
+            max_out,
+            base.clone(),
+            n_slices,
+            WB_LOAD_ADD_STORE,
+            16,
+            64,
+            4,
         )
         las_err = float((las.float() - ref).abs().max())
         print(f"{preset:<12s} load_add_store_vs_ref_abs_err={las_err:.3e}")
@@ -251,12 +296,17 @@ def mode_x3(args, device) -> None:
             preset, s, args.rank, dtype, device, args.l2_mult, args.max_groups
         )
         row = {}
-        for label, wb in [("atomic", WB_ATOMIC),
-                          ("load_add_store", WB_LOAD_ADD_STORE),
-                          ("store", WB_STORE)]:
+        for label, wb in [
+            ("atomic", WB_ATOMIC),
+            ("load_add_store", WB_LOAD_ADD_STORE),
+            ("store", WB_STORE),
+        ]:
             calls = [
-                (lambda x=x, w=w, off=off, base=base: run_diag(
-                    x, w, bi, off, max_out, base, n_slices, wb, 16, 64, 4))
+                (
+                    lambda x=x, w=w, off=off, base=base: run_diag(
+                        x, w, bi, off, max_out, base, n_slices, wb, 16, 64, 4
+                    )
+                )
                 for x, w, off, base in groups
             ]
             us = bench_us_rotated(calls, args.rep_ms)
@@ -289,9 +339,22 @@ def mode_x2(args, device) -> None:
                 for nw in warps_list:
                     grid0 = triton.cdiv(s, bs_) * triton.cdiv(max_out, bo)
                     calls = [
-                        (lambda x=x, w=w, off=off, base=base, bs_=bs_, bo=bo, nw=nw:
-                         run_diag(x, w, bi, off, max_out, base, n_slices,
-                                  wb, bs_, bo, nw, args.pdl))
+                        (
+                            lambda x=x, w=w, off=off, base=base, bs_=bs_, bo=bo, nw=nw: run_diag(
+                                x,
+                                w,
+                                bi,
+                                off,
+                                max_out,
+                                base,
+                                n_slices,
+                                wb,
+                                bs_,
+                                bo,
+                                nw,
+                                args.pdl,
+                            )
+                        )
                         for x, w, off, base in groups
                     ]
                     try:
@@ -302,16 +365,24 @@ def mode_x2(args, device) -> None:
         results.sort(key=lambda t: t[0])
         for us, bs_, bo, nw, gprog in results[:8]:
             tag = " <- baseline" if (bs_, bo, nw) == (16, 64, 4) else ""
-            print(f"  {us:6.2f}us  BLOCK_S={bs_:<3d} BLOCK_OUT={bo:<4d} warps={nw} grid_prog={gprog}{tag}")
+            print(
+                f"  {us:6.2f}us  BLOCK_S={bs_:<3d} BLOCK_OUT={bo:<4d} warps={nw} grid_prog={gprog}{tag}"
+            )
         base = next(r for r in results if (r[1], r[2], r[3]) == (16, 64, 4))
-        print(f"  baseline(16,64,4)={base[0]:.2f}us  best={results[0][0]:.2f}us  speedup={base[0]/results[0][0]:.2f}x")
+        print(
+            f"  baseline(16,64,4)={base[0]:.2f}us  best={results[0][0]:.2f}us  speedup={base[0]/results[0][0]:.2f}x"
+        )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["x3", "x2", "verify"], default="x3")
-    ap.add_argument("--wb", choices=["atomic", "load_add_store", "store"],
-                    default="atomic", help="writeback mode for x2 sweep")
+    ap.add_argument(
+        "--wb",
+        choices=["atomic", "load_add_store", "store"],
+        default="atomic",
+        help="writeback mode for x2 sweep",
+    )
     ap.add_argument("--pdl", action="store_true", help="enable PDL in x2 sweep")
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--rank", type=int, default=16)
