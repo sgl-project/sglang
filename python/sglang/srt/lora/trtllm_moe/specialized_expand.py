@@ -65,12 +65,11 @@ def _moe_lora_expand_add_kernel(
     ``GATED_A_HALF == 0`` is the non-gated path (read ``[0:R]`` for all tiles).
     """
     pid = tl.program_id(0)
-    # GDC wait: the routing buffers (sorted_token_ids / expert_ids /
-    # num_tokens_post_padded) come from the preceding align kernel; wait before
-    # consuming them. The intermediate (A) is produced by an earlier shrink that
-    # is ordered before this align, so it is already visible.
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+    # PDL: the routing buffers (sorted_token_ids / expert_ids / num_tokens_post_padded)
+    # are produced before the immediately-preceding shrink and are already resident,
+    # so we load them and the LoRA-B weight WITHOUT waiting. Only the intermediate (A)
+    # is freshly produced by that shrink; the gdc_wait is deferred to just before the
+    # A load (below), so the dominant B-weight prefetch overlaps the shrink's tail.
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -107,17 +106,9 @@ def _moe_lora_expand_add_kernel(
     offs_r = tl.arange(0, BLOCK_SIZE_R).to(tl.int64)
     rank_mask = offs_r < R
 
-    # Gated gate_up split: the up-half output tiles read up-shrink (A columns [R:2R]); gate-half
-    # tiles read gate-shrink (A columns [0:R]). GATED_A_HALF == 0 -> always read [0:R] (non-gated).
-    a_col = offs_r
-    if GATED_A_HALF > 0:
-        a_col = offs_r + tl.where(pid_n * BLOCK_SIZE_N >= GATED_A_HALF, R, 0)
-
-    a = tl.load(
-        a_ptr + offs_token[:, None] * stride_am + a_col[None, :] * stride_ar,
-        mask=token_mask[:, None] & rank_mask[None, :],
-        other=0.0,
-    )
+    # Load the LoRA-B weight FIRST. It is the dominant traffic and does not depend on
+    # the shrink's output, so issuing it before the gdc_wait lets its prefetch overlap
+    # the producer (shrink) kernel's tail under PDL.
     b = tl.load(
         b_ptr
         + off_expert * stride_be
@@ -127,10 +118,21 @@ def _moe_lora_expand_add_kernel(
         other=0.0,
     )
 
-    # All input reads (routing, A intermediate, B weight) are issued; hint the
-    # runtime that the dependent (successor) kernel may begin launching.
+    # Gated gate_up split: the up-half output tiles read up-shrink (A columns [R:2R]); gate-half
+    # tiles read gate-shrink (A columns [0:R]). GATED_A_HALF == 0 -> always read [0:R] (non-gated).
+    a_col = offs_r
+    if GATED_A_HALF > 0:
+        a_col = offs_r + tl.where(pid_n * BLOCK_SIZE_N >= GATED_A_HALF, R, 0)
+
+    # Only the intermediate (A) is freshly produced by the immediately-preceding shrink:
+    # wait for it now, AFTER the independent B prefetch above has been issued.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+    a = tl.load(
+        a_ptr + offs_token[:, None] * stride_am + a_col[None, :] * stride_ar,
+        mask=token_mask[:, None] & rank_mask[None, :],
+        other=0.0,
+    )
 
     accumulator = tl.dot(a, b, out_dtype=tl.float32)
     if MUL_ROUTED_WEIGHT:
@@ -151,6 +153,11 @@ def _moe_lora_expand_add_kernel(
         tl.atomic_add(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
     else:
         tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
+
+    # Signal the dependent (successor) kernel may launch, AFTER this expand's output
+    # write is visible (its successor adds onto / reads this output).
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _invoke_moe_lora_expand_add(
