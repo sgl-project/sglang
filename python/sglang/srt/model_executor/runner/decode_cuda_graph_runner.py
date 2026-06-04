@@ -45,6 +45,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -63,6 +64,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    NgramEmbeddingInfo,
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
@@ -168,6 +170,132 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         spec_info=forward_batch.spec_info,
+    )
+
+
+def _allocate_decode_buffers(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    hidden_size: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    dp_size: int,
+    pp_size: int,
+    is_encoder_decoder: bool,
+    require_mlp_tp_gather: bool,
+    seq_len_fill_value: int,
+    encoder_len_fill_value: int,
+    num_tokens_per_bs: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool,
+    ne_token_table: Optional[torch.Tensor] = None,
+    hc_hidden_size: Optional[int] = None,
+) -> SimpleNamespace:
+    """Allocate the FB-shared decode buffers as a namespace adopted by
+    ``build_decode_registry(source=...)``."""
+    with torch.device(device):
+        input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+        input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+        req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+        seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
+        out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+        positions = torch.zeros((max_num_token,), dtype=torch.int64)
+        mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+        num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+        custom_mask = torch.ones(
+            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+            dtype=torch.bool,
+        )
+        next_token_logits_buffer = torch.zeros(
+            (max_num_token, vocab_size),
+            dtype=torch.float,
+        )
+        mamba_track_indices = (
+            torch.zeros((max_bs,), dtype=torch.int64) if enable_mamba_track else None
+        )
+        mamba_track_mask = (
+            torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
+        )
+
+        if pp_size > 1:
+            # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+            is_mhc = hc_hidden_size is not None
+            hs = hc_hidden_size if is_mhc else hidden_size
+            pp_proxy_tensors = {
+                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+            }
+            if not is_mhc:
+                pp_proxy_tensors["residual"] = torch.zeros(
+                    (max_bs, hidden_size), dtype=dtype
+                )
+        else:
+            pp_proxy_tensors = None
+
+        if is_encoder_decoder:
+            encoder_lens = torch.full(
+                (max_bs,), encoder_len_fill_value, dtype=torch.int32
+            )
+        else:
+            encoder_lens = None
+
+        if require_mlp_tp_gather:
+            global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+            global_num_tokens_for_logprob_gpu = torch.zeros(
+                (dp_size,), dtype=torch.int32
+            )
+        else:
+            global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+            global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
+
+        ngram_embedding_info = (
+            NgramEmbeddingInfo(
+                token_table=ne_token_table,
+                column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                req_lens=torch.ones([max_bs], dtype=torch.int32),
+                out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+            )
+            if ne_token_table is not None
+            else None
+        )
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            rids_int = torch.zeros((max_bs,), dtype=torch.int64)
+            bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
+        else:
+            rids_int = None
+            bootstrap_room_ids_int = None
+
+    seq_lens_cpu = torch.full(
+        (max_bs,),
+        seq_len_fill_value,
+        dtype=torch.int32,
+        device="cpu",
+    )
+
+    return SimpleNamespace(
+        input_ids=input_ids,
+        input_embeds=input_embeds,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        out_cache_loc=out_cache_loc,
+        positions=positions,
+        mrope_positions=mrope_positions,
+        num_token_non_padded=num_token_non_padded,
+        custom_mask=custom_mask,
+        next_token_logits_buffer=next_token_logits_buffer,
+        mamba_track_indices=mamba_track_indices,
+        mamba_track_mask=mamba_track_mask,
+        encoder_lens=encoder_lens,
+        global_num_tokens_gpu=global_num_tokens_gpu,
+        global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+        pp_proxy_tensors=pp_proxy_tensors,
+        ngram_embedding_info=ngram_embedding_info,
+        rids_int=rids_int,
+        bootstrap_room_ids_int=bootstrap_room_ids_int,
     )
 
 

@@ -87,6 +87,7 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
 
 if _use_aiter:
     import aiter
+    from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
     from aiter import (
         gemm_a8w8_blockscale_bpreshuffle,
         gemm_a8w8_bpreshuffle,
@@ -773,6 +774,8 @@ def aiter_w8a8_block_fp8_linear(
 
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    elif _use_aiter_gfx95:
+        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     else:
         use_triton = True
 
@@ -780,20 +783,21 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-        if not use_triton:
+        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
             x_scale = x_scale.transpose(-1, -2).contiguous().view(*x_scale.shape)
     else:
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=not use_triton,
+            transpose_scale=(_use_aiter_bpreshuffle_gfx95 and not use_triton),
         )
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
-    else:
-        # TODO(1am9trash), to deal with chance of this branch changes
+    elif _use_aiter_bpreshuffle_gfx95:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
+    else:
+        gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
 
     output = gemm_a8w8_blockscale_op(
         q_input,
