@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.common import is_sm120_supported
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,21 +47,25 @@ def _dequant_fp4_lut(nibble):
 
 # ── Per-slot GEMV kernel: processes one (token, expert) pair ──
 
-
-@triton.autotune(
-    configs=[
-        # Original configs
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-        # Deeper pipeline — SM120 has 99 KB SMEM, can afford 3 stages for small tiles
+# Autotune configs: base for all platforms, SM120-only extras.
+# SM120 has 99 KB SMEM — deeper pipeline (num_stages=3) benefits small tiles.
+_gemv_configs = [
+    triton.Config({"BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+]
+if is_sm120_supported():
+    _gemv_configs += [
         triton.Config({"BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=3),
-        # More warps for larger tiles
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=3),
-    ],
+    ]
+
+
+@triton.autotune(
+    configs=_gemv_configs,
     key=["N", "K"],
 )
 @triton.jit
