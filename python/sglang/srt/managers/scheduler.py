@@ -3180,7 +3180,12 @@ class Scheduler(
         group_size is computed adaptively by _get_pipeline_group_size().
         """
         self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
         self.profiler_manager._profile_batch_predicate(batch)
+
+        # Match run_batch(): ForwardBatch.init_new borrows batch.input_ids, so
+        # materialize deferred prefill inputs before initializing split prefill.
+        resolve_forward_inputs(batch, self.future_map)
 
         num_layers = self.model_config.num_hidden_layers
         page_size = self.token_to_kv_pool_allocator.page_size
