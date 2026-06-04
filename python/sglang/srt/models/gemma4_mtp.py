@@ -397,4 +397,8 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         )
 
 
-EntryClass = Gemma4AssistantForCausalLM
+class Gemma4UnifiedAssistantForCausalLM(Gemma4AssistantForCausalLM):
+    """Gemma 4 unified MTP assistant; text path identical to the gemma4 assistant."""
+
+
+EntryClass = [Gemma4AssistantForCausalLM, Gemma4UnifiedAssistantForCausalLM]
