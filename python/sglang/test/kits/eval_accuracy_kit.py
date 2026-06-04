@@ -8,15 +8,6 @@ from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_sum
 
 _THRESHOLD_NOT_SET = float("nan")
 
-# Pinned sgl-eval (the SGLang accuracy-eval vendor), used by the reasoning mixins
-# and the optional "sgl_eval" backend. It is git-only (not a pyproject dep -- PyPI
-# rejects direct-URL deps); install this commit for reproducible accuracy gates:
-#   pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval@<commit>"
-_SGL_EVAL_PIN = (
-    "sgl-eval @ git+https://github.com/sgl-project/sgl-eval"
-    "@67bac94cb967f4d99670bf4f56fbffa11e8b9c07"
-)
-
 
 def _check_accept_length(test_case, base_url, threshold=None):
     """Print speculative accept length; optionally assert it exceeds threshold."""
@@ -119,7 +110,7 @@ def _run_sgl_eval(
     asserts the score meets ``score_threshold``, and checks the speculative accept
     length. ``thinking=True`` sends per-request ``chat_template_kwargs={"thinking":
     True}`` so the server separates reasoning from the final answer. Skips the test
-    if sgl-eval is not installed (see ``_SGL_EVAL_PIN``). Returns the RunResult.
+    if sgl-eval (git-only) is not installed. Returns the RunResult.
     """
     assert (
         score_threshold == score_threshold
@@ -130,7 +121,10 @@ def _run_sgl_eval(
         from sgl_eval.sampler import ChatCompletionSampler
         from sgl_eval.types import GenConfig
     except ImportError:
-        test_case.skipTest(f"sgl-eval not installed; pip install '{_SGL_EVAL_PIN}'")
+        test_case.skipTest(
+            "sgl-eval not installed; pip install "
+            "'sgl-eval @ git+https://github.com/sgl-project/sgl-eval'"
+        )
 
     base_url = test_case.base_url.rstrip("/")
     if not base_url.endswith("/v1"):
@@ -282,7 +276,7 @@ class GPQAMixin:
     """Mixin for GPQA-Diamond evaluation (graduate-level multiple choice).
 
     Runs via the sgl-eval Python API (the test is skipped if sgl-eval is not
-    installed; see ``_SGL_EVAL_PIN``). ``gpqa_thinking`` defaults to True, which
+    installed). ``gpqa_thinking`` defaults to True, which
     enables per-request thinking so the server separates reasoning from the final
     answer.
 
@@ -330,7 +324,7 @@ class AIME25Mixin:
     """Mixin for AIME 2025 evaluation (competition math, integer answers).
 
     Runs via the sgl-eval Python API (the test is skipped if sgl-eval is not
-    installed; see ``_SGL_EVAL_PIN``). ``aime25_thinking`` defaults to True, which
+    installed). ``aime25_thinking`` defaults to True, which
     enables per-request thinking so the server separates reasoning from the final
     answer.
 
