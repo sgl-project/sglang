@@ -766,7 +766,10 @@ class DefaultModelLoader(BaseModelLoader):
         )
 
         if is_online_nvfp4_weight_quantization:
-            with temp_set_env(TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1"):
+            with temp_set_env(
+                TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+            ):
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
