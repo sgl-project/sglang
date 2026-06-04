@@ -30,6 +30,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # ================================================
     scale,
     T,
+    stride_a,
     stride_q,
     stride_k,
     stride_v,
@@ -81,10 +82,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Gating computation pointers
     p_A_log = A_log + i_hv
     if IS_KDA:
-        p_a = a + (bos * HV + i_hv) * K + o_k
+        p_a = a + bos * stride_a + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_a + i_hv
         p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -220,10 +221,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_v += stride_v
         p_b += stride_b
         p_o += HV * V
-        if IS_KDA:
-            p_a += HV * K
-        else:
-            p_a += HV
+        p_a += stride_a
 
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
@@ -260,7 +258,9 @@ def fused_sigmoid_gating_delta_rule_update(
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
-    cache_steps: Optional[int] = None,
+    cache_steps: Optional[
+        int
+    ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ):
     """
@@ -278,6 +278,10 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_k = k.stride()[1]
     stride_v = v.stride()[1]
     stride_b = b.stride()[-2]
+    # Both paths (KDA/GDN) advance p_a once per token, so use the token-axis stride.
+    # For 2D a ([T, ...]) this is stride(0); for 3D a ([B, T, ...]) this is stride(1).
+    # Using stride()[-2] covers GDN [T, HV] and KDA layouts ([T, HV*K] / [B, T, HV*K]).
+    stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
@@ -305,6 +309,14 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
+    # Per-req stride must match the buffer's allocated dim, not runtime steps
+    # (they can differ under --speculative-adaptive).
+    cache_stride_steps = (
+        intermediate_states_buffer.shape[1]
+        if intermediate_states_buffer is not None
+        else 0
+    )
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -321,12 +333,13 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
-        cache_steps=0 if cache_steps is None else cache_steps,
+        cache_steps=cache_stride_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         scale=scale,
         T=T,
+        stride_a=stride_a,
         stride_q=stride_q,
         stride_k=stride_k,
         stride_v=stride_v,

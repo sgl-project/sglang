@@ -9,10 +9,11 @@ from torch import Tensor
 from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
     fused_norm_scale_shift,
     fused_scale_residual_norm_scale_shift,
+    validate_scale_shift,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=28, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=28, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"
@@ -123,6 +124,16 @@ def _make_tensor(index_mode: str, shape: Tuple, dtype: torch.dtype):
     if index_mode == "NAT":
         return None
     return torch.randn(*SHAPE_MAP[index_mode](*shape), device=DEVICE, dtype=dtype)
+
+
+def test_validate_scale_shift_rejects_non_divisible_frames():
+    with pytest.raises(ValueError, match=r"S\(10\) must be divisible by F\(4\)"):
+        validate_scale_shift(
+            torch.empty((1, 4, 1, 256), device=DEVICE, dtype=torch.float16),
+            1,
+            10,
+            256,
+        )
 
 
 @torch.no_grad()

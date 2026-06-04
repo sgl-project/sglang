@@ -30,6 +30,7 @@ DEFAULT_TEXT_SEQ_LEN = 64
 DEFAULT_TOKEN_LAYOUT_SIZE = 32
 REDUCED_TOKEN_LAYOUT_SIZE = 16
 DEFAULT_VIDEO_FRAME_COUNT = 4
+DEFAULT_AUDIO_FRAME_COUNT = 16
 DEFAULT_IMAGE_TOKEN_COUNT = 257
 ALIAS_ROTARY_TEXT_PAD_MULTIPLE = 32
 DEFAULT_TRANSFORMER_IN_CHANNELS = 16
@@ -37,6 +38,7 @@ DEFAULT_TRANSFORMER_TEXT_CHANNELS = 4096
 DEFAULT_TRANSFORMER_POOLED_CHANNELS = 768
 DEFAULT_VAE_LATENT_CHANNELS = 16
 DEFAULT_VAE_LATENT_SPATIAL_SIZE = 32
+DEFAULT_VAE_VIDEO_LATENT_FRAMES = 3
 LARGE_CHANNEL_LAYOUT_THRESHOLD = 128
 
 
@@ -210,6 +212,13 @@ def _build_transformer_hook_inputs(
 
     rng = _DeterministicRNG()
     layout = _infer_transformer_layout(param_names)
+    requires_audio_stream_inputs = (
+        "audio_hidden_states" in param_names
+        and "audio_encoder_hidden_states" in param_names
+    )
+    requires_audio_video_shape_inputs = requires_audio_stream_inputs and all(
+        key in param_names for key in ("num_frames", "height", "width")
+    )
     in_channels = _read_config_value(
         model,
         [
@@ -238,6 +247,16 @@ def _build_transformer_hook_inputs(
         ],
         default=DEFAULT_TRANSFORMER_TEXT_CHANNELS,
     )
+    audio_in_channels = _read_config_value(
+        model,
+        [
+            "arch_config.audio_in_channels",
+            "audio_in_channels",
+            "arch_config.audio_out_channels",
+            "audio_out_channels",
+        ],
+        default=in_channels,
+    )
     pooled_channels = _read_config_value(
         model,
         [
@@ -256,7 +275,21 @@ def _build_transformer_hook_inputs(
         default=I2V_IMAGE_DIM,
     )
 
-    if layout == "token_shapes":
+    if requires_audio_video_shape_inputs:
+        patch_size = getattr(model, "patch_size", None)
+        if not (
+            isinstance(patch_size, tuple)
+            and len(patch_size) == 3
+            and all(isinstance(dim, int) and dim > 0 for dim in patch_size)
+        ):
+            patch_size = (1, 2, 2)
+        patch_t, patch_h, patch_w = patch_size
+        num_frames = DEFAULT_VIDEO_FRAME_COUNT * patch_t
+        height = REDUCED_TOKEN_LAYOUT_SIZE * patch_h
+        width = REDUCED_TOKEN_LAYOUT_SIZE * patch_w
+        seq_len = (num_frames // patch_t) * (height // patch_h) * (width // patch_w)
+        hidden_states = rng.randn((1, seq_len, in_channels), device, torch.bfloat16)
+    elif layout == "token_shapes":
         height, width = DEFAULT_TOKEN_LAYOUT_SIZE, DEFAULT_TOKEN_LAYOUT_SIZE
         seq_len = (height // 2) * (width // 2)
         hidden_states = rng.randn((1, seq_len, in_channels), device, torch.bfloat16)
@@ -307,6 +340,24 @@ def _build_transformer_hook_inputs(
         "guidance": torch.tensor([1.0], device=device, dtype=torch.bfloat16),
     }
 
+    if requires_audio_stream_inputs:
+        inputs["audio_hidden_states"] = rng.randn(
+            (1, DEFAULT_AUDIO_FRAME_COUNT, audio_in_channels),
+            device,
+            torch.bfloat16,
+        )
+        inputs["audio_encoder_hidden_states"] = rng.randn(
+            (1, DEFAULT_TEXT_SEQ_LEN, text_channels),
+            device,
+            torch.bfloat16,
+        )
+        inputs["audio_timestep"] = inputs["timestep"].clone()
+        inputs["audio_num_frames"] = DEFAULT_AUDIO_FRAME_COUNT
+        if requires_audio_video_shape_inputs:
+            inputs["num_frames"] = num_frames
+            inputs["height"] = height
+            inputs["width"] = width
+
     if "pooled_projections" in param_names:
         inputs["pooled_projections"] = rng.randn(
             (1, pooled_channels), device, torch.bfloat16
@@ -320,6 +371,10 @@ def _build_transformer_hook_inputs(
         )
         inputs["encoder_attention_mask"] = attention_mask
         inputs["encoder_hidden_states_mask"] = attention_mask
+    if "audio_encoder_attention_mask" in param_names:
+        inputs["audio_encoder_attention_mask"] = torch.ones(
+            1, DEFAULT_TEXT_SEQ_LEN, device=device, dtype=torch.bool
+        )
     if "encoder_hidden_states_image" in param_names and _supports_image_conditioning(
         model
     ):
@@ -471,8 +526,16 @@ def _prepare_transformer_hook_call(
         "txt_seq_lens",
         "freqs_cis",
         "additional_t_cond",
+        "audio_hidden_states",
+        "audio_encoder_hidden_states",
+        "audio_timestep",
         "encoder_attention_mask",
         "encoder_hidden_states_mask",
+        "audio_encoder_attention_mask",
+        "num_frames",
+        "height",
+        "width",
+        "audio_num_frames",
     ):
         if key in param_names and key in inputs:
             kwargs[key] = inputs[key]
@@ -489,6 +552,17 @@ def _prepare_transformer_sglang_call(module: nn.Module, inputs: Inputs) -> HookC
 
 def _prepare_transformer_reference_call(module: nn.Module, inputs: Inputs) -> HookCall:
     return _prepare_transformer_hook_call(module, inputs, side="reference")
+
+
+def _normalize_transformer_reference_output(output: Any) -> torch.Tensor:
+    sample = getattr(output, "sample", None)
+    if (
+        isinstance(sample, (list, tuple))
+        and sample
+        and all(isinstance(item, torch.Tensor) for item in sample)
+    ):
+        return torch.stack(list(sample), dim=0)
+    return extract_output_tensor(output)
 
 
 class _VAEDecodeModule(nn.Module):
@@ -537,17 +611,35 @@ def _infer_vae_latent_channels(model: nn.Module) -> int:
 def _build_vae_hook_inputs(
     case: Any, model: nn.Module, device: str, ref_model: Optional[nn.Module] = None
 ) -> Inputs:
-    del case, ref_model
+    del ref_model
     latent_channels = _infer_vae_latent_channels(model)
+    model_path = getattr(getattr(case, "server_args", None), "model_path", "").lower()
+    modality = getattr(getattr(case, "server_args", None), "modality", None)
+    use_wan_video_latent = (
+        modality == "video"
+        and "wan" in model_path
+        and any(isinstance(module, nn.Conv3d) for module in model.modules())
+    )
+    shape = (
+        (
+            1,
+            latent_channels,
+            DEFAULT_VAE_VIDEO_LATENT_FRAMES,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+        )
+        if use_wan_video_latent
+        else (
+            1,
+            latent_channels,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+        )
+    )
     rng = _DeterministicRNG()
     return {
         "z": rng.randn(
-            (
-                1,
-                latent_channels,
-                DEFAULT_VAE_LATENT_SPATIAL_SIZE,
-                DEFAULT_VAE_LATENT_SPATIAL_SIZE,
-            ),
+            shape,
             device,
             torch.bfloat16,
         )
@@ -562,6 +654,7 @@ TRANSFORMER_NATIVE_PROFILE = NativeHookProfile(
     build_inputs=_build_transformer_hook_inputs,
     prepare_sglang_call=_prepare_transformer_sglang_call,
     prepare_reference_call=_prepare_transformer_reference_call,
+    normalize_reference_output=_normalize_transformer_reference_output,
 )
 
 VAE_NATIVE_PROFILE = NativeHookProfile(

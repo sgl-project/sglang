@@ -79,7 +79,9 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_cuda_version,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_npu,
@@ -88,6 +90,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_tinygemm_supported = (
@@ -96,7 +99,7 @@ _is_tinygemm_supported = (
     and (is_sm90_supported() or is_blackwell_supported())
 )
 
-if _is_tinygemm_supported:
+if _is_tinygemm_supported and get_cuda_version()[0] < 13:
     try:
         from flashinfer.gemm import tinygemm_bf16
     except ImportError:
@@ -104,6 +107,7 @@ if _is_tinygemm_supported:
         _is_tinygemm_supported = False
 else:
     tinygemm_bf16 = None
+    _is_tinygemm_supported = False
 
 
 class GptOssConfig(PretrainedConfig):
@@ -217,7 +221,7 @@ class GptOssSparseMoeBlock(nn.Module):
             bias=True,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
     def forward(
@@ -466,7 +470,7 @@ class GptOssDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
         self.layer_id = layer_id
@@ -879,7 +883,8 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
-            weight = weight.cuda()
+            if _is_cuda:
+                weight = weight.cuda()
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1161,6 +1166,22 @@ class GptOssForCausalLM(nn.Module):
                         param = params_dict[name]
                         if "sinks" in name:
                             start = get_attention_tp_rank() * param.numel()
+                            tp_size = get_tensor_model_parallel_world_size()
+                            full_shard_size = param.numel() * tp_size
+                            # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
+                            # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
+                            if (
+                                _is_cpu
+                                and full_shard_size > loaded_weight.size(0)
+                                and start + param.numel() >= loaded_weight.size(0)
+                            ):
+                                pad_size = start + param.numel() - loaded_weight.size(0)
+                                pad_tensor = torch.zeros(pad_size).to(
+                                    loaded_weight.dtype
+                                )
+                                loaded_weight = torch.cat(
+                                    [loaded_weight, pad_tensor], dim=0
+                                ).to(loaded_weight.dtype)
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1174,6 +1195,9 @@ class GptOssForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -1196,6 +1220,18 @@ class GptOssForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

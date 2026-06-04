@@ -20,6 +20,7 @@ jobs:
        contains(github.event.comment.body, '/rerun-failed-ci') ||
        contains(github.event.comment.body, '/tag-and-rerun-ci') ||
        contains(github.event.comment.body, '/rerun-stage') ||
+       contains(github.event.comment.body, '/rerun-group') ||
        contains(github.event.comment.body, '/rerun-test'))
     runs-on: ubuntu-latest
 
@@ -85,7 +86,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install PyGithub
+          pip install PyGithub PyYAML
 
       - name: Handle Slash Command
         env:

@@ -250,6 +250,45 @@ In particular, for the `global segment size`, if at least one `store service` in
 
 **Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance and contributes `1/global_segment_size` memory. Therefore, the total memory consumption equals `global segment size`.
 
+**SSD Offload (`enable_ssd_offload`):**
+
+When `enable_ssd_offload` is set to `true`, SGLang will request that Mooncake enable SSD offloading for the KV cache. This allows Mooncake to spill overflow data from DRAM to local SSDs, effectively expanding the available L3 cache capacity.
+
+If you need to explicitly control the SSD spill directory, set `ssd_offload_path` or the `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` environment variable. SGLang forwards this value to `MooncakeDistributedStore.setup(..., ssd_offload_path=...)`, while other SSD offload tuning parameters continue to be read directly by the Mooncake C++ library.
+
+You can enable it in any of the three supported configuration methods:
+
+- **Via `--hicache-storage-backend-extra-config`:**
+  ```bash
+  python -m sglang.launch_server \
+      --enable-hierarchical-cache \
+      --hicache-storage-backend mooncake \
+      --model-path [model_path] \
+      --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_ssd_offload": true, "ssd_offload_path": "/mnt/mooncake-ssd"}'
+  ```
+
+- **Via JSON config file (`SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`):**
+  ```json
+  {
+      "master_server_address": "127.0.0.1:50051",
+      "enable_ssd_offload": true,
+      "ssd_offload_path": "/mnt/mooncake-ssd"
+  }
+  ```
+
+- **Via environment variable:**
+  ```bash
+  MOONCAKE_MASTER="127.0.0.1:50051" \
+  MOONCAKE_ENABLE_SSD_OFFLOAD=1 \
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="/mnt/mooncake-ssd" \
+  python -m sglang.launch_server \
+      --enable-hierarchical-cache \
+      --hicache-storage-backend mooncake \
+      --model-path [model_path]
+  ```
+
+> **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support it, SGLang will automatically fall back to the old behavior and print a warning.
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
