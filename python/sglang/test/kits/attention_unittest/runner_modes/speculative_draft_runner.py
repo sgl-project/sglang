@@ -713,10 +713,20 @@ def _make_dense_frozen_kv_mtp_draft_inputs(
     settings: EagleDraftRunnerSettings,
 ) -> dict[str, torch.Tensor]:
     draft_inputs = _make_dense_draft_inputs(case, settings)
+    # `draft_forward` now runs the assistant seed iter in-graph: it consumes the
+    # per-req bonus token + target hidden and derives iter-0 topk_p/topk_index
+    # itself, so the fixture supplies `bonus_tokens` rather than topk_p/index.
+    with _seeded_rng(4090 + len(case.name) + settings.topk, device=settings.device):
+        bonus_tokens = torch.randint(
+            0,
+            settings.vocab_size,
+            (case.batch_size,),
+            dtype=torch.int64,
+            device=settings.device,
+        )
     return {
         "hidden_states": draft_inputs["hidden_states"],
-        "topk_p": draft_inputs["topk_p"],
-        "topk_index": draft_inputs["topk_index"],
+        "bonus_tokens": bonus_tokens,
     }
 
 
@@ -849,9 +859,8 @@ def _make_dense_frozen_kv_mtp_forward_batch(
     settings: EagleDraftRunnerSettings,
 ) -> ForwardBatch:
     spec_info = FrozenKVMTPDraftInput(
-        topk_p=draft_inputs["topk_p"].clone(),
-        topk_index=draft_inputs["topk_index"].clone(),
         hidden_states=draft_inputs["hidden_states"].clone(),
+        bonus_tokens=draft_inputs["bonus_tokens"].clone(),
         capture_hidden_mode=CaptureHiddenMode.LAST,
         num_tokens_per_req=settings.topk,
         num_tokens_for_logprob_per_req=settings.topk,
