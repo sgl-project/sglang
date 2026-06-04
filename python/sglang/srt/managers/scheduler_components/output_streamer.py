@@ -74,9 +74,11 @@ class SchedulerOutputStreamer:
                 "device": req.cached_tokens_device,
                 "host": req.cached_tokens_host,
             }
-            # Only include storage fields if L3 storage is enabled
-            if self.enable_hicache_storage():
+            # In PD mode the L3 hit is produced on prefill and reported on
+            # decode via metadata, while decode may not have a local storage backend.
+            if req.cached_tokens_storage > 0 or self.enable_hicache_storage():
                 details["storage"] = req.cached_tokens_storage
+            if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
 
