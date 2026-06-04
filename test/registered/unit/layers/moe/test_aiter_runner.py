@@ -113,3 +113,7 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
