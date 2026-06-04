@@ -21,6 +21,7 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -52,6 +53,8 @@ SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND = (
     f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated/ascend"
 )
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+if current_platform.is_npu():
+    SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
