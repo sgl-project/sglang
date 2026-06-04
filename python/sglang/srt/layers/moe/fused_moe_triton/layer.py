@@ -5,6 +5,7 @@
 import logging
 from enum import Enum
 from functools import cached_property
+from threading import Lock
 from typing import List, Optional, Tuple
 
 import torch
@@ -211,6 +212,10 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed // self.moe_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
+        self._fp8_shared_to_fp4_lock = Lock()
+        self._fp8_shared_to_fp4_cache: dict[
+            tuple[int, str], dict[str, torch.Tensor]
+        ] = {}
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -559,6 +564,118 @@ class FusedMoE(torch.nn.Module):
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 
+    @staticmethod
+    def _quantize_mxfp4_weight(
+        weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize BF16/FP32 weight to packed MXFP4 and e8m0 scales."""
+        assert weight.shape[-1] % 32 == 0
+
+        original_shape = weight.shape
+        x = weight.reshape(-1, 32).to(torch.float32)
+        x_amax = x.abs().max(dim=-1, keepdim=True).values
+        descale = x_amax / 6.0
+        min_exp = torch.tensor(-127.0, device=x.device)
+        scale_exp = torch.ceil(torch.maximum(torch.log2(descale), min_exp))
+        x_scaled = x / torch.exp2(scale_exp)
+
+        bounds = torch.tensor(
+            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+            device=x.device,
+            dtype=torch.float32,
+        )
+        sign_bit = (x_scaled < 0).to(torch.uint8) << 3
+        magnitude = torch.sum(
+            (x_scaled.abs().unsqueeze(-1) - bounds) > 0,
+            dim=-1,
+        ).to(torch.uint8)
+        fp4 = (sign_bit + magnitude).view(original_shape)
+
+        packed = (fp4[..., 1::2] << 4) + fp4[..., 0::2]
+        scale = (scale_exp.squeeze(-1) + 127).to(torch.uint8)
+        scale = scale.view(*original_shape[:-1], original_shape[-1] // 32)
+        return packed.contiguous().view(torch.int8), scale.contiguous().view(
+            torch.float8_e8m0fnu
+        )
+
+    def _maybe_load_fp8_shared_expert_as_fp4(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        shard_dim: int,
+        tp_rank: int,
+    ) -> bool:
+        if (
+            not self._has_fused_shared
+            or expert_id < self._num_local_routed
+            or self.quant_config is None
+            or not getattr(self.quant_config, "is_fp4_experts", False)
+            or shard_id not in ("w1", "w2", "w3")
+        ):
+            return False
+
+        is_weight = (
+            "weight" in weight_name
+            and "scale" not in weight_name
+            and loaded_weight.dtype == torch.float8_e4m3fn
+        )
+        is_scale = "weight_scale_inv" in weight_name and loaded_weight.dtype in (
+            torch.float8_e8m0fnu,
+            torch.float32,
+        )
+        if not is_weight and not is_scale:
+            return False
+
+        weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
+        scale_param = (
+            self.w2_weight_scale_inv
+            if shard_id == "w2"
+            else self.w13_weight_scale_inv
+        )
+        if param is not weight_param and param is not scale_param:
+            return False
+
+        key = (expert_id, shard_id)
+        with self._fp8_shared_to_fp4_lock:
+            entry = self._fp8_shared_to_fp4_cache.setdefault(key, {})
+            entry["weight" if is_weight else "scale"] = loaded_weight
+            if "weight" not in entry or "scale" not in entry:
+                return True
+
+            fp8_weight = entry.pop("weight")
+            fp8_scale = entry.pop("scale").to(torch.float32)
+            if not entry:
+                self._fp8_shared_to_fp4_cache.pop(key, None)
+
+            dequant_weight = (
+                fp8_weight.to(torch.float32)
+                * fp8_scale.repeat_interleave(128, dim=-2).repeat_interleave(
+                    128, dim=-1
+                )[..., : fp8_weight.shape[-2], : fp8_weight.shape[-1]]
+            ).to(torch.bfloat16)
+            fp4_weight, fp4_scale = self._quantize_mxfp4_weight(dequant_weight)
+
+            weight_data = weight_param.data[expert_id]
+            scale_data = scale_param.data[expert_id]
+            self._load_model_weight_or_group_weight_scale(
+                shard_dim=shard_dim,
+                expert_data=weight_data,
+                shard_id=shard_id,
+                loaded_weight=fp4_weight,
+                tp_rank=tp_rank,
+            )
+            self._load_model_weight_or_group_weight_scale(
+                shard_dim=shard_dim,
+                expert_data=scale_data,
+                shard_id=shard_id,
+                loaded_weight=fp4_scale,
+                tp_rank=tp_rank,
+            )
+            return True
+
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
@@ -826,6 +943,17 @@ class FusedMoE(torch.nn.Module):
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
+
+        if self._maybe_load_fp8_shared_expert_as_fp4(
+            param=param,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+            shard_id=shard_id,
+            expert_id=expert_id,
+            shard_dim=shard_dim,
+            tp_rank=tp_rank,
+        ):
+            return
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
