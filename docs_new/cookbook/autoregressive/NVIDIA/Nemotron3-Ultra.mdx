@@ -454,17 +454,17 @@ TBD — benchmark numbers will be filled in once the official run completes on t
 #### 5.2.1 GSM8K Benchmark
 
 **Environment**
-- Hardware: B200 (8x)
-- Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
-- Tensor Parallelism: 8
+- Hardware: GB200 (4x)
+- Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
+- Tensor Parallelism: 4
 - SGLang Version: main branch
 
 **Launch Model**
 ```bash Command
 python3 -m sglang.launch_server \
-  --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
+  --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --trust-remote-code \
-  --tp 8 \
+  --tp 4 \
   --reasoning-parser nemotron_3
 ```
 
