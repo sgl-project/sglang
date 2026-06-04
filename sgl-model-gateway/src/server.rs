@@ -59,7 +59,7 @@ use crate::{
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
             get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
         },
-        parse,
+        error as router_error, parse,
         router_manager::RouterManager,
         tokenize, RouterTrait,
     },
@@ -172,13 +172,37 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    Json(raw_body): Json<Value>,
 ) -> Response {
+    let body: GenerateRequest = match serde_json::from_value(raw_body.clone()) {
+        Ok(body) => body,
+        Err(e) => {
+            return router_error::bad_request(
+                "invalid_generate_request",
+                format!("Failed to parse generate request: {}", e),
+            );
+        }
+    };
+    let keep_sampling_mask_fields = extract_keep_sampling_mask_fields(&raw_body);
     let model_id = body.model.as_deref();
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_generate_with_extra(
+            Some(&headers),
+            &body,
+            keep_sampling_mask_fields.as_ref(),
+            model_id,
+        )
         .await
+}
+
+fn extract_keep_sampling_mask_fields(raw_body: &Value) -> Option<serde_json::Map<String, Value>> {
+    let raw_map = raw_body.as_object()?;
+    let mut fields = serde_json::Map::new();
+    if let Some(value) = raw_map.get("return_sampling_mask") {
+        fields.insert("return_sampling_mask".to_string(), value.clone());
+    }
+    (!fields.is_empty()).then_some(fields)
 }
 
 async fn v1_chat_completions(

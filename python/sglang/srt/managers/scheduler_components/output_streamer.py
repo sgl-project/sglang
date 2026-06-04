@@ -132,9 +132,13 @@ class SchedulerOutputStreamer:
         return_indexer_topk = any(
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
+        return_sampling_mask = any(
+            req.return_sampling_mask for req in reqs if req is not skip_req
+        )
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
+            return_sampling_mask=return_sampling_mask,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
@@ -244,6 +248,7 @@ class SchedulerOutputStreamer:
 @dataclass(slots=True, kw_only=True)
 class _GenerationStreamAccumulator:
     return_logprob: bool
+    return_sampling_mask: bool
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
@@ -291,6 +296,8 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_token_sampling_mask: Optional[list] = None
+    output_token_sampling_logprobs: Optional[list] = None
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -313,6 +320,9 @@ class _GenerationStreamAccumulator:
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
+        if self.return_sampling_mask:
+            self.output_token_sampling_mask = []
+            self.output_token_sampling_logprobs = []
 
     def accept(self, *, req: Req) -> None:
         if req.finished():
@@ -347,6 +357,7 @@ class _GenerationStreamAccumulator:
 
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+        send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
         self.rids.append(req.rid)
         self.http_worker_ipcs.append(req.http_worker_ipc)
         self.finished_reasons.append(
@@ -459,6 +470,24 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
+        if self.return_sampling_mask:
+            if req.return_sampling_mask:
+                sampling_mask_end = len(output_ids_)
+                self.output_token_sampling_mask.append(
+                    (req.output_token_sampling_mask or [])[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                self.output_token_sampling_logprobs.append(
+                    (req.output_token_sampling_logprobs or [])[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                req.send_output_sampling_mask_offset = sampling_mask_end
+            else:
+                self.output_token_sampling_mask.append([])
+                self.output_token_sampling_logprobs.append([])
+
         if self.return_hidden_states:
             self.output_hidden_states.append(
                 req.hidden_states if req.return_hidden_states else None
@@ -504,6 +533,8 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            output_token_sampling_mask=self.output_token_sampling_mask,
+            output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             input_token_logprobs_val=self.input_token_logprobs_val,
             input_token_logprobs_idx=self.input_token_logprobs_idx,
             output_token_logprobs_val=self.output_token_logprobs_val,

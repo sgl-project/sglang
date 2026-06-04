@@ -9,6 +9,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
+use serde_json::{Map, Value};
 use tracing::{debug, error};
 
 use crate::{
@@ -198,6 +199,20 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
+        self.route_typed_request_with_extra(headers, typed_req, None, route, model_id)
+            .await
+    }
+
+    pub async fn route_typed_request_with_extra<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        extra_body: Option<&Map<String, Value>>,
+        route: &'static str,
+        model_id: Option<&str>,
+    ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
@@ -219,7 +234,9 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers, typed_req, extra_body, route, model_id, is_stream, &text,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -274,6 +291,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        extra_body: Option<&Map<String, Value>>,
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
@@ -308,7 +326,9 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers, typed_req, extra_body, route, &worker, is_stream, load_guard,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -483,11 +503,28 @@ impl Router {
         }
     }
 
+    fn merge_extra_body_fields(
+        json_val: &mut Value,
+        extra_body: Option<&Map<String, Value>>,
+    ) -> Result<(), &'static str> {
+        let Some(extra_body) = extra_body else {
+            return Ok(());
+        };
+        let Some(map) = json_val.as_object_mut() else {
+            return Err("Failed to merge extra request fields into a non-object request body");
+        };
+        for (key, value) in extra_body {
+            map.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
     // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        extra_body: Option<&Map<String, Value>>,
         route: &'static str,
         worker: &Arc<dyn Worker>,
         is_stream: bool,
@@ -537,9 +574,28 @@ impl Router {
                     "Failed to insert the data_parallel_rank field into the request body",
                 );
             }
+            if let Err(message) = Self::merge_extra_body_fields(&mut json_val, extra_body) {
+                return error::bad_request("extra_body_merge_failed", message);
+            }
 
             self.client
                 .post(format!("{}{}", worker_url_prefix, route))
+                .json(&json_val)
+        } else if extra_body.is_some() {
+            let mut json_val = match serde_json::to_value(typed_req) {
+                Ok(j) => j,
+                Err(e) => {
+                    return error::bad_request(
+                        "serialization_failed",
+                        format!("Convert into serde_json::Value failed: {}", e),
+                    );
+                }
+            };
+            if let Err(message) = Self::merge_extra_body_fields(&mut json_val, extra_body) {
+                return error::bad_request("extra_body_merge_failed", message);
+            }
+            self.client
+                .post(format!("{}{}", worker_url, route))
                 .json(&json_val)
         } else {
             self.client
@@ -754,6 +810,23 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/generate", model_id)
             .await
+    }
+
+    async fn route_generate_with_extra(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        extra_body: Option<&Map<String, Value>>,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request_with_extra(
+            headers,
+            body,
+            extra_body,
+            "/generate",
+            model_id,
+        )
+        .await
     }
 
     async fn route_chat(

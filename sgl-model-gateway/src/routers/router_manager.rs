@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -514,6 +514,45 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router
                 .route_generate(headers, body, effective_model_id.as_deref().or(model_id))
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_generate_with_extra(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        extra_body: Option<&Map<String, Value>>,
+        model_id: Option<&str>,
+    ) -> Response {
+        // In IGW mode, resolve model_id and fail fast if not resolvable
+        // In non-IGW mode, pass through to router (router handles validation)
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_generate_with_extra(
+                    headers,
+                    body,
+                    extra_body,
+                    effective_model_id.as_deref().or(model_id),
+                )
                 .await
         } else {
             (

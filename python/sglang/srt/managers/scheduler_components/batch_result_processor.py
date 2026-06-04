@@ -252,6 +252,9 @@ class SchedulerBatchResultProcessor:
                             logprob_pt=logprob_pt,
                         )
 
+                    if req.return_sampling_mask:
+                        self.add_sampling_mask_return_values(i, req, logits_output)
+
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
@@ -677,6 +680,9 @@ class SchedulerBatchResultProcessor:
                     logits_output=logits_output,
                 )
 
+            if req.return_sampling_mask and batch.spec_algorithm.is_none():
+                self.add_sampling_mask_return_values(i, req, logits_output)
+
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
@@ -775,6 +781,31 @@ class SchedulerBatchResultProcessor:
                 req.logprob.output_token_ids_logprobs_idx.append(
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
+
+    @staticmethod
+    def add_sampling_mask_return_values(
+        i: int,
+        req: Req,
+        output: LogitsProcessorOutput,
+    ) -> None:
+        if req.output_token_sampling_mask is None:
+            req.output_token_sampling_mask = []
+        if req.output_token_sampling_logprobs is None:
+            req.output_token_sampling_logprobs = []
+
+        if output.next_token_sampling_mask_idx is None:
+            req.output_token_sampling_mask.append(None)
+        else:
+            req.output_token_sampling_mask.append(
+                output.next_token_sampling_mask_idx[i]
+            )
+
+        if output.next_token_sampling_logprobs is None:
+            req.output_token_sampling_logprobs.append(None)
+        else:
+            req.output_token_sampling_logprobs.append(
+                output.next_token_sampling_logprobs[i]
+            )
 
     def _apply_decode_grammar(
         self,
