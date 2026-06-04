@@ -51,6 +51,7 @@ import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.network import is_zmq_endpoint_ipv6
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import GetLoadsReqOutput
@@ -439,6 +440,8 @@ class ZmqLoadSnapshotWriter:
         self._zmq = _zmq
         self._ctx = _zmq.Context.instance()
         self._socket = self._ctx.socket(_zmq.PUSH)
+        if is_zmq_endpoint_ipv6(endpoint):
+            self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
         self._socket.connect(endpoint)
@@ -577,6 +580,8 @@ class ZmqShmLoadSnapshotReader:
         self._zmq = _zmq
         self._ctx = _zmq.Context.instance()
         self._socket = self._ctx.socket(_zmq.PULL)
+        if is_zmq_endpoint_ipv6(endpoint):
+            self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
         self._socket.bind(endpoint)

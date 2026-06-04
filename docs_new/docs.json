@@ -1140,6 +1140,12 @@
                     ]
                   },
                   {
+                    "group": "ERNIE-Image",
+                    "pages": [
+                      "cookbook/diffusion/Ernie-Image/Ernie-Image"
+                    ]
+                  },
+                  {
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
