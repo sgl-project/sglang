@@ -31,14 +31,14 @@ def _fused_cat_pad_5d_kernel(
     tmp = offsets // out_w
     oh = tmp % out_h
     tmp = tmp // out_h
-    ot = tmp % out_t
+    out = tmp % out_t
     tmp = tmp // out_t
     oc = tmp % channels
     ob = tmp // channels
 
     iw = ow - pad_w_left
     ih = oh - pad_h_top
-    src_t = ot - pad_d_left
+    src_t = out - pad_d_left
 
     valid = (
         mask

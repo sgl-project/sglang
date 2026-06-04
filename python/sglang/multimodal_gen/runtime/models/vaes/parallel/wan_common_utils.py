@@ -7,7 +7,9 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 if current_platform.is_cuda():
-    from sglang.jit_kernel.diffusion.triton.wan_vae_pad import fused_causal_conv3d_cat_pad
+    from sglang.jit_kernel.diffusion.triton.wan_vae_pad import (
+        fused_causal_conv3d_cat_pad,
+    )
 
 
 def _channels_last_3d_supported_by_platform() -> bool:
