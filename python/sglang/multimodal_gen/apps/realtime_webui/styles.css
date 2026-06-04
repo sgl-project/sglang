@@ -295,13 +295,20 @@ button:focus-visible {
 }
 
 .topbar-spacer { flex: 1; }
+.record-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
 .record-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  flex: 0 0 118px;
-  width: 118px;
+  flex: 0 0 86px;
+  width: 86px;
   min-height: 28px;
   height: 28px;
   padding: 0 9px;
@@ -331,9 +338,11 @@ button:focus-visible {
   cursor: wait;
   opacity: 0.76;
 }
-#recordLabel {
-  flex: 0 0 36px;
-  text-align: left;
+.record-button > span:last-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .record-button-icon {
   flex: 0 0 9px;
@@ -351,12 +360,12 @@ button:focus-visible {
 }
 .record-button-duration {
   display: inline-block;
-  flex: 0 0 34px;
-  min-width: 34px;
+  flex: 0 0 38px;
+  min-width: 38px;
   text-align: right;
   color: rgba(232, 234, 223, 0.7);
 }
-.record-button.is-recording .record-button-duration {
+.record-actions.is-recording .record-button-duration {
   color: rgba(255, 253, 247, 0.86);
 }
 .preview-scale-control {
@@ -429,7 +438,25 @@ button:focus-visible {
   #stageLatencyText { min-width: 108px; }
 }
 
-.timeline { justify-content: flex-end; border-top: 1px solid rgba(232, 234, 223, 0.12); }
+.timeline {
+  justify-content: space-between;
+  border-top: 1px solid rgba(232, 234, 223, 0.12);
+}
+.timeline-stats {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.timeline-stats span {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .dot.live { background: #8ecf9d; box-shadow: 0 0 0 4px rgba(142, 207, 157, 0.14); }
 .dot.error { background: var(--accent); }
@@ -707,6 +734,16 @@ button:focus-visible {
   .topbar { flex-wrap: wrap; height: auto; min-height: 44px; padding: 10px 14px; }
   .topbar-spacer { display: none; }
   .preview-scale-control { min-width: 160px; }
+  .timeline {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 44px;
+    padding: 8px 14px;
+  }
+  .timeline-stats {
+    justify-content: flex-start;
+    flex-basis: 100%;
+  }
 }
 
 @keyframes previewProgressSpin {

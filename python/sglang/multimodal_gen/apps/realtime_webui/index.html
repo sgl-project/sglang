@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-record-v49" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-record-dual-v1" />
   </head>
   <body>
     <main class="shell">
@@ -87,11 +87,6 @@
             <span id="statusDot" class="dot"></span>
             <span id="statusText">Idle</span>
             <span id="chunkText">chunk -</span>
-            <button id="recordBtn" class="record-button" type="button" aria-pressed="false" title="Record preview">
-              <span class="record-button-icon" aria-hidden="true"></span>
-              <span id="recordLabel">Record</span>
-              <span id="recordDuration" class="record-button-duration">00:00</span>
-            </button>
             <span class="topbar-spacer"></span>
             <label class="preview-scale-control">Preview
               <input id="previewScale" type="range" min="80" max="170" value="120" />
@@ -133,9 +128,22 @@
             </div>
           </div>
           <div class="timeline">
-            <span id="queueText">queue 0</span>
-            <span id="frameText">frames 0</span>
-            <span id="byteText">0 MB</span>
+            <div class="record-actions" aria-label="Recording">
+              <button id="recordSmoothBtn" class="record-button" type="button" aria-pressed="false" title="Record a smooth target-FPS MP4">
+                <span class="record-button-icon" aria-hidden="true"></span>
+                <span id="recordSmoothLabel">Smooth</span>
+              </button>
+              <button id="recordRealtimeBtn" class="record-button" type="button" aria-pressed="false" title="Record an MP4 paced by received source frames">
+                <span class="record-button-icon" aria-hidden="true"></span>
+                <span id="recordRealtimeLabel">Server</span>
+              </button>
+              <span id="recordDuration" class="record-button-duration">00:00</span>
+            </div>
+            <div class="timeline-stats">
+              <span id="queueText">queue 0</span>
+              <span id="frameText">frames 0</span>
+              <span id="byteText">0 MB</span>
+            </div>
           </div>
           <div class="telemetry stage-telemetry">
             <span>Payload<b id="payloadMode">webp</b></span>
@@ -163,6 +171,6 @@
       </section>
     </main>
   <script src="./playback_controller.js?v=realtime-playback-v13"></script>
-  <script src="./app.js?v=realtime-record-v73"></script>
+  <script src="./app.js?v=realtime-record-dual-v1"></script>
 </body>
 </html>

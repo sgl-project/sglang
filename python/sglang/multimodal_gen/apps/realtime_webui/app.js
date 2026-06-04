@@ -233,6 +233,10 @@ let recordingEncoderReady = null;
 let recordingEncoderConfig = null;
 let recordingFrameIndex = 0;
 let recordingFps = DEFAULT_TARGET_FPS;
+let recordingMode = "smooth";
+let recordingStartedAt = 0;
+let recordingLastTimestampUs = -1;
+let recordingLastDurationUs = 0;
 let recordingTimer = 0;
 let recordingSaving = false;
 let recordingEncodeChain = Promise.resolve();
@@ -493,20 +497,41 @@ function closeFrames(items) {
 
 function recordingFileName() {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `sglang-realtime-${stamp}.mp4`;
+  return `sglang-realtime-${recordingMode}-${stamp}.mp4`;
 }
 
 function updateRecordButton() {
-  const button = $("recordBtn");
-  button.classList.toggle("is-recording", recordingActive);
-  button.classList.toggle("is-saving", recordingSaving);
-  button.disabled = recordingSaving;
-  button.setAttribute("aria-pressed", recordingActive ? "true" : "false");
-  $("recordLabel").textContent = recordingSaving
+  const smoothButton = $("recordSmoothBtn");
+  const realtimeButton = $("recordRealtimeBtn");
+  const smoothActive = recordingActive && recordingMode === "smooth";
+  const realtimeActive = recordingActive && recordingMode === "realtime";
+  document.querySelector(".record-actions")?.classList.toggle("is-recording", recordingActive);
+  smoothButton.classList.toggle("is-recording", smoothActive);
+  realtimeButton.classList.toggle("is-recording", realtimeActive);
+  smoothButton.classList.toggle("is-saving", recordingSaving && recordingMode === "smooth");
+  realtimeButton.classList.toggle("is-saving", recordingSaving && recordingMode === "realtime");
+  smoothButton.disabled = recordingSaving || (recordingActive && recordingMode !== "smooth");
+  realtimeButton.disabled = recordingSaving || (recordingActive && recordingMode !== "realtime");
+  smoothButton.setAttribute("aria-pressed", smoothActive ? "true" : "false");
+  realtimeButton.setAttribute("aria-pressed", realtimeActive ? "true" : "false");
+  $("recordSmoothLabel").textContent = recordingSaving && recordingMode === "smooth"
     ? "Saving"
-    : recordingActive ? "Stop" : "Record";
-  const elapsedMs = recordingActive ? recordingFrameIndex / Math.max(1, recordingFps) * 1000 : 0;
+    : smoothActive ? "Stop" : "Smooth";
+  $("recordRealtimeLabel").textContent = recordingSaving && recordingMode === "realtime"
+    ? "Saving"
+    : realtimeActive ? "Stop" : "Server";
+  const elapsedMs = recordingActive || recordingSaving ? recordingElapsedMs() : 0;
   $("recordDuration").textContent = formatRecordingDuration(elapsedMs);
+}
+
+function recordingElapsedMs() {
+  if (recordingMode === "realtime" && recordingLastTimestampUs >= 0) {
+    return (recordingLastTimestampUs + recordingLastDurationUs) / 1000;
+  }
+  if (recordingFrameIndex > 0) {
+    return recordingFrameIndex / Math.max(1, recordingFps) * 1000;
+  }
+  return recordingStartedAt ? performance.now() - recordingStartedAt : 0;
 }
 
 function formatRecordingDuration(elapsedMs) {
@@ -516,13 +541,14 @@ function formatRecordingDuration(elapsedMs) {
   return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
-function startRecording() {
+function startRecording(mode = "smooth") {
   if (recordingActive || recordingSaving) return;
   if (!window.VideoEncoder || !window.VideoFrame) {
     setStatus("MP4 unsupported", "error");
     addHistory("MP4 recording requires WebCodecs H.264 support");
     return;
   }
+  recordingMode = mode;
   recordingActive = true;
   recordingSamples = [];
   recordingEncoder = null;
@@ -530,10 +556,13 @@ function startRecording() {
   recordingEncoderConfig = null;
   recordingFrameIndex = 0;
   recordingFps = Math.max(1, previewPlaybackTargetFps());
+  recordingStartedAt = performance.now();
+  recordingLastTimestampUs = -1;
+  recordingLastDurationUs = 0;
   recordingEncodeChain = Promise.resolve();
   recordingTimer = window.setInterval(updateRecordButton, 250);
   updateRecordButton();
-  addHistory("recording started");
+  addHistory(`${recordingMode === "realtime" ? "server-paced" : "smooth"} recording started`);
 }
 
 async function stopRecording() {
@@ -583,24 +612,40 @@ async function stopRecording() {
     recordingEncoderReady = null;
     recordingSaving = false;
     recordingSamples = [];
+    recordingFrameIndex = 0;
+    recordingStartedAt = 0;
+    recordingLastTimestampUs = -1;
+    recordingLastDurationUs = 0;
     updateRecordButton();
   }
 }
 
-function recordDecodedFrameBatch(decodedFrames) {
+function recordDecodedFrameBatch(decodedFrames, header = {}) {
   if (!recordingActive || recordingSaving) return;
-  for (const item of decodedFrames) {
-    if (!recordingActive) break;
-    recordDecodedFrame(item.image);
+  let duration = Math.round(1_000_000 / Math.max(1, recordingFps));
+  if (recordingMode === "realtime") {
+    const chunkDurationMs =
+      Number(header.chunk_total_ms || 0) || playbackController.snapshot().latestChunkDurationMs || 0;
+    if (chunkDurationMs > 0 && decodedFrames.length) {
+      duration = Math.max(1, Math.round(chunkDurationMs * 1000 / decodedFrames.length));
+    }
+    for (let i = 0; i < decodedFrames.length; i++) {
+      if (!recordingActive) break;
+      const timestamp = recordingLastTimestampUs < 0 ? 0 : recordingLastTimestampUs + duration;
+      recordDecodedFrame(decodedFrames[i].image, timestamp, duration);
+    }
+  } else {
+    for (const item of decodedFrames) {
+      if (!recordingActive) break;
+      recordDecodedFrame(item.image, recordingFrameIndex * duration, duration);
+    }
   }
   updateRecordButton();
 }
 
-function recordDecodedFrame(image) {
+function recordDecodedFrame(image, timestamp, duration) {
   if (!recordingActive || recordingSaving) return;
   const frameIndex = recordingFrameIndex;
-  const duration = Math.round(1_000_000 / Math.max(1, recordingFps));
-  const timestamp = frameIndex * duration;
   let frame;
   try {
     frame = createRecordingFrame(image, timestamp, duration);
@@ -611,6 +656,8 @@ function recordDecodedFrame(image) {
     return;
   }
   recordingFrameIndex += 1;
+  recordingLastTimestampUs = timestamp;
+  recordingLastDurationUs = duration;
   recordingEncodeChain = recordingEncodeChain
     .then(async () => {
       await ensureRecordingEncoder(frame.displayWidth, frame.displayHeight);
@@ -1558,7 +1605,7 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   }
   const now = performance.now();
   // record source frames before preview playback can hold or drop for latency
-  recordDecodedFrameBatch(decodedFrames);
+  recordDecodedFrameBatch(decodedFrames, header);
   const enqueueResult = playbackController.enqueueDecodedFrames(header, decodedFrames, now);
   closeFrames(enqueueResult.droppedFrames);
   if (enqueueResult.cutover?.latencyMs) {
@@ -2058,11 +2105,18 @@ $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
-$("recordBtn").onclick = () => {
-  if (recordingActive) {
+$("recordSmoothBtn").onclick = () => {
+  if (recordingActive && recordingMode === "smooth") {
     stopRecording();
   } else {
-    startRecording();
+    startRecording("smooth");
+  }
+};
+$("recordRealtimeBtn").onclick = () => {
+  if (recordingActive && recordingMode === "realtime") {
+    stopRecording();
+  } else {
+    startRecording("realtime");
   }
 };
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
