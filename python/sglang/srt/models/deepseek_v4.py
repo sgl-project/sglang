@@ -588,7 +588,7 @@ class MQALayer(nn.Module):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """unified_kv-style ROCm path: overlap compressors, keep Q/KV on main stream."""
+        """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 1
 
@@ -716,69 +716,13 @@ class MQALayer(nn.Module):
             is_unified_kv_triton,
         )
 
-        if is_unified_kv_triton():
-            # unified_kv. Decode: one fully-fused kernel does q norm+rope, kv norm+rope
-            # AND writes K straight into the bf16 unified_kv SWA ring (slot =
-            # state_slot*win + pos%win) -> backend skips its SWA store. Prefill: keep
-            # bf16 kv (no store here); backend writes the ring AFTER attention (the
-            # 2-source path needs the current chunk out of the ring during attention).
-            q_lora = self.q_norm(q_lora)
-            pool = get_token_to_kv_pool()
-            is_decode = forward_batch.forward_mode.is_decode_or_idle()
-            if is_decode and _is_hip:
-                from sglang.srt.layers.fused_qk_norm_rope_store import (
-                    fused_qk_norm_rope_swa_store,
-                )
+        unified = is_unified_kv_triton()
+        is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        do_fused_store = (unified and is_decode) or (
+            not unified and self.use_fused_qk_norm_rope
+        )
 
-                q_b, _ = self.wq_b(q_lora)
-                kv_raw = (
-                    qkv_a[..., self.q_lora_rank :]
-                    if qkv_a is not None
-                    else self.wkv(x_linear)[0]
-                )
-                cs = pool.unified_cs  # SWA ring stride (win_with_spec; == win w/o spec)
-                ring_loc = (
-                    forward_batch.req_pool_indices.to(torch.int64) * cs
-                    + positions.to(torch.int64) % cs
-                ).to(torch.int32)
-                q = fused_qk_norm_rope_swa_store(
-                    q=q_b,
-                    kv=kv_raw,
-                    q_norm_weight=None,
-                    kv_norm_weight=self.kv_norm.weight,
-                    q_rms_eps=self.eps,
-                    kv_rms_eps=self.eps,
-                    rope_head_dim=self.qk_rope_head_dim,
-                    cos_cache=self.cos_cache,
-                    sin_cache=self.sin_cache,
-                    positions=positions,
-                    swa_cache=pool.get_unified_kv(self.layer_id),
-                    swa_loc=ring_loc,
-                    swa_page_size=1,
-                    q_out=q_out,
-                    dtype=x.dtype,
-                    bf16_store=True,
-                )
-                kv = None  # already written into the unified_kv ring
-            else:
-                q = self._compute_q_b(q_lora, positions, q_out)
-                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-            del qkv_a
-            if self.indexer is not None:
-                self.indexer(
-                    x=x,
-                    q_lora=q_lora,
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                )
-            if self.compressor is not None:
-                attn_backend.forward_core_compressor(
-                    x, forward_batch, self.layer_id, self.compressor
-                )
-            return q, kv
-
-        if self.use_fused_qk_norm_rope:
-
+        if do_fused_store:
             if _is_gfx95_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
@@ -796,16 +740,29 @@ class MQALayer(nn.Module):
                 else self.wkv(x_linear)[0]
             )
 
+            token_to_kv_pool = get_token_to_kv_pool()
+            if unified:
+                swa_ring_size = token_to_kv_pool.unified_swa_ring_size
+                swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
+                swa_loc = (
+                    forward_batch.req_pool_indices.to(torch.int64) * swa_ring_size
+                    + positions.to(torch.int64) % swa_ring_size
+                ).to(torch.int32)
+                swa_page_size, bf16_store = 1, True
+            else:
+                # framework packed-fp8 SWA pool via out_cache_loc -> swa-slot map.
+                swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+                swa_loc = token_to_kv_pool.get_cached_swa_loc(
+                    forward_batch.out_cache_loc, self.layer_id
+                )
+                swa_page_size, bf16_store = (
+                    token_to_kv_pool.swa_kv_pool.page_size,
+                    False,
+                )
+
             from sglang.srt.layers.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
-
-            token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = token_to_kv_pool.get_cached_swa_loc(
-                forward_batch.out_cache_loc, self.layer_id
-            )
-            swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
-            swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
             q = fused_qk_norm_rope_swa_store(
                 q=q,
@@ -823,21 +780,27 @@ class MQALayer(nn.Module):
                 swa_page_size=swa_page_size,
                 q_out=q_out,
                 dtype=x.dtype,
+                bf16_store=bf16_store,
             )
+            kv = None
 
-            if use_cp:
-                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+        if use_cp:
+            # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
+            # write to the FlashMLA cache after gather.
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            kv = cp_all_gather_rerange_output(
+                kv.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
+            if unified:
+                # unified_kv prefill: keep bf16 kv; the backend writes
+                # the ring AFTER attention (2-source path).
+                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
             if use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -956,13 +919,6 @@ class MQALayer(nn.Module):
         )
 
         if is_unified_kv_triton():
-            # Pass the LOCAL-head q (already [T, n_local, head_dim]); the backend
-            # writes the SWA ring + compressed indices and runs unified_kv paged attn,
-            # returning local-head output (no tp re-slice needed).
-            # Decode already wrote the SWA ring via the fused kernel (kv is None) ->
-            # tell the backend to skip its store. Prefill returns bf16 kv and the
-            # backend writes the ring AFTER attention.
-            unified_save_kv = kv is not None
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
@@ -971,7 +927,7 @@ class MQALayer(nn.Module):
                 forward_batch=forward_batch,
                 compress_ratio=self.compress_ratio,
                 attn_sink=self.attn_sink,
-                save_kv_cache=unified_save_kv,
+                save_kv_cache=kv is not None,
             )
         else:
             o = attn_backend.forward(

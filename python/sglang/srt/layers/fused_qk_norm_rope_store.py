@@ -210,14 +210,15 @@ def _fused_qk_norm_rope_store_kernel(
     if HAS_SWA_STORE and BF16_STORE:
         # unified_kv unified_kv: write the whole head_dim as plain bf16 into a
         # [num_slots, head_dim] bf16 cache at row=loc (no fp8 / no scale).
-        # swa_cache_stride_page == head_dim (element stride of the bf16 cache).
         loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=0)
         row_base = loc.to(tl.int64)[:, None] * swa_cache_stride_page
+        # nope
         tl.store(
             swa_cache_ptr + row_base + offs_d_full[None, :],
             kv_normed.to(swa_cache_ptr.dtype.element_ty),
             mask=src_mask[:, None] & nope_d_mask[None, :],
         )
+        # pe
         tl.store(
             swa_cache_ptr + row_base + (NOPE_DIM + d_pe_offs[None, :]),
             kv_pe.to(swa_cache_ptr.dtype.element_ty),
@@ -312,12 +313,10 @@ def fused_qk_norm_rope_swa_store(
     Args:
         q: [M, N] or [splitk, M, N] where N = num_local_heads * head_dim
         kv: [M, head_dim=512] mutated in-place (norm + RoPE)
-        swa_cache: SWA KV cache. Packed-uint8 paged pool (bf16_store=False), OR a
-            plain bf16 [num_slots, head_dim] cache (bf16_store=True, unified_kv).
-        swa_loc: [M] int32 indices. Paged loc (packed) or direct slot row (bf16_store).
-        swa_page_size: tokens per SWA page (packed path only; ignored for bf16_store).
+        swa_cache: paged SWA KV pool buffer [num_pages, bytes_per_page] uint8 OR a plain [num_slots, head_dim] bf16 cache
+        swa_loc: [M] int32 pre-translated paged indices
+        swa_page_size: tokens per SWA page (default 128)
         bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
-            instead of the fp8-packed FlashMLA layout.
     """
     head_dim = kv.shape[1]
 
@@ -380,8 +379,6 @@ def fused_qk_norm_rope_swa_store(
         kv.stride(1),
         cos_cache.stride(0),
         cos_cache.stride(-1),
-        # bf16_store: element stride of the [slots, head_dim] bf16 cache (== head_dim).
-        # packed path: byte stride of the paged uint8 pool.
         swa_cache.stride(0) if HAS_SWA_STORE else 0,
         q_rms_eps,
         kv_rms_eps,

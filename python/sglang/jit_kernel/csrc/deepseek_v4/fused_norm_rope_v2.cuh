@@ -376,8 +376,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   // 64-element fp8 group (own UE8M0 scale).
   constexpr uint32_t kRopeWarp = kNumWarps - 1;
   // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
-  // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc — used by the
-  // atom_paged unified_kv path. Otherwise the 584B packed FlashMLA layout.
+  // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
   constexpr int64_t kPageBytes =
       kBf16Store ? ((kHeadDim * 2ll) << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
   static_assert(kHeadDim == kBlockSize * kVecSize);
@@ -456,9 +455,6 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
   // part 2: rope on the rope warp (BF16 store), or per-warp FP8 quant + store.
   if constexpr (kBf16Store) {
-    // Plain BF16 store of all head_dim elems. The rope-tail warp applies rope
-    // first; every thread writes its own 2-elem pack at the slot's tx-th pair.
-    // Layout matches q (nope[0:448] normed, rope[448:512] norm+rope'd).
     Float2 d = data;
     if (warp_id == kRopeWarp) {
       const auto x_real = data[0];
@@ -499,8 +495,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL,
-          bool kBf16Store = false>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL, bool kBf16Store = false>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
@@ -508,8 +503,7 @@ struct FusedNormRopeKernel {
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
-  static constexpr int64_t kPageBytes =
-      kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
+  static constexpr int64_t kPageBytes = kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
 
   /// TODO: Let's fix the config for now.
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));

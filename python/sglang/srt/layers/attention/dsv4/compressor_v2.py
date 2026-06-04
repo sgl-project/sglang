@@ -492,8 +492,6 @@ class CompressorBackendMixin:
         )
 
         if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
-            # Non-JIT HIP fallback (Triton). unified_kv: core compressor store is
-            # redirected to unified_kv inside this path too.
             self._forward_unified_hip(
                 token_to_kv_pool=token_to_kv_pool,
                 kv_score_input=kv_score_input,
@@ -507,18 +505,14 @@ class CompressorBackendMixin:
                 compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
             )
             bf16_store = False
-            unified_core = is_unified_kv_triton() and not compressor.is_in_indexer
-            if unified_core:
-                # unified_kv core compressor: write the bf16 compressed KV straight
-                # into the unified_kv compress region (slot = swa_pages + out_loc),
-                # via the fused all-in-one kernel's bf16-store mode (page_size=1).
+            if compressor.is_in_indexer:
+                kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
+                page_size = token_to_kv_pool.get_index_k_page_size()
+            elif is_unified_kv_triton():
                 kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
                 page_size = 1
                 out_loc = out_loc + token_to_kv_pool.unified_swa_pages
                 bf16_store = True
-            elif compressor.is_in_indexer:
-                kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
-                page_size = token_to_kv_pool.get_index_k_page_size()
             else:
                 _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
                 assert compress_kv_pool is not None
@@ -632,11 +626,6 @@ class CompressorBackendMixin:
         )
 
         if is_unified_kv_triton() and not is_indexer:
-            # unified_kv: the core compressor produces the MAIN bf16 compressed
-            # attention KV (head_dim 512). Scatter it into the bf16 unified_kv
-            # compress region at swa_pages + out_loc (== c128/c4 page slot) instead
-            # of fp8-packing into the (dummied) packed pool. The indexer fp8 pool
-            # write (is_indexer=True) is left on the original path below.
             from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
                 store_compressed_into_unified,
             )

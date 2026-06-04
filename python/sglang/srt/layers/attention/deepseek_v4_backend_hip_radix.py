@@ -117,10 +117,7 @@ class DSV4AttnMetadata:
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
     # unified_kv: per-forward prebuilt ragged decode index streams (one per
-    # ratio). Built ONCE per forward by `_attach_unified_kv_decode_streams`; the
-    # per-layer attention reads the stream matching its compress_ratio (CSA
-    # tail is filled per c4 layer in `_forward_unified_kv`). None on the
-    # non-unified_kv path / prefill metadata.
+    # ratio). Built ONCE per forward by `_attach_unified_kv_decode_streams`
     unified_swa_indices: Optional[torch.Tensor] = None
     unified_swa_indptr: Optional[torch.Tensor] = None
     unified_hca_indices: Optional[torch.Tensor] = None
@@ -962,8 +959,8 @@ class DeepseekV4HipRadixBackend(
             csa_len=core.c4_sparse_topk_lengths,
             c128_page_indices=core.c128_page_indices,
             csa_width=core.c4_sparse_page_indices.shape[1],
-            win=pool.unified_win,
-            cs=pool.unified_cs,
+            win=pool.unified_swa_pages,
+            cs=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
         )
 
@@ -990,8 +987,8 @@ class DeepseekV4HipRadixBackend(
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
         unified = pool.get_unified_kv(layer_id)
-        win = pool.unified_win
-        cs = pool.unified_cs
+        win = pool.unified_swa_window
+        cs = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
 
         if q.ndim == 4:

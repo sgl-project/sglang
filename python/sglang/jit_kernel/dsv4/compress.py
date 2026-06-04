@@ -26,16 +26,10 @@ def _jit_compress_norm_rope_module(
     page_size: int,
     bf16_store: bool = False,
 ) -> Module:
-    # bf16_store=True: write the whole head_dim as plain bf16 into a
-    # [num_slots, head_dim] bf16 cache (page_size==1) instead of the packed
-    # fp8 FlashMLA / indexer layout. Used by the unified_kv unified_kv path.
     args = make_cpp_args(
         dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
-    # forward_fp4 is the sm100-only FP4 indexer kernel; it uses warp-32
-    # `__shfl_xor_sync` masks that don't compile on ROCm (gfx950 warp=64), and
-    # the FP4 indexer is gated off on HIP anyway. Don't register/compile it there.
     if head_dim == 128 and not is_hip_runtime():
         cuda_wrappers.append(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
