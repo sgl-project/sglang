@@ -1024,7 +1024,7 @@ def _find_remote_consistency_gt_files(
         bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
     else:
         # Avoid accidentally comparing non-comparable CI cases against official GT.
-        bases = (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
+        bases = (SGL_TEST_FILES_CONSISTENCY_GT_BASE,)
     for base_url in bases:
         candidates = _remote_consistency_gt_candidates(
             base_url, case_id, num_gpus, is_video, output_format
