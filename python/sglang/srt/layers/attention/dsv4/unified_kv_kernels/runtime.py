@@ -86,12 +86,11 @@ def store_swa_into_unified(
     if n_rows == 0:
         return
 
+    has_final = final_pos is not None
+    fp_arg = final_pos if has_final else positions
     assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
-
-    has_final = final_pos is not None
-    fp_arg = final_pos if has_final else positions
     _swa_scatter_kernel[(n_rows,)](
         kv,
         state_slot,
