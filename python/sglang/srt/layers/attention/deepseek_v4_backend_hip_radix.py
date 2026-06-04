@@ -116,8 +116,7 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
-    # unified_kv: per-forward prebuilt ragged decode index streams (one per
-    # ratio). Built ONCE per forward by `_attach_unified_kv_decode_streams`
+    # unified_kv: per-forward prebuilt ragged decode index
     unified_swa_indices: Optional[torch.Tensor] = None
     unified_swa_indptr: Optional[torch.Tensor] = None
     unified_hca_indices: Optional[torch.Tensor] = None
@@ -929,11 +928,7 @@ class DeepseekV4HipRadixBackend(
     def _attach_unified_kv_decode_streams(
         self, core: "DSV4AttnMetadata", req_pool_indices: torch.Tensor
     ) -> None:
-        """unified_kv Phase B: build the three ragged decode index streams ONCE
-        per forward (layer-invariant SWA + HCA; CSA prefix only — its tail is
-        filled per c4 layer in `_forward_unified_kv`). Stored on `core`. No-op
-        unless unified_kv is active. Decode is 1 token/req so the per-token SWA
-        ring slot == req_pool_indices."""
+        """build the ragged decode index streams once per forward"""
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
@@ -976,12 +971,7 @@ class DeepseekV4HipRadixBackend(
         core_attn_metadata: "DSV4AttnMetadata",
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        """unified_kv paged-attention path over the bf16 unified_kv.
-
-        SWA K is scattered into the unified_kv ring; compressed KV was already
-        written into unified_kv by the (redirected) core compressor. Indices are
-        built from SGLang metadata (SWA ring ++ swa_pages+page_index).
-        """
+        """unified_kv paged-attention path over the bf16 unified_kv"""
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -1004,9 +994,6 @@ class DeepseekV4HipRadixBackend(
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         if is_decode:
             state_slot = forward_batch.req_pool_indices[:T]
-            # current token must be visible to its own SWA window -> write first.
-            # decode: each token IS its request's last position. When save_kv_cache
-            # is False the model's fused qk-norm-rope kernel already wrote the ring.
             if save_kv_cache:
                 runtime.store_swa_into_unified(
                     kv=kv,
@@ -1017,10 +1004,6 @@ class DeepseekV4HipRadixBackend(
                     cs=cs,
                     final_pos=positions,
                 )
-            # Index streams were built once this forward by
-            # `_attach_unified_kv_decode_streams` (Phase B). Pick the one for this
-            # layer's ratio; the CSA stream's compress tail is layer-specific
-            # (per-layer indexer top-k) so fill it here (Phase C).
             if compress_ratio == 0:
                 kv_indices = core_attn_metadata.unified_swa_indices
                 kv_indptr = core_attn_metadata.unified_swa_indptr
@@ -1052,7 +1035,6 @@ class DeepseekV4HipRadixBackend(
         # prefill / extend
         bs = forward_batch.req_pool_indices.shape[0]
         if forward_batch.extend_seq_lens is not None:
-            # Chunked prefill: variable per-req extend lengths from forward_batch.
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 forward_batch.extend_seq_lens.to(torch.int64),
@@ -1060,21 +1042,15 @@ class DeepseekV4HipRadixBackend(
             state_slot = forward_batch.req_pool_indices[bid]
             chunk_start = forward_batch.extend_prefix_lens[bid]
             cu_q = forward_batch.extend_start_loc[bid]
-            # request's last (current) absolute position, per token — restricts the
-            # SWA ring write to the final window (avoids >win aliasing scatter races).
             final_pos = forward_batch.seq_lens[bid].to(torch.int64) - 1
         else:
-            # Speculative burst (target-verify / draft-extend): a UNIFORM `qo_len`
-            # tokens per req, laid out req-major (see expand_extend_with_same_length).
-            # forward_batch.extend_* are unset here, so derive everything from the
-            # per-token absolute positions (consecutive within each req's burst).
             qo_len = T // bs
             ar = torch.arange(T, device=device, dtype=torch.int64)
             tok_in_req = ar % qo_len
             bid = ar // qo_len
             state_slot = forward_batch.req_pool_indices[bid]
-            chunk_start = positions - tok_in_req  # first burst pos of the token's req
-            cu_q = ar - tok_in_req  # row of the req's first burst token in `kv`
+            chunk_start = positions - tok_in_req
+            cu_q = ar - tok_in_req
             final_pos = chunk_start + (qo_len - 1)
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
@@ -1089,11 +1065,7 @@ class DeepseekV4HipRadixBackend(
             c128_page_indices=c128_pi,
             c4_sparse_page_indices=c4_pi,
         )
-        # DP attention pads `q` with dummy tokens at the tail, so q rows (T) can
-        # exceed the real token count L = sum(extend_seq_lens). The indptrs above
-        # have length L+1, but both the OPUS kernel and the triton path index per
-        # q row and require length T+1. Pad the tail with the final cumulative
-        # offset -> dummy rows get empty segments (read no KV, no OOB).
+
         if kpre_p.shape[0] < T + 1:
             pad = T + 1 - kpre_p.shape[0]
             kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
@@ -1109,12 +1081,10 @@ class DeepseekV4HipRadixBackend(
             attn_sink=attn_sink,
             softmax_scale=self.softmax_scale,
         )
+
         # write this chunk's SWA K into the ring for future chunks / decode
-        # (only the final-window tokens per request, to avoid >win aliasing races)
+        # only the final-window tokens per request
         if save_kv_cache:
-            # `kv` has T rows (q-aligned, incl. DP padding); the per-req tensors
-            # cover only the L real tokens. Scatter just the real rows into the
-            # ring (dummy tokens carry garbage positions/state_slot).
             n_real = state_slot.shape[0]
             runtime.store_swa_into_unified(
                 kv=kv[:n_real],
