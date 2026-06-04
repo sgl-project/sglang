@@ -750,6 +750,14 @@ class SamplingParams:
 
         # Progressive resolution growing (DCT spectral upsampling)
         add_argument(
+            "--progressive-mode",
+            type=str,
+            dest="progressive_mode",
+            choices=["fullres", "dct", "dct_rewind"],
+            help="Progressive resolution mode. 'fullres' disables (default). "
+            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
+        )
+        add_argument(
             "--progressive-levels",
             type=int,
             dest="progressive_levels",
