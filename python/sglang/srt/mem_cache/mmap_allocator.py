@@ -66,9 +66,7 @@ def hugepage_available_bytes(hugepage_size: int) -> int:
         with open(os.path.join(sysfs_path, "free_hugepages")) as f:
             return int(f.read().strip()) * hugepage_size
     except (OSError, ValueError) as e:
-        logger.warning(
-            'Failed to read free_hugepages from %s: %s', sysfs_path, e
-        )
+        logger.warning("Failed to read free_hugepages from %s: %s", sysfs_path, e)
         return 0
 
 
