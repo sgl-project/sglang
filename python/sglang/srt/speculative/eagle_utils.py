@@ -137,6 +137,7 @@ def build_tree_kernel_efficient(
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
+    needs_parent_token: bool = True,
 ):
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
@@ -188,6 +189,14 @@ def build_tree_kernel_efficient(
         (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )
     retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve_buf
+    # GDN/KDA models need parent_token for conv1d/SSM tree traversal;
+    # regular attention models pass an empty tensor (kernel receives nullptr).
+    if needs_parent_token:
+        retrieve_parent_token = torch.full(
+            (bs, num_verify_tokens), -1, device=device, dtype=torch.long
+        )
+    else:
+        retrieve_parent_token = torch.empty((0,), device=device, dtype=torch.long)
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
@@ -208,6 +217,7 @@ def build_tree_kernel_efficient(
             retrieve_index,
             retrieve_next_token,
             retrieve_next_sibling,
+            retrieve_parent_token,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -223,6 +233,7 @@ def build_tree_kernel_efficient(
             retrieve_index,
             retrieve_next_token,
             retrieve_next_sibling,
+            retrieve_parent_token,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -234,6 +245,7 @@ def build_tree_kernel_efficient(
         retrieve_index,
         retrieve_next_token,
         retrieve_next_sibling,
+        retrieve_parent_token,
         draft_tokens,
     )
 
