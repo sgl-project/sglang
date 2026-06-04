@@ -1389,12 +1389,9 @@ class ModelRunner:
         """Load a new lora adapter from disk or huggingface."""
         return self.lora_manager.load_lora_adapter(lora_ref)
 
-    def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
-    ):
-        return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
-        )
+    def register_lora_adapter(self, lora_ref: LoRARef, config_dict):
+        logger.info(f"LoRA adapter registration: {lora_ref}.")
+        return self.lora_manager.register_lora_adapter(lora_ref, config_dict)
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""

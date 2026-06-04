@@ -247,6 +247,18 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # An abort matched this rid while the request was still tokenizer-held
+    # (parked at the pause gate / model-update lock / tokenization). The
+    # scheduler never saw the rid, so the dispatch path must resolve the
+    # request as aborted instead of sending it.
+    abort_before_dispatch: bool = False
+
+    # The LoRA lease for this request has already been released. Every terminal
+    # path funnels through TokenizerManager._finalize_lora_lease, which uses
+    # this flag to stay idempotent: a leaked release hangs unload's
+    # wait_for_zero forever, and a double release drives the ConcurrentCounter
+    # negative, which hangs it just the same (it waits for exactly zero).
+    lora_lease_released: bool = False
 
     # For streaming output
     last_output_offset: int = 0
@@ -724,6 +736,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self._weight_update_session_open = False
+        # A staged session (adapter-only, deferred publications pending) runs
+        # under the reader lock, concurrent with generation.
+        self._weight_update_staged_session = False
+        self._weight_update_pending_version: Optional[str] = None
 
     def init_lora(self):
         # LoRA
@@ -745,6 +762,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
+        # defer_publish registrations: zeroed identities on the backends, names
+        # unservable until end_weight_update commits their session
+        self._pending_lora_publications: Dict[str, LoRARef] = {}
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
@@ -1675,10 +1695,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _abort_instead_of_dispatch(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> bool:
+        """Resolve a request whose rid an abort matched while it was still
+        tokenizer-held (see abort_request): the scheduler never saw the rid, so
+        it must be finished here instead of dispatched. Returns True if the
+        request was aborted."""
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if (
+            state is None
+            or not state.abort_before_dispatch
+            or is_health_check_generate_req(tokenized_obj)
+        ):
+            return False
+        self._handle_abort_req(
+            AbortReq(
+                rid=tokenized_obj.rid,
+                abort_message="Aborted by AbortReq before dispatch to scheduler",
+            )
+        )
+        dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
+        if dispatch_ready is not None:
+            dispatch_ready.set()
+        return True
+
     async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        if self._abort_instead_of_dispatch(tokenized_obj):
+            return
         prepared_mm_items = []
         dispatched = False
         try:
@@ -1720,6 +1768,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        tokenized_objs = [
+            tokenized_obj
+            for tokenized_obj in tokenized_objs
+            if not self._abort_instead_of_dispatch(tokenized_obj)
+        ]
+        if not tokenized_objs:
+            return
         prepared_mm_items = []
         dispatched = False
         try:
@@ -1787,6 +1842,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             out["meta_info"] = meta_info
         return out
 
+    def _finalize_lora_lease(self, state: Optional[ReqState]) -> None:
+        """Release the request's LoRA lease exactly once, however it terminates:
+        normal finish, scheduler abort echo (queued / tokenizer-held / disagg),
+        status-code abort, or a failed dispatch. A request whose LoRA was never
+        acquired (pre-acquire failure leaves lora_id unset) has no lease to
+        release."""
+        if state is None or state.lora_lease_released:
+            return
+        # lora_path / lora_id are declared on both input structs with default
+        # None (= base model / lease never acquired), so plain None checks are
+        # the contract. State-derived checks come first: a request without a
+        # lease has nothing to release, whatever the server config says.
+        if state.obj.lora_path is None or state.obj.lora_id is None:
+            return
+        if not self.enable_lora:
+            return
+        state.lora_lease_released = True
+        asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
     async def _handle_abort_finish_reason(
         self,
         out: dict,
@@ -1816,9 +1890,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.obj.rid in self.rid_to_state:
                 del self.rid_to_state[state.obj.rid]
 
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+            # Status-code aborts also arrive through _handle_batch_output, which
+            # already released the lease and deleted the state — the finalizer's
+            # idempotency is what prevents the counter from going negative here.
+            self._finalize_lora_lease(state)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2111,20 +2186,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, prefix: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         state = None if abort_all else self.rid_to_state.get(rid)
         if not abort_all:
-            if state is not None:
+            if prefix:
+                if get_serving().tokenizer_worker_num == 1 and not any(
+                    r.startswith(rid) for r in self.rid_to_state
+                ):
+                    return
+            elif state is not None:
                 if state.abort_sent:
                     return
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        # A matching request can still be tokenizer-held: rid_to_state is
+        # populated in _init_req_state, several awaits (pause gate,
+        # model_update_lock, tokenization) before the scheduler learns the rid
+        # in _send_one_request. The scheduler-side abort cannot match those, so
+        # flag them here; the dispatch path resolves flagged requests as
+        # aborted instead of sending them. Already-dispatched requests are
+        # unaffected (the flag is only read at dispatch).
+        for tracked_rid, tracked_state in self.rid_to_state.items():
+            if abort_all or (
+                tracked_rid.startswith(rid) if prefix else tracked_rid == rid
+            ):
+                tracked_state.abort_before_dispatch = True
+        req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
@@ -2628,8 +2722,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                self._finalize_lora_lease(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3427,6 +3520,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if state.prompt_token_ids is not None:
             out["prompt_token_ids"] = state.prompt_token_ids
+        # This abort echo is the scheduler-side terminal ACK for queued,
+        # tokenizer-held, and disagg-retracted requests — none of them reach
+        # _handle_batch_output, so this is their only lease-release point.
+        self._finalize_lora_lease(self.rid_to_state.get(recv_obj.rid))
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3548,18 +3645,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         unregistered_loras = await self.lora_registry.get_unregistered_loras(
             unique_lora_paths
         )
+        backfill_paths = obj.lora_backfill_paths or {}
         for lora_path in unregistered_loras:
             if lora_path is None:
                 continue
 
-            if lora_path not in self.lora_ref_cache:
+            if lora_path in self._pending_lora_publications:
+                # a staged session is streaming this name; a disk load now would give it two identities
                 raise ValueError(
-                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
-                    f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    f"LoRA adapter '{lora_path}' is awaiting publication and "
+                    "cannot be served or backfilled yet."
                 )
+            if lora_path not in self.lora_ref_cache:
+                # a request-carried path lets a fresh or restarted engine serve any published version
+                if lora_path in backfill_paths:
+                    self.lora_ref_cache[lora_path] = LoRARef(
+                        lora_name=lora_path,
+                        lora_path=backfill_paths[lora_path],
+                        pinned=False,
+                    )
+                else:
+                    raise ValueError(
+                        f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                        f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    )
 
-            logger.info(f"Reloading evicted adapter: {lora_path}")
             new_lora_ref = self.lora_ref_cache[lora_path]
+            if not new_lora_ref.reloadable:
+                raise ValueError(
+                    f"LoRA adapter '{lora_path}' was loaded over the wire "
+                    f"(lora_path={new_lora_ref.lora_path!r}) and has no disk "
+                    "artifact to reload from; it must be re-pushed by the "
+                    "trainer instead of implicitly reloaded."
+                )
+            logger.info(f"Reloading evicted adapter: {lora_path}")
             load_result = await self.load_lora_adapter(
                 LoadLoRAAdapterReqInput(
                     lora_name=new_lora_ref.lora_name,
@@ -3645,6 +3764,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Failed to abort request %s during cleanup", rid
                         )
                 else:
+                    # A failed/partial dispatch never produces a scheduler
+                    # terminal for this rid, so release the LoRA lease here.
+                    self._finalize_lora_lease(state)
                     del self.rid_to_state[rid]
             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
             if dispatch_ready is not None:

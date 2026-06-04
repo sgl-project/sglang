@@ -154,8 +154,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
@@ -163,6 +161,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    RegisterLoRAAdapterReqInput,
+    RegisterLoRAAdapterReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1802,10 +1802,7 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
-                (
-                    LoadLoRAAdapterFromTensorsReqInput,
-                    self.load_lora_adapter_from_tensors,
-                ),
+                (RegisterLoRAAdapterReqInput, self.register_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
@@ -5788,20 +5785,22 @@ class Scheduler(
         result = self.tp_worker.load_lora_adapter(recv_req)
         return result
 
-    def load_lora_adapter_from_tensors(
-        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
-    ) -> LoadLoRAAdapterFromTensorsReqOutput:
-        """In-place loading a new lora adapter from serialized tensors."""
-
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-        return result
-
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
+        return result
+
+    def register_lora_adapter(
+        self, recv_req: RegisterLoRAAdapterReqInput
+    ) -> RegisterLoRAAdapterReqOutput:
+        """Create-or-refresh a LoRA adapter's identity and config (weights zeroed)."""
+
+        result = self.tp_worker.register_lora_adapter(recv_req)
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
         return result
 
     def init_weights_send_group_for_remote_instance(

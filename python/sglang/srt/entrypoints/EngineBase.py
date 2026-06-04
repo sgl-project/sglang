@@ -46,12 +46,12 @@ class EngineBase(ABC):
         pass
 
     @abstractmethod
-    def begin_weight_update(self, selector: str = "all"):
+    def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session; update_weights_from_* must run inside one."""
         pass
 
     @abstractmethod
-    def end_weight_update(self):
+    def end_weight_update(self, expected_lora_checksums: Optional[Dict] = None):
         """Close the weight-update session and finalize quantized weights."""
         pass
 

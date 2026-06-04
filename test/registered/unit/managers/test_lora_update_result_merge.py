@@ -20,9 +20,9 @@ from unittest.mock import AsyncMock, Mock
 
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.io_struct import (
-    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     LoRAUpdateOutput,
+    RegisterLoRAAdapterReqInput,
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.tokenizer_control_mixin import (
@@ -89,13 +89,14 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
         """Rejected duplicates must keep the original adapter's unload ID;
         fresh partial loads must remain cleanable via their new ID."""
 
-        async def scenario(from_tensors, duplicate):
+        async def scenario(from_stream, duplicate):
             original = LoRARef(lora_name="a", lora_path="path", pinned=False)
             manager = TokenizerControlMixin()
             manager.auto_create_handle_loop = Mock()
             manager.lora_update_lock = asyncio.Lock()
             manager.lora_registry = LoRARegistry([original] if duplicate else [])
             manager.pending_lora_unloads = {}
+            manager._pending_lora_publications = {}
             manager.lora_ref_cache = {}
             replies = (
                 [_err("already loaded", {"a": "path"})]
@@ -105,11 +106,9 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
             manager.update_lora_adapter_communicator = AsyncMock(
                 side_effect=[replies, [_ok()]]
             )
-            if from_tensors:
-                request = LoadLoRAAdapterFromTensorsReqInput(
-                    lora_name="a", config_dict={}, serialized_named_tensors=[b""]
-                )
-                result = await manager.load_lora_adapter_from_tensors(request)
+            if from_stream:
+                request = RegisterLoRAAdapterReqInput(lora_name="a", config_dict={})
+                result = await manager.load_lora_adapter_from_stream(request)
             else:
                 request = LoadLoRAAdapterReqInput(lora_name="a", lora_path="path")
                 result = await manager.load_lora_adapter(request)
@@ -136,10 +135,10 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
             self.assertEqual(manager.pending_lora_unloads, {})
 
         with get_context().override_server_args(enable_lora=True, dp_size=1):
-            for from_tensors in (False, True):
+            for from_stream in (False, True):
                 for duplicate in (True, False):
-                    with self.subTest(from_tensors=from_tensors, duplicate=duplicate):
-                        asyncio.run(scenario(from_tensors, duplicate))
+                    with self.subTest(from_stream=from_stream, duplicate=duplicate):
+                        asyncio.run(scenario(from_stream, duplicate))
 
 
 if __name__ == "__main__":
