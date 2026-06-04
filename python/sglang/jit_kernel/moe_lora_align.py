@@ -4,15 +4,26 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+def _lora_pdl_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_LORA_ENABLE_PDL.get() and is_arch_support_pdl()
+
+
 @cache_once
 def _jit_moe_align_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+    args = make_cpp_args(dtype, _lora_pdl_enabled())
     return load_jit(
         "moe_lora_align_block_size",
         *args,

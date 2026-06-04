@@ -2,7 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -35,6 +38,7 @@ def _sgemm_lora_a_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """
     Computes a segmented batched matrix multiplication for the LoRA A matrix.
@@ -92,6 +96,9 @@ def _sgemm_lora_a_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
@@ -109,6 +116,9 @@ def _sgemm_lora_a_kernel(
 
         x_ptrs += BLOCK_K * x_stride_1
         w_ptrs += BLOCK_K * w_stride_2
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     # Store result to output matrix
     partial_sum = partial_sum.to(x.dtype.element_ty)
@@ -153,6 +163,7 @@ def sgemm_lora_a_fwd(
     )
 
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     output = torch.empty((S, R), device=x.device, dtype=x.dtype)
     _sgemm_lora_a_kernel[grid](
@@ -178,5 +189,7 @@ def sgemm_lora_a_fwd(
         BLOCK_S,
         BLOCK_R,
         BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return output

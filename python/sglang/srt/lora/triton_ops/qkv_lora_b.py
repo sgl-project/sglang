@@ -2,7 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -38,6 +41,7 @@ def _qkv_lora_b_kernel(
     BLOCK_K: tl.constexpr,
     # For fused output scaling
     scalings,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """
     This kernel packs 3 sgemms (q/k/v) into a single kernel. The multiplication
@@ -107,6 +111,9 @@ def _qkv_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
@@ -124,6 +131,9 @@ def _qkv_lora_b_kernel(
 
         x_ptrs += BLOCK_K * x_stride_1
         w_ptrs += BLOCK_K * w_stride_2
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     # Store result to output matrix
     partial_sum *= scaling
@@ -187,6 +197,7 @@ def qkv_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _qkv_lora_b_kernel[grid_b](
         x,
         qkv_lora_b,
@@ -211,6 +222,8 @@ def qkv_lora_b_fwd(
         BLOCK_OUT,
         BLOCK_R,
         batch_info.scalings,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
 
     return output

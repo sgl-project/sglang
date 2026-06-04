@@ -272,7 +272,7 @@ SGL_DEVICE void _count_and_sort_expert_tokens(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool kUsePDL>
 __global__ void moe_lora_align_block_size_kernel(
     scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ seg_indptr,
@@ -296,6 +296,8 @@ __global__ void moe_lora_align_block_size_kernel(
     int32_t* lora_ids,
     int32_t* __restrict__ token_mask,
     bool has_expert_map) {
+  device::PDLWaitPrimary<kUsePDL>();
+
   int lora_idx = blockIdx.x / 2;
   int lora_id = lora_ids[lora_idx];
   if (lora_id == -1 || adapter_enabled[lora_id] == 0) {
@@ -350,9 +352,11 @@ __global__ void moe_lora_align_block_size_kernel(
       topk_num,
       &token_mask[(lora_id * num_tokens)],
       has_expert_map);
+
+  device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool kUsePDL>
 __global__ void lora_count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
@@ -366,6 +370,8 @@ __global__ void lora_count_and_sort_expert_tokens_kernel(
     int32_t* lora_ids,
     int32_t* adapter_enabled,
     bool has_expert_map) {
+  device::PDLWaitPrimary<kUsePDL>();
+
   int lora_idx = blockIdx.x;
   int lora_id = lora_ids[lora_idx];
   if (lora_id == -1 || adapter_enabled[lora_id] == 0) {
@@ -386,9 +392,11 @@ __global__ void lora_count_and_sort_expert_tokens_kernel(
       lora_id,
       topk_num,
       has_expert_map);
+
+  device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename scalar_t, int32_t fill_threads>
+template <typename scalar_t, int32_t fill_threads, bool kUsePDL>
 __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
     scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ seg_indptr,
@@ -409,6 +417,8 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
     int32_t* lora_ids,
     int32_t* token_mask,
     bool has_expert_map) {
+  device::PDLWaitPrimary<kUsePDL>();
+
   int lora_idx = blockIdx.x;
   int lora_id = lora_ids[lora_idx];
   if (lora_id == -1 || adapter_enabled[lora_id] == 0) {
@@ -463,13 +473,15 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
       topk_num,
       &token_mask[(lora_id * num_tokens)],
       has_expert_map);
+
+  device::PDLTriggerSecondary<kUsePDL>();
 }
 
 }  // namespace moe
 
 namespace {
 
-template <typename scalar_t>
+template <typename scalar_t, bool kUsePDL>
 struct MoeLoraAlignBlockSizeKernel {
   static void
   run(tvm::ffi::TensorView topk_ids,
@@ -528,30 +540,31 @@ struct MoeLoraAlignBlockSizeKernel {
       constexpr int32_t fill_threads = 256;
 
       dim3 blockDim(num_thread + fill_threads);
-      auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
+      auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads, kUsePDL>;
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
 
-      LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
-          kernel,
-          static_cast<scalar_t*>(topk_ids.data_ptr()),
-          static_cast<int32_t*>(seg_indptr.data_ptr()),
-          static_cast<int32_t*>(req_to_lora.data_ptr()),
-          num_reqs,
-          block_size,
-          expert_map_ptr,
-          num_experts,
-          max_loras,
-          topk_ids.numel(),
-          max_num_tokens_padded,
-          max_num_m_blocks,
-          static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-          static_cast<int32_t*>(expert_ids.data_ptr()),
-          topk_num,
-          static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
-          static_cast<int32_t*>(adapter_enabled.data_ptr()),
-          static_cast<int32_t*>(lora_ids.data_ptr()),
-          token_mask_ptr,
-          has_expert_map);
+      LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)
+          .enable_pdl(kUsePDL)(
+              kernel,
+              static_cast<scalar_t*>(topk_ids.data_ptr()),
+              static_cast<int32_t*>(seg_indptr.data_ptr()),
+              static_cast<int32_t*>(req_to_lora.data_ptr()),
+              num_reqs,
+              block_size,
+              expert_map_ptr,
+              num_experts,
+              max_loras,
+              topk_ids.numel(),
+              max_num_tokens_padded,
+              max_num_m_blocks,
+              static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+              static_cast<int32_t*>(expert_ids.data_ptr()),
+              topk_num,
+              static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
+              static_cast<int32_t*>(adapter_enabled.data_ptr()),
+              static_cast<int32_t*>(lora_ids.data_ptr()),
+              token_mask_ptr,
+              has_expert_map);
 
     } else {
       int num_thread = 1024;
@@ -560,35 +573,36 @@ struct MoeLoraAlignBlockSizeKernel {
 
       size_t shared_mem_size = num_warps * WARP_SIZE * sizeof(int32_t);
 
-      auto align_kernel = moe::moe_lora_align_block_size_kernel<scalar_t>;
+      auto align_kernel = moe::moe_lora_align_block_size_kernel<scalar_t, kUsePDL>;
 
       // launch two threadblocks for each lora
       // blockIdx.x % 2 == 0: counting experts and aligning
       // blockIdx.x % 2 == 1: filling sorted_token_ids
-      LaunchKernel(dim3(max_loras * 2), blockDim, stream, shared_mem_size)(
-          align_kernel,
-          static_cast<scalar_t*>(topk_ids.data_ptr()),
-          static_cast<int32_t*>(seg_indptr.data_ptr()),
-          static_cast<int32_t*>(req_to_lora.data_ptr()),
-          num_reqs,
-          block_size,
-          expert_map_ptr,
-          num_experts,
-          max_loras,
-          topk_ids.numel(),
-          max_num_tokens_padded,
-          max_num_m_blocks,
-          static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-          static_cast<int32_t*>(expert_ids.data_ptr()),
-          topk_num,
-          static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
-          static_cast<int32_t*>(adapter_enabled.data_ptr()),
-          static_cast<int32_t*>(cumsum_buffer.data_ptr()),
-          WARP_SIZE,
-          padded_num_experts,
-          static_cast<int32_t*>(lora_ids.data_ptr()),
-          token_mask_ptr,
-          has_expert_map);
+      LaunchKernel(dim3(max_loras * 2), blockDim, stream, shared_mem_size)
+          .enable_pdl(kUsePDL)(
+              align_kernel,
+              static_cast<scalar_t*>(topk_ids.data_ptr()),
+              static_cast<int32_t*>(seg_indptr.data_ptr()),
+              static_cast<int32_t*>(req_to_lora.data_ptr()),
+              num_reqs,
+              block_size,
+              expert_map_ptr,
+              num_experts,
+              max_loras,
+              topk_ids.numel(),
+              max_num_tokens_padded,
+              max_num_m_blocks,
+              static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+              static_cast<int32_t*>(expert_ids.data_ptr()),
+              topk_num,
+              static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
+              static_cast<int32_t*>(adapter_enabled.data_ptr()),
+              static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+              WARP_SIZE,
+              padded_num_experts,
+              static_cast<int32_t*>(lora_ids.data_ptr()),
+              token_mask_ptr,
+              has_expert_map);
 
       const int block_threads = std::min(256, (int)num_thread);
       const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
@@ -597,22 +611,23 @@ struct MoeLoraAlignBlockSizeKernel {
       const int actual_blocks = std::min(num_blocks, max_blocks);
 
       dim3 gridDims(max_loras, actual_blocks);
-      auto sort_kernel = moe::lora_count_and_sort_expert_tokens_kernel<scalar_t>;
+      auto sort_kernel = moe::lora_count_and_sort_expert_tokens_kernel<scalar_t, kUsePDL>;
 
-      LaunchKernel(gridDims, dim3(block_threads), stream)(
-          sort_kernel,
-          static_cast<scalar_t*>(topk_ids.data_ptr()),
-          static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-          static_cast<int32_t*>(cumsum_buffer.data_ptr()),
-          expert_map_ptr,
-          topk_ids.numel(),
-          num_experts,
-          max_num_tokens_padded,
-          topk_num,
-          token_mask_ptr,
-          static_cast<int32_t*>(lora_ids.data_ptr()),
-          static_cast<int32_t*>(adapter_enabled.data_ptr()),
-          has_expert_map);
+      LaunchKernel(gridDims, dim3(block_threads), stream)
+          .enable_pdl(kUsePDL)(
+              sort_kernel,
+              static_cast<scalar_t*>(topk_ids.data_ptr()),
+              static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+              static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+              expert_map_ptr,
+              topk_ids.numel(),
+              num_experts,
+              max_num_tokens_padded,
+              topk_num,
+              token_mask_ptr,
+              static_cast<int32_t*>(lora_ids.data_ptr()),
+              static_cast<int32_t*>(adapter_enabled.data_ptr()),
+              has_expert_map);
     }
   }
 };
