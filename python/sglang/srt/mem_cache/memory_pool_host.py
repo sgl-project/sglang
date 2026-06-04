@@ -30,10 +30,7 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
-from sglang.jit_kernel.hisparse import (
-    backup_cache_to_host_dsv4_mla,
-    load_cache_from_host_to_device_dsv4_mla,
-)
+from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     KVCache,
@@ -2021,11 +2018,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"layer_first/kernel, got {self.layout}/{io_backend}"
             )
         assert self.data_ptrs is not None
-        backup_cache_to_host_dsv4_mla(
-            device_ptrs=self.device_ptrs,
-            host_ptrs=self.data_ptrs,
-            device_indices=device_indices.to(dtype=torch.int64),
-            host_indices=host_indices.to(dtype=torch.int64),
+        transfer_cache_dsv4_mla(
+            src_ptrs=self.device_ptrs,
+            dst_ptrs=self.data_ptrs,
+            src_indices=device_indices.to(dtype=torch.int64),
+            dst_indices=host_indices.to(dtype=torch.int64),
         )
 
     def load_to_device_all_layer(
@@ -2046,11 +2043,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"layer_first/kernel, got {self.layout}/{io_backend}"
             )
         assert self.data_ptrs is not None
-        load_cache_from_host_to_device_dsv4_mla(
-            host_ptrs=self.data_ptrs,
-            device_ptrs=self.device_ptrs,
-            host_indices=host_indices.to(dtype=torch.int64),
-            device_indices=device_indices.to(dtype=torch.int64),
+        transfer_cache_dsv4_mla(
+            src_ptrs=self.data_ptrs,
+            dst_ptrs=self.device_ptrs,
+            src_indices=host_indices.to(dtype=torch.int64),
+            dst_indices=device_indices.to(dtype=torch.int64),
         )
 
     def get_size_per_token(self):

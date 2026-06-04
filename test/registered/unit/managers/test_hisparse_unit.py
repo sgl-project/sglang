@@ -34,105 +34,6 @@ MAX_NUM_REQS = 8
 MAX_CONTEXT_LEN = 2048
 
 
-class TestDeepSeekV4PagedHostPoolMixin(unittest.TestCase):
-    def _make_pool(self):
-        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
-
-        device_buffers = [
-            torch.empty((4, 128), dtype=torch.uint8, device="cpu") for _ in range(2)
-        ]
-        return DeepSeekV4PagedHostPool(
-            pool_name="test_dsv4_c4",
-            device_buffers=device_buffers,
-            item_bytes=128,
-            num_host_pages=4,
-            slot_page_size=4,
-            layout="layer_first",
-            pin_memory=False,
-        )
-
-    def test_page_allocation_free_and_allocated_index_recovery(self):
-        pool = self._make_pool()
-        req_to_host_pool = torch.full((2, 20), -1, dtype=torch.int64)
-        allocated_len = torch.zeros(2, dtype=torch.int64)
-
-        first = pool.alloc_paged_token_slots(
-            req_to_host_pool,
-            allocated_len,
-            req_pool_idx=0,
-            start_pos=0,
-            num_tokens=5,
-        )
-        self.assertEqual(first.tolist(), [0, 1, 2, 3, 4])
-        self.assertEqual(int(allocated_len[0]), 8)
-        self.assertEqual(pool.available_size(), 8)
-
-        same_page = pool.alloc_paged_token_slots(
-            req_to_host_pool,
-            allocated_len,
-            req_pool_idx=0,
-            start_pos=5,
-            num_tokens=2,
-        )
-        self.assertEqual(same_page.tolist(), [5, 6])
-        self.assertEqual(int(allocated_len[0]), 8)
-        self.assertEqual(pool.available_size(), 8)
-
-        next_page = pool.alloc_paged_token_slots(
-            req_to_host_pool,
-            allocated_len,
-            req_pool_idx=0,
-            start_pos=7,
-            num_tokens=3,
-        )
-        self.assertEqual(next_page.tolist(), [7, 8, 9])
-        self.assertEqual(int(allocated_len[0]), 12)
-        self.assertEqual(pool.available_size(), 4)
-
-        allocated = pool.allocated_host_indices(req_to_host_pool, 0, 10)
-        self.assertEqual(allocated.tolist(), list(range(12)))
-        pool.free(allocated)
-        self.assertEqual(pool.available_size(), 16)
-
-    def test_contiguous_buf_infos_are_per_layer_rows(self):
-        pool = self._make_pool()
-        data_ptrs, data_lens, item_lens = pool.get_contiguous_buf_infos()
-        self.assertEqual(len(data_ptrs), 2)
-        self.assertEqual(data_lens, [4 * 128, 4 * 128])
-        self.assertEqual(item_lens, [128, 128])
-
-    def test_page_allocation_can_reserve_dummy_page_zero(self):
-        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
-
-        device_buffers = [
-            torch.empty((5, 128), dtype=torch.uint8, device="cpu") for _ in range(2)
-        ]
-        pool = DeepSeekV4PagedHostPool(
-            pool_name="test_dsv4_c4_aligned",
-            device_buffers=device_buffers,
-            item_bytes=128,
-            num_host_pages=5,
-            slot_page_size=4,
-            layout="layer_first",
-            pin_memory=False,
-            reserve_page_zero=True,
-        )
-        req_to_host_pool = torch.full((2, 20), -1, dtype=torch.int64)
-        allocated_len = torch.zeros(2, dtype=torch.int64)
-
-        first = pool.alloc_paged_token_slots(
-            req_to_host_pool,
-            allocated_len,
-            req_pool_idx=0,
-            start_pos=0,
-            num_tokens=5,
-        )
-
-        self.assertEqual(first.tolist(), [4, 5, 6, 7, 8])
-        self.assertEqual(int(allocated_len[0]), 8)
-        self.assertEqual(pool.available_size(), 8)
-
-
 @unittest.skipIf(not is_cuda(), "CUDA is required for HiSparseCoordinator streams")
 class TestDeepSeekV4HiSparseCoordinatorHostPool(unittest.TestCase):
     @classmethod
@@ -189,6 +90,13 @@ class TestDeepSeekV4HiSparseCoordinatorHostPool(unittest.TestCase):
 
         host_len = coordinator.host_token_len(260)
         self.assertEqual(host_len, 65)
+        data_ptrs, data_lens, item_lens = (
+            coordinator.mem_pool_host.get_contiguous_buf_infos()
+        )
+        self.assertEqual(len(data_ptrs), 2)
+        self.assertEqual(data_lens, [5 * 128, 5 * 128])
+        self.assertEqual(item_lens, [128, 128])
+
         host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
             coordinator.req_to_host_pool,
             coordinator.req_to_host_pool_allocated_len,
@@ -200,6 +108,13 @@ class TestDeepSeekV4HiSparseCoordinatorHostPool(unittest.TestCase):
         self.assertEqual(host_indices[:3].cpu().tolist(), [64, 65, 66])
         self.assertEqual((host_indices.cpu().numpy()[::64] // 64).tolist(), [1, 2])
         self.assertEqual(int(coordinator.req_to_host_pool_allocated_len[0]), 128)
+        allocated = coordinator.mem_pool_host.allocated_host_indices(
+            coordinator.req_to_host_pool, 0, host_len
+        )
+        self.assertEqual(allocated.numel(), 128)
+        self.assertEqual(coordinator.mem_pool_host.available_size(), 128)
+        coordinator.mem_pool_host.free(allocated)
+        self.assertEqual(coordinator.mem_pool_host.available_size(), 256)
 
 
 def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):

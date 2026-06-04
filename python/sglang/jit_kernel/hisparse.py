@@ -72,40 +72,6 @@ def transfer_cache_dsv4_mla(
     )
 
 
-def backup_cache_to_host_dsv4_mla(
-    device_ptrs: torch.Tensor,
-    host_ptrs: torch.Tensor,
-    device_indices: torch.Tensor,
-    host_indices: torch.Tensor,
-    block_size: int = 1024,
-) -> None:
-    """Back up DSv4 C4 tokens from GPU page rows to host page rows."""
-    transfer_cache_dsv4_mla(
-        src_ptrs=device_ptrs,
-        dst_ptrs=host_ptrs,
-        src_indices=device_indices,
-        dst_indices=host_indices,
-        block_size=block_size,
-    )
-
-
-def load_cache_from_host_to_device_dsv4_mla(
-    host_ptrs: torch.Tensor,
-    device_ptrs: torch.Tensor,
-    host_indices: torch.Tensor,
-    device_indices: torch.Tensor,
-    block_size: int = 1024,
-) -> None:
-    """Load DSv4 C4 tokens from paged host rows into paged GPU C4 rows."""
-    transfer_cache_dsv4_mla(
-        src_ptrs=host_ptrs,
-        dst_ptrs=device_ptrs,
-        src_indices=host_indices,
-        dst_indices=device_indices,
-        block_size=block_size,
-    )
-
-
 def _load_cache_to_device_buffer_mla(
     *,
     is_dsv4_layout: bool,

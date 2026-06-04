@@ -226,9 +226,10 @@ class HiSparseCoordinator:
             0,
             prefill_len,
         )
-        host_transfer_indices = self._host_indices_for_transfer(
-            req.req_pool_idx, prefill_len
-        )
+        host_transfer_len = self._host_transfer_len(prefill_len)
+        host_transfer_indices = self.req_to_host_pool[
+            req.req_pool_idx, :host_transfer_len
+        ]
         device_transfer_indices = self._device_indices_for_transfer(device_indices)
 
         start_event = device_module.Event()
@@ -292,12 +293,6 @@ class HiSparseCoordinator:
         if self.is_dsv4_hisparse:
             return ((host_len + self.page_size - 1) // self.page_size) * self.page_size
         return host_len
-
-    def _host_indices_for_transfer(
-        self, req_pool_idx: int, host_len: int
-    ) -> torch.Tensor:
-        transfer_len = self._host_transfer_len(host_len)
-        return self.req_to_host_pool[req_pool_idx, :transfer_len]
 
     def _device_indices_for_transfer(
         self, device_indices: torch.Tensor
