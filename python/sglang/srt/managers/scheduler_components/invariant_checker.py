@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Deque,
     List,
     Optional,
     Tuple,
@@ -33,6 +35,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# When busy mem check is verbose (level > 1), keep the most recent messages in a
+# ring buffer and only flush them on a detected leak, instead of logging every
+# iteration.
+BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
@@ -52,6 +59,9 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
+    recent_busy_msgs: Deque[str] = field(
+        default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
+    )
 
     @staticmethod
     def _check_pool_invariant(
@@ -204,10 +214,17 @@ class SchedulerInvariantChecker:
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
 
+        # At verbose level (> 1), buffer per-iteration messages in a ring buffer
+        # and stay silent; only flush them when a leak is detected below.
         if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            logger.info(f"[Mem Check (BUSY)] {full_msg}")
+            self.recent_busy_msgs.append(f"[Mem Check (BUSY)] {full_msg}")
             if swa_msg:
-                logger.info(f"[Mem Check (BUSY)] {swa_msg}")
+                self.recent_busy_msgs.append(f"[Mem Check (BUSY)] {swa_msg}")
+
+        if full_leak or swa_leak:
+            for msg in self.recent_busy_msgs:
+                logger.info(msg)
+
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 
