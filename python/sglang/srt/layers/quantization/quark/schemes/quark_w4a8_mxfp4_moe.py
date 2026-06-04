@@ -346,7 +346,18 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            # gpt-oss populates `gemm1_clamp_limit` (renamed in
+            # `models/gpt_oss.py` from `config.swiglu_limit`); DSv4 populates
+            # `swiglu_limit` directly. Accept either so the AITER `gate_mode`
+            # + `swiglu_limit` dispatch block in `moe_runner/aiter.py` (gated
+            # on `quant_info.swiglu_limit > 0`) is actually entered for both
+            # families. Mirrors the same fix PR #27201 applied to the native
+            # `Mxfp4MoEMethod.apply` path.
+            swiglu_limit=(
+                self.moe_runner_config.gemm1_clamp_limit
+                or self.moe_runner_config.swiglu_limit
+                or 0.0
+            ),
         )
         return self.runner.run(
             dispatch_output._replace(hidden_states=x_padded), quant_info
