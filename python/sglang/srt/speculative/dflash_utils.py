@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -10,13 +9,13 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
-DFLASH_PREFILL_REFILL_TARGET_ENV = "SGLANG_DFLASH_PREFILL_REFILL_TARGET"
 
 logger = logging.getLogger(__name__)
 
@@ -57,34 +56,16 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
-def get_default_dflash_prefill_refill_target(max_running_requests: int) -> int:
+def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
     """Choose how many free running-request slots DFlash waits for before refill."""
+    override = envs.SGLANG_DFLASH_PREFILL_REFILL_TARGET.get()
+    if override is not None:
+        return override
+
     max_running_requests = max(0, int(max_running_requests))
     if max_running_requests < 8:
         return 1
     return min(4, max(2, (max_running_requests + 5) // 6))
-
-
-def get_dflash_prefill_refill_target_override() -> Optional[int]:
-    env_value = os.getenv(DFLASH_PREFILL_REFILL_TARGET_ENV)
-    if env_value is None or not env_value.strip():
-        return None
-    try:
-        return int(env_value)
-    except ValueError:
-        logger.warning(
-            "Ignoring invalid %s=%r; using DFlash prefill refill heuristic.",
-            DFLASH_PREFILL_REFILL_TARGET_ENV,
-            env_value,
-        )
-        return None
-
-
-def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
-    override = get_dflash_prefill_refill_target_override()
-    if override is not None:
-        return override
-    return get_default_dflash_prefill_refill_target(max_running_requests)
 
 
 def should_delay_dflash_prefill_for_batching(
