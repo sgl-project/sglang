@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+from array import array
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Optional
+
+import msgspec
+import numpy as np
+
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.sampling.sampling_params import SamplingParams
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
+
+
+logger = logging.getLogger(__name__)
+
+SELF_BENCHMARK_REQ_PREFIX = "__sgl_bench_"
+
+
+@dataclass
+class SelfBenchmarkConfig:
+    mode: str
+    prefill_isl_granularity: int = 16
+    decode_length_granularity: int = 6
+    decode_batch_size_granularity: int = 6
+    warmup_iterations: int = 5
+    output_path: str = "/tmp/benchmark_results.json"
+    timeout: int = 300
+
+
+@dataclass
+class BenchmarkPoint:
+    point_type: str
+    isl: int = 0
+    context_length: int = 0
+    batch_size: int = 0
+
+
+@dataclass
+class BenchmarkPointResult:
+    point: BenchmarkPoint
+    fpms: list = field(default_factory=list)
+
+
+class BenchmarkPhase(Enum):
+    WARMUP = "warmup"
+    SWEEP = "sweep"
+    DONE = "done"
+
+
+class SelfBenchmark:
+    """Scheduler-local self benchmark that reuses normal SGLang request paths."""
+
+    def __init__(self, scheduler: Scheduler):
+        self.scheduler = scheduler
+        self.config = SelfBenchmarkConfig(
+            mode=scheduler.server_args.benchmark_mode,
+            prefill_isl_granularity=scheduler.server_args.benchmark_prefill_granularity,
+            decode_length_granularity=(
+                scheduler.server_args.benchmark_decode_length_granularity
+            ),
+            decode_batch_size_granularity=(
+                scheduler.server_args.benchmark_decode_batch_granularity
+            ),
+            warmup_iterations=scheduler.server_args.benchmark_warmup_iterations,
+            output_path=scheduler.server_args.benchmark_output_path,
+            timeout=scheduler.server_args.benchmark_timeout,
+        )
+        self.phase = BenchmarkPhase.WARMUP
+        self._grid: list[BenchmarkPoint] = []
+        self._results: list[BenchmarkPointResult] = []
+        self._current: Optional[BenchmarkPointResult] = None
+        self._seq = 0
+        self._warmup_remaining = max(0, self.config.warmup_iterations)
+        self._grid_index = 0
+        self._write_results = bool(getattr(scheduler, "enable_fpm", False))
+        self._build_grid()
+        if self._warmup_remaining == 0:
+            self.phase = BenchmarkPhase.SWEEP
+        logger.info("Self-benchmark enabled: %s", self.config)
+
+    @property
+    def active(self) -> bool:
+        return self.phase != BenchmarkPhase.DONE
+
+    def maybe_schedule_next(self) -> None:
+        if not self.active or self._current is not None or self._has_inflight_work():
+            return
+
+        if self.phase == BenchmarkPhase.WARMUP:
+            if (
+                self._inject_prefill(
+                    prompt_len=min(256, self._max_prefill_isl()), max_tokens=0
+                )
+                == 0
+            ):
+                self.phase = BenchmarkPhase.SWEEP
+            return
+
+        if self._grid_index >= len(self._grid):
+            self._finish()
+            return
+
+        point = self._grid[self._grid_index]
+        self._current = BenchmarkPointResult(point=point)
+        if point.point_type == "prefill":
+            injected = self._inject_prefill(prompt_len=point.isl, max_tokens=0)
+        else:
+            injected = self._inject_decode(
+                context_length=point.context_length, batch_size=point.batch_size
+            )
+
+        if injected == 0:
+            logger.warning("Skipping benchmark point with no valid requests: %s", point)
+            self._current = None
+            self._grid_index += 1
+
+    def observe_forward_pass(
+        self, batch: ScheduleBatch, fpm: Optional[ForwardPassMetrics]
+    ) -> None:
+        if not self.active:
+            return
+        if getattr(batch.forward_mode, "is_prebuilt", lambda: False)():
+            return
+
+        point_type = self._scheduled_point_type(batch, fpm)
+        if point_type is None:
+            return
+
+        if self.phase == BenchmarkPhase.WARMUP:
+            self._warmup_remaining -= 1
+            if self._warmup_remaining <= 0:
+                self.phase = BenchmarkPhase.SWEEP
+            return
+
+        if self._current is None:
+            return
+
+        current_type = self._current.point.point_type
+        if current_type == "decode" and point_type == "prefill":
+            return
+        if point_type != current_type:
+            return
+
+        if fpm is not None:
+            self._current.fpms.append(msgspec.to_builtins(fpm))
+        self._results.append(self._current)
+        self._current = None
+        self._grid_index += 1
+
+    def _build_grid(self) -> None:
+        if self.config.mode in ("prefill", "agg"):
+            self._build_prefill_grid()
+        if self.config.mode in ("decode", "agg"):
+            self._build_decode_grid()
+        logger.info("Self-benchmark grid: %d point(s)", len(self._grid))
+
+    def _build_prefill_grid(self) -> None:
+        n = max(1, self.config.prefill_isl_granularity)
+        max_isl = self._max_prefill_isl()
+        if max_isl < 1:
+            return
+        min_isl = min(10, max_isl)
+        for isl in np.unique(np.linspace(min_isl, max_isl, n, dtype=int)):
+            self._grid.append(BenchmarkPoint(point_type="prefill", isl=int(isl)))
+
+    def _build_decode_grid(self) -> None:
+        n_len = max(1, self.config.decode_length_granularity)
+        n_bs = max(1, self.config.decode_batch_size_granularity)
+        max_ctx = max(1, self.scheduler.max_req_input_len)
+        ctx_lens = np.unique(np.linspace(1, max_ctx, n_len, dtype=int))
+        for ctx_len_raw in ctx_lens:
+            ctx_len = int(ctx_len_raw)
+            max_bs = self._max_batch_size_for_context(ctx_len)
+            if max_bs < 1:
+                continue
+            for bs in np.unique(np.linspace(1, max_bs, n_bs, dtype=int)):
+                self._grid.append(
+                    BenchmarkPoint(
+                        point_type="decode",
+                        context_length=ctx_len,
+                        batch_size=int(bs),
+                    )
+                )
+
+    def _max_prefill_isl(self) -> int:
+        return max(
+            1,
+            min(
+                self.scheduler.max_req_input_len,
+                self.scheduler.max_total_num_tokens - 2,
+            ),
+        )
+
+    def _max_batch_size_for_context(self, context_length: int) -> int:
+        max_running = max(1, getattr(self.scheduler, "max_running_requests", 1))
+        max_tokens = max(1, getattr(self.scheduler, "max_total_num_tokens", 1))
+        token_capped = max(1, max_tokens // max(1, context_length + 2))
+        return min(max_running, token_capped)
+
+    def _inject_prefill(self, prompt_len: int, max_tokens: int) -> int:
+        return self._inject_requests(prompt_len=prompt_len, max_tokens=max_tokens, n=1)
+
+    def _inject_decode(self, context_length: int, batch_size: int) -> int:
+        # In normal aggregated serving this performs prefill then one decode step.
+        # In disaggregated decode mode the fake bootstrap path skips real transfer.
+        return self._inject_requests(
+            prompt_len=context_length, max_tokens=2, n=batch_size
+        )
+
+    def _inject_requests(self, prompt_len: int, max_tokens: int, n: int) -> int:
+        prompt_len = max(1, min(prompt_len, self.scheduler.max_req_input_len))
+        token_id = self._dummy_token_id()
+        injected = 0
+        for _ in range(n):
+            rid = f"{SELF_BENCHMARK_REQ_PREFIX}{self._seq}"
+            self._seq += 1
+            req = Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q", [token_id] * prompt_len),
+                sampling_params=SamplingParams(
+                    max_new_tokens=max_tokens,
+                    temperature=0.0,
+                    ignore_eos=True,
+                ),
+                return_logprob=False,
+                top_logprobs_num=0,
+                token_ids_logprob=[],
+                stream=False,
+                eos_token_ids=self.scheduler.model_config.hf_eos_token_id,
+                bootstrap_host=FAKE_BOOTSTRAP_HOST,
+                bootstrap_port=self.scheduler.server_args.disaggregation_bootstrap_port,
+                bootstrap_room=self._seq,
+                disagg_mode=self.scheduler.disaggregation_mode,
+                vocab_size=self.scheduler.model_config.vocab_size,
+                metrics_collector=None,
+                extra_key=rid,
+            )
+            req.tokenizer = self.scheduler.tokenizer
+            req.suppress_output = True
+            self.scheduler.init_req_max_new_tokens(req)
+            error_msg = validate_input_length(
+                req,
+                self.scheduler.max_req_input_len,
+                self.scheduler.server_args.allow_auto_truncate,
+            )
+            if error_msg:
+                logger.warning("Skipping invalid benchmark request: %s", error_msg)
+                continue
+            self.scheduler._add_request_to_queue(req)
+            injected += 1
+        return injected
+
+    def _dummy_token_id(self) -> int:
+        vocab_size = getattr(self.scheduler.model_config, "vocab_size", None) or 1
+        return 0 if vocab_size > 0 else 0
+
+    def _has_inflight_work(self) -> bool:
+        result_queue = getattr(self.scheduler, "result_queue", None)
+        if result_queue:
+            return True
+        if getattr(self.scheduler, "waiting_queue", None):
+            return True
+        for queue_name in (
+            "disagg_prefill_bootstrap_queue",
+            "disagg_prefill_inflight_queue",
+            "disagg_decode_prealloc_queue",
+            "disagg_decode_transfer_queue",
+        ):
+            queue_owner = getattr(self.scheduler, queue_name, None)
+            if queue_owner is None:
+                continue
+            queue = getattr(queue_owner, "queue", None)
+            if queue:
+                return True
+        running = getattr(self.scheduler, "running_batch", None)
+        if running is not None and not running.is_empty():
+            return True
+        return False
+
+    def _scheduled_point_type(
+        self, batch: ScheduleBatch, fpm: Optional[ForwardPassMetrics]
+    ) -> Optional[str]:
+        if fpm is not None:
+            scheduled = fpm.scheduled_requests
+            if scheduled.num_decode_requests > 0:
+                return "decode"
+            if scheduled.num_prefill_requests > 0:
+                return "prefill"
+            return None
+        if batch.forward_mode.is_decode():
+            return "decode"
+        if batch.forward_mode.is_extend():
+            return "prefill"
+        return None
+
+    def _finish(self) -> None:
+        if self._write_results:
+            self._write_output()
+        self.phase = BenchmarkPhase.DONE
+        logger.info("Self-benchmark completed")
+
+    def _write_output(self) -> None:
+        output_path = self._rank_output_path(self.config.output_path)
+        output = {
+            "config": asdict(self.config),
+            "limits": {
+                "max_num_scheduled_tokens": getattr(
+                    self.scheduler, "max_prefill_tokens", None
+                ),
+                "max_num_running_reqs": getattr(
+                    self.scheduler, "max_running_requests", None
+                ),
+                "max_model_len": getattr(self.scheduler, "max_req_len", None),
+                "block_size": getattr(self.scheduler, "page_size", None),
+                "num_gpu_blocks": getattr(self.scheduler, "max_total_num_tokens", None),
+            },
+            "results": [
+                {"point": asdict(result.point), "fpms": result.fpms}
+                for result in self._results
+            ],
+        }
+        tmp = output_path + ".tmp"
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(output, f, indent=2)
+        os.replace(tmp, output_path)
+        logger.info(
+            "Self-benchmark results written to %s (%d point(s))",
+            output_path,
+            len(self._results),
+        )
+
+    def _rank_output_path(self, base_path: str) -> str:
+        dp_rank = (
+            self.scheduler.ps.dp_rank if self.scheduler.ps.dp_rank is not None else 0
+        )
+        if dp_rank == 0:
+            return base_path
+        stem, ext = os.path.splitext(base_path)
+        return f"{stem}_dp{dp_rank}{ext}"

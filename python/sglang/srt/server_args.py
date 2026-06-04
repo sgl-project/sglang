@@ -493,6 +493,13 @@ class ServerArgs:
     enable_forward_pass_metrics: bool = False
     forward_pass_metrics_worker_id: str = ""
     forward_pass_metrics_ipc_name: Optional[str] = None
+    benchmark_mode: Optional[Literal["prefill", "decode", "agg"]] = None
+    benchmark_prefill_granularity: int = 16
+    benchmark_decode_length_granularity: int = 6
+    benchmark_decode_batch_granularity: int = 6
+    benchmark_warmup_iterations: int = 5
+    benchmark_output_path: str = "/tmp/benchmark_results.json"
+    benchmark_timeout: int = 300
     enable_trace: bool = False
     trace_modules: str = "request"
     otlp_traces_endpoint: str = "localhost:4317"
@@ -889,6 +896,9 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args (model-independent).
         self._handle_asr_validation()
+
+        if self.benchmark_mode is not None:
+            self.enable_forward_pass_metrics = True
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -5254,6 +5264,52 @@ class ServerArgs:
             type=str,
             default=None,
             help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--benchmark-mode",
+            type=str,
+            default=None,
+            choices=["prefill", "decode", "agg"],
+            help=(
+                "Run a scheduler-local self-benchmark on startup and write "
+                "ForwardPassMetrics results to --benchmark-output-path."
+            ),
+        )
+        parser.add_argument(
+            "--benchmark-prefill-granularity",
+            type=int,
+            default=16,
+            help="Number of ISL sample points for self-benchmark prefill sweep.",
+        )
+        parser.add_argument(
+            "--benchmark-decode-length-granularity",
+            type=int,
+            default=6,
+            help="Number of context length sample points for self-benchmark decode sweep.",
+        )
+        parser.add_argument(
+            "--benchmark-decode-batch-granularity",
+            type=int,
+            default=6,
+            help="Number of batch size sample points per decode context length.",
+        )
+        parser.add_argument(
+            "--benchmark-warmup-iterations",
+            type=int,
+            default=5,
+            help="Number of warmup forward passes before collecting benchmark data.",
+        )
+        parser.add_argument(
+            "--benchmark-output-path",
+            type=str,
+            default="/tmp/benchmark_results.json",
+            help="Path to write self-benchmark results JSON.",
+        )
+        parser.add_argument(
+            "--benchmark-timeout",
+            type=int,
+            default=300,
+            help="Timeout in seconds for external callers waiting on benchmark output.",
         )
         parser.add_argument(
             "--enable-trace",
