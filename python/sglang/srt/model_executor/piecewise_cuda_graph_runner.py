@@ -20,8 +20,7 @@ import gc
 import logging
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
@@ -60,7 +59,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_musa,
@@ -77,18 +75,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_musa = is_musa()
-
-
-@dataclass
-class PrefillInputBuffers(ForwardInputBuffers):
-    input_ids: torch.Tensor
-    out_cache_loc: torch.Tensor
-    mamba_track_indices: Optional[torch.Tensor]
-    mamba_track_mask: Optional[torch.Tensor]
-    mamba_track_seqlens: Optional[torch.Tensor]
-    positions: torch.Tensor
-    input_embeds: Optional[torch.Tensor]
-    mrope_positions: Optional[torch.Tensor]
 
 
 @contextmanager
@@ -242,62 +228,10 @@ class PiecewiseCudaGraphRunner:
         # CUDA graph capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
-        # Graph inputs
         with torch.device(self.device):
-            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
-            )
-            mamba_track_indices = (
-                torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_mask = (
-                torch.zeros((self.max_bs,), dtype=torch.bool)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_seqlens = (
-                torch.zeros((self.max_bs,), dtype=torch.int32)
-                if self.mamba_track_enabled
-                else None
-            )
-            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-            if (
-                self.is_multimodal
-            ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
-                # 1. In multimodal, we only compile and capture the language model part.
-                # 2. The embedder is outside of the graph, but cuda graph requires the input embeds to have a fixed memory address.
-                # 3. Input embeds is a pre-allocated buffer. In model.forward, we copy the embed output to this buffer.
-                input_embeds = torch.zeros(
-                    (self.max_num_tokens, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                )
-                mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
-            else:
-                input_embeds = None
-                mrope_positions = None
-
-        self.buffers = PrefillInputBuffers(
-            input_ids=input_ids,
-            out_cache_loc=out_cache_loc,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
-            positions=positions,
-            input_embeds=input_embeds,
-            mrope_positions=mrope_positions,
-        )
-        self.buffers.share_buffers()
-
-        # Token-axis FB-shared slot registry, adopting the PrefillInputBuffers
-        # storage (one data_ptr shared with capture + replay).
+        # Registry owns (allocates + pools) the token-axis input buffers.
         self.buffer_registry = build_prefill_registry(
             device=self.device,
             max_bs=self.max_bs,
@@ -307,7 +241,8 @@ class PiecewiseCudaGraphRunner:
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
-            source=self.buffers,
+            share_pool=not is_npu(),
+            source=None,
         )
 
         self.attention_layers = self.model_runner.attention_layers
