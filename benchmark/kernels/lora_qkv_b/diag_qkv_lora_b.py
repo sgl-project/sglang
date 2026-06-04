@@ -217,9 +217,18 @@ def run_diag(
 
 
 def verify(args, device) -> None:
-    """Assert the parametrized atomic mode == production qkv_lora_b_fwd (bitwise) and
-    matches the fp32 ref within tol, on both presets. Raises SystemExit(1) on any
-    mismatch so it works as a hard guardrail in automated runs."""
+    """Hard guardrail (SystemExit(1) on mismatch) that the diag kernel is a faithful
+    proxy of the production kernel, so the X3/X2 numbers below are trustworthy:
+
+      * diag WB_ATOMIC          == production qkv_lora_b_fwd (atomic, default)  [bitwise]
+      * diag WB_LOAD_ADD_STORE  == production qkv_lora_b_fwd (STORE=True)       [bitwise]
+
+    The second check is the important one: the production store path is load+add+store,
+    which corresponds to diag's WB_LOAD_ADD_STORE -- NOT diag's WB_STORE (pure overwrite,
+    a speed-floor probe only). Both diag modes are also checked against the fp32 ref.
+    """
+    from sglang.srt.environ import envs
+
     dtype = torch.bfloat16
     failures = 0
     for preset, slice_dims in PRESETS.items():
@@ -228,52 +237,33 @@ def verify(args, device) -> None:
         bi = make_merged_decode_batch_info(s, args.rank, args.scaling, device)
         x, w, off, base = make_inputs(s, slice_dims, args.rank, dtype, device, seed=1)
         max_out = max(slice_dims)
-        prod = qkv_lora_b_fwd(
-            x,
-            w,
-            bi,
-            off,
-            max_out,
-            base_output=base.clone(),
-            n_slices=n_slices,
-            output_offset_cpu=None,
+        with envs.SGLANG_OPT_LORA_QKV_B_STORE.override(False):
+            prod_atomic = qkv_lora_b_fwd(
+                x, w, bi, off, max_out, base_output=base.clone(),
+                n_slices=n_slices, output_offset_cpu=None,
+            )
+        with envs.SGLANG_OPT_LORA_QKV_B_STORE.override(True):
+            prod_store = qkv_lora_b_fwd(
+                x, w, bi, off, max_out, base_output=base.clone(),
+                n_slices=n_slices, output_offset_cpu=None,
+            )
+        diag_atomic = run_diag(
+            x, w, bi, off, max_out, base.clone(), n_slices, WB_ATOMIC, 16, 64, 4
         )
-        diag = run_diag(
-            x,
-            w,
-            bi,
-            off,
-            max_out,
-            base.clone(),
-            n_slices,
-            WB_ATOMIC,
-            16,
-            64,
-            4,
+        diag_las = run_diag(
+            x, w, bi, off, max_out, base.clone(), n_slices, WB_LOAD_ADD_STORE, 16, 64, 4
         )
         ref = ref_qkv_b(x, w, off, args.scaling, args.rank, base)
-        bitwise = torch.equal(prod, diag)
-        err = float((diag.float() - ref).abs().max())
-        # load_add_store on disjoint tiles must also equal ref (probe sanity).
-        las = run_diag(
-            x,
-            w,
-            bi,
-            off,
-            max_out,
-            base.clone(),
-            n_slices,
-            WB_LOAD_ADD_STORE,
-            16,
-            64,
-            4,
-        )
-        las_err = float((las.float() - ref).abs().max())
-        ok = bitwise and err < 5e-2 and las_err < 5e-2
+        bw_atomic = torch.equal(prod_atomic, diag_atomic)
+        bw_store = torch.equal(prod_store, diag_las)
+        err = float((diag_atomic.float() - ref).abs().max())
+        las_err = float((diag_las.float() - ref).abs().max())
+        ok = bw_atomic and bw_store and err < 5e-2 and las_err < 5e-2
         failures += int(not ok)
         print(
-            f"{'OK  ' if ok else 'FAIL'} {preset:<12s} atomic==production bitwise={bitwise} "
-            f"diag_vs_ref_abs_err={err:.3e} load_add_store_vs_ref_abs_err={las_err:.3e}"
+            f"{'OK  ' if ok else 'FAIL'} {preset:<12s} "
+            f"diag_atomic==prod_atomic={bw_atomic} diag_las==prod_store={bw_store} "
+            f"atomic_vs_ref={err:.3e} las_vs_ref={las_err:.3e}"
         )
     if failures:
         raise SystemExit(1)
