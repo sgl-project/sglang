@@ -17,6 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.kernel_utils import shapecap_dump
 
 
 @triton.jit
@@ -188,6 +189,30 @@ def _invoke_moe_lora_expand_add(
         * triton.cdiv(N, block_size_n),
     )
 
+    shapecap_dump(
+        "moe_lora_expand_add",
+        intermediate=intermediate,
+        weight=weight,
+        output=output,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        N=N,
+        R=R,
+        num_valid_tokens=topk_ids.numel(),
+        router_topk=topk_ids.shape[1],
+        block_size_m=block_size_m,
+        block_size_n=block_size_n,
+        block_size_r=block_size_r,
+        group_size_m=group_size_m,
+        gated_a_half=gated_a_half,
+        grid=grid,
+        mul_routed_weight=mul_routed_weight,
+        fuse_sum_all_reduce=fuse_sum_all_reduce,
+        num_warps=config.get("num_warps", 4),
+    )
     _moe_lora_expand_add_kernel[grid](
         intermediate,
         weight,

@@ -7,6 +7,7 @@ import triton.language as tl
 from sglang.srt.lora.triton_ops.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
+    shapecap_dump,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -216,12 +217,36 @@ def qkv_lora_b_fwd(
     assert input_dim == n_slices * r
     assert output_offset.shape[0] == n_slices + 1
 
+    shapecap_dump(
+        "qkv_lora_b.entry",
+        x=x,
+        qkv_lora_b=qkv_lora_b,
+        output_offset=output_offset,
+        output_offset_cpu=output_offset_cpu,
+        base_output=base_output,
+        s=s,
+        r=r,
+        output_dim=output_dim,
+        n_slices=n_slices,
+        max_qkv_out_dim=max_qkv_out_dim,
+        bs=batch_info.bs,
+        max_len=batch_info.max_len,
+        use_cuda_graph=batch_info.use_cuda_graph,
+        uniform_weight_index=batch_info.uniform_weight_index,
+        uniform_rank=batch_info.uniform_rank,
+        permutation=batch_info.permutation,
+        seg_lens=batch_info.seg_lens,
+        lora_ranks=batch_info.lora_ranks,
+        scalings=batch_info.scalings,
+    )
+
     if (
         output_offset_cpu is not None
         and batch_info.uniform_weight_index is not None
         and not batch_info.use_cuda_graph
         and batch_info.max_len >= _CUBLAS_MIN_MAX_LEN
     ):
+        shapecap_dump("qkv_lora_b.path", path="cublas")
         return _qkv_lora_b_cublas(
             x, qkv_lora_b, batch_info, output_offset_cpu, base_output, n_slices
         )
@@ -247,6 +272,16 @@ def qkv_lora_b_fwd(
 
     sorted_by_adapter = batch_info.permutation is not None
     enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
+    shapecap_dump(
+        "qkv_lora_b.triton",
+        path="triton",
+        output=output,
+        grid_b=grid_b,
+        BLOCK_S=BLOCK_S,
+        BLOCK_OUT=BLOCK_OUT,
+        BLOCK_R=BLOCK_R,
+        sorted_by_adapter=sorted_by_adapter,
+    )
     _qkv_lora_b_kernel[grid_b](
         x,
         qkv_lora_b,
