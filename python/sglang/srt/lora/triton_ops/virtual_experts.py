@@ -692,33 +692,60 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
-    invoke_fused_moe_kernel(
-        intermediate.view(-1, max_lora_rank),
-        lora_b_virtual,
-        None,
-        output,
-        None,
-        None,
-        None,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        mul_routed_weight,
-        1,
-        b_stage_config,
-        tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
-        False,
-        False,
-        False,
-        False,
-        False,
-        None,
-        fuse_add_to_output=True,
-        add_output_mask=token_lora_mask,
-        router_topk=topk_ids.shape[1],
-    )
+    intermediate_2d = intermediate.view(-1, max_lora_rank)
+
+    def _expand(a_2d, b_3d, out):
+        invoke_fused_moe_kernel(
+            a_2d,
+            b_3d,
+            None,
+            out,
+            None,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            1,
+            b_stage_config,
+            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
+            False,
+            False,
+            False,
+            False,
+            False,
+            None,
+            fuse_add_to_output=True,
+            add_output_mask=token_lora_mask,
+            router_topk=topk_ids.shape[1],
+        )
+
+    # Gated MLP (gate_up): lora_a stacks gate+up A-weights along the rank dim
+    # (rank = 2r) while lora_b keeps the original rank r. The shrink produces
+    # both gate-shrink [:, 0:r] and up-shrink [:, r:2r], but the expand kernel
+    # contracts only K = lora_b.shape[-1] = r columns. A single call would feed
+    # the gate-shrink [:, 0:r] to BOTH the gate and up output halves, dropping
+    # up_A entirely (up delta computed from gate_A — wrong whenever gate_A !=
+    # up_A, which is the normal independently-trained gate/up LoRA case). Match
+    # the classic-LoRA path (_add_lora_gate_up_delta) by splitting the expand
+    # into gate and up halves, each contracting its own rank slice.
+    expand_rank = lora_b_virtual.shape[-1]
+    if max_lora_rank > expand_rank:
+        n_half = lora_b_virtual.shape[1] // 2
+        # Slice the output's last dim (3D [M, top_k, gate_up_dim]); the kernel
+        # addresses C via stride(-2)/stride(-1), so a strided column slice writes
+        # the right half in-place without a contiguity-forcing .view/.reshape.
+        for half in range(2):
+            _expand(
+                intermediate_2d[:, half * expand_rank : (half + 1) * expand_rank],
+                lora_b_virtual[:, half * n_half : (half + 1) * n_half, :],
+                output[..., half * n_half : (half + 1) * n_half],
+            )
+    else:
+        _expand(intermediate_2d, lora_b_virtual, output)
 
 
 def _merged_experts_fused_moe_lora_add_op(
