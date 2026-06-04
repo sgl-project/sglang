@@ -17,6 +17,7 @@
 
 body {
   margin: 0;
+  overflow-x: hidden;
   min-height: 100vh;
   background:
     linear-gradient(90deg, rgba(23, 26, 22, 0.035) 1px, transparent 1px),
@@ -32,8 +33,10 @@ button:disabled { cursor: wait; opacity: 0.64; transform: none; }
 
 .shell {
   display: grid;
-  grid-template-columns: minmax(260px, 320px) minmax(560px, 1fr);
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
   gap: 18px;
+  width: 100%;
+  max-width: 100vw;
   min-height: 100vh;
   padding: 18px;
 }
@@ -219,6 +222,7 @@ button:focus-visible {
   display: grid;
   gap: 18px;
   min-width: 0;
+  max-width: 100%;
 }
 
 .stage {
@@ -227,6 +231,7 @@ button:focus-visible {
   grid-template-rows: auto auto auto auto auto;
   align-self: start;
   justify-self: center;
+  min-width: 0;
   width: 100%;
   max-width: min(1500px, 100%);
   overflow: hidden;
@@ -273,23 +278,97 @@ button:focus-visible {
 .topbar, .timeline {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
+  min-width: 0;
   height: 44px;
   padding: 0 14px;
   color: #e8eadf;
   background: rgba(17, 20, 15, 0.88);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.topbar > * {
+  flex: 0 0 auto;
+  align-self: center;
 }
 
 .topbar-spacer { flex: 1; }
+.record-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 0 0 118px;
+  width: 118px;
+  min-height: 28px;
+  height: 28px;
+  padding: 0 9px;
+  border-color: rgba(232, 234, 223, 0.22);
+  background: rgba(238, 241, 236, 0.08);
+  color: #e8eadf;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.record-button:hover:not(:disabled) {
+  border-color: rgba(232, 234, 223, 0.44);
+  background: rgba(238, 241, 236, 0.14);
+  box-shadow: none;
+  transform: none;
+}
+.record-button:active:not(:disabled),
+.record-button.is-pressed:not(:disabled),
+.record-button:focus-visible {
+  transform: none;
+}
+.record-button.is-recording {
+  border-color: color-mix(in oklch, var(--accent), white 18%);
+  background: var(--accent);
+  color: #fffdf7;
+}
+.record-button.is-saving {
+  cursor: wait;
+  opacity: 0.76;
+}
+#recordLabel {
+  flex: 0 0 36px;
+  text-align: left;
+}
+.record-button-icon {
+  flex: 0 0 9px;
+  width: 9px;
+  height: 9px;
+  min-width: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.16);
+}
+.record-button.is-recording .record-button-icon {
+  border-radius: 2px;
+  background: #fffdf7;
+  box-shadow: none;
+}
+.record-button-duration {
+  display: inline-block;
+  flex: 0 0 34px;
+  min-width: 34px;
+  text-align: right;
+  color: rgba(232, 234, 223, 0.7);
+}
+.record-button.is-recording .record-button-duration {
+  color: rgba(255, 253, 247, 0.86);
+}
 .preview-scale-control {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-width: 190px;
+  flex: 0 0 170px;
+  min-width: 170px;
   margin: 0;
   color: rgba(232, 234, 223, 0.72);
   font-size: 11px;
+  line-height: 1;
 }
 .preview-scale-control input {
   width: 92px;
@@ -307,21 +386,47 @@ button:focus-visible {
 #statusText {
   display: inline-block;
   min-width: 92px;
+  line-height: 1;
 }
 #chunkText {
   display: inline-block;
   min-width: 70px;
+  line-height: 1;
 }
 .stage-stat {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 5px;
-  min-width: max-content;
+  flex: 0 1 auto;
+  min-width: 0;
   color: rgba(232, 234, 223, 0.72);
+  line-height: 1;
 }
 .stage-stat b {
+  display: inline-block;
   color: #fffdf7;
   font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+#outputSizeText { min-width: 206px; }
+#renderFps { min-width: 2ch; text-align: right; }
+#theoreticalFpsText { min-width: 116px; }
+#stageLatencyText { min-width: 120px; }
+
+@media (max-width: 1180px) {
+  .topbar {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 44px;
+    padding: 8px 14px;
+    row-gap: 7px;
+  }
+  .topbar-spacer { display: none; }
+  .preview-scale-control { flex-basis: 170px; min-width: 170px; }
+  #outputSizeText { min-width: 156px; }
+  #theoreticalFpsText { min-width: 100px; }
+  #stageLatencyText { min-width: 108px; }
 }
 
 .timeline { justify-content: flex-end; border-top: 1px solid rgba(232, 234, 223, 0.12); }
@@ -357,34 +462,12 @@ button:focus-visible {
 }
 
 .preview-loader {
-  position: relative;
-  width: 7px;
-  height: 7px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background: rgba(238, 241, 236, 0.88);
-  animation: previewDotPulse 1.05s ease-in-out infinite;
-}
-
-.preview-loader::before,
-.preview-loader::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: rgba(238, 241, 236, 0.88);
-  animation: previewDotPulse 1.05s ease-in-out infinite;
-}
-
-.preview-loader::before {
-  left: -16px;
-  animation-delay: -0.18s;
-}
-
-.preview-loader::after {
-  left: 16px;
-  animation-delay: 0.18s;
+  border: 2px solid rgba(238, 241, 236, 0.22);
+  border-top-color: rgba(238, 241, 236, 0.82);
+  animation: previewProgressSpin 0.8s linear infinite;
 }
 
 .stage-controls {
@@ -626,7 +709,6 @@ button:focus-visible {
   .preview-scale-control { min-width: 160px; }
 }
 
-@keyframes previewDotPulse {
-  0%, 80%, 100% { opacity: 0.32; }
-  40% { opacity: 1; }
+@keyframes previewProgressSpin {
+  to { transform: rotate(360deg); }
 }

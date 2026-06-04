@@ -616,13 +616,16 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        sampling_params = {
+            "temperature": args.temperature,
+            "max_new_tokens": request_func_input.output_len,
+            "ignore_eos": not args.disable_ignore_eos,
+        }
+        if args.top_p < 1.0:
+            sampling_params["top_p"] = args.top_p
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
@@ -1717,6 +1720,11 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "return_logprob"):
         args.return_logprob = False
 
+    if not hasattr(args, "temperature"):
+        args.temperature = 0.0
+    if not hasattr(args, "top_p"):
+        args.top_p = 1.0
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -2204,6 +2212,18 @@ if __name__ == "__main__":
         "--disable-ignore-eos",
         action="store_true",
         help="Disable ignoring EOS.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling parameter.",
     )
     parser.add_argument(
         "--extra-request-body",

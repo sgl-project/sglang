@@ -431,6 +431,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.disable = params.disable
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -559,9 +560,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
                 mamba_ping_pong_track_buffer_to_keep = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
+                    self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                 )
                 mamba_value = (
                     req.mamba_ping_pong_track_buffer[
@@ -569,6 +568,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     ]
                     .unsqueeze(-1)
                     .clone()
+                )
+                assert mamba_value.item() != -1, (
+                    f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
+                    f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                    f"next_track_idx={req.mamba_next_track_idx}, "
+                    f"last_track_seqlen={req.mamba_last_track_seqlen}, "
+                    f"rid={req.rid}"
                 )
             else:
                 mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
@@ -644,23 +650,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Donate the mamba index to the radix cache instead of copying.
         # This avoids a data copy that would race with the forward stream.
         if self.enable_mamba_extra_buffer:
-            mamba_ping_pong_track_buffer_to_keep = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
-            mamba_value_donated = (
-                req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
-                .unsqueeze(-1)
-                .clone()
-            )
             new_slot = self._alloc_mamba_slot()
-            req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep] = (
-                new_slot[0]
+            mamba_value_donated = self.req_to_token_pool.donate_mamba_ping_pong_slot(
+                req, new_slot
             )
-            self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.req_pool_idx
-            ] = req.mamba_ping_pong_track_buffer
         else:
             mamba_value_donated = self._alloc_mamba_slot()
             self.req_to_token_pool.mamba_pool.copy_from(

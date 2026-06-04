@@ -222,6 +222,44 @@ def select_top_k_tokens(
     )
 
 
+def _sample_simulated_acc_len(
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    max_len: int,
+) -> int:
+    """Sample a simulated acceptance length in [1, max_len]."""
+    if simulate_acc_method == "multinomial":
+        simulated_values = torch.normal(
+            mean=simulate_acc_len,
+            std=1.0,
+            size=(1,),
+            device="cpu",
+        )
+        # clamp simulated values to be between 1 and max_len
+        simulated_values = torch.clamp(simulated_values, min=1.0, max=max_len)
+        simulate_acc_len = int(simulated_values.round().item())
+    elif simulate_acc_method == "match-expected":
+        # multinomial sampling does not match the expected length
+        # we keep it for the sake of compatibility of existing tests
+        # but it's better to use "match-expected" for the cases that need to
+        # match the expected length, One caveat is that this will only sample
+        # either round down or round up of the expected length
+        simulate_acc_len = max(1.0, min(max_len, simulate_acc_len))
+        lower = int(simulate_acc_len // 1)
+        upper = lower + 1 if lower < max_len else lower
+        if lower == upper:
+            simulate_acc_len = lower
+        else:
+            weight_upper = simulate_acc_len - lower
+            weight_lower = 1.0 - weight_upper
+            probs = torch.tensor([weight_lower, weight_upper], device="cpu")
+            sampled_index = torch.multinomial(probs, num_samples=1)
+            simulate_acc_len = lower if sampled_index == 0 else upper
+    else:
+        raise ValueError(f"Invalid simulate_acc_method: {simulate_acc_method}")
+    return int(simulate_acc_len)
+
+
 def generate_simulated_accept_index(
     accept_index,
     predict,
@@ -232,36 +270,9 @@ def generate_simulated_accept_index(
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
 ):
     assert simulate_acc_len > 0.0
-
-    if simulate_acc_method == "multinomial":
-        simulated_values = torch.normal(
-            mean=simulate_acc_len,
-            std=1.0,
-            size=(1,),
-            device="cpu",
-        )
-        # clamp simulated values to be between 1 and self.spec_steps
-        simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps + 1)
-        simulate_acc_len = int(simulated_values.round().item())
-    elif simulate_acc_method == "match-expected":
-        # multinomial sampling does not match the expected length
-        # we keep it for the sake of compatibility of existing tests
-        # but it's better to use "match-expected" for the cases that need to
-        # match the expected length, One caveat is that this will only sample
-        # either round down or round up of the expected length
-        simulate_acc_len = max(1.0, min(spec_steps + 1, simulate_acc_len))
-        lower = int(simulate_acc_len // 1)
-        upper = lower + 1 if lower < spec_steps + 1 else lower
-        if lower == upper:
-            simulate_acc_len = lower
-        else:
-            weight_upper = simulate_acc_len - lower
-            weight_lower = 1.0 - weight_upper
-            probs = torch.tensor([weight_lower, weight_upper], device="cpu")
-            sampled_index = torch.multinomial(probs, num_samples=1)
-            simulate_acc_len = lower if sampled_index == 0 else upper
-    else:
-        raise ValueError(f"Invalid simulate_acc_method: {SIMULATE_ACC_METHOD}")
+    simulate_acc_len = _sample_simulated_acc_len(
+        simulate_acc_len, simulate_acc_method, spec_steps + 1
+    )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
