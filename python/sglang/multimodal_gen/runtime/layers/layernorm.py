@@ -443,11 +443,9 @@ def _fuse_scale_shift_native(
         batch_size, seq_len, hidden_size = x.shape
         num_frames = scale.shape[1]
         frame_seqlen = seq_len // num_frames
-        scale = (
-            scale.squeeze(2)
-            .unsqueeze(2)
-            .expand(batch_size, num_frames, frame_seqlen, hidden_size)
-            .reshape(batch_size, seq_len, hidden_size)
+        assert scale.size(2) == 1
+        scale = scale.expand(batch_size, num_frames, frame_seqlen, hidden_size).reshape(
+            batch_size, seq_len, hidden_size
         )
     elif scale.dim() == 2:
         scale = scale.unsqueeze(1)
@@ -456,11 +454,9 @@ def _fuse_scale_shift_native(
         batch_size, seq_len, hidden_size = x.shape
         num_frames = shift.shape[1]
         frame_seqlen = seq_len // num_frames
-        shift = (
-            shift.squeeze(2)
-            .unsqueeze(2)
-            .expand(batch_size, num_frames, frame_seqlen, hidden_size)
-            .reshape(batch_size, seq_len, hidden_size)
+        assert shift.size(2) == 1
+        shift = shift.expand(batch_size, num_frames, frame_seqlen, hidden_size).reshape(
+            batch_size, seq_len, hidden_size
         )
     elif shift.dim() == 2:
         shift = shift.unsqueeze(1)
