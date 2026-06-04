@@ -222,6 +222,13 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
             assert transformer is not None
             self.transformer = transformer
             num_blocks = len(transformer.blocks)
+            if _SANAWM_FORK_DUMP_DIR:  # parity harness: weights fingerprint
+                _fp = {
+                    n: float(p.detach().float().abs().sum().item())
+                    for n, p in transformer.named_parameters()
+                }
+                _Path(_SANAWM_FORK_DUMP_DIR).mkdir(parents=True, exist_ok=True)
+                torch.save(_fp, f"{_SANAWM_FORK_DUMP_DIR}/dit_fingerprint.pt")
             kv_cache = [
                 [[None] * _NUM_STREAM_CACHE_SLOTS for _ in range(num_blocks)]
                 for _ in range(num_chunks)
@@ -290,6 +297,9 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
                     if do_cfg:
                         noise_uncond, noise_text = noise_pred.chunk(2)
                         noise_pred = noise_uncond + cfg_scale * (noise_text - noise_uncond)
+
+                    if chunk_idx == 0:  # parity harness: per-step model output
+                        _fdump(f"noise_pred_c0_t{int(t.item())}", noise_pred)
 
                     denoised = scheduler.step(
                         -noise_pred.reshape(B, C, -1).transpose(1, 2),

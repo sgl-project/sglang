@@ -939,7 +939,16 @@ class SanaWMRealtimeStage(PipelineStage):
         device = get_local_torch_device()
         weight_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        transformer = self.transformer.to(device=device, dtype=weight_dtype).eval()
+        # Device move WITHOUT a blanket dtype cast: Module.to(dtype=...) also casts
+        # the DiT's complex RoPE buffers (WanRotaryPosEmbed._freqs, complex) to the
+        # real weight dtype, silently DISCARDING the imaginary part (torch warns
+        # "Casting complex values to real discards the imaginary part") and
+        # corrupting every RoPE rotation. This was the realtime<->batch stage-1
+        # divergence root cause: bitwise-identical inputs + identical weights but
+        # ~40% relRMS on the very first forward. The loader already produces
+        # dit_precision weights, exactly as the batch streaming path consumes them
+        # (use_declared_component moves the module without re-casting).
+        transformer = self.transformer.to(device=device).eval()
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
         batch.enable_sequence_shard = int(server_args.sp_degree or 1) > 1
 

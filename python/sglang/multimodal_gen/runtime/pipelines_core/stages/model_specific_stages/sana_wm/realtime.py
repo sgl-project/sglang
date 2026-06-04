@@ -237,6 +237,11 @@ class SanaWMRealtimeSession:
             if self.chunk_idx == 0:
                 _rdump("cond_embeds", embeds)
                 _rdump("cond_mask", mask)
+                _fp = {  # parity harness: weights fingerprint
+                    n: float(p.detach().float().abs().sum().item())
+                    for n, p in self.transformer.named_parameters()
+                }
+                torch.save(_fp, _p / "dit_fingerprint.pt")
         self._scheduler.set_timesteps(sigmas=self._sigmas, device=self.device)
         for t in self._scheduler.timesteps:
             lat_in = torch.cat([chunk_lat, chunk_lat], dim=0) if self.use_cfg else chunk_lat
@@ -258,6 +263,11 @@ class SanaWMRealtimeSession:
             if self.use_cfg:
                 nu, nt = noise_pred.chunk(2)
                 noise_pred = nu + self.cfg_scale * (nt - nu)
+            if _rt_dump and self.chunk_idx == 0:  # parity harness: per-step model output
+                torch.save(
+                    noise_pred.detach().float().cpu(),
+                    _p / f"noise_pred_c0_t{int(t.item())}.pt",
+                )
             denoised = self._scheduler.step(
                 -noise_pred.reshape(B, C, -1).transpose(1, 2),
                 t,
