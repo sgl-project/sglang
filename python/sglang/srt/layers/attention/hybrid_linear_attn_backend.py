@@ -16,7 +16,6 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -784,21 +783,6 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
-        # Explicit linear-attention subclass → strong linear signal (KDA, GDN,
-        # Qwen3-Next, Qwen3.5 main linear layers).
-        if isinstance(layer, RadixLinearAttention):
-            return False
-        # Some hybrid models (Ling-2.5/2.6) wrap their linear layers in plain
-        # `RadixAttention` rather than `RadixLinearAttention`. Those wrappers
-        # set `_is_linear_attention=True` on the attn module so we can
-        # distinguish them from full-attention RadixAttention instances —
-        # including MTP/NEXTN draft layers, which are full and must default to
-        # the full-attn path.
-        if layer is not None and getattr(layer, "_is_linear_attention", False):
-            return False
-        if isinstance(layer, RadixAttention):
-            return True
-
         if layer is not None:
             layer_id = layer.layer_id
         assert layer_id is not None, "either layer or layer_id must be provided"
