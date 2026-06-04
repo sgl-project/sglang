@@ -164,9 +164,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._swa_kv_pool is None:
             return None
         shape = token_indices.shape
-        return self._swa_kv_pool.translate_loc_from_full_to_swa(
-            token_indices.reshape(-1)
-        ).reshape(shape)
+        # trtllm-gen SWA attention kernels require int32 page indices.
+        return (
+            self._swa_kv_pool.translate_loc_from_full_to_swa(token_indices.reshape(-1))
+            .reshape(shape)
+            .to(torch.int32)
+        )
 
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int

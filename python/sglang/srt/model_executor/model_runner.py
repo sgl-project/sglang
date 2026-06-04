@@ -3362,9 +3362,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
-            if self.is_hybrid_swa:
-                self.token_to_kv_pool.invalidate_loc_cache()
-
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.graph_runner.replay(

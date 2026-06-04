@@ -2071,6 +2071,14 @@ class GetLoadsReqOutput(BaseReq):
     num_waiting_reqs: int = field(
         metadata={"metric": ("gauge", "Number of waiting requests")}
     )
+    num_waiting_uncached_tokens: int = field(
+        metadata={
+            "metric": (
+                "gauge",
+                "Number of uncached input tokens waiting for prefill compute",
+            )
+        }
+    )
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}
     )
