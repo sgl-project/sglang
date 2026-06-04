@@ -876,9 +876,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
         from flashinfer import SfLayout, nvfp4_quantize
 
+        e4m3_max = 448.0
+        if (
+            envs.FLASHINFER_NVFP4_4OVER6.get()
+            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+        ):
+            e4m3_max = 256.0
+
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (448.0 * 6.0),
+            1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
         )
