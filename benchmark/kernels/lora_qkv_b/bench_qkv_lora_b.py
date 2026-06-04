@@ -306,10 +306,11 @@ def main():
             )
             for x, w, off, base in groups
         ]
-        # Mirror of qkv_lora_b_fwd's launch geometry (BLOCK_S=16, BLOCK_OUT=128 since
-        # the lora-mq-a merge; was 64 in the e2e SHAPECAP capture).
+        # Mirror of qkv_lora_b_fwd's launch geometry (BLOCK_S=16, BLOCK_OUT=64; the
+        # jybsuper#31 BLOCK_OUT=128 change was reverted after the testbed measured a
+        # ~70% decode regression).
         grid = (
-            triton.cdiv(s, 16) * triton.cdiv(max_out, 128),
+            triton.cdiv(s, 16) * triton.cdiv(max_out, 64),
             n_slices,
             1,
         )
