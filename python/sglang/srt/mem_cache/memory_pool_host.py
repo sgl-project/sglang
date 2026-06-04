@@ -377,9 +377,7 @@ class HostKVCache(abc.ABC):
         if need_size > self.available_size():
             return None
 
-        # Clone to detach from parent storage -- prevents the entire free_slots
-        # tensor from being kept alive by this small view (memory leak).
-        select_index = self.free_slots[:need_size].clone()
+        select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
         return select_index
