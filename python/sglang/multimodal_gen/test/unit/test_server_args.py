@@ -177,12 +177,13 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
-                "acceleration_config": "attention_autotune=true,attention_autotune_iters=20",
+                "acceleration_config": "attention_autotune=true,attention_autotune_iters=20,attention_autotune_min_speedup=1.03",
             }
         )
 
         self.assertTrue(args.acceleration_config.attention_autotune)
         self.assertEqual(args.acceleration_config.attention_autotune_iters, 20)
+        self.assertEqual(args.acceleration_config.attention_autotune_min_speedup, 1.03)
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):

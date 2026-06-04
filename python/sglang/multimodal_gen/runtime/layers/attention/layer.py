@@ -311,6 +311,7 @@ class LocalAttention(nn.Module):
             self.enable_attention_autotune,
             self.attention_autotune_warmup,
             self.attention_autotune_iters,
+            self.attention_autotune_min_speedup,
         ) = attention_autotune_config(extra_impl_args)
         self.attn_impl = impl_cls(
             num_heads=num_heads,
@@ -430,6 +431,10 @@ class LocalAttention(nn.Module):
             for name, fn in candidates.items()
         }
         selected = min(timings, key=timings.get)
+        if selected != "native":
+            speedup = timings["native"] / timings[selected]
+            if speedup < self.attention_autotune_min_speedup:
+                selected = "native"
         _LOCAL_ATTENTION_AUTOTUNE_CACHE[key] = selected
         return selected
 

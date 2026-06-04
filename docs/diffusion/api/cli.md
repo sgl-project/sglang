@@ -83,7 +83,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
-- `--acceleration-config {CONFIG}`: experimental diffusion acceleration policy, for example `allow_cudnn_sdp=true`, `attention_autotune=true`, or `kernel_compile_policy=auto,kernel_compile_ops=LayerNormScaleShift`
+- `--acceleration-config {CONFIG}`: experimental diffusion acceleration policy, for example `allow_cudnn_sdp=true`, `attention_autotune=true,attention_autotune_min_speedup=1.02`, or `kernel_compile_policy=auto,kernel_compile_ops=LayerNormScaleShift`
 
 ### Sampling and output
 

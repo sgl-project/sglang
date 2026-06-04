@@ -1119,7 +1119,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "JSON string, or key=value pairs. Supported keys include "
                 "kernel_compile_policy=off|auto|force_torch_compile|force_fused "
                 "with kernel_compile_ops=op1,op2, allow_cudnn_sdp=true, "
-                "and attention_autotune=true."
+                "attention_autotune=true, and attention_autotune_min_speedup=1.02."
             ),
         )
 

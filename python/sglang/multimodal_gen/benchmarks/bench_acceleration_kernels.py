@@ -234,6 +234,7 @@ def bench_local_attention_autotune(args: argparse.Namespace) -> None:
             attention_autotune=True,
             attention_autotune_warmup=args.autotune_warmup,
             attention_autotune_iters=args.autotune_iters,
+            attention_autotune_min_speedup=args.autotune_min_speedup,
         ).cuda()
     _LOCAL_ATTENTION_AUTOTUNE_CACHE.clear()
     with torch.inference_mode(), set_forward_context(0, metadata):
@@ -278,6 +279,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--autotune-warmup", type=int, default=3)
     parser.add_argument("--autotune-iters", type=int, default=10)
+    parser.add_argument("--autotune-min-speedup", type=float, default=1.02)
     parser.add_argument(
         "--kernel-policies",
         nargs="+",

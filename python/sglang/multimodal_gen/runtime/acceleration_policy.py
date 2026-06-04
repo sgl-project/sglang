@@ -133,7 +133,9 @@ def attention_allows_cudnn_sdp(extra_impl_args: Mapping[str, Any]) -> bool:
     return policy in {"auto", "on", "true", "1", "force"}
 
 
-def attention_autotune_config(extra_impl_args: Mapping[str, Any]) -> tuple[bool, int, int]:
+def attention_autotune_config(
+    extra_impl_args: Mapping[str, Any],
+) -> tuple[bool, int, int, float]:
     attention_cfg: Mapping[str, Any] = addict.Dict()
     acceleration_cfg: Mapping[str, Any] = addict.Dict()
     if "attention_autotune" in extra_impl_args:
@@ -184,4 +186,17 @@ def attention_autotune_config(extra_impl_args: Mapping[str, Any]) -> tuple[bool,
             ),
         )
     )
-    return enabled, warmup, iters
+    min_speedup = float(
+        extra_impl_args.get(
+            "attention_autotune_min_speedup",
+            attention_cfg.get(
+                "attention_autotune_min_speedup",
+                acceleration_cfg.get(
+                    "attention_autotune_min_speedup",
+                    _get_nested(acceleration_cfg, "attention", "autotune_min_speedup")
+                    or 1.02,
+                ),
+            ),
+        )
+    )
+    return enabled, warmup, iters, min_speedup
