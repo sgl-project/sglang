@@ -38,6 +38,10 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_sana_wm_self_forcing import (
+    SanaWMSelfForcingSamplerConfig,
+    SanaWMSelfForcingScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMDenoisingStage,
     _align_sana_wm_cfg_text_conditions,
@@ -64,18 +68,16 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
     """Autoregressive self-forcing streaming variant of SanaWMDenoisingStage."""
 
     # ----------------------------------------------------------------- #
-    # Chunk schedule + KV cache accumulation (port of scheduler.py:201-404)
+    # Chunk schedule + KV cache: thin static delegators to the dedicated
+    # SanaWMSelfForcingScheduler. Kept as static methods so the CPU tests and
+    # SanaWMRealtimeSession call sites are unchanged; the logic now lives in
+    # runtime/models/schedulers/scheduling_sana_wm_self_forcing.py.
     # ----------------------------------------------------------------- #
     @staticmethod
     def _autoregressive_segments(total_frames: int, num_frame_per_block: int) -> list[int]:
-        base = int(num_frame_per_block)
-        remained = total_frames % base
-        num_chunks = total_frames // base
-        chunk_indices = [0]
-        for idx in range(num_chunks):
-            cur = chunk_indices[-1] + base + (remained if idx == 0 else 0)
-            chunk_indices.append(cur)
-        return chunk_indices
+        return SanaWMSelfForcingScheduler.create_autoregressive_segments(
+            total_frames, num_frame_per_block
+        )
 
     @staticmethod
     def _accumulate_kv_cache(
@@ -86,89 +88,17 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
         sink_token: bool,
         num_blocks: int,
     ) -> tuple[list, int]:
-        """Build chunk ``chunk_idx``'s read-only KV prefix from prior chunks.
-
-        GDN/STATE blocks (type flag > 0.5) copy-forward the PREVIOUS chunk's
-        recurrent state; softmax/CONCAT blocks concatenate the rolling-window +
-        sink K/V along **dim=1** (token axis of our (B,N,H,D) softmax cache)."""
-        if chunk_idx == 0:
-            return kv_cache[0], 0
-
-        cur = kv_cache[chunk_idx]
-        start_chunk = max(chunk_idx - num_cached_blocks, 0) if num_cached_blocks > 0 else 0
-        valid = list(range(start_chunk, chunk_idx))
-        sink_num = 0
-        if sink_token and num_cached_blocks > 0:
-            sink_start = max(chunk_idx - num_cached_blocks + 1, 0)
-            if sink_start > 0:
-                valid = [0] + list(range(sink_start, chunk_idx))
-                sink_num = chunk_indices[1] - chunk_indices[0]
-
-        for block_id in range(num_blocks):
-            prev_last = kv_cache[chunk_idx - 1][block_id]
-            type_flag = prev_last[_SLOT_TYPE_FLAG]
-            if type_flag is not None and float(type_flag.item()) > 0.5:
-                # STATE (GDN) block: carry the previous chunk's recurrent state.
-                cur[block_id] = [
-                    prev_last[_SLOT_K],
-                    prev_last[_SLOT_V],
-                    prev_last[_SLOT_CAM_K],
-                    prev_last[_SLOT_CAM_V],
-                    prev_last[_SLOT_SHORTCONV],
-                    None,
-                    prev_last[_SLOT_TYPE_FLAG],
-                    None,
-                    None,
-                    prev_last[_SLOT_FFN_TCONV],
-                ]
-                continue
-
-            # CONCAT (softmax) block: concat cached K/V over the valid window.
-            acc: list[torch.Tensor | None] = [None] * _NUM_STREAM_CACHE_SLOTS
-            for idx in valid:
-                prev = kv_cache[idx][block_id]
-                if prev[_SLOT_K] is None:
-                    continue
-                for slot in (_SLOT_K, _SLOT_V, _SLOT_CAM_K, _SLOT_CAM_V):
-                    if prev[slot] is None:
-                        continue
-                    acc[slot] = (
-                        prev[slot].clone()
-                        if acc[slot] is None
-                        else torch.cat([acc[slot], prev[slot]], dim=1)  # (B,N,H,D) token axis
-                    )
-            cur[block_id] = [
-                acc[_SLOT_K],
-                acc[_SLOT_V],
-                acc[_SLOT_CAM_K],
-                acc[_SLOT_CAM_V],
-                prev_last[_SLOT_SHORTCONV],
-                None,
-                prev_last[_SLOT_TYPE_FLAG],
-                None,
-                None,
-                prev_last[_SLOT_FFN_TCONV],
-            ]
-
-        SanaWMStreamingDenoisingStage._evict_stale_kv_cache(
-            kv_cache, chunk_idx, valid, num_cached_blocks, num_blocks
+        return SanaWMSelfForcingScheduler.accumulate_kv_cache(
+            kv_cache, chunk_idx, chunk_indices, num_cached_blocks, sink_token, num_blocks
         )
-        return cur, sink_num
 
     @staticmethod
     def _evict_stale_kv_cache(
         kv_cache: list, chunk_idx: int, valid: list[int], num_cached_blocks: int, num_blocks: int
     ) -> None:
-        if num_cached_blocks <= 0:
-            return
-        keep = set(valid)
-        keep.add(chunk_idx)
-        for stale in range(chunk_idx):
-            if stale in keep:
-                continue
-            kv_cache[stale] = [
-                [None] * _NUM_STREAM_CACHE_SLOTS for _ in range(num_blocks)
-            ]
+        SanaWMSelfForcingScheduler.evict_stale_kv_cache(
+            kv_cache, chunk_idx, valid, num_cached_blocks, num_blocks
+        )
 
     # ----------------------------------------------------------------- #
     # Streaming denoising loop
@@ -203,18 +133,18 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
             init_latents = latents.clone()
             B, C, total_frames, H, W = latents.shape
 
-        num_frame_per_block = int(getattr(pcfg, "num_frame_per_block", 3))
-        num_cached_blocks = int(getattr(pcfg, "num_cached_blocks", 2))
-        sink_token = bool(getattr(pcfg, "sink_token", True))
-        schedule = list(getattr(pcfg, "denoising_step_list", (1000, 960, 889, 727, 0)))
-        if len(schedule) < 2 or schedule[-1] != 0:
-            raise ValueError(f"denoising_step_list must end with 0, got {schedule}")
-        explicit_sigmas = [float(t) / 1000.0 for t in schedule[:-1]]
+        sampler_cfg = SanaWMSelfForcingSamplerConfig.from_pipeline_config(pcfg)
+        num_frame_per_block = sampler_cfg.num_frame_per_block
+        num_cached_blocks = sampler_cfg.num_cached_blocks
+        sink_token = sampler_cfg.sink_token
+        explicit_sigmas = SanaWMSelfForcingScheduler.build_per_chunk_sigmas(
+            sampler_cfg.denoising_step_list
+        )
 
         # Streaming uses its OWN cfg scale (official StreamingGenerationConfig.cfg_scale=1.0
         # => no CFG on the distilled 4-step model). The general guidance_scale (e.g. 4.5)
         # is for the dense path; using it here ran CFG=4.5 vs the reference's none.
-        cfg_scale = float(getattr(pcfg, "streaming_cfg_scale", 1.0) or 1.0)
+        cfg_scale = sampler_cfg.streaming_cfg_scale
         do_cfg = bool(batch.do_classifier_free_guidance) and cfg_scale > 1.0
         if server_args.enable_cfg_parallel and do_cfg:
             raise NotImplementedError(
