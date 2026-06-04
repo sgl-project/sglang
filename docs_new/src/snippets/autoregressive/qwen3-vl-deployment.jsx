@@ -10,7 +10,8 @@ export const Qwen3VLDeployment = () => {
         { id: 'h200', label: 'H200', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     modelsize: {
@@ -28,10 +29,12 @@ export const Qwen3VLDeployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      items: [
-        { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false }
-      ]
+      getDynamicItems: () => {
+        return [
+          { id: 'bf16', label: 'BF16', default: true },
+          { id: 'fp8', label: 'FP8', default: false }
+        ];
+      }
     },
     thinking: {
       name: 'thinking',
@@ -61,7 +64,8 @@ export const Qwen3VLDeployment = () => {
       b200: { tp: 8, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 8, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 8, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 8, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 8, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
     },
     '30b': {
       baseName: '30B-A3B',
@@ -71,7 +75,8 @@ export const Qwen3VLDeployment = () => {
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '32b': {
       baseName: '32B',
@@ -81,7 +86,8 @@ export const Qwen3VLDeployment = () => {
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
     },
     '8b': {
       baseName: '8B',
@@ -91,7 +97,8 @@ export const Qwen3VLDeployment = () => {
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '4b': {
       baseName: '4B',
@@ -101,7 +108,8 @@ export const Qwen3VLDeployment = () => {
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '2b': {
       baseName: '2B',
@@ -111,17 +119,26 @@ export const Qwen3VLDeployment = () => {
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     }
   };
 
 
   // Initialize state
+  const resolveItems = (option, currentValues) => {
+    if (typeof option.getDynamicItems === 'function') {
+      return option.getDynamicItems(currentValues || {});
+    }
+    return option.items || [];
+  };
+
   const getInitialState = () => {
     const initialState = {};
     Object.entries(options).forEach(([key, option]) => {
-      const defaultItem = option.items.find(item => item.default);
-      initialState[key] = defaultItem ? defaultItem.id : option.items[0].id;
+      const items = resolveItems(option, initialState);
+      const defaultItem = items.find(item => item.default && !item.disabled) || items.find(item => !item.disabled) || items[0];
+      initialState[key] = defaultItem ? defaultItem.id : '';
     });
     return initialState;
   };
@@ -145,13 +162,29 @@ export const Qwen3VLDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware') {
+        for (const [key, option] of Object.entries(options)) {
+          if (key === 'hardware') continue;
+          const items = resolveItems(option, next);
+          if (!items || items.length === 0) continue;
+          const current = items.find(i => i.id === next[key]);
+          if (!current || current.disabled) {
+            const fallback = items.find(i => i.default && !i.disabled) || items.find(i => !i.disabled);
+            if (fallback) next[key] = fallback.id;
+          }
+        }
+      }
+      return next;
+    });
   };
 
   // Generate command
   const generateCommand = () => {
     const { hardware, modelsize, quantization, thinking, toolcall } = values;
     const commandKey = `${hardware}-${modelsize}-${quantization}-${thinking}`;
+    const isXeon = hardware === 'xeon';
 
     // Special error handling
     if (commandKey === 'h100-235b-bf16-instruct' || commandKey === 'h100-235b-bf16-thinking') {
@@ -174,6 +207,9 @@ export const Qwen3VLDeployment = () => {
 
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
 
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;
@@ -188,7 +224,7 @@ export const Qwen3VLDeployment = () => {
       cmd += ` \\\n  --ep ${ep}`;
     }
 
-    if (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x') {
+    if (!isXeon && (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x')) {
       if (modelsize === '32b' && quantization === 'bf16') {
         cmd += ` \\\n  --context-length 65536`;
       }
@@ -218,16 +254,18 @@ export const Qwen3VLDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
+      {Object.entries(options).map(([key, option]) => {
+        const items = resolveItems(option, values);
+        return (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
-            {option.items.map(item => {
+            {items.map(item => {
               const isChecked = values[option.name] === item.id;
               const isDisabled = item.disabled;
               return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                  <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                <label key={item.id} title={item.disabledReason || ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                  <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                   {item.label}
                   {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                 </label>
@@ -235,7 +273,7 @@ export const Qwen3VLDeployment = () => {
             })}
           </div>
         </div>
-      ))}
+      )})}
       <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>
