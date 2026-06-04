@@ -172,14 +172,14 @@ class TestRoundRobinScheduler(CustomTestCase):
             ctl.round_robin_scheduler(_req())
         # 8 reqs across 4 active workers — 2 each, in round-robin order
         for i, worker in enumerate(ctl.workers):
-            self.assertEqual(worker.send_pyobj.call_count, 2, f"worker {i} call count")
+            self.assertEqual(worker.send.call_count, 2, f"worker {i} call count")
 
     def test_first_dispatch_picks_worker_zero(self):
         ctl = _make_controller(dp_size=4)
         ctl.round_robin_scheduler(_req())
-        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.workers[0].send.assert_called_once()
         for i in (1, 2, 3):
-            ctl.workers[i].send_pyobj.assert_not_called()
+            ctl.workers[i].send.assert_not_called()
 
     def test_skips_inactive_workers(self):
         ctl = _make_controller(dp_size=4)
@@ -188,16 +188,16 @@ class TestRoundRobinScheduler(CustomTestCase):
         for _ in range(6):
             ctl.round_robin_scheduler(_req())
         # Only workers 0 and 2 are active — should split 6 reqs evenly
-        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 3)
-        ctl.workers[1].send_pyobj.assert_not_called()
-        self.assertEqual(ctl.workers[2].send_pyobj.call_count, 3)
-        ctl.workers[3].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.workers[0].send.call_count, 3)
+        ctl.workers[1].send.assert_not_called()
+        self.assertEqual(ctl.workers[2].send.call_count, 3)
+        ctl.workers[3].send.assert_not_called()
 
     def test_routed_dp_rank_bypasses_counter(self):
         """External dp-rank routing must not advance the counter."""
         ctl = _make_controller(dp_size=4)
         ctl.round_robin_scheduler(_req(routed_dp_rank=2))
-        ctl.workers[2].send_pyobj.assert_called_once()
+        ctl.workers[2].send.assert_called_once()
         self.assertEqual(
             ctl.round_robin_counter,
             0,
@@ -205,7 +205,7 @@ class TestRoundRobinScheduler(CustomTestCase):
         )
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
-        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.workers[0].send.assert_called_once()
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):
@@ -220,7 +220,7 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             (101, 1),
         ]:
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=room))
-            ctl.workers[expected_rank].send_pyobj.assert_called()
+            ctl.workers[expected_rank].send.assert_called()
 
     def test_requires_bootstrap_room(self):
         ctl = _make_controller(dp_size=4)
@@ -230,8 +230,8 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
     def test_routed_dp_rank_bypasses_bootstrap_room(self):
         ctl = _make_controller(dp_size=4)
         ctl.follow_bootstrap_room_scheduler(_req(routed_dp_rank=3, bootstrap_room=1))
-        ctl.workers[3].send_pyobj.assert_called_once()
-        ctl.workers[1].send_pyobj.assert_not_called()
+        ctl.workers[3].send.assert_called_once()
+        ctl.workers[1].send.assert_not_called()
 
 
 class TestTotalRequestsScheduler(CustomTestCase):
@@ -239,9 +239,9 @@ class TestTotalRequestsScheduler(CustomTestCase):
         ctl = _make_controller(dp_size=4)
         ctl.dp_budget.total_requests = [5, 3, 1, 4]
         ctl.total_requests_scheduler(_req())
-        ctl.workers[2].send_pyobj.assert_called_once()
+        ctl.workers[2].send.assert_called_once()
         for i in (0, 1, 3):
-            ctl.workers[i].send_pyobj.assert_not_called()
+            ctl.workers[i].send.assert_not_called()
         self.assertEqual(
             ctl.dp_budget.total_requests[2],
             2,
@@ -252,7 +252,7 @@ class TestTotalRequestsScheduler(CustomTestCase):
         ctl = _make_controller(dp_size=4)
         ctl.dp_budget.total_requests = [5, 3, 1, 4]
         ctl.total_requests_scheduler(_req(routed_dp_rank=0))
-        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.workers[0].send.assert_called_once()
         # DPBudget must not be touched when bypassed
         self.assertEqual(
             ctl.dp_budget.total_requests,
@@ -275,7 +275,7 @@ class TestStatusAwarenessInconsistency(CustomTestCase):
         ctl.status[2] = False
         ctl.total_requests_scheduler(_req())
         # Current behaviour: still dispatches to the inactive worker.
-        ctl.workers[2].send_pyobj.assert_called_once()
+        ctl.workers[2].send.assert_called_once()
 
 
 if __name__ == "__main__":
