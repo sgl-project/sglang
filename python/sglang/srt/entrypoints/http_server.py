@@ -33,9 +33,9 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Union,
-    Literal,
 )
 
 # Fix a bug of Python threading
@@ -111,33 +111,77 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput as CheckWeightsReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     CloseSessionReqInput as CloseSessionReqInputIpc,
-    ConfigureLoggingReq as ConfigureLoggingReqIpc,
+)
+from sglang.srt.managers.io_struct import ConfigureLoggingReq as ConfigureLoggingReqIpc
+from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput as ContinueGenerationReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput as DestroyWeightsUpdateGroupReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+)
+from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput as GetWeightsByNameReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput as InitWeightsSendGroupForRemoteInstanceReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput as InitWeightsUpdateGroupReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput as LoadLoRAAdapterFromTensorsReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput as LoadLoRAAdapterReqInputIpc,
-    OpenSessionReqInput as OpenSessionReqInputIpc,
+)
+from sglang.srt.managers.io_struct import OpenSessionReqInput as OpenSessionReqInputIpc
+from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
+)
+from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput as PauseGenerationReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     ProfileReqInput,
+)
+from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput as ReleaseMemoryOccupationReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput as ResumeMemoryOccupationReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput as SendWeightsToRemoteInstanceReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     SeparateReasoningReqInput,
-    SetInternalStateReq as SetInternalStateReqIpc,
-    SlowDownReqInput as SlowDownReqInputIpc,
+)
+from sglang.srt.managers.io_struct import SetInternalStateReq as SetInternalStateReqIpc
+from sglang.srt.managers.io_struct import SlowDownReqInput as SlowDownReqInputIpc
+from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput as UnloadLoRAAdapterReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput as UpdateWeightFromDiskReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput as UpdateWeightsFromDistributedReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput as UpdateWeightsFromIPCReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput as UpdateWeightsFromTensorReqInputIpc,
+)
+from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
@@ -1327,8 +1371,7 @@ async def update_weights_from_tensor(
     """
 
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
-        UpdateWeightsFromTensorReqInputIpc(**obj.__dict__),
-        request
+        UpdateWeightsFromTensorReqInputIpc(**obj.__dict__), request
     )
 
     content = {"success": success, "message": message}
@@ -1504,6 +1547,7 @@ async def resume_memory_occupation(
 class CheckWeightsReqInput:
     action: str = "checksum"
 
+
 @app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(
@@ -1643,6 +1687,7 @@ class OpenSessionReqInput:
     streaming: Optional[bool] = None
     timeout: Optional[float] = None
 
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
@@ -1663,6 +1708,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 @dataclasses.dataclass
 class CloseSessionReqInput:
     session_id: str
+
 
 @app.api_route("/close_session", methods=["GET", "POST"])
 async def close_session(obj: CloseSessionReqInput, request: Request):
@@ -1698,11 +1744,13 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     )
     return Response(status_code=200)
 
+
 @dataclasses.dataclass
 class AbortReq:
     rid: Optional[str] = None
     # Whether to abort all requests
     abort_all: bool = False
+
 
 @app.post("/abort_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
@@ -1769,8 +1817,6 @@ class PauseGenerationReqInput:
             raise ValueError(
                 f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
             )
-
-
 
 
 @app.post("/pause_generation")

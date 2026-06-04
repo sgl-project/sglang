@@ -19,31 +19,30 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 from __future__ import annotations
 
 import copy
+import logging
+import pickle
 import uuid
 from abc import ABC
 from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-import logging
-import msgspec
-import pickle
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional, Union, Type
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional, Type, Union
 
+import msgspec
 import torch
 from pydantic import PlainValidator
-
 from zmq import Socket
 from zmq.asyncio import Socket as AsyncSocket
 
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
-    SchedulerReqTimeStats,
     ReqTimeStatsBase,
+    SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -56,6 +55,7 @@ else:
     Image = Any
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class BaseReq(ABC):
@@ -745,9 +745,9 @@ class GenerateReqInput(BaseReq):
 
 class TokenizedGenerateReqInput(BaseReqIpc, kw_only=True):
     # The input text
-    input_text: Optional[str] # str
+    input_text: Optional[str]  # str
     # The input token ids
-    input_ids: Optional[array] # Optional[array[int]]
+    input_ids: Optional[array]  # Optional[array[int]]
     # The multimodal inputs
     mm_inputs: Optional[object]
     # The sampling parameters
@@ -1060,9 +1060,9 @@ class EmbeddingReqInput(BaseReq):
 
 class TokenizedEmbeddingReqInput(BaseReqIpc, kw_only=True):
     # The input text
-    input_text: Optional[str] # str
+    input_text: Optional[str]  # str
     # The input token ids
-    input_ids: Optional[array] # array[int]
+    input_ids: Optional[array]  # array[int]
     # The image inputs
     image_inputs: Optional[dict]
     # The token type ids
@@ -1106,13 +1106,13 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReqIpc, kw_only=True):
 
 class BatchTokenIDOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     # The finish reason
-    finished_reasons: List[Optional[Dict[str, Any]]] # List[BaseFinishReason]
+    finished_reasons: List[Optional[Dict[str, Any]]]  # List[BaseFinishReason]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[array] # List[array[int]]
+    decode_ids: List[array]  # List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[array]] # Optional[List[array[int]]]
+    output_ids: Optional[List[array]]  # Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
@@ -1177,11 +1177,11 @@ class BatchTokenIDOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
 
 class BatchStrOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     # The finish reason
-    finished_reasons: List[Optional[Dict[str, Any]]] # List[dict]
+    finished_reasons: List[Optional[Dict[str, Any]]]  # List[dict]
     # The output decoded strings
     output_strs: List[str]
     # The token ids
-    output_ids: Optional[List[array]] # Optional[List[int]]
+    output_ids: Optional[List[array]]  # Optional[List[int]]
 
     # Token counts
     prompt_tokens: List[int]
@@ -1242,7 +1242,7 @@ class BatchStrOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
 
 class BatchEmbeddingOutput(BaseBatchReqIpc, kw_only=True):
     # The finish reason
-    finished_reasons: List[Optional[Dict[str, Any]]] # List[BaseFinishReason]
+    finished_reasons: List[Optional[Dict[str, Any]]]  # List[BaseFinishReason]
     # The output embedding
     embeddings: List[Union[List[float], Dict[int, float]]]
     # Token counts
@@ -1316,7 +1316,7 @@ class ListExternalCorporaReqOutput(BaseReqIpc, kw_only=True):
     message: str = ""
 
 
-# see aslo AttachHiCacheStorageReqInput in the http_server.py
+# see also AttachHiCacheStorageReqInput in the http_server.py
 class AttachHiCacheStorageReqInput(BaseReqIpc, kw_only=True):
     """Dynamically attach (enable) HiCache storage backend at runtime.
 
@@ -1784,6 +1784,7 @@ class ParseFunctionCallReq(BaseReq):
         None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
     )
 
+
 @dataclass
 class SeparateReasoningReqInput(BaseReq):
     text: str  # The text to parse.
@@ -2063,12 +2064,12 @@ def _check_all_req_types():
             name.endswith("Req")
             or name.endswith("Input")
             or name.endswith("Output")
-            or name.endswith("Ipc") # allow IPC-specific struct naming
+            or name.endswith("Ipc")  # allow IPC-specific struct naming
         )
         is_base_req = (
             issubclass(class_type[1], BaseReq)
             or issubclass(class_type[1], BaseBatchReq)
-            or issubclass(class_type[1], msgspec.Struct) # allow IPC objects
+            or issubclass(class_type[1], msgspec.Struct)  # allow IPC objects
         )
         if is_io_struct and not is_base_req:
             raise ValueError(f"{name} is not a subclass of BaseReq or BaseBatchReq.")
@@ -2113,11 +2114,15 @@ def dec_hook(tp: Type, obj: Any) -> Any:
         return res
     else:
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
-            logger.info(f"Object of type {type(obj)} and {str(tp)} is decoding with pickle.")
+            logger.info(
+                f"Object of type {type(obj)} and {str(tp)} is decoding with pickle."
+            )
         return pickle.loads(obj)
 
+
 _struct_types = tuple(
-    cls for cls in BaseReqIpc.__subclasses__()
+    cls
+    for cls in BaseReqIpc.__subclasses__()
     + BaseBatchReqIpc.__subclasses__()
     + SpeculativeDecodingMetricsMixinReq.__subclasses__()
     + [PickleWrapperIpc]
@@ -2127,12 +2132,12 @@ _primitive_types = (int, float, bool, bytes)
 
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)
 _msgpack_decoder = msgspec.msgpack.Decoder(
-    Union[*_struct_types, *_primitive_types],
-    dec_hook=dec_hook
+    Union[*_struct_types, *_primitive_types], dec_hook=dec_hook
 )
 
+
 def _maybe_wrap_pickle(obj: Any) -> PickleWrapperIpc:
-    # for msgspec.Struct type, we can directly serialize 
+    # for msgspec.Struct type, we can directly serialize
     if isinstance(obj, msgspec.Struct):
         return obj
     # for primitive types, we can directly serialize
@@ -2143,16 +2148,20 @@ def _maybe_wrap_pickle(obj: Any) -> PickleWrapperIpc:
         logger.info(f"Object of type {type(obj)} is wrapped via PickleWrapperIpc.")
     return PickleWrapperIpc(pickle.dumps(obj))
 
+
 def _maybe_unwrap_pickle(obj: Any) -> Any:
     # only PickleWrapperIpc type needs to be unwrapped,
     # other types can be directly used
     if isinstance(obj, PickleWrapperIpc):
-        obj =  pickle.loads(obj.data)
+        obj = pickle.loads(obj.data)
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
-            logger.info(f"Object of type {type(obj)} is unwrapped from PickleWrapperIpc.")
+            logger.info(
+                f"Object of type {type(obj)} is unwrapped from PickleWrapperIpc."
+            )
         return obj
 
     return obj
+
 
 def sock_send(socket: Socket, obj: Any, flags=0):
     obj = _maybe_wrap_pickle(obj)

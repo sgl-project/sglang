@@ -2,11 +2,7 @@ from typing import Optional, Union
 
 import zmq
 
-from sglang.srt.managers.io_struct import(
-    BaseBatchReqIpc,
-    BaseReqIpc,
-    sock_send
-)
+from sglang.srt.managers.io_struct import BaseBatchReqIpc, BaseReqIpc, sock_send
 
 
 class SenderWrapper:

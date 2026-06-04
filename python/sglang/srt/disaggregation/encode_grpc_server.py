@@ -88,6 +88,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
         from sglang.srt.managers.io_struct import async_sock_send
+
         try:
             request_dict = {
                 "mm_items": list(request.mm_items),

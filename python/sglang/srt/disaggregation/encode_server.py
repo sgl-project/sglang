@@ -44,8 +44,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqInput,
     ProfileReqType,
-    sock_send,
     async_sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
@@ -2316,7 +2316,7 @@ class EncoderScheduler:
                     "modality": modality.name,
                     "requests": requests,
                     "enter_time": start,
-                }
+                },
             )
 
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")

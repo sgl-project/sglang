@@ -684,7 +684,7 @@ class TraceReqContext:
         self.abort(abort_info={"reason": "have unclosed span, auto closed"})
 
 
-# Temperary remove the @dataclass decorator to make msgpack treat
+# Temporary remove the @dataclass decorator to make msgpack treat
 # TraceReqContext as a custom class and serialize with pickle like TraceReqContext.
 # When the TraceReqContext fixed with msgpack, we can consider to add @dataclass back.
 class TraceNullContext:

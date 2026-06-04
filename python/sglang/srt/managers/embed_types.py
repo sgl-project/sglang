@@ -19,7 +19,7 @@ io_struct.py and schedule_batch.py.
 """
 
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List
 
 import torch
 

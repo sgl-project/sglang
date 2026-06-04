@@ -12,7 +12,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_send, sock_recv
+from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_recv, sock_send
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_local_ip_auto
 

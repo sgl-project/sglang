@@ -40,9 +40,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
+    BaseBatchReqIpc,
     BaseReq,
     BaseReqIpc,
-    BaseBatchReqIpc,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -51,10 +51,10 @@ from sglang.srt.managers.io_struct import (
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
     TokenizerWorkerRegistrationReq,
-    sock_recv,
-    sock_send,
     async_sock_recv,
     async_sock_send,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -588,7 +588,7 @@ class TokenizerWorker(TokenizerManager):
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
         await self.send_to_scheduler.async_send_obj(obj)
-        
+
         await self._pause_continue_future
 
         if obj.mode == "abort":

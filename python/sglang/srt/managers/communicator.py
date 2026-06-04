@@ -4,9 +4,10 @@ import asyncio
 import copy
 from collections import deque
 from typing import Deque, Generic, List, Optional, TypeVar
-from sglang.srt.managers.io_struct import sock_send
 
 import zmq
+
+from sglang.srt.managers.io_struct import sock_send
 
 T = TypeVar("T")
 
