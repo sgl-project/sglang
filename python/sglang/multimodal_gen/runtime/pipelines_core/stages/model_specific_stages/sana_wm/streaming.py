@@ -199,6 +199,13 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
                 cam_in = torch.cat([cam_in, cam_in], dim=0)
                 plk_in = torch.cat([plk_in, plk_in], dim=0)
 
+        # parity harness: full-length conditioning fed to forward_long (windowed
+        # internally per chunk via [start_f:end_f]).
+        _fdump("cond_embeds", embeds_in)
+        _fdump("cond_mask", mask_in)
+        _fdump("cond_camera", cam_in)
+        _fdump("cond_plucker", plk_in)
+
         scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
 
         chunk_indices = self._autoregressive_segments(total_frames, num_frame_per_block)

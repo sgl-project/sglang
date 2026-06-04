@@ -223,6 +223,20 @@ class SanaWMRealtimeSession:
 
         embeds, mask = self._embeds_for_step()
         prope = (camera_conditions, chunk_plucker)
+        _rt_dump = __import__("os").environ.get("SANAWM_RT_DUMP_DIR")
+        if _rt_dump:  # parity harness: per-chunk conditioning fed to forward_long
+            _p = __import__("pathlib").Path(_rt_dump)
+            _p.mkdir(parents=True, exist_ok=True)
+
+            def _rdump(_name, _t):
+                if _t is not None:
+                    torch.save(_t.detach().float().cpu(), _p / f"{_name}.pt")
+
+            _rdump(f"cond_camera_{self.chunk_idx:03d}", camera_conditions)
+            _rdump(f"cond_plucker_{self.chunk_idx:03d}", chunk_plucker)
+            if self.chunk_idx == 0:
+                _rdump("cond_embeds", embeds)
+                _rdump("cond_mask", mask)
         self._scheduler.set_timesteps(sigmas=self._sigmas, device=self.device)
         for t in self._scheduler.timesteps:
             lat_in = torch.cat([chunk_lat, chunk_lat], dim=0) if self.use_cfg else chunk_lat
