@@ -6,9 +6,14 @@
 from collections.abc import Callable
 from typing import Any
 
+import torch
 import torch.nn as nn
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.multimodal_gen.runtime.acceleration_policy import (
+    kernel_compile_kwargs,
+    should_torch_compile_custom_op,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -24,6 +29,7 @@ class CustomOp(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self._compiled_forward_native: Callable | None = None
         self._forward_method = self.dispatch_forward()
 
     @debug_kernel_api
@@ -71,6 +77,10 @@ class CustomOp(nn.Module):
 
     def dispatch_forward(self) -> Callable:
         if _is_cuda:
+            if should_torch_compile_custom_op(
+                getattr(self, "name", None), type(self).__name__
+            ):
+                return self._get_compiled_forward_native()
             return self.forward_cuda
         elif current_platform.is_hip():
             return self.forward_hip
@@ -82,6 +92,20 @@ class CustomOp(nn.Module):
             return self.forward_musa
         else:
             return self.forward_native
+
+    def _get_compiled_forward_native(self) -> Callable:
+        if self._compiled_forward_native is None:
+            logger.info_once(
+                "Using torch.compile native path for custom op "
+                f"{getattr(self, 'name', type(self).__name__)}"
+            )
+            if hasattr(self.forward_native, "_torchdynamo_orig_callable"):
+                self._compiled_forward_native = self.forward_native
+            else:
+                self._compiled_forward_native = torch.compile(
+                    self.forward_native, **kernel_compile_kwargs()
+                )
+        return self._compiled_forward_native
 
     @classmethod
     def enabled(cls) -> bool:

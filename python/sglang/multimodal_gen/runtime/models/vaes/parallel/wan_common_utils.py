@@ -47,8 +47,8 @@ class AvgDown3D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
-        pad = (0, 0, 0, 0, pad_t, 0)
-        x = F.pad(x, pad)
+        if pad_t:
+            x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
         B, C, T, H, W = x.shape
         x = x.view(
             B,
@@ -164,10 +164,12 @@ class WanCausalConv3d(nn.Conv3d):
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
+            if cache_x.device != x.device:
+                cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+        if any(padding):
+            x = F.pad(x, padding)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
         )  # casting needed if amp isn't supported
