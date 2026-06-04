@@ -49,7 +49,7 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
-        from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
         assert isinstance(
             cache.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
