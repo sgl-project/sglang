@@ -375,7 +375,7 @@ class Compressor(nn.Module):
             self._fused_caches_built = False
             self._fused_wkv_w: Optional[torch.Tensor] = None
             self._fused_wgate_w: Optional[torch.Tensor] = None
-            self._fused_norm_weight_bf16: Optional[torch.Tensor] = None
+            self._fused_norm_weight_fp32: Optional[torch.Tensor] = None
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
@@ -484,8 +484,8 @@ class Compressor(nn.Module):
           along output dim, kv first per ``ReplicatedLinear`` convention).
           The op signature wants them separately; views avoid the copy
           cost on every forward.
-        * ``_fused_norm_weight_bf16``: bf16 copy of the fp32 RMSNorm
-          weight. The op signature requires bf16/fp16; the cast result is
+        * ``_fused_norm_weight_fp32``: fp32 copy of the fp32 RMSNorm
+          weight. The op signature requires fp32 for norm_weight; the cast result is
           a constant since the underlying weight is frozen post-load.
         """
         if self._fused_caches_built:
@@ -499,7 +499,7 @@ class Compressor(nn.Module):
         )
         self._fused_wkv_w = w[:split]
         self._fused_wgate_w = w[split:]
-        self._fused_norm_weight_bf16 = self.norm.weight.to(torch.bfloat16)
+        self._fused_norm_weight_fp32 = self.norm.weight.to(torch.float32)
         self._fused_caches_built = True
 
     def _forward_npu_fused(
@@ -561,7 +561,7 @@ class Compressor(nn.Module):
             state_cache = pool.get_attention_compress_state_cache(self.layer_id)
 
         cos, sin = get_fused_compressor_rope_cos_sin(
-            self.freqs_cis, positions_cmp, dtype=torch.bfloat16
+            self.freqs_cis, positions_cmp, dtype=torch.float32
         )
 
         cmp_kv = torch.ops.custom.compressor(
@@ -570,7 +570,7 @@ class Compressor(nn.Module):
             self._fused_wgate_w,
             state_cache,
             self.ape,
-            self._fused_norm_weight_bf16,
+            self._fused_norm_weight_fp32,
             rope_sin=sin,
             rope_cos=cos,
             rope_head_dim=self.rope_head_dim,
