@@ -101,11 +101,15 @@ def main():
     print(f"experts={E} bs={bs} scaling={args.scaling}")
     print(f"  GATE half: max_abs_err={gate_err:.3e}  ref_max={gate_den:.3e}  rel={gate_err/(gate_den+1e-9):.2%}")
     print(f"  UP   half: max_abs_err={up_err:.3e}  ref_max={up_den:.3e}  rel={up_err/(up_den+1e-9):.2%}")
-    gate_ok = gate_err < 2e-2 * (gate_den + 1e-9) or gate_err < 1e-2
-    up_ok = up_err < 2e-2 * (up_den + 1e-9) or up_err < 1e-2
+    # Relative-error verdict (these tensors are tiny in magnitude, so an absolute
+    # tolerance falsely passes; a wrong low-rank delta still has rel >> 1).
+    gate_rel = gate_err / (gate_den + 1e-9)
+    up_rel = up_err / (up_den + 1e-9)
+    gate_ok = gate_rel < 0.05
+    up_ok = up_rel < 0.05
     print(f"  GATE {'MATCH' if gate_ok else 'MISMATCH'} | UP {'MATCH' if up_ok else 'MISMATCH'} vs PEFT")
     if gate_ok and not up_ok:
-        print("  => CONFIRMED BUG: gate half correct, up half wrong (up uses gate shrink).")
+        print("  => CONFIRMED BUG: gate half correct, up half wrong (up output uses gate_A shrink).")
 
 
 if __name__ == "__main__":
