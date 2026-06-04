@@ -625,19 +625,31 @@ class TritonAttnBackend(AttentionBackend):
             if spec_info is None or spec_info.kv_indptr is None:
                 # kv_indptr is None for draft-extend's idle batch (no tree
                 # indices); build plain metadata from seq_lens.
-                # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
-                seq_lens_sum = forward_batch.seq_lens_sum
-                if seq_lens_sum is None:
-                    seq_lens_sum = bs * self.max_context_len
-                kv_indices = torch.empty(
-                    seq_lens_sum, dtype=torch.int64, device=self.device
-                )
-                kv_indptr = self._fill_kv_indptr_and_indices(
-                    bs,
-                    forward_batch.seq_lens,
-                    forward_batch.req_pool_indices,
-                    kv_indices,
-                )
+                if self.dcp_size > 1:
+                    # DCP: per-rank sharded KV indices (must mirror the
+                    # cuda-graph path's _fill_dcp_kv_indices). Building full
+                    # contiguous indices here would make each rank read the
+                    # whole KV instead of its owner shard.
+                    kv_indptr, kv_indices = self._create_dcp_kv_indices(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        self.kv_indptr,
+                        None,
+                    )
+                else:
+                    # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+                    seq_lens_sum = forward_batch.seq_lens_sum
+                    if seq_lens_sum is None:
+                        seq_lens_sum = bs * self.max_context_len
+                    kv_indices = torch.empty(
+                        seq_lens_sum, dtype=torch.int64, device=self.device
+                    )
+                    kv_indptr = self._fill_kv_indptr_and_indices(
+                        bs,
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
+                        kv_indices,
+                    )
                 # Sliding window
                 if (
                     self.sliding_window_size is not None
