@@ -451,6 +451,8 @@ class TestStatLoggersDIRecording(CustomTestCase):
     """
 
     def setUp(self) -> None:
+        # Avoid stale PROMETHEUS_MULTIPROC_DIR from prior in-process Engine boots.
+        os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
         try:
             os.unlink(_DI_RECORDING_MARKER_PATH)
         except FileNotFoundError:
