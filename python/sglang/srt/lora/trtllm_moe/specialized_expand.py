@@ -17,8 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import get_pdl_launch_metadata
-
 
 
 @triton.jit
@@ -218,7 +216,12 @@ def _invoke_moe_lora_expand_add(
         * triton.cdiv(N, block_size_n),
     )
 
-    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
+    # Lazy import: specialized_expand lives in trtllm_moe, and importing the triton_ops
+    # package at module load triggers a circular import (triton_ops/__init__ ->
+    # virtual_experts -> specialized_expand). By call time both modules are loaded.
+    from sglang.srt.lora.triton_ops import kernel_utils
+
+    enable_pdl, pdl_kwargs = kernel_utils.get_pdl_launch_metadata()
     _moe_lora_expand_add_kernel[grid](
         intermediate,
         weight,

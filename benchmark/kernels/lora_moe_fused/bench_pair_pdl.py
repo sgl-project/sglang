@@ -25,7 +25,7 @@ import torch
 import triton
 import triton.testing
 
-import sglang.srt.lora.trtllm_moe.specialized_expand as _se
+import sglang.srt.lora.triton_ops.kernel_utils as _ku
 import sglang.srt.lora.triton_ops.virtual_experts as _ve
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
@@ -47,8 +47,9 @@ PROJ = {
 def disable_pdl():
     def no_pdl():
         return False, {}
+    # shrink reads it as a module-level name; expand lazy-imports kernel_utils.* per call.
     _ve.get_pdl_launch_metadata = no_pdl
-    _se.get_pdl_launch_metadata = no_pdl
+    _ku.get_pdl_launch_metadata = no_pdl
 
 
 def make_inputs(proj, bs, ep, dtype, device, seed=0, routing="skewed", skew_a=0.9):
