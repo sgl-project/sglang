@@ -1799,10 +1799,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # Only use `swizzle_blockscale` for shapes, not for real content
-        layer.w13_blockscale_swizzled = Parameter(
-            swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
-        )
+        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
+        # during process_weights_after_loading, so skip the expensive
+        # swizzle+allocate here to avoid GPU memory fragmentation
+        if self.enable_flashinfer_trtllm_moe:
+            layer.w13_blockscale_swizzled = None
+        else:
+            layer.w13_blockscale_swizzled = Parameter(
+                swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+            )
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -1817,9 +1822,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        layer.w2_blockscale_swizzled = Parameter(
-            swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
-        )
+        if self.enable_flashinfer_trtllm_moe:
+            layer.w2_blockscale_swizzled = None
+        else:
+            layer.w2_blockscale_swizzled = Parameter(
+                swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+            )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 

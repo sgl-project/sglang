@@ -12,7 +12,9 @@ The ImageUpscaler wrapper and integration code are original work.
 import math
 import os
 import time
+from hashlib import sha256
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -689,6 +691,7 @@ def _resolve_model_path(model_path: str) -> str:
 
     Accepts:
     - An existing local file path (pass-through).
+    - An http(s) URL to a .pth file, downloaded into the local cache.
     - A HuggingFace ``repo_id`` → downloads the default weight file
       (``RealESRGAN_x4.pth``).
     - A HuggingFace ``repo_id:filename`` → downloads *filename* from *repo_id*,
@@ -701,6 +704,25 @@ def _resolve_model_path(model_path: str) -> str:
     if os.path.isfile(model_path):
         _RESOLVED_MODEL_PATH_CACHE[model_path] = model_path
         return model_path
+
+    parsed_url = urlparse(model_path)
+    if parsed_url.scheme in ("http", "https"):
+        filename = (
+            os.path.basename(unquote(parsed_url.path)) or _DEFAULT_REALESRGAN_FILENAME
+        )
+        cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "sglang", "realesrgan"
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = sha256(model_path.encode("utf-8")).hexdigest()[:12]
+        local_path = os.path.join(cache_dir, f"{cache_key}-{filename}")
+        if not os.path.isfile(local_path):
+            tmp_path = f"{local_path}.tmp"
+            logger.info("Downloading Real-ESRGAN weights from URL %s", model_path)
+            torch.hub.download_url_to_file(model_path, tmp_path, progress=False)
+            os.replace(tmp_path, local_path)
+        _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
+        return local_path
 
     # Parse optional "repo_id:filename" syntax; fall back to default filename.
     if ":" in model_path and not model_path.startswith("/"):

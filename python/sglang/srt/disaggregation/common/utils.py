@@ -3,10 +3,15 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+
+from sglang.srt.observability.trace import (
+    TraceNullContext,
+    TraceReqContext,
+)
 
 
 @dataclasses.dataclass
@@ -20,6 +25,9 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
+        default_factory=TraceNullContext
+    )
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
