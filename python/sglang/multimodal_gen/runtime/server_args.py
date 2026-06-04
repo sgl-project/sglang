@@ -224,9 +224,6 @@ class ServerArgs(DisaggArgsMixin):
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
-    # Progressive resolution growing (DCT spectral upsampling); "fullres" disables.
-    progressive_mode: str = "fullres"
-
     disable_autocast: bool | None = None
 
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
@@ -1242,16 +1239,6 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.server_warmup,
             help="Send a warmup request after server ready",
         )
-        parser.add_argument(
-            "--progressive-mode",
-            type=str,
-            default=ServerArgs.progressive_mode,
-            choices=["fullres", "dct", "dct_rewind"],
-            dest="progressive_mode",
-            help="Progressive resolution mode for FLUX. 'fullres' disables (default). "
-            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
-        )
-
         # layerwise offload
         parser.add_argument(
             "--dit-cpu-offload",
