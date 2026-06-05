@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import functools
+import os
 from typing import Any, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once, load_jit
 from sglang.srt.utils.custom_op import register_custom_op
 
 _H200_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _B200_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _SUPPORTED_NUM_GROUPS = {32}
-_USE_PDL = False
-_LARGE_THRESH = 1 << 16
+_LARGE_THRESH = int(os.environ.get("GNS_SMALL_LARGE_THRESH", str(1 << 16)))
 _CHUNK_ELEMS = 8192
-_GIANT_THRESH = 900_000
+_GIANT_THRESH = int(os.environ.get("GNS_GIANT_THRESH", str(700_000)))
+_GIANT_CHUNK_ELEMS = int(os.environ.get("GNS_GIANT_CHUNK", str(16384)))
+_CLEAN_CHUNK_ELEMS = int(os.environ.get("GNS_CLEAN_CHUNK", "0"))
+_GIANT_STATS_CHUNK_ELEMS = int(os.environ.get("GNS_GIANT_STATS_CHUNK", "0"))
 
 
 def _capability(t: torch.Tensor) -> tuple[int, int]:
@@ -55,16 +59,17 @@ def _torch_extension_flags() -> tuple[list[str], list[str]]:
 
 
 @cache_once
-def _h200_module(dtype: torch.dtype, pdl: bool):
-    args = make_cpp_args(dtype, pdl)
+def _h200_module():
+    include_paths, ldflags = _torch_extension_flags()
     return load_jit(
-        "diffusion_native_group_norm_silu",
-        *args,
-        cuda_files=["diffusion/group_norm_silu_native.cuh"],
-        cuda_wrappers=[
-            ("group_norm_silu", f"GroupNormSiluKernel<{args}>::run"),
-            ("group_norm_silu_large", f"GroupNormSiluKernel<{args}>::run_large"),
-        ],
+        "diffusion_native_group_norm_silu_h200",
+        "v1",
+        cuda_files=["diffusion/group_norm_silu_h200.cu"],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+        extra_ldflags=ldflags,
+        extra_include_paths=include_paths,
+        header_only=False,
     )
 
 
@@ -111,16 +116,13 @@ def _base_inputs_ok(x: Any, weight: Any, bias: Any, num_groups: Any) -> bool:
 
 
 def _can_use_h200(x: Any, weight: Any, bias: Any, num_groups: Any) -> bool:
-    if not (
+    return (
         _base_inputs_ok(x, weight, bias, num_groups)
         and _is_h200(x)
         and x.dtype in _H200_SUPPORTED_DTYPES
         and x.is_contiguous()
         and _aligned(x)
-    ):
-        return False
-    group_size = (x.shape[1] // int(num_groups)) * _spatial(x)
-    return group_size < _GIANT_THRESH
+    )
 
 
 def _can_use_b200(x: Any, weight: Any, bias: Any, num_groups: Any) -> bool:
@@ -152,6 +154,120 @@ def _group_norm_silu_fake(
     return x.new_empty(x.shape)
 
 
+@functools.lru_cache(maxsize=256)
+def _giant_chunk_for(spatial: int) -> int:
+    target = _GIANT_CHUNK_ELEMS
+    k_min = -(-spatial // target)
+    for k in range(k_min, min(4 * k_min, spatial) + 1):
+        if spatial % k == 0 and (spatial // k) % 8 == 0:
+            return spatial // k
+    return target
+
+
+_row_counters: dict = {}
+
+
+def _row_counter(num_rows: int, device: torch.device) -> torch.Tensor:
+    stream = torch.cuda.current_stream(device)
+    key = (device.type, device.index, stream.cuda_stream)
+    buf = _row_counters.get(key)
+    if buf is None or buf.numel() < num_rows:
+        buf = torch.zeros(max(num_rows, 64), dtype=torch.int32, device=device)
+        _row_counters[key] = buf
+    return buf
+
+
+def _run_h200_group_norm_silu(
+    x3: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    y3: torch.Tensor,
+    num_groups: int,
+    eps: float,
+) -> None:
+    mod = _h200_module()
+    channels = x3.shape[1]
+    spatial = x3.shape[2]
+    group_size = (channels // num_groups) * spatial
+    with torch.cuda.device(x3.device):
+        if group_size < _LARGE_THRESH:
+            mod.gns_candidate_small(x3, weight, bias, int(num_groups), float(eps), y3)
+            return
+
+        num_rows = x3.shape[0] * num_groups
+        clean_chunk = _CLEAN_CHUNK_ELEMS or _giant_chunk_for(spatial)
+        use_clean = (
+            group_size >= _GIANT_THRESH
+            and spatial >= clean_chunk
+            and spatial % clean_chunk == 0
+        )
+        use_giant = (
+            not use_clean
+            and group_size >= _GIANT_THRESH
+            and spatial >= _GIANT_CHUNK_ELEMS
+        )
+        if use_clean:
+            total = num_rows * (group_size // clean_chunk)
+        elif use_giant:
+            apply_chunk = _giant_chunk_for(spatial)
+            stats_chunk = _GIANT_STATS_CHUNK_ELEMS or apply_chunk
+            stats_chunks_per_row = (group_size + stats_chunk - 1) // stats_chunk
+            total = num_rows * stats_chunks_per_row
+        else:
+            chunks_per_row = (group_size + _CHUNK_ELEMS - 1) // _CHUNK_ELEMS
+            total = num_rows * chunks_per_row
+
+        scratch_kwargs = {"device": x3.device, "dtype": torch.float32}
+        partial_sum = torch.empty(total, **scratch_kwargs)
+        partial_sumsq = torch.empty(total, **scratch_kwargs)
+        mean = torch.empty(num_rows, **scratch_kwargs)
+        rstd = torch.empty(num_rows, **scratch_kwargs)
+        if use_clean:
+            mod.gns_candidate_clean_giant(
+                x3,
+                weight,
+                bias,
+                partial_sum,
+                partial_sumsq,
+                mean,
+                rstd,
+                _row_counter(num_rows, x3.device),
+                int(num_groups),
+                float(eps),
+                int(clean_chunk),
+                y3,
+            )
+        elif use_giant:
+            mod.gns_candidate_giant(
+                x3,
+                weight,
+                bias,
+                partial_sum,
+                partial_sumsq,
+                mean,
+                rstd,
+                _row_counter(num_rows, x3.device),
+                int(num_groups),
+                float(eps),
+                int(stats_chunk),
+                int(apply_chunk),
+                y3,
+            )
+        else:
+            mod.gns_candidate_large(
+                x3,
+                weight,
+                bias,
+                partial_sum,
+                partial_sumsq,
+                mean,
+                rstd,
+                int(num_groups),
+                float(eps),
+                y3,
+            )
+
+
 @register_custom_op(
     op_name="diffusion_native_group_norm_silu_cuda",
     fake_impl=_group_norm_silu_fake,
@@ -172,33 +288,9 @@ def _native_group_norm_silu_cuda(
 
     batch, channels = int(x.shape[0]), int(x.shape[1])
     spatial = _spatial(x)
-    group_size = (channels // int(num_groups)) * spatial
     x3 = x.reshape(batch, channels, spatial)
     y3 = torch.empty_like(x3)
-    mod = _h200_module(x.dtype, _USE_PDL)
-    if group_size >= _LARGE_THRESH:
-        num_rows = batch * int(num_groups)
-        chunks_per_row = (group_size + _CHUNK_ELEMS - 1) // _CHUNK_ELEMS
-        total_tasks = num_rows * chunks_per_row
-        scratch_kwargs = {"device": x.device, "dtype": torch.float32}
-        partial_sum = torch.empty(total_tasks, **scratch_kwargs)
-        partial_sumsq = torch.empty(total_tasks, **scratch_kwargs)
-        mean = torch.empty(num_rows, **scratch_kwargs)
-        rstd = torch.empty(num_rows, **scratch_kwargs)
-        mod.group_norm_silu_large(
-            x3,
-            weight,
-            bias,
-            y3,
-            partial_sum,
-            partial_sumsq,
-            mean,
-            rstd,
-            int(num_groups),
-            float(eps),
-        )
-    else:
-        mod.group_norm_silu(x3, weight, bias, y3, int(num_groups), float(eps))
+    _run_h200_group_norm_silu(x3, weight, bias, y3, int(num_groups), float(eps))
     return y3.reshape_as(x)
 
 
