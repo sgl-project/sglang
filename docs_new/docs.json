@@ -877,7 +877,8 @@
                     "group": "Model Tutorials",
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1",
-                      "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2"
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_dense"
                     ]
                   },
                   "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
