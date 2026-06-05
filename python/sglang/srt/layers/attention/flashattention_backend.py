@@ -968,14 +968,18 @@ class FlashAttentionBackend(AttentionBackend):
                 # Append the padded tail as a dummy, self-attending segment so every
                 # row is a valid sequence. Real tokens stay in their own segment and
                 # are unaffected. Built once per forward and cached on the metadata
-                # (reused across layers); ``extend_num_tokens`` is a python int equal
-                # to ``cu_seqlens_q[-1]``, so this needs no device sync.
+                # (reused across layers). ``extend_num_tokens`` is a python int equal
+                # to ``cu_seqlens_q[-1]`` for extend/prefill forwards, so it needs no
+                # device sync. With no padding -- or if the count is unavailable (e.g.
+                # any non-piecewise path) -- cu_seqlens_q already covers q, so fall
+                # through to using it as-is (no dummy segment).
                 if metadata.fa_skip_cu_seqlens_q is None:
                     num_real_tokens = forward_batch.extend_num_tokens
-                    if num_real_tokens is None:
-                        num_real_tokens = int(cu_seqlens_q[-1].item())
                     num_padded_tokens = q.shape[0]
-                    if num_real_tokens < num_padded_tokens:
+                    if (
+                        num_real_tokens is not None
+                        and num_real_tokens < num_padded_tokens
+                    ):
                         metadata.fa_skip_cu_seqlens_q = torch.cat(
                             [cu_seqlens_q, cu_seqlens_q.new_tensor([num_padded_tokens])]
                         )
