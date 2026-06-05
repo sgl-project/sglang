@@ -192,7 +192,7 @@ if _is_cuda:
     from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
     from sgl_kernel import dsv3_router_gemm
 
-    from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
+    from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import dsv3_fused_a_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -1657,7 +1657,7 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and not self.is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] in (2112, 6144)
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and _is_cuda
             and _device_sm >= 90

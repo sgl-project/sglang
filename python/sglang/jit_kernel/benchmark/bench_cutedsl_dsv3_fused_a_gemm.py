@@ -25,21 +25,11 @@ from sglang.utils import is_in_ci
 register_cuda_ci(est_time=8, suite="base-b-kernel-benchmark-1-gpu-large")
 
 GEMM_M = 2112
-GEMM_K = 7168
+GEMM_K_LIST = [6144, 7168]
 
-try:
-    from sgl_kernel import dsv3_fused_a_gemm as aot_fn
+from sgl_kernel import dsv3_fused_a_gemm as aot_fn
 
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
-
-try:
-    from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import dsv3_fused_a_gemm as jit_fn
-
-    JIT_AVAILABLE = True
-except ImportError:
-    JIT_AVAILABLE = False
+from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import dsv3_fused_a_gemm as jit_fn
 
 
 def _median_us(fn) -> float:
@@ -51,18 +41,34 @@ def _median_us(fn) -> float:
 
 def benchmark():
     torch.manual_seed(0)
-    weight = torch.randn(GEMM_M, GEMM_K, dtype=torch.bfloat16, device="cuda")
-    mat_b = weight.t()  # [GEMM_K, GEMM_M] column-major (the weight)
-    num_tokens = [1] if is_in_ci() else [1, 2, 4, 8, 12, 16]
+    num_tokens = [1] if is_in_ci() else list(range(1, 17))
 
-    print(f"dsv3 fused-A GEMM  K={GEMM_K} N={GEMM_M}  (CUPTI cold-L2, us)")
-    print(f"{'M':>4} {'aot':>9} {'jit':>9} {'aot/jit':>9}")
-    for m in num_tokens:
-        a = torch.randn(m, GEMM_K, dtype=torch.bfloat16, device="cuda")
-        aot_us = _median_us(lambda: aot_fn(a, mat_b)) if AOT_AVAILABLE else float("nan")
-        jit_us = _median_us(lambda: jit_fn(a, mat_b)) if JIT_AVAILABLE else float("nan")
-        ratio = aot_us / jit_us if (AOT_AVAILABLE and JIT_AVAILABLE) else float("nan")
-        print(f"{m:>4} {aot_us:>9.2f} {jit_us:>9.2f} {ratio:>9.2f}")
+    for gemm_k in GEMM_K_LIST:
+        weight = torch.randn(GEMM_M, gemm_k, dtype=torch.bfloat16, device="cuda")
+        mat_b = weight.t()  # [gemm_k, GEMM_M] column-major (the weight)
+
+        # The AOT kernel hardcodes K=7168; skip it for other K.
+        has_aot = gemm_k == 7168
+
+        print(f"dsv3 fused-A GEMM  K={gemm_k} N={GEMM_M}  (CUPTI cold-L2, us)")
+        print(
+            f"{'M':>4} {'aot':>9} {'jit':>9} {'torch':>9} {'aot/jit':>9} {'torch/jit':>9}"
+        )
+        for m in num_tokens:
+            a = torch.randn(m, gemm_k, dtype=torch.bfloat16, device="cuda")
+            jit_us = _median_us(lambda: jit_fn(a, mat_b))
+            torch_us = _median_us(lambda: torch.matmul(a, mat_b))
+            aot_str = f"{'-':>9}"
+            ratio_str = f"{'-':>9}"
+            if has_aot:
+                aot_us = _median_us(lambda: aot_fn(a, mat_b))
+                aot_str = f"{aot_us:>9.2f}"
+                ratio_str = f"{aot_us / jit_us:>9.2f}"
+            print(
+                f"{m:>4} {aot_str} {jit_us:>9.2f} {torch_us:>9.2f} "
+                f"{ratio_str} {torch_us / jit_us:>9.2f}"
+            )
+        print()
 
 
 if __name__ == "__main__":
