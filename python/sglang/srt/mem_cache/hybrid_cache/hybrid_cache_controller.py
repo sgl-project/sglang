@@ -426,6 +426,7 @@ class HybridCacheController(BaseHiCacheController):
                 finish_event=finish_event,
                 node_ids=op.node_ids,
                 token_count=token_count,
+                pool_transfers=resolved_pool_transfers,
             )
         )
 
@@ -509,6 +510,7 @@ class HybridCacheController(BaseHiCacheController):
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
                 token_count=token_count,
+                pool_transfers=resolved_pool_transfers,
             )
         )
         return producer_id
