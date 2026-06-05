@@ -4,6 +4,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    BALLAST_MAX_NEW_TOKENS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
@@ -43,6 +44,16 @@ class TestKVPressureBasic(ScriptedTestCase):
     @staticmethod
     def _script_kv_full_chunked_new_req_retracts(t: ScriptedContext):
         baseline = t.engine_stats()["kv_pool_free"]
+
+        # A retractable decode peer: it holds KV that the scheduler's decode-OOM
+        # path can actually retract to admit/continue the chunked req. With only
+        # the raw-allocator exhauster (no Req) there is nothing to retract, so
+        # the chunked req's next-chunk alloc_for_extend hard-OOMs and crashes
+        # the scheduler.
+        r_peer = t.start_req(
+            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
+        )
+        yield from run_until(r_peer, lambda h: h.status == "running")
         t.exhaust_kv(leave_pages=2)
         yield
 
@@ -416,21 +427,39 @@ class TestKVPressurePriority(ScriptedTestCase):
     @staticmethod
     def _script_priority_preempt_multiple_chunked(t: ScriptedContext):
         baseline = t.engine_stats()["kv_pool_free"]
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Distinct prompt_token per req: with identical prompts r2 would hit
+        # r1's cached prefix and never genuinely chunk, so the preemption under
+        # test would not occur.
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=11)
         yield from run_until(r1, lambda h: h.is_chunking)
 
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10)
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10, prompt_token=12
+        )
+        # Probe BOTH handles every step (no short-circuit) so the faster req is
+        # registered before recycle.
+        done = {r1.rid: False, r2.rid: False}
         for _ in range(DEFAULT_MAX_STEPS * 4):
             assert not (r1.is_chunking and r2.is_chunking), (
                 f"two reqs cannot share the chunked slot; "
                 f"r1.is_chunking={r1.is_chunking}, r2.is_chunking={r2.is_chunking}"
             )
-            if r1.finished and r2.finished:
+            done[r1.rid] = done[r1.rid] or r1.finished
+            done[r2.rid] = done[r2.rid] or r2.finished
+            if all(done.values()):
                 break
             yield
-        assert r1.finished and r2.finished
+        assert done[r1.rid] and done[r2.rid]
         assert r1.kv_pages == 0
         assert r2.kv_pages == 0
+        # The finished prompts legitimately stay committed in the radix tree
+        # (cached != leaked); drain to idle and flush before the leak comparison.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        t.flush_cache()
+        yield
         final = t.engine_stats()["kv_pool_free"]
         assert final >= baseline, (
             f"KV pool not fully released after preemption: "

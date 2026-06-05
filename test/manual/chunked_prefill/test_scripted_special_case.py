@@ -4,6 +4,7 @@ from typing import Optional
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    BALLAST_MAX_NEW_TOKENS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
@@ -440,6 +441,15 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_forced_admission_avoids_leak(t: ScriptedContext):
+        # A retractable decode peer holds KV the scheduler's decode-OOM retract
+        # path can actually free; raw exhaust_kv pages have no backing Req, so
+        # with leave_pages=0 the forced chunk's alloc_for_extend hard-OOMs
+        # (common.py raise RuntimeError) and crashes the scheduler.
+        r_peer = t.start_req(
+            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
+        )
+        yield from run_until(r_peer, lambda h: h.status == "running")
+
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
@@ -447,7 +457,10 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             t.scheduler.req_to_token_pool.size
             - t.scheduler.req_to_token_pool.available_size()
         )
-        t.exhaust_kv(leave_pages=0)
+        # Squeeze free KV to a sub-chunk sliver so the chunked resume sees
+        # _rem_tokens <= 0 and takes the force-re-add path; the retractable peer
+        # supplies the pages the forced chunk needs.
+        t.exhaust_kv(leave_pages=1)
         yield from run_until_finished(r)
         assert r.finished
         assert (
@@ -650,9 +663,20 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_add_chunked_req_non_swa_forced_admit_on_rem_zero(t: ScriptedContext):
+        # A retractable decode peer holds KV the scheduler's decode-OOM retract
+        # path can actually free; raw exhaust_kv pages have no backing Req, so
+        # with leave_pages=0 the forced chunk's alloc_for_extend hard-OOMs
+        # (common.py raise RuntimeError) and crashes the scheduler.
+        r_peer = t.start_req(
+            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
+        )
+        yield from run_until(r_peer, lambda h: h.status == "running")
+
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.exhaust_kv(leave_pages=0)
+        # Sub-chunk sliver => _rem_tokens <= 0 => force-re-add; the peer is
+        # retractable so the forced chunk can allocate and the req finishes.
+        t.exhaust_kv(leave_pages=1)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished, (
             "non-SWA chunked-resume must be force-admitted when "
@@ -842,57 +866,6 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
                 return
             yield
         raise AssertionError("req did not finish under disabled chunking")
-
-
-class TestSpecialCaseTinyChunk(ScriptedTestCase):
-    # chunked_prefill_size must be divisible by page_size (server_args validation),
-    # so a chunk smaller than the page is invalid. Use chunk == page (still tiny).
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=16,
-        page_size=16,
-    )
-
-    def test_chunked_admission_trunc_lt_zero_returns_other(self):
-        self.server.execute_script(
-            self._script_chunked_admission_trunc_lt_zero_returns_other
-        )
-
-    @staticmethod
-    def _script_chunked_admission_trunc_lt_zero_returns_other(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        saw_deferred_iter = False
-        for _ in range(DEFAULT_MAX_STEPS):
-            if r.finished:
-                break
-            if r.status == "waiting":
-                # add_one_req returned OTHER (trunc_len <= 0 because
-                # chunked_prefill_size < page_size), so admission is deferred:
-                # the req must still be sitting in the waiting queue with no KV
-                # allocated to it.
-                saw_deferred_iter = True
-                assert r.kv_pages == 0, (
-                    f"deferred (OTHER) chunked req must hold no KV while waiting; "
-                    f"got kv_pages={r.kv_pages}"
-                )
-            yield
-        assert r.finished
-        assert saw_deferred_iter, (
-            "expected at least one iter where add_one_req returned OTHER "
-            "(req status == waiting); chunked_prefill_size < page_size must "
-            "defer admission"
-        )
-
-
-# Deterministic inference with the flashinfer backend forces the chunked-prefill
-# truncation to a multiple of the prefill split-tile size
-# (SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE, default 4096; scheduler.py
-# init_deterministic_inference_config). schedule_policy.py:940-946 then refuses to
-# admit a chunk smaller than that align size, so chunked_prefill_size must be at
-# least the align size or the long prompt can never start chunking (it would sit in
-# the waiting queue forever). Use chunk_size == the align size and a prompt longer
-# than one chunk so the req chunks exactly once before the (sub-align) tail admits
-# as the non-chunked last chunk.
-DETERMINISTIC_ALIGN_SIZE = 4096
 
 
 class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
@@ -1092,21 +1065,28 @@ class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
         # post-squeeze chunks_done bump is NOT a reliable witness: with all KV held
         # the req may land on its final chunk and finish without advancing chunks_done
         # in the observable window, so requiring a bump is a wrong assumption.
+        # A retractable decode peer holds the KV so pressure is real but
+        # recoverable: the scheduler's decode-OOM retract path frees its pages,
+        # whereas exhaust_kv pages have no backing Req to retract -- the forced
+        # chunk's alloc_for_extend would hard-OOM and crash the scheduler.
+        r_peer = t.start_req(
+            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
+        )
+        yield from run_until(r_peer, lambda h: h.status == "running")
+
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        # Grab every free KV page (leave_pages=0). Leaving a sub-chunk sliver
-        # (e.g. one page) instead lures the scheduler into attempting a full
-        # 256-token chunk allocation against insufficient pages and hard-OOMs the
-        # forward pass; draining to exactly zero makes rem_total_tokens hit 0 so
-        # _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0 and the force-
-        # to-rem_chunk_tokens re-add path (schedule_policy.py:682) runs cleanly.
-        t.exhaust_kv(leave_pages=0)
+        # Squeeze the remaining free KV down to a sub-chunk sliver so the chunked
+        # resume sees _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0
+        # and takes the force-to-rem_chunk_tokens re-add path; the decode peer can
+        # then be retracted to supply the pages the forced chunk needs.
+        t.exhaust_kv(leave_pages=1)
 
         yield from run_until_finished(r, max_steps=DEFAULT_MAX_STEPS * 2)
         assert r.finished, (
             "non-SWA chunked resume must be force-re-added when _rem_tokens <= 0 "
-            "(schedule_policy.py:682); pre-fix it would block forever and leak its "
+            "and complete once a retractable peer frees KV; it must not leak its "
             f"held row + KV. status={r.status} kv_pages={r.kv_pages}"
         )
         assert r.kv_pages == 0, f"kv_pages={r.kv_pages}"

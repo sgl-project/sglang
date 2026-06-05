@@ -39,17 +39,22 @@ class TestPageSize16ChunkSize16(ScriptedTestCase):
         assert r.kv_pages == 0
 
 
-class TestPageSize16ChunkSize15(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=15, page_size=16)
+class TestPageSize16ChunkSize16NonMultiplePrompt(ScriptedTestCase):
+    # chunked_prefill_size must be a multiple of page_size (server_args), so a
+    # sub-page chunk is impossible; chunk == page is the smallest valid "tiny
+    # chunk".
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=16, page_size=16)
 
-    def test_chunk_size_misaligned_page_size_plus_minus_1(self):
-        """Chunk size below page size still advances in page-aligned steps."""
+    def test_non_page_multiple_prompt_advances_in_page_steps(self):
+        """A prompt that is not a page multiple still advances in page-aligned chunks."""
         self.server.execute_script(
-            self._script_chunk_size_misaligned_page_size_plus_minus_1
+            self._script_non_page_multiple_prompt_advances_in_page_steps
         )
 
     @staticmethod
-    def _script_chunk_size_misaligned_page_size_plus_minus_1(t: ScriptedContext):
+    def _script_non_page_multiple_prompt_advances_in_page_steps(t: ScriptedContext):
+        # prompt_len=60 with chunk==page==16 -> ceil(60/16) == 4 page-aligned
+        # chunks (16, 16, 16, 12); the trailing partial page is its own chunk.
         r = t.start_req(prompt_len=60, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=400)
         assert r.finished

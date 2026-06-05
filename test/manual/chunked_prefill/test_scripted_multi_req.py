@@ -3,6 +3,7 @@ import unittest
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    BALLAST_MAX_NEW_TOKENS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
@@ -470,7 +471,10 @@ class TestMultiReqPriority(ScriptedTestCase):
         # high req's priority must exceed each normal's by more than 10.
         normal = [
             t.start_req(
-                prompt_len=16, max_new_tokens=100000, ignore_eos=True, priority=0
+                prompt_len=16,
+                max_new_tokens=BALLAST_MAX_NEW_TOKENS,
+                ignore_eos=True,
+                priority=0,
             )
             for _ in range(4)
         ]
