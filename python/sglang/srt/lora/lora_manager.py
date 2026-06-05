@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -46,6 +47,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +127,7 @@ class LoRAManager:
         # ===== TO BE REFACTORED ====
         # Pre-create the experimental LoRA two-stream side stream now (gated) so the
         # torch.cuda.Stream() call never lands inside a cuda-graph capture region.
-        from sglang.srt.environ import envs as _sgl_envs
-
-        if _sgl_envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp import (
                 init_lora_two_stream_resources,
             )

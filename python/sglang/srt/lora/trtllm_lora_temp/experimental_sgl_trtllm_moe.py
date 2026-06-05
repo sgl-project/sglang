@@ -66,7 +66,7 @@ def sgl_trtllm_fp8_block_scale_moe_wrapper(
         from flashinfer.fused_moe.core import ActivationType
     except ImportError as e:
         raise ImportError(
-            "sgl_flashinfer_trtllm requires flashinfer-python to provide "
+            "experimental_sgl_trtllm requires flashinfer-python to provide "
             "TRTLLM enums and cubin-loader utilities."
         ) from e
 
@@ -164,7 +164,7 @@ def sgl_trtllm_fp8_block_scale_routed_moe_wrapper(
         from flashinfer.fused_moe.core import ActivationType
     except ImportError as e:
         raise ImportError(
-            "sgl_flashinfer_trtllm requires flashinfer-python to provide "
+            "experimental_sgl_trtllm requires flashinfer-python to provide "
             "TRTLLM enums and cubin-loader utilities."
         ) from e
 

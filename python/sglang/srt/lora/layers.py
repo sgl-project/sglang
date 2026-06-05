@@ -10,6 +10,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -25,6 +26,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -868,20 +871,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     rather than computed independently and added at the end.
     """
 
-    def __getattr__(self, name: str):
-        # Delegate attrs not on this wrapper to the wrapped base FusedMoE (experimental
-        # path only — off/oss falls through to the plain nn.Module AttributeError).
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            from sglang.srt.environ import envs
-
-            if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
-                modules = self.__dict__.get("_modules")
-                if modules is not None and "base_layer" in modules:
-                    return getattr(modules["base_layer"], name)
-            raise
-
     def __init__(
         self,
         base_layer: FusedMoE,
@@ -896,6 +885,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
+        self.dispatcher = base_layer.dispatcher
+        self.num_local_experts = base_layer.num_local_experts
+        self.should_fuse_routed_scaling_factor_in_topk = (
+            base_layer.should_fuse_routed_scaling_factor_in_topk
+        )
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
@@ -925,12 +919,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # ===== TO BE REFACTORED ====
         self._lora_runner_backend = runner_backend
-        if runner_backend.is_sgl_flashinfer_trtllm():
+        if runner_backend.is_experimental_sgl_trtllm():
             from sglang.srt.lora.trtllm_lora_temp.lora_layer import (
-                init_sgl_flashinfer_trtllm_lora,
+                init_experimental_sgl_trtllm_lora,
             )
 
-            init_sgl_flashinfer_trtllm_lora(self, base_layer)
+            init_experimental_sgl_trtllm_lora(self, base_layer)
             return
         # ===== END TO BE REFACTORED ====
 
@@ -990,7 +984,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
 
-        if self._lora_runner_backend.is_sgl_flashinfer_trtllm():
+        if self._lora_runner_backend.is_experimental_sgl_trtllm():
             # Per-rank (local) expert count the LoRA buffers are indexed by, so
             # virtual-experts indexing matches the buffers under EP.
             num_experts = (
@@ -1059,12 +1053,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         quant_info = self._quant_info
 
         # ===== TO BE REFACTORED ====
-        if self._lora_runner_backend.is_sgl_flashinfer_trtllm():
+        if self._lora_runner_backend.is_experimental_sgl_trtllm():
             from sglang.srt.lora.trtllm_lora_temp.lora_layer import (
-                dispatch_sgl_flashinfer_trtllm_lora,
+                dispatch_experimental_sgl_trtllm_lora,
             )
 
-            combine_input = dispatch_sgl_flashinfer_trtllm_lora(
+            combine_input = dispatch_experimental_sgl_trtllm_lora(
                 dispatch_output, quant_info, base_layer, lora_info
             )
         # ===== END TO BE REFACTORED ====
@@ -1207,9 +1201,7 @@ def get_lora_layer(
 
 # ===== TO BE REFACTORED ====
 # Experimental two-stream LoRA overlap; installed only under the master switch, else no-op.
-from sglang.srt.environ import envs as _sgl_envs  # noqa: E402
-
-if _sgl_envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+if _SGLANG_EXPERIMENTAL_LORA_OPTI:
     from sglang.srt.lora.trtllm_lora_temp import (  # noqa: E402
         install_two_stream_overrides as _install_lora_two_stream,
     )

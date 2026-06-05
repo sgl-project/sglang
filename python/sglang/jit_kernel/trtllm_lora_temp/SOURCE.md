@@ -2,7 +2,7 @@ FlashInfer TRTLLM MoE Overlay
 =============================
 
 This directory contains only the editable overlay files used by SGLang's
-`sgl_flashinfer_trtllm` SM100 TRTLLM fused MoE backend. Unmodified FlashInfer
+`experimental_sgl_trtllm` SM100 TRTLLM fused MoE backend. Unmodified FlashInfer
 and TRTLLM sources are compiled from the installed `flashinfer` package at JIT
 time.
 

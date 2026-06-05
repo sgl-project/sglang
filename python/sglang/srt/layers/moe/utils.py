@@ -91,7 +91,7 @@ class MoeRunnerBackend(Enum):
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
-    SGL_FLASHINFER_TRTLLM = "sgl_flashinfer_trtllm"
+    EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -113,15 +113,15 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
-        # sgl_flashinfer_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
-        # trtllm weight-prep here; divergent sites check is_sgl_flashinfer_trtllm() first.
+        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
         return self in (
             MoeRunnerBackend.FLASHINFER_TRTLLM,
-            MoeRunnerBackend.SGL_FLASHINFER_TRTLLM,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM,
         )
 
-    def is_sgl_flashinfer_trtllm(self):
-        return self == MoeRunnerBackend.SGL_FLASHINFER_TRTLLM
+    def is_experimental_sgl_trtllm(self):
+        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM
 
     def is_flashinfer_trtllm_routed(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED

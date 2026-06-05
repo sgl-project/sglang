@@ -113,6 +113,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
 
@@ -438,7 +440,7 @@ class TopK(MultiPlatformOp):
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
         # ===== TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_sgl_flashinfer_trtllm():
+        elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
                 from sglang.srt.server_args import get_global_server_args
 
@@ -1243,43 +1245,37 @@ def biased_grouped_topk_gpu(
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
             # ===== TO BE REFACTORED ====
-            _use_jit_kimi_gate = False
-            if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+            _use_jit_bf16_gate = False
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
-                _use_jit_kimi_gate = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE.get()
-            if _use_jit_kimi_gate:
+                _use_jit_bf16_gate = (
+                    lora_envs.SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE.get()
+                    and lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
+                )
+            if _use_jit_bf16_gate:
                 from sglang.jit_kernel.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
                     kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
                 )
 
-                use_bf16_input = lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
-            else:
-                _kimi_k2_moe_fused_gate = kimi_k2_moe_fused_gate
-                use_bf16_input = False
-
-            if use_bf16_input:
-                # Pass gating_output and correction_bias through untouched, dropping the
-                # two host-side elementwise upcast kernels.
-                _gi = gating_output
-                _cb = correction_bias
-            else:
-                _gi = gating_output.to(dtype=torch.float32)
-                _cb = (
-                    correction_bias.to(dtype=torch.float32)
-                    if correction_bias is not None
-                    else correction_bias
+                # bf16 pass-through: skip the two host-side fp32 upcast kernels.
+                return _kimi_k2_moe_fused_gate(
+                    gating_output,
+                    correction_bias,
+                    topk=topk,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
-            _ret = _kimi_k2_moe_fused_gate(
-                _gi,
-                _cb,
+            return kimi_k2_moe_fused_gate(
+                gating_output.to(dtype=torch.float32),
+                correction_bias,
                 topk=topk,
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
-            return _ret
         elif (
             _is_cuda
             and num_expert_group == 1
@@ -1634,7 +1630,7 @@ def select_experts(
             # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): only on the plain
             # CUDA softmax path with no EPLB remap / shared experts / bias / routing overrides.
             _fused_topk_pack = False
-            if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
                 _fused_topk_pack = lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()

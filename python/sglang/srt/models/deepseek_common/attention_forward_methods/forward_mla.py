@@ -46,6 +46,8 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.utils import BumpAllocator
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -286,7 +288,7 @@ class DeepseekMLAForwardMixin:
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         _kvb_q = None
-        if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_q_prepare,
@@ -377,7 +379,7 @@ class DeepseekMLAForwardMixin:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-        if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_q_apply,
             )
@@ -565,7 +567,7 @@ class DeepseekMLAForwardMixin:
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
-        if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_prepare,
@@ -711,7 +713,7 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_apply,
             )

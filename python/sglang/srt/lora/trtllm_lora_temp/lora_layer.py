@@ -1,13 +1,13 @@
-"""sgl_flashinfer_trtllm-specific bits of ``FusedMoEWithLoRA``.
+"""experimental_sgl_trtllm-specific bits of ``FusedMoEWithLoRA``.
 
 This file holds the two trtllm-specific code blocks that used to be inlined
 inside the ``FusedMoEWithLoRA`` class in ``lora/layers.py``:
 
-  - :func:`init_sgl_flashinfer_trtllm_lora` — builds the FP8 block-scale
+  - :func:`init_experimental_sgl_trtllm_lora` — builds the FP8 block-scale
     ``FlashInferTrtllmFp8MoeQuantInfo`` and stores it on the layer instance.
     Called from ``FusedMoEWithLoRA.__init__`` when the runner backend is the
-    sgl_flashinfer_trtllm MoE.
-  - :func:`dispatch_sgl_flashinfer_trtllm_lora` — dispatches the LoRA fused
+    experimental_sgl_trtllm MoE.
+  - :func:`dispatch_experimental_sgl_trtllm_lora` — dispatches the LoRA fused
     experts call. Called from ``FusedMoEWithLoRA.run`` for the same backend.
 
 Keeping them here means ``lora/layers.py`` only has tiny ``if backend == ...:
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 
-def init_sgl_flashinfer_trtllm_lora(layer, base_layer) -> None:
+def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
     """Build and store the trtllm FP8 LoRA quant info on the layer.
 
     Sets ``layer._lora_runner = None`` (trtllm path doesn't use ``MoeRunner``)
@@ -83,13 +83,13 @@ def init_sgl_flashinfer_trtllm_lora(layer, base_layer) -> None:
     use_mxfp8 = bool(getattr(quant_config, "use_mxfp8", False))
     assert getattr(
         quant_method, "block_quant", False
-    ), "sgl_flashinfer_trtllm LoRA currently requires FP8 block quant."
+    ), "experimental_sgl_trtllm LoRA currently requires FP8 block quant."
     assert (
         not use_mxfp8
-    ), "sgl_flashinfer_trtllm LoRA currently targets the non-MX FP8 Qwen path."
+    ), "experimental_sgl_trtllm LoRA currently targets the non-MX FP8 Qwen path."
     assert (
         weight_block_size is not None
-    ), "sgl_flashinfer_trtllm LoRA needs the FP8 weight block size."
+    ), "experimental_sgl_trtllm LoRA needs the FP8 weight block size."
     w13_weight_scale = getattr(base_layer, "w13_weight_scale_inv", None)
     if w13_weight_scale is None:
         w13_weight_scale = getattr(base_layer, "w13_weight_scale", None)
@@ -123,7 +123,7 @@ def init_sgl_flashinfer_trtllm_lora(layer, base_layer) -> None:
     )
 
 
-def dispatch_sgl_flashinfer_trtllm_lora(
+def dispatch_experimental_sgl_trtllm_lora(
     dispatch_output, quant_info, base_layer, lora_info
 ) -> "StandardCombineInput":
     """Call the trtllm fused-experts LoRA function for a single layer.
@@ -140,9 +140,9 @@ def dispatch_sgl_flashinfer_trtllm_lora(
     # two-stream monkey-patch (sglang.srt.lora.trtllm_lora_temp) takes effect. Route by
     # quant dtype: NVFP4 -> fp4 LoRA op, else the FP8 path.
     if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
-        fused_fn = ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora
+        fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora
     else:
-        fused_fn = ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora
+        fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora
 
     return fused_fn(
         dispatch_output,

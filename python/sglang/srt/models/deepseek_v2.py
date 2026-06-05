@@ -724,10 +724,6 @@ class DeepseekV2MoE(nn.Module):
                 )
                 and fc1_n % 128 == 0
                 and get_global_server_args().disable_piecewise_cuda_graph
-                # LoRA wraps gate_up/down_proj so the fused swiglu path can't see
-                # input_scale_inv and would bypass the LoRA delta; disable under LoRA.
-                and not get_global_server_args().enable_lora
-                and not get_global_server_args().lora_paths
             ):
                 self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True

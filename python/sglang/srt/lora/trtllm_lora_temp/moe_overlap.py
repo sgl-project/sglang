@@ -1,6 +1,6 @@
 """Two-stream MoE LoRA dispatch (O1).
 
-Monkey-patches ``fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora`` in
+Monkey-patches ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora`` in
 ``layers/moe/moe_runner/flashinfer_trtllm.py`` (when
 ``SGLANG_LORA_TWO_STREAM=1``) so the gate_up LoRA shrink+expand runs on a
 side stream concurrent with the main-stream FP8 quant.
@@ -26,7 +26,7 @@ from sglang.srt.lora.trtllm_lora_temp import (
 _LORA_OVERLAP_EVENTS: list = []
 
 
-def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
+def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     dispatch_output,
     quant_info,
     runner_config,
@@ -77,11 +77,11 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     from sglang.srt.utils.common import next_power_of_2
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
-        "sgl_flashinfer_trtllm LoRA currently supports the gated SwiGLU FP8 "
+        "experimental_sgl_trtllm LoRA currently supports the gated SwiGLU FP8 "
         "Qwen path only."
     )
     assert quant_info.block_quant and not quant_info.use_mxfp8, (
-        "sgl_flashinfer_trtllm LoRA currently supports DeepSeekFp8 block-quant "
+        "experimental_sgl_trtllm LoRA currently supports DeepSeekFp8 block-quant "
         "checkpoints only."
     )
     assert quant_info.weight_block_k is not None
@@ -308,7 +308,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     return StandardCombineInput(hidden_states=output)
 
 
-def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
+def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
     dispatch_output,
     quant_info,
     runner_config,
@@ -349,7 +349,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
 
     assert (
         runner_config.activation == "silu" and runner_config.is_gated
-    ), "sgl_flashinfer_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    ), "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None

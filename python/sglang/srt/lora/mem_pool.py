@@ -44,6 +44,8 @@ from sglang.srt.lora.utils import (
 from sglang.srt.utils import is_pin_memory_available
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 logger = logging.getLogger(__name__)
 
 
@@ -120,7 +122,7 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return (
             b.is_flashinfer_cutlass()
             or b.is_flashinfer_cutedsl()
-            or b.is_sgl_flashinfer_trtllm()
+            or b.is_experimental_sgl_trtllm()
             or b.is_flashinfer_trtllm_routed()
         )
     except Exception:  # pragma: no cover - backend not initialized
@@ -1181,7 +1183,7 @@ class LoRAMemoryPool:
                             weights,
                         )
                     load_lora_weight_tensor(buffer_view, weights)
-                    if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+                    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                         # Zero beyond loaded rank: the experimental dense LoRA-B kernel
                         # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()

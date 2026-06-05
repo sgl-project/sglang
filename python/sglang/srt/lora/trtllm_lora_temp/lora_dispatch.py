@@ -1,9 +1,9 @@
-"""sgl_flashinfer_trtllm MoE LoRA dispatch (original single-stream).
+"""experimental_sgl_trtllm MoE LoRA dispatch (original single-stream).
 
 This is the LoRA-enabled fused-experts path added by the trtllm-lora work — it
 was originally a function in ``layers/moe/moe_runner/flashinfer_trtllm.py`` and
 is now hosted here so that file holds only a re-export. The function name
-remains ``fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora`` for
+remains ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora`` for
 import-site stability.
 
 When ``SGLANG_LORA_TWO_STREAM=1`` is set, this is the function the
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     )
 
 
-def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
+def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     dispatch_output: "StandardDispatchOutput",
     quant_info: "FlashInferTrtllmFp8MoeQuantInfo",
     runner_config: "MoeRunnerConfig",
@@ -69,11 +69,11 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
-        "sgl_flashinfer_trtllm LoRA currently supports the gated SwiGLU FP8 "
+        "experimental_sgl_trtllm LoRA currently supports the gated SwiGLU FP8 "
         "Qwen path only."
     )
     assert quant_info.block_quant and not quant_info.use_mxfp8, (
-        "sgl_flashinfer_trtllm LoRA currently supports DeepSeekFp8 block-quant "
+        "experimental_sgl_trtllm LoRA currently supports DeepSeekFp8 block-quant "
         "checkpoints only."
     )
     assert quant_info.weight_block_k is not None
@@ -301,13 +301,13 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
     return StandardCombineInput(hidden_states=output)
 
 
-def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora(
+def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     dispatch_output: "StandardDispatchOutput",
     quant_info: "FlashInferTrtllmFp4MoeQuantInfo",
     runner_config: "MoeRunnerConfig",
     lora_info,
 ) -> "StandardCombineInput":
-    """NVFP4 sibling of ``fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora``.
+    """NVFP4 sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``.
 
     Decomposed (unfused-activation) MoE-LoRA: routing -> gather -> gate_up grouped
     GEMM (raw 2*inter) -> activation that adds ``gate_up_lora_delta`` pre-SwiGLU and
@@ -331,7 +331,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora(
 
     assert (
         runner_config.activation == "silu" and runner_config.is_gated
-    ), "sgl_flashinfer_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    ), "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output

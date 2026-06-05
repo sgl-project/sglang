@@ -9,8 +9,8 @@ defined entirely in this package:
   * ``QKVParallelLinearWithLoRA.forward``  → :mod:`.attention.qkv_proj_lora_forward`
   * ``RowParallelLinearWithLoRA.forward``  → :mod:`.attention.row_parallel_lora_forward`
   * ``MergedColumnParallelLinearWithLoRA.forward`` → :mod:`.merged_column.merged_column_lora_forward`
-  * ``fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora`` →
-    :mod:`.moe_overlap.fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream`
+  * ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora`` →
+    :mod:`.moe_overlap.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream`
 
 When disabled (env unset), ``install_two_stream_overrides`` is a no-op and all
 the original functions / methods in ``sglang/srt/lora/layers.py`` and
@@ -132,7 +132,7 @@ def install_two_stream_overrides() -> None:
       2. ``RowParallelLinearWithLoRA.forward`` (O8 — o_proj LoRA shrink overlap)
       3. ``MergedColumnParallelLinearWithLoRA.forward`` (O9 — merged-column LoRA
          shrink overlap: dense gate_up + mamba in_proj_qkvz)
-      4. ``flashinfer_trtllm.fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora``
+      4. ``flashinfer_trtllm.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``
          (O1 — MoE gate_up LoRA overlap)
 
     The saved originals are exposed via :func:`get_original_qkv_forward`,
@@ -178,21 +178,21 @@ def install_two_stream_overrides() -> None:
 
     import sglang.srt.lora.trtllm_lora_temp.lora_dispatch as ft
     from sglang.srt.lora.trtllm_lora_temp.moe_overlap import (
-        fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream,
-        fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream,
+        fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream,
+        fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream,
     )
 
     # O1 (FP8 Qwen) + O1-fp4 (NVFP4 Kimi): MoE gate_up LoRA overlap. Each patched
     # fn falls back to its saved single-stream original for non-decode batches.
-    _ORIGINAL_MOE_LORA_FUNC = ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora
+    _ORIGINAL_MOE_LORA_FUNC = ft.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora
     _ORIGINAL_FP4_MOE_LORA_FUNC = (
-        ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora
+        ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora
     )
-    ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora = (
-        fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream
+    ft.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora = (
+        fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream
     )
-    ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora = (
-        fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream
+    ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora = (
+        fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream
     )
 
     _INSTALLED = True

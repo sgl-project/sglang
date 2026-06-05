@@ -1,4 +1,4 @@
-"""Copy of upstream flashinfer-trtllm FP8 MoE dispatch, wired to sgl_flashinfer_trtllm_moe
+"""Copy of upstream flashinfer-trtllm FP8 MoE dispatch, wired to experimental_sgl_trtllm_moe
 block-scale wrappers (LoRA-capable) so moe_runner/flashinfer_trtllm.py stays pristine. Body is
 verbatim from upstream; helper imports are call-time (cycle-safe); two FP8 wrappers shadowed.
 """
@@ -43,10 +43,10 @@ def fused_experts_fp8_sgl(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
-    from sglang.srt.lora.trtllm_lora_temp.sgl_flashinfer_trtllm_moe import (
+    from sglang.srt.lora.trtllm_lora_temp.experimental_sgl_trtllm_moe import (
         sgl_trtllm_fp8_block_scale_moe_wrapper as trtllm_fp8_block_scale_moe_wrapper,
     )
-    from sglang.srt.lora.trtllm_lora_temp.sgl_flashinfer_trtllm_moe import (
+    from sglang.srt.lora.trtllm_lora_temp.experimental_sgl_trtllm_moe import (
         sgl_trtllm_fp8_block_scale_routed_moe_wrapper as trtllm_fp8_block_scale_routed_moe_wrapper,
     )
 

@@ -1,4 +1,4 @@
-"""Registers the ``sgl_flashinfer_trtllm`` MoE fused-func.
+"""Registers the ``experimental_sgl_trtllm`` MoE fused-func.
 
 ``MoeRunner.__init__`` requires a registered fused-func at CONSTRUCTION time even
 for the LoRA case, because LoRA is attached *after* the MoE layer is built (so
@@ -15,11 +15,11 @@ pristine; the sgl FP8 LoRA dispatch lives in ``sgl_fp8_moe.py`` (used only by th
 from sglang.srt.layers.moe.moe_runner.base import register_fused_func
 
 
-@register_fused_func("none", "sgl_flashinfer_trtllm")
-def fused_experts_none_to_sgl_flashinfer_trtllm(
+@register_fused_func("none", "experimental_sgl_trtllm")
+def fused_experts_none_to_experimental_sgl_trtllm(
     dispatch_output, quant_info, runner_config
 ):
-    # No-LoRA on the sgl_flashinfer_trtllm backend == upstream flashinfer_trtllm for EVERY
+    # No-LoRA on the experimental_sgl_trtllm backend == upstream flashinfer_trtllm for EVERY
     # quant type (FP8 / NVFP4 / bf16). When LoRA is disabled the runner calls this fused-func,
     # so delegating entirely to upstream keeps the no-LoRA path byte-identical to the stock
     # backend. The new sgl kernels (sgl_fp8_moe, trtllm_*_routed_moe_lora) run ONLY on the LoRA
