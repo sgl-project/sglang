@@ -302,7 +302,7 @@ class Envs:
     # Layer-pipelined KV transfer: overlap RDMA transfer with GPU compute
     # by splitting prefill into layer groups and transferring each group
     # incrementally. Only effective in PD disaggregation prefill mode.
-    SGLANG_PIPELINED_KV_TRANSFER = EnvBool(False)
+    SGLANG_ENABLE_PIPELINED_KV_TRANSFER = EnvBool(False)
     # Optional fixed group_size override. When not set, the adaptive formula
     # below computes group_size automatically based on prompt length.
     SGLANG_PIPELINE_GROUP_SIZE = EnvInt(0)

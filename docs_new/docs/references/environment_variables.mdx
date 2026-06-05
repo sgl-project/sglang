@@ -674,7 +674,7 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PIPELINED_KV_TRANSFER</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_PIPELINED_KV_TRANSFER</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable layer-pipelined KV transfer. Splits prefill into layer groups and transfers KV cache incrementally after each group, overlapping RDMA transfer with GPU compute. Only effective in PD disaggregation prefill mode. When enabled together with overlap schedule, overlap is automatically disabled (pipelined subsumes its CPU sync savings). When using with <code>--hicache-storage-backend mooncake</code>, set <code>MOONCAKE_DEVICE</code> to a separate IB port (e.g. <code>mlx5_5</code>) to avoid RDMA resource conflicts.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>

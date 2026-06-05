@@ -1,6 +1,6 @@
 """Tests for layer-pipelined KV transfer in disaggregated prefill-decode mode.
 
-Validates that enabling SGLANG_PIPELINED_KV_TRANSFER produces correct outputs
+Validates that enabling SGLANG_ENABLE_PIPELINED_KV_TRANSFER produces correct outputs
 across different prompt lengths and verifies the adaptive group_size logic
 correctly falls back to the normal path for short prompts.
 """
@@ -30,7 +30,9 @@ class TestDisaggregationPipelined(PDDisaggregationServerBase):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls._env_stack = ExitStack()
-        cls._env_stack.enter_context(envs.SGLANG_PIPELINED_KV_TRANSFER.override(True))
+        cls._env_stack.enter_context(
+            envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.override(True)
+        )
         cls._env_stack.enter_context(envs.SGLANG_PIPELINE_MIN_TOKENS.override(64))
         try:
             cls.launch_all()
@@ -148,7 +150,9 @@ class TestDisaggregationPipelinedGroupSize(PDDisaggregationServerBase):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls._env_stack = ExitStack()
-        cls._env_stack.enter_context(envs.SGLANG_PIPELINED_KV_TRANSFER.override(True))
+        cls._env_stack.enter_context(
+            envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.override(True)
+        )
         cls._env_stack.enter_context(envs.SGLANG_PIPELINE_MIN_TOKENS.override(64))
         cls._env_stack.enter_context(envs.SGLANG_PIPELINE_GROUP_SIZE.override(5))
         try:

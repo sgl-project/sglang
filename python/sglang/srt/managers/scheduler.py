@@ -3245,13 +3245,27 @@ class Scheduler(
                         len(req.fill_ids), len(req.origin_input_ids)
                     )
 
-        # Sample next tokens
+        # Sample next tokens unless this is a logprob-only/prefill-only batch.
         assert (
             logits_output is not None
         ), "forward_split_prefill should return logits after the last layer"
-        next_token_ids = self.tp_worker.forward_batch_generation_split_sample(
-            logits_output, forward_batch
-        )
+        if not forward_batch.is_prefill_only:
+            next_token_ids = self.tp_worker.forward_batch_generation_split_sample(
+                logits_output, forward_batch
+            )
+        else:
+            next_token_ids = torch.zeros(
+                len(forward_batch.seq_lens),
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
+            )
+            if (
+                forward_batch.return_logprob
+                and logits_output.next_token_logits is not None
+            ):
+                self.tp_worker.model_runner.compute_logprobs_only(
+                    logits_output, forward_batch
+                )
 
         batch.output_ids = next_token_ids
 
@@ -3984,7 +3998,7 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
-        if envs.SGLANG_PIPELINED_KV_TRANSFER.get():
+        if envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get():
             logger.info(
                 "Layer-pipelined KV transfer enabled "
                 "(dispatched per-batch in normal event loop)"

@@ -453,7 +453,7 @@ class SchedulerDisaggregationPrefillMixin:
         for req in batch.reqs:
             state_indices = None
             if state_types:
-                seq_len = len(req.fill_ids)
+                seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
 
                 def _mamba_payload():
                     return [
@@ -501,7 +501,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _get_pipeline_group_size(self: Scheduler, batch) -> int:
         """Return adaptive group_size, or 0 if pipelining should not be used."""
-        if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
+        if not envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get():
             return 0
 
         # Layer-pipelined transfer currently requires the mooncake backend.

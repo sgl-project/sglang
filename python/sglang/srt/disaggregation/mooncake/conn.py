@@ -1515,8 +1515,9 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
+                            extra_ret = 0
                             if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                                extra_ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
@@ -1529,7 +1530,7 @@ class MooncakeKVManager(CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
-                            polls.append(True if ret == 0 else False)
+                            polls.append(extra_ret == 0 and ret == 0)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
