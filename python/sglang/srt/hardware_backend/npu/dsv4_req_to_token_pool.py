@@ -1,24 +1,26 @@
 """DSV4-NPU per-request mapping pool.
 
-Subclass of ``ReqToTokenPool`` that adds three auxiliary per-request tables
+Subclass of ``ReqToTokenPool`` that adds five auxiliary per-request tables
 needed by the DSV4 attention backend:
 
-  * ``req_to_token_swa``   — slot ids in the SWA full-pool view
-  * ``req_to_token_c4``    — slot ids in the c4 compressed-KV pool
-  * ``req_to_token_c128``  — slot ids in the c128 compressed-KV pool
+  * ``req_to_token_swa``        — slot ids in the SWA full-pool view
+  * ``req_to_token_c4``         — slot ids in the c4 compressed-KV pool
+  * ``req_to_token_c128``       — slot ids in the c128 compressed-KV pool
+  * ``req_to_token_c4_state``   — c4 state-pool slot ids, 1 per raw token
+  * ``req_to_token_c128_state`` — c128 state-pool slot ids, 1 per raw token
 
-Compressed pools store 1 slot per ``ratio`` raw tokens, so their per-req
+Compressed KV pools store 1 slot per ``ratio`` raw tokens, so their per-req
 table column count is ``max_context_len // ratio``. swa mirrors the raw
 token count. Elements are token-level slot ids; the attention backend
 converts to page ids via ``// page_size`` when constructing PA_ND block
 tables.
 
-State pools (c4 / c128) do NOT have per-req tables — their slots are
-derived on-the-fly by the attention backend via
-``translate_kv_loc_to_compress_state_loc(raw_loc, ratio)`` which folds
-each swa page into ``ring_size`` state slots. State pool reads from the
-compressor use flat indices (no PA_ND constraint), so the mapping is
-purely arithmetic and doesn't need a per-req allocator.
+The c4/c128 STATE pools also have per-req tables here: the NPU fused
+compressor uses a paged state pool (``cache_mode=1``), so each raw token's
+state slot id is recorded (1 column per raw token) and the backend builds
+``state_block_table = req_to_token_c{N}_state[req, ::page_size] // page_size``
+to feed the kernel. (The base class' ``translate_kv_loc_to_compress_state_loc``
+ring-hash is the CUDA-only path; it is disabled on NPU.)
 
 Memory cost example (size=64, max_context_len=32K): swa 8MB + c4 2MB +
 c128 64KB ≈ 10MB extra on top of the base req_to_token (8MB).

@@ -633,49 +633,66 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return data_ptrs, data_lens, item_lens
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
-        c4_state_pool_size = self.c4_state_pool_size
-        c128_state_pool_size = self.c128_state_pool_size
-        self.compress_state_pools: List[CompressStatePool] = []
-        self.indexer_compress_state_pools: List[CompressStatePool] = []
+        self.compress_state_pools: List[Optional[CompressStatePool]] = []
+        self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = []
 
         for ratio in self.compression_ratios:
-            overlap = ratio == 4
-            compress_state_pool = indexer_compress_state_pool = None
-            size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
-            # ratio == 1 (V4-Flash dense edge layers) is treated like
-            # ratio == 0 here: no compress-state pool, no ring buffer.
-            # get_compress_state_ring_size only handles 4 and 128.
+            # ratio in (0, 1) (V4-Flash dense / uncompressed edge layers) get
+            # no compress-state pool; only ratio 4/128 do. Pool construction
+            # is delegated to _make_{attn,indexer}_state_pool so the NPU
+            # subclass can swap the pool class without re-spelling this loop.
             has_compress_state = ratio in (4, 128)
-            ring_size = self.get_ring_size(ratio) if has_compress_state else 0
-            if has_compress_state:
-                compress_state_pool = CompressStatePool(
-                    size=size,
-                    ring_size=ring_size,
-                    overlap=overlap,
-                    head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-                    dtype=self.state_dtype,
-                    device=self.device,
-                    enable_memory_saver=enable_memory_saver,
-                    ratio=ratio,
-                    online=(ratio == 128 and ONLINE_C128),
-                    page_size=self.swa_page_size,
-                )
-
-            if ratio == 4:
-                indexer_compress_state_pool = CompressStatePool(
-                    size=size,
-                    ring_size=ring_size,
-                    overlap=overlap,
-                    head_dim=self.indexer_head_dim,
-                    device=self.device,
-                    dtype=self.state_dtype,
-                    enable_memory_saver=enable_memory_saver,
-                    ratio=ratio,
-                    page_size=self.swa_page_size,
-                )
-
+            compress_state_pool = (
+                self._make_attn_state_pool(ratio, enable_memory_saver)
+                if has_compress_state
+                else None
+            )
+            # Only c4 layers carry an indexer state pool.
+            indexer_compress_state_pool = (
+                self._make_indexer_state_pool(ratio, enable_memory_saver)
+                if ratio == 4
+                else None
+            )
             self.compress_state_pools.append(compress_state_pool)
             self.indexer_compress_state_pools.append(indexer_compress_state_pool)
+
+    def _state_pool_size(self, ratio: int) -> int:
+        return self.c4_state_pool_size if ratio == 4 else self.c128_state_pool_size
+
+    def _make_attn_state_pool(
+        self, ratio: int, enable_memory_saver: bool
+    ) -> CompressStatePool:
+        """Build the per-layer attention compress-state pool for ``ratio``
+        (4 or 128). Overridden by :class:`DSV4NPUTokenToKVPool` to swap the
+        ring-buffered pool for the NPU paged one."""
+        return CompressStatePool(
+            size=self._state_pool_size(ratio),
+            ring_size=self.get_ring_size(ratio),
+            overlap=ratio == 4,
+            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+            dtype=self.state_dtype,
+            device=self.device,
+            enable_memory_saver=enable_memory_saver,
+            ratio=ratio,
+            online=(ratio == 128 and ONLINE_C128),
+            page_size=self.swa_page_size,
+        )
+
+    def _make_indexer_state_pool(
+        self, ratio: int, enable_memory_saver: bool
+    ) -> CompressStatePool:
+        """Build the per-layer indexer compress-state pool (c4 only)."""
+        return CompressStatePool(
+            size=self._state_pool_size(ratio),
+            ring_size=self.get_ring_size(ratio),
+            overlap=ratio == 4,
+            head_dim=self.indexer_head_dim,
+            device=self.device,
+            dtype=self.state_dtype,
+            enable_memory_saver=enable_memory_saver,
+            ratio=ratio,
+            page_size=self.swa_page_size,
+        )
 
     def _init_compressed_layer_mapping(self):
         c1_cnt, c4_cnt, c128_cnt = 0, 0, 0

@@ -16,17 +16,22 @@ Allocation flow:
      :class:`NPUPagedTokenToKVPoolAllocator` driven against the
      ``c4_kv_pool`` / ``c128_kv_pool`` sub-buffers of
      :class:`DeepSeekV4TokenToKVPool`.
-  4. Bundle full / swa / c4 / c128 slot tensors into a
-     :class:`DSV4OutCacheLoc` and stash on ``self._last_dsv4_alloc``.
+  4. Allocate the c4/c128 attention + indexer state-pool slots the same
+     way (paged ``NPUPagedTokenToKVPoolAllocator`` against the
+     NPUCompressStatePool buffers), tail-only per req.
+  5. Bundle full / swa / c4 / c128 KV slots AND the c4/c128 state slots
+     into a :class:`DSV4OutCacheLoc` and stash on ``self._last_dsv4_alloc``.
 
-State pool slots are NOT in the bundle — they're derived on the fly by
-the attention backend via ``translate_kv_loc_to_compress_state_loc``
-(swa_page * ring_size + offset). State pool reads use flat indices (no
-PA_ND constraint), so no per-req allocator / table is needed.
+State pool slots ARE part of the bundle (``out_c{4,128}_state_loc``): the
+NPU fused compressor uses a paged state pool (``cache_mode=1``), so state
+slots come from the paged allocator, NOT from a ring-buffer hash. (The
+base class' ``translate_kv_loc_to_compress_state_loc`` ring-hash is the
+CUDA-only path and is disabled on NPU — see dsv4_memory_pool.py.)
 
 mem_cache/common.py fetches the bundle via ``get_last_dsv4_alloc()``
 after each alloc, stashes it on ``batch.out_cache_loc_dsv4``, and writes
-the per-req tables on the DSV4NPUReqToTokenPool.
+the per-req tables (``req_to_token_c{4,128}`` and the per-token
+``req_to_token_c{4,128}_state``) on the DSV4NPUReqToTokenPool.
 """
 
 from __future__ import annotations

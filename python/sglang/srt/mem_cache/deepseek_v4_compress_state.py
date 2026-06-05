@@ -72,13 +72,31 @@ class CompressStatePool:
             last_dim = 2 * (1 + overlap) * head_dim
 
         self.last_dim = last_dim
+        self._alloc_kv_score_buffer(
+            dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
+        )
+        if not online:
+            self.kv_score_buffer[-1].clear()
+
+    def _alloc_kv_score_buffer(
+        self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool
+    ) -> None:
+        """Allocate the flat ``(self._size, self.last_dim)`` kv+score buffer
+        under the memory-saver / custom-mem-pool context and wrap it in
+        :class:`KVAndScore`. Sets ``self.memory_saver_adapter``,
+        ``self.custom_mem_pool`` and ``self.kv_score_buffer``.
+
+        Subclasses (e.g. :class:`NPUCompressStatePool`) that compute a
+        different ``self._size`` reuse this instead of duplicating the
+        allocation boilerplate. Requires ``self._size`` and ``self.last_dim``
+        to be set already.
+        """
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=device)
         )
-
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -87,13 +105,11 @@ class CompressStatePool:
             ):
                 self.kv_score_buffer = KVAndScore(
                     torch.empty(
-                        (self._size, last_dim),
+                        (self._size, self.last_dim),
                         dtype=dtype,
                         device=device,
                     )
                 )
-                if not online:
-                    self.kv_score_buffer[-1].clear()
 
     @property
     def state_cache_3d(self) -> torch.Tensor:
