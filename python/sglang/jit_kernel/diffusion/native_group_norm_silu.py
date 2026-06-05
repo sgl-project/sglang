@@ -7,7 +7,8 @@ import torch
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
-_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_H200_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_B200_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _SUPPORTED_NUM_GROUPS = {32}
 _USE_PDL = False
 _LARGE_THRESH = 1 << 16
@@ -15,8 +16,16 @@ _CHUNK_ELEMS = 8192
 _GIANT_THRESH = 900_000
 
 
+def _capability(t: torch.Tensor) -> tuple[int, int]:
+    return torch.cuda.get_device_capability(t.device)
+
+
 def _is_h200(t: torch.Tensor) -> bool:
-    return torch.cuda.get_device_capability(t.device) == (9, 0)
+    return _capability(t) == (9, 0)
+
+
+def _is_blackwell(t: torch.Tensor) -> bool:
+    return _capability(t)[0] >= 10
 
 
 def _aligned(t: torch.Tensor) -> bool:
@@ -30,8 +39,23 @@ def _spatial(x: torch.Tensor) -> int:
     return spatial
 
 
+def _torch_extension_flags() -> tuple[list[str], list[str]]:
+    from torch.utils import cpp_extension as tce
+
+    try:
+        include_paths = list(tce.include_paths(device_type="cuda"))
+        library_paths = list(tce.library_paths(device_type="cuda"))
+    except TypeError:
+        include_paths = list(tce.include_paths())
+        library_paths = list(tce.library_paths())
+    ldflags = [f"-L{p}" for p in library_paths]
+    ldflags += [f"-Wl,-rpath,{p}" for p in library_paths]
+    ldflags += ["-ltorch", "-ltorch_cpu", "-ltorch_cuda", "-lc10", "-lc10_cuda"]
+    return include_paths, ldflags
+
+
 @cache_once
-def _module(dtype: torch.dtype, pdl: bool):
+def _h200_module(dtype: torch.dtype, pdl: bool):
     args = make_cpp_args(dtype, pdl)
     return load_jit(
         "diffusion_native_group_norm_silu",
@@ -44,22 +68,28 @@ def _module(dtype: torch.dtype, pdl: bool):
     )
 
 
-def can_use_native_group_norm_silu(
-    x: Any,
-    weight: Any,
-    bias: Any,
-    num_groups: Any,
-) -> bool:
-    if not (
+@cache_once
+def _b200_module():
+    include_paths, ldflags = _torch_extension_flags()
+    return load_jit(
+        "diffusion_native_group_norm_silu_b200",
+        "v1",
+        cuda_files=["diffusion/group_norm_silu_b200.cu"],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+        extra_ldflags=ldflags,
+        extra_include_paths=include_paths,
+        header_only=False,
+    )
+
+
+def _base_inputs_ok(x: Any, weight: Any, bias: Any, num_groups: Any) -> bool:
+    return (
         isinstance(x, torch.Tensor)
         and x.is_cuda
-        and _is_h200(x)
         and not torch.is_grad_enabled()
         and not x.requires_grad
-        and x.dtype in _SUPPORTED_DTYPES
         and x.dim() in (2, 3, 4, 5)
-        and x.is_contiguous()
-        and _aligned(x)
         and isinstance(num_groups, int)
         and num_groups in _SUPPORTED_NUM_GROUPS
         and x.shape[1] % num_groups == 0
@@ -77,13 +107,55 @@ def can_use_native_group_norm_silu(
         and bias.is_contiguous()
         and _aligned(weight)
         and _aligned(bias)
+    )
+
+
+def _can_use_h200(x: Any, weight: Any, bias: Any, num_groups: Any) -> bool:
+    if not (
+        _base_inputs_ok(x, weight, bias, num_groups)
+        and _is_h200(x)
+        and x.dtype in _H200_SUPPORTED_DTYPES
+        and x.is_contiguous()
+        and _aligned(x)
     ):
         return False
     group_size = (x.shape[1] // int(num_groups)) * _spatial(x)
     return group_size < _GIANT_THRESH
 
 
-@register_custom_op(op_name="diffusion_native_group_norm_silu_cuda", out_shape="x")
+def _can_use_b200(x: Any, weight: Any, bias: Any, num_groups: Any) -> bool:
+    return (
+        _base_inputs_ok(x, weight, bias, num_groups)
+        and _is_blackwell(x)
+        and x.dtype in _B200_SUPPORTED_DTYPES
+    )
+
+
+def can_use_native_group_norm_silu(
+    x: Any,
+    weight: Any,
+    bias: Any,
+    num_groups: Any,
+) -> bool:
+    return _can_use_h200(x, weight, bias, num_groups) or _can_use_b200(
+        x, weight, bias, num_groups
+    )
+
+
+def _group_norm_silu_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    num_groups: int,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    return x.new_empty(x.shape)
+
+
+@register_custom_op(
+    op_name="diffusion_native_group_norm_silu_cuda",
+    fake_impl=_group_norm_silu_fake,
+)
 def _native_group_norm_silu_cuda(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -91,12 +163,19 @@ def _native_group_norm_silu_cuda(
     num_groups: int,
     eps: float = 1e-5,
 ) -> torch.Tensor:
+    if _is_blackwell(x):
+        out = torch.empty_like(x, memory_format=torch.contiguous_format)
+        _b200_module().group_norm_silu(
+            x, weight, bias, int(num_groups), float(eps), out
+        )
+        return out
+
     batch, channels = int(x.shape[0]), int(x.shape[1])
     spatial = _spatial(x)
     group_size = (channels // int(num_groups)) * spatial
     x3 = x.reshape(batch, channels, spatial)
     y3 = torch.empty_like(x3)
-    mod = _module(x.dtype, _USE_PDL)
+    mod = _h200_module(x.dtype, _USE_PDL)
     if group_size >= _LARGE_THRESH:
         num_rows = batch * int(num_groups)
         chunks_per_row = (group_size + _CHUNK_ELEMS - 1) // _CHUNK_ELEMS
@@ -131,7 +210,10 @@ def try_native_group_norm_silu(
     eps: float = 1e-5,
 ) -> Optional[torch.Tensor]:
     if can_use_native_group_norm_silu(x, weight, bias, num_groups):
-        return _native_group_norm_silu_cuda(x, weight, bias, num_groups, eps)
+        try:
+            return _native_group_norm_silu_cuda(x, weight, bias, num_groups, eps)
+        except Exception:
+            return None
     return None
 
 

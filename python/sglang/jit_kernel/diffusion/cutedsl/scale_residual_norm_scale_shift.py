@@ -11,6 +11,10 @@ from sglang.jit_kernel.diffusion.cutedsl.common.norm_fusion import (
     tensor_slice_for_bsfd,
 )
 from sglang.jit_kernel.diffusion.cutedsl.utils import TORCH_TO_CUTE_DTYPE, WARP_SIZE
+from sglang.jit_kernel.diffusion.native_norm_scale_shift import (
+    try_native_fused_norm_scale_shift,
+    try_native_fused_scale_residual_norm_scale_shift,
+)
 
 _COMPILE_CACHE = {}
 
@@ -299,7 +303,6 @@ def fused_norm_scale_shift(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Tensor Validation
     BSD = x.shape
     validate_x(x, *BSD)
@@ -308,7 +311,14 @@ def fused_norm_scale_shift(
     validate_scale_shift(scale, *BSD)
     validate_scale_shift(shift, *BSD)
 
+    native_y = try_native_fused_norm_scale_shift(
+        x, weight, bias, scale, shift, norm_type, eps
+    )
+    if native_y is not None:
+        return native_y
+
     if norm_type == "layer" or norm_type == "rms":
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         D = x.shape[-1]
         if D % 256 != 0 or D > 8192:
             raise ValueError(
@@ -385,6 +395,20 @@ def fused_scale_residual_norm_scale_shift(
     validate_weight_bias(bias, *BSD)
     validate_scale_shift(scale, *BSD)
     validate_scale_shift(shift, *BSD)
+    native_out = try_native_fused_scale_residual_norm_scale_shift(
+        residual,
+        x,
+        gate if isinstance(gate, torch.Tensor) else None,
+        weight,
+        bias,
+        scale,
+        shift,
+        norm_type,
+        eps,
+    )
+    if native_out is not None:
+        return native_out
+
     if norm_type == "layer" or norm_type == "rms":
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 

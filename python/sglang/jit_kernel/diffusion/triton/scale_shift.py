@@ -2,6 +2,11 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.jit_kernel.diffusion.native_scale_shift import (
+    try_native_fuse_scale_shift_kernel,
+    try_native_layernorm_scale_shift_gate_select01,
+    try_native_residual_layernorm_scale_shift_gate_select01,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -346,6 +351,10 @@ def fuse_scale_shift_kernel(
     if x.numel() == 0:
         return output
 
+    native_out = try_native_fuse_scale_shift_kernel(x, scale, shift, scale_constant)
+    if native_out is not None:
+        return native_out
+
     if scale.dim() == 4:
         # scale/shift: [B, F, 1, C]
         rows = B * L
@@ -489,6 +498,12 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
     if bias is not None and (bias.dim() != 1 or bias.shape[0] != C):
         raise ValueError("bias must be 1D [C]")
 
+    native_out = try_native_layernorm_scale_shift_gate_select01(
+        x, weight, bias, scale0, shift0, gate0, scale1, shift1, gate1, index, eps
+    )
+    if native_out is not None:
+        return native_out
+
     x_2d = x.view(B * L, C)
     output_2d = output.view(B * L, C)
     gate_out_2d = gate_out.view(B * L, C)
@@ -589,6 +604,24 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
         raise ValueError("weight must be 1D [C]")
     if bias is not None and (bias.dim() != 1 or bias.shape[0] != C):
         raise ValueError("bias must be 1D [C]")
+
+    native_out = try_native_residual_layernorm_scale_shift_gate_select01(
+        x,
+        residual,
+        residual_gate,
+        weight,
+        bias,
+        scale0,
+        shift0,
+        gate0,
+        scale1,
+        shift1,
+        gate1,
+        index,
+        eps,
+    )
+    if native_out is not None:
+        return native_out
 
     x_2d = x.view(B * L, C)
     residual_2d = residual.view(B * L, C)
