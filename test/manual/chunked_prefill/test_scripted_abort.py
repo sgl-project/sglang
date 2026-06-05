@@ -392,9 +392,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert r.req is None or r.req.req_pool_idx is None
 
     def test_abort_mid_chunk_no_extra_radix_node(self):
-        self.server.execute_script(
-            self._script_abort_mid_chunk_no_extra_radix_node
-        )
+        self.server.execute_script(self._script_abort_mid_chunk_no_extra_radix_node)
 
     @staticmethod
     def _script_abort_mid_chunk_no_extra_radix_node(

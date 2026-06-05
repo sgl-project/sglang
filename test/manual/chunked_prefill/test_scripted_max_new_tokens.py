@@ -187,8 +187,7 @@ class TestMaxNewTokensFirstDecodeAdjacent(ScriptedTestCase):
 
         decode_records = _decode_records(batch_log, r.rid)
         assert len(decode_records) == max_new_tokens, (
-            f"expected {max_new_tokens} decode forwards, got "
-            f"{len(decode_records)}"
+            f"expected {max_new_tokens} decode forwards, got " f"{len(decode_records)}"
         )
 
         # Within the subsequence of records that contain this rid, the first

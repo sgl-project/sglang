@@ -430,11 +430,16 @@ class TestKVPressurePriority(ScriptedTestCase):
         # Distinct prompt_token per req: with identical prompts r2 would hit
         # r1's cached prefix and never genuinely chunk, so the preemption under
         # test would not occur.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=11)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=11
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
 
         r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10, prompt_token=12
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=2,
+            priority=10,
+            prompt_token=12,
         )
         # Probe BOTH handles every step (no short-circuit) so the faster req is
         # registered before recycle.
