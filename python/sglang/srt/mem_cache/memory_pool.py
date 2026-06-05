@@ -80,6 +80,11 @@ _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+# `SGLANG_AITER_KV_CACHE_LAYOUT` is only meaningful on the ROCm AITER backend
+# (HIP + --enable-aiter / SGLANG_USE_AITER=1). On any other platform / backend
+# the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
+# silently ignored and the legacy NHD layout is used.
+_use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -921,11 +926,6 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
-        # Explicit per-pool override for the physical KV layout. When
-        # None (default) the env var SGLANG_KV_CACHE_LAYOUT is consulted.
-        # SWAKVPool passes "nhd" explicitly for its SWA sub-pool so the SWA
-        # decode path continues using unified_attention on the legacy layout.
-        kv_cache_layout: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -946,34 +946,38 @@ class MHATokenToKVPool(KVCache):
         )
 
         # Optional SHUFFLE 5D ("vectorized") physical layout for K/V.
-        # Selected by `SGLANG_KV_CACHE_LAYOUT=vectorized_5d`. When active:
+        # Selected by `SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d` on the ROCm
+        # AITER backend (HIP + SGLANG_USE_AITER=1). When active:
         #   K shape: (num_blocks, H, D_k // X, page, X)
         #   V shape: (num_blocks, H, page // X, D_v, X)   where X = 16 / dtype_bytes
         # aiter `mha_batch_prefill_func` consumes these 5D shapes natively and
         # aiter `pa_decode_gluon` reads SHUFFLE blocks directly during decode.
-        if kv_cache_layout is not None:
-            layout = kv_cache_layout.lower()
-        else:
-            layout = envs.SGLANG_KV_CACHE_LAYOUT.get().lower()
-        if layout not in ("nhd", "vectorized_5d"):
-            raise ValueError(
-                f"Unsupported SGLANG_KV_CACHE_LAYOUT={layout!r}; "
-                "expected 'nhd' or 'vectorized_5d'."
-            )
-        self.kv_cache_layout = layout
-        if layout == "vectorized_5d":
-            # X is the inner vectorization width in the SHUFFLE layout,
-            # determined by the STORAGE dtype (not the compute dtype) since
-            # it controls how many elements fit in 16 bytes of the on-pool
-            # tensor. For fp8 storage X=16, for bf16/fp16 X=8.
-            self._kv_vector_x = 16 // self.store_dtype.itemsize
-            assert (self.size + self.page_size) % self.page_size == 0
-            assert self.page_size % self._kv_vector_x == 0, (
-                f"page_size={self.page_size} must be divisible by "
-                f"X={self._kv_vector_x} for vectorized_5d layout"
-            )
-            assert self.head_dim % self._kv_vector_x == 0
-            assert self.v_head_dim % self._kv_vector_x == 0
+        # An explicit `kv_cache_layout=` argument always wins (e.g. SWAKVPool
+        # passes "nhd" to keep its SWA sub-pool on the legacy layout); on
+        # non-AITER platforms the env var is ignored and NHD is forced since
+        # no consumer kernel exists for SHUFFLE 5D outside the AITER backend.
+        self.kv_cache_layout = "nhd"
+        if _use_aiter:
+            layout = envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower()
+            if layout not in ("nhd", "vectorized_5d"):
+                raise ValueError(
+                    f"Unsupported SGLANG_AITER_KV_CACHE_LAYOUT={layout!r}; "
+                    "expected 'nhd' or 'vectorized_5d'."
+                )
+            self.kv_cache_layout = layout
+            if layout == "vectorized_5d":
+                # X is the inner vectorization width in the SHUFFLE layout,
+                # determined by the STORAGE dtype (not the compute dtype) since
+                # it controls how many elements fit in 16 bytes of the on-pool
+                # tensor. For fp8 storage X=16, for bf16/fp16 X=8.
+                self._kv_vector_x = 16 // self.store_dtype.itemsize
+                assert (self.size + self.page_size) % self.page_size == 0
+                assert self.page_size % self._kv_vector_x == 0, (
+                    f"page_size={self.page_size} must be divisible by "
+                    f"X={self._kv_vector_x} for vectorized_5d layout"
+                )
+                assert self.head_dim % self._kv_vector_x == 0
+                assert self.v_head_dim % self._kv_vector_x == 0
 
         self._create_buffers()
 

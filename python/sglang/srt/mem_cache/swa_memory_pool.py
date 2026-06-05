@@ -56,12 +56,6 @@ class SWAKVPool(BaseSWAKVPool):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        # Both sub-pools follow the env-driven layout so SWA
-        # decode can also route through pa_decode_gluon. SWA semantics:
-        # swa_page_table[i] is left-aligned to FULL seq_len; positions
-        # outside the window are mapped to dummy swa slot 0. The kernel
-        # applies sliding_window=sw internally to read only the last `sw`
-        # positions (same convention as unified_attention).
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             dtype=dtype,

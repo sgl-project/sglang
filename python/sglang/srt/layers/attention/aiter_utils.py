@@ -1,7 +1,7 @@
 """SHUFFLE 5D KV pool helpers for the AITER attention backend.
 
 This module hosts the attention pathways that are specific to the
-``SGLANG_KV_CACHE_LAYOUT=vectorized_5d`` (SHUFFLE 5D) physical layout.
+``SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d`` (SHUFFLE 5D) physical layout.
 They live here rather than inline in
 :mod:`sglang.srt.layers.attention.aiter_backend` so the main backend
 file keeps focused on the legacy NHD path and on dispatch wiring.
