@@ -38,12 +38,17 @@ from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+# Route to the H100 runner (1-gpu-large, SM90) -- NOT 1-gpu-small, which is an
+# RTX 5090 (SM120/Blackwell) where FA3 does not exist. FA3 + the piecewise embedding
+# path this regression covers only runs on Ampere/Ada/Hopper (SM 80-90), so the test
+# must land on the H100 pool to actually execute (on 1-gpu-small it would skip 100%).
+register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
 
-# This regression covers the fa3 + piecewise CUDA graph embedding path (the prod
-# config), which only exists on Ampere/Ada/Hopper (SM 80-90). FA3 is unavailable on
-# Blackwell (sm100 B200 / sm120 consumer e.g. RTX 5090), so gate to SM 80-90.
-_DEVICE_SM = get_device_sm()
+# Lowest/highest CUDA SM that supports the FA3 + piecewise embedding path. FA3 is
+# unavailable on Blackwell (sm100 B200 / sm120 consumer e.g. RTX 5090); the gate is
+# applied at RUNTIME (see setUp) so the SM is read after CUDA is initialized on the
+# actual runner, never at import/collection time.
+_FA3_SM_MIN, _FA3_SM_MAX = 80, 90
 
 # Overridable so the test can run against a locally-mounted model in dev.
 MODEL_PATH = os.environ.get("SGLANG_TEST_EMB_MODEL", "Qwen/Qwen3-Embedding-0.6B")
@@ -108,11 +113,18 @@ _PIECEWISE_KWARGS = dict(
 )
 
 
-@unittest.skipUnless(
-    80 <= _DEVICE_SM <= 90,
-    f"fa3 + piecewise embedding repro requires CUDA SM 80-90 (Ampere/Ada/Hopper); got SM {_DEVICE_SM}",
-)
 class TestFaSkipKvCachePiecewiseNoNaN(CustomTestCase):
+    def setUp(self):
+        # Gate at runtime: read the SM after CUDA is initialized on the runner. If
+        # the hardware can't run FA3 (e.g. SM120 RTX 5090 / SM100 B200), skip --
+        # a skip is NOT a CI failure, it just records the test as inapplicable here.
+        sm = get_device_sm()
+        if not (_FA3_SM_MIN <= sm <= _FA3_SM_MAX):
+            self.skipTest(
+                f"fa3 + piecewise embedding repro requires CUDA SM "
+                f"{_FA3_SM_MIN}-{_FA3_SM_MAX} (Ampere/Ada/Hopper); got SM {sm}"
+            )
+
     def test_no_nan_with_piecewise(self):
         prompts = _short_prompts()
         embs = _embed(prompts, **_PIECEWISE_KWARGS)
