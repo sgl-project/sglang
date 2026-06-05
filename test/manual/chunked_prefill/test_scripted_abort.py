@@ -447,17 +447,21 @@ class TestAbortBasic(ScriptedTestCase):
         # and that it does not revive.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        chunks_before = r.chunks_done
 
         t.abort(r)
         yield from _drain_until_released(t, r)
 
-        # The abort releases the req and does not revive it.
+        # The abort releases the req and does not revive it. The abort lands
+        # when the req exits the chunked state, so chunks_done may legitimately
+        # advance between injection and landing; once RELEASED it must freeze.
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
-        assert r.chunks_done == chunks_before, (
-            f"aborted mid-chunk req revived and ran another chunk; "
-            f"chunks_done went {chunks_before} -> {r.chunks_done}"
+        chunks_after_release = r.chunks_done
+        for _ in range(4):
+            yield
+        assert r.chunks_done == chunks_after_release, (
+            f"aborted mid-chunk req revived after release; chunks_done went "
+            f"{chunks_after_release} -> {r.chunks_done}"
         )
 
         # No radix node remains locked once the aborted chunked req is released:
