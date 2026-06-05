@@ -986,20 +986,18 @@ class AutoencoderKLWan(ParallelTiledVAE):
             with forward_context(
                 feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
             ):
+                out_chunks = []
                 for i in range(iter_):
                     feat_idx.set(0)
-                    if i == 0:
-                        first_chunk.set(True)
-                    else:
-                        first_chunk.set(False)
-                    outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
-            out = torch.cat(outs, 2)
+                    first_chunk.set(i == 0)
+                    out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                out = torch.cat(out_chunks, 2) if len(out_chunks) > 1 else out_chunks[0]
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)
 
             out = out.float()
-            out = torch.clamp(out, min=-1.0, max=1.0)
+            out.clamp_(min=-1.0, max=1.0)
             self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)

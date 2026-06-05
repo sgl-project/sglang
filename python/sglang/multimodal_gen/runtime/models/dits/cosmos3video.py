@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -31,6 +31,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    Qwen3VLTextRotaryEmbedding,
+    qwen3_apply_rotary_pos_emb,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
@@ -125,125 +129,6 @@ def compute_mrope_position_ids_vision(
 
     next_offset = math.ceil(mrope_ids.max().item()) + 1
     return mrope_ids, next_offset
-
-
-# -----------------------------------------------------------------------------
-# Qwen3-style RoPE functions
-# -----------------------------------------------------------------------------
-
-
-def qwen3_rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Qwen3/Llama-style rotate_half: split first/second half of head_dim."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def qwen3_apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Qwen3-style RoPE: (x * cos) + (rotate_half(x) * sin).
-
-    Args:
-        q: [B, S, H, D]
-        k: [B, S, H_kv, D]
-        cos: [1, S, 1, D] or broadcastable
-        sin: [1, S, 1, D] or broadcastable
-    """
-    q_embed = (q * cos) + (qwen3_rotate_half(q) * sin)
-    k_embed = (k * cos) + (qwen3_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-# -----------------------------------------------------------------------------
-# Qwen3VL-style Rotary Embedding
-# -----------------------------------------------------------------------------
-
-
-class Qwen3VLTextRotaryEmbedding(nn.Module):
-    """Qwen3VL-style multi-dimensional rotary embedding."""
-
-    def __init__(
-        self,
-        head_dim: int = 128,
-        rope_theta: float = 5000000.0,
-        mrope_section: tuple[int, int, int] = (24, 20, 20),
-    ):
-        super().__init__()
-        self.rope_type = "default"
-        self.max_seq_len_cached = 262144
-        self.mrope_section = list(mrope_section)
-        self.head_dim = head_dim
-
-        # Compute inverse frequencies
-        dim = head_dim
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.attention_scaling = 1.0
-
-    def apply_interleaved_mrope(
-        self, freqs: torch.Tensor, mrope_section: list[int]
-    ) -> torch.Tensor:
-        """Apply interleaved MRoPE to 3D rotary embeddings.
-
-        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-        interleaved [THTHWHTHW...TT], preserving frequency continuity.
-
-        Args:
-            freqs: (3, bs, seq_len, head_dim // 2)
-            mrope_section: (3,) section sizes
-
-        Returns:
-            freqs_t: (bs, seq_len, head_dim // 2)
-        """
-        freqs_t = freqs[0].clone()
-        for dim, offset in enumerate((1, 2), start=1):  # H, W
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
-
-    @torch.no_grad()
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute cos and sin for rotary embeddings.
-
-        Args:
-            x: dummy tensor for dtype
-            position_ids: [3, B, S] or [B, S] position IDs
-
-        Returns:
-            (cos, sin) each of shape [B, S, D]
-        """
-        if position_ids.ndim == 2:
-            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-
-        # Expand inv_freq: [3, B, D//2, 1]
-        inv_freq_expanded = (
-            self.inv_freq[None, None, :, None]
-            .float()
-            .expand(3, position_ids.shape[1], -1, 1)
-            .to(position_ids.device)
-        )
-        # position_ids_expanded: [3, B, 1, S]
-        position_ids_expanded = position_ids[:, :, None, :].float()
-
-        # freqs: [3, B, D//2, S] -> transpose -> [3, B, S, D//2]
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
-            2, 3
-        )
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * self.attention_scaling
-        sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 # -----------------------------------------------------------------------------
@@ -555,11 +440,8 @@ class Cosmos3CrossAttention(nn.Module):
         ]
         v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
-        q = F.rms_norm(
-            q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
-        )
-        k = F.rms_norm(
-            k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+        q, k = apply_qk_norm(
+            q.contiguous(), k.contiguous(), self.norm_q, self.norm_k, self.head_dim
         )
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
