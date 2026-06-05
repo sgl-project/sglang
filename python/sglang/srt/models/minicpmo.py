@@ -44,6 +44,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
+    MultimodalInputFormat,
     MultimodalInputs,
     flatten_nested_list,
 )
@@ -53,7 +54,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import logger
+from sglang.srt.utils import get_device, logger
 
 try:
     from transformers import LogitsWarper
@@ -1513,7 +1514,7 @@ class MiniCPMO(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
         # Get all special token IDs
@@ -1668,6 +1669,24 @@ class MiniCPMO(MiniCPMBaseModel):
             [item.audio_feature_lens for item in items if item.audio_feature_lens]
         )
 
+        # Ensure audio_feature_lens_raw is properly formatted as [[tensor], [tensor], ...]
+        if audio_feature_lens_raw:
+            if isinstance(audio_feature_lens_raw[0], torch.Tensor):
+                # Flat list of tensors, wrap each in a list
+                audio_feature_lens_raw = [[lens] for lens in audio_feature_lens_raw]
+            elif isinstance(audio_feature_lens_raw[0], list):
+                # Already nested, ensure all elements are properly formatted
+                # Flatten if needed
+                flattened = []
+                for item in audio_feature_lens_raw:
+                    if isinstance(item, list):
+                        flattened.extend(item)
+                    else:
+                        flattened.append(item)
+                audio_feature_lens_raw = [
+                    [item] if not isinstance(item, list) else item for item in flattened
+                ]
+
         final_audio_embeds = []
 
         assert isinstance(wavforms, list)
@@ -1675,7 +1694,14 @@ class MiniCPMO(MiniCPMBaseModel):
         # exist audio
         for wavform in wavforms:
             if len(wavform) > 0:
-                audio_feature_lens = torch.hstack(audio_feature_lens_raw)
+                # Flatten audio_feature_lens_raw to get a list of tensors
+                flattened_lens = []
+                for item in audio_feature_lens_raw:
+                    if isinstance(item, list):
+                        flattened_lens.extend(item)
+                    else:
+                        flattened_lens.append(item)
+                audio_feature_lens = torch.hstack(flattened_lens)
                 batch_size, _, max_mel_seq_len = wavform.shape
                 max_seq_len = (max_mel_seq_len - 1) // 2 + 1
 
@@ -1778,6 +1804,10 @@ class MiniCPMO(MiniCPMBaseModel):
         return audio_embs
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            result = torch.cat([item.feature for item in items])
+            return result.reshape(-1, result.shape[-1])
+
         # list of tensors
         pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(

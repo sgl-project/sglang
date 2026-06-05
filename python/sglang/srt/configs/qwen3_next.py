@@ -17,12 +17,18 @@
 import enum
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
+from sglang.srt.configs.update_config import adjust_tp_num_heads_if_necessary
+from sglang.srt.utils import is_cpu
 
 logger = logging.get_logger(__name__)
+_is_cpu = is_cpu()
 
 
 class HybridLayerType(enum.Enum):
@@ -62,6 +68,8 @@ class Qwen3NextConfig(PretrainedConfig):
             paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to `32`.
         hidden_act (`str`, *optional*, defaults to `"silu"`):
             The non-linear activation function in the decoder.
+        output_gate_type (`str`, *optional*, defaults to `None`):
+            The gate activation function used by the linear attention output norm.
         max_position_embeddings (`int`, *optional*, defaults to 32768):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -180,6 +188,7 @@ class Qwen3NextConfig(PretrainedConfig):
         num_attention_heads=16,
         num_key_value_heads=2,
         hidden_act="silu",
+        output_gate_type=None,
         max_position_embeddings=32768,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
@@ -217,6 +226,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
+        self.output_gate_type = output_gate_type
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -226,7 +236,6 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.head_dim = head_dim
-        rope_config_validation(self)
 
         # linear attention (gdn now part)
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
@@ -278,6 +287,10 @@ class Qwen3NextConfig(PretrainedConfig):
     def mamba2_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
+        if _is_cpu:
+            world_size = get_attention_tp_size()
+            adjust_tp_num_heads_if_necessary(self, world_size, False)
+
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
@@ -288,4 +301,6 @@ class Qwen3NextConfig(PretrainedConfig):
             conv_kernel=self.linear_conv_kernel_dim,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
+        )

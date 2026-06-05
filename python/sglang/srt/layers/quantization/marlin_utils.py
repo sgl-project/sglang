@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/marlin_utils.py
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from sglang.srt.layers.quantization.utils import (
     unpack_cols,
 )
 from sglang.srt.utils import get_device_capability, is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -38,12 +40,11 @@ try:
 except ImportError:
     ops = None
 
-from sglang.srt.utils import direct_register_custom_op
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import gptq_marlin_gemm
+    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,8 @@ GPTQ_MARLIN_MIN_THREAD_K = 128
 GPTQ_MARLIN_MAX_PARALLEL = 16
 
 MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+# NVFP SUPPORT 16, while MXFP4 supports 32 and 16.
+FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16, 32]
 
 # In case there is a performance issue with Marlin, the variable below can be
 # changed to False, which allows Marlin to perform global reductions in fp16
@@ -136,11 +139,15 @@ def _check_marlin_supported(
             f"are supported (for group_size = {group_size}, "
             f"device_capability = {device_capability}, zp = {has_zp}).",
         )
-    if group_size is None or group_size not in MARLIN_SUPPORTED_GROUP_SIZES:
+    if quant_type == scalar_types.float4_e2m1f:
+        allowed_group_sizes = FP4_MARLIN_SUPPORTED_GROUP_SIZES
+    else:
+        allowed_group_sizes = MARLIN_SUPPORTED_GROUP_SIZES
+    if group_size is None or group_size not in allowed_group_sizes:
         return (
             False,
-            f"Marlin does not support group_size = {group_size}. "
-            f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
+            f"Marlin does not support group_size = {group_size} for "
+            f"quant_type = {quant_type}. Only group_sizes = {allowed_group_sizes} "
             "are supported.",
         )
 
@@ -238,8 +245,13 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
     supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
-    # moe marlin requires the activation to be silu
-    supports_activation = layer.moe_runner_config.activation == "silu"
+    if layer.moe_runner_config.is_gated:
+        supports_activation = layer.moe_runner_config.activation == "silu"
+    else:
+        supports_activation = layer.moe_runner_config.activation in {
+            "silu",
+            "relu2",
+        }
 
     # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
     # down: (n, k) = (hidden_size, intermediate_size_per_partition)
@@ -261,7 +273,7 @@ def marlin_make_workspace(
     device: torch.device, max_blocks_per_sm: int = 1
 ) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
-    # size. The num of threadblocks is is sms_count * max_blocks_per_sm.
+    # size. The num of threadblocks is sms_count * max_blocks_per_sm.
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(
         sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
@@ -509,7 +521,7 @@ def apply_gptq_marlin_linear(
             is_zp_float=False,
         )
     else:
-        output = torch.ops.sglang.unified_apply_gptq_marlin_gemm_with_wtype(
+        output = unified_apply_gptq_marlin_gemm_with_wtype(
             input=reshaped_x,
             weight=weight,
             weight_scale=weight_scale,
@@ -578,7 +590,7 @@ def apply_awq_marlin_linear(
             is_zp_float=False,
         )
     else:
-        output = torch.ops.sglang.unified_apply_gptq_marlin_gemm(
+        output = unified_apply_gptq_marlin_gemm(
             input=reshaped_x,
             weight=weight,
             weight_scale=weight_scale,
@@ -860,6 +872,26 @@ class MarlinLinearMethod(LinearMethodBase):
         return output
 
 
+def fake_unified_apply_gptq_marlin_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_zp: torch.Tensor,
+    g_idx: torch.Tensor,
+    g_idx_sort_indices: torch.Tensor,
+    workspace: torch.Tensor,
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    is_zp_float: bool,
+) -> torch.Tensor:
+    return input.new_empty(
+        (input.shape[0], output_size_per_partition), dtype=input.dtype
+    )
+
+
+@register_custom_op(fake_impl=fake_unified_apply_gptq_marlin_gemm)
 def unified_apply_gptq_marlin_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -896,7 +928,7 @@ def unified_apply_gptq_marlin_gemm(
     )
 
 
-def fake_unified_apply_gptq_marlin_gemm(
+def fake_unified_apply_gptq_marlin_gemm_with_wtype(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -904,8 +936,10 @@ def fake_unified_apply_gptq_marlin_gemm(
     g_idx: torch.Tensor,
     g_idx_sort_indices: torch.Tensor,
     workspace: torch.Tensor,
+    wtype_id: int,
     output_size_per_partition: int,
     input_size_per_partition: int,
+    is_k_full: bool,
     use_atomic_add: bool,
     use_fp32_reduce: bool,
     is_zp_float: bool,
@@ -915,14 +949,7 @@ def fake_unified_apply_gptq_marlin_gemm(
     )
 
 
-direct_register_custom_op(
-    op_name="unified_apply_gptq_marlin_gemm",
-    op_func=unified_apply_gptq_marlin_gemm,
-    mutates_args=[],
-    fake_impl=fake_unified_apply_gptq_marlin_gemm,
-)
-
-
+@register_custom_op(fake_impl=fake_unified_apply_gptq_marlin_gemm_with_wtype)
 def unified_apply_gptq_marlin_gemm_with_wtype(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -966,32 +993,3 @@ def unified_apply_gptq_marlin_gemm_with_wtype(
         use_fp32_reduce=use_fp32_reduce,
         is_zp_float=is_zp_float,
     )
-
-
-def fake_unified_apply_gptq_marlin_gemm_with_wtype(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_zp: torch.Tensor,
-    g_idx: torch.Tensor,
-    g_idx_sort_indices: torch.Tensor,
-    workspace: torch.Tensor,
-    wtype_id: int,
-    output_size_per_partition: int,
-    input_size_per_partition: int,
-    is_k_full: bool,
-    use_atomic_add: bool,
-    use_fp32_reduce: bool,
-    is_zp_float: bool,
-) -> torch.Tensor:
-    return input.new_empty(
-        (input.shape[0], output_size_per_partition), dtype=input.dtype
-    )
-
-
-direct_register_custom_op(
-    op_name="unified_apply_gptq_marlin_gemm_with_wtype",
-    op_func=unified_apply_gptq_marlin_gemm_with_wtype,
-    mutates_args=[],
-    fake_impl=fake_unified_apply_gptq_marlin_gemm_with_wtype,
-)

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import contextvars
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Tuple, TypeGuard
 
 import torch
 
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (
@@ -22,9 +28,22 @@ if TYPE_CHECKING:
     )
 
 
+_moe_output_buf: contextvars.ContextVar[Optional[torch.Tensor]] = (
+    contextvars.ContextVar("moe_output_buf", default=None)
+)
+
+
+@contextmanager
+def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
+    token = _moe_output_buf.set(buf)
+    try:
+        yield
+    finally:
+        _moe_output_buf.reset(token)
+
+
 @dataclass
 class MoeRunnerConfig:
-
     # MoE parameters
     num_experts: Optional[int] = None
     num_local_experts: Optional[int] = None
@@ -34,20 +53,22 @@ class MoeRunnerConfig:
     top_k: Optional[int] = None
     num_fused_shared_experts: Optional[int] = None
     params_dtype: Optional[torch.dtype] = None
+    routing_method_type: Optional[RoutingMethodType] = None
 
     # Runner configuration
     activation: str = "silu"
+    is_gated: bool = True
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    swiglu_limit: Optional[float] = None
 
 
 @dataclass
 class RunnerInput(ABC):
-
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
@@ -57,7 +78,6 @@ class RunnerInput(ABC):
 
 
 class RunnerOutput(ABC):
-
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
@@ -74,13 +94,16 @@ class MoeQuantInfo(ABC):
 
 
 class MoeRunnerCore(ABC):
-
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 
     @abstractmethod
     def run(
-        self, runner_input: RunnerInput, quant_info: MoeQuantInfo, running_state: dict
+        self,
+        runner_input: RunnerInput,
+        quant_info: MoeQuantInfo,
+        running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> RunnerOutput:
         pass
 
@@ -93,7 +116,6 @@ class MoeRunnerCore(ABC):
 
 
 class FusedOpPool:
-
     _fused_funcs: dict[str, Callable] = {}
 
     @classmethod
@@ -121,7 +143,6 @@ class FusedOpPool:
 
 
 class PermuteMethodPool:
-
     _pre_permute_methods: dict[
         Tuple[DispatchOutputFormat, MoeRunnerBackend], Callable
     ] = {}
@@ -250,9 +271,8 @@ def register_pre_permute(
     def decorator(
         permute_func: Callable[
             [DispatchOutput, MoeQuantInfo, MoeRunnerConfig, dict], RunnerInput
-        ]
+        ],
     ) -> Callable:
-
         PermuteMethodPool.register_pre_permute(
             dispatch_output_name, runner_backend_name, permute_func
         )
@@ -276,7 +296,7 @@ def register_post_permute(
     def decorator(
         permute_func: Callable[
             [RunnerOutput, MoeQuantInfo, MoeRunnerConfig, dict], CombineInput
-        ]
+        ],
     ) -> Callable:
         PermuteMethodPool.register_post_permute(
             runner_backend_name, combine_input_name, permute_func

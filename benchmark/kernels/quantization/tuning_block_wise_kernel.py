@@ -16,6 +16,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import random
 import time
 from datetime import datetime
 from typing import Any, Dict, List
@@ -31,7 +32,13 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     _w8a8_block_fp8_matmul_unrolledx4,
 )
 from sglang.srt.layers.quantization.int8_kernel import _w8a8_block_int8_matmul
-from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
+from sglang.srt.utils import (
+    get_device,
+    get_device_core_count,
+    get_device_count,
+    get_device_name,
+    is_hip,
+)
 
 _is_hip = is_hip()
 
@@ -84,6 +91,8 @@ def w8a8_block_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
+    needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
+
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -96,12 +105,15 @@ def w8a8_block_matmul(
         N, config["BLOCK_SIZE_N"]
     )
 
+    extra_kernel_args = {}
     if A.dtype == torch.float8_e4m3fnuz or A.dtype == torch.float8_e4m3fn:
         kernel = (
             _w8a8_block_fp8_matmul_unrolledx4
             if (_is_hip == True and num_workgroups <= get_device_core_count())
             else _w8a8_block_fp8_matmul
         )
+        # set masking flag required by kernel arguments
+        extra_kernel_args["needs_masking"] = needs_masking
     else:
         kernel = _w8a8_block_int8_matmul
 
@@ -127,6 +139,7 @@ def w8a8_block_matmul(
         Bs.stride(1),
         Bs.stride(0),
         **config,
+        **extra_kernel_args,
     )
 
     return C
@@ -218,18 +231,18 @@ def benchmark_config(
     def run():
         w8a8_block_matmul(A, B, As, Bs, block_size, config, out_dtype)
 
-    torch.cuda.synchronize()
+    torch.get_device_module().synchronize()
     # JIT complication & warmup
     for _ in range(5):
         run()
-    torch.cuda.synchronize()
+    torch.get_device_module().synchronize()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    start_event = torch.get_device_module().Event(enable_timing=True)
+    end_event = torch.get_device_module().Event(enable_timing=True)
 
     latencies: List[float] = []
-    for i in range(num_iters):
-        torch.cuda.synchronize()
+    for _ in range(num_iters):
+        torch.get_device_module().synchronize()
         start_event.record()
         run()
         end_event.record()
@@ -241,6 +254,7 @@ def benchmark_config(
 
 def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     factor_for_scale = 1e-2
+    device = get_device()
 
     if input_type == "fp8":
         fp8_info = torch.finfo(
@@ -249,14 +263,14 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
         fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
         A_fp32 = (
-            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
+            (torch.rand(M, K, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
         )
         A = A_fp32.clamp(min=fp8_min, max=fp8_max).to(
             torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
         )
 
         B_fp32 = (
-            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
+            (torch.rand(N, K, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
         )
         B = B_fp32.clamp(min=fp8_min, max=fp8_max).to(
             torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -266,12 +280,12 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
         int8_max, int8_min = int8_info.max, int8_info.min
 
         A_fp32 = (
-            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
+            (torch.rand(M, K, dtype=torch.float32, device=device) - 0.5) * 2 * int8_max
         )
         A = A_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
 
         B_fp32 = (
-            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
+            (torch.rand(N, K, dtype=torch.float32, device=device) - 0.5) * 2 * int8_max
         )
         B = B_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
 
@@ -279,9 +293,9 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     n_tiles = (N + block_n - 1) // block_n
     k_tiles = (K + block_k - 1) // block_k
 
-    As = torch.rand(M, k_tiles, dtype=torch.float32, device="cuda") * factor_for_scale
+    As = torch.rand(M, k_tiles, dtype=torch.float32, device=device) * factor_for_scale
     Bs = (
-        torch.rand(n_tiles, k_tiles, dtype=torch.float32, device="cuda")
+        torch.rand(n_tiles, k_tiles, dtype=torch.float32, device=device)
         * factor_for_scale
     )
 
@@ -320,6 +334,7 @@ def save_configs(
     configs,
     save_path,
     input_type="fp8",
+    lock=None,
 ) -> None:
     os.makedirs(save_path, exist_ok=True)
     device_name = get_device_name().replace(" ", "_")
@@ -328,14 +343,24 @@ def save_configs(
     config_file_path = os.path.join(save_path, json_file_name)
     print(f"Writing best config to {config_file_path}...")
 
-    with open(config_file_path, "w") as f:
-        json.dump(configs, f, indent=4)
-        f.write("\n")
+    if lock is not None:
+        lock.acquire()
+    try:
+        existing_configs = {}
+        if os.path.exists(config_file_path):
+            with open(config_file_path, "r") as f:
+                existing_configs = json.load(f)
+            existing_configs = {int(k): v for k, v in existing_configs.items()}
 
+        existing_configs.update(configs)
+        existing_configs = dict(sorted(existing_configs.items()))
 
-def get_available_gpu_count():
-    """Get the number of available GPUs."""
-    return torch.cuda.device_count()
+        with open(config_file_path, "w") as f:
+            json.dump(existing_configs, f, indent=4)
+            f.write("\n")
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def tune_on_gpu(args_dict):
@@ -344,8 +369,9 @@ def tune_on_gpu(args_dict):
     batch_sizes = args_dict["batch_sizes"]
     weight_shapes = args_dict["weight_shapes"]
     args = args_dict["args"]
+    lock = args_dict["lock"]
 
-    torch.cuda.set_device(gpu_id)
+    torch.get_device_module().set_device(gpu_id)
     print(f"Starting tuning on GPU {gpu_id} with batch sizes {batch_sizes}")
 
     block_n = args.block_n
@@ -360,7 +386,6 @@ def tune_on_gpu(args_dict):
     ]
 
     start = time.perf_counter()
-    results = {}
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
         N, K = shape[0], shape[1]
         print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")
@@ -377,7 +402,7 @@ def tune_on_gpu(args_dict):
             for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
         ]
         best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
-        save_configs(N, K, block_n, block_k, best_configs, save_path, input_type)
+        save_configs(N, K, block_n, block_k, best_configs, save_path, input_type, lock)
 
     end = time.perf_counter()
     print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
@@ -385,6 +410,8 @@ def tune_on_gpu(args_dict):
 
 def distribute_batch_sizes(batch_sizes, num_gpus):
     """Distribute batch sizes across available GPUs."""
+    # shuffle to distribute workload more evenly and minimize bottleneck effects
+    random.shuffle(batch_sizes)
     batches_per_gpu = []
     for i in range(num_gpus):
         start_idx = i * len(batch_sizes) // num_gpus
@@ -396,14 +423,14 @@ def distribute_batch_sizes(batch_sizes, num_gpus):
 def main(args):
     print(args)
 
-    num_gpus = get_available_gpu_count()
+    num_gpus = get_device_count()
     if num_gpus == 0:
         raise RuntimeError("No GPU available for tuning")
     print(f"Found {num_gpus} GPUs for parallel tuning")
 
-    torch.cuda.init()
+    torch.get_device_module().init()
 
-    if args.batch_size is None:
+    if args.batch_sizes is None:
         batch_sizes = [
             1,
             2,
@@ -425,12 +452,21 @@ def main(args):
             4096,
         ]
     else:
-        batch_sizes = [args.batch_size]
-        num_gpus = 1  # If only one batch size, use only one GPU
+        batch_sizes = args.batch_sizes
 
-    weight_shapes = get_weight_shapes(args.tp_size)
+    # Support manual N and K specification
+    if args.N is not None and args.K is not None:
+        weight_shapes = [(args.N, args.K)]
+        print(f"Using manually specified weight shape: N={args.N}, K={args.K}")
+    else:
+        weight_shapes = get_weight_shapes(args.tp_size)
+        print(f"Using predefined weight shapes for TP size {args.tp_size}")
 
     batches_per_gpu = distribute_batch_sizes(batch_sizes, num_gpus)
+
+    ctx = mp.get_context("spawn")
+    manager = ctx.Manager()
+    lock = manager.Lock()
 
     process_args = []
     for gpu_id in range(num_gpus):
@@ -440,10 +476,10 @@ def main(args):
                 "batch_sizes": batches_per_gpu[gpu_id],
                 "weight_shapes": weight_shapes,  # Each GPU processes all weight shapes
                 "args": args,
+                "lock": lock,
             }
         )
 
-    ctx = mp.get_context("spawn")
     with ctx.Pool(num_gpus) as pool:
         pool.map(tune_on_gpu, process_args)
 
@@ -453,7 +489,25 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--tp-size", "-tp", type=int, default=8)
+    parser.add_argument(
+        "--tp-size",
+        "-tp",
+        type=int,
+        default=8,
+        help="Tensor parallelism size (ignored if --N and --K are specified)",
+    )
+    parser.add_argument(
+        "--N",
+        type=int,
+        default=None,
+        help="Output dimension of weight matrix (number of columns)",
+    )
+    parser.add_argument(
+        "--K",
+        type=int,
+        default=None,
+        help="Input dimension of weight matrix (number of rows)",
+    )
     parser.add_argument(
         "--input-type", type=str, choices=["fp8", "int8"], default="fp8"
     )
@@ -465,10 +519,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--block-n", type=int, default=128)
     parser.add_argument("--block-k", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, required=False)
+    parser.add_argument("--batch-sizes", nargs="+", type=int, required=False)
     parser.add_argument(
         "--save-path", type=str, default="python/sglang/srt/layers/quantization/configs"
     )
     args = parser.parse_args()
+
+    # Validate arguments
+    if (args.N is None) != (args.K is None):
+        parser.error("--N and --K must be specified together or not at all")
 
     main(args)

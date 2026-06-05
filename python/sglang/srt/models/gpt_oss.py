@@ -17,6 +17,7 @@
 
 import logging
 import math
+import re
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -25,6 +26,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -54,6 +59,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -70,13 +76,38 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    get_cuda_version,
+    is_blackwell_supported,
+    is_cpu,
+    is_cuda,
+    is_flashinfer_available,
+    is_npu,
+    is_sm90_supported,
+    make_layers,
+)
+from sglang.srt.utils.custom_op import register_custom_op
 
+_is_cpu = is_cpu()
+_is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_tinygemm_supported = (
+    _is_cuda
+    and is_flashinfer_available()
+    and (is_sm90_supported() or is_blackwell_supported())
+)
 
-
-if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+if _is_tinygemm_supported and get_cuda_version()[0] < 13:
+    try:
+        from flashinfer.gemm import tinygemm_bf16
+    except ImportError:
+        tinygemm_bf16 = None
+        _is_tinygemm_supported = False
+else:
+    tinygemm_bf16 = None
+    _is_tinygemm_supported = False
 
 
 class GptOssConfig(PretrainedConfig):
@@ -93,6 +124,45 @@ logger = logging.getLogger(__name__)
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
+
+
+class TinyGemmLinear(ReplicatedLinear):
+    """ReplicatedLinear with a FlashInfer tinygemm BF16 fast path."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_tinygemm = (
+            _is_tinygemm_supported
+            and not self.skip_bias_add
+            and self.weight.is_contiguous()
+            and self.weight.shape[0] % 16 == 0
+            and self.weight.shape[1] % 64 == 0
+            and self.weight.dtype == torch.bfloat16
+            and (
+                self.bias is None
+                or (
+                    self.bias.dtype == torch.bfloat16
+                    and self.bias.is_contiguous()
+                    and self.bias.shape[0] == self.weight.shape[0]
+                )
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            self._use_tinygemm
+            and x.ndim == 2
+            and x.is_cuda
+            and x.shape[0] <= 128
+            and x.is_contiguous()
+            and x.shape[1] == self.weight.shape[1]
+            and x.dtype == torch.bfloat16
+        ):
+            out = x.new_empty((x.shape[0], self.output_size))
+            tinygemm_bf16(x, self.weight, out, self.bias)
+            return out, None
+
+        return super().forward(x)
 
 
 class GptOssSparseMoeBlock(nn.Module):
@@ -113,6 +183,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
+            layer_id=layer_id,
         )
 
         self.top_k = config.num_experts_per_tok
@@ -127,6 +198,7 @@ class GptOssSparseMoeBlock(nn.Module):
                 "use_weight_loader_fused": quant_config_name
                 != "mxfp4"
             }
+
         self.experts = experts_type(
             num_experts=config.num_local_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -143,13 +215,13 @@ class GptOssSparseMoeBlock(nn.Module):
             **extra_kwargs,
         )
 
-        self.router = ReplicatedLinear(
+        self.router = TinyGemmLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=True,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
     def forward(
@@ -168,6 +240,9 @@ class GptOssSparseMoeBlock(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward_normal(
@@ -176,16 +251,28 @@ class GptOssSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-
-        router_logits, _ = self.router(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if is_in_piecewise_cuda_graph():
+            final_hidden_states = moe_impl(self.layer_id, hidden_states)
+        else:
+            router_logits, _ = self.router(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
         return ans
+
+
+@register_custom_op(out_shape="hidden_states")
+def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
+    forward_context = get_forward_context()
+    moe_fusion = forward_context.moe_fusions[layer_id]
+    router_logits, _ = moe_fusion.router(hidden_states)
+    topk_output = moe_fusion.topk(hidden_states, router_logits)
+    final_hidden_states = moe_fusion.experts(hidden_states, topk_output)
+    return final_hidden_states
 
 
 class GptOssAttention(nn.Module):
@@ -300,20 +387,20 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
+        extra_args = {}
+        if not _is_npu:
+            extra_args = {
+                "fused_set_kv_buffer_arg": (
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    else None
+                ),
+            }
+        q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -355,8 +442,8 @@ class GptOssDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -383,7 +470,7 @@ class GptOssDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
         self.layer_id = layer_id
@@ -395,12 +482,14 @@ class GptOssDecoderLayer(nn.Module):
         self.is_layer_sparse = True
         self.is_nextn = False
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -483,11 +572,14 @@ class GptOssModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
+        if _is_npu:
+            config.hidden_act = "npu_swiglu_oai"
+
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -563,6 +655,13 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    _lora_pattern_moe = re.compile(
+        r"^(?:model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern_moe.match(module_name))
 
     def __init__(
         self,
@@ -784,7 +883,8 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
-            weight = weight.cuda()
+            if _is_cuda:
+                weight = weight.cuda()
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1066,6 +1166,22 @@ class GptOssForCausalLM(nn.Module):
                         param = params_dict[name]
                         if "sinks" in name:
                             start = get_attention_tp_rank() * param.numel()
+                            tp_size = get_tensor_model_parallel_world_size()
+                            full_shard_size = param.numel() * tp_size
+                            # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
+                            # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
+                            if (
+                                _is_cpu
+                                and full_shard_size > loaded_weight.size(0)
+                                and start + param.numel() >= loaded_weight.size(0)
+                            ):
+                                pad_size = start + param.numel() - loaded_weight.size(0)
+                                pad_tensor = torch.zeros(pad_size).to(
+                                    loaded_weight.dtype
+                                )
+                                loaded_weight = torch.cat(
+                                    [loaded_weight, pad_tensor], dim=0
+                                ).to(loaded_weight.dtype)
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1079,6 +1195,9 @@ class GptOssForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -1101,6 +1220,18 @@ class GptOssForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

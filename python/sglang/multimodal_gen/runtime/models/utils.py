@@ -1,57 +1,24 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/utils.py
 """Utils for model executor."""
+
 from typing import Any
 
 import torch
 
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
+)
 
-# TODO(PY): move it elsewhere
-def auto_attributes(init_func):
-    """
-    Decorator that automatically adds all initialization arguments as object attributes.
-
-    Example:
-        @auto_attributes
-        def __init__(self, a=1, b=2):
-            pass
-
-        # This will automatically set:
-        # - self.a = 1 and self.b = 2
-        # - self.config.a = 1 and self.config.b = 2
-    """
-
-    def wrapper(self, *args, **kwargs):
-        # Get the function signature
-        import inspect
-
-        signature = inspect.signature(init_func)
-        parameters = signature.parameters
-
-        # Get parameter names (excluding 'self')
-        param_names = list(parameters.keys())[1:]
-
-        # Bind arguments to parameters
-        bound_args = signature.bind(self, *args, **kwargs)
-        bound_args.apply_defaults()
-
-        # Create config object if it doesn't exist
-        if not hasattr(self, "config"):
-            self.config = type("Config", (), {})()
-
-        # Set attributes on self and self.config
-        for name in param_names:
-            if name in bound_args.arguments:
-                value = bound_args.arguments[name]
-                setattr(self, name, value)
-                setattr(self.config, name, value)
-
-        # Call the original __init__ function
-        return init_func(self, *args, **kwargs)
-
-    return wrapper
+_is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 
 def set_weight_attrs(
@@ -124,16 +91,7 @@ def modulate(
     shift: torch.Tensor | None = None,
     scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """modulate by shift and scale
-
-    Args:
-        x (torch.Tensor): input tensor.
-        shift (torch.Tensor, optional): shift tensor. Defaults to None.
-        scale (torch.Tensor, optional): scale tensor. Defaults to None.
-
-    Returns:
-        torch.Tensor: the output tensor after modulate.
-    """
+    """modulate by shift and scale"""
     if scale is None and shift is None:
         return x
     elif shift is None:

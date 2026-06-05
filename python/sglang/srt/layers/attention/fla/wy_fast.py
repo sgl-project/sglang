@@ -11,7 +11,6 @@ import triton.language as tl
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -116,14 +115,14 @@ def recompute_w_u_fwd(
     g_cumsum: torch.Tensor,
     A: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor],
+    chunk_indices: torch.LongTensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
@@ -147,6 +146,7 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=3,
     )

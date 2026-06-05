@@ -3,20 +3,29 @@
 import contextlib
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils.common import calc_diff, get_bool_env_var
+from sglang.srt.utils.common import (
+    calc_diff,
+    get_bool_env_var,
+    get_device_core_count,
+    get_dispatch_device_backend,
+)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
 _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
+)
+# If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
+_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
 )
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
@@ -165,7 +174,7 @@ def _matmul_persistent_triton(
     assert (
         bias is None or bias.dim() == 1
     ), "Currently assuming bias is 1D, let Horace know if you run into this"
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = get_device_core_count()
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
@@ -241,7 +250,15 @@ def _matmul_persistent_deepgemm(
     dtype = a.dtype
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    deep_gemm.bf16_gemm_nn(a, b, out)
+    try:
+        deep_gemm.bf16_gemm_nn(a, b, out)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
+            f"This typically occurs when dimensions are too small for DeepGEMM's TMA descriptors. "
+            f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
+            f"for small matrices. Original error: {e}"
+        ) from e
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -253,11 +270,10 @@ def _matmul_persistent_deepgemm(
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
-    M, K = a.shape
-    K2, N = b.shape
+    K, N = b.shape
 
-    # DeepGEMM requires minimum dimensions, skip DeepGEMM for small dimensions to avoid CUDA_ERROR_INVALID_VALUE
-    MIN_DIM_FOR_DEEPGEMM = 64
+    # DeepGEMM has minimum dimension requirements for TMA descriptors
+    MIN_DEEPGEMM_DIM = 16
 
     if (
         _ENABLE_MM_DEEPGEMM
@@ -266,8 +282,7 @@ def matmul_persistent(
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
-        and M >= MIN_DIM_FOR_DEEPGEMM
-        and N >= MIN_DIM_FOR_DEEPGEMM
+        and N >= MIN_DEEPGEMM_DIM
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -284,12 +299,13 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
-        try:
-            return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
-        except RuntimeError:
-            # DeepGEMM failed, fallback to Triton kernel silently
-            # (dimension checks above should prevent most errors)
-            pass
+        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+
+    if _ENABLE_MM_FALLBACK_VARIANT:
+        out = torch.einsum("ik,kj->ij", a, b)
+        if bias is not None:
+            out += bias
+        return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
@@ -298,9 +314,9 @@ def matmul_persistent(
 def _log_softmax_kernel(
     input_ptr,
     output_ptr,
-    input_row_stride,
-    output_row_stride,
-    n_cols,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -479,7 +495,7 @@ def mean_dim(
         Tensor with mean values along specified dimension
     """
     # Validate inputs
-    assert input.is_cuda, "Input must be a CUDA tensor"
+    assert input.is_cuda or input.is_xpu, "Input must be a CUDA or XPU tensor"
     assert (
         -input.ndim <= dim < input.ndim
     ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
@@ -722,7 +738,7 @@ def bmm_batch_invariant(a, b, *, out=None):
         else:
             c = out
 
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        NUM_SMS = get_device_core_count()
 
         # Use fixed kernel configuration for determinism
         configs = {
@@ -803,9 +819,9 @@ def _rms_norm_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
-    input_row_stride,
-    output_row_stride,
-    n_cols,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -918,6 +934,35 @@ def rms_norm_batch_invariant(
     return rms_norm(input, weight, eps=eps)
 
 
+_ONES_CACHE: dict[Tuple, torch.Tensor] = {}
+
+
+def _get_or_make_ones(shape, device, dtype) -> torch.Tensor:
+    key = (tuple(shape), device, dtype)
+    t = _ONES_CACHE.get(key)
+    if t is None:
+        t = torch.ones(shape, device=device, dtype=dtype)
+        _ONES_CACHE[key] = t
+    return t
+
+
+def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
+    if eps is None:
+        eps = torch.finfo(input.dtype).eps
+    if weight is None:
+        weight = _get_or_make_ones(normalized_shape, input.device, input.dtype)
+    assert tuple(normalized_shape) == (input.shape[-1],), (
+        "rms_norm_batch_invariant only supports last-dim normalization "
+        f"(got normalized_shape={tuple(normalized_shape)}, "
+        f"input.shape={tuple(input.shape)})"
+    )
+    return rms_norm_batch_invariant(input, weight, eps=eps)
+
+
+def _mm_dtype_compat(self, mat2, out_dtype):
+    return matmul_persistent(self.contiguous(), mat2.contiguous()).to(out_dtype)
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _original_torch_bmm = None
@@ -927,25 +972,28 @@ def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
 
-def enable_batch_invariant_mode(
-    enable_bmm: bool = True,
-):
+def enable_batch_invariant_mode(enable_bmm: bool = True):
     global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
     if _batch_invariant_MODE:
         return
 
+    dispatch_key = get_dispatch_device_backend()
+
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "CUDA")
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "CUDA")
+
+    # Register for detected device
+    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl(
-        "aten::_log_softmax", _log_softmax_batch_invariant, "CUDA"
+        "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
     )
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, "CUDA")
+    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+    _batch_invariant_LIB.impl("aten::rms_norm", _rms_norm_aten_compat, dispatch_key)
+    _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
 
     if enable_bmm:
-        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "CUDA")
-
+        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
         # Also monkeypatch torch.bmm directly as a fallback
         _original_torch_bmm = torch.bmm
         torch.bmm = bmm_batch_invariant

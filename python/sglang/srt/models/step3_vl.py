@@ -24,6 +24,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -60,6 +61,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,7 @@ class Step3TextMoEMLP(nn.Module):
             top_k=config.moe_top_k,
             renormalize=config.norm_expert_weight,
             use_grouped_topk=False,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -288,8 +291,7 @@ class Step3TextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -337,12 +339,14 @@ class Step3TextDecoderLayer(nn.Module):
         self.is_previous_layer_sparse = (
             True if layer_id - 1 in moe_layers_idx else False
         )
+        self.is_next_layer_sparse = True if layer_id + 1 in moe_layers_idx else False
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=self.is_previous_layer_sparse,
+            is_next_layer_sparse=self.is_next_layer_sparse,
         )
 
         if not self.is_layer_sparse:
@@ -440,7 +444,7 @@ class Step3TextModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -571,7 +575,6 @@ class Step3VisionAttention(nn.Module):
         self,
         dim: int,
         num_heads: int = 16,
-        qkv_backend="fa3",
         quant_config=None,
         prefix: str = "",
     ) -> None:
@@ -593,9 +596,7 @@ class Step3VisionAttention(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend=qkv_backend,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -616,7 +617,7 @@ class Step3VisionEmbeddings(nn.Module):
 
         self.class_embedding = nn.Parameter(torch.randn(1, self.embed_dim))
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,

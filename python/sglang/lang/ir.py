@@ -30,9 +30,9 @@ class SglSamplingParams:
     presence_penalty: float = 0.0
     ignore_eos: bool = False
     return_logprob: Optional[bool] = None
-    logprob_start_len: Optional[int] = (None,)
-    top_logprobs_num: Optional[int] = (None,)
-    return_text_in_logprobs: Optional[bool] = (None,)
+    logprob_start_len: Optional[int] = None
+    top_logprobs_num: Optional[int] = None
+    return_text_in_logprobs: Optional[bool] = None
     json_schema: Optional[str] = None
 
     # for constrained generation, not included in to_xxx_kwargs
@@ -312,11 +312,6 @@ class SglFunction:
 
         backend = backend or global_config.default_backend
         return cache_program(self, backend)
-
-    def compile(self, *, backend=None):
-        from sglang.lang.compiler import compile_func
-
-        return compile_func(self, backend)
 
     def __call__(self, *args, **kwargs):
         from sglang.lang.tracer import TracingScope

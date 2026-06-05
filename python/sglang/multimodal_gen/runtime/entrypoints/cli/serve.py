@@ -6,13 +6,13 @@ import argparse
 import os
 from typing import cast
 
+from sglang.multimodal_gen.apps.webui import run_sgl_diffusion_webui
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
-from sglang.multimodal_gen.runtime.launch_server import launch_server
+from sglang.multimodal_gen.runtime.launch_server import (
+    dispatch_launch,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
-
-logger = init_logger(__name__)
 
 
 def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
@@ -29,13 +29,18 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
-    server_args = ServerArgs.from_cli_args(args, unknown_args)
-    server_args.post_init_serve()
-    launch_server(server_args)
+    server_args = ServerArgs.from_cli_args(
+        args, unknown_args, default_args={"warmup": True, "server_warmup": True}
+    )
+
+    dispatch_launch(server_args)
+
+    if server_args.webui:
+        run_sgl_diffusion_webui(server_args)
 
 
 class ServeSubcommand(CLISubcommand):
-    """The `serve` subcommand for the sgl-diffusion CLI"""
+    """The `serve` subcommand for the sglang-diffusion CLI"""
 
     def __init__(self) -> None:
         self.name = "serve"
@@ -57,7 +62,7 @@ class ServeSubcommand(CLISubcommand):
         serve_parser = subparsers.add_parser(
             "serve",
             help="Launch the server and start FastAPI listener.",
-            usage="sgl_diffusion serve --model-path MODEL_PATH_OR_ID [OPTIONS]",
+            usage="sglang serve --model-path MODEL_PATH_OR_ID [OPTIONS]",
         )
 
         serve_parser = add_multimodal_gen_serve_args(serve_parser)

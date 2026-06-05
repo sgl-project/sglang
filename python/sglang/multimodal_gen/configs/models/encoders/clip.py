@@ -9,14 +9,11 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-
-
-def _is_transformer_layer(n: str, m) -> bool:
-    return "layers" in n and str.isdigit(n.split(".")[-1])
-
-
-def _is_embeddings(n: str, m) -> bool:
-    return n.endswith("embeddings")
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_embeddings,
+    is_layer,
+)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass
@@ -38,6 +35,11 @@ class CLIPTextArchConfig(TextEncoderArchConfig):
     bos_token_id: int = 49406
     eos_token_id: int = 49407
     text_len: int = 77
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: {
+            AttentionBackendEnum.TORCH_SDPA,  # Force TORCH_SDPA to support attention_mask
+        }
+    )
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             # (param_name, shard_name, shard_id)
@@ -47,7 +49,7 @@ class CLIPTextArchConfig(TextEncoderArchConfig):
         ]
     )
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer, _is_embeddings]
+        default_factory=lambda: [is_layer, is_embeddings]
     )
 
 

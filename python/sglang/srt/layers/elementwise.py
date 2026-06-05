@@ -1,74 +1,14 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.triton_ops.softcap import softcap_out as fused_softcap
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
-
-
-fused_softcap_autotune = triton.autotune(
-    configs=[
-        triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 256}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 256}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 4096}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 32768}, num_warps=32),
-    ],
-    key=["n_ele"],
-)
-
-
-@triton.jit
-def fused_softcap_kernel(
-    output_ptr,
-    input_ptr,
-    n_ele,
-    softcap_const: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_ele
-    x = tl.load(input_ptr + offsets, mask=mask)
-    fx = x.to(tl.float32)
-    fxs = fx / softcap_const
-    exped = tl.exp(2 * fxs)
-    top = exped - 1
-    bottom = exped + 1
-    output = top / bottom * softcap_const
-    tl.store(output_ptr + offsets, output, mask=mask)
-
-
-fused_softcap_kernel_autotuned = fused_softcap_autotune(fused_softcap_kernel)
-
-
-def fused_softcap(x, softcap_const, autotune=False):
-    output = torch.empty_like(x, dtype=torch.float32)
-    n_elements = output.numel()
-    if autotune:
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        fused_softcap_kernel_autotuned[grid](output, x, n_elements, softcap_const)
-    else:
-        fused_softcap_kernel[(triton.cdiv(n_elements, 128),)](
-            output, x, n_elements, softcap_const, BLOCK_SIZE=128, num_warps=8
-        )
-    return output
 
 
 # cast to float + softcap
@@ -229,7 +169,7 @@ def fused_rmsnorm_kernel(
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0).to(tl.int64)
     input_start = pid * hidden_dim
 
     offsets = tl.arange(0, BLOCK_SIZE)
@@ -358,7 +298,12 @@ def experts_combine_kernel(
     tl.store(out_hidden_states + start_index_mlp + offsets, combined_x, mask=mask)
 
 
-def experts_combine_triton(moe_hidden_states, mlp_hidden_states, output_buffer=None):
+@register_custom_op(out_shape="mlp_hidden_states")
+def experts_combine_triton(
+    moe_hidden_states: torch.Tensor,
+    mlp_hidden_states: torch.Tensor,
+    output_buffer: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     assert moe_hidden_states.is_contiguous()
     assert mlp_hidden_states.is_contiguous()
 
@@ -393,6 +338,7 @@ def experts_combine_triton(moe_hidden_states, mlp_hidden_states, output_buffer=N
         hidden_dim,
         **config,
     )
+
     return out_hidden_states
 
 

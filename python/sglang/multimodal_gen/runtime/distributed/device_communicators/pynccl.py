@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/pynccl.py
 
 # ===================== import region =====================
@@ -74,7 +75,7 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
 
-        logger.info("sgl-diffusion is using nccl==%s", self.nccl.ncclGetVersion())
+        logger.info("sglang-diffusion is using nccl==%s", self.nccl.ncclGetVersion())
 
         if self.rank == 0:
             # get the unique id from NCCL

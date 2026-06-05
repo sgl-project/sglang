@@ -12,17 +12,21 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     UlyssesAttention,
     UlyssesAttention_VSA,
     USPAttention,
+    build_varlen_mask_meta,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import MinimalA2AAttnOp
 
 __all__ = [
     "USPAttention",
     "LocalAttention",
     "UlyssesAttention",
     "UlyssesAttention_VSA",
+    "MinimalA2AAttnOp",
     "AttentionBackend",
     "AttentionMetadata",
     "AttentionMetadataBuilder",
     # "AttentionState",
     "get_attn_backend",
+    "build_varlen_mask_meta",
 ]

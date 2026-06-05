@@ -1,36 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from typing import Any, Callable, Optional
 
 import torch
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
+from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import mxfp_supported
+
+_is_hip = is_hip()
+if _is_hip:
+    from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+        fused_gemm_afp4wfp4_split_cat,
+    )
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
 
 __all__ = ["QuarkW4A4MXFP4"]
+logger = logging.getLogger(__name__)
 
 OCP_MX_BLOCK_SIZE = 32
 
 
-class QuarkW4A4MXFP4(QuarkScheme):
+class QuarkW4A4MXFP4(QuarkLinearScheme):
 
     def __init__(
-        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
+        self,
+        weight_quant_spec: dict[str, Any],
+        input_quant_spec: dict[str, Any],
+        is_checkpoint_mxfp4_serialized: bool = True,
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
+        self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+
+        if not self.is_checkpoint_mxfp4_serialized:
+            if not mxfp_supported():
+                raise NotImplementedError(
+                    "Online MXFP4 quantization requires an AMD ROCm device with "
+                    "FP4 hardware support (gfx95x, e.g. MI355x)."
+                )
+            logger.info_once(
+                "Using online MXFP4 quantization from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+            )
 
     @classmethod
     def get_min_capability(cls) -> int:
         return 70
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        return
+        if not self.is_checkpoint_mxfp4_serialized:
+            assert layer.weight.dtype == torch.uint8
+            assert layer.weight_scale.dtype == torch.uint8
 
     def create_weights(
         self,
@@ -39,12 +66,21 @@ class QuarkW4A4MXFP4(QuarkScheme):
         input_size_per_partition: int,
         params_dtype: torch.dtype,
         weight_loader: Callable,
-        **kwargs
+        **kwargs,
     ):
+        self.input_size_per_partition = input_size_per_partition
+
         output_size_per_partition = sum(output_partition_sizes)
+        self.output_size_per_partition = output_size_per_partition
+
         layer.logical_widths = output_partition_sizes
 
+        original_weight_loader = weight_loader
+        if not self.is_checkpoint_mxfp4_serialized:
+            weight_loader = self.get_online_mxfp4_weight_loader(layer, weight_loader)
+
         # WEIGHT
+        # Both serialized and online quantization use packed uint8 format
         weight = PackedvLLMParameter(
             data=torch.empty(
                 output_size_per_partition,
@@ -68,9 +104,42 @@ class QuarkW4A4MXFP4(QuarkScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=original_weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
+
+    def get_online_mxfp4_weight_loader(
+        self,
+        layer,
+        original_weight_loader: Callable,
+    ) -> Callable:
+        """
+        Wrap the original weight loader to perform online MXFP4 quantization.
+        """
+
+        def online_mxfp4_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            shard_id: int | str | None = None,
+        ):
+            # Materialize on device the loaded weight.
+            loaded_weight = loaded_weight.to(param.device)
+
+            # Quantize the loaded weight shard immediately. Since MXFP4 uses per-group quantization, there is no need to load all shards (e.g. q_proj, k_proj, v_proj) before doing online quantization.
+            qweight, weight_scale = dynamic_mxfp4_quant(loaded_weight)
+
+            # Required e.g. for q_proj, k_proj, v_proj.
+            kwargs = {}
+            if shard_id is not None:
+                kwargs["loaded_shard_id"] = shard_id
+
+            # Use the original weight loader to handle the loading logic
+            # (e.g. qkv sharding, etc.)
+            original_weight_loader(param, qweight, **kwargs)
+
+            layer.weight_scale.weight_loader(layer.weight_scale, weight_scale, **kwargs)
+
+        return online_mxfp4_weight_loader
 
     def apply_weights(
         self,
@@ -78,24 +147,31 @@ class QuarkW4A4MXFP4(QuarkScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # This path does not have support for bias currently
-        assert bias is None, "bias is not supported"
-
+        # Bias will be added after the GEMM if provided
         three_d = False
+        fused_gemm_split_cat = False
         x_s = None
         y = None
+
         if isinstance(x, tuple):
             assert len(x) in [
                 2,
                 3,
-            ], "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+                5,
+            ], "For tuple input, only (x, x_s), (x, x_s, y), or (x, y, S1, S2, out_dtype) formats are accepted"
             if len(x) == 2:
                 x, x_s = x
             elif len(x) == 3:
                 x, x_s, y = x
+            elif len(x) == 5:
+                x, y, S1, S2, out_dtype = x
+                fused_gemm_split_cat = True
 
         use_fused_quant_gemm = (
-            x_s is None and y is not None and layer.weight.shape[0] == y.shape[1]
+            not fused_gemm_split_cat
+            and x_s is None
+            and y is not None
+            and layer.weight.shape[0] == y.shape[1]
         )
 
         if x.dim() == 3:
@@ -121,10 +197,26 @@ class QuarkW4A4MXFP4(QuarkScheme):
         if use_fused_quant_gemm:
             gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
             y = y.to(x.dtype)
+        elif fused_gemm_split_cat:
+            k, v = fused_gemm_afp4wfp4_split_cat(
+                x=x_q,
+                w=layer.weight,
+                y=y,
+                x_scale=x_s,
+                w_scale=layer.weight_scale,
+                S1=S1,
+                S2=S2,
+                dtype=out_dtype,
+            )
         else:
             gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y)
 
-        if three_d:
-            return y.view(*output_shape)
+        if bias is not None:
+            y = y + bias
 
-        return y
+        if fused_gemm_split_cat:
+            return k, v
+        elif three_d:
+            return y.view(*output_shape)
+        else:
+            return y

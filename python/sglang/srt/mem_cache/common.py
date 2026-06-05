@@ -3,74 +3,62 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
-import triton
-import triton.language as tl
 
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.triton_ops.common import (
+    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
+    get_last_loc_kernel as get_last_loc_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
+    get_last_loc_triton,
+    get_last_loc_triton_safe,
+    write_req_to_token_pool_triton,
+)
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import support_triton
+from sglang.srt.utils import is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
+# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+# Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
+MAMBA_STATE_PER_REQ_NO_CACHE = 1
+
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
-def write_req_to_token_pool_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices,
-    prefix_tensors,
-    pre_lens,
-    seq_lens,
-    extend_lens,
-    out_cache_loc,
-    req_to_token_ptr_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0)
+def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
+    # The page is guaranteed to be full except the last page.
+    if page_size == 1:
+        return kv_indices
 
-    req_pool_index = tl.load(req_pool_indices + pid)
-    pre_len = tl.load(pre_lens + pid)
-    seq_len = tl.load(seq_lens + pid)
-    prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int64))
+    return kv_indices[::page_size] // page_size
 
-    # write prefix
-    num_loop = tl.cdiv(pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < pre_len
-        value = tl.load(prefix_tensor + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + offset,
-            value,
-            mask=mask,
-        )
 
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_lens + i)
+def kv_to_page_num(num_kv_indices: int, page_size: int):
+    return (num_kv_indices + page_size - 1) // page_size
 
-    num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < (seq_len - pre_len)
-        value = tl.load(out_cache_loc + cumsum_start + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + offset
-            + pre_len,
-            value,
-            mask=mask,
-        )
+
+def page_align_floor(length: int, page_size: int) -> int:
+    return (length // page_size) * page_size
+
+
+def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+    if getattr(req, "skip_radix_cache_insert", False):
+        return
+
+    tree_cache.cache_unfinished_req(req, **kwargs)
 
 
 def write_cache_indices(
@@ -127,10 +115,24 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if (
-        get_global_server_args().attention_backend != "ascend"
-        and get_global_server_args().attention_backend != "torch_native"
-    ):
+    attn_backend = get_global_server_args().attention_backend
+    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+
+    if _is_hip and uses_triton_dispatch:
+        # HIP-only: the legacy get_last_loc_triton kernel emits a
+        # mixed-width int32->int64 store that Triton mis-compiles on HIP,
+        # producing out-of-range last_loc values under EAGLE +
+        # page_size>1 (e.g. with aiter unified attention or the triton
+        # attention backend). The bug is in the Triton HIP codegen, not
+        # in any particular attention backend, so route every HIP path
+        # that would otherwise use get_last_loc_triton through the
+        # int32-safe variant. Non-HIP hardware keeps the original
+        # dispatcher below.
+        return get_last_loc_triton_safe(
+            req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+        )
+
+    if uses_triton_dispatch:
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch
@@ -148,52 +150,6 @@ def get_last_loc_torch(
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
-
-
-@triton.jit
-def get_last_loc_kernel(
-    req_to_token,
-    req_pool_indices_tensor,
-    prefix_lens_tensor,
-    result,
-    num_tokens,
-    req_to_token_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
-    mask = offset < num_tokens
-
-    prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
-    req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
-
-    token_mask = prefix_lens > 0
-    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
-    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
-
-    tl.store(result + offset, tokens, mask=mask)
-
-
-def get_last_loc_triton(
-    req_to_token: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-) -> torch.Tensor:
-    BLOCK_SIZE = 256
-    num_tokens = prefix_lens_tensor.shape[0]
-    result = torch.empty_like(prefix_lens_tensor)
-    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
-
-    get_last_loc_kernel[grid](
-        req_to_token,
-        req_pool_indices_tensor,
-        prefix_lens_tensor,
-        result,
-        num_tokens,
-        req_to_token.stride(0),
-        BLOCK_SIZE,
-    )
-    return result
 
 
 def alloc_token_slots(
@@ -228,13 +184,12 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
 
-    if isinstance(tree_cache, (SWAChunkCache, ChunkCache)):
+    if tree_cache.is_chunk_cache():
         return
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
-    # Check if this is a hybrid allocator
-    if hasattr(allocator, "full_available_size"):
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
         full_available_size = allocator.full_available_size()
         swa_available_size = allocator.swa_available_size()
@@ -242,11 +197,13 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(full_num_tokens, swa_num_tokens)
+            tree_cache.evict(
+                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+            )
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
-            tree_cache.evict(num_tokens)
+            tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
 def alloc_paged_token_slots_extend(
@@ -293,20 +250,27 @@ def alloc_paged_token_slots_extend(
 
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
-    num_reqs: int,
-    reqs: list[Req] | None,
+    reqs: list[Req],
     tree_cache: BasePrefixCache | None,
 ) -> list[int]:
     """Allocate request slots from the pool."""
+    num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
-        if mamba_available_size < num_reqs:
-            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
-                mamba_num = max(0, num_reqs - mamba_available_size)
-                tree_cache.evict_mamba(mamba_num)
-        req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
-    else:
-        req_pool_indices = req_to_token_pool.alloc(num_reqs)
+        if tree_cache.supports_mamba():
+            factor = (
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                if req_to_token_pool.enable_mamba_extra_buffer_lazy
+                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            )
+        else:
+            factor = MAMBA_STATE_PER_REQ_NO_CACHE
+        mamba_state_needed = num_reqs * factor
+        if mamba_available_size < mamba_state_needed:
+            if tree_cache is not None and tree_cache.supports_mamba():
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+    req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:
         raise RuntimeError(
@@ -320,23 +284,18 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
     Returns:
         out_cache_loc: allocated cache locations
-        req_pool_indices_device: request pool indices at a device tensor
-        req_pool_indices: request pool indices as list
+        req_pool_indices_device: request pool indices as a device tensor
+        req_pool_indices_cpu: request pool indices as a CPU tensor (host mirror)
     """
     # free out-of-window swa tokens
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            batch.tree_cache.evict_swa(
-                req, pre_len, batch.model_config.attention_chunk_size
-            )
+    batch.maybe_evict_swa()
 
-    bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
@@ -347,7 +306,7 @@ def alloc_for_extend(
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+        batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
@@ -386,7 +345,7 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
 def alloc_paged_token_slots_decode(
@@ -425,13 +384,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req in batch.reqs:
-            batch.tree_cache.evict_swa(
-                req, req.seqlen - 1, batch.model_config.attention_chunk_size
-            )
 
-    bs = batch.seq_lens.shape[0]
+    batch.maybe_evict_swa()
+
+    seq_lens_gpu = batch.seq_lens
+    bs = seq_lens_gpu.shape[0]
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
@@ -439,9 +396,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
+            batch.req_pool_indices, seq_lens_gpu - 1
         ]
-        seq_lens_next = batch.seq_lens + token_per_req
+        seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
@@ -452,9 +409,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + batch.seq_lens
+        locs = batch.encoder_lens + seq_lens_gpu
     else:
-        locs = batch.seq_lens.clone()
+        locs = seq_lens_gpu.clone()
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
@@ -464,14 +421,38 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    tree_cache.cache_finished_req(req, is_insert=is_insert)
+    # MambaRadixCache may alloc mamba state before alloc KV cache
+    if req.req_pool_idx is None:
+        assert (
+            tree_cache.supports_mamba()
+        ), "Only MambaRadixCache allow freeing before alloc"
+        # TODO (csy, hanming): clean up this early allocation logic
+        if req.mamba_pool_idx is not None:
+            tree_cache.req_to_token_pool.mamba_pool.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+        return
+
+    tree_cache.cache_finished_req(
+        req,
+        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+    )
+
+    # StreamingSession.cache_finished_req handles speculative tail trim
+    # and bookkeeping flag sync internally, then sets req_pool_idx = None.
+    if req.req_pool_idx is None:
+        return
+
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    if spec_algo is None:
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path below (#22373).
+    if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
@@ -479,29 +460,21 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
-    if start_p >= end_p:
-        return
+    if start_p < end_p:
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+            start_p:end_p
+        ]
+        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    # If the prefix cache doesn't manage mamba states, we must free them here.
+    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
+        not tree_cache.supports_mamba()
+    ):
+        assert (
+            req.mamba_pool_idx is not None
+        ), "mamba state is freed while the tree cache does not manage mamba states"
+        tree_cache.req_to_token_pool.free_mamba_cache(req)
+    tree_cache.req_to_token_pool.free(req)
 
-    indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-        start_p:end_p
-    ]
-    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 
-
-def available_and_evictable_str(tree_cache) -> str:
-    token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
-    if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-        full_available_size = token_to_kv_pool_allocator.full_available_size()
-        swa_available_size = token_to_kv_pool_allocator.swa_available_size()
-        full_evictable_size = tree_cache.full_evictable_size()
-        swa_evictable_size = tree_cache.swa_evictable_size()
-        return (
-            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-            f"Full LRU list evictable size: {tree_cache.full_lru_list_evictable_size()}\n"
-            f"SWA LRU list evictable size: {tree_cache.swa_lru_list_evictable_size()}\n"
-        )
-    else:
-        available_size = token_to_kv_pool_allocator.available_size()
-        evictable_size = tree_cache.evictable_size()
-        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()

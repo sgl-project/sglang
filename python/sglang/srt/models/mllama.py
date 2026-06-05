@@ -1,7 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/7193774b1ff8603ad5bf4598e5efba0d9a39b436/vllm/model_executor/models/mllama.py
 """PyTorch Mllama model."""
+
+from __future__ import annotations
+
 import math
+from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -202,9 +208,6 @@ class MllamaVisionEncoderLayer(nn.Module):
             self.hidden_size,
             use_qkv_parallel=True,
             quant_config=quant_config,
-            dropout=0.0,
-            qkv_backend="sdpa",
-            softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
         )
@@ -478,23 +481,6 @@ class MllamaVisionModel(nn.Module):
         return hidden_state
 
 
-class MllamaTextRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
 class MllamaTextCrossAttention(nn.Module):
     def __init__(
         self,
@@ -537,10 +523,8 @@ class MllamaTextCrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        # vllm.model_executor.layers.layernorm.RMSNorm has precision issue,
-        # use huggingface's instead
-        self.q_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scaling = self.head_dim**-0.5
 
         self.attn = RadixAttention(
@@ -575,11 +559,16 @@ class MllamaTextCrossAttention(nn.Module):
             )
             k = k.view(-1, self.num_local_key_value_heads, self.head_dim)
             v = v.view(-1, self.num_local_key_value_heads, self.head_dim)
-            k = self.k_norm(k)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(
+                -1, self.num_local_key_value_heads, self.head_dim
+            )
         q = q.view(-1, self.num_local_heads, self.head_dim)
-        q = self.q_norm(q)
+        q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(
+            -1, self.num_local_heads, self.head_dim
+        )
 
         output = self.attn(q, k, v, forward_batch)
+        output = output.view(-1, self.num_local_heads * self.head_dim)
         out, _ = self.o_proj(output)
         return out
 
@@ -837,9 +826,11 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
+        pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
 
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
@@ -880,9 +871,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 self.image_size,
                 dtype=torch.float32,
             )
-            batched_ar_ids = torch.ones(
-                bs, max_num_images, dtype=torch.int64, device="cuda"
-            )
+            batched_ar_ids = torch.ones(bs, max_num_images, dtype=torch.int64)
             batched_ar_mask = torch.zeros(
                 bs, max_num_images, max_num_tiles, dtype=torch.int64
             )
@@ -901,11 +890,13 @@ class MllamaForConditionalGeneration(nn.Module):
                     img = pixel_values[0, j]
                     num_tiles = img.shape[0]
                     batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].aspect_ratio_ids[0, j]
+                    batched_ar_ids[i, j] = mm_input.mm_items[0].model_specific_data[
+                        "aspect_ratio_ids"
+                    ][0, j]
 
                     batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
                         0
-                    ].aspect_ratio_mask[0, j]
+                    ].model_specific_data["aspect_ratio_mask"][0, j]
                 i += 1
 
         return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need

@@ -1,5 +1,6 @@
 import asyncio
-from typing import List, Optional, Union
+import os
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 from transformers.models.auto.processing_auto import (
@@ -7,7 +8,11 @@ from transformers.models.auto.processing_auto import (
 )
 
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.llava import (
     LlavaForConditionalGeneration,
     LlavaLlamaForCausalLM,
@@ -16,7 +21,11 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
-from sglang.srt.multimodal.mm_utils import expand2square, process_anyres_image
+from sglang.srt.multimodal.mm_utils import (
+    ensure_numpy,
+    expand2square,
+    process_anyres_image,
+)
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import ImageData, load_image, logger
 from sglang.utils import get_exception_traceback
@@ -29,6 +38,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaQwenForCausalLM,
         LlavaMistralForCausalLM,
     ]
+    gpu_image_decode = False  # Llava processes loaded image as PIL image explicitly
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -45,13 +55,13 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
         try:
             url = image_data.url if isinstance(image_data, ImageData) else image_data
-            image, image_size = load_image(url)
+            image, image_size = load_image(url, False)
             if image_size is not None:
                 # It is a video with multiple images
                 image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
-                for _ in range(len(pixel_values)):
-                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                for i in range(len(pixel_values)):
+                    pixel_values[i] = ensure_numpy(pixel_values[i]).astype(np.float16)
                 pixel_values = np.stack(pixel_values, axis=0)
                 return pixel_values, image_hash, image_size
             else:
@@ -75,6 +85,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 else:
                     pixel_values = image_processor(image)["pixel_values"][0]
 
+                pixel_values = ensure_numpy(pixel_values)
                 if isinstance(pixel_values, np.ndarray):
                     pixel_values = pixel_values.astype(np.float16)
 
@@ -89,8 +100,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         grid_pinpoints: str,
     ):
         if self.cpu_executor is not None:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
+            loop = asyncio.get_running_loop()
+            fut = loop.run_in_executor(
                 self.cpu_executor,
                 LlavaImageProcessor._process_single_image_task,
                 image_data,
@@ -98,6 +109,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 grid_pinpoints,
                 self._processor,
             )
+            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            return await asyncio.wait_for(fut, timeout=timeout)
         else:
             return self._process_single_image_task(
                 image_data,
@@ -105,6 +118,32 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 grid_pinpoints,
                 self._processor.image_processor,
             )
+
+    def _process_precomputed_image_data(self, image_data: List[Dict]) -> Dict:
+        mm_items = []
+        for item in image_data:
+            # Infer size logic...
+            if "image_sizes" not in item:
+                if "pixel_values" in item:
+                    pv = item["pixel_values"]
+                    # Handle simplified if/else
+                    h, w = (
+                        (pv.shape[2], pv.shape[3])
+                        if len(pv.shape) == 4
+                        else (pv.shape[1], pv.shape[2])
+                    )
+                    item["image_sizes"] = [(w, h)]
+                else:
+                    item["image_sizes"] = [(336, 336)]
+
+            mm_items.append(
+                MultimodalDataItem(
+                    feature=item["feature"],
+                    modality=Modality.IMAGE,
+                    model_specific_data=item,
+                )
+            )
+        return MultimodalProcessorOutput(mm_items=mm_items)
 
     async def process_mm_data_async(
         self,
@@ -114,6 +153,17 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
+        # FIX: Handle precomputed embeddings (dictionaries)
+        # If the input is already a dictionary, we skip the CPU image processor.
+        # We also need to infer 'image_sizes' from 'pixel_values' if missing,
+        # because pad_input_ids requires it.
+        if (
+            isinstance(image_data, list)
+            and len(image_data) > 0
+            and isinstance(image_data[0], dict)
+        ):
+            return self._process_precomputed_image_data(image_data)
+
         modalities = request_obj.modalities or ["image"]
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
@@ -141,35 +191,40 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     pixel_values.append(pixel_v)
                     data_hashes.append(image_h)
                     image_sizes.append(image_s)
-
-                if isinstance(pixel_values[0], np.ndarray):
-                    pixel_values = np.stack(pixel_values, axis=0)
             else:
                 # A single image
                 pixel_values, image_hash, image_size = await self._process_single_image(
                     image_data[0], aspect_ratio, grid_pinpoints
                 )
+                pixel_values = [pixel_values]
                 image_sizes = [image_size]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
         modality = Modality.IMAGE
         if isinstance(request_obj.modalities, list):
-            if request_obj.modalities[0] == "multi-images":
-                modality = Modality.MULTI_IMAGES
-            elif request_obj.modalities[0] == "video":
+            if request_obj.modalities[0] == "video":
                 modality = Modality.VIDEO
 
-        return {
-            "mm_items": [
+        # Create one item per image for better cache granularity
+        mm_items = []
+        for pixel_v, image_s in zip(pixel_values, image_sizes):
+            # Ensure ndim=4 so the model forward takes the correct encode branch
+            if isinstance(pixel_v, np.ndarray) and pixel_v.ndim == 3:
+                pixel_v = np.expand_dims(pixel_v, 0)
+            mm_items.append(
                 MultimodalDataItem(
-                    feature=pixel_values,
+                    feature=pixel_v,
                     model_specific_data={
-                        "image_sizes": image_sizes,
+                        "image_sizes": [image_s],
+                        "image_aspect_ratio": aspect_ratio,
                     },
                     modality=modality,
                 )
-            ],
-        }
+            )
+
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+        )
 
 
 class LlavaMultimodalProcessor(BaseMultimodalProcessor):
@@ -180,6 +235,8 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
     models = [LlavaForConditionalGeneration, Mistral3ForConditionalGeneration]
 
     def _get_sgl_processor_cls(self, model_type: str):
+        if model_type == "clip_vision_model":
+            return LlavaImageProcessor
         if hf_name := HF_MAPPING_NAMES.get(model_type):
             sgl_mm_processor_set = sgl_mm_processor_utils.PROCESSOR_MAPPING.values()
             sgl_processor_cls = list(

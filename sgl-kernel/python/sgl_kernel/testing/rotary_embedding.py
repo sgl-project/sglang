@@ -1,7 +1,31 @@
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
-from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+
+from sglang.jit_kernel.rope import FusedSetKVBufferArg as _JitFusedSetKVBufferArg
+from sglang.jit_kernel.rope import (
+    apply_rope_with_cos_sin_cache_inplace as _jit_apply_rope_with_cos_sin_cache_inplace,
+)
+
+
+@dataclass
+class FusedSetKVBufferArg:
+    value: torch.Tensor
+    k_buffer: torch.Tensor
+    v_buffer: torch.Tensor
+    cache_loc: torch.Tensor
+    # Kept for backward compatibility with old sgl_kernel test/bench callsites.
+    k_scale: Optional[float] = None
+    v_scale: Optional[float] = None
+
+    def to_jit(self) -> _JitFusedSetKVBufferArg:
+        return _JitFusedSetKVBufferArg(
+            value=self.value,
+            k_buffer=self.k_buffer,
+            v_buffer=self.v_buffer,
+            cache_loc=self.cache_loc,
+        )
 
 
 # vLLM torch native
@@ -97,10 +121,6 @@ class RotaryEmbedding(torch.nn.Module):
         num_tokens = positions.shape[0]
         cos_sin = self.cos_sin_cache.index_select(0, positions)
 
-        # Modification: float32 is required for the rotary embedding to work correctly
-        query = query.to(torch.float32)
-        key = key.to(torch.float32)
-
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
@@ -133,16 +153,46 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-            head_size=self.head_size,
+        query_view = query.view(query.shape[0], -1, self.head_size)
+        key_view = key.view(key.shape[0], -1, self.head_size)
+        _jit_apply_rope_with_cos_sin_cache_inplace(
+            q=query_view,
+            k=key_view,
             cos_sin_cache=self.cos_sin_cache,
+            positions=positions,
             is_neox=self.is_neox_style,
+            fused_args=(
+                fused_set_kv_buffer_arg.to_jit()
+                if fused_set_kv_buffer_arg is not None
+                else None
+            ),
         )
 
+        return query, key
+
+
+class SglKernelRotaryEmbedding(RotaryEmbedding):
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for sgl-kernel implementation"
+        if self.cos_sin_cache.dtype != query.dtype:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
+        torch.ops.sgl_kernel.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
         return query, key
 
 

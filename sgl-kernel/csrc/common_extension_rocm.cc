@@ -20,7 +20,7 @@ limitations under the License.
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
-   * From csrc/activation
+   * From csrc/elementwise
    */
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
@@ -33,6 +33,38 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
+
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
+
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+      "topk_indices_offset, Tensor ? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
+
+  m.def(
+      "deepseek_v4_topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_table, Tensor! "
+      "page_indices, int page_size, Tensor!? raw_indices) -> ()");
+  m.impl("deepseek_v4_topk_transform_512", torch::kCUDA, &deepseek_v4_topk_transform_512);
+
+  m.def(
+      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
+  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
+
+  m.def(
+      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
+      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
+  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
+
+  m.def(
+      "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "
+      "Tensor! weights_out, float weight_scale, Tensor freqs_cis, Tensor positions) -> ()");
+  m.impl("dsv4_fused_q_indexer_rope_hadamard_quant", torch::kCUDA, &dsv4_fused_q_indexer_rope_hadamard_quant);
 
   /*
    * From csrc/allreduce
@@ -50,6 +82,17 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> "
       "()");
   m.impl("all_reduce_unreg", torch::kCUDA, &all_reduce_unreg);
+
+  // Deterministic all-reduce for ROCm
+  extern void deterministic_all_reduce_reg(int64_t _fa, torch::Tensor& inp, torch::Tensor& out);
+  extern void deterministic_all_reduce_unreg(
+      int64_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out);
+
+  m.def("deterministic_all_reduce_reg(int fa, Tensor inp, Tensor! out) -> ()");
+  m.impl("deterministic_all_reduce_reg", torch::kCUDA, &deterministic_all_reduce_reg);
+
+  m.def("deterministic_all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()");
+  m.impl("deterministic_all_reduce_unreg", torch::kCUDA, &deterministic_all_reduce_unreg);
 
   m.def("dispose", &dispose);
 
@@ -99,6 +142,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
       "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
+
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
 
   /*
    * From csrc/speculative
@@ -181,6 +229,21 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
   m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
+
+  /*
+   * From csrc/elementwise
+   */
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+
+  /*
+   * From csrc/memory
+   */
+  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
+  m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 }
 
 REGISTER_EXTENSION(common_ops)

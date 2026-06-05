@@ -9,18 +9,19 @@ pynvml. However, it should not initialize cuda context.
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
-from typing import TypeVar
+from typing import Any, TypeVar
 
+import psutil
 import torch
 from typing_extensions import ParamSpec
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
     Platform,
     PlatformEnum,
 )
-from sglang.multimodal_gen.runtime.utils.common import is_blackwell
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import import_pynvml
 
@@ -75,6 +76,10 @@ class CudaPlatformBase(Platform):
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -83,6 +88,7 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         raise NotImplementedError
 
@@ -96,6 +102,74 @@ class CudaPlatformBase(Platform):
             )
             return False
         return True
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        try:
+            from flashinfer import fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            pass
+
+        try:
+            from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            return None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        default_backend = "trtllm"
+        if backend is None:
+            return default_backend
+
+        backend = backend.lower()
+        backend = {
+            "flashinfer_cudnn": "cudnn",
+            "flashinfer_cutlass": "cutlass",
+            "flashinfer_trtllm": "trtllm",
+            "trtllm": "trtllm",
+            "cudnn": "cudnn",
+            "auto": "auto",
+        }.get(backend, backend)
+        if backend not in {"auto", "cudnn", "cutlass", "trtllm"}:
+            logger.warning(
+                "Unsupported SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r. "
+                "Falling back to %r.",
+                backend,
+                default_backend,
+            )
+            return default_backend
+        return backend
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        requested_backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+
+        try:
+            from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+            return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+        except ImportError:
+            logger.warning(
+                "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
+                "but flashinfer.mm_fp4 is unavailable. Falling back to "
+                "cutlass.",
+                requested_backend or "flashinfer_trtllm (default)",
+            )
+
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
+        except ImportError:
+            return None, None
 
     @classmethod
     def is_full_nvlink(cls, device_ids: list[int]) -> bool:
@@ -113,12 +187,42 @@ class CudaPlatformBase(Platform):
         return float(torch.cuda.max_memory_allocated(device))
 
     @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int | None = None,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        if empty_cache:
+            torch.cuda.empty_cache()
+
+        if device_id is None:
+            device_id = torch.cuda.current_device()
+
+        device_props = torch.cuda.get_device_properties(device_id)
+        if device_props.is_integrated:
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
+
+        if distributed:
+            import torch.distributed as dist
+
+            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="cuda")
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+            free_gpu_memory = float(tensor.item())
+
+        return free_gpu_memory / (1 << 30)
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        target_backend: AttentionBackendEnum | None = None
         # TODO(will): maybe come up with a more general interface for local attention
         # if distributed is False, we always try to use Flash attn
         if selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
@@ -129,7 +233,7 @@ class CudaPlatformBase(Platform):
                     SlidingTileAttentionBackend,
                 )
 
-                logger.info("Using Sliding Tile Attention backend.")
+                logger.info("Using Sliding Tile Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
             except ImportError as e:
@@ -147,31 +251,29 @@ class CudaPlatformBase(Platform):
                     SageAttentionBackend,
                 )
 
-                logger.info("Using Sage Attention backend.")
+                logger.info("Using Sage Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
             except ImportError as e:
                 logger.info(e)
                 logger.info(
-                    "Sage Attention backend is not installed. Fall back to Flash Attention."
+                    "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
                 )
-        elif selected_backend == AttentionBackendEnum.SAGE_ATTN_THREE:
+                target_backend = AttentionBackendEnum.FA
+        elif selected_backend == AttentionBackendEnum.SAGE_ATTN_3:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
                     SageAttention3Backend,
                 )
-                from sglang.multimodal_gen.runtime.layers.attention.backends.sageattn.api import (  # noqa: F401
-                    sageattn_blackwell,
-                )
 
-                logger.info("Using Sage Attention 3 backend.")
-
+                logger.info("Using Sage Attention 3 backend")
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
             except ImportError as e:
                 logger.info(e)
                 logger.info(
-                    "Sage Attention 3 backend is not installed. Fall back to Flash Attention."
+                    "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Torch SDPA."
                 )
+                target_backend = AttentionBackendEnum.TORCH_SDPA
         elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN:
             try:
                 from vsa import block_sparse_attn  # noqa: F401
@@ -180,7 +282,7 @@ class CudaPlatformBase(Platform):
                     VideoSparseAttentionBackend,
                 )
 
-                logger.info("Using Video Sparse Attention backend.")
+                logger.info("Using Video Sparse Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
             except ImportError as e:
@@ -188,7 +290,36 @@ class CudaPlatformBase(Platform):
                     "Failed to import Video Sparse Attention backend: %s", str(e)
                 )
                 raise ImportError(
-                    "Video Sparse Attention backend is not installed. "
+                    "Video Sparse Attention backend is not installed."
+                ) from e
+        elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            try:
+                from svg.kernels.triton.permute import (  # noqa: F401
+                    apply_inverse_permutation_triton,
+                    permute_tensor_by_labels_triton,
+                )
+                from svg.kmeans_utils import (  # noqa: F401
+                    batch_kmeans_Euclid,
+                    density_calculation,
+                    dynamic_block_sparse_fwd_flashinfer,
+                    identify_dynamic_map,
+                )
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                    SparseVideoGen2AttentionBackend,
+                )
+
+                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
+                    str(e),
+                )
+                raise ImportError(
+                    "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
+                    "Please install it by following the instructions at "
+                    "https://github.com/svg-project/Sparse-VideoGen"
                 ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:
@@ -198,7 +329,7 @@ class CudaPlatformBase(Platform):
                     VMOBAAttentionBackend,
                 )
 
-                logger.info("Using Video MOBA Attention backend.")
+                logger.info("Using Video MOBA Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
             except ImportError as e:
@@ -209,40 +340,82 @@ class CudaPlatformBase(Platform):
                     "Video MoBA Attention backend is not installed. "
                 ) from e
         elif selected_backend == AttentionBackendEnum.AITER:
-            logger.info("Using AITer backend.")
+            logger.info("Using AITer backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend.")
+            logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-        elif selected_backend == AttentionBackendEnum.FA3:
-            if is_blackwell():
-                raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
-            target_backend = AttentionBackendEnum.FA3
+        elif selected_backend == AttentionBackendEnum.SLA_ATTN:
+            logger.info("Using Sparse Linear Attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
+        elif selected_backend == AttentionBackendEnum.SAGE_SLA_ATTN:
+            logger.info("Using Sage Sparse Linear Attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
+        elif selected_backend == AttentionBackendEnum.FA2:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
+                FlashAttention2Backend,
+            )
+
+            logger.info("Using FlashAttention2 backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
+        elif selected_backend in [
+            AttentionBackendEnum.FA,
+        ]:
+            if cls.is_sm120():
+                logger.info(
+                    "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
+                )
+                target_backend = AttentionBackendEnum.TORCH_SDPA
+            elif cls.is_blackwell():
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+                    set_fa_ver,
+                )
+
+                set_fa_ver(4)
+                target_backend = AttentionBackendEnum.FA
+            else:
+                target_backend = AttentionBackendEnum.FA
         elif selected_backend:
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:
-            if is_blackwell():
+            if cls.is_sm120():
+                # On SM12.x, the sgl-kernel FlashAttention wheels may not include
+                # support yet. Default to Torch SDPA for correctness.
+                logger.info("Defaulting to Torch SDPA backend on SM12.x")
                 target_backend = AttentionBackendEnum.TORCH_SDPA
-                logger.debug(f"Use torch_sdpa as default backend")
+            elif cls.is_blackwell():
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+                    set_fa_ver,
+                )
+
+                set_fa_ver(4)
+                target_backend = AttentionBackendEnum.FA
             else:
-                target_backend = AttentionBackendEnum.FA3
-                logger.debug(f"Use fa3 as default backend")
+                target_backend = AttentionBackendEnum.FA
+
+        # Ensure we have a target backend selected before validation/fallback.
+        if target_backend is None:
+            target_backend = AttentionBackendEnum.FA
+
+        if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
+            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+                set_fa_ver,
+            )
+
+            set_fa_ver(4)
 
         if not cls.has_device_capability(80):
-            logger.info(
-                "Cannot use FlashAttention-2 backend for Volta and Turing " "GPUs."
-            )
+            logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             target_backend = AttentionBackendEnum.TORCH_SDPA
         elif dtype not in (torch.float16, torch.bfloat16):
             logger.info(
-                "Cannot use FlashAttention-2 backend for dtype other than "
+                "Cannot use FlashAttention backend for dtype other than "
                 "torch.float16 or torch.bfloat16."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
-
         # FlashAttn is valid for the model, checking if the package is
         # installed.
-        if target_backend == AttentionBackendEnum.FA3:
+        if target_backend == AttentionBackendEnum.FA:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
@@ -251,13 +424,13 @@ class CudaPlatformBase(Platform):
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
                 if head_size not in supported_sizes:
                     logger.info(
-                        "Cannot use FlashAttention-2 backend for head size %d.",
+                        "Cannot use FlashAttention backend for head size %d.",
                         head_size,
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
             except ImportError:
                 logger.info(
-                    "Cannot use FlashAttention-2 backend because the "
+                    "Cannot use FlashAttention backend because the "
                     "flash_attn package is not found. "
                     "Make sure that flash_attn was built and installed "
                     "(on by default)."
@@ -265,11 +438,11 @@ class CudaPlatformBase(Platform):
                 target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend.")
+            logger.info("Using Torch SDPA backend")
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info("Using fa3 backend.")
+        logger.info("Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend")
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
@@ -283,7 +456,6 @@ class CudaPlatformBase(Platform):
 # all the related functions work on real physical device ids.
 # the major benefit of using NVML is that it will not initialize CUDA
 class NvmlCudaPlatform(CudaPlatformBase):
-
     @classmethod
     @lru_cache(maxsize=8)
     @with_nvml_context
@@ -330,7 +502,10 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         physical_device_id = device_id_to_physical_device_id(device_id)
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
-        return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        try:
+            return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        except pynvml.NVMLError_NotSupported:
+            return int(torch.cuda.get_device_properties(device_id).total_memory)
 
     @classmethod
     @with_nvml_context
@@ -382,7 +557,6 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
 
 class NonNvmlCudaPlatform(CudaPlatformBase):
-
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
         major, minor = torch.cuda.get_device_capability(device_id)
@@ -393,6 +567,7 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
         return str(torch.cuda.get_device_name(device_id))
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.cuda.get_device_properties(device_id)
         return int(device_props.total_memory)

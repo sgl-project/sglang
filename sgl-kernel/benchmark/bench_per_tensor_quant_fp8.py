@@ -7,7 +7,9 @@ import numpy as np
 import torch
 import triton
 import triton.testing
-from sgl_kernel import sgl_per_tensor_quant_fp8
+
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from sglang.utils import is_in_ci
 
 # Optional imports
 try:
@@ -22,11 +24,7 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
@@ -51,7 +49,7 @@ def sglang_scaled_fp8_quant(
     if scale is None:
         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
         is_static = False
-    sgl_per_tensor_quant_fp8(input, output, scale, is_static)
+    per_tensor_quant_fp8(input, output, scale, is_static)
 
     return output, scale
 
@@ -90,14 +88,24 @@ else:
 configs = list(itertools.product(batch_size_range, seq_len_range))
 
 
+if VLLM_AVAILABLE:
+    line_vals = ["vllm", "sglang"]
+    line_names = ["VLLM", "SGL Kernel"]
+    styles = [("blue", "-"), ("green", "-")]
+else:
+    line_vals = ["sglang"]
+    line_names = ["SGL Kernel"]
+    styles = [("green", "-")]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size", "seq_len"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["vllm", "sglang"],
-        line_names=["VLLM", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=styles,
         ylabel="us",
         plot_name="per-tensor-quant-fp8-performance",
         args={},

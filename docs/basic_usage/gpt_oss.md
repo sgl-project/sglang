@@ -25,7 +25,7 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 
 ### Tool & Reasoning Parser
 
-- We support OpenAI Reasoning and Tool Call parser, as well as our SGLang native api for tool call and reasoning. Refer to [reasoning parser](../advanced_features/separate_reasoning.ipynb) and [tool call parser](../advanced_features/function_calling.ipynb) for more details.
+- We support OpenAI Reasoning and Tool Call parser, as well as our SGLang native api for tool call and reasoning. Refer to [reasoning parser](../advanced_features/separate_reasoning.ipynb) and [tool parser](../advanced_features/tool_parser.ipynb) for more details.
 
 
 ## Notes
@@ -59,6 +59,24 @@ python -m sglang.launch_server ... --tool-server ip-1:port-1,ip-2:port-2
 ```
 The URLs should be MCP SSE servers that expose server information and well-documented tools. These tools are added to the system prompt so the model can use them.
 
+## Speculative Decoding
+
+SGLang supports speculative decoding for GPT-OSS models using EAGLE3 algorithm. This can significantly improve decoding speed, especially for small batch sizes.
+
+**Usage**:
+Add `--speculative-algorithm EAGLE3` along with the draft model path.
+```bash
+python3 -m sglang.launch_server \
+  --model-path openai/gpt-oss-120b \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 \
+  --tp 2
+```
+
+```{tip}
+To enable the experimental overlap scheduler for EAGLE3 speculative decoding, set the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
+```
+
 ### Quick Demo
 
 ```python
@@ -87,7 +105,7 @@ print(response.output_text)
 # Test python tool
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helfpul assistant, you could use python tool to execute code.",
+    instructions="You are a helpful assistant, you could use python tool to execute code.",
     input="Use python tool to calculate the sum of 29138749187 and 29138749187", # 58,277,498,374
     tools=tools
 )
@@ -97,7 +115,7 @@ print(response.output_text)
 # Test browser tool
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helfpul assistant, you could use browser to search the web",
+    instructions="You are a helpful assistant, you could use browser to search the web",
     input="Search the web for the latest news about Nvidia stock price",
     tools=tools
 )

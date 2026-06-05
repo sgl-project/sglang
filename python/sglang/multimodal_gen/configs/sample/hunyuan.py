@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.sample.base import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 
@@ -18,9 +18,28 @@ class HunyuanSamplingParams(SamplingParams):
 
     guidance_scale: float = 1.0
 
+    # HunyuanVideo supported resolutions
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            # 540p resolutions
+            (960, 544),  # 9:16
+            (544, 960),  # 16:9
+            (832, 624),  # 4:3
+            (624, 832),  # 3:4
+            (720, 720),  # 1:1
+            # 720p resolutions (recommended)
+            (1280, 720),  # 9:16
+            (720, 1280),  # 16:9
+            (832, 1104),  # 4:3
+            (1104, 832),  # 3:4
+            (960, 960),  # 1:1
+        ]
+    )
+
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
             teacache_thresh=0.15,
+            # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4HunyuanVideo/teacache_sample_video.py#L222
             coefficients=[
                 7.33226126e02,
                 -4.01131952e02,
