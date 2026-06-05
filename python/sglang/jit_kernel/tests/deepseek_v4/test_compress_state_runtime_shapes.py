@@ -409,8 +409,11 @@ def _benchmark_spec(
 
     out_diff = (fp32_out.float() - bf16_out.float()).abs().max().item()
     state_diff = (
-        fp32_diff_case.state_pool.float() - bf16_diff_case.state_pool.float()
-    ).abs().max().item()
+        (fp32_diff_case.state_pool.float() - bf16_diff_case.state_pool.float())
+        .abs()
+        .max()
+        .item()
+    )
 
     return BenchResult(
         shape_name=spec.shape_name,
@@ -447,7 +450,9 @@ def _expand_shape_names(shape_presets: list[str]) -> list[str]:
     return shape_presets
 
 
-def _one_or_many(value: Optional[list[int]], fallback: tuple[int, ...]) -> tuple[int, ...]:
+def _one_or_many(
+    value: Optional[list[int]], fallback: tuple[int, ...]
+) -> tuple[int, ...]:
     return tuple(value) if value is not None else fallback
 
 
@@ -597,7 +602,8 @@ def _format_table(results: list[BenchResult]) -> str:
         for r in results
     ]
     widths = [
-        max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))
+        max(len(headers[i]), *(len(row[i]) for row in rows))
+        for i in range(len(headers))
     ]
     line = "  ".join(headers[i].rjust(widths[i]) for i in range(len(headers)))
     sep = "  ".join("-" * widths[i] for i in range(len(headers)))
@@ -690,7 +696,9 @@ def _preset_args(**overrides):
 
 def test_flash_pro_shape_presets_cover_compress_paths() -> None:
     specs = list(_make_shape_specs(_preset_args()))
-    keys = {(s.shape_name, s.ratio, s.mode, s.batch_size, s.tokens_per_req) for s in specs}
+    keys = {
+        (s.shape_name, s.ratio, s.mode, s.batch_size, s.tokens_per_req) for s in specs
+    }
 
     for shape_name in ("flash", "pro"):
         assert (shape_name, 4, "decode", 16, 128) in keys
@@ -880,7 +888,9 @@ def test_captured_flash_runtime_specs_are_unique() -> None:
     assert len(CAPTURED_FLASH_RUNTIME_SPECS) == 84
     assert any(s.head_dim == 128 and s.ratio == 4 for s in CAPTURED_FLASH_RUNTIME_SPECS)
     assert any(s.head_dim == 512 and s.ratio == 4 for s in CAPTURED_FLASH_RUNTIME_SPECS)
-    assert any(s.head_dim == 512 and s.ratio == 128 for s in CAPTURED_FLASH_RUNTIME_SPECS)
+    assert any(
+        s.head_dim == 512 and s.ratio == 128 for s in CAPTURED_FLASH_RUNTIME_SPECS
+    )
 
 
 @pytest.mark.parametrize("spec", CAPTURED_FLASH_RUNTIME_SPECS)

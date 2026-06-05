@@ -166,8 +166,7 @@ SGL_DEVICE void c128_forward(
     for (int32_t j = 0; j < 8; ++j) {
       const auto fp32_score = score_fp32[j];
       const auto exp_score = expf(fp32_score - max_value);
-      const float kv_value =
-          j + warp_offset < buffer_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
+      const float kv_value = j + warp_offset < buffer_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
       sum_product += kv_value * exp_score;
       sum_exp_value += exp_score;
     }
@@ -270,8 +269,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
     c128_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
   }
   if (plan.write_loc % 128 == 127) {
-    c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
-        kv_buf, kv_src, kv_out, score_bias, 128);
+    c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, 128);
   }
 }
 
@@ -298,8 +296,7 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   PDLWaitPrimary<kUsePDL>();
-  c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
-      kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
+  c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
 }
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
@@ -349,12 +346,9 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress128Kernel {
-  static constexpr auto decode_kernel =
-      flash_c128_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel =
-      flash_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel =
-      write_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel = flash_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_w_kernel = write_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
   static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 64
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
   using Trait = C128Trait<kHeadDim>;

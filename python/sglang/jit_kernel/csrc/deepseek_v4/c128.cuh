@@ -197,8 +197,7 @@ SGL_DEVICE void c128_forward(
     for (int32_t j = 0; j < 8; ++j) {
       const auto fp32_score = score_fp32[j];
       const auto exp_score = expf(fp32_score - max_value);
-      const float kv_value =
-          j + warp_offset < window_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
+      const float kv_value = j + warp_offset < window_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
       sum_product += kv_value * exp_score;
       sum_exp_value += exp_score;
     }
@@ -374,8 +373,7 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress128Kernel {
-  static constexpr auto decode_kernel =
-      flash_c128_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
   template <bool kWrite>
   static constexpr auto prefill_kernel =
       flash_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kWrite, kUsePDL>;

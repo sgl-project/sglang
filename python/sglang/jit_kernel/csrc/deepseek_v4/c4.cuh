@@ -195,8 +195,7 @@ SGL_DEVICE void c4_forward(
     float max_value = -INFINITY;
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
-      const float score_value =
-          j < window_len ? cast<float>(score_hist[j][i]) : cast<float>(score_live[j][i]);
+      const float score_value = j < window_len ? cast<float>(score_hist[j][i]) : cast<float>(score_live[j][i]);
       const float score = score_value + cast<float>(bias[j][i]);
       score_fp32[j] = score;
       max_value = fmaxf(max_value, score);
@@ -208,8 +207,7 @@ SGL_DEVICE void c4_forward(
     for (int32_t j = 0; j < 8; ++j) {
       const auto fp32_score = score_fp32[j];
       const auto exp_score = expf(fp32_score - max_value);
-      const float kv_value =
-          j < window_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
+      const float kv_value = j < window_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
       sum_product += kv_value * exp_score;
       sum_exp_value += exp_score;
     }
@@ -281,7 +279,14 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, PageMode kMode, bool kWrite, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename OutFloat,
+    PageMode kMode,
+    bool kWrite,
+    bool kUsePDL>
 C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
 
@@ -370,8 +375,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress4Kernel {
   template <PageMode kMode>
-  static constexpr auto decode_kernel =
-      flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kMode, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kMode, kUsePDL>;
   template <PageMode kMode, bool kWrite>
   static constexpr auto prefill_kernel =
       flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kMode, kWrite, kUsePDL>;

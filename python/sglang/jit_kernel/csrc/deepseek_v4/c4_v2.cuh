@@ -153,8 +153,7 @@ SGL_DEVICE void c4_forward(
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
       const bool use_hist = j < 4 ? (should_overlap && j < buffer_len) : (j < buffer_len);
-      const float score_value =
-          use_hist ? cast<float>(score_hist[j][i]) : cast<float>(score_live[j][i]);
+      const float score_value = use_hist ? cast<float>(score_hist[j][i]) : cast<float>(score_live[j][i]);
       const float score = score_value + cast<float>(bias[j][i]);
       score_fp32[j] = score;
       max_value = fmaxf(max_value, score);
@@ -312,12 +311,9 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress4Kernel {
-  static constexpr auto decode_kernel =
-      flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel =
-      flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel =
-      write_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel = flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_w_kernel = write_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
   static constexpr uint32_t kBlockSize = 128;
   static constexpr uint32_t kTileDim = kTileElements * device::kWarpThreads;
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
