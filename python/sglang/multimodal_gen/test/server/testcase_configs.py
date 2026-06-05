@@ -422,6 +422,11 @@ class PerformanceSummary:
         )
 
 
+HALLOWEEN_ILLUSTRATION_PROMPT = (
+    "a high quality, cute halloween themed illustration, consistent style and lighting"
+)
+
+
 T2I_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="1024x1024",
@@ -429,6 +434,7 @@ T2I_sampling_params = DiffusionSamplingParams(
 
 IDEOGRAM4_CI_sampling_params = replace(
     T2I_sampling_params,
+    prompt=HALLOWEEN_ILLUSTRATION_PROMPT,
     output_size="1024x1024",
     output_format="png",
     extras={"preset": "V4_QUALITY_48", "seed": 0},
@@ -468,7 +474,7 @@ MULTI_IMAGE_TI2I_UPLOAD_sampling_params = DiffusionSamplingParams(
     ],
 )
 MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
-    prompt="a high quality, cute halloween themed illustration, consistent style and lighting",
+    prompt=HALLOWEEN_ILLUSTRATION_PROMPT,
     image_path=[
         "https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png"
     ],
