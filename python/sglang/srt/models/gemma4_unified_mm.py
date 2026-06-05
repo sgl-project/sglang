@@ -132,7 +132,7 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
         reconciled with the HF processor. Kept as a 1D fold for the skeleton.
         """
         k = self.pooling_kernel_size
-        if k <= 1 or x.shape[0] % k != 0:
+        if k <= 1 or x.shape[0] < k:
             return x
         n = (x.shape[0] // k) * k
         pooled = x[:n].reshape(n // k, k, x.shape[-1]).mean(dim=1)
@@ -345,7 +345,7 @@ class Gemma4UnifiedForConditionalGeneration(PreTrainedModel):
     def prepare_attn_masks(
         self,
         forward_batch: ForwardBatch,
-        input_ids: torch.Tensor,
+        device: torch.device,
         mask_dtype: torch.dtype,
     ):
         if not isinstance(get_attn_backend(), TritonAttnBackend):
@@ -358,7 +358,7 @@ class Gemma4UnifiedForConditionalGeneration(PreTrainedModel):
 
         masks_list = []
         mask_indptr = torch.zeros(
-            forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
+            forward_batch.batch_size + 1, dtype=torch.int32, device=device
         )
         split_images = []
         for i in range(forward_batch.batch_size):
@@ -368,7 +368,7 @@ class Gemma4UnifiedForConditionalGeneration(PreTrainedModel):
                 extend_seq_len,
                 extend_seq_len + prefix_len,
                 dtype=mask_dtype,
-                device=input_ids.device,
+                device=device,
             )
             mask.fill_(1)
             mask = mask.tril(diagonal=prefix_len)
@@ -435,7 +435,9 @@ class Gemma4UnifiedForConditionalGeneration(PreTrainedModel):
             forward_batch.forward_mode == ForwardMode.EXTEND
             and forward_batch.contains_image_inputs()
         ):
-            self.prepare_attn_masks(forward_batch, input_ids, mask_dtype=torch.bool)
+            self.prepare_attn_masks(
+                forward_batch, positions.device, mask_dtype=torch.bool
+            )
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
