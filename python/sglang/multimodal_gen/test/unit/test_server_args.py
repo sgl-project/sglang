@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_2_TI2V_5B_Config,
     TurboWanT2V480PConfig,
@@ -665,6 +666,7 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
@@ -685,6 +687,22 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+
+        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
+        self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+
+    def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
@@ -1345,6 +1363,10 @@ class TestModelIdResolution(unittest.TestCase):
         )
         info = _get_config_info(path)
         self.assertIsNotNone(info)
+
+    def test_sana_wm_model_path_resolves_registry(self):
+        info = _get_config_info("Efficient-Large-Model/SANA-WM_bidirectional")
+        self.assertIs(info.pipeline_config_cls, SanaWMPipelineConfig)
 
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection

@@ -744,6 +744,31 @@ class PipelineConfig:
             help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
         )
 
+        # SANA-WM streaming knobs. default=None so they only apply to pipeline
+        # configs that define these fields (e.g. SanaWMPipelineConfig); other
+        # configs are left untouched by update_config_from_args.
+        parser.add_argument(
+            f"--{prefix_with_dot}streaming",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}streaming",
+            default=None,
+            help="SANA-WM: enable chunk-causal streaming (forward_long) generation.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}refiner-chunked",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}refiner_chunked",
+            default=None,
+            help="SANA-WM: chunk-wise streaming refiner (vs whole-clip dense refiner).",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}num-frame-per-block",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}num_frame_per_block",
+            default=None,
+            help="SANA-WM: latent frames per streaming chunk (default 3).",
+        )
+
         # DiT configuration
         parser.add_argument(
             f"--{prefix_with_dot}dit-precision",
