@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
+    apply_qk_norm,
     apply_qk_norm_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -157,6 +158,7 @@ def _apply_qwen3_qk_norm_rope(
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
         positions=rope_cache_positions,
+        round_norm_before_rope=True,
     )
 
 
@@ -180,6 +182,18 @@ def _apply_qwen3_rope_from_cache(
     k_out[..., :half] = k1 * cos - k2 * sin
     k_out[..., half:] = k2 * cos + k1 * sin
     return q_out, k_out
+
+
+def _apply_qwen3_qk_norm_rope_split(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k = apply_qk_norm(q.contiguous(), k.contiguous(), q_norm, k_norm, head_dim)
+    return _apply_qwen3_rope_from_cache(q, k, cos_sin_cache)
 
 
 # -----------------------------------------------------------------------------
@@ -462,6 +476,7 @@ class Cosmos3CrossAttention(nn.Module):
         v_und: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         rope_cache_positions: torch.Tensor,
+        use_fused_qk_norm_rope: bool,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -491,15 +506,20 @@ class Cosmos3CrossAttention(nn.Module):
         ]
         v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
-        q, k = _apply_qwen3_qk_norm_rope(
-            q,
-            k,
-            self.norm_q,
-            self.norm_k,
-            self.head_dim,
-            cos_sin_cache,
-            rope_cache_positions,
-        )
+        if use_fused_qk_norm_rope:
+            q, k = _apply_qwen3_qk_norm_rope(
+                q,
+                k,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                cos_sin_cache,
+                rope_cache_positions,
+            )
+        else:
+            q, k = _apply_qwen3_qk_norm_rope_split(
+                q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
+            )
 
         # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
@@ -625,6 +645,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         v_und: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         rope_cache_positions: torch.Tensor,
+        use_fused_qk_norm_rope: bool,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
@@ -638,7 +659,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.cross_attention(
-            hidden_states, k_und, v_und, cos_sin_cache, rope_cache_positions
+            hidden_states,
+            k_und,
+            v_und,
+            cos_sin_cache,
+            rope_cache_positions,
+            use_fused_qk_norm_rope,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -1112,6 +1138,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         # fused add+rmsnorm path instead of separate add + norm kernels.
         cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
+        use_fused_qk_norm_rope = T > 1
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
             hidden_gen, residual = layer(
@@ -1120,6 +1147,7 @@ class Cosmos3OmniTransformer(CachableDiT):
                 v_und,
                 cos_sin_gen,
                 gen_rope_cache_positions,
+                use_fused_qk_norm_rope,
                 residual=residual,
             )
 

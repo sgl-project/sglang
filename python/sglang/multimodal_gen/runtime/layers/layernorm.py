@@ -819,6 +819,7 @@ def apply_qk_norm_with_optional_rope(
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
     allow_inplace: bool = True,
+    round_norm_before_rope: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm and optionally RoPE when a cos/sin cache is provided."""
 
@@ -843,6 +844,7 @@ def apply_qk_norm_with_optional_rope(
         positions=positions,
         position_offset=position_offset,
         allow_inplace=allow_inplace,
+        round_norm_before_rope=round_norm_before_rope,
     )
 
 
@@ -858,6 +860,7 @@ def apply_qk_norm_rope(
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
     allow_inplace: bool = True,
+    round_norm_before_rope: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA shapes."""
 
@@ -922,7 +925,9 @@ def apply_qk_norm_rope(
         and k_norm.weight.dtype == k.dtype
         and q.is_contiguous()
         and k.is_contiguous()
-        and can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, q.dtype)
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim, rope_dim, is_neox, q.dtype, round_norm_before_rope
+        )
     ):
         fused_inplace_qknorm_rope(
             q=q.reshape(-1, q.shape[-2], head_dim),
@@ -935,6 +940,7 @@ def apply_qk_norm_rope(
             eps=q_eps,
             head_dim=head_dim,
             rope_dim=rope_dim,
+            round_norm_before_rope=round_norm_before_rope,
         )
         return q, k
 

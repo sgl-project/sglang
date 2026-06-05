@@ -25,9 +25,12 @@ def _jit_qknorm_rope_module(
     head_dim: int,
     rope_dim: int,
     is_neox: bool,
+    round_norm_before_rope: bool,
     dtype: torch.dtype,
 ) -> Module:
-    args = make_cpp_args(head_dim, rope_dim, is_neox, is_arch_support_pdl(), dtype)
+    args = make_cpp_args(
+        head_dim, rope_dim, is_neox, round_norm_before_rope, is_arch_support_pdl(), dtype
+    )
     return load_jit(
         "qknorm_rope",
         *args,
@@ -43,6 +46,7 @@ def can_use_fused_inplace_qknorm_rope(
     rope_dim: int,
     is_neox: bool,
     dtype: torch.dtype,
+    round_norm_before_rope: bool = False,
 ) -> bool:
     if head_dim not in (64, 128, 256):
         logger.warning(f"Unsupported head_dim={head_dim} for JIT fused QKNorm+RoPE")
@@ -70,7 +74,9 @@ def can_use_fused_inplace_qknorm_rope(
             )
             return False
     try:
-        _jit_qknorm_rope_module(head_dim, rope_dim, is_neox, dtype)
+        _jit_qknorm_rope_module(
+            head_dim, rope_dim, is_neox, round_norm_before_rope, dtype
+        )
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT fused QKNorm+RoPE kernel: {e}")
@@ -90,8 +96,11 @@ def fused_inplace_qknorm_rope(
     eps: float = 1e-6,
     head_dim: int = 0,
     rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
 ) -> None:
     head_dim = head_dim or q.size(-1)
     rope_dim = rope_dim or cos_sin_cache.size(-1)
-    module = _jit_qknorm_rope_module(head_dim, rope_dim, is_neox, q.dtype)
+    module = _jit_qknorm_rope_module(
+        head_dim, rope_dim, is_neox, round_norm_before_rope, q.dtype
+    )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
