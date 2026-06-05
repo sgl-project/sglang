@@ -49,12 +49,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libstdc++-12-dev \
     && rm -rf /var/lib/apt/lists/*
 # ---- python 3.14 ----
-RUN apt update \
-    && apt install -y --no-install-recommends software-properties-common \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt update \
-    && apt install -y python3.14 python3.14-venv python3.14-dev \
-    && rm /usr/bin/python3 && ln -s /usr/bin/python3.14 /usr/bin/python3
+# RUN apt update \
+#     && apt install -y --no-install-recommends software-properties-common \
+#     && add-apt-repository -y ppa:deadsnakes/ppa \
+#     && apt update \
+#     && apt install -y python3.14 python3.14-venv python3.14-dev \
+#     && rm /usr/bin/python3 && ln -s /usr/bin/python3.14 /usr/bin/python3
 ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
@@ -81,7 +81,7 @@ RUN ROCM_SPEC="${ROCM_SDK_VERSION:+==${ROCM_SDK_VERSION}}" \
 
 # Initialize ROCm SDK
 RUN rocm-sdk init && rocm-sdk targets
-ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.14/site-packages/_rocm_sdk_devel
+ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
 ENV CPATH=$ROCM_HOME/include
 ENV LIBRARY_PATH=$ROCM_HOME/lib
 ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
@@ -289,8 +289,8 @@ RUN apt update && apt install -y ninja-build patchelf cmake \
     && git clone https://github.com/ROCm/FlyDSL.git --branch v0.1.8
 RUN cd FlyDSL \
     && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
-    && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.14/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
-    && bash -lc 'source /opt/venv/bin/activate \
+    && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
+    && bash -lc 'unset LLVM_COMMIT && source /opt/venv/bin/activate \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
       && pip install -e .;'
@@ -321,7 +321,7 @@ RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "${GPU_ARCH}" = "gfx950-rocm7_13" ]; then \
-         PATH=$PATH:/opt/venv/lib/python3.14/site-packages/_rocm_sdk_devel/llvm/bin GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
+         PATH=$PATH:$ROCM_HOME/llvm/bin GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
         elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
