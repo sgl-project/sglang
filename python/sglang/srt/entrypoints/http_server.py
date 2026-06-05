@@ -635,6 +635,7 @@ async def get_server_info():
 
 
 @app.get("/server_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
@@ -644,9 +645,16 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    # server_args.model_config is not serializable but should be excluded by asdict.
+    # Serialize server args but redact sensitive fields
+    server_args_dict = dataclasses.asdict(server_args)
+    # Remove sensitive authentication credentials from response
+    _SENSITIVE_FIELDS = ("api_key", "admin_api_key")
+    for field in _SENSITIVE_FIELDS:
+        if field in server_args_dict:
+            server_args_dict[field] = "[REDACTED]" if server_args_dict[field] else None
+
     return {
-        **dataclasses.asdict(server_args),
+        **server_args_dict,
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
@@ -1355,6 +1363,7 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
 ):
