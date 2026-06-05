@@ -566,6 +566,7 @@ def test_lingbot_last_context_block_projects_kv_only(monkeypatch):
     block.norm_q = _FailIfCalled()
     block.norm_k = _Identity()
     block.num_attention_heads = 1
+    block._use_fused_kv_projection = False
     block.attn1 = _KVOnlyAttention()
     monkeypatch.setattr(
         lingbot_world_module,
