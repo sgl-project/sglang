@@ -211,6 +211,8 @@ class WanUpsample(nn.Upsample):
     """
 
     def forward(self, x):
+        if current_platform.is_amp_supported():
+            return super().forward(x)
         return super().forward(x.float()).type_as(x)
 
 

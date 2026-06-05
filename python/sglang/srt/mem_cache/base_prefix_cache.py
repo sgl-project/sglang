@@ -74,6 +74,7 @@ class InsertResult:
     """Result of an insert operation"""
 
     prefix_len: int
+    total_len: int = 0
     mamba_exist: bool = False
     inserted_host_node: Any = None
 
@@ -236,6 +237,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
+
+    def supports_fast_match_prefix(self) -> bool:
+        return False
 
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
