@@ -59,6 +59,9 @@ def _emit(name: str, policy: str, ms: float, args: argparse.Namespace) -> None:
                 "heads": args.heads,
                 "head_dim": args.head_dim,
                 "dtype": args.dtype,
+                "attention_autotune_mode": getattr(
+                    args, "attention_autotune_mode", None
+                ),
             },
             sort_keys=True,
         )
@@ -226,20 +229,30 @@ def bench_local_attention_autotune(args: argparse.Namespace) -> None:
     )
     v = torch.randn_like(k)
     metadata = FlashAttentionMetadata(max_seqlen_q=args.seq, max_seqlen_k=kv_seq)
+    attention_kwargs = {}
+    if args.attention_autotune_mode == "explicit":
+        attention_kwargs = {
+            "attention_autotune": True,
+            "attention_autotune_warmup": args.autotune_warmup,
+            "attention_autotune_iters": args.autotune_iters,
+            "attention_autotune_min_speedup": args.autotune_min_speedup,
+        }
+    elif args.attention_autotune_mode == "disabled":
+        attention_kwargs = {"attention_autotune": False}
     with global_force_attn_backend_context_manager(AttentionBackendEnum.FA):
         layer = LocalAttention(
             num_heads=args.heads,
             head_size=args.head_dim,
             num_kv_heads=args.heads,
-            attention_autotune=True,
-            attention_autotune_warmup=args.autotune_warmup,
-            attention_autotune_iters=args.autotune_iters,
-            attention_autotune_min_speedup=args.autotune_min_speedup,
+            **attention_kwargs,
         ).cuda()
     _LOCAL_ATTENTION_AUTOTUNE_CACHE.clear()
     with torch.inference_mode(), set_forward_context(0, metadata):
         layer(q, k, v)
-        selected = next(iter(_LOCAL_ATTENTION_AUTOTUNE_CACHE.values()))
+        selected = next(
+            iter(_LOCAL_ATTENTION_AUTOTUNE_CACHE.values()),
+            f"{args.attention_autotune_mode}_uncached",
+        )
         ms = _time_cuda(lambda: layer(q, k, v), args.warmup, args.iters)
     _emit("local_attention_autotune", selected, ms, args)
 
@@ -280,6 +293,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--autotune-warmup", type=int, default=3)
     parser.add_argument("--autotune-iters", type=int, default=10)
     parser.add_argument("--autotune-min-speedup", type=float, default=1.02)
+    parser.add_argument(
+        "--attention-autotune-mode",
+        choices=["default", "explicit", "disabled"],
+        default="default",
+    )
     parser.add_argument(
         "--kernel-policies",
         nargs="+",
