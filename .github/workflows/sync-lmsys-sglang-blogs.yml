@@ -29,7 +29,7 @@ jobs:
 
       - name: Open or update pull request
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
         run: |
           set -euo pipefail
 
@@ -38,9 +38,9 @@ jobs:
             exit 0
           fi
 
-          BRANCH="auto/lmsys-blog-cards"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH="bot/lmsys-blog-cards"
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
 
           # Recreate the bot branch as "current main + card diff" and overwrite
           # any previous state, so the PR always shows a clean single-commit diff.
@@ -56,5 +56,5 @@ jobs:
               --base main \
               --head "$BRANCH" \
               --title "docs: sync LMSYS SGLang blog cards" \
-              --body 'Automated sync of the LMSYS SGLang blog cards in `docs_new/index.mdx`, opened by the `Sync LMSYS SGLang blogs` workflow.'
+              --body $'Automated sync of the LMSYS SGLang blog cards in `docs_new/index.mdx`.\n\n🤖 Generated with GitHub Actions'
           fi
