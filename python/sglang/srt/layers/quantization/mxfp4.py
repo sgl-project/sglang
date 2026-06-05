@@ -28,11 +28,11 @@ from torch.nn.parameter import Parameter
 # cutlass_fused_moe. Its C++ logger reads TLLM_LOG_LEVEL on first kernel launch;
 # setdefault preserves any explicit user override.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
-
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -154,6 +154,7 @@ if _is_hip:
     # import aiter
     try:
         from aiter.ops.shuffle import (
+            shuffle_scale,
             shuffle_scale_a16w4,
             shuffle_weight,
             shuffle_weight_a16w4,
@@ -795,20 +796,46 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(e, n, -1)
             )
-
-            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
-            shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-                self.num_experts,
-                True,
+            layer.w13_weight_bias.data = (
+                layer.w13_weight_bias.data.view(-1, n // 2, 2)
+                .permute(0, 2, 1)
+                .contiguous()
+                .view(-1, n)
             )
 
-            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
-            shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-                self.num_experts,
-                False,
-            )
+            if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+                layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+                shuffled_w13_scale = shuffle_scale_a16w4(
+                    layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                    self.num_experts,
+                    True,
+                )
+
+                layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+                shuffled_w2_scale = shuffle_scale_a16w4(
+                    layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                    self.num_experts,
+                    False,
+                )
+            else:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight, is_guinterleave=False, gate_up=True
+                )
+                shuffled_w13_scale = shuffle_scale(
+                    layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                    experts_cnt=self.num_experts,
+                    is_guinterleave=False,
+                    gate_up=True,
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight, is_guinterleave=False, gate_up=False
+                )
+                shuffled_w2_scale = shuffle_scale(
+                    layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                    experts_cnt=self.num_experts,
+                    is_guinterleave=False,
+                    gate_up=False,
+                )
 
             # shuffle_weight_a16w4(gate_up=True) above preshuffles w13 into aiter's
             # preshuffle + gate/up-interleaved layout. Tag the Parameter so apply()
@@ -816,13 +843,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # fused_moe selects the preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
-
-            layer.w13_weight_bias.data = (
-                layer.w13_weight_bias.data.view(-1, n // 2, 2)
-                .permute(0, 2, 1)
-                .contiguous()
-                .view(-1, n)
-            )
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 shuffled_w13_scale, requires_grad=False
