@@ -19,7 +19,9 @@ Life cycle of a request in the prefill server
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from array import array
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -37,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    is_aborted,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
@@ -67,7 +70,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def release_req_to_metadata_buffer(
+def should_force_retry(req: Req) -> bool:
+    """Test hook to force a request into optimistic prefill retry."""
+    retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
+    if retry_prob <= 0 or req.time_stats.prefill_retry_count > 0 or req.is_retracted:
+        return False
+
+    digest = hashlib.sha256(str(req.rid).encode()).digest()
+    return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def maybe_release_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
     """
@@ -79,11 +92,7 @@ def release_req_to_metadata_buffer(
         req: The request object that may have a metadata_buffer_index allocated
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
-    if (
-        hasattr(req, "metadata_buffer_index")
-        and req.metadata_buffer_index is not None
-        and req.metadata_buffer_index >= 0
-    ):
+    if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
 
@@ -123,8 +132,10 @@ class PrefillBootstrapQueue:
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
-        self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
+        self.max_total_num_tokens = (
+            self.scheduler.tp_worker.model_runner.max_token_pool_size
+        )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
@@ -132,13 +143,6 @@ class PrefillBootstrapQueue:
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
-
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens,
-                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
-            )
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -219,9 +223,11 @@ class PrefillBootstrapQueue:
                 )
         return kv_manager
 
-    def add(self, req: Req, num_kv_heads: int) -> None:
+    def create_sender(self, req: Req, num_kv_heads: int) -> bool:
+        """Create a KV sender for the request without enqueuing it.
+        Returns False if the request exceeds KV capacity."""
         if self._check_if_req_exceed_kv_capacity(req):
-            return
+            return False
 
         backend = (
             TransferBackend.FAKE
@@ -240,6 +246,42 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
         )
         self._process_req(req)
+        req.pending_bootstrap = True
+        return True
+
+    def ensure_metadata_buffer(self, req: Req) -> bool:
+        if req.metadata_buffer_index >= 0:
+            return True
+
+        if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+            return False
+        req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        assert req.metadata_buffer_index is not None
+        return True
+
+    def finalize_bootstrap(self, req: Req) -> bool:
+        """Initialize the sender after bootstrap completes.
+        Returns False if no metadata buffer is available (non-terminal)."""
+        assert req.pending_bootstrap, f"finalize_bootstrap is not idempotent"
+        if not self.ensure_metadata_buffer(req):
+            return False
+
+        req.time_stats.set_bootstrap_done_time()
+        num_kv_indices = len(req.origin_input_ids)
+
+        decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+        req.start_send_idx = decode_prefix_len
+        num_kv_indices_to_send = num_kv_indices - decode_prefix_len
+        num_pages = kv_to_page_num(
+            num_kv_indices_to_send, self.token_to_kv_pool.page_size
+        )
+        req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        req.pending_bootstrap = False
+        return True
+
+    def add(self, req: Req, num_kv_heads: int) -> None:
+        if not self.create_sender(req, num_kv_heads):
+            return
         self.queue.append(req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -291,59 +333,41 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None:
-                # if req not in reqs_info_to_check, skip
-                if req.rid not in rids_to_check:
-                    continue
-
-            if poll == KVPoll.Bootstrapping:
+            if (
+                rids_to_check is not None
+                and req.rid not in rids_to_check
+                and poll != KVPoll.Failed
+            ):
+                # In PP mode, successful bootstrap still requires cross-rank
+                # consensus. Local failures are terminal and must be drained
+                # even if an earlier PP rank has already removed the request.
                 continue
-            elif poll == KVPoll.Failed:
-                error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.error(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+
+            if poll == KVPoll.Failed:
+                self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                if self.scheduler.metrics_reporter.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                if self.scheduler.enable_hicache_storage:
-                    # to release prefetch events associated with the request
-                    self.scheduler.tree_cache.release_aborted_request(req.rid)
-                continue
-
-            # KV.WaitingForInput - decode is ready to receive. initialize the kv sender
-            req.time_stats.set_bootstrap_done_time()
-            num_kv_indices = len(req.origin_input_ids)
-            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
-                break
-
-            req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert req.metadata_buffer_index is not None
-
-            # Cal number of pages to send
-            # if decode has a cached prefix, we need to send the delta indices
-            # otherwise, send the entire request
-            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-            req.start_send_idx = decode_prefix_len
-            num_kv_indices_to_send = num_kv_indices - decode_prefix_len
-            num_pages = kv_to_page_num(
-                num_kv_indices_to_send, self.token_to_kv_pool.page_size
-            )
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
-
-            bootstrapped_reqs.append(req)
-            indices_to_remove.add(i)
-            req.time_stats.set_wait_queue_entry_time()
+            elif poll == KVPoll.Bootstrapping:
+                if (
+                    req.time_stats.prefill_retry_count
+                    < self.scheduler.server_args.optimistic_prefill_retries
+                    and not req.is_retracted  # engine paused
+                ):
+                    if not self.ensure_metadata_buffer(req):
+                        continue  # no more metadata buffer
+                    bootstrapped_reqs.append(req)
+                    indices_to_remove.add(i)
+                    req.time_stats.set_wait_queue_entry_time()
+            elif poll == KVPoll.WaitingForInput:
+                if not self.finalize_bootstrap(req):
+                    continue
+                bootstrapped_reqs.append(req)
+                indices_to_remove.add(i)
+                req.time_stats.set_wait_queue_entry_time()
+            else:
+                raise RuntimeError(
+                    f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
+                )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -437,7 +461,8 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             # WAR barrier on shared GPU buffers (req_to_token_pool / SWA mapping).
-            self.schedule_stream.wait_stream(self.forward_stream)
+            if self._war_barrier_enabled:
+                self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -504,26 +529,40 @@ class SchedulerDisaggregationPrefillMixin:
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
-        if batch.return_logprob:
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.tolist()
-                )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
-            if logits_output.next_token_top_logprobs_val:
-                logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
-                ]
-                logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                ]
-            if logits_output.next_token_token_ids_logprobs_val:
-                logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
-                ]
+        self.batch_result_processor.move_logprobs_to_cpu(
+            batch=batch,
+            logits_output=logits_output,
+        )
+
+        def advance_logprob_pt(i: int, req: Req) -> None:
+            nonlocal logprob_pt
+            if not req.return_logprob or extend_input_len_per_req is None:
+                return
+            extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+            extend_input_len = extend_input_len_per_req[i]
+            if extend_logprob_start_len < extend_input_len:
+                logprob_pt += extend_input_len - extend_logprob_start_len
+
+        # Poll optimistic prefill requests in this batch.
+        # Note: In overlap scheduling, a chunked request that was still pending
+        # during process_prefill_chunk is not checked again here.
+        # If it becomes ready in the gap, we still retry the request to keep
+        # chunked-prefill state management simple.
+        optimistic_polls = {}
+        optimistic_reqs = [
+            (i, req)
+            for i, req in enumerate(batch.reqs)
+            if req.pending_bootstrap and req.inflight_middle_chunks <= 0
+        ]
+        if optimistic_reqs:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for _, req in optimistic_reqs],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+            optimistic_polls = {
+                idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
+            }
 
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
@@ -531,7 +570,14 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
-                # There is no output_ids for prefill
+                # For optimistic requests, check bootstrap before side effects
+                if i in optimistic_polls:
+                    if not self.handle_pending_bootstrap(
+                        req, optimistic_polls[i], defer_release=False
+                    ):
+                        advance_logprob_pt(i, req)
+                        continue
+
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
@@ -562,12 +608,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
-                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
-                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                        # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                         release_kv_cache(req, self.tree_cache)
                         prepare_abort(
@@ -580,11 +623,24 @@ class SchedulerDisaggregationPrefillMixin:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
 
+                # Overlap deferred release for optimistic requests stopped in process_prefill_chunk
+                if req.pending_bootstrap:
+                    advance_logprob_pt(i, req)
+                    self.optimistic_release_and_requeue(req)
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
+
+                # Optimistic bootstrap can fail while this overlapped chunk is
+                # already running. Drop aborted chunks instead of sending KV.
+                if is_aborted(req):
+                    advance_logprob_pt(i, req)
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
+
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
                     if extend_logprob_start_len < extend_input_len:
-                        # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
                         self.batch_result_processor.logprob_result_processor.add_input_logprob_return_values(
                             i,
@@ -597,6 +653,9 @@ class SchedulerDisaggregationPrefillMixin:
                         logprob_pt += num_input_logprobs
 
                 if self.enable_overlap:
+                    assert (
+                        req.metadata_buffer_index >= 0
+                    ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -712,7 +771,7 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             req: Req
 
-            release_req_to_metadata_buffer(
+            maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
 
@@ -738,12 +797,77 @@ class SchedulerDisaggregationPrefillMixin:
 
         return transferred_rids
 
+    def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        error_message = (
+            f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
+            f"{req.rid=} {req.bootstrap_room=}"
+        )
+        try:
+            req.disagg_kv_sender.failure_exception()
+        except Exception as e:
+            error_message += f" with exception {e}"
+        logger.warning(error_message)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
+            release_kv_cache(req, self.tree_cache)
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.output_streamer.stream_output([req], req.return_logprob)
+        if self.metrics_reporter.enable_metrics:
+            self.metrics_collector.increment_bootstrap_failed_reqs()
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+
+    def handle_pending_bootstrap(
+        self: Scheduler, req: Req, poll: KVPoll, defer_release: bool
+    ) -> bool:
+        """Return True when bootstrap is finalized and KV transfer can proceed."""
+        if poll == KVPoll.Failed:
+            self.handle_bootstrap_failure(req)
+            return False
+        elif poll == KVPoll.Bootstrapping:
+            if not defer_release:
+                self.optimistic_release_and_requeue(req)
+            return False
+        elif poll == KVPoll.WaitingForInput:
+            force_retry = should_force_retry(req)  # test hook
+            if force_retry:
+                if not defer_release:
+                    self.optimistic_release_and_requeue(req)
+                return False
+            # Metadata buffer was allocated in pop_bootstrapped before
+            # the request entered the waiting queue, so finalize should not fail.
+            assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+            return True
+        else:
+            raise RuntimeError(
+                f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
+            )
+
+    def check_bootstrap(self: Scheduler, req: Req) -> bool:
+        """Check bootstrap status for an optimistic prefilled request.
+        Returns True if bootstrap is finished."""
+        if not req.pending_bootstrap:
+            return True
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        return self.handle_pending_bootstrap(
+            req, polls[0], defer_release=self.enable_overlap
+        )
+
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
             maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
-            if self.enable_overlap:
+
+            if not self.check_bootstrap(self.chunked_req):
+                self.chunked_req = None  # stop the current chunked prefill
+            elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
                     len(self.chunked_req.fill_ids),
@@ -751,7 +875,9 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             else:
                 self.send_kv_chunk(self.chunked_req)
-            self.running_batch.batch_is_full = False
+
+            if self.chunked_req is not None:
+                self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req:
@@ -805,7 +931,13 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            seq_len = len(req.fill_ids)
+            # fill_ids includes the token sampled during prefill, but decode
+            # registers state pages over origin_input_ids (DecodePreallocQueue)
+            # and the main pool send is clamped to end_idx above. Matching that
+            # length here avoids emitting an extra state page when the sampled
+            # token crosses a page boundary, which mismatched src/dst lengths in
+            # group_concurrent_contiguous.
+            seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [
@@ -857,3 +989,34 @@ class SchedulerDisaggregationPrefillMixin:
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
+
+    def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
+        """Release KV cache and requeue an optimistic prefill request."""
+        max_retries = self.server_args.optimistic_prefill_retries
+        maybe_cache_unfinished_req(req, self.tree_cache)
+        release_kv_cache(req, self.tree_cache)
+        req.reset_for_retract()
+        req.output_ids = array("q")
+        req.start_send_idx = 0
+        req.tmp_end_idx = -1
+        req.hidden_states_tensor = None
+        req.pending_bootstrap = True
+        req.time_stats.reset_prefill_retry_time()
+        if req.time_stats.prefill_retry_count >= max_retries:
+            logger.info(
+                f"Req {req.rid} exhausted optimistic prefill retries "
+                "falling back to bootstrap queue"
+            )
+            # Reset it so the next real bootstrap done can be recorded.
+            req.time_stats.bootstrap_done_time = 0.0
+            self.disagg_prefill_bootstrap_queue.queue.append(req)
+        else:
+            req.time_stats.prefill_retry_count += 1
+            logger.info(
+                f"Req {req.rid} optimistic prefill retry "
+                f"{req.time_stats.prefill_retry_count}/{max_retries}"
+            )
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_collector.increment_prefill_retries(1)
+            req.time_stats.set_wait_queue_entry_time()
+            self.waiting_queue.insert(0, req)

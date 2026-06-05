@@ -575,13 +575,18 @@ class DeepseekMLAForwardMixin:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
-                attn_bmm_output = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_vc.shape[2],
+                B_heads, M_batch = x.shape[0], x.shape[1]
+                N_vdim = self.w_vc.shape[2]
+                # Allocate in (batch, heads, dim) so the post-GEMM
+                # transpose+flatten is a free view instead of a copy.
+                _bmm_buf = torch.empty(
+                    M_batch,
+                    B_heads,
+                    N_vdim,
                     device=x.device,
                     dtype=torch.bfloat16,
                 )
+                attn_bmm_output = _bmm_buf.transpose(0, 1)
                 batched_gemm_afp4wfp4_pre_quant(
                     x,
                     self.w_vc.transpose(-2, -1),
@@ -590,6 +595,7 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                 )
             else:
+                _bmm_buf = None
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
@@ -607,7 +613,17 @@ class DeepseekMLAForwardMixin:
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
-            if self.o_proj.weight.dtype == torch.uint8:
+            if _bmm_buf is not None:
+                # _bmm_buf is already (batch, heads, dim) contiguous
+                if self.o_proj.weight.dtype == torch.uint8:
+                    attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
+                elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                    attn_bmm_output = fused_flatten_fp8_group_quant(
+                        _bmm_buf, group_size=128, dtype_quant=torch.float8_e4m3fn
+                    )
+                else:
+                    attn_bmm_output = _bmm_buf.flatten(1, 2)
+            elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn:

@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=False)
+register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=True)
 
 
 class TestDeepEpQwen(CustomTestCase):
@@ -82,6 +82,7 @@ class TestDeepEpQwen(CustomTestCase):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
                 "HCCL_BUFFSIZE": "2100",
                 "HCCL_OP_EXPANSION_MODE": "AIV",
+                "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
             },
         )
