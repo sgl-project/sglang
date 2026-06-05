@@ -1301,27 +1301,26 @@ class HiCacheController:
             HiCacheL1L2TransferMetricsCollector(labels)
         )
 
-    def _host_pool_bytes_per_token(self) -> int:
-        """Return bytes per token slot for the host-side KV pools.
-
-        Handles both a normal HostKVCache and HostPoolGroup-style wrappers.
-        """
-        if hasattr(self.mem_pool_host, "entries"):
-            bytes_per_token = 0
-            for entry in self.mem_pool_host.entries:
-                size_per_token = getattr(entry.host_pool, "size_per_token", None)
-                if size_per_token is None:
-                    self._warn_unknown_host_pool_bytes(entry.host_pool)
-                    continue
-                bytes_per_token += int(size_per_token)
-            return bytes_per_token
-
+    def _host_pool_size_per_token(self, pool_name=None) -> int:
+        """Return size_per_token for a specific named pool, or the whole pool for plain caches."""
+        if hasattr(self.mem_pool_host, "entry_map") and pool_name is not None:
+            entry = self.mem_pool_host.entry_map.get(pool_name)
+            if entry is None:
+                return 0
+            return int(getattr(entry.host_pool, "size_per_token", 0) or 0)
         size_per_token = getattr(self.mem_pool_host, "size_per_token", None)
         if size_per_token is None:
             self._warn_unknown_host_pool_bytes(self.mem_pool_host)
             return 0
-
         return int(size_per_token)
+
+    def _transfer_index_count(self, transfer) -> int:
+        """Return the number of index slots in a PoolTransfer (host preferred, device fallback)."""
+        if transfer.host_indices is not None:
+            return int(transfer.host_indices.numel())
+        if transfer.device_indices is not None:
+            return int(transfer.device_indices.numel())
+        return 0
 
     def _warn_unknown_host_pool_bytes(self, host_pool) -> None:
         if self._warned_unknown_host_pool_bytes:
@@ -1333,10 +1332,24 @@ class HiCacheController:
             type(host_pool).__name__,
         )
 
-    def _estimate_l1_l2_transfer_bytes(self, token_count: int) -> int:
-        """Estimate total bytes moved for one L1<->L2 transfer operation."""
-        bytes_per_token = self._host_pool_bytes_per_token()
-        total = int(token_count) * bytes_per_token
+    def _estimate_l1_l2_transfer_bytes(
+        self,
+        token_count: int,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> int:
+        """Estimate total bytes moved for one L1<->L2 transfer operation.
+
+        For hybrid caches (Mamba, SWA, DSA sidecars) each sidecar pool may use
+        a different index count than the primary KV token count, so per-transfer
+        index counts are used rather than assuming every pool moves token_count slots.
+        """
+        total = int(token_count) * self._host_pool_size_per_token(PoolName.KV)
+
+        for transfer in pool_transfers or []:
+            total += (
+                self._transfer_index_count(transfer)
+                * self._host_pool_size_per_token(transfer.name)
+            )
 
         if self.has_draft and self.mem_pool_host_draft is not None:
             draft_size_per_token = getattr(
@@ -1356,11 +1369,12 @@ class HiCacheController:
         finish_event: device_module.Event,
         node_ids: List[int],
         token_count: int,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
     ) -> HiCacheAck:
         block_count = (int(token_count) + int(self.page_size) - 1) // int(
             self.page_size
         )
-        byte_count = self._estimate_l1_l2_transfer_bytes(token_count)
+        byte_count = self._estimate_l1_l2_transfer_bytes(token_count, pool_transfers)
 
         return HiCacheAck(
             start_event=start_event,
