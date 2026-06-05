@@ -78,6 +78,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import statistics
 import threading
 import time
@@ -222,6 +223,20 @@ class BenchMemPoolHost:
 # core_fraction = loop_cpu / loop_wall is bounded [0,1] and excludes the
 # batch op's registration work.
 # --------------------------------------------------------------------------- #
+class TimeWrapper:
+    # Shadow hicache_nixl's `time` reference instead of mutating the process-global
+    # time.sleep. Only sleep is overridden; every other time.* attribute falls
+    # through to the real module.
+    def __init__(self, real_time, sleep_func):
+        self._real_time = real_time
+        self._sleep_func = sleep_func
+
+    def __getattr__(self, name):
+        if name == "sleep":
+            return self._sleep_func
+        return getattr(self._real_time, name)
+
+
 class PollProbe:
     def __init__(self, hicache, nixl_mod, no_sleep: bool):
         self.hicache = hicache
@@ -260,11 +275,10 @@ class PollProbe:
         self._orig = {
             "initialize_xfer": a.initialize_xfer,
             "check_xfer_state": a.check_xfer_state,
-            "sleep": self.nixl_mod.time.sleep,
+            "time": self.nixl_mod.time,
         }
         oi = self._orig["initialize_xfer"]
         oc = self._orig["check_xfer_state"]
-        osleep = self._orig["sleep"]
 
         def w_init(*a_, **k_):
             # Each transfer starts a new poll-loop record.
@@ -300,7 +314,7 @@ class PollProbe:
                 return None
             t0 = time.perf_counter()
             c0 = _thread_cpu()
-            r = osleep(seconds)
+            r = self._orig["time"].sleep(seconds)
             c1 = _thread_cpu()
             t1 = time.perf_counter()
             self._loop_cpu += c1 - c0
@@ -309,14 +323,14 @@ class PollProbe:
 
         a.initialize_xfer = w_init
         a.check_xfer_state = w_check
-        self.nixl_mod.time.sleep = w_sleep
+        self.nixl_mod.time = TimeWrapper(self._orig["time"], w_sleep)
         return self
 
     def __exit__(self, *exc):
         self._flush()
         self.agent.initialize_xfer = self._orig["initialize_xfer"]
         self.agent.check_xfer_state = self._orig["check_xfer_state"]
-        self.nixl_mod.time.sleep = self._orig["sleep"]
+        self.nixl_mod.time = self._orig["time"]
         return False
 
 
@@ -1061,6 +1075,25 @@ def _print_latency_tax(results: List[CellResult]) -> None:
     )
 
 
+def _clear_files(file_path: str) -> None:
+    # Drop the benchmark's temporary KV files so a long sweep cannot exhaust a
+    # size-limited /tmp (tmpfs). Best-effort; never fatal. Called only after all
+    # measurement is written, so it cannot perturb any cell's timing.
+    try:
+        entries = os.listdir(file_path)
+    except OSError:
+        return
+    for entry in entries:
+        full = os.path.join(file_path, entry)
+        try:
+            if os.path.isfile(full) or os.path.islink(full):
+                os.remove(full)
+            else:
+                shutil.rmtree(full, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -1211,6 +1244,23 @@ def main():
                         )
                     )
 
+        # Hardening (2026-06-06): the single-thread sweep above leaves backend/agent
+        # state that slows the concurrency measurement ~3x -- verified NOT files, NOT
+        # page cache, NOT transfer count. Rebuild the backend on a fresh path so
+        # concurrency is measured in isolation (a fresh server), not contaminated by
+        # the sweep. Without this, K>=2 wall_speedup understates parallelism ~2x and
+        # overstates polls/thread ~3x.
+        try:
+            hicache.clear()
+            hicache.close()
+        except Exception:
+            pass
+        conc_path = os.path.join(args.file_path, "_conc")
+        shutil.rmtree(conc_path, ignore_errors=True)
+        os.makedirs(conc_path, exist_ok=True)
+        hicache = _make_hicache(conc_path, backend_mode)
+        hicache.register_mem_pool_host(host)
+
         for K in concurrency_ks:
             # bounce mode shares ONE _bounce_set/_bounce_get slot, so K>2 would put
             # two same-role threads on the same buffer (a real data race once NIXL
@@ -1266,6 +1316,8 @@ def main():
             f"\nWrote {len(results)} cell rows + {len(cresults)} concurrency rows "
             f"to {args.output_file}"
         )
+
+    _clear_files(args.file_path)  # clear residual temp files at the end
 
 
 if __name__ == "__main__":
