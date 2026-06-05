@@ -36,16 +36,24 @@ impl TokenizerRegistry {
         me.inner.insert(m.id.clone(), t);
         // Best-effort: a model without a chat template (or without a readable
         // tokenizer_config.json) simply routes chat traffic via raw text.
+        // Every arm logs its outcome: whether chat-template routing is live for
+        // this model is the single most useful signal for diagnosing
+        // "cache-aware routing degraded to overlap=0 on chat traffic", so it
+        // must never be silent.
         match adapter::load_tokenizer_config(&m.tokenizer_path) {
             Ok(Some(cfg_json)) => match ChatTemplate::from_tokenizer_config(&cfg_json) {
                 Ok(Some(tmpl)) => {
                     me.templates.insert(m.id.clone(), Arc::new(tmpl));
+                    tracing::info!(model = %m.id,
+                        "chat-template routing enabled; chat requests route by templated tokens");
                 }
-                Ok(None) => {}
+                Ok(None) => tracing::info!(model = %m.id,
+                    "tokenizer_config.json has no chat_template; chat traffic routes via raw prompt text"),
                 Err(e) => tracing::warn!(model = %m.id, error = %e,
                     "failed to compile chat template; chat traffic for this model routes via raw prompt text"),
             },
-            Ok(None) => {}
+            Ok(None) => tracing::info!(model = %m.id,
+                "no tokenizer_config.json found; chat traffic routes via raw prompt text"),
             Err(e) => tracing::warn!(model = %m.id, error = %e,
                 "failed to load tokenizer_config.json; chat traffic for this model routes via raw prompt text"),
         }
@@ -68,7 +76,9 @@ impl TokenizerRegistry {
     /// `None` — caller falls back to raw routing — when the model has no
     /// template, no tokenizer, or rendering/encoding produced no tokens.
     pub fn encode_chat(&self, model_id: &str, messages: &serde_json::Value) -> Option<Vec<u32>> {
-        let template = self.templates.get(model_id)?;
+        // Clone the Arc and drop the DashMap guard before the CPU-bound
+        // render+encode (mirrors `get`), so no shard read-lock is held across it.
+        let template = Arc::clone(&*self.templates.get(model_id)?);
         let tokenizer = self.get(model_id)?;
         let rendered = template
             .render(messages)
@@ -341,5 +351,30 @@ mod tests {
         assert!(!reg.has_chat_template("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(reg.encode_chat("tiny", &messages).is_none());
+    }
+
+    /// A template that fails to render (here, one that calls `raise_exception`)
+    /// makes `encode_chat` return `None`, so the policy falls back to the raw
+    /// prompt-text path rather than failing the request.
+    #[test]
+    fn encode_chat_none_on_render_failure() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
+        );
+        reg.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ raise_exception('nope') }}",
+                "bos_token": "<s>",
+            }),
+        );
+        assert!(reg.has_chat_template("tiny"));
+        let messages = serde_json::json!([{"role":"user","content":"hi"}]);
+        assert!(
+            reg.encode_chat("tiny", &messages).is_none(),
+            "a failing render must yield None so routing falls back to raw text"
+        );
     }
 }

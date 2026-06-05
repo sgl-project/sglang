@@ -46,9 +46,11 @@ from infra.gateway import Gateway
 from infra.model_pool import spawn_worker
 from infra.model_specs import get_model_spec
 
-# Disjoint prefixes — share no common opening text, so block 0 hashes
-# differ from the first block onward and each worker's HashTree
-# contribution is uniquely identifying.
+# Disjoint prefixes — share no common content. Under the chat template both
+# render with the same leading role header (BOS + ``<|im_start|>user`` ...), so
+# the first block(s) may hash identically; the disjoint content then diverges
+# well within the matched region, making each worker's HashTree contribution
+# uniquely identifying.
 #
 # Length matters: each prefix must span ≥2 SGLang blocks at the default
 # block_size of 64 tokens so the worker actually emits BlockStored

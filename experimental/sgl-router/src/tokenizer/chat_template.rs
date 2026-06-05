@@ -80,9 +80,9 @@ impl ChatTemplate {
     /// the engine would tokenize, with `add_generation_prompt = true`.
     ///
     /// `messages` is passed through as-is; templates expect string `content`.
-    /// Multimodal content arrays are out of scope (text-only routing) and will
-    /// surface as a render error, which the caller treats as "fall back to the
-    /// raw prompt-text path".
+    /// Multimodal content arrays are out of scope (text-only routing): depending
+    /// on the template they either render incorrectly or surface as a render
+    /// error — either way the caller falls back to the raw prompt-text path.
     ///
     /// Request-level template inputs beyond `messages` (`tools`, `documents`,
     /// ...) are not threaded through: a request carrying them renders without
