@@ -615,13 +615,17 @@ class PrefillAdder:
     def _accumulate_hit_token_split(self, req, prefix_len: int) -> None:
         """Accumulate per-source cache-hit split alongside log_hit_tokens.
 
-        Must be called only for non-retracted requests and only once per
-        scheduling decision (not for chunk 2+ of chunked prefill, where
-        prefix_len passed to _update_prefill_budget is 0).
+        Must be called exactly once per scheduling decision (not for chunk 2+
+        of chunked prefill, where prefix_len passed to _update_prefill_budget
+        is 0). Called for both retracted and non-retracted requests so that
+        the split always sums to log_hit_tokens.
         """
         if prefix_len <= 0:
             return
-        host_total = req.host_hit_length
+        # Cap host_total at prefix_len: if init_load_back loaded fewer tokens
+        # than host_hit_length (e.g. allocation failure), prefix_len is already
+        # the true total and host_hit_length would be stale/too large.
+        host_total = min(req.host_hit_length, prefix_len)
         storage_portion = min(host_total, req.storage_hit_length)
         self.log_hit_tokens_storage += storage_portion
         self.log_hit_tokens_host += host_total - storage_portion
@@ -684,8 +688,7 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        if not req.retracted_stain:
-            self._accumulate_hit_token_split(req, prefix_len)
+        self._accumulate_hit_token_split(req, prefix_len)
         self._update_prefill_budget(
             prefix_len,
             trunc_len,
@@ -1011,8 +1014,7 @@ class PrefillAdder:
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
-                if not req.retracted_stain:
-                    self._accumulate_hit_token_split(req, prefix_len)
+                self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -1056,8 +1058,7 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                if not req.retracted_stain:
-                    self._accumulate_hit_token_split(req, prefix_len)
+                self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
                     prefix_len,
                     trunc_len,
