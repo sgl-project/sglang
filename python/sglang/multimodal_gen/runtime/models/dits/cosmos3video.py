@@ -863,19 +863,19 @@ class Cosmos3OmniTransformer(CachableDiT):
         )
 
         # Latent projection layers - ReplicatedLinear for quantization support
-        self.vae2llm = ReplicatedLinear(
+        self.proj_in = ReplicatedLinear(
             self.patch_latent_dim,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix="vae2llm",
+            prefix="proj_in",
         )
-        self.llm2vae = ReplicatedLinear(
+        self.proj_out = ReplicatedLinear(
             self.hidden_size,
             self.patch_latent_dim,
             bias=True,
             quant_config=quant_config,
-            prefix="llm2vae",
+            prefix="proj_out",
         )
 
         # Timestep embedder
@@ -1084,7 +1084,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         sequence_shard_enabled = self.sp_size > 1
 
         # Patchify and project to hidden dim
-        hidden_gen, _ = self.vae2llm(self.patchify(hidden_states, T, H, W))
+        hidden_gen, _ = self.proj_in(self.patchify(hidden_states, T, H, W))
         seq_len_orig = hidden_gen.shape[1]
         seq_shard_pad = 0
 
@@ -1195,7 +1195,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         # this cuts the post-loop SP collective bandwidth ~21x.
         hidden_gen = hidden_gen + residual
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        output, _ = self.llm2vae(hidden_gen)
+        output, _ = self.proj_out(hidden_gen)
 
         if sequence_shard_enabled:
             output = sequence_model_parallel_all_gather(output, dim=1)
@@ -1343,10 +1343,10 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         # Ensure embeddings and projections are in target dtype
         self.language_model.embed_tokens.to(target_dtype)
-        for module in self.vae2llm.modules():
+        for module in self.proj_in.modules():
             if not _is_quantized(module):
                 _cast_direct(module, target_dtype)
-        for module in self.llm2vae.modules():
+        for module in self.proj_out.modules():
             if not _is_quantized(module):
                 _cast_direct(module, target_dtype)
 

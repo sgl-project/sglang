@@ -285,9 +285,7 @@ class ModelRunnerKVCacheMixin:
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
-            max_spec_draft_tokens = (
-                self.server_args.effective_max_speculative_num_draft_tokens()
-            )
+            max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             extra_max_context_len = 4
             if max_spec_draft_tokens is not None:
                 extra_max_context_len += max_spec_draft_tokens

@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import tempfile
+from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -590,8 +591,6 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
-    speculative_adaptive: bool = False
-    speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
@@ -604,6 +603,10 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
+
+    # Adaptive speculative decoding
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -2210,7 +2213,21 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
                 )
-        elif "Step3p5ForCausalLM" in model_arch:
+        elif (
+            "Step3p5ForCausalLM" in model_arch
+            or "Step3p7ForConditionalGeneration" in model_arch
+        ):
+            if self.is_attention_backend_not_set():
+                if is_blackwell_supported():
+                    self.attention_backend = "fa4"
+                    logger.info(
+                        "Auto-select fa4 attention backend for Step3p7 on Blackwell."
+                    )
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                    logger.info(
+                        "Auto-select fa3 attention backend for Step3p7 on Hopper."
+                    )
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(
@@ -7070,8 +7087,9 @@ class ServerArgs:
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
-    def effective_max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count runtime speculative decoding may use."""
+    @cached_property
+    def max_speculative_num_draft_tokens(self) -> Optional[int]:
+        """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:

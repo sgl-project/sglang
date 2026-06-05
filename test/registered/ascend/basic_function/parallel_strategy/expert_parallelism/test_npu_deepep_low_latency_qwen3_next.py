@@ -20,7 +20,6 @@ register_npu_ci(
     est_time=200,
     suite="nightly-8-npu-a3",
     nightly=True,
-    disabled="https://github.com/Ascend/sglang/issues/58",
 )
 
 
@@ -56,7 +55,11 @@ class TestQwen3Next(CustomTestCase):
                 "--watchdog-timeout",
                 9000,
                 "--disable-radix-cache",
-                "--disable-cuda-graph",
+                "--cuda-graph-bs",
+                2,
+                4,
+                6,
+                8,
                 "--chunked-prefill-size",
                 1024,
                 "--max-prefill-tokens",
@@ -69,11 +72,18 @@ class TestQwen3Next(CustomTestCase):
                 "low_latency",
             ],
             env={
+                # The product of the following two environment variables must be greater than --max-prefill-tokens
+                # divide by dp size
+                "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "3000",
+                "DEEPEP_NORMAL_LONG_SEQ_ROUND": "10",
+                # In NPU scenarios, operators only support BF16 precision.
+                # This environment variable needs to be set for quantizing weights.
+                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
                 "STREAMS_PER_DEVICE": "32",
                 "HCCL_OP_EXPANSION_MODE": "AIV",
                 "HCCL_ALGO": "level0:NA;level1:ring",
-                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "20",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "160",
                 "HCCL_BUFFSIZE": "2048",
                 **os.environ,
             },

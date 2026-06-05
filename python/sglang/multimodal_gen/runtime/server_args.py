@@ -1331,9 +1331,11 @@ class ServerArgs(DisaggArgsMixin):
             help=(
                 "Quantization method for the transformer. If omitted, the method is "
                 "auto-detected from the checkpoint config or safetensors metadata when "
-                "possible. Applies to both pre-quantized checkpoints and online "
-                "quantization. Use this flag to override auto-detection. "
-                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "possible. Use this flag to override auto-detection. "
+                "Online (post-load) quantization from a BF16/FP16 checkpoint "
+                "is supported for 'fp8' and 'mxfp4'. Other methods "
+                "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
+                "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
                 "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
             ),

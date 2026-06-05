@@ -324,6 +324,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
+                metadata.cache_seqlens_int32.copy_(
+                    seq_lens + self.speculative_step_id + 1
+                )
                 metadata.max_seq_len_k = seq_lens.max().item() + (
                     self.speculative_step_id + 1
                 )
@@ -458,16 +461,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # Draft Decode
                 # Here we only support topk = 1 for now.
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
-                metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
+                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cache_seqlens_int32.copy_(
+                    seq_lens + self.speculative_step_id + 1
+                )
+                metadata.max_seq_len_k = seq_lens.max().item() + (
+                    self.speculative_step_id + 1
+                )
 
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
-
-                metadata.cache_seqlens_int32.copy_(
-                    seq_lens + self.speculative_step_id + 1
-                )
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]

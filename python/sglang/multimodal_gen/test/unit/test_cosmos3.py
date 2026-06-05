@@ -32,123 +32,131 @@ class TestCosmos3ParamNamesMapping(unittest.TestCase):
         key, idx, total = _apply(self.fn, "lm_head.weight")
         self.assertEqual(key, "")
 
-    def test_model_norm_dropped(self):
-        key, idx, total = _apply(self.fn, "model.norm.weight")
+    def test_norm_dropped(self):
+        key, idx, total = _apply(self.fn, "norm.weight")
+        self.assertEqual(key, "")
+
+    def test_audio_proj_in_dropped(self):
+        key, *_ = _apply(self.fn, "audio_proj_in.weight")
+        self.assertEqual(key, "")
+
+    def test_action_proj_in_dropped(self):
+        key, *_ = _apply(self.fn, "action_proj_in.weight")
         self.assertEqual(key, "")
 
     # --- top-level pass-through ---
 
     def test_embed_tokens(self):
-        key, *_ = _apply(self.fn, "model.embed_tokens.weight")
+        key, *_ = _apply(self.fn, "embed_tokens.weight")
         self.assertEqual(key, "language_model.embed_tokens.weight")
 
     def test_norm_moe_gen(self):
-        key, *_ = _apply(self.fn, "model.norm_moe_gen.weight")
+        key, *_ = _apply(self.fn, "norm_moe_gen.weight")
         self.assertEqual(key, "norm_moe_gen.weight")
 
-    # --- time embedder ---
+    # --- time embedder (pass-through: checkpoint already uses linear_1/2) ---
 
-    def test_time_embedder_mlp_0(self):
-        key, *_ = _apply(self.fn, "time_embedder.mlp.0.weight")
+    def test_time_embedder_linear_1_passthrough(self):
+        key, *_ = _apply(self.fn, "time_embedder.linear_1.weight")
         self.assertEqual(key, "time_embedder.linear_1.weight")
 
-    def test_time_embedder_mlp_2(self):
-        key, *_ = _apply(self.fn, "time_embedder.mlp.2.bias")
+    def test_time_embedder_linear_2_passthrough(self):
+        key, *_ = _apply(self.fn, "time_embedder.linear_2.bias")
         self.assertEqual(key, "time_embedder.linear_2.bias")
 
     # --- GEN pathway: Q/K/V merge (must not be claimed by UND catch-all) ---
 
     def test_gen_q_proj_key_and_merge_index(self):
-        key, idx, total = _apply(
-            self.fn, "model.layers.3.self_attn.q_proj_moe_gen.weight"
-        )
+        key, idx, total = _apply(self.fn, "layers.3.self_attn.add_q_proj.weight")
         self.assertEqual(key, "gen_layers.3.cross_attention.to_qkv.weight")
         self.assertEqual(idx, 0)
         self.assertEqual(total, 3)
 
     def test_gen_k_proj_merge_index(self):
-        _, idx, total = _apply(
-            self.fn, "model.layers.0.self_attn.k_proj_moe_gen.weight"
-        )
+        _, idx, total = _apply(self.fn, "layers.0.self_attn.add_k_proj.weight")
         self.assertEqual(idx, 1)
         self.assertEqual(total, 3)
 
     def test_gen_v_proj_merge_index(self):
-        _, idx, total = _apply(
-            self.fn, "model.layers.0.self_attn.v_proj_moe_gen.weight"
-        )
+        _, idx, total = _apply(self.fn, "layers.0.self_attn.add_v_proj.weight")
         self.assertEqual(idx, 2)
         self.assertEqual(total, 3)
 
     def test_gen_o_proj(self):
-        key, idx, total = _apply(
-            self.fn, "model.layers.5.self_attn.o_proj_moe_gen.weight"
-        )
+        key, idx, total = _apply(self.fn, "layers.5.self_attn.to_add_out.weight")
         self.assertEqual(key, "gen_layers.5.cross_attention.to_out.weight")
         self.assertIsNone(idx)
 
+    def test_gen_norm_added_q(self):
+        key, idx, _ = _apply(self.fn, "layers.2.self_attn.norm_added_q.weight")
+        self.assertEqual(key, "gen_layers.2.cross_attention.norm_q.weight")
+        self.assertIsNone(idx)
+
+    def test_gen_norm_added_k(self):
+        key, idx, _ = _apply(self.fn, "layers.2.self_attn.norm_added_k.weight")
+        self.assertEqual(key, "gen_layers.2.cross_attention.norm_k.weight")
+        self.assertIsNone(idx)
+
     def test_gen_mlp_gate_proj(self):
-        key, idx, total = _apply(self.fn, "model.layers.2.mlp_moe_gen.gate_proj.weight")
+        key, idx, total = _apply(self.fn, "layers.2.mlp_moe_gen.gate_proj.weight")
         self.assertEqual(key, "gen_layers.2.mlp.gate_up_proj.weight")
         self.assertEqual(idx, 0)
         self.assertEqual(total, 2)
 
     def test_gen_mlp_up_proj(self):
-        key, idx, total = _apply(self.fn, "model.layers.2.mlp_moe_gen.up_proj.weight")
+        key, idx, total = _apply(self.fn, "layers.2.mlp_moe_gen.up_proj.weight")
         self.assertEqual(key, "gen_layers.2.mlp.gate_up_proj.weight")
         self.assertEqual(idx, 1)
         self.assertEqual(total, 2)
 
     def test_gen_mlp_down_proj_passthrough(self):
-        key, idx, _ = _apply(self.fn, "model.layers.2.mlp_moe_gen.down_proj.weight")
+        key, idx, _ = _apply(self.fn, "layers.2.mlp_moe_gen.down_proj.weight")
         self.assertEqual(key, "gen_layers.2.mlp.down_proj.weight")
         self.assertIsNone(idx)
 
     # --- UND pathway: Q/K/V merge ---
 
     def test_und_q_proj_key_and_merge_index(self):
-        key, idx, total = _apply(self.fn, "model.layers.7.self_attn.q_proj.weight")
+        key, idx, total = _apply(self.fn, "layers.7.self_attn.to_q.weight")
         self.assertEqual(key, "language_model.layers.7.self_attn.to_qkv.weight")
         self.assertEqual(idx, 0)
         self.assertEqual(total, 3)
 
     def test_und_k_proj_merge_index(self):
-        _, idx, total = _apply(self.fn, "model.layers.0.self_attn.k_proj.weight")
+        _, idx, total = _apply(self.fn, "layers.0.self_attn.to_k.weight")
         self.assertEqual(idx, 1)
         self.assertEqual(total, 3)
 
     def test_und_v_proj_merge_index(self):
-        _, idx, total = _apply(self.fn, "model.layers.0.self_attn.v_proj.weight")
+        _, idx, total = _apply(self.fn, "layers.0.self_attn.to_v.weight")
         self.assertEqual(idx, 2)
         self.assertEqual(total, 3)
 
     def test_und_mlp_gate_proj(self):
-        key, idx, total = _apply(self.fn, "model.layers.1.mlp.gate_proj.weight")
+        key, idx, total = _apply(self.fn, "layers.1.mlp.gate_proj.weight")
         self.assertEqual(key, "language_model.layers.1.mlp.gate_up_proj.weight")
         self.assertEqual(idx, 0)
         self.assertEqual(total, 2)
 
     def test_und_mlp_up_proj(self):
-        _, idx, total = _apply(self.fn, "model.layers.1.mlp.up_proj.weight")
+        _, idx, total = _apply(self.fn, "layers.1.mlp.up_proj.weight")
         self.assertEqual(idx, 1)
         self.assertEqual(total, 2)
 
     def test_und_layernorm_catch_all(self):
-        key, idx, _ = _apply(self.fn, "model.layers.0.input_layernorm.weight")
+        key, idx, _ = _apply(self.fn, "layers.0.input_layernorm.weight")
         self.assertEqual(key, "language_model.layers.0.input_layernorm.weight")
         self.assertIsNone(idx)
 
     # --- ordering: GEN patterns must not be swallowed by UND catch-all ---
 
     def test_gen_layernorm_not_mapped_to_und(self):
-        key, *_ = _apply(self.fn, "model.layers.0.input_layernorm_moe_gen.weight")
+        key, *_ = _apply(self.fn, "layers.0.input_layernorm_moe_gen.weight")
         self.assertIn("gen_layers", key)
         self.assertNotIn("language_model", key)
 
     def test_gen_post_attention_layernorm_not_mapped_to_und(self):
-        key, *_ = _apply(
-            self.fn, "model.layers.4.post_attention_layernorm_moe_gen.weight"
-        )
+        key, *_ = _apply(self.fn, "layers.4.post_attention_layernorm_moe_gen.weight")
         self.assertIn("gen_layers", key)
         self.assertNotIn("language_model", key)
 
