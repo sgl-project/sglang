@@ -147,14 +147,16 @@ def _compute_pad_value(hash: int) -> int:
 
 
 def compute_cache_hit_split(
-    prefix_len: int, host_hit_length: int, storage_hit_length: int
+    prefix_len: int, loaded_host_hit_length: int, storage_hit_length: int
 ) -> tuple:
     """Return (device, host, storage) token counts. Always sums to prefix_len.
 
-    host_hit_length is capped at prefix_len so the result is correct even
-    when init_load_back loads fewer tokens than expected (e.g. alloc failure).
+    loaded_host_hit_length is the number of KV tokens actually restored from
+    host in this scheduling decision. It intentionally differs from
+    host_hit_length, which can be a load-back trigger sentinel for hybrid
+    caches.
     """
-    host_total = min(host_hit_length, prefix_len)
+    host_total = min(loaded_host_hit_length, prefix_len)
     storage = min(host_total, storage_hit_length)
     return prefix_len - host_total, host_total - storage, storage
 
@@ -864,6 +866,7 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        self.loaded_host_hit_length = 0
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1208,6 +1211,7 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.loaded_host_hit_length = 0
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1458,6 +1462,9 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        self.host_hit_length = 0
+        self.loaded_host_hit_length = 0
+        self.storage_hit_length = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
@@ -2134,7 +2141,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.cached_tokens_storage,
                     ) = compute_cache_hit_split(
                         len(req.prefix_indices),
-                        req.host_hit_length,
+                        req.loaded_host_hit_length,
                         req.storage_hit_length,
                     )
                     req._cache_breakdown_computed = True

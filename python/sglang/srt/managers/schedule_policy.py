@@ -127,6 +127,7 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    req.loaded_host_hit_length = 0
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
@@ -627,7 +628,7 @@ class PrefillAdder:
         if prefix_len <= 0:
             return
         device, host, storage = compute_cache_hit_split(
-            prefix_len, req.host_hit_length, req.storage_hit_length
+            prefix_len, req.loaded_host_hit_length, req.storage_hit_length
         )
         self.log_hit_tokens_device += device
         self.log_hit_tokens_host += host
@@ -980,9 +981,12 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                req.loaded_host_hit_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+            else:
+                req.loaded_host_hit_length = 0
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
