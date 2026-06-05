@@ -29,7 +29,12 @@ def _jit_qknorm_rope_module(
     dtype: torch.dtype,
 ) -> Module:
     args = make_cpp_args(
-        head_dim, rope_dim, is_neox, round_norm_before_rope, is_arch_support_pdl(), dtype
+        head_dim,
+        rope_dim,
+        is_neox,
+        round_norm_before_rope,
+        is_arch_support_pdl(),
+        dtype,
     )
     return load_jit(
         "qknorm_rope",

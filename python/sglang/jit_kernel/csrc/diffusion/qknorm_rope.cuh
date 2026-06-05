@@ -55,7 +55,14 @@ SGL_DEVICE float round_to_dtype(float value) {
   return static_cast<float>(device::cast<DType>(value));
 }
 
-template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kRoundNormBeforeRope, bool kUsePDL, typename DType, typename IdType>
+template <
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    bool kIsNeox,
+    bool kRoundNormBeforeRope,
+    bool kUsePDL,
+    typename DType,
+    typename IdType>
 __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ params) {
   using namespace device;
 
@@ -199,7 +206,8 @@ template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kRoundNormBefor
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   template <typename IdType>
-  static constexpr auto kernel = fused_qknorm_rope_warp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope, kUsePDL, DType, IdType>;
+  static constexpr auto kernel =
+      fused_qknorm_rope_warp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope, kUsePDL, DType, IdType>;
 
   static void
   run(const tvm::ffi::TensorView q,
