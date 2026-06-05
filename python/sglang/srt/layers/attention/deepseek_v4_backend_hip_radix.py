@@ -114,6 +114,7 @@ class DSV4AttnMetadata:
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c4_sparse_topk_lengths: torch.Tensor = field(init=False)
     c4_sparse_page_indices: torch.Tensor = field(init=False)
+    c4_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
@@ -169,6 +170,7 @@ class DSV4AttnMetadata:
                 "c4_topk_lengths_clamp1",
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
+                "c4_sparse_raw_indices",
                 "unified_swa_indices",
                 "unified_swa_indptr",
                 "unified_hca_indices",
@@ -1425,6 +1427,7 @@ class DeepseekV4HipRadixBackend(
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
+            core_attn_metadata.c4_sparse_raw_indices = None
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
