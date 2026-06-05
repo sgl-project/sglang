@@ -343,6 +343,22 @@ def main() -> None:
             current_start_frames=18,
         ),
         Scenario(
+            name="cache18_sink6_roll_3f",
+            cache_frames=18,
+            sink_frames=6,
+            prev_global_frames=18,
+            prev_local_frames=18,
+            current_start_frames=18,
+        ),
+        Scenario(
+            name="cache18_sink3_roll_6f",
+            cache_frames=18,
+            sink_frames=3,
+            prev_global_frames=18,
+            prev_local_frames=18,
+            current_start_frames=18,
+        ),
+        Scenario(
             name="long_window_sink9_roll_27f",
             cache_frames=45,
             sink_frames=9,
