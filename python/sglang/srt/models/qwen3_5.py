@@ -85,6 +85,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import fused_qk_gemma_rmsnorm
+from sglang.srt.server_args import get_global_server_args
 
 # Utils
 from sglang.srt.utils import (
