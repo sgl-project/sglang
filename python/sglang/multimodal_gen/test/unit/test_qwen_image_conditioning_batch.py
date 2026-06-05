@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
@@ -32,7 +31,11 @@ def test_repeat_conditioning_preserves_per_prompt_output_order():
 def test_repeat_conditioning_rejects_incompatible_batch_size():
     conditioning = torch.zeros(2, 1, 1)
 
-    with pytest.raises(ValueError, match="cannot expand"):
+    try:
         _repeat_conditioning_to_batch_size(
             conditioning, target_batch_size=3, name="encoder_hidden_states"
         )
+    except ValueError as e:
+        assert "cannot expand" in str(e)
+    else:
+        raise AssertionError("Expected ValueError for incompatible batch size")
