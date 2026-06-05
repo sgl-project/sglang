@@ -714,14 +714,57 @@ class HiRadixCache(RadixCache):
         if host_indices is not None:
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
-            # Record backup_len for ack-time walk-and-concat after split.
-            self.ongoing_write_through[node.id] = (node, len(node.key))
+            self._track_write_through_node(node, len(node.key))
             if not write_back:
                 self.inc_lock_ref(node)
         else:
             return 0
 
         return len(host_indices)
+
+    def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
+        node.write_through_pending_id = node.id
+        self.ongoing_write_through[node.id] = (node, backup_len, [node])
+
+    def _replace_pending_write_through_node(
+        self, old_node: TreeNode, new_nodes: List[TreeNode]
+    ) -> None:
+        ack_id = old_node.write_through_pending_id
+        if ack_id is None:
+            return
+
+        pending = self.ongoing_write_through.get(ack_id)
+        if pending is None:
+            return
+
+        lock_node, backup_len, publish_nodes = pending
+        updated_nodes = []
+        replaced = False
+        for node in publish_nodes:
+            if node is old_node:
+                updated_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                updated_nodes.append(node)
+
+        if not replaced:
+            return
+
+        for node in new_nodes:
+            node.write_through_pending_id = ack_id
+        self.ongoing_write_through[ack_id] = (lock_node, backup_len, updated_nodes)
+
+    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> None:
+        lock_node, backup_len, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        for node in publish_nodes:
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            # DMA confirmed -- block is now on host.
+            self._record_store_event(node, medium=StorageMedium.CPU)
+        if self.enable_storage:
+            self.write_backup_storage(lock_node, backup_len)
+        if release_lock:
+            self.dec_lock_ref(lock_node)
 
     def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
         # Recover pre-split data via walk-and-concat if node was split.
@@ -802,11 +845,7 @@ class HiRadixCache(RadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        node, backup_len = self.ongoing_write_through.pop(ack_id)
-                        # DMA confirmed -- block is now on host.
-                        self._record_store_event(node, medium=StorageMedium.CPU)
-                        if self.enable_storage:
-                            self.write_backup_storage(node, backup_len)
+                        self._finish_write_through_ack(ack_id, release_lock=False)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -829,12 +868,7 @@ class HiRadixCache(RadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node, backup_len = self.ongoing_write_through.pop(ack_id)
-                # DMA confirmed -- block is now on host.
-                self._record_store_event(node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(node)
-                if self.enable_storage:
-                    self.write_backup_storage(node, backup_len)
+                self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
     def loading_check(self):
@@ -1381,13 +1415,16 @@ class HiRadixCache(RadixCache):
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            avaliable_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = avaliable_size - (avaliable_size % self.page_size)
+            available_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = available_size - (available_size % self.page_size)
             if prefetch_length >= self.prefetch_threshold:
-                new_input_tokens = new_input_tokens[:prefetch_length]
+                prefetch_key = prefetch_key[:prefetch_length]
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
+                if host_indices is None:
+                    last_host_node.release_host()
+                    return
             else:
                 last_host_node.release_host()
                 # no sufficient host memory for prefetch
@@ -1502,6 +1539,9 @@ class HiRadixCache(RadixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+
+        if child.backuped:
+            self._replace_pending_write_through_node(child, [new_node, child])
 
         return new_node
 

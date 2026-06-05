@@ -281,7 +281,7 @@ class AiterAttnBackend(AttentionBackend):
             # so all num_head size does not use qh16 kernel to simulate
             # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)
             # it will cause gpu-fault or accuracy issue
-            if self.num_head == 32 or self.num_head == 128:
+            if self.num_head in (32, 64, 128):
                 fast_mode = True
                 intra_batch_mode = False
 
@@ -488,8 +488,8 @@ class AiterAttnBackend(AttentionBackend):
         tile_q = 256
         qhead_granularity = gqa_ratio
         qlen_granularity = tile_q // qhead_granularity
-        kvlen_granularity = max(128, self.page_size)
-        block_size = self.page_size
+        kvlen_granularity = 128
+        block_size = 1
 
         qo_indptr_cpu = qo_indptr.to("cpu", dtype=torch.int32)
         kv_indptr_cpu = kv_indptr.to("cpu", dtype=torch.int32)

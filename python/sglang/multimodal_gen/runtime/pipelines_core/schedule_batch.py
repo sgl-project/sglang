@@ -211,6 +211,8 @@ class Req:
     realtime_chunk_size: int | None = None
     realtime_event_id: int | None = None
     realtime_output_format: str | None = None
+    realtime_preview_max_width: int | None = None
+    realtime_output_pacing: bool = False
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
