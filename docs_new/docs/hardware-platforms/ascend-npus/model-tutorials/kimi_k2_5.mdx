@@ -47,8 +47,8 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 If you need to download model weights, check the model size before downloading to reserve enough space.
 </Warning>
 
-- [Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) (BF16)
-- [Kimi-K2.5-w4a8](https://modelers.cn/models/Eco-Tech/Kimi-K2.5-w4a8) (W4A8 quantized version, available on [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Kimi-K2.5-w4a8))
+- [Kimi-K2.5](https://modelers.cn/models/moonshotai/Kimi-K2.5) (BF16)
+- [Kimi-K2.5-w4a8](https://www.modelscope.cn/models/Eco-Tech/Kimi-K2.5-w4a8) (W4A8 quantized version)
 
 You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize `Kimi-K2.5-w4a8` from `Kimi-K2.5`.
 
@@ -105,6 +105,33 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
 quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ```
 
   </Tab>
