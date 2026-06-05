@@ -187,12 +187,12 @@ def fill_compress_tail(
 def build_decode_streams(
     *,
     state_slot: torch.Tensor,  # [N] int
-    positions: torch.Tensor,  # [N] int 
-    swa_len: torch.Tensor,  # [N] int 
-    hca_len: torch.Tensor,  # [N] int 
+    positions: torch.Tensor,  # [N] int
+    swa_len: torch.Tensor,  # [N] int
+    hca_len: torch.Tensor,  # [N] int
     csa_len: torch.Tensor,  # [N] int
-    c128_page_indices: torch.Tensor,  # [N, Wc128] int32 
-    csa_width: int,  
+    c128_page_indices: torch.Tensor,  # [N, Wc128] int32
+    csa_width: int,
     win: int,  # SWA attention window length
     cs: int,  # SWA ring per-slot stride
     swa_pages: int,
@@ -286,7 +286,7 @@ def _build_prefill_indices_kernel(
     page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
     pre_indptr_ptr,  # [T+1] int32 (prefix stream ragged indptr)
     ext_indptr_ptr,  # [T+1] int32 (extend stream ragged indptr)
-    pre_out_ptr,  
+    pre_out_ptr,
     ext_out_ptr,
     swa_pages,
     ring_stride,  # SWA ring per-slot stride

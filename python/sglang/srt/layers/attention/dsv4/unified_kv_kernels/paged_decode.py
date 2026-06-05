@@ -49,7 +49,6 @@ import functools
 import torch
 import triton
 import triton.language as tl
-
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
