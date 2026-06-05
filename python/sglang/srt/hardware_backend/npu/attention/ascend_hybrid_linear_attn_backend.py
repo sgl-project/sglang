@@ -254,7 +254,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             dtype=torch.int64,
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
-        draft_token_num = intermediate_state_cache.shape[2]
 
         move_intermediate_cache(
             ssm_states,
@@ -264,6 +263,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             last_steps,
         )
 
+        draft_token_num = intermediate_state_cache.shape[2]
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(
                 conv_states,
