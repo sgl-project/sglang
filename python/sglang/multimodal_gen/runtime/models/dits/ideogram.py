@@ -71,9 +71,7 @@ class Ideogram4Attention(nn.Module):
         q = self.norm_q(q)
         k = self.norm_k(k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, cos, sin)
-        out = self.attn(
-            q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
-        )
+        out = self.attn(q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta)
         out = out.reshape(batch_size, seq_len, self.hidden_size)
         return self.o(out)
 

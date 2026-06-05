@@ -680,9 +680,7 @@ class TestIdeogram4(unittest.TestCase):
             batch.extra["ideogram4"] = {
                 "max_text_tokens": 1,
                 "num_image_tokens": 1,
-                "position_ids": torch.zeros(
-                    1, 2, 3, dtype=torch.long, device=device
-                ),
+                "position_ids": torch.zeros(1, 2, 3, dtype=torch.long, device=device),
                 "segment_ids": torch.ones(1, 2, dtype=torch.long, device=device),
                 "indicator": torch.tensor(
                     [[LLM_TOKEN_INDICATOR, OUTPUT_IMAGE_INDICATOR]],

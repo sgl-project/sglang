@@ -462,8 +462,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
 
         with maybe_nvtx_range("scheduler_step", use_nvtx):
             velocity = (
-                guidance_schedule[i] * pos_v
-                + (1.0 - guidance_schedule[i]) * neg_v
+                guidance_schedule[i] * pos_v + (1.0 - guidance_schedule[i]) * neg_v
             )
             ctx.latents = z + velocity * (s_val - t_val)
 
