@@ -1013,6 +1013,28 @@ def _assert_draft_extend_outputs_close(actual, expected, settings) -> None:
     torch.testing.assert_close(actual.topk_index, expected.topk_index)
 
 
+def _assert_draft_extend_v2_outputs_close(actual, expected, settings) -> None:
+    # DRAFT_EXTEND_V2 graph runner only anchors the full-row
+    # `next_token_logits` / `hidden_states`; the selected-row `topk_p` /
+    # `topk_index` are owned by EAGLEWorkerV2 and computed *after* replay (see
+    # `eagle_worker_v2._draft_extend_for_decode` and the early-return in
+    # `EAGLEDraftExtendCudaGraphRunner.replay` for DRAFT_EXTEND_V2). The V2
+    # production runner output therefore carries no topk fields, so the
+    # runner-mode reference must only compare what the graph actually anchors.
+    torch.testing.assert_close(
+        actual.next_token_logits,
+        expected.next_token_logits,
+        atol=settings.atol,
+        rtol=settings.rtol,
+    )
+    torch.testing.assert_close(
+        actual.hidden_states,
+        expected.hidden_states,
+        atol=settings.atol,
+        rtol=settings.rtol,
+    )
+
+
 @dataclass(frozen=True)
 class EagleDraftExtendCudaGraphRunnerAdapter:
     build_fixture: Callable[..., Any]
@@ -1554,6 +1576,7 @@ def run_dense_eagle_draft_extend_v2_cuda_graph_runner_case(
         make_draft_inputs=_make_dense_draft_extend_inputs,
         prepare_replay_state=_prepare_dense_draft_extend_replay_state,
         make_forward_batch=_make_dense_eagle_draft_extend_v2_forward_batch,
+        assert_outputs_close=_assert_draft_extend_v2_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(
         testcase,
@@ -1757,6 +1780,7 @@ def run_mla_eagle_draft_extend_v2_cuda_graph_runner_case(
         make_draft_inputs=_make_mla_draft_extend_inputs,
         prepare_replay_state=_prepare_mla_draft_extend_replay_state,
         make_forward_batch=_make_mla_eagle_draft_extend_v2_forward_batch,
+        assert_outputs_close=_assert_draft_extend_v2_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(
         testcase,
