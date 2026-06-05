@@ -47,6 +47,7 @@ RUN source $HOME/.local/bin/env && \
 
 ENV SGLANG_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so
+ENV PATH="/opt/.venv/bin:$PATH"
 RUN echo 'source /opt/.venv/bin/activate' >> /root/.bashrc
 
 WORKDIR /sgl-workspace/sglang
