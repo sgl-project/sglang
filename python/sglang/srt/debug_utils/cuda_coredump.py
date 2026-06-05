@@ -29,12 +29,9 @@ def is_enabled() -> bool:
 
 
 def get_dump_dir() -> str:
-    # Base directory, mirroring the resolution in
-    # .github/actions/upload-cuda-coredumps/action.yml so the producer (here)
-    # and the uploader always agree: an explicit (non-empty)
-    # SGLANG_CUDA_COREDUMP_DIR wins; otherwise prefer the runner's per-job
-    # RUNNER_TEMP (wiped between CI jobs) over the shared /tmp default. An empty
-    # value counts as unset, like the action's `[ -n ... ]` checks.
+    # Resolve the base dir the same way as the uploader
+    # (.github/actions/upload-cuda-coredumps/action.yml) so they agree; an empty
+    # SGLANG_CUDA_COREDUMP_DIR counts as unset, like the action's `[ -n ... ]`.
     explicit = envs.SGLANG_CUDA_COREDUMP_DIR.get()
     runner_temp = os.getenv("RUNNER_TEMP")
     if explicit:
@@ -43,12 +40,8 @@ def get_dump_dir() -> str:
         base = os.path.join(runner_temp, "sglang_cuda_coredumps")
     else:
         base = "/tmp/sglang_cuda_coredumps"
-    # Isolate dumps per (run, attempt). A coredump file is written by the GPU
-    # driver and lives on the runner's local filesystem; on shared self-hosted
-    # runners a leftover file from one job would otherwise be picked up and
-    # mis-attributed by a later, unrelated job. A distinct GITHUB_RUN_ID yields
-    # a distinct dir, so cross-job/cross-PR mix-ups are structurally impossible.
-    # GitHub Actions sets these vars; they are absent in local runs.
+    # Isolate dumps per (run, attempt): on a shared self-hosted runner a leftover
+    # dump from one job must not be picked up and mis-attributed by a later one.
     run_id = os.getenv("GITHUB_RUN_ID")
     if run_id:
         attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")

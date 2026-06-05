@@ -1,17 +1,9 @@
-"""Unit tests for cuda_coredump.get_dump_dir() directory resolution.
+"""Unit tests for cuda_coredump.get_dump_dir().
 
-get_dump_dir() must resolve the dump directory identically to the bash logic in
-.github/actions/upload-cuda-coredumps/action.yml so the producer (the server
-process) and the uploader (the composite action) always agree on the path:
-
-  explicit (non-empty) SGLANG_CUDA_COREDUMP_DIR
-    > per-job RUNNER_TEMP base (wiped between CI jobs)
-    > /tmp default,
-  then a per-(run, attempt) subdir under GITHUB_RUN_ID.
-
-The per-(run, attempt) subdir is what prevents a coredump left on a shared
-self-hosted runner by one job from being mis-attributed to a later, unrelated
-job (a distinct GITHUB_RUN_ID yields a distinct dir).
+It must resolve the dump dir identically to the bash in
+.github/actions/upload-cuda-coredumps/action.yml (producer and uploader must
+agree) and isolate dumps per (run, attempt), so a leftover dump on a shared
+self-hosted runner is never mis-attributed to a later job.
 """
 
 import os
@@ -26,18 +18,13 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-# External (runner / GitHub Actions) env vars, cleared per case so the ambient
-# CI environment does not leak into the assertions.
+# Runner / GitHub Actions vars, cleared per case so ambient CI env can't leak in.
 _CI_ENV_KEYS = ("RUNNER_TEMP", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")
 
 
 class TestCudaCoredumpDir(CustomTestCase):
     def _resolve(self, *, explicit=None, runner_temp=None, run_id=None, attempt=None):
-        """Resolve get_dump_dir() under a fully controlled environment.
-
-        explicit -> SGLANG_CUDA_COREDUMP_DIR override (None = unset);
-        runner_temp / run_id / attempt -> external CI vars (None = unset).
-        """
+        """Resolve get_dump_dir() under a controlled env (a None arg = that var unset)."""
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_CUDA_COREDUMP_DIR.override(explicit))
             stack.enter_context(mock.patch.dict(os.environ, {}, clear=False))
