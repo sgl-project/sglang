@@ -10,6 +10,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.test.scripted_runtime.context.http_post import (
     _http_post_and_await_recv_msg,
+    _http_post_fire_and_forget,
 )
 
 if TYPE_CHECKING:
@@ -57,7 +58,16 @@ def abort_all(ctx: "ScriptedContext") -> None:
     )
 
 
-def abort(ctx: "ScriptedContext", *, rid: str) -> None:
+def abort(ctx: "ScriptedContext", *, rid: str, await_arrival: bool = True) -> None:
+    if not await_arrival:
+        # An abort of an unknown or already-finished rid never reaches the
+        # scheduler (TokenizerManager drops it), so there is no AbortReq to await.
+        _http_post_fire_and_forget(
+            ctx,
+            path="/abort_request",
+            json={"rid": rid, "abort_all": False},
+        )
+        return
     _await_control(
         ctx,
         path="/abort_request",

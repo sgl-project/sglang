@@ -50,6 +50,13 @@ class ScriptedBatchRecord:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
+    # A prior script may have left the engine paused (e.g. pause_generation with
+    # no matching continue_generation). While paused the event loop short-circuits
+    # before get_next_batch_to_run, so neither the drain below nor the next
+    # script's requests can make progress -- resume first so the reset can settle.
+    if scheduler._engine_paused:
+        ctx.continue_generation()
+
     ctx._release_exhausted_pools()
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
