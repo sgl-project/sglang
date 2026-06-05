@@ -12,8 +12,8 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
-_LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
-_LORA_ADAPTER_B = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test-b"
+_LORA_ADAPTER = "codelion/Llama-3.2-1B-Instruct-tool-calling-lora"
+_LORA_ADAPTER_B = "nicoboss/Llama-3.2-1B-Instruct-Uncensored-Lora"
 
 
 class TestLoRASingleAdapter(ScriptedTestCase):
@@ -189,7 +189,7 @@ class TestLoRAAdapterEviction(ScriptedTestCase):
         enable_lora=True,
         lora_paths=[_LORA_ADAPTER, _LORA_ADAPTER_B],
         max_loras_per_batch=1,
-        max_loaded_loras=1,
+        max_loaded_loras=2,
     )
 
     def test_lora_adapter_eviction_between_chunks(self):

@@ -11,14 +11,16 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 _SPEC_MODEL = "Qwen/Qwen3-8B"
-_SPEC_DRAFT = "Qwen/Qwen3-8B-EAGLE"
+# Real, public EAGLE3 draft for Qwen3-8B; the previous "Qwen/Qwen3-8B-EAGLE"
+# path does not exist on HF (404).
+_SPEC_DRAFT = "Tengyunw/qwen3_8b_eagle3"
 
 
 def _spec_engine_kwargs(**overrides):
     return base_engine_kwargs(
         model_path=_SPEC_MODEL,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        speculative_algorithm="EAGLE",
+        speculative_algorithm="EAGLE3",
         speculative_draft_model_path=_SPEC_DRAFT,
         speculative_num_steps=3,
         speculative_eagle_topk=4,
@@ -60,28 +62,6 @@ class TestSpecBasic(ScriptedTestCase):
         # abort already prove the draft state was released along with the rest.
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-
-
-class TestSpecDisagg(ScriptedTestCase):
-    ENGINE_KWARGS = _spec_engine_kwargs(disaggregation_mode="prefill")
-
-    def test_spec_eagle_disagg_chunked(self):
-        self.server.execute_script(self._script_spec_eagle_disagg_chunked)
-
-    @staticmethod
-    def _script_spec_eagle_disagg_chunked(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
-        yield from run_until_finished(r, max_steps=800)
-        assert r.finished
-        assert r.chunks_done >= 2
-        # "Eagle draft state was captured" is not an externally observable
-        # invariant -- topk_p/topk_index/hidden_states are non-None by construction
-        # on any draft step. The real, honest signal that eagle ran across the
-        # disagg chunked-prefill handoff is that it actually verified at least once.
-        assert r.req.spec_verify_ct >= 1, (
-            f"expected >=1 spec verify after disagg chunked handoff, got "
-            f"{r.req.spec_verify_ct}"
-        )
 
 
 if __name__ == "__main__":

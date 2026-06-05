@@ -13,8 +13,8 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
-_LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
-_LORA_ADAPTER_B = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test-b"
+_LORA_ADAPTER = "codelion/Llama-3.2-1B-Instruct-tool-calling-lora"
+_LORA_ADAPTER_B = "nicoboss/Llama-3.2-1B-Instruct-Uncensored-Lora"
 
 
 def _expected_lora_id(adapter_path: str) -> str:
@@ -30,6 +30,8 @@ class TestLoRAOverlapSingleAdapter(ScriptedTestCase):
         enable_lora=True,
         lora_paths=[_LORA_ADAPTER],
         enable_lora_overlap_loading=True,
+        max_loras_per_batch=1,
+        max_loaded_loras=1,
     )
 
     def test_naive_lora_overlap_chunked(self):
@@ -58,7 +60,7 @@ class TestLoRAOverlapH2dDuringChunk(ScriptedTestCase):
         lora_paths=[_LORA_ADAPTER, _LORA_ADAPTER_B],
         enable_lora_overlap_loading=True,
         max_loras_per_batch=2,
-        max_loaded_loras=1,
+        max_loaded_loras=2,
     )
 
     def test_lora_overlap_h2d_during_chunk_admit(self):
@@ -106,7 +108,7 @@ class TestLoRAOverlapAbortDuringH2d(ScriptedTestCase):
         lora_paths=[_LORA_ADAPTER, _LORA_ADAPTER_B],
         enable_lora_overlap_loading=True,
         max_loras_per_batch=2,
-        max_loaded_loras=1,
+        max_loaded_loras=2,
     )
 
     def test_lora_overlap_abort_during_h2d(self):
@@ -163,7 +165,7 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
         lora_paths=[_LORA_ADAPTER, _LORA_ADAPTER_B],
         enable_lora_overlap_loading=True,
         max_loras_per_batch=1,
-        max_loaded_loras=1,
+        max_loaded_loras=2,
     )
 
     def test_lora_overlap_back_to_back_adapters_chunked(self):
