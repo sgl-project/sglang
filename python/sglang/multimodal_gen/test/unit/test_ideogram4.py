@@ -25,12 +25,16 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType, get_mod
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    _maybe_shard_bitsandbytes_4bit_quant_state,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     FP8_WEIGHT_DTYPE,
+    WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
     dequantize_rowwise_fp8_weight,
 )
@@ -116,6 +120,29 @@ class FakeIdeogramPipeline:
             "transformer": transformer,
             "unconditional_transformer": unconditional_transformer,
         }
+
+
+class FakeBnbQuantState:
+    def __init__(
+        self,
+        absmax,
+        shape=None,
+        code=None,
+        blocksize=None,
+        quant_type=None,
+        dtype=None,
+        offset=None,
+        state2=None,
+    ):
+        self.absmax = absmax
+        self.shape = shape
+        self.code = code
+        self.blocksize = blocksize
+        self.quant_type = quant_type
+        self.dtype = dtype
+        self.offset = offset
+        self.state2 = state2
+        self.nested = state2 is not None
 
 
 def _fake_server_args(cfg=None):
@@ -629,6 +656,48 @@ class TestIdeogram4(unittest.TestCase):
         )
         self.assertEqual(state["layers.0.attention.qkv.weight"].dtype, FP8_WEIGHT_DTYPE)
 
+    def test_ideogram_dit_uses_tp_fp8_linears_when_tp_is_initialized(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.get_tp_world_size",
+                    return_value=2,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(Ideogram4DiTConfig(), {})
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertIsInstance(model.input_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertEqual(tuple(model.input_proj.weight.shape), (2304, 128))
+        self.assertEqual(
+            tuple(model.layers[0].attention.qkv.weight.shape), (6912, 4608)
+        )
+
     def test_ideogram_dit_nvfp4_quant_config_uses_native_fp4_linears(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
@@ -690,6 +759,79 @@ class TestIdeogram4(unittest.TestCase):
         self.assertEqual(
             tuple(state["layers.0.attention.qkv.input_scale"].shape),
             (1,),
+        )
+
+    def test_ideogram_dit_tp_nvfp4_uses_column_parallel_quant_linears(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+        )
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.get_tp_world_size",
+                    return_value=2,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(
+                        Ideogram4DiTConfig(),
+                        {},
+                        quant_config=quant_config,
+                    )
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertTrue(model.layers[0].attention.qkv.gather_output)
+        self.assertEqual(
+            tuple(model.layers[0].attention.qkv.weight.shape), (6912, 2304)
+        )
+        self.assertIsInstance(
+            model.layers[0].attention.qkv.quant_method,
+            ModelOptFp4LinearMethod,
+        )
+
+    def test_bitsandbytes_tp_quant_state_uses_local_output_shard(self):
+        param = torch.nn.Parameter(
+            torch.empty(8, 1, dtype=torch.uint8), requires_grad=False
+        )
+        param.bnb_full_shape = (4, 8)
+        param.bnb_local_shape = (2, 8)
+        param.bnb_output_shard_start = 2
+        param.bnb_input_shard_start = 0
+        quant_state = FakeBnbQuantState(
+            absmax=torch.arange(8, dtype=torch.float32),
+            shape=torch.Size((4, 8)),
+            code=torch.ones(16, dtype=torch.float32),
+            blocksize=4,
+            quant_type="nf4",
+            dtype=torch.bfloat16,
+        )
+
+        sharded = _maybe_shard_bitsandbytes_4bit_quant_state(param, quant_state)
+
+        self.assertEqual(sharded.shape, torch.Size((2, 8)))
+        torch.testing.assert_close(
+            sharded.absmax, torch.tensor([4.0, 5.0, 6.0, 7.0])
         )
 
     def test_missing_weight_only_fp8_scale_is_fatal(self):
