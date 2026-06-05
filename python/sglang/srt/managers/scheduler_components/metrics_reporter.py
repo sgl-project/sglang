@@ -560,7 +560,7 @@ class SchedulerMetricsReporter:
         )
 
         if (
-            getattr(self.scheduler, "enable_hicache_storage", False)
+            self.scheduler.enable_hicache_storage
             or prefill_stats.log_hit_tokens_storage > 0
         ):
             cache_split_msg += (

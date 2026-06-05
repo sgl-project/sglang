@@ -37,7 +37,11 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req, 
+    ScheduleBatch, 
+    compute_cache_hit_split,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -622,14 +626,12 @@ class PrefillAdder:
         """
         if prefix_len <= 0:
             return
-        # Cap host_total at prefix_len: if init_load_back loaded fewer tokens
-        # than host_hit_length (e.g. allocation failure), prefix_len is already
-        # the true total and host_hit_length would be stale/too large.
-        host_total = min(req.host_hit_length, prefix_len)
-        storage_portion = min(host_total, req.storage_hit_length)
-        self.log_hit_tokens_storage += storage_portion
-        self.log_hit_tokens_host += host_total - storage_portion
-        self.log_hit_tokens_device += max(0, prefix_len - host_total)
+        device, host, storage = compute_cache_hit_split(
+            prefix_len, req.host_hit_length, req.storage_hit_length
+        )
+        self.log_hit_tokens_device += device
+        self.log_hit_tokens_host += host
+        self.log_hit_tokens_storage += storage
 
     def _update_prefill_budget(
         self,

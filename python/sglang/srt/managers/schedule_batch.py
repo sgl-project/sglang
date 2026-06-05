@@ -146,6 +146,19 @@ def _compute_pad_value(hash: int) -> int:
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
+def compute_cache_hit_split(
+    prefix_len: int, host_hit_length: int, storage_hit_length: int
+) -> tuple:
+    """Return (device, host, storage) token counts. Always sums to prefix_len.
+
+    host_hit_length is capped at prefix_len so the result is correct even
+    when init_load_back loads fewer tokens than expected (e.g. alloc failure).
+    """
+    host_total = min(host_hit_length, prefix_len)
+    storage = min(host_total, storage_hit_length)
+    return prefix_len - host_total, host_total - storage, storage
+
+
 class BaseFinishReason:
     def to_json(self):
         raise NotImplementedError()
@@ -2115,24 +2128,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
                 # would incorrectly count previously computed tokens as cache hits.
                 if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ) = compute_cache_hit_split(
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        req.storage_hit_length,
+                    )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
