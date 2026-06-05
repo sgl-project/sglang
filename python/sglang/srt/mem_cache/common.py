@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.triton_ops.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
