@@ -29,7 +29,29 @@ def is_enabled() -> bool:
 
 
 def get_dump_dir() -> str:
-    return envs.SGLANG_CUDA_COREDUMP_DIR.get()
+    # Base directory: an explicit SGLANG_CUDA_COREDUMP_DIR wins; otherwise prefer
+    # the runner's per-job RUNNER_TEMP (wiped between CI jobs) over the shared
+    # /tmp default.
+    if envs.SGLANG_CUDA_COREDUMP_DIR.is_set():
+        base = envs.SGLANG_CUDA_COREDUMP_DIR.get()
+    else:
+        runner_temp = os.getenv("RUNNER_TEMP")
+        base = (
+            os.path.join(runner_temp, "sglang_cuda_coredumps")
+            if runner_temp
+            else envs.SGLANG_CUDA_COREDUMP_DIR.get()
+        )
+    # Isolate dumps per (run, attempt). A coredump file is written by the GPU
+    # driver and lives on the runner's local filesystem; on shared self-hosted
+    # runners a leftover file from one job would otherwise be picked up and
+    # mis-attributed by a later, unrelated job. A distinct GITHUB_RUN_ID yields
+    # a distinct dir, so cross-job/cross-PR mix-ups are structurally impossible.
+    # GitHub Actions sets these vars; they are absent in local runs.
+    run_id = os.getenv("GITHUB_RUN_ID")
+    if run_id:
+        attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")
+        return os.path.join(base, f"{run_id}-{attempt}")
+    return base
 
 
 def _inject_env():
