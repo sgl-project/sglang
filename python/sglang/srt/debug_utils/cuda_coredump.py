@@ -29,18 +29,20 @@ def is_enabled() -> bool:
 
 
 def get_dump_dir() -> str:
-    # Base directory: an explicit SGLANG_CUDA_COREDUMP_DIR wins; otherwise prefer
-    # the runner's per-job RUNNER_TEMP (wiped between CI jobs) over the shared
-    # /tmp default.
-    if envs.SGLANG_CUDA_COREDUMP_DIR.is_set():
-        base = envs.SGLANG_CUDA_COREDUMP_DIR.get()
+    # Base directory, mirroring the resolution in
+    # .github/actions/upload-cuda-coredumps/action.yml so the producer (here)
+    # and the uploader always agree: an explicit (non-empty)
+    # SGLANG_CUDA_COREDUMP_DIR wins; otherwise prefer the runner's per-job
+    # RUNNER_TEMP (wiped between CI jobs) over the shared /tmp default. An empty
+    # value counts as unset, like the action's `[ -n ... ]` checks.
+    explicit = envs.SGLANG_CUDA_COREDUMP_DIR.get()
+    runner_temp = os.getenv("RUNNER_TEMP")
+    if explicit:
+        base = explicit
+    elif runner_temp:
+        base = os.path.join(runner_temp, "sglang_cuda_coredumps")
     else:
-        runner_temp = os.getenv("RUNNER_TEMP")
-        base = (
-            os.path.join(runner_temp, "sglang_cuda_coredumps")
-            if runner_temp
-            else envs.SGLANG_CUDA_COREDUMP_DIR.get()
-        )
+        base = "/tmp/sglang_cuda_coredumps"
     # Isolate dumps per (run, attempt). A coredump file is written by the GPU
     # driver and lives on the runner's local filesystem; on shared self-hosted
     # runners a leftover file from one job would otherwise be picked up and
