@@ -384,7 +384,7 @@ class KimiK2Detector(BaseFormatDetector):
         """
         candidates = (self.bot_token, self.tool_call_start_token)
         max_tail = max(len(t) for t in candidates) - 1
-        for n in range(min(len(text), max_tail), 0, -1):
+        for n in range(min(len(text), max_tail), 1, -1):
             tail = text[-n:]
             if any(t.startswith(tail) for t in candidates):
                 return text[:-n], tail
