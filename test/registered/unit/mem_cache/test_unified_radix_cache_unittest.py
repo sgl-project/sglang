@@ -1935,7 +1935,16 @@ class UnifiedRadixCacheSuite:
 
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        seq = self._make_seq(1, 4)
+        num_pages = 4
+        if self.cfg.has_swa:
+            # SWA L3 prefetch is all-or-nothing over one full sliding window.
+            # Keep the generic L3 round trip valid for SWA configs whose window
+            # is larger than the old fixed 4-page request.
+            sw_pages = (
+                self.cfg.sliding_window_size + self.cfg.page_size - 1
+            ) // self.cfg.page_size
+            num_pages = max(num_pages, sw_pages + 1)
+        seq = self._make_seq(1, num_pages)
 
         # --- Producer tree: fill KV, backup D->H, offload H->L3. ---
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
@@ -1983,6 +1992,145 @@ class UnifiedRadixCacheSuite:
         loaded_k, loaded_v = self._snapshot_full_kv(cons_alloc, loaded_indices)
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
+        cons.sanity_check()
+
+    # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
+
+    def _patch_tp_all_reduce(self, tree, drop_swa: bool):
+        """Fake all_reduce so check_prefetch_progress runs the tp>1 path."""
+        import torch.distributed as dist
+
+        min_sizes = []
+
+        def swa_packed_index():
+            # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
+            # matches comp_xfers stored in ongoing_prefetch (one live entry).
+            for info in tree.ongoing_prefetch.values():
+                comp_xfers = info[-1]
+                names = [t.name for xfers in comp_xfers.values() for t in xfers]
+                if PoolName.SWA in names:
+                    return 1 + names.index(PoolName.SWA)
+            return None
+
+        def fake(tensor, op=None, group=None):
+            if op == dist.ReduceOp.MIN:
+                min_sizes.append(tensor.numel())
+                if drop_swa:
+                    idx = swa_packed_index()
+                    if idx is not None and idx < tensor.numel():
+                        tensor[idx] = 0
+            return None
+
+        p = mock.patch.object(dist, "all_reduce", side_effect=fake)
+        p.start()
+        self.addCleanup(p.stop)
+        return min_sizes
+
+    def _swa_host_on_path(self, tree, seq):
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_host_node
+        while node is not tree.root_node:
+            if node.component_data[ComponentType.SWA].host_value is not None:
+                return True
+            node = node.parent
+        return False
+
+    def _l3_produce(self, storage_dir, seq):
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        leaf = prod.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(prod, leaf)
+        self._write_path_to_l3(prod, leaf)
+        self._flush_l3_backups(prod)
+
+    def _l3_consumer(self, storage_dir):
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        return cons
+
+    def _consume_prefetch(self, cons, seq, req_id):
+        cons.prefetch_from_storage(req_id, cons.root_node, array("q", seq), None, None)
+        self._run_prefetch_to_completion(cons, req_id)
+        cons.drain_storage_control_queues()
+
+    def _setup_swa_tp_prefetch(self):
+        """Skip non-SWA fixtures; produce one full SWA window+1 page to L3.
+
+        Returns (storage_dir, seq) or None when this fixture cannot exercise
+        SWA L3 prefetch (then the caller skips).
+        """
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only fixture required")
+        if self._skip_unsupported_hicache_test():
+            return None
+        sw_pages = (
+            self.cfg.sliding_window_size + self.cfg.page_size - 1
+        ) // self.cfg.page_size
+        seq = self._make_seq(1, sw_pages + 1)
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        self._l3_produce(storage_dir, seq)
+
+        # Baseline (single rank) must actually adopt SWA, else the TP assertions
+        # below would be vacuous -> skip.
+        base = self._l3_consumer(storage_dir)
+        self._consume_prefetch(base, seq, "base")
+        if not self._swa_host_on_path(base, seq):
+            self.skipTest("fixture does not exercise SWA L3 prefetch")
+        return storage_dir, seq
+
+    def test_tp_swa_prefetch_dropped_when_peer_misses(self):
+        """A peer rank missing the SWA window drops the whole prefetch result
+        on every rank (TP-consistent all-or-nothing)."""
+        setup = self._setup_swa_tp_prefetch()
+        if setup is None:
+            return
+        storage_dir, seq = setup
+
+        cons = self._l3_consumer(storage_dir)
+        cons.tp_world_size = 2
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=True)
+        self._consume_prefetch(cons, seq, "drop")
+
+        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.host_hit_length, 0)
+        self.assertFalse(
+            self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
+        )
+        # Full + sidecars must be synced through a packed MIN all_reduce. The
+        # poll loop may observe more than one completed check, so do not pin the
+        # exact number of reductions.
+        self.assertIn(2, min_sizes)
+        cons.sanity_check()
+
+    def test_tp_swa_prefetch_adopted_when_peer_present(self):
+        """When every rank has the full SWA window, SWA is adopted under tp>1
+        (the single packed all_reduce path still works)."""
+        setup = self._setup_swa_tp_prefetch()
+        if setup is None:
+            return
+        storage_dir, seq = setup
+
+        cons = self._l3_consumer(storage_dir)
+        cons.tp_world_size = 2
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=False)  # peer == local
+        self._consume_prefetch(cons, seq, "keep")
+
+        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.host_hit_length, len(seq))
+        self.assertTrue(
+            self._swa_host_on_path(cons, seq),
+            "SWA must be adopted when all ranks have it",
+        )
+        self.assertIn(2, min_sizes)
         cons.sanity_check()
 
     def _skip_unsupported_hicache_test(self):
