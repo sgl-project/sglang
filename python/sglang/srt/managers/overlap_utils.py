@@ -166,8 +166,7 @@ class FutureMap:
         self.need_bonus_tokens = getattr(draft_input, "bonus_tokens", None) is not None
         self.need_topk = self.spec_algo.need_topk()
         self.need_hidden_states = (
-            self.need_topk
-            and spec_need_hidden_states()
+            spec_need_hidden_states()
             and getattr(draft_input, "hidden_states", None) is not None
         )
 
@@ -200,13 +199,13 @@ class FutureMap:
                 dtype=topk_index0.dtype,
                 device=self.device,
             )
-            if self.need_hidden_states:
-                hidden_states0 = draft_input.hidden_states[0]
-                self.hidden_states_buf = torch.empty(
-                    (self.req_pool_size, *hidden_states0.shape),
-                    dtype=hidden_states0.dtype,
-                    device=self.device,
-                )
+        if self.need_hidden_states:
+            hidden_states0 = draft_input.hidden_states[0]
+            self.hidden_states_buf = torch.empty(
+                (self.req_pool_size, *hidden_states0.shape),
+                dtype=hidden_states0.dtype,
+                device=self.device,
+            )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         draft_input: EagleDraftInput = batch.spec_info
@@ -247,6 +246,8 @@ class FutureMap:
                 draft_input.hidden_states = hidden_states
         elif self.need_bonus_tokens:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
+        if self.need_hidden_states and not self.need_topk:
+            draft_input.hidden_states = self.hidden_states_buf[indices]
         if _DEBUG_ASSERT:
             if self.need_verified_id:
                 _assert_nonneg_and_invalidate(
