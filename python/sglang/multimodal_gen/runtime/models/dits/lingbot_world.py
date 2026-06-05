@@ -1038,9 +1038,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             return None
 
         forward_context = get_forward_context()
-        if forward_context.current_timestep < 0:
-            return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
-
         forward_batch = forward_context.forward_batch
         if not CausalLingBotWorldTransformer3DModel._should_cache_cam_conditioner(
             forward_batch
