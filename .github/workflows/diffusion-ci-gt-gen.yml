@@ -230,8 +230,8 @@ jobs:
 
       - name: Generate official output
         env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
           CUDA_VISIBLE_DEVICES: 0
@@ -384,8 +384,8 @@ jobs:
 
       - name: Generate outputs
         env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
         run: |
@@ -461,8 +461,8 @@ jobs:
 
       - name: Generate outputs
         env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
         run: |
@@ -538,8 +538,8 @@ jobs:
 
       - name: Generate outputs
         env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_IDEOGRAM_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-b200 }}
         run: |
