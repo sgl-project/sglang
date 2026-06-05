@@ -51,66 +51,6 @@ class TestMultiReqBasic(ScriptedTestCase):
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
 
-    def test_chunked_plus_decode_in_batch(self):
-        self.server.execute_script(self._script_chunked_plus_decode_in_batch)
-
-    @staticmethod
-    def _script_chunked_plus_decode_in_batch(t: ScriptedContext):
-        # Every mid-chunk of a 2048/256 prompt consumes the entire 256-token chunk
-        # budget, so a second PREFILL can never co-batch with an in-flight chunked
-        # req -- by the time it ran, r1 had already finished chunking. The reachable
-        # "chunked + another req in one batch" scenario is chunked prefill MIXED
-        # WITH A DECODING req: bring r2 to a decoding state first, then start the
-        # long r1 so it chunks while r2 keeps decoding.
-        r2 = t.start_req(prompt_len=8, max_new_tokens=64, ignore_eos=True)
-        yield from run_until(
-            r2, lambda h: h.status == "running" and len(h.req.output_ids) >= 1
-        )
-
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r1, lambda h: h.is_chunking)
-
-        # The overlap scheduler may alternate chunk batches and decode batches
-        # rather than landing both subsets in one sampled step, so latch across
-        # r1's whole chunking window: r2's decode must PROGRESS while r1 chunks
-        # (the real coexistence consequence), and whenever a sampled step shows
-        # both, the chunked subset must stay disjoint from prefill/decode.
-        r2_out_before = len(r2.req.output_ids)
-        saw_chunked_r1 = False
-        saw_r2_decode_during_chunking = False
-        for _ in range(DEFAULT_MAX_STEPS):
-            comp = t.batch_composition()
-            if r1.rid in comp.get("chunked", []):
-                saw_chunked_r1 = True
-                if r2.rid in comp.get("decode", []):
-                    saw_r2_decode_during_chunking = True
-                chunked_set = set(comp.get("chunked", []))
-                assert chunked_set.isdisjoint(set(comp.get("prefill", [])))
-                assert chunked_set.isdisjoint(set(comp.get("decode", [])))
-            if not r1.is_chunking:
-                break
-            yield
-        assert saw_chunked_r1, "r1 was never observed in the chunked subset"
-        r2_out_after = len(r2.req.output_ids) if r2.req is not None else 64
-        assert r2_out_after > r2_out_before, (
-            f"r2's decode must progress while r1 chunks; output_ids stayed at "
-            f"{r2_out_before}"
-        )
-        assert saw_r2_decode_during_chunking, (
-            "r2 was never observed in the decode subset while r1 held the "
-            "chunked slot"
-        )
-
-        # Abort the long-running decoder so the class teardown starts from a clean,
-        # drained pool; let r1 finish naturally.
-        t.abort(r2)
-        yield from run_until_finished(r1)
-        for _ in range(40):
-            if t.is_fully_idle:
-                break
-            yield
-        assert r1.finished
-
     def test_hundred_short_reqs(self):
         self.server.execute_script(self._script_hundred_short_reqs)
 
@@ -585,6 +525,77 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
             f"a 4-chunk prompt must chunk >= 4 times under concurrent decode; "
             f"got {long_req.chunks_done}"
         )
+
+
+class TestMultiReqMixedChunk(ScriptedTestCase):
+    # Default v1 scheduling runs chunk batches back-to-back and starves decode
+    # until the prefill completes; co-running decode WITH an in-flight chunked
+    # prefill is exactly what --enable-mixed-chunk provides, so the coexistence
+    # test runs on a mixed-chunk engine.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_mixed_chunk=True,
+    )
+
+    def test_chunked_plus_decode_in_batch(self):
+        self.server.execute_script(self._script_chunked_plus_decode_in_batch)
+
+    @staticmethod
+    def _script_chunked_plus_decode_in_batch(t: ScriptedContext):
+        # Every mid-chunk of a 2048/256 prompt consumes the entire 256-token chunk
+        # budget, so a second PREFILL can never co-batch with an in-flight chunked
+        # req -- by the time it ran, r1 had already finished chunking. The reachable
+        # "chunked + another req in one batch" scenario is chunked prefill MIXED
+        # WITH A DECODING req: bring r2 to a decoding state first, then start the
+        # long r1 so it chunks while r2 keeps decoding.
+        r2 = t.start_req(prompt_len=8, max_new_tokens=64, ignore_eos=True)
+        yield from run_until(
+            r2, lambda h: h.status == "running" and len(h.req.output_ids) >= 1
+        )
+
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r1, lambda h: h.is_chunking)
+
+        # The overlap scheduler may alternate chunk batches and decode batches
+        # rather than landing both subsets in one sampled step, so latch across
+        # r1's whole chunking window: r2's decode must PROGRESS while r1 chunks
+        # (the real coexistence consequence), and whenever a sampled step shows
+        # both, the chunked subset must stay disjoint from prefill/decode.
+        r2_out_before = len(r2.req.output_ids)
+        saw_chunked_r1 = False
+        saw_r2_decode_during_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            comp = t.batch_composition()
+            if r1.rid in comp.get("chunked", []):
+                saw_chunked_r1 = True
+                if r2.rid in comp.get("decode", []):
+                    saw_r2_decode_during_chunking = True
+                chunked_set = set(comp.get("chunked", []))
+                assert chunked_set.isdisjoint(set(comp.get("prefill", [])))
+                assert chunked_set.isdisjoint(set(comp.get("decode", [])))
+            if not r1.is_chunking:
+                break
+            yield
+        assert saw_chunked_r1, "r1 was never observed in the chunked subset"
+        r2_out_after = len(r2.req.output_ids) if r2.req is not None else 64
+        assert r2_out_after > r2_out_before, (
+            f"r2's decode must progress while r1 chunks; output_ids stayed at "
+            f"{r2_out_before}"
+        )
+        assert saw_r2_decode_during_chunking, (
+            "r2 was never observed in the decode subset while r1 held the "
+            "chunked slot"
+        )
+
+        # Abort the long-running decoder so the class teardown starts from a clean,
+        # drained pool; let r1 finish naturally.
+        t.abort(r2)
+        yield from run_until_finished(r1)
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        assert r1.finished
 
 
 if __name__ == "__main__":

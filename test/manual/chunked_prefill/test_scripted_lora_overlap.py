@@ -207,15 +207,21 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
         # its prefill in a single extend batch -- it is never held as chunked_req,
         # so chunks_done == 0. The first req of each adapter cannot prefix-hit and
         # processes all 2048 tokens in 256-chunks -> exactly 8 chunks.
+        # LPM scheduling does not guarantee which req of a same-adapter pair
+        # runs cold first (observed [8, 0, 0, 8]: B's twin ran before B's first).
+        # The invariant is per-adapter: exactly one req of each pair does the
+        # full cold 8-chunk prefill and its twin full-prefix-hits (0 chunks).
         expected_first_chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
         chunk_counts = [r.chunks_done for r in reqs]
-        assert reqs[0].chunks_done == expected_first_chunks, (
-            f"first A req must chunk exactly {expected_first_chunks}; "
-            f"per-req chunks_done={chunk_counts}"
+        a_counts = sorted([reqs[0].chunks_done, reqs[2].chunks_done])
+        b_counts = sorted([reqs[1].chunks_done, reqs[3].chunks_done])
+        assert a_counts == [0, expected_first_chunks], (
+            f"adapter A pair must be one cold full prefill + one full prefix "
+            f"hit; per-req chunks_done={chunk_counts}"
         )
-        assert reqs[1].chunks_done == expected_first_chunks, (
-            f"first B req must chunk exactly {expected_first_chunks}; "
-            f"per-req chunks_done={chunk_counts}"
+        assert b_counts == [0, expected_first_chunks], (
+            f"adapter B pair must be one cold full prefill + one full prefix "
+            f"hit; per-req chunks_done={chunk_counts}"
         )
         assert reqs[2].chunks_done < expected_first_chunks
         assert reqs[3].chunks_done < expected_first_chunks
