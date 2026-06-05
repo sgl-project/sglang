@@ -23,8 +23,8 @@ recommended to use v0.5.10 or a later version.
 
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
-| Tensor Parallelism            | `--tp 32`                                                                                     |
-| Data Parallelism              | `--enable-dp-attention --dp 8`                                                                |
+| Tensor Parallelism            | `--tp-size 32`                                                                                |
+| Data Parallelism              | `--enable-dp-attention --dp-size 8`                                                           |
 | Expert Parallelism            | `--ep 32 --moe-a2a-backend deepep --deepep-mode low_latency`                                  |
 | Context Parallelism           | `--enable-dsa-prefill-context-parallel --dsa-prefill-cp-mode in-seq-split --attn-cp-size 32`  |
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
@@ -162,7 +162,7 @@ do
         export GLOO_SOCKET_IFNAME=xxx
 
         python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --tp 32 \
+        --tp-size 32 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu \
@@ -209,8 +209,8 @@ do
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
 
         python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --tp 32 \
-        --dp ${DP} \
+        --tp-size 32 \
+        --dp-size ${DP} \
         --ep 32 \
         --moe-dense-tp-size 1 \
         --enable-dp-attention \

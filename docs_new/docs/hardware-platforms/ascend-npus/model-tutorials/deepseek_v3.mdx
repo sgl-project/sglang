@@ -23,7 +23,7 @@ v0.5.10 or a later version.
 
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
-| Tensor Parallelism            | `--tp 16`                                                                                     |
+| Tensor Parallelism            | `--tp-size 16`                                                                                  |
 | Data Parallelism              | `--enable-dp-attention --dp-size 4`                                                           |
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
@@ -159,7 +159,7 @@ MODEL_PATH=xxx
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
-    --tp 16 \
+    --tp-size 16 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
