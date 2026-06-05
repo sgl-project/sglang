@@ -128,6 +128,12 @@ class DSV4AttnMetadata:
     unified_csa_indices: Optional[torch.Tensor] = None
     unified_csa_indptr: Optional[torch.Tensor] = None
 
+    # unified_kv: per-forward prefill/extend per-token mapping
+    unified_pf_state_slot: Optional[torch.Tensor] = None
+    unified_pf_chunk_start: Optional[torch.Tensor] = None
+    unified_pf_cu_q: Optional[torch.Tensor] = None
+    unified_pf_final_pos: Optional[torch.Tensor] = None
+
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -177,6 +183,10 @@ class DSV4AttnMetadata:
                 "unified_hca_indptr",
                 "unified_csa_indices",
                 "unified_csa_indptr",
+                "unified_pf_state_slot",
+                "unified_pf_chunk_start",
+                "unified_pf_cu_q",
+                "unified_pf_final_pos",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -493,6 +503,9 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             is_prefill=True,
+        )
+        self._attach_unified_kv_prefill_meta(
+            core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -1008,6 +1021,33 @@ class DeepseekV4HipRadixBackend(
             swa_pages=pool.unified_swa_pages,
         )
 
+    def _attach_unified_kv_prefill_meta(
+        self,
+        core: "DSV4AttnMetadata",
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+    ) -> None:
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if not is_unified_kv_triton():
+            return
+        device = req_pool_indices.device
+        bs = req_pool_indices.shape[0]
+        seq_lens = seq_lens.to(torch.int64)
+        extend_seq_lens = extend_seq_lens.to(torch.int64)
+        # token -> req index (length L = sum(extend_seq_lens))
+        bid = torch.repeat_interleave(
+            torch.arange(bs, device=device, dtype=torch.int64), extend_seq_lens
+        )
+        core.unified_pf_state_slot = req_pool_indices[bid]
+        core.unified_pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
+        cu_q_per_req = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
+        core.unified_pf_cu_q = cu_q_per_req[bid]
+        core.unified_pf_final_pos = (seq_lens - 1)[bid]
+
     def _forward_unified_kv(
         self,
         *,
@@ -1040,6 +1080,7 @@ class DeepseekV4HipRadixBackend(
         c128_pi = getattr(core_attn_metadata, "c128_page_indices", None)
         c4_pi = getattr(core_attn_metadata, "c4_sparse_page_indices", None)
 
+        # decode
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         if is_decode:
             state_slot = forward_batch.req_pool_indices[:T]
@@ -1082,25 +1123,10 @@ class DeepseekV4HipRadixBackend(
             )
 
         # prefill / extend
-        bs = forward_batch.req_pool_indices.shape[0]
-        if forward_batch.extend_seq_lens is not None:
-            bid = torch.repeat_interleave(
-                torch.arange(bs, device=device, dtype=torch.int64),
-                forward_batch.extend_seq_lens.to(torch.int64),
-            )[:T]
-            state_slot = forward_batch.req_pool_indices[bid]
-            chunk_start = forward_batch.extend_prefix_lens[bid]
-            cu_q = forward_batch.extend_start_loc[bid]
-            final_pos = forward_batch.seq_lens[bid].to(torch.int64) - 1
-        else:
-            qo_len = T // bs
-            ar = torch.arange(T, device=device, dtype=torch.int64)
-            tok_in_req = ar % qo_len
-            bid = ar // qo_len
-            state_slot = forward_batch.req_pool_indices[bid]
-            chunk_start = positions - tok_in_req
-            cu_q = ar - tok_in_req
-            final_pos = chunk_start + (qo_len - 1)
+        state_slot = core_attn_metadata.unified_pf_state_slot
+        chunk_start = core_attn_metadata.unified_pf_chunk_start
+        cu_q = core_attn_metadata.unified_pf_cu_q
+        final_pos = core_attn_metadata.unified_pf_final_pos
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,

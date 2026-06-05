@@ -747,14 +747,19 @@ class MQALayer(nn.Module):
             if unified:
                 swa_ring_size = token_to_kv_pool.unified_swa_ring_size
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
+                # ring slot = req_slot * ring + pos % ring, per token. 
+                # positions is per-token; req_pool_indices is per-req.
+                req_slot = forward_batch.req_pool_indices.to(torch.int64)
+                if req_slot.shape[0] != positions.shape[0]:
+                    req_slot = req_slot.repeat_interleave(
+                        positions.shape[0] // req_slot.shape[0]
+                    )
                 swa_loc = (
-                    forward_batch.req_pool_indices.to(torch.int64) * swa_ring_size
+                    req_slot * swa_ring_size
                     + positions.to(torch.int64) % swa_ring_size
                 ).to(torch.int32)
                 swa_page_size, bf16_store = 1, True
             else:
-                # framework packed-fp8 SWA pool; swa_loc from the backend
-                # (main #27091: full->SWA translation unified in init_forward_metadata).
                 swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
                 swa_page_size, bf16_store = (

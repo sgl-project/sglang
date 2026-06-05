@@ -85,9 +85,8 @@ class DeepSeekV4SingleKVPool(KVCache):
             ):
                 self.kv_buffer = [
                     self.create_buffer(
-                        self.create_buffer(
-                            num_pages=(self.size + self.page_size + 1) // self.page_size,
-                        )
+                        num_pages=(self.size + self.page_size + 1) // self.page_size,
+                    )
                     for _ in range(self.layer_num)
                 ]
 
