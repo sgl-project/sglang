@@ -2358,12 +2358,12 @@ class ServerArgs:
                     self.attention_backend = default_attention_backend
 
             prefill_backend, decode_backend = self.get_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton")
+            accepted_backends = ("trtllm_mha", "triton", "intel_xpu")
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha or triton attention backend, "
+                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 

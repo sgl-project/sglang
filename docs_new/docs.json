@@ -1203,6 +1203,7 @@
                 "group": "Performance Optimization",
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
+                  "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
                   {
