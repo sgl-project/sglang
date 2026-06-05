@@ -1172,6 +1172,9 @@ class MooncakeKVManager(CommonKVManager):
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
                 ):
+                    logger.debug(
+                        f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
+                    )
                     if self.enable_trace:
                         kv_chunk.trace_ctx.trace_slice_end(
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
