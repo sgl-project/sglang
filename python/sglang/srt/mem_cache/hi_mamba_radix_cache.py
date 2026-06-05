@@ -151,6 +151,8 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
             enable_storage_metrics=self.enable_storage_metrics,
+            enable_metrics=params.enable_metrics,
+            extra_metric_labels=self.extra_metric_labels,
             attn_cp_group=params.attn_cp_cache_group,
             attn_tp_group=params.attn_tp_cache_group,
         )
