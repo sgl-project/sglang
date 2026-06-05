@@ -243,38 +243,26 @@ def _kernel(
                     sA.iterator
                     + (buf * TILE_M * KI + arow * KI + _swizzle(arow, kbh + aoff))
                 )
-                if cutlass.const_expr(NB == 2):
-                    # One ldmatrix.x4 loads both 8-wide n-blocks for this k-step
-                    # (B is n-major with a multiple-of-4 swizzle, same as A). The
-                    # four regs map to mma operands as nb0=(0,2), nb1=(1,3).
-                    brow, boff = lane % 16, (lane // 16) * 4
-                    bb = _ldmatrix(
+                # Load each 8-wide n-block with its own ldmatrix.x2 (two 8x8 tiles =
+                # the two B regs b0, b1). A single x4 over all 16 n-rows would put the
+                # n0-7 and n8-15 lane groups on the same k-octet, and the row%8 swizzle
+                # then collides their smem banks; the per-block x2 reads two distinct
+                # k-octets that swizzle apart, so it is bank-conflict free (like CUDA).
+                brow_lo = lane % 8
+                boff = ((lane // 8) & 1) * 4
+                for nb in cutlass.range_constexpr(NB):
+                    brow = nb * 8 + brow_lo
+                    bb = _ldmatrix_x2(
                         sB.iterator
                         + (buf * tile_n * KI + brow * KI + _swizzle(brow, kbh + boff))
                     )
-                    b01 = [(bb[0], bb[2]), (bb[1], bb[3])]
-                else:
-                    # 8 n-rows -> ldmatrix.x2 (two 8x8 tiles = the two B regs b0, b1).
-                    brow8 = lane % 8
-                    boff8 = ((lane // 8) & 1) * 4
-                    bb = _ldmatrix_x2(
-                        sB.iterator
-                        + (
-                            buf * tile_n * KI
-                            + brow8 * KI
-                            + _swizzle(brow8, kbh + boff8)
-                        )
-                    )
-                    b01 = [(bb[0], bb[1])]
-                for nb in cutlass.range_constexpr(NB):
-                    b0, b1 = b01[nb]
                     d = _mma(
                         a[0],
                         a[1],
                         a[2],
                         a[3],
-                        b0,
-                        b1,
+                        bb[0],
+                        bb[1],
                         acc[nb][0].ir_value(),
                         acc[nb][1].ir_value(),
                         acc[nb][2].ir_value(),
