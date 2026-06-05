@@ -188,7 +188,12 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 .amax()
                 .to(device=weight.device, dtype=torch.float32)
             )
-            e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
+            e4m3_max = (
+                256.0
+                if envs.FLASHINFER_NVFP4_4OVER6.get()
+                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+                else float(torch.finfo(torch.float8_e4m3fn).max)
+            )
             fp8_fp4_max = e4m3_max * 6.0
             weight_scale_2 = torch.where(
                 weight_amax > 0,

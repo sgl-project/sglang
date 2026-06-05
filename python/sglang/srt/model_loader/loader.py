@@ -769,8 +769,6 @@ class DefaultModelLoader(BaseModelLoader):
             with temp_set_env(
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="0",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
             ):
                 model.load_weights(weights)
             if target_device.type == "cuda":
