@@ -464,6 +464,7 @@ class MellumModel(Qwen3MoeModel):
 class MellumForCausalLM(Qwen3MoeForCausalLM):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(
@@ -492,13 +493,6 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
                 "Mellum ignores config.max_window_layers and relies on "
                 "config.layer_types for per-layer SWA routing."
             )
-
-        # gate_up_proj packing only needed when dense MLP layers exist.
-        if any(mt == "dense" for mt in cfg.mlp_layer_types):
-            self.packed_modules_mapping = {
-                **self.packed_modules_mapping,
-                "gate_up_proj": ["gate_proj", "up_proj"],
-            }
 
         self.model = MellumModel(cfg, quant_config, prefix=add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
