@@ -887,7 +887,6 @@ class TestDecodeMambaLockRefScenarios(unittest.TestCase):
         self.assertEqual(len(preallocated), 1)
         queue._pre_alloc.assert_called_once()
 
-
     def test_tombstone_restoration_lock_ref(self):
         """Restoring a tombstone via cache_unfinished_req must not crash.
 
