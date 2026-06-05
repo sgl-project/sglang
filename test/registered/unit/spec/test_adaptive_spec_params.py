@@ -5,9 +5,10 @@ import unittest
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 
 class TestAdaptiveSpeculativeParams(unittest.TestCase):

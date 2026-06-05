@@ -4,21 +4,26 @@ const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
 const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
-const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
+const DEFAULT_PREVIEW_OUTPUT_QUALITY = 80;
+const MAX_WEBP_PREVIEW_OUTPUT_QUALITY = 80;
+const SMOOTH_PREVIEW_OUTPUT_QUALITY = 70;
+const SR_PREVIEW_OUTPUT_QUALITY = 70;
+const HEAVY_PREVIEW_OUTPUT_QUALITY = 60;
 const DEFAULT_TARGET_FPS = 25;
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
 const DEFAULT_UPSCALING_SCALE = 2;
+const DEFAULT_UPSCALING_MODEL =
+  "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth";
 const DEFAULT_PREVIEW_SCALE = 120;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
-const LIVE_QUEUE_SECONDS = 0.45;
-const LOW_LATENCY_FPS_FLOOR = 10;
-const LOW_LATENCY_QUEUE_SECONDS = 0.35;
-const MAX_CATCHUP_FPS = 30;
-const EVENT_QUEUE_SECONDS = 0.25;
+const DECODE_QUEUE_SECONDS = 2.0;
+const STARTUP_DECODE_QUEUE_SECONDS = 2.5;
+const RECENT_DROP_DISPLAY_MS = 1800;
 const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
+const CONTROL_TRANSITION_FLUSH_DELAY_MS = 140;
 const CONTROL_KEY_ACTIONS = new Map([
   ["w", "w"],
   ["a", "a"],
@@ -58,7 +63,7 @@ const reactorPresets = [
     tone: "green",
     size: "832x480",
     fps: 25,
-    prompt: "A first-person perspective from the back of a colossal obsidian-black dragon in mid-flight, looking over its horned head and outstretched wings toward an ancient moss-covered castle rising above a dense jungle canopy, with mist, river gorges, and golden humid light.",
+    prompt: "A locked first-person dragon-rider view matching the reference image: both tan forearms in brown leather gloves stay visible at the bottom, gripping leather reins around the green-brown scaled dragon neck; the dragon head, horns, and both wide wings frame the jungle valley, waterfalls, mist, and tall castle on the right. Smooth forward flight only, keep the same rider hands, dragon body, wing silhouette, castle placement, and humid daylight colors in every frame.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/dragon-ride.jpg`,
     source: "Reactor LingBot preset",
   },
@@ -180,7 +185,7 @@ const examplePresets = [
   { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 25, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
   { name: "Lake Scout", tone: "green", size: "832x480", fps: 25, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
   { name: "Ziggy Stardust", tone: "accent", size: "832x480", fps: 25, prompt: "A static night view of a narrow London alley in soft rain, wet pavement reflecting a yellow streetlamp, the blue K. West sign glowing above a doorway, cardboard boxes near the wall, a pale parked car in the distance, and a slender glam-rock figure holding a guitar under the lamp; preserve the album-cover composition, brick storefronts, muted teal and amber colors, subtle rain shimmer only.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/0/01/ZiggyStardust.jpg", source: "David Bowie Ziggy Stardust artwork", mime: "image/jpeg" },
-  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 25, prompt: "A static locked-off view of the back side of Plastic Beach: a pastel toy-like island hotel built from plastic debris and washed-up junk in the open ocean, turquoise water in the foreground, distant horizon, clouds slowly drifting behind the island, tiny stars gently twinkling in the dusk sky, an occasional shooting star, and tiny distant pigeons crossing the sky; subtle water shimmer only, keep the island geometry fixed, no camera orbit, no dolly, no zoom.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
+  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 25, prompt: "A static album-cover view matching the reference image: the Plastic Beach island stays centered above a dark midnight-blue ocean, the lighthouse remains on the left with its white reflection path, the starry navy sky stays unchanged, and the large white Plastic Beach title graphic stays in the lower foreground. Keep the original camera height, horizon, waterline, island silhouette, and deep blue color palette fixed; only tiny water shimmer, lighthouse glint, and subtle star twinkle, with no camera descent, no push-in, no orbit, and no turquoise color shift.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
   { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 25, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
   { name: "Kid A", tone: "accent", size: "832x480", fps: 25, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
 ];
@@ -191,28 +196,23 @@ const presets = [
 ];
 
 let ws = null;
-const referenceCache = new Map();
 let selectedPreset = null;
 let selectedReferenceBytes = null;
+let selectedReferenceUrl = "";
 let selectedReferenceLabel = "";
 let pendingHeader = null;
-let queue = [];
 let frames = 0;
 let bytes = 0;
-let lastFrameAt = 0;
-let chunkWaitStartedAt = 0;
 let clearQueueOnClose = false;
 let fpsSamples = [];
-let playbackFps = 0;
-let droppedFrames = 0;
-let decodeChain = Promise.resolve();
+let decodeQueue = [];
+let queuedDecodeFrames = 0;
+let decodeInProgress = false;
 let pendingDecodeBatches = 0;
+let droppedDecodeFrames = 0;
+let lastDecodeDropAt = 0;
+let lastDecodeDropCount = 0;
 let nextEventId = 1;
-let awaitedEventId = 0;
-let awaitedEventSentAt = 0;
-let chunkReceiveStartedAt = 0;
-let currentReceiveChunk = null;
-let currentReceiveChunkFrames = 0;
 let lastRawRgbFrame = null;
 let decoderWorker = null;
 let decodeWorkerUnavailable = false;
@@ -226,6 +226,16 @@ let socketCloseExpected = false;
 let socketServerError = "";
 let renderedPreviewFrames = 0;
 let previewScaleFrame = 0;
+let recordingActive = false;
+let recordingSamples = [];
+let recordingEncoder = null;
+let recordingEncoderReady = null;
+let recordingEncoderConfig = null;
+let recordingFrameIndex = 0;
+let recordingFps = DEFAULT_TARGET_FPS;
+let recordingTimer = 0;
+let recordingSaving = false;
+let recordingEncodeChain = Promise.resolve();
 const decodeRequests = new Map();
 let controlStateController = null;
 
@@ -235,6 +245,11 @@ const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
 const scratchCanvas = document.createElement("canvas");
 const scratchCtx = scratchCanvas.getContext("2d", { alpha: false });
+const recordingCanvas = document.createElement("canvas");
+const recordingCtx = recordingCanvas.getContext("2d", { alpha: false });
+const playbackController = new RealtimePlaybackController({
+  targetFps: DEFAULT_TARGET_FPS,
+});
 
 function setStatus(text, kind = "") {
   $("statusText").textContent = text;
@@ -269,20 +284,18 @@ function drawIdle() {
 function resetStreamStats() {
   pendingHeader = null;
   clearFrameQueue();
+  playbackController.reset({ targetFps: previewPlaybackTargetFps() });
   frames = 0;
   bytes = 0;
   fpsSamples = [];
-  chunkWaitStartedAt = 0;
   clearQueueOnClose = false;
-  playbackFps = Number($("fps").value || DEFAULT_TARGET_FPS);
-  droppedFrames = 0;
-  decodeChain = Promise.resolve();
+  decodeQueue = [];
+  queuedDecodeFrames = 0;
+  decodeInProgress = false;
   pendingDecodeBatches = 0;
-  awaitedEventId = 0;
-  awaitedEventSentAt = 0;
-  chunkReceiveStartedAt = 0;
-  currentReceiveChunk = null;
-  currentReceiveChunkFrames = 0;
+  droppedDecodeFrames = 0;
+  lastDecodeDropAt = 0;
+  lastDecodeDropCount = 0;
   encodedDecodeErrors = 0;
   renderedPreviewFrames = 0;
   controlStateController?.reset({ sendRelease: false });
@@ -370,15 +383,19 @@ async function decodeFrameBatch(header, data) {
   const payload = await payloadToArrayBuffer(data);
   const id = decodeRequestId++;
   const decodeHeader = { ...header, __decode_id: id };
-  const useTransfer = isWorkerDecodableRawContentType(header.content_type);
+  const useTransfer =
+    isWorkerDecodableRawContentType(header.content_type) ||
+    isEncodedPreviewContentType(header.content_type);
   try {
     return await new Promise((resolve, reject) => {
       decodeRequests.set(id, {
         resolve: (message) => {
           const decodedAt = performance.now();
           lastDecodeMs = decodedAt - decodeStartedAt;
-          resolve(message.frames.map((buffer) => ({
-            image: new ImageData(new Uint8ClampedArray(buffer), message.width, message.height),
+          resolve(message.frames.map((frame) => ({
+            image: message.frame_type === "bitmap"
+              ? frame
+              : new ImageData(new Uint8ClampedArray(frame), message.width, message.height),
             chunk: message.chunk,
             receivedAt: header.__received_at,
             decodedAt,
@@ -398,7 +415,7 @@ async function decodeFrameBatch(header, data) {
       }
     });
   } catch (error) {
-    if (isEncodedPreviewContentType(header.content_type)) {
+    if (isEncodedPreviewContentType(header.content_type) && !useTransfer) {
       const items = await framePayloadToImageData(header, data);
       const decodedAt = performance.now();
       lastDecodeMs = decodedAt - decodeStartedAt;
@@ -428,50 +445,581 @@ function isWorkerDecodableRawContentType(contentType) {
   );
 }
 
-function updateStats(header) {
-  $("queueText").textContent = droppedFrames
-    ? `queue ${queue.length} · drop ${droppedFrames}`
-    : `queue ${queue.length}`;
+function updateStats() {
+  const playback = playbackController.snapshot();
+  const queueParts = [`buffer ${formatMs(playback.bufferMs)}`];
+  queueParts.push(`q ${playback.queueFrames}`);
+  if (playback.buffering && playback.queueFrames) queueParts.push("hold");
+  if (pendingDecodeBatches) queueParts.push(`decode ${pendingDecodeBatches}`);
+  const now = performance.now();
+  if (playback.lastDropAt && now - playback.lastDropAt < RECENT_DROP_DISPLAY_MS) {
+    const reason = playback.lastDropReason ? ` ${playback.lastDropReason}` : "";
+    queueParts.push(`drop +${playback.lastDropCount}${reason}`);
+  }
+  if (lastDecodeDropAt && now - lastDecodeDropAt < RECENT_DROP_DISPLAY_MS) {
+    queueParts.push(`decode drop +${lastDecodeDropCount}`);
+  }
+  $("queueText").textContent = queueParts.join(" · ");
   $("frameText").textContent = `frames ${frames}`;
   $("byteText").textContent = `${(bytes / 1048576).toFixed(1)} MB`;
+  $("stageLatencyText").textContent =
+    `${formatMs(playback.bufferMs)} / ${formatMs(playback.targetLeadMs)}`;
 }
 
-function trimLiveQueue(latestFrameCount) {
-  const targetFps = Number($("fps").value || DEFAULT_TARGET_FPS);
-  const maxQueue = Math.max(
-    Number(latestFrameCount || 0),
-    Math.round(targetFps * LIVE_QUEUE_SECONDS),
-  );
-  if (queue.length <= maxQueue) return;
-  const dropCount = queue.length - maxQueue;
-  dropQueuedFrames(dropCount);
-  droppedFrames += dropCount;
+function requestedInputFps() {
+  return Number($("fps").value || DEFAULT_TARGET_FPS);
 }
 
-function liveQueueFrameFloor(header, decodedFrameCount) {
-  const frameBatchCount = Number(header.num_frame_batches || 1);
-  if (!isEncodedPreviewContentType(header.content_type) || frameBatchCount <= 1) {
-    return decodedFrameCount;
-  }
-  return Math.max(decodedFrameCount, frameBatchCount * decodedFrameCount);
+function frameInterpolationMultiplier() {
+  return $("frameInterpolation").checked ? 2 ** DEFAULT_FRAME_INTERPOLATION_EXP : 1;
 }
 
-function trimQueueForPendingEvent() {
-  const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
-  const keep = Math.max(1, Math.round(targetFps * EVENT_QUEUE_SECONDS));
-  if (queue.length <= keep) return;
-  const dropCount = queue.length - keep;
-  dropQueuedFrames(dropCount);
-  droppedFrames += dropCount;
+function previewPlaybackTargetFps() {
+  return requestedInputFps() * frameInterpolationMultiplier();
+}
+
+function syncPlaybackTargetFps() {
+  playbackController.setTargetFps(previewPlaybackTargetFps());
+  updateStats();
 }
 
 function clearFrameQueue() {
-  for (const item of queue) item.image?.close?.();
-  queue = [];
+  closeFrames(playbackController.clear());
 }
 
-function dropQueuedFrames(count) {
-  for (const item of queue.splice(0, count)) item.image?.close?.();
+function closeFrames(items) {
+  for (const item of items || []) item.image?.close?.();
+}
+
+function recordingFileName() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `sglang-realtime-${stamp}.mp4`;
+}
+
+function updateRecordButton() {
+  const button = $("recordBtn");
+  button.classList.toggle("is-recording", recordingActive);
+  button.classList.toggle("is-saving", recordingSaving);
+  button.disabled = recordingSaving;
+  button.setAttribute("aria-pressed", recordingActive ? "true" : "false");
+  $("recordLabel").textContent = recordingSaving
+    ? "Saving"
+    : recordingActive ? "Stop" : "Record";
+  const elapsedMs = recordingActive ? recordingFrameIndex / Math.max(1, recordingFps) * 1000 : 0;
+  $("recordDuration").textContent = formatRecordingDuration(elapsedMs);
+}
+
+function formatRecordingDuration(elapsedMs) {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+}
+
+function startRecording() {
+  if (recordingActive || recordingSaving) return;
+  if (!window.VideoEncoder || !window.VideoFrame) {
+    setStatus("MP4 unsupported", "error");
+    addHistory("MP4 recording requires WebCodecs H.264 support");
+    return;
+  }
+  recordingActive = true;
+  recordingSamples = [];
+  recordingEncoder = null;
+  recordingEncoderReady = null;
+  recordingEncoderConfig = null;
+  recordingFrameIndex = 0;
+  recordingFps = Math.max(1, previewPlaybackTargetFps());
+  recordingEncodeChain = Promise.resolve();
+  recordingTimer = window.setInterval(updateRecordButton, 250);
+  updateRecordButton();
+  addHistory("recording started");
+}
+
+async function stopRecording() {
+  if (!recordingActive || recordingSaving) return;
+  recordingActive = false;
+  if (recordingTimer) {
+    window.clearInterval(recordingTimer);
+    recordingTimer = 0;
+  }
+  recordingSaving = true;
+  updateRecordButton();
+
+  let fileHandle = null;
+  const fileName = recordingFileName();
+  try {
+    if (window.showSaveFilePicker) {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: fileName,
+        types: [{
+          description: "MP4 video",
+          accept: { "video/mp4": [".mp4"] },
+        }],
+      });
+    }
+    await recordingEncodeChain;
+    if (!recordingEncoder || !recordingSamples.length) throw new Error("No frames were recorded");
+    await recordingEncoder.flush();
+    const mp4Blob = buildRecordingMp4();
+    if (fileHandle) {
+      const writable = await fileHandle.createWritable();
+      await writable.write(mp4Blob);
+      await writable.close();
+    } else {
+      downloadBlob(mp4Blob, fileName);
+    }
+    addHistory(`saved ${recordingSamples.length} frames as mp4`);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      addHistory("recording save canceled");
+    } else {
+      addHistory(error.message || "recording save failed");
+      setStatus("Save failed", "error");
+    }
+  } finally {
+    recordingEncoder?.close?.();
+    recordingEncoder = null;
+    recordingEncoderReady = null;
+    recordingSaving = false;
+    recordingSamples = [];
+    updateRecordButton();
+  }
+}
+
+function recordDecodedFrameBatch(decodedFrames) {
+  if (!recordingActive || recordingSaving) return;
+  for (const item of decodedFrames) {
+    if (!recordingActive) break;
+    recordDecodedFrame(item.image);
+  }
+  updateRecordButton();
+}
+
+function recordDecodedFrame(image) {
+  if (!recordingActive || recordingSaving) return;
+  const frameIndex = recordingFrameIndex;
+  const duration = Math.round(1_000_000 / Math.max(1, recordingFps));
+  const timestamp = frameIndex * duration;
+  let frame;
+  try {
+    frame = createRecordingFrame(image, timestamp, duration);
+  } catch (error) {
+    recordingActive = false;
+    addHistory(error.message || "recording frame capture failed");
+    updateRecordButton();
+    return;
+  }
+  recordingFrameIndex += 1;
+  recordingEncodeChain = recordingEncodeChain
+    .then(async () => {
+      await ensureRecordingEncoder(frame.displayWidth, frame.displayHeight);
+      recordingEncoder.encode(frame, { keyFrame: frameIndex === 0 || frameIndex % 120 === 0 });
+      frame.close();
+    })
+    .catch((error) => {
+      frame.close();
+      recordingActive = false;
+      addHistory(error.message || "recording encode failed");
+      updateRecordButton();
+    });
+}
+
+function createRecordingFrame(image, timestamp, duration) {
+  if (image instanceof ImageData) {
+    if (recordingCanvas.width !== image.width || recordingCanvas.height !== image.height) {
+      recordingCanvas.width = image.width;
+      recordingCanvas.height = image.height;
+    }
+    recordingCtx.putImageData(image, 0, 0);
+    return new VideoFrame(recordingCanvas, { timestamp, duration });
+  }
+  return new VideoFrame(image, { timestamp, duration });
+}
+
+async function ensureRecordingEncoder(width, height) {
+  if (recordingEncoderReady) return recordingEncoderReady;
+  recordingEncoderReady = createRecordingEncoder(width, height);
+  return recordingEncoderReady;
+}
+
+async function createRecordingEncoder(width, height) {
+  const fps = Math.max(1, recordingFps);
+  const bitrate = Math.round(Math.min(
+    180_000_000,
+    Math.max(24_000_000, width * height * fps * 0.8),
+  ));
+  const configs = [
+    { codec: "avc1.640028", width, height, bitrate, framerate: fps },
+    { codec: "avc1.4d4028", width, height, bitrate, framerate: fps },
+    { codec: "avc1.42e028", width, height, bitrate, framerate: fps },
+  ];
+  let supported = null;
+  for (const config of configs) {
+    const candidate = {
+      ...config,
+      avc: { format: "avc" },
+      bitrateMode: "variable",
+      hardwareAcceleration: "prefer-hardware",
+      latencyMode: "realtime",
+    };
+    const result = await VideoEncoder.isConfigSupported(candidate);
+    if (result.supported) {
+      supported = result.config;
+      break;
+    }
+  }
+  if (!supported) throw new Error("This browser cannot encode H.264 MP4");
+  recordingEncoderConfig = supported;
+  recordingEncoder = new VideoEncoder({
+    output: (chunk, metadata) => recordEncodedChunk(chunk, metadata),
+    error: (error) => {
+      recordingActive = false;
+      addHistory(error.message || "recording encoder failed");
+      updateRecordButton();
+    },
+  });
+  recordingEncoder.configure(supported);
+}
+
+function recordEncodedChunk(chunk, metadata) {
+  if (metadata?.decoderConfig?.description) {
+    recordingEncoderConfig.description = metadata.decoderConfig.description;
+  }
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  recordingSamples.push({
+    data,
+    timestamp: chunk.timestamp,
+    duration: chunk.duration || 0,
+    key: chunk.type === "key",
+  });
+}
+
+function downloadBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function buildRecordingMp4() {
+  if (!recordingEncoderConfig.description) {
+    throw new Error("H.264 encoder did not return MP4 decoder config");
+  }
+  const width = recordingEncoderConfig.width;
+  const height = recordingEncoderConfig.height;
+  const samples = normalizeRecordingSamples(recordingSamples);
+  const mdatPayload = concatBytes(samples.map((sample) => sample.data));
+  const ftyp = mp4Box("ftyp", ascii("isom"), u32(0x200), ascii("isom"), ascii("iso2"), ascii("avc1"), ascii("mp41"));
+  const mdat = mp4Box("mdat", mdatPayload);
+  const firstSampleOffset = ftyp.byteLength + 8;
+  const moov = buildMoovBox({
+    width,
+    height,
+    samples,
+    firstSampleOffset,
+    avcConfig: new Uint8Array(recordingEncoderConfig.description),
+  });
+  return new Blob([ftyp, mdat, moov], { type: "video/mp4" });
+}
+
+function normalizeRecordingSamples(samples) {
+  const ordered = [...samples].sort((left, right) => left.timestamp - right.timestamp);
+  const timescale = 90_000;
+  const fallbackDuration = Math.round(timescale / Math.max(1, recordingFps));
+  const normalized = ordered.map((sample) => ({
+    ...sample,
+    time: Math.round(sample.timestamp * timescale / 1_000_000),
+  }));
+  for (let i = 0; i < normalized.length; i++) {
+    const next = normalized[i + 1];
+    normalized[i].duration = next
+      ? Math.max(1, next.time - normalized[i].time)
+      : Math.max(1, Math.round((ordered[i].duration || 0) * timescale / 1_000_000) || fallbackDuration);
+  }
+  return normalized;
+}
+
+function buildMoovBox({ width, height, samples, firstSampleOffset, avcConfig }) {
+  const timescale = 90_000;
+  const duration = samples.reduce((sum, sample) => sum + sample.duration, 0);
+  const movieTimescale = 1000;
+  const movieDuration = Math.ceil(duration * movieTimescale / timescale);
+  return mp4Box(
+    "moov",
+    buildMvhdBox(movieTimescale, movieDuration),
+    mp4Box(
+      "trak",
+      buildTkhdBox(width, height, movieDuration),
+      mp4Box(
+        "mdia",
+        buildMdhdBox(timescale, duration),
+        buildHdlrBox(),
+        mp4Box(
+          "minf",
+          buildVmhdBox(),
+          buildDinfBox(),
+          buildStblBox({ width, height, samples, firstSampleOffset, avcConfig }),
+        ),
+      ),
+    ),
+  );
+}
+
+function buildMvhdBox(timescale, duration) {
+  return mp4Box(
+    "mvhd",
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(timescale),
+    u32(duration),
+    u32(0x00010000),
+    u16(0x0100),
+    u16(0),
+    zeros(8),
+    u32(0x00010000), u32(0), u32(0),
+    u32(0), u32(0x00010000), u32(0),
+    u32(0), u32(0), u32(0x40000000),
+    zeros(24),
+    u32(2),
+  );
+}
+
+function buildTkhdBox(width, height, duration) {
+  return mp4Box(
+    "tkhd",
+    u32(0x00000007),
+    u32(0),
+    u32(0),
+    u32(1),
+    u32(0),
+    u32(duration),
+    zeros(8),
+    u16(0),
+    u16(0),
+    u16(0),
+    u16(0),
+    u32(0x00010000), u32(0), u32(0),
+    u32(0), u32(0x00010000), u32(0),
+    u32(0), u32(0), u32(0x40000000),
+    u32(width << 16),
+    u32(height << 16),
+  );
+}
+
+function buildMdhdBox(timescale, duration) {
+  return mp4Box(
+    "mdhd",
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(timescale),
+    u32(duration),
+    u16(0x55c4),
+    u16(0),
+  );
+}
+
+function buildHdlrBox() {
+  return mp4Box("hdlr", u32(0), u32(0), ascii("vide"), zeros(12), ascii("VideoHandler\0"));
+}
+
+function buildVmhdBox() {
+  return mp4Box("vmhd", u32(0x00000001), u16(0), u16(0), u16(0), u16(0));
+}
+
+function buildDinfBox() {
+  return mp4Box(
+    "dinf",
+    mp4Box(
+      "dref",
+      u32(0),
+      u32(1),
+      mp4Box("url ", u32(0x00000001)),
+    ),
+  );
+}
+
+function buildStblBox({ width, height, samples, firstSampleOffset, avcConfig }) {
+  return mp4Box(
+    "stbl",
+    buildStsdBox(width, height, avcConfig),
+    buildSttsBox(samples),
+    buildStssBox(samples),
+    buildStscBox(samples.length),
+    buildStszBox(samples),
+    buildStcoBox(firstSampleOffset),
+  );
+}
+
+function buildStsdBox(width, height, avcConfig) {
+  const compressor = new Uint8Array(32);
+  return mp4Box(
+    "stsd",
+    u32(0),
+    u32(1),
+    mp4Box(
+      "avc1",
+      zeros(6),
+      u16(1),
+      zeros(16),
+      u16(width),
+      u16(height),
+      u32(0x00480000),
+      u32(0x00480000),
+      u32(0),
+      u16(1),
+      compressor,
+      u16(24),
+      u16(0xffff),
+      mp4Box("avcC", avcConfig),
+    ),
+  );
+}
+
+function buildSttsBox(samples) {
+  const entries = [];
+  for (const sample of samples) {
+    const last = entries[entries.length - 1];
+    if (last && last.duration === sample.duration) {
+      last.count += 1;
+    } else {
+      entries.push({ count: 1, duration: sample.duration });
+    }
+  }
+  return mp4Box("stts", u32(0), u32(entries.length), ...entries.flatMap((entry) => [u32(entry.count), u32(entry.duration)]));
+}
+
+function buildStssBox(samples) {
+  const keySamples = samples
+    .map((sample, index) => sample.key ? index + 1 : 0)
+    .filter(Boolean);
+  if (!keySamples.length && samples.length) keySamples.push(1);
+  return mp4Box("stss", u32(0), u32(keySamples.length), ...keySamples.map(u32));
+}
+
+function buildStscBox(sampleCount) {
+  return mp4Box("stsc", u32(0), u32(1), u32(1), u32(sampleCount), u32(1));
+}
+
+function buildStszBox(samples) {
+  return mp4Box("stsz", u32(0), u32(0), u32(samples.length), ...samples.map((sample) => u32(sample.data.byteLength)));
+}
+
+function buildStcoBox(firstSampleOffset) {
+  return mp4Box("stco", u32(0), u32(1), u32(firstSampleOffset));
+}
+
+function mp4Box(type, ...payloads) {
+  const size = 8 + payloads.reduce((sum, payload) => sum + payload.byteLength, 0);
+  const output = new Uint8Array(size);
+  const view = new DataView(output.buffer);
+  view.setUint32(0, size, false);
+  output.set(ascii(type), 4);
+  let offset = 8;
+  for (const payload of payloads) {
+    output.set(payload, offset);
+    offset += payload.byteLength;
+  }
+  return output;
+}
+
+function concatBytes(parts) {
+  const output = new Uint8Array(parts.reduce((sum, part) => sum + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
+}
+
+function ascii(text) {
+  const output = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) output[i] = text.charCodeAt(i);
+  return output;
+}
+
+function zeros(length) {
+  return new Uint8Array(length);
+}
+
+function u16(value) {
+  const output = new Uint8Array(2);
+  new DataView(output.buffer).setUint16(0, value, false);
+  return output;
+}
+
+function u32(value) {
+  const output = new Uint8Array(4);
+  new DataView(output.buffer).setUint32(0, value >>> 0, false);
+  return output;
+}
+
+function hasPendingPlaybackInput() {
+  return (
+    pendingDecodeBatches > 0 ||
+    decodeInProgress ||
+    decodeQueue.length > 0 ||
+    Boolean(ws && ws.readyState === WebSocket.OPEN)
+  );
+}
+
+function enqueueDecodeBatch(header, data, epoch) {
+  const frameCount = Number(header.num_frames || 1);
+  decodeQueue.push({ header, data, epoch, frameCount });
+  queuedDecodeFrames += frameCount;
+  pendingDecodeBatches += 1;
+  trimDecodeQueue();
+  pumpDecodeQueue();
+  updateStats();
+}
+
+function trimDecodeQueue() {
+  if (recordingActive) return;
+  if (!decodeQueue.length) return;
+  const playback = playbackController.snapshot();
+  const decodeWindowSeconds = renderedPreviewFrames
+    ? Math.max(DECODE_QUEUE_SECONDS, (playback.maxLeadMs || 0) / 1000)
+    : STARTUP_DECODE_QUEUE_SECONDS;
+  const maxQueuedFrames = Math.max(
+    2,
+    Math.round(previewPlaybackTargetFps() * decodeWindowSeconds),
+  );
+  while (queuedDecodeFrames > maxQueuedFrames && decodeQueue.length > 1) {
+    const item = decodeQueue[0];
+    if (!isEncodedPreviewContentType(item.header.content_type)) break;
+    decodeQueue.shift();
+    queuedDecodeFrames = Math.max(0, queuedDecodeFrames - item.frameCount);
+    pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
+    droppedDecodeFrames += item.frameCount;
+    lastDecodeDropAt = performance.now();
+    lastDecodeDropCount = item.frameCount;
+  }
+}
+
+async function pumpDecodeQueue() {
+  if (decodeInProgress) return;
+  const item = decodeQueue.shift();
+  if (!item) return;
+  queuedDecodeFrames = Math.max(0, queuedDecodeFrames - item.frameCount);
+  decodeInProgress = true;
+  try {
+    await decodeAndEnqueueFrameBatch(item.header, item.data, item.epoch);
+  } catch (error) {
+    handleReceiveError(error, item.epoch);
+  } finally {
+    pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
+    decodeInProgress = false;
+    updateStats();
+    if (decodeQueue.length) pumpDecodeQueue();
+  }
 }
 
 function rgbToImageData(header, payload) {
@@ -582,22 +1130,47 @@ function isEncodedPreviewContentType(contentType) {
 }
 
 async function encodedImageToImageData(header, payload) {
-  const blob = new Blob([payload], { type: header.content_type });
+  const framePayloads = splitEncodedPayload(header, payload);
   if (typeof createImageBitmap === "function") {
     try {
-      const bitmap = await createImageBitmap(blob);
-      return [{ image: bitmap, chunk: header.chunk_index }];
+      return await Promise.all(framePayloads.map(async (framePayload) => ({
+        image: await createImageBitmap(new Blob([framePayload], { type: header.content_type })),
+        chunk: header.chunk_index,
+      })));
     } catch (error) {
-      return [await encodedImageElementFallback(blob, header, error)];
+      return Promise.all(framePayloads.map((framePayload) => (
+        encodedImageElementFallback(
+          new Blob([framePayload], { type: header.content_type }),
+          header,
+          error,
+        )
+      )));
     }
   }
-  return [
-    await encodedImageElementFallback(
-      blob,
+  return Promise.all(framePayloads.map((framePayload) => (
+    encodedImageElementFallback(
+      new Blob([framePayload], { type: header.content_type }),
       header,
       new Error("createImageBitmap unavailable"),
-    ),
-  ];
+    )
+  )));
+}
+
+function splitEncodedPayload(header, payload) {
+  const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+  const lengths = Array.isArray(header.payload_lengths) && header.payload_lengths.length
+    ? header.payload_lengths.map(Number)
+    : [bytes.byteLength];
+  const payloads = [];
+  let offset = 0;
+  for (const length of lengths) {
+    payloads.push(bytes.buffer.slice(
+      bytes.byteOffset + offset,
+      bytes.byteOffset + offset + length,
+    ));
+    offset += length;
+  }
+  return payloads;
 }
 
 async function encodedImageElementFallback(blob, header, createBitmapError) {
@@ -691,20 +1264,13 @@ function drawFrame(image) {
 }
 
 function renderLoop(now) {
-  const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
-  const queueSeconds = queue.length / Math.max(1, targetFps);
-  const catchupFps = !$("superResolution").checked && queueSeconds > LOW_LATENCY_QUEUE_SECONDS
-    ? Math.min(MAX_CATCHUP_FPS, Math.ceil(queue.length / LOW_LATENCY_QUEUE_SECONDS))
-    : targetFps;
-  const targetMs = 1000 / Math.max(1, catchupFps);
-  const elapsedMs = lastFrameAt ? now - lastFrameAt : targetMs;
-  if (queue.length && elapsedMs >= targetMs) {
-    const item = queue.shift();
+  const decision = playbackController.render(now, {
+    hasPendingInput: hasPendingPlaybackInput(),
+  });
+  closeFrames(decision.droppedFrames);
+  if (decision.action === "draw") {
+    const item = decision.frame;
     drawFrame(item.image);
-    // preserve remainder so 25fps is not quantized to 20fps on 60Hz rAF
-    lastFrameAt = !lastFrameAt || elapsedMs > targetMs * 4
-      ? now
-      : now - (elapsedMs % targetMs);
     fpsSamples.push(now);
     fpsSamples = fpsSamples.filter((t) => now - t < 1000);
     const renderedFps = String(fpsSamples.length);
@@ -714,6 +1280,8 @@ function renderLoop(now) {
     $("decodeText").textContent = `${Math.round(item.decodeMs || lastDecodeMs)} ms`;
     $("displayLagText").textContent = `${(lastDisplayLagMs / 1000).toFixed(1)} s`;
     updateStats();
+  } else if (decision.action === "hold") {
+    updateStats();
   }
   requestAnimationFrame(renderLoop);
 }
@@ -721,7 +1289,7 @@ function renderLoop(now) {
 async function readFirstFrame() {
   const file = $("firstFrame").files[0];
   if (file) return new Uint8Array(await file.arrayBuffer());
-  return selectedReferenceBytes || undefined;
+  return selectedReferenceBytes || selectedReferenceUrl || undefined;
 }
 
 function drawReferencePreviewFromImageSource(src, label) {
@@ -746,30 +1314,18 @@ function drawReferencePreviewFromImageSource(src, label) {
 
 function drawReferencePreview(file) {
   selectedReferenceBytes = null;
+  selectedReferenceUrl = "";
   selectedReferenceLabel = file ? file.name : "";
   if (!file) return;
   drawReferencePreviewFromImageSource(URL.createObjectURL(file), file.name);
 }
 
-async function fetchPresetReference(preset) {
-  if (!referenceCache.has(preset.referenceUrl)) {
-    referenceCache.set(preset.referenceUrl, fetch(preset.referenceUrl).then(async (response) => {
-      if (!response.ok) throw new Error(`failed to load ${preset.source}`);
-      return new Uint8Array(await response.arrayBuffer());
-    }).catch((error) => {
-      referenceCache.delete(preset.referenceUrl);
-      throw error;
-    }));
-  }
-  return referenceCache.get(preset.referenceUrl);
-}
-
 async function setPresetReference(preset) {
-  selectedReferenceBytes = await fetchPresetReference(preset);
+  selectedReferenceBytes = null;
+  selectedReferenceUrl = preset.referenceUrl;
   selectedReferenceLabel = preset.source;
   $("firstFrame").value = "";
-  const blob = new Blob([selectedReferenceBytes], { type: preset.mime || "image/jpeg" });
-  drawReferencePreviewFromImageSource(URL.createObjectURL(blob), selectedReferenceLabel);
+  drawReferencePreviewFromImageSource(preset.referenceUrl, selectedReferenceLabel);
 }
 
 function showError(error) {
@@ -847,7 +1403,7 @@ async function connect() {
     }
     resetStreamStats();
     const epoch = ++streamEpoch;
-    if (!$("firstFrame").files[0] && !selectedReferenceBytes) {
+    if (!$("firstFrame").files[0] && !selectedReferenceBytes && !selectedReferenceUrl) {
       await setPresetReference(presets[0]);
     }
     const firstFrame = await readFirstFrame();
@@ -890,7 +1446,6 @@ async function connect() {
     socketServerError = "";
     socket.onopen = () => {
       if (epoch !== streamEpoch) return;
-      chunkWaitStartedAt = performance.now();
       socket.send(pack(init));
       setStatus("Starting", "live");
       addHistory(
@@ -972,13 +1527,7 @@ function receive(data, epoch) {
     if (message.type === "frame_batch") {
       const payload = message.payload;
       delete message.payload;
-      pendingDecodeBatches += 1;
-      decodeChain = decodeChain
-        .then(() => decodeAndEnqueueFrameBatch(message, payload, epoch))
-        .catch((error) => handleReceiveError(error, epoch))
-        .finally(() => {
-          pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
-        });
+      enqueueDecodeBatch(message, payload, epoch);
       setStatus("Live", "live");
       return;
     }
@@ -988,20 +1537,12 @@ function receive(data, epoch) {
   }
   const header = pendingHeader;
   pendingHeader = null;
-  pendingDecodeBatches += 1;
-  decodeChain = decodeChain
-    .then(() => decodeAndEnqueueFrameBatch(header, data, epoch))
-    .catch((error) => handleReceiveError(error, epoch))
-    .finally(() => {
-      pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
-    });
+  enqueueDecodeBatch(header, data, epoch);
 }
 
 async function decodeAndEnqueueFrameBatch(header, data, epoch) {
-  const eventId = Number(header.event_id || 0);
   const chunkFrameCount = Number(header.num_frames || 0);
   const payloadBytes = data.byteLength || data.size || 0;
-  const isEventCutover = awaitedEventId && eventId >= awaitedEventId;
   let decodedFrames;
   try {
     decodedFrames = await decodeFrameBatch(header, data);
@@ -1015,27 +1556,21 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
     for (const item of decodedFrames) item.image?.close?.();
     return;
   }
-  if (isEventCutover) {
-    droppedFrames += queue.length;
-    clearFrameQueue();
-    lastFrameAt = 0;
-    if (awaitedEventSentAt) {
-      const eventLatency = (performance.now() - awaitedEventSentAt) / 1000;
-      $("latencyText").textContent = `${eventLatency.toFixed(1)}s · event`;
-      $("stageLatencyText").textContent = `${eventLatency.toFixed(1)}s · event`;
-    }
-    awaitedEventId = 0;
-    awaitedEventSentAt = 0;
+  const now = performance.now();
+  // record source frames before preview playback can hold or drop for latency
+  recordDecodedFrameBatch(decodedFrames);
+  const enqueueResult = playbackController.enqueueDecodedFrames(header, decodedFrames, now);
+  closeFrames(enqueueResult.droppedFrames);
+  if (enqueueResult.cutover?.latencyMs) {
+    const eventLatency = enqueueResult.cutover.latencyMs / 1000;
+    $("latencyText").textContent = `${eventLatency.toFixed(1)}s · event`;
   }
-  queue.push(...decodedFrames);
-  trimLiveQueue(liveQueueFrameFloor(header, chunkFrameCount));
   frames += chunkFrameCount;
   bytes += payloadBytes;
   $("payloadMode").textContent = header.encoding || "raw RGB";
   updateOutputSizeFromHeader(header);
-  updatePlaybackPace(header, performance.now(), chunkFrameCount);
   setStatus("Live", "live");
-  updateStats(header);
+  updateStats();
 }
 
 function updateServerChunkStats(stats) {
@@ -1043,49 +1578,24 @@ function updateServerChunkStats(stats) {
   const wsWrite = Number(stats.ws_write_ms || 0) / 1000;
   const chunkTotal = Number(stats.chunk_total_ms || 0) / 1000;
   const numFrames = Number(stats.num_frames || 0);
-  const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
+  const chunkIndex = Number(stats.chunk_index || 0);
+  const targetFps = previewPlaybackTargetFps();
   const theoreticalFps = chunkTotal > 0 ? numFrames / chunkTotal : 0;
-  const realtimeRatio = requestedFps > 0 ? theoreticalFps / requestedFps : 0;
+  const playback = playbackController.observeServerStats(stats, performance.now());
+  const realtimeRatio = targetFps > 0 ? theoreticalFps / targetFps : 0;
+  const isWarmupChunk =
+    chunkIndex === 0 && theoreticalFps > 0 && theoreticalFps < targetFps * 0.8;
   $("serverSendText").textContent = `raw ${rawWrite.toFixed(2)}s · ws ${wsWrite.toFixed(2)}s`;
   $("chunkPayloadText").textContent = `${formatBytes(stats.ws_payload_bytes || 0)} · ${numFrames}f`;
-  $("theoreticalFpsText").textContent = theoreticalFps > 0
-    ? `${theoreticalFps.toFixed(1)} fps · ${realtimeRatio.toFixed(2)}x`
+  $("theoreticalFpsText").textContent = isWarmupChunk
+    ? `warmup · ${chunkTotal.toFixed(2)}s`
+    : theoreticalFps > 0
+    ? `${playback.sourceFps.toFixed(1)} fps · ${realtimeRatio.toFixed(2)}x`
     : "-";
+  if (chunkTotal > 0) {
+    $("latencyText").textContent = `${chunkTotal.toFixed(2)}s · ${playback.sourceFps.toFixed(1)}fps`;
+  }
   if (stats.content_type) $("payloadMode").textContent = shortPayloadMode(stats.content_type);
-}
-
-function updatePlaybackPace(header, now, frameCount) {
-  const chunkIndex = Number(header.chunk_index || 0);
-  if (currentReceiveChunk !== chunkIndex) {
-    currentReceiveChunk = chunkIndex;
-    currentReceiveChunkFrames = 0;
-    chunkReceiveStartedAt = chunkWaitStartedAt || now;
-  }
-  currentReceiveChunkFrames += Number(frameCount || 0);
-  const frameBatchIndex = Number(header.frame_batch_index || 0);
-  const numFrameBatches = Number(header.num_frame_batches || 1);
-  const isFinalFrameBatch =
-    Boolean(header.is_final_frame_batch) ||
-    frameBatchIndex + 1 >= numFrameBatches;
-  if (!isFinalFrameBatch || !chunkWaitStartedAt) return;
-
-  const waitSeconds = (now - chunkWaitStartedAt) / 1000;
-  if (waitSeconds > 0) {
-    const generatedFps = currentReceiveChunkFrames / Math.max(0.001, waitSeconds);
-    const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
-    const playbackFloor = $("superResolution").checked ? 1 : LOW_LATENCY_FPS_FLOOR;
-    playbackFps = Math.min(
-      requestedFps,
-      Math.max(playbackFloor, generatedFps * 1.05),
-    );
-    const latencyText = `${waitSeconds.toFixed(1)}s · ${playbackFps.toFixed(1)}fps`;
-    $("latencyText").textContent = latencyText;
-    $("stageLatencyText").textContent = latencyText;
-  }
-  chunkWaitStartedAt = performance.now();
-  chunkReceiveStartedAt = chunkWaitStartedAt;
-  currentReceiveChunk = null;
-  currentReceiveChunkFrames = 0;
 }
 
 function sendEvent(kind, payload, historyText = null) {
@@ -1096,14 +1606,20 @@ function sendEvent(kind, payload, historyText = null) {
   const eventId = nextEventId++;
   ws.send(pack({ type: "event", kind, payload, event_id: eventId }));
   if (kind === "camera_actions" || kind === "prompt") {
-    awaitedEventId = eventId;
-    awaitedEventSentAt = performance.now();
-    trimQueueForPendingEvent();
+    playbackController.noteInputEvent(eventId, performance.now(), {
+      cutoverMode: cameraActionHasActiveMotion(payload) || kind === "prompt" ? "motion" : "settle",
+    });
     updateStats();
     setStatus("Updating", "live");
   }
   addHistory(`${historyText || `${kind} event sent`} · event#${eventId}`);
   return eventId;
+}
+
+function cameraActionHasActiveMotion(payload) {
+  const transitions = payload?.transitions || [];
+  const finalTransition = transitions[transitions.length - 1];
+  return Array.isArray(finalTransition?.actions) && finalTransition.actions.length > 0;
 }
 
 function sendCameraControlTransitions(transitions) {
@@ -1130,6 +1646,7 @@ async function applyPreset(preset, options = {}) {
   $("size").value = preset.size;
   $("fps").value = preset.fps;
   updateOutputSizeText();
+  syncPlaybackTargetFps();
   await setPresetReference(preset);
   if (sendRuntimeEvents) {
     sendEvent("prompt", preset.prompt, `prompt update · ${preset.name}`);
@@ -1249,11 +1766,32 @@ function readPreviewTransportParams() {
   const outputFormat = $("transportFormat").value;
   const outputQuality = Number($("transportQuality").value || DEFAULT_PREVIEW_OUTPUT_QUALITY);
   if (!outputFormat) return {};
-  const params = { realtime_output_format: outputFormat };
+  const params = {
+    realtime_output_format: outputFormat,
+    realtime_output_pacing: true,
+  };
   if (outputFormat === "webp" || outputFormat === "jpeg") {
     params.output_compression = outputQuality;
+    if ($("superResolution").checked && $("frameInterpolation").checked) {
+      const baseSize = parseSizeValue($("size").value);
+      if (baseSize?.width) params.realtime_preview_max_width = baseSize.width;
+    }
   }
   return params;
+}
+
+function tunePreviewQualityForPostprocess() {
+  if ($("transportFormat").value !== "webp") return;
+  const currentQuality = Number($("transportQuality").value || DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  let qualityCap = MAX_WEBP_PREVIEW_OUTPUT_QUALITY;
+  if ($("frameInterpolation").checked && $("superResolution").checked) {
+    qualityCap = HEAVY_PREVIEW_OUTPUT_QUALITY;
+  } else if ($("frameInterpolation").checked) {
+    qualityCap = SMOOTH_PREVIEW_OUTPUT_QUALITY;
+  } else if ($("superResolution").checked) {
+    qualityCap = SR_PREVIEW_OUTPUT_QUALITY;
+  }
+  if (currentQuality > qualityCap) $("transportQuality").value = String(qualityCap);
 }
 
 function readFrameInterpolationParams() {
@@ -1271,10 +1809,13 @@ function readUpscalingScale() {
 
 function readSuperResolutionParams() {
   if (!$("superResolution").checked) return {};
-  return {
+  const params = {
     enable_upscaling: true,
     upscaling_scale: readUpscalingScale(),
   };
+  const modelPath = $("upscalingModel").value;
+  if (modelPath) params.upscaling_model_path = modelPath;
+  return params;
 }
 
 function parseSizeValue(sizeText) {
@@ -1304,13 +1845,19 @@ function updateOutputSizeText(width = null, height = null) {
 }
 
 function updateOutputSizeFromHeader(header) {
-  const width = Number(header.width || 0);
-  const height = Number(header.height || 0);
-  if (width && height) updateOutputSizeText(width, height);
+  const width = Number(header.source_width || header.width || 0);
+  const height = Number(header.source_height || header.height || 0);
+  if (!width || !height) return;
+  updateOutputSizeText(width, height);
+  if (header.preview_width && header.preview_height) {
+    $("outputSizeText").textContent += ` · preview ${header.preview_width}x${header.preview_height}`;
+  }
 }
 
 function updateSuperResolutionControls() {
-  $("upscalingScale").disabled = !$("superResolution").checked;
+  const disabled = !$("superResolution").checked;
+  $("upscalingScale").disabled = disabled;
+  $("upscalingModel").disabled = disabled;
   updateOutputSizeText();
 }
 
@@ -1343,6 +1890,12 @@ function formatBytes(value) {
   return `${(Number(value || 0) / 1048576).toFixed(1)} MB`;
 }
 
+function formatMs(value) {
+  const ms = Number(value || 0);
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms)}ms`;
+}
+
 function renderPresets() {
   $("presetList").innerHTML = "";
   presets.forEach((preset) => {
@@ -1357,6 +1910,23 @@ function renderPresets() {
 
 async function applyQueryParams() {
   const params = new URLSearchParams(window.location.search);
+  const server = params.get("server");
+  if (server) $("serverUrl").value = server;
+  const model = params.get("model");
+  if (model) $("model").value = model;
+  $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
+  $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  const srParam = params.get("sr");
+  $("superResolution").checked = srParam === "1" || srParam === "true";
+  const smoothParam = params.get("smooth");
+  $("frameInterpolation").checked = smoothParam === "1" || smoothParam === "true";
+  $("upscalingScale").value = params.get("sr_scale") || String(DEFAULT_UPSCALING_SCALE);
+  $("upscalingModel").value = params.get("sr_model") || DEFAULT_UPSCALING_MODEL;
+  tunePreviewQualityForPostprocess();
+  setPreviewScale(params.get("preview_scale") || params.get("zoom"));
+  updateSuperResolutionControls();
+  syncPlaybackTargetFps();
+
   const presetKey = params.get("preset");
   let appliedPreset = false;
   if (presetKey) {
@@ -1370,17 +1940,6 @@ async function applyQueryParams() {
       appliedPreset = true;
     }
   }
-  const server = params.get("server");
-  if (server) $("serverUrl").value = server;
-  const model = params.get("model");
-  if (model) $("model").value = model;
-  $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
-  $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
-  const srParam = params.get("sr");
-  $("superResolution").checked = srParam === "1" || srParam === "true";
-  $("upscalingScale").value = params.get("sr_scale") || String(DEFAULT_UPSCALING_SCALE);
-  setPreviewScale(params.get("preview_scale") || params.get("zoom"));
-  updateSuperResolutionControls();
   return {
     model: Boolean(model),
     preset: Boolean(presetKey && appliedPreset),
@@ -1459,6 +2018,12 @@ function unpack(buf) {
         (buf[i++] * 16777216) + (buf[i++] << 16) + (buf[i++] << 8) + buf[i++],
       );
     }
+    if (b === 0xdc) return Array.from({ length: (buf[i++] << 8) | buf[i++] }, read);
+    if (b === 0xdd) {
+      return Array.from({
+        length: (buf[i++] * 16777216) + (buf[i++] << 16) + (buf[i++] << 8) + buf[i++],
+      }, read);
+    }
     if (b === 0xd9) return readStr(buf[i++]);
     if (b === 0xda) return readStr((buf[i++] << 8) | buf[i++]);
     if (b === 0xde) return readMap((buf[i++] << 8) | buf[i++]);
@@ -1478,21 +2043,38 @@ renderPresets();
 drawIdle();
 setPreviewScale(DEFAULT_PREVIEW_SCALE);
 updateSuperResolutionControls();
-applyPreset(presets[0], { sendRuntimeEvents: false })
-  .then(applyQueryParams)
+applyQueryParams()
+  .then(async (query) => {
+    if (!query.preset) await applyPreset(presets[0], { sendRuntimeEvents: false });
+    return query;
+  })
   .then((query) => queryServerModelInfo({
     applyPresetForModel: !query.model && !query.preset,
   }))
   .catch(showError);
 requestAnimationFrame(renderLoop);
+updateRecordButton();
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
+$("recordBtn").onclick = () => {
+  if (recordingActive) {
+    stopRecording();
+  } else {
+    startRecording();
+  }
+};
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
 $("size").addEventListener("input", () => updateOutputSizeText());
+$("fps").addEventListener("input", syncPlaybackTargetFps);
 $("superResolution").addEventListener("change", updateSuperResolutionControls);
 $("upscalingScale").addEventListener("change", () => updateOutputSizeText());
+$("frameInterpolation").addEventListener("change", () => {
+  tunePreviewQualityForPostprocess();
+  syncPlaybackTargetFps();
+});
+$("superResolution").addEventListener("change", tunePreviewQualityForPostprocess);
 $("previewScale").addEventListener("input", () => setPreviewScale($("previewScale").value));
 $("serverUrl").addEventListener("change", () => {
   queryServerModelInfo({ applyPresetForModel: true }).catch(showError);
@@ -1536,14 +2118,14 @@ class ControlStateController {
   constructor() {
     this.activeActions = new Set();
     this.pendingTransitions = [];
-    this.flushScheduled = false;
+    this.flushTimer = 0;
   }
 
   reset({ sendRelease = false } = {}) {
     const hadActions = this.activeActions.size > 0;
     this.activeActions.clear();
     this.pendingTransitions = [];
-    this.flushScheduled = false;
+    this.clearFlushTimer();
     this.updateButtons();
     if (sendRelease && hadActions) {
       this.enqueueTransition();
@@ -1579,15 +2161,15 @@ class ControlStateController {
   }
 
   scheduleFlush() {
-    if (this.flushScheduled) return;
-    this.flushScheduled = true;
-    queueMicrotask(() => {
-      this.flushScheduled = false;
+    if (this.flushTimer) return;
+    this.flushTimer = window.setTimeout(() => {
+      this.flushTimer = 0;
       this.flush();
-    });
+    }, CONTROL_TRANSITION_FLUSH_DELAY_MS);
   }
 
   flush() {
+    this.clearFlushTimer();
     if (!this.pendingTransitions.length) return;
     if (ws && ws.bufferedAmount > CONTROL_BUFFERED_AMOUNT_LIMIT) {
       this.compactPendingToLatestPulse();
@@ -1622,6 +2204,12 @@ class ControlStateController {
 
   sameActions(left, right) {
     return left.length === right.length && left.every((item, idx) => item === right[idx]);
+  }
+
+  clearFlushTimer() {
+    if (!this.flushTimer) return;
+    window.clearTimeout(this.flushTimer);
+    this.flushTimer = 0;
   }
 }
 
