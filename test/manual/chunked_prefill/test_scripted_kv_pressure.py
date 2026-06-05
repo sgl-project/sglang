@@ -38,6 +38,12 @@ class TestKVPressureBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r_warm)
         assert r_warm.finished
+        # the overlap scheduler drops the finished req's protective lock a few
+        # steps after the finish is observed; drain before asserting.
+        for _ in range(12):
+            if r_warm.lock_refs == 0:
+                break
+            yield
         assert r_warm.lock_refs == 0
 
         # Baseline AFTER warming: this is the global lock_ref state the reset
@@ -98,7 +104,10 @@ class TestKVPressureBasic(ScriptedTestCase):
         # is stuck waiting. Confirm it stays waiting under the full pool, release
         # the exhauster, then confirm it is admitted, completes, and the pool
         # recovers to baseline.
-        t.exhaust_kv(leave_pages=0)
+        # leave_pages must stay positive: the kv-canary integrity layer itself
+        # allocates a few pages during its sweep, and a literally-zero pool
+        # wedges the engine; 8 pages still keep a 16-token req unadmittable.
+        t.exhaust_kv(leave_pages=8)
         yield
 
         r = t.start_req(prompt_len=16, max_new_tokens=2)

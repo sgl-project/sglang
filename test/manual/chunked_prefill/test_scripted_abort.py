@@ -281,7 +281,10 @@ class TestAbortBasic(ScriptedTestCase):
         # Real admission pressure: grab every free KV page so the scheduler can
         # never admit the req, yet the loop keeps running get_next_batch_to_run
         # (and thus the sweep) every iteration.
-        t.exhaust_kv(leave_pages=0)
+        # leave_pages must stay positive: the kv-canary integrity layer itself
+        # allocates a few pages during its sweep, and a literally-zero pool
+        # wedges the engine; 8 pages still keep a 16-token req unadmittable.
+        t.exhaust_kv(leave_pages=8)
 
         r = t.start_req(prompt_len=16, max_new_tokens=2)
 
