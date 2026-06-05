@@ -283,6 +283,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.mark_forward_metadata_ready()
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
@@ -291,6 +292,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
+        forward_batch.mark_forward_metadata_ready()
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
@@ -622,9 +624,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             seq_lens_cpu=batch.seq_lens_cpu,
         )
 
-    def draft_forward(
-        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
-    ):
+    def draft_forward(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
@@ -634,7 +634,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         # Seed + recurrent iters share the same `seq_lens - 1` rope position,
         # so one init covers the loop. Must run even at num_steps == 1.
-        if not skip_attn_backend_init:
+        if forward_batch.needs_forward_metadata_init():
             self._init_frozen_kv_metadata(forward_batch)
 
         # Seed iter: assistant forward on (bonus_token, target_h) to produce
@@ -657,9 +657,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             self._target_kv_pool_view(forward_batch),
             forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
         ):
-            seed_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            seed_output = self.draft_model_runner.forward(forward_batch).logits_output
 
         maybe_detect_nan(
             seed_output.next_token_logits, "frozen_kv_mtp_draft: seed iter"
@@ -703,7 +701,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 ).logits_output
 
             maybe_detect_nan(
