@@ -1295,31 +1295,61 @@ class CustomQwen2Decoder(nn.Module):
                 token_type_ids,
             ):
                 min_dtype = torch.finfo(dtype).min
-                masks = []
-                for b in range(batch_size):
-                    mask = torch.full(
-                        (sequence_length, sequence_length),
-                        fill_value=min_dtype,
-                        dtype=dtype,
-                        device=device,
-                    )
 
-                    type_ids = token_type_ids[b]
-                    image_positions = (type_ids == 0).nonzero(as_tuple=True)[0]
-                    text_positions = (type_ids == 1).nonzero(as_tuple=True)[0]
+                # token_type_ids: [batch_size, sequence_length]
+                # type 0 = image, type 1 = text
 
-                    if len(image_positions) > 0:
-                        mask[image_positions[:, None], image_positions] = 0.0
+                # is_image / is_text: [B, S] bool
+                is_image = token_type_ids == 0  # [B, S]
+                is_text  = token_type_ids == 1  # [B, S]
 
-                    for i, text_pos in enumerate(text_positions):
-                        if len(image_positions) > 0:
-                            mask[text_pos, image_positions] = 0.0
-                        mask[text_pos, text_positions[: i + 1]] = 0.0
+                # Start with an all-masked (min_dtype) matrix for every batch item.
+                # mask shape: [B, S, S]  (query dim=1, key dim=2)
+                mask = torch.full(
+                    (batch_size, sequence_length, sequence_length),
+                    fill_value=min_dtype,
+                    dtype=dtype,
+                    device=device,
+                )
 
-                    masks.append(mask)
+                # -------------------------------------------------------------------
+                # Rule 1: image tokens can attend to all other image tokens.
+                #   mask[b, img_q, img_k] = 0   for all image positions q,k
+                #   Vectorised: outer-product of is_image with itself → [B, S, S]
+                # -------------------------------------------------------------------
+                img_outer = is_image.unsqueeze(2) & is_image.unsqueeze(1)   # [B, S, S]
 
-                mask = torch.stack(masks, dim=0).unsqueeze(1)
-                return mask
+                # -------------------------------------------------------------------
+                # Rule 2: text token i can attend to
+                #   (a) all image tokens
+                #   (b) text tokens j with j <= i  (causal, within the text tokens only)
+                #
+                # Build a causal mask over the *full* sequence positions but zeroed
+                # only where both positions are text:
+                #   causal_text[b, q, k] = is_text[b,q] & is_text[b,k] & (k <= q)
+                # Plus text attending to image:
+                #   text_to_image[b, q, k] = is_text[b,q] & is_image[b,k]
+                # -------------------------------------------------------------------
+                # causal indices: k <= q  →  lower-triangular boolean [S, S]
+                idx = torch.arange(sequence_length, device=device)
+                causal = idx.unsqueeze(0) <= idx.unsqueeze(1)   # [S, S]  (q row, k col)
+
+                # text-causal: [B, S, S]
+                text_causal = (
+                    is_text.unsqueeze(2)       # [B, S, 1] query is text
+                    & is_text.unsqueeze(1)     # [B, 1, S] key   is text
+                    & causal.unsqueeze(0)      # [1, S, S] causal
+                )
+
+                # text attending to image: [B, S, S]
+                text_to_img = is_text.unsqueeze(2) & is_image.unsqueeze(1)  # [B, S, S]
+
+                # Combine: wherever any of the three conditions holds, set mask to 0
+                allow = img_outer | text_causal | text_to_img   # [B, S, S]
+                mask[allow] = 0.0
+
+                # Add the head dimension → [B, 1, S, S]
+                return mask.unsqueeze(1)
 
         return CustomQwen2ModelInner(config)
 
