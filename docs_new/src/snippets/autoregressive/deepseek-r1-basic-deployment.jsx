@@ -193,16 +193,23 @@ export const DeepSeekR1BasicDeployment = () => {
           }
         }
       }
+      if (optionName === 'hardware') {
+        if (next.hardware === 'xeon') {
+          next.quantization = 'int8';
+        } else if (next.quantization === 'int8') {
+          next.quantization = 'fp8';
+        }
+      }
       const strategyItems = options.strategy.items || [];
       const currentStrategy = Array.isArray(next.strategy) ? next.strategy : [];
       next.strategy = currentStrategy.filter((id) => {
         const item = strategyItems.find((s) => s.id === id);
         if (!item) {
-	  return false;
-	}
+          return false;
+        }
         if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) {
-	  return false;
-	}
+          return false;
+        }
         return true;
       });
       return next;
