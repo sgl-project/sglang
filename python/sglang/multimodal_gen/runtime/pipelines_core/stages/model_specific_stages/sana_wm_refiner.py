@@ -107,16 +107,11 @@ def sana_wm_skip_refiner_enabled(
     if batch is None:
         return False
     extra = getattr(batch, "extra", None) or {}
-    diffusers_kwargs = extra.get("diffusers_kwargs", {})
-    if not isinstance(diffusers_kwargs, dict):
-        diffusers_kwargs = {}
     return any(
         _truthy_flag(value)
         for value in (
             extra.get("skip_refiner"),
             extra.get("sana_wm_skip_refiner"),
-            diffusers_kwargs.get("skip_refiner"),
-            diffusers_kwargs.get("sana_wm_skip_refiner"),
         )
     )
 

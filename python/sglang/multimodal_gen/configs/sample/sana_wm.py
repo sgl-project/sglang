@@ -45,19 +45,18 @@ class SanaWMSamplingParams(SamplingParams):
     rotation_speed_deg: float = 1.2
     pitch_limit_deg: float = 85.0
 
-    def build_request_extra(self) -> dict[str, Any]:
-        extra = super().build_request_extra()
+    def _adjust(self, server_args):
+        super()._adjust(server_args)
         if self.action is not None and self.camera_to_world is not None:
             raise ValueError(
                 "SANA-WM accepts either action or camera_to_world, not both."
             )
         if self.camera_to_world is not None:
-            extra["camera_to_world"] = self.camera_to_world
+            self.condition_inputs["camera_to_world"] = self.camera_to_world
         if self.intrinsics is not None:
-            extra["intrinsics"] = self.intrinsics
+            self.condition_inputs["intrinsics"] = self.intrinsics
         if self.action is not None:
-            extra["action"] = self.action
-            extra["translation_speed"] = self.translation_speed
-            extra["rotation_speed_deg"] = self.rotation_speed_deg
-            extra["pitch_limit_deg"] = self.pitch_limit_deg
-        return extra
+            self.condition_inputs["action"] = self.action
+            self.condition_inputs["translation_speed"] = self.translation_speed
+            self.condition_inputs["rotation_speed_deg"] = self.rotation_speed_deg
+            self.condition_inputs["pitch_limit_deg"] = self.pitch_limit_deg

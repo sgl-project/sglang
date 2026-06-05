@@ -72,6 +72,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     _sana_wm_effective_guidance_scale,
     _sana_wm_should_do_cfg,
     configure_sana_wm_ltx2_vae_for_long_video,
+)
+from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
+    coerce_sana_wm_intrinsics_vec4,
+    latent_frame_sana_wm_camera_conditions,
     parse_sana_wm_action_string,
     sana_wm_action_to_camera_to_world,
 )
@@ -579,6 +583,10 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
 
 
 class TestSanaWMSamplingParams(unittest.TestCase):
+    @staticmethod
+    def _server_args():
+        return SimpleNamespace(pipeline_config=SanaWMPipelineConfig(), output_path=None)
+
     def test_defaults_match_video_ti2v_contract(self) -> None:
         params = SanaWMSamplingParams()
         self.assertEqual(params.height, 704)
@@ -588,21 +596,21 @@ class TestSanaWMSamplingParams(unittest.TestCase):
         self.assertEqual(params.guidance_scale, 4.5)
         self.assertEqual(params.negative_prompt, "")
 
-    def test_build_request_extra_omits_camera_by_default(self) -> None:
+    def test_adjust_omits_camera_condition_inputs_by_default(self) -> None:
         params = SanaWMSamplingParams()
-        extra = params.build_request_extra()
-        self.assertNotIn("camera_to_world", extra)
-        self.assertNotIn("intrinsics", extra)
+        params._adjust(self._server_args())
+        self.assertNotIn("camera_to_world", params.condition_inputs)
+        self.assertNotIn("intrinsics", params.condition_inputs)
 
-    def test_build_request_extra_includes_camera_when_set(self) -> None:
+    def test_adjust_includes_camera_condition_inputs_when_set(self) -> None:
         cam = torch.eye(4).unsqueeze(0).expand(49, 4, 4)
         intr = torch.eye(3).unsqueeze(0).expand(49, 3, 3)
         params = SanaWMSamplingParams(camera_to_world=cam, intrinsics=intr)
-        extra = params.build_request_extra()
-        self.assertIs(extra["camera_to_world"], cam)
-        self.assertIs(extra["intrinsics"], intr)
+        params._adjust(self._server_args())
+        self.assertIs(params.condition_inputs["camera_to_world"], cam)
+        self.assertIs(params.condition_inputs["intrinsics"], intr)
 
-    def test_build_request_extra_includes_action_when_set(self) -> None:
+    def test_adjust_includes_action_condition_inputs_when_set(self) -> None:
         params = SanaWMSamplingParams(
             action="w-8,jw-8",
             translation_speed=0.06,
@@ -610,19 +618,19 @@ class TestSanaWMSamplingParams(unittest.TestCase):
             pitch_limit_deg=70.0,
         )
 
-        extra = params.build_request_extra()
+        params._adjust(self._server_args())
 
-        self.assertEqual(extra["action"], "w-8,jw-8")
-        self.assertEqual(extra["translation_speed"], 0.06)
-        self.assertEqual(extra["rotation_speed_deg"], 2.0)
-        self.assertEqual(extra["pitch_limit_deg"], 70.0)
+        self.assertEqual(params.condition_inputs["action"], "w-8,jw-8")
+        self.assertEqual(params.condition_inputs["translation_speed"], 0.06)
+        self.assertEqual(params.condition_inputs["rotation_speed_deg"], 2.0)
+        self.assertEqual(params.condition_inputs["pitch_limit_deg"], 70.0)
 
-    def test_build_request_extra_rejects_action_with_direct_camera(self) -> None:
+    def test_adjust_rejects_action_with_direct_camera(self) -> None:
         cam = torch.eye(4).unsqueeze(0).expand(49, 4, 4)
         params = SanaWMSamplingParams(action="w-8", camera_to_world=cam)
 
         with self.assertRaisesRegex(ValueError, "either action or camera_to_world"):
-            params.build_request_extra()
+            params._adjust(self._server_args())
 
     def test_cli_args_accept_upstream_action_aliases(self) -> None:
         parser = argparse.ArgumentParser()
@@ -1474,10 +1482,8 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             pipeline_config=SanaWMPipelineConfig(),
         )
         batch = SimpleNamespace(
+            condition_inputs={"intrinsics": [50.0, 50.0, 50.0, 50.0]},
             extra={
-                "diffusers_kwargs": {
-                    "intrinsics": [50.0, 50.0, 50.0, 50.0],
-                },
                 "sana_wm_condition_image_preprocess": {
                     "source_size": (100, 100),
                     "resized_size": (1280, 1280),
@@ -1507,19 +1513,17 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             )
         )
 
-    def test_explicit_camera_request_detects_diffusers_path_kwargs(self) -> None:
-        batch = SimpleNamespace(
-            extra={"diffusers_kwargs": {"camera_to_world_path": "/tmp/cam.npy"}}
-        )
+    def test_explicit_camera_request_detects_camera_condition_inputs(self) -> None:
+        batch = SimpleNamespace(condition_inputs={"camera_to_world": "/tmp/cam.npy"})
 
         self.assertTrue(SanaWMBeforeDenoisingStage._has_explicit_camera_request(batch))
 
-    def test_explicit_camera_request_detects_action_kwargs(self) -> None:
-        batch = SimpleNamespace(extra={"diffusers_kwargs": {"action": "w-8"}})
+    def test_explicit_camera_request_detects_action_condition_inputs(self) -> None:
+        batch = SimpleNamespace(condition_inputs={"action": "w-8"})
 
         self.assertTrue(SanaWMBeforeDenoisingStage._has_explicit_camera_request(batch))
 
-    def test_action_conditioning_uses_existing_camera_path(self) -> None:
+    def test_action_conditioning_uses_condition_inputs(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
             transformer=None,
@@ -1527,11 +1531,9 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             pipeline_config=SanaWMPipelineConfig(),
         )
         batch = SimpleNamespace(
-            extra={
-                "diffusers_kwargs": {
-                    "action": "w-8",
-                    "intrinsics": [50.0, 50.0, 32.0, 32.0],
-                }
+            condition_inputs={
+                "action": "w-8",
+                "intrinsics": [50.0, 50.0, 32.0, 32.0],
             },
             height=64,
             width=64,
@@ -1559,7 +1561,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             pipeline_config=SanaWMPipelineConfig(),
         )
         batch = SimpleNamespace(
-            extra={"chunk_plucker": torch.zeros(48, 3, 12, 20)},
+            condition_inputs={"chunk_plucker": torch.zeros(48, 3, 12, 20)},
             height=384,
             width=640,
         )
@@ -1577,7 +1579,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(camera_conditions.shape, (1, 3, 20))
         self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
 
-    def test_camera_conditioning_accepts_diffusers_prebuilt_raymap(self) -> None:
+    def test_camera_conditioning_accepts_prebuilt_raymap_condition_inputs(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
             transformer=None,
@@ -1588,7 +1590,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         camera_conditions[..., :16] = torch.eye(4).reshape(1, 1, 16)
         camera_conditions[..., 16:] = torch.tensor([16.0, 16.0, 10.0, 6.0])
         batch = SimpleNamespace(
-            extra={"diffusers_kwargs": {"camera_conditions": camera_conditions}},
+            condition_inputs={"camera_conditions": camera_conditions},
             height=384,
             width=640,
         )
@@ -1617,7 +1619,9 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "camera_conditions must have shape"):
             stage._build_camera_conditioning(
                 SimpleNamespace(
-                    extra={"camera_conditions": torch.zeros(1, 1, 3, 20)},
+                    condition_inputs={
+                        "camera_conditions": torch.zeros(1, 1, 3, 20)
+                    },
                     height=384,
                     width=640,
                 ),
@@ -1631,7 +1635,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "batch dimension"):
             stage._build_camera_conditioning(
                 SimpleNamespace(
-                    extra={"camera_conditions": torch.zeros(3, 3, 20)},
+                    condition_inputs={"camera_conditions": torch.zeros(3, 3, 20)},
                     height=384,
                     width=640,
                 ),
@@ -1645,7 +1649,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "require chunk_plucker"):
             stage._build_camera_conditioning(
                 SimpleNamespace(
-                    extra={"camera_conditions": torch.zeros(1, 3, 20)},
+                    condition_inputs={"camera_conditions": torch.zeros(1, 3, 20)},
                     height=384,
                     width=640,
                 ),
@@ -1659,7 +1663,9 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "batch dimension"):
             stage._build_camera_conditioning(
                 SimpleNamespace(
-                    extra={"chunk_plucker": torch.zeros(3, 48, 3, 12, 20)},
+                    condition_inputs={
+                        "chunk_plucker": torch.zeros(3, 48, 3, 12, 20)
+                    },
                     height=384,
                     width=640,
                 ),
@@ -1673,7 +1679,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "chunk_plucker shape mismatch"):
             stage._build_camera_conditioning(
                 SimpleNamespace(
-                    extra={"chunk_plucker": torch.zeros(48, 2, 12, 20)},
+                    condition_inputs={"chunk_plucker": torch.zeros(48, 2, 12, 20)},
                     height=384,
                     width=640,
                 ),
@@ -1684,7 +1690,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
                 dtype=torch.float32,
             )
 
-    def test_action_and_camera_path_are_mutually_exclusive(self) -> None:
+    def test_action_and_camera_to_world_are_mutually_exclusive(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
             transformer=None,
@@ -1692,11 +1698,9 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             pipeline_config=SanaWMPipelineConfig(),
         )
         batch = SimpleNamespace(
-            extra={
-                "diffusers_kwargs": {
-                    "action": "w-8",
-                    "camera_to_world": torch.eye(4).unsqueeze(0),
-                }
+            condition_inputs={
+                "action": "w-8",
+                "camera_to_world": torch.eye(4).unsqueeze(0),
             },
             height=64,
             width=64,
@@ -1713,7 +1717,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             )
 
     def test_action_num_frames_uses_longest_batched_action(self) -> None:
-        batch = SimpleNamespace(extra={"diffusers_kwargs": {"action": ["w-8", "w-16"]}})
+        batch = SimpleNamespace(condition_inputs={"action": ["w-8", "w-16"]})
 
         self.assertEqual(
             SanaWMBeforeDenoisingStage._action_num_frames_for_request(batch),
@@ -1723,7 +1727,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
     def test_intrinsics_3x3_sequence_can_exceed_requested_frame_count(self) -> None:
         intrinsics = torch.eye(3).unsqueeze(0).repeat(321, 1, 1)
 
-        coerced = SanaWMBeforeDenoisingStage._coerce_intrinsics_vec4(
+        coerced = coerce_sana_wm_intrinsics_vec4(
             intrinsics,
             batch_size=1,
             num_frames=49,
@@ -1732,12 +1736,14 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         )
 
         self.assertEqual(coerced.shape, (1, 49, 4))
-        self.assertTrue(torch.equal(coerced[0, 0], torch.tensor([1.0, 1.0, 0.0, 0.0])))
+        self.assertTrue(
+            torch.equal(coerced[0, 0], torch.tensor([1.0, 1.0, 0.0, 0.0]))
+        )
 
     def test_latent_frame_camera_conditions_samples_stride_indices(self) -> None:
         original = torch.arange(1 * 17 * 20, dtype=torch.float32).reshape(1, 17, 20)
 
-        sampled = SanaWMBeforeDenoisingStage._latent_frame_camera_conditions(
+        sampled = latent_frame_sana_wm_camera_conditions(
             original,
             num_frames=17,
             latent_frames=3,
@@ -2589,7 +2595,7 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(out.shape, hidden_states.shape)
 
     def test_skip_refiner_flag_accepts_request_extra(self) -> None:
-        batch = SimpleNamespace(extra={"diffusers_kwargs": {"skip_refiner": True}})
+        batch = SimpleNamespace(extra={"skip_refiner": True})
         self.assertTrue(sana_wm_skip_refiner_enabled(batch))
 
     def test_skip_refiner_flag_accepts_pipeline_config(self) -> None:
