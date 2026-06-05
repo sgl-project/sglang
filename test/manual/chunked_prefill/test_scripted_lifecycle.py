@@ -332,7 +332,11 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 1
             yield from _drain_until_released(t, r)
-            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            # A fully-released req may already be removed from the scheduler
+            # (r.req is None) -- removal is a strictly stronger row-release
+            # witness than req_pool_idx is None.
+            assert r.req is None or r.req.req_pool_idx is None
+            assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert (
                     r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
@@ -357,7 +361,11 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 1
             yield from _drain_until_released(t, r)
-            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            # A fully-released req may already be removed from the scheduler
+            # (r.req is None) -- removal is a strictly stronger row-release
+            # witness than req_pool_idx is None.
+            assert r.req is None or r.req.req_pool_idx is None
+            assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert (
                     r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE

@@ -36,12 +36,18 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
     def _script_two_reqs_finish(t: ScriptedContext):
         r1 = t.start_req(prompt_len=8, max_new_tokens=4)
         r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        # Probe BOTH handles every step (no short-circuit): a handle is only
+        # registered for post-recycle finished-tracking by probing it, so the
+        # faster req must not go unprobed while waiting on the slower one.
+        done = {r1.rid: False, r2.rid: False}
         for _ in range(800):
-            if r1.finished and r2.finished:
+            done[r1.rid] = done[r1.rid] or r1.finished
+            done[r2.rid] = done[r2.rid] or r2.finished
+            if all(done.values()):
                 break
             yield
-        assert r1.finished
-        assert r2.finished
+        assert done[r1.rid]
+        assert done[r2.rid]
         assert r1.chunks_done == 0
         # r2's prompt is 2 * DEFAULT_CHUNK_SIZE (512), an exact multiple of the
         # 256 chunk size, so it chunks into ceil(512 / 256) = 2 partial prefill

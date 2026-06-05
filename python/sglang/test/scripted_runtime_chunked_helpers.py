@@ -46,13 +46,20 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
+    # Probe EVERY handle EVERY step (no short-circuit): a handle is only
+    # registered in the context's _seen_rids by probing it (finished/status/req),
+    # and a req that finishes and recycles before its first probe would report
+    # not-finished forever. Latch each handle's finished state per step.
+    done = [False] * len(handles)
     for _ in range(max_steps):
-        if all(h.finished for h in handles):
+        for i, h in enumerate(handles):
+            done[i] = done[i] or h.finished
+        if all(done):
             return
         yield
     raise AssertionError(
         f"run_until_all_finished: not all reqs finished after {max_steps} "
-        f"steps (finished={[h.finished for h in handles]})"
+        f"steps (finished={done})"
     )
 
 

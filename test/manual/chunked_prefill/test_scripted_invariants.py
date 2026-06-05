@@ -169,11 +169,16 @@ class TestInvariantsBasic(ScriptedTestCase):
     def _script_sustained_long_chunked_load(t: ScriptedContext):
         # VERY_LONG_PROMPT_LEN == 8 * DEFAULT_CHUNK_SIZE, so each req's prompt is
         # scheduled across exactly ceil(prompt_len/chunk_size) == 8 chunk iters.
+        # Distinct prompt_token per req so each chunks cold (8x): an identical
+        # fill token would let later reqs hit an earlier one's cached prefix and
+        # chunk fewer times (chunks_done == 0 on a full prefix hit).
         expected_chunks_done = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
         baseline_kv = t.engine_stats()["kv_pool_free"]
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(30)
+            t.start_req(
+                prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10 + i
+            )
+            for i in range(30)
         ]
         yield from run_until_all_finished(reqs, max_steps=DEFAULT_MAX_STEPS * 20)
         for r in reqs:
@@ -182,6 +187,15 @@ class TestInvariantsBasic(ScriptedTestCase):
                 f"VERY_LONG_PROMPT_LEN must take exactly {expected_chunks_done} "
                 f"chunks; got chunks_done={r.chunks_done}"
             )
+        # The 30 distinct finished prompts legitimately stay committed in the
+        # radix tree (cached != leaked); drain to idle and flush before the
+        # leak comparison so only genuinely-held pages would fail it.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        t.flush_cache()
+        yield
         final_kv = t.engine_stats()["kv_pool_free"]
         assert (
             final_kv >= baseline_kv

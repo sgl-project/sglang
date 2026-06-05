@@ -636,7 +636,10 @@ class TestRadixLpm(ScriptedTestCase):
             prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=7
         )
 
+        # cached_tokens is set at admission but the req object is cleared on
+        # finish (handle.req becomes None), so capture it live each step.
         first_admitted = None
+        cached_tokens_by_rid: dict = {}
         for _ in range(DEFAULT_MAX_STEPS):
             comp = t.batch_composition()
             active = (
@@ -646,6 +649,9 @@ class TestRadixLpm(ScriptedTestCase):
             )
             if first_admitted is None and active:
                 first_admitted = active[0]
+            for r in (r_long, r_short):
+                if r.req is not None:
+                    cached_tokens_by_rid[r.rid] = r.req.cached_tokens
             if r_long.finished and r_short.finished:
                 break
             yield
@@ -654,8 +660,8 @@ class TestRadixLpm(ScriptedTestCase):
             f"LPM must admit the longest-prefix-match req first; first admitted "
             f"rid was {first_admitted!r}, expected r_long={r_long.rid!r}"
         )
-        assert r_long.req.cached_tokens > 0
-        assert r_short.req.cached_tokens == 0
+        assert cached_tokens_by_rid.get(r_long.rid, 0) > 0
+        assert cached_tokens_by_rid.get(r_short.rid, 0) == 0
         for r in (r_long, r_short):
             assert r.kv_pages == 0
             assert r.lock_refs == 0
