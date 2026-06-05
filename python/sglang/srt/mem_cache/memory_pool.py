@@ -364,7 +364,6 @@ class MambaPool:
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
-
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
@@ -744,6 +743,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     ]
                 )
             self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
+            # Match the req.mamba_pool_idx=None clear above so the next
+            # alloc() doesn't see a stale ping-pong reference on the req
+            # and skip allocation (which would silently reuse a freed
+            # tensor on the req side while the new pool slot leaks).
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
