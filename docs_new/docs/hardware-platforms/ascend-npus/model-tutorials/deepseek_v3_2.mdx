@@ -46,7 +46,7 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 If you need to download model weights, check the model size before downloading to reserve enough space.
 </Warning>
 
-- [DeepSeek-V3.2-W8A8](https://modelers.cn/models/Modelers_Park/DeepSeek-V3.2-W8A8) (Quantized version)
+- [DeepSeek-V3.2-W8A8](https://www.modelscope.cn/models/sgl-npu/DeepSeek-V3.2-W8A8) (Quantized version)
 
 Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
 refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
@@ -101,6 +101,33 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
 quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ```
 
   </Tab>
@@ -310,9 +337,3 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
 This section only covers model-specific issues.
-
-### Q: Why is there no single-node deployment configuration for DeepSeek-V3.2?
-
-A: DeepSeek-V3.2 on Ascend NPUs currently only supports PD disaggregation mode with 32 cards (4 x Atlas 800I A3), using
-DSA context parallel for long-context scenarios (128K input). Single-node deployment is not yet available for this model
-on Ascend NPUs.
