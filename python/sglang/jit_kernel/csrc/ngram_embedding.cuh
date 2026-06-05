@@ -21,16 +21,16 @@ __global__ void ComputeNGramIdsKernel(
     int batch_size,
     int ne_n,
     int ne_k,
-    int* ne_weights,                      // [ne_n-1,ne_k,ne_n]
-    int* ne_mods,                         // [ne_n-1,ne_k]
-    int* exclusive_ne_embeder_size_sums,  // [(ne_n-1)*ne_k]
-    int* tokens,                          // [token_num]
-    int* exclusive_req_len_sums,          // [batch_size+1]
-    int* ne_token_table,                  // [max_running_reqs, max_context_len]
-    int max_context_len,                  // max_context_len
+    int* ne_weights,                          // [ne_n-1,ne_k,ne_n]
+    int* ne_mods,                             // [ne_n-1,ne_k]
+    int* exclusive_ne_embeder_size_sums,      // [(ne_n-1)*ne_k]
+    int* tokens,                              // [token_num]
+    int* exclusive_req_len_sums,              // [batch_size+1]
+    int* ne_token_table,                      // [max_running_reqs, max_context_len]
+    int max_context_len,                      // max_context_len
     const int64_t* __restrict__ row_indices,  // [batch_size]
-    int* column_starts,                   // [batch_size]
-    int* n_gram_ids                       // [ne_n-1,ne_k,token_num]
+    int* column_starts,                       // [batch_size]
+    int* n_gram_ids                           // [ne_n-1,ne_k,token_num]
 ) {
   // Determine which n, k, and request this block handles.
   /**
@@ -135,14 +135,14 @@ __global__ void ComputeNGramIdsDecodeKernel(
 
 __global__ void UpdateTokenTableKernel(
     int batch_size,
-    int* tokens,           // [token_num]
-    int* ne_token_table,   // [max_running_reqs, max_context_len]
-    int max_context_len,   // max_context_len
+    int* tokens,                              // [token_num]
+    int* ne_token_table,                      // [max_running_reqs, max_context_len]
+    int max_context_len,                      // max_context_len
     const int64_t* __restrict__ row_indices,  // [batch_size]
-    int* column_starts,    // [batch_size]
-    int* req_lens,         // [batch_size]
-    int ignore_token_num,  // number of tokens to ignore
-    int* ignore_tokens     // [ignore_token_num]
+    int* column_starts,                       // [batch_size]
+    int* req_lens,                            // [batch_size]
+    int ignore_token_num,                     // number of tokens to ignore
+    int* ignore_tokens                        // [ignore_token_num]
 ) {
   // Each block processes one request.
   const int req_id = blockIdx.x % batch_size;
