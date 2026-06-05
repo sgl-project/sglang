@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=800, suite="nightly-4-gpu-b200", nightly=True)
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -336,10 +336,14 @@ class TestFlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4(
     FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base, CustomTestCase
 ):
     extra_env = {
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
         "SGLANG_FP4_IGNORED_LAYERS": ",".join(
             ["shared_expert"]
             + [f"model.layers.{layer_id}" for layer_id in range(40, 48)]
-        )
+        ),
     }
     backend = "flashinfer_trtllm"
 
