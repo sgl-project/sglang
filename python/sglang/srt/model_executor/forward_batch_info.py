@@ -318,6 +318,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    input_deepstack_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
@@ -431,31 +432,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
-    # For LoRA
-    lora_ids: Optional[List[str]] = None
-
-    # For input embeddings
-    input_embeds: Optional[torch.Tensor] = None
-    input_deepstack_embeds: Optional[torch.Tensor] = None
-
-    # For token embedding overrides (sparse replacement at specific positions)
-    replace_embeds: Optional[torch.Tensor] = None
-    replace_positions: Optional[torch.Tensor] = None
-
-    # For cross-encoder model
-    token_type_ids: Optional[torch.Tensor] = None
-
-    # Sampling info
-    sampling_info: SamplingBatchInfo = None
-
     # For DP attention (padding / local info)
-    original_global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Has to be None when cuda graph is captured.
-    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
-    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
