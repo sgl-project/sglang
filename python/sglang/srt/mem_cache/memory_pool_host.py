@@ -171,11 +171,6 @@ class SharedMemoryHostTensorAllocator(HostTensorAllocator):
                 size = os.path.getsize(path)
                 if size == nbytes:
                     return os.open(path, os.O_RDWR), False
-                if size > 0 and size != nbytes:
-                    raise RuntimeError(
-                        f"Shared host tensor file {path} has size {size}, "
-                        f"expected {nbytes}."
-                    )
             except FileNotFoundError:
                 pass
 
