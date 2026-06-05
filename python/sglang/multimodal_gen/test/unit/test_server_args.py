@@ -34,6 +34,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.acceleration_policy import (
     KERNEL_COMPILE_POLICY_ENV,
+    attention_allows_cudnn_sdp,
+    attention_autotune_config,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -184,6 +186,19 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertTrue(args.acceleration_config.attention_autotune)
         self.assertEqual(args.acceleration_config.attention_autotune_iters, 20)
         self.assertEqual(args.acceleration_config.attention_autotune_min_speedup, 1.03)
+
+    def test_attention_acceleration_defaults_to_auto(self):
+        self.assertTrue(attention_allows_cudnn_sdp({}))
+        enabled, warmup, iters, min_speedup = attention_autotune_config({})
+        self.assertTrue(enabled)
+        self.assertEqual(warmup, 3)
+        self.assertEqual(iters, 10)
+        self.assertEqual(min_speedup, 1.02)
+
+    def test_attention_acceleration_can_be_disabled(self):
+        self.assertFalse(attention_allows_cudnn_sdp({"allow_cudnn_sdp": False}))
+        enabled, _, _, _ = attention_autotune_config({"attention_autotune": False})
+        self.assertFalse(enabled)
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):

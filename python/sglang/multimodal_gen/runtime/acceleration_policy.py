@@ -129,7 +129,7 @@ def attention_allows_cudnn_sdp(extra_impl_args: Mapping[str, Any]) -> bool:
         if candidate is not None:
             policy = candidate
             break
-    policy = _normalize_policy(policy)
+    policy = _normalize_policy(policy, default="auto")
     return policy in {"auto", "on", "true", "1", "force"}
 
 
@@ -142,7 +142,7 @@ def attention_autotune_config(
         enabled = bool(extra_impl_args["attention_autotune"])
     else:
         attention_cfg, acceleration_cfg = _get_server_policy_configs()
-        enabled = False
+        enabled = True
         for candidate in (
             attention_cfg.get("attention_autotune"),
             attention_cfg.get("autotune_attention"),

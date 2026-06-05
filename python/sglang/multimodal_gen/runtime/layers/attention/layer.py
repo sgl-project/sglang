@@ -364,7 +364,9 @@ class LocalAttention(nn.Module):
             )
         return output.transpose(1, 2)
 
-    def _can_autotune_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    def _can_autotune_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> bool:
         return (
             self.enable_attention_autotune
             and self.backend in (
@@ -399,18 +401,26 @@ class LocalAttention(nn.Module):
             self.causal,
         )
 
-    def _time_attention_candidate(self, fn) -> float:
-        for _ in range(self.attention_autotune_warmup):
-            fn()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(self.attention_autotune_iters):
-            fn()
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) / self.attention_autotune_iters
+    def _time_attention_candidate(
+        self, fn, *, allow_failure: bool = False
+    ) -> float | None:
+        try:
+            for _ in range(self.attention_autotune_warmup):
+                fn()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(self.attention_autotune_iters):
+                fn()
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / self.attention_autotune_iters
+        except RuntimeError:
+            if not allow_failure:
+                raise
+            torch.cuda.synchronize()
+            return None
 
     def _select_attention_backend(
         self,
@@ -431,12 +441,16 @@ class LocalAttention(nn.Module):
             "sdpa_cudnn": lambda: self._sdpa_forward(q, k, v, True),
             "sdpa_no_cudnn": lambda: self._sdpa_forward(q, k, v, False),
         }
-        timings = {
-            name: self._time_attention_candidate(fn)
-            for name, fn in candidates.items()
-        }
-        selected = min(timings, key=timings.get)
-        if selected != "native":
+        timings = {}
+        for name, fn in candidates.items():
+            elapsed = self._time_attention_candidate(
+                fn, allow_failure=name != "native"
+            )
+            if elapsed is not None:
+                timings[name] = elapsed
+
+        selected = min(timings, key=timings.get) if timings else "native"
+        if selected != "native" and "native" in timings:
             speedup = timings["native"] / timings[selected]
             if speedup < self.attention_autotune_min_speedup:
                 selected = "native"
