@@ -80,6 +80,8 @@ than restating.
   that only released FP8/FP4 is a factual bug.
 - `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
   from the `sglang serve` deploy command.
+- `sglang_version` is a real build the author ran (a release, or `dev`/nightly) — not a
+  guessed/placeholder value (no leftover `0.0.0`).
 
 ### 5. Doc ↔ config parity (the #1 finding)
 - Any `sglang serve` command shown in MDX prose (config tips, benchmark section) must
@@ -107,12 +109,16 @@ than restating.
   `navigation` → Cookbook → Autoregressive Models, root-relative, **no `.mdx`**:
   `cookbook/<category>/<Vendor>/<Model>`.
 - Homepage `<Card href>` in `docs_new/cookbook/<category>/intro.mdx` points to the vendor's
-  flagship; new vendors get a new `<Card>` + a logo at `docs_new/cards/logos/<vendor>.png`.
+  flagship; new vendors get a new `<Card>` + a logo at `docs_new/cards/logos/<vendor>.png` —
+  **940×525 RGBA transparent, icon-only (no wordmark)**, lowercase filename, tracked via
+  `git add -f` (`*.png` is gitignored repo-wide). Card order matches the `docs.json` nav order.
 - Don't change `docs_new/cookbook/intro.mdx` for individual model adds (top-level only).
 
 ### 9. Links & factual
 - HuggingFace URLs resolve to a real model. License section matches the actual HF license
   (don't copy from another model). Docker images from `lmsysorg/sglang`; no `sgl-project-dev`.
+  The image **tag** is a real build (a release the author ran, or `:dev`/nightly) — not a
+  guessed version.
 - Internal links root-relative, no extension (`/cookbook/.../<Model>`); flag `.md`/`.mdx`
   or `../`-relative links. `docs.sglang.io` is canonical.
 - No Google-Drive image links (don't render). Shell placeholders are `export VAR=<value>`,

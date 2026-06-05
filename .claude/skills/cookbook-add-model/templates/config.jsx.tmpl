@@ -125,19 +125,21 @@ sgl-eval run gsm8k \\
     ],
   },
 
-  // Per-hw image for `docker run` framing. NVIDIA share one image; AMD uses ROCm
-  // tags. GB200/GB300/B300 may need a `-cu130` (CUDA 13) tag — confirm per release.
+  // Per-hw image for `docker run` framing. ASK the user which sglang build the recipes ran
+  // on; don't guess a supporting release. Default below is :dev (nightly) — replace the tag
+  // with the user's release if they give one. NVIDIA share one image; AMD uses ROCm tags.
+  // GB200/GB300/B300 may need a `-cu130` (CUDA 13) tag — confirm per release.
   dockerImages: {
-    h100:  "lmsysorg/sglang:latest",
-    h200:  "lmsysorg/sglang:latest",
-    b200:  "lmsysorg/sglang:latest",
-    b300:  "lmsysorg/sglang:latest",
-    gb200: "lmsysorg/sglang:latest",
-    gb300: "lmsysorg/sglang:latest",
-    mi300x: "lmsysorg/sglang:latest-rocm720-mi30x",
-    mi325x: "lmsysorg/sglang:latest-rocm720-mi30x",
-    mi350x: "lmsysorg/sglang:latest-rocm720-mi35x",
-    mi355x: "lmsysorg/sglang:latest-rocm720-mi35x",
+    h100:  "lmsysorg/sglang:dev",
+    h200:  "lmsysorg/sglang:dev",
+    b200:  "lmsysorg/sglang:dev",
+    b300:  "lmsysorg/sglang:dev",
+    gb200: "lmsysorg/sglang:dev",
+    gb300: "lmsysorg/sglang:dev",
+    mi300x: "lmsysorg/sglang:dev-rocm720-mi30x",
+    mi325x: "lmsysorg/sglang:dev-rocm720-mi30x",
+    mi350x: "lmsysorg/sglang:dev-rocm720-mi35x",
+    mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".

@@ -26,6 +26,7 @@ lacks, and replace the EXAMPLE cells with verified recipes. DeepSeek-V4 is a pop
 - [references/authoring-reference.md](references/authoring-reference.md) — field-by-field config / cells / playground / MDX contract.
 - [references/mintlify-authoring.md](references/mintlify-authoring.md) — MDX rules (forbidden syntax, JSX tables, labeled fences) + invocation-example patterns. Read before writing §1–§3 prose.
 - [references/engine-axis.md](references/engine-axis.md) — adding a new Playground feature axis (rare engine work).
+- [references/vendor-logo.md](references/vendor-logo.md) — new-vendor card logo: ask the user for the brand logo, then generate the icon-only 940×525 RGBA PNG (spec + Pillow recipe + `git add -f`).
 
 ## Architecture at a glance
 
@@ -85,7 +86,11 @@ benchmarks (Phases 2 + 4); everything else is filling the template.
 4. **Verified launch recipes** — the full `sglang serve` flags per
    (hw × variant × quant × strategy × nodes) combo → these become `cells[]`. Rewrite any
    `python -m sglang.launch_server` to `sglang serve` form.
-5. **Pre-flight**: `gh pr list --repo sgl-project/sglang --search "<model>"` (dup check).
+5. **sglang version / image tag** — ask which sglang build the recipes + benchmarks ran on
+   (a release like `0.5.x`, or `main`/nightly). **Never guess or hallucinate it.** This one
+   tag fills `dockerImages` and the benchmarks' `sglang_version`; when the user is unsure,
+   default the image to `lmsysorg/sglang:dev` (nightly) rather than inventing a release.
+6. **Pre-flight**: `gh pr list --repo sgl-project/sglang --search "<model>"` (dup check).
 
 **Hardware reference** (the shared `HARDWARE_CATALOG` in `_deployment.jsx`). A GPU **not** in
 this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.hardware`
@@ -104,6 +109,9 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 | MI350X | AMD | 288GB | `lmsysorg/sglang:<ver>-rocm720-mi35x` |
 | MI355X | AMD | 288GB | `lmsysorg/sglang:<ver>-rocm720-mi35x` |
 
+- **Image tag (`<ver>`)**: don't guess — ask the user for the tag the recipes ran on, or
+  default to `dev` (nightly). The same tag goes in `dockerImages` and benchmarks'
+  `sglang_version`; the engine falls back to `lmsysorg/sglang:dev` for any unmapped hw.
 - **TP sizing** (sanity-check recipes): `weight_GB / gpu_mem`, round up to a power of 2,
   ~20–30% headroom. BF16 ≈ params×2 GB, FP8 ≈ ×1, FP4 ≈ ×0.5. MoE → **total** weight, not
   active params. FP4 is Blackwell-only (B200/B300/GB200/GB300). GB200/GB300 single-node
@@ -134,7 +142,8 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
      `modelNames`/`defaultAccuracy` keys).
 4. **Fill `cells[]`** with the verified recipes from Phase 1 (replace every EXAMPLE cell;
    set `verified: true` only on tested combos), and `modelNames` with real HF slugs,
-   `dockerImages` for your hw, `multiNodeHints` only for fabric-specific hw (e.g. gb200).
+   `dockerImages` for your hw (use the Phase-1 tag, or default `lmsysorg/sglang:dev` — never
+   a guessed release), `multiNodeHints` only for fabric-specific hw (e.g. gb200).
 
 ### Site-wiring (do all three)
 
@@ -148,8 +157,11 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
   files; don't assume the first `docs.json` entry holds NEW.)
 - **Homepage card** — `docs_new/cookbook/<category>/intro.mdx`: if the org already has a
   `<Card>`, update only its `href` (keep `img`). If the org is **new**, add a `<Card>`
-  **and tell the user to provide `docs_new/cards/logos/<org-slug>.png`** — never invent or
-  copy a logo.
+  (title = nav-group name; keep card order aligned with `docs.json`) **and create its logo**:
+  ask the user for the brand logo, then generate the conforming **icon-only 940×525 RGBA
+  transparent** PNG → `docs_new/cards/logos/<org-slug>.png` per
+  [references/vendor-logo.md](references/vendor-logo.md) (track with `git add -f` — `*.png`
+  is gitignored repo-wide). Never invent or copy a logo.
 
 ## Phase 3 — Validate
 
@@ -171,8 +183,9 @@ and is gone from same-vendor siblings; the homepage card points to the new model
 The user deploys each cell, runs the benches, and pastes results; you fill the data:
 - mark each tested `cells[]` entry `verified: true` (absent = yellow/unverified badge);
 - fill the `<model>-benchmarks.jsx` entries (one per cell `match`) with measured
-  speed/accuracy; set model-level `defaultAccuracy` per variant. Leave a cell's entry as a
-  bare `match` stub if it has no numbers yet (the card shows "pending").
+  speed/accuracy + the `sglang_version` the user reports (don't invent one — the template's
+  `0.0.0` is a deliberate TODO); set model-level `defaultAccuracy` per variant. Leave a
+  cell's entry as a bare `match` stub if it has no numbers yet (the card shows "pending").
 
 ## Phase 5 — Prose & config tips
 
