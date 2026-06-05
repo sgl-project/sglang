@@ -687,6 +687,105 @@ def _extract_runner_configs(content):
     return out
 
 
+def _extract_legacy_suites(content):
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)` calls.
+
+    Mirrors _extract_runner_configs for the legacy nightly/weekly shape: a file
+    may register on multiple pools, so collect all of them rather than the first.
+    """
+    out = []
+    for args in re.finditer(
+        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+    ):
+        m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+# Legacy nightly/weekly CUDA suites register with a single-string `suite=`
+# instead of `runner_config=`, so they carry no runner metadata of their own.
+# Map each to the runner_config in scripts/ci/runner_configs.yml whose hardware
+# matches the runner the nightly/weekly pipeline actually uses (see
+# .github/workflows/{nightly,weekly}-test-nvidia.yml), so /rerun-test can still
+# dispatch a single nightly/weekly test. The runner label, install script,
+# timeout and rdma_devices are then resolved from runner_configs.yml as usual,
+# keeping that file the single source of truth for runner details.
+#
+# Suites on hardware with no matching runner_config (e.g. nightly-4-gpu-gb300)
+# and non-CUDA suites (npu/amd) are intentionally absent and stay
+# non-dispatchable until a matching runner_config exists.
+_LEGACY_SUITE_TO_RUNNER_CONFIG = {
+    "nightly-1-gpu": "1-gpu-large",
+    "nightly-kernel-1-gpu": "1-gpu-large",
+    "nightly-eval-text-2-gpu": "2-gpu-large",
+    "nightly-perf-text-2-gpu": "2-gpu-large",
+    "nightly-eval-vlm-2-gpu": "2-gpu-large",
+    "nightly-perf-vlm-2-gpu": "2-gpu-large",
+    "nightly-4-gpu": "4-gpu-h100",
+    "nightly-4-gpu-b200": "4-gpu-b200",
+    "nightly-8-gpu-common": "8-gpu-h200",
+    "nightly-8-gpu-h200": "8-gpu-h200",
+    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    "nightly-8-gpu-h20": "8-gpu-h20",
+    "nightly-8-gpu-b200": "8-gpu-b200",
+    "weekly-8-gpu-h200": "8-gpu-h200",
+}
+
+
+def _dispatch_err(suite, msg):
+    """Build a detect_suite error result for the given suite."""
+    return {
+        "suite": suite,
+        "runner_label": None,
+        "install_script": "",
+        "install_timeout": "",
+        "rdma_devices": "",
+        "is_cpu": False,
+        "error": msg,
+    }
+
+
+def _resolve_runner_config(rc, full_path, suite):
+    """Resolve a runner_config key into a detect_suite dispatch dict.
+
+    Returns the dispatch dict on success, or an error dict on failure.
+    """
+    configs = _runner_configs.load()
+    cfg = configs.get(rc)
+    if cfg is None:
+        known = ", ".join(f"`{k}`" for k in sorted(configs))
+        return _dispatch_err(
+            suite,
+            f"Unknown runner_config `{rc}` in `{full_path}` "
+            f"— not in scripts/ci/runner_configs.yml.\n\n"
+            f"Known runner_configs: {known}",
+        )
+    install_script = cfg["install"]
+    if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
+        return _dispatch_err(
+            suite,
+            f"Disallowed `install` value `{install_script}` for runner_config "
+            f"`{rc}` in scripts/ci/runner_configs.yml. The slash handler "
+            f"passes this string verbatim into a shell step, so it must "
+            f"match `scripts/ci/cuda/*.sh`.",
+        )
+    runs_on = cfg.get("runs_on")
+    # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
+    # so always pick the non-kernel b200 pool.
+    if runs_on == "$b200_runner":
+        runs_on = _B200_DEFAULT_RUNNER
+    return {
+        "suite": suite,
+        "runner_label": runs_on,
+        "install_script": install_script,
+        "install_timeout": str(cfg["install_timeout"]),
+        "rdma_devices": cfg.get("rdma_devices", ""),
+        "is_cpu": False,
+        "error": None,
+    }
+
+
 def detect_suite(file_path_from_test):
     """
     Read a test file and extract dispatch info from register_cuda_ci or
@@ -694,8 +793,16 @@ def detect_suite(file_path_from_test):
 
     A CUDA file can carry multiple `register_cuda_ci(...)` calls — one per
     pool it should run on — so this returns a *list* of dispatch dicts, one
-    per registration. CPU files yield a single-element list. A file with no
-    recognised registration yields a one-element list whose dict has an
+    per registration. Runner label, install script, timeout, and rdma_devices
+    are all resolved from scripts/ci/runner_configs.yml — the same single
+    source of truth that drives the main PR test pipeline.
+
+    Legacy nightly/weekly CUDA suites (single-string `suite=`) are dispatchable
+    too: each suite name is mapped to the matching runner_config via
+    _LEGACY_SUITE_TO_RUNNER_CONFIG, then resolved the same way.
+
+    CPU files yield a single-element list. A file with no recognised (or no
+    dispatchable) registration yields a one-element list whose dict has an
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
@@ -705,65 +812,24 @@ def detect_suite(file_path_from_test):
     with open(full_path, "r") as f:
         content = f.read()
 
-    def _err(suite, msg):
-        return {
-            "suite": suite,
-            "runner_label": None,
-            "install_script": "",
-            "install_timeout": "",
-            "rdma_devices": "",
-            "is_cpu": False,
-            "error": msg,
-        }
-
     cuda_calls = _extract_runner_configs(content)
     if cuda_calls:
-        configs = _runner_configs.load()
         results = []
         for rc, args_str in cuda_calls:
-            cfg = configs.get(rc)
-            if cfg is None:
-                known = ", ".join(f"`{k}`" for k in sorted(configs))
-                results.append(
-                    _err(
-                        rc,
-                        f"Unknown runner_config `{rc}` in `{full_path}` "
-                        f"— not in scripts/ci/runner_configs.yml.\n\n"
-                        f"Known runner_configs: {known}",
-                    )
-                )
-                continue
-            install_script = cfg["install"]
-            if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
-                results.append(
-                    _err(
-                        rc,
-                        f"Disallowed `install` value `{install_script}` for "
-                        f"runner_config `{rc}` in scripts/ci/runner_configs.yml. "
-                        f"The slash handler passes this string verbatim into a "
-                        f"shell step, so it must match `scripts/ci/cuda/*.sh`.",
-                    )
-                )
-                continue
-            runs_on = cfg.get("runs_on")
-            # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
-            # so always pick the non-kernel b200 pool.
-            if runs_on == "$b200_runner":
-                runs_on = _B200_DEFAULT_RUNNER
             stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
             suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-            results.append(
-                {
-                    "suite": suite,
-                    "runner_label": runs_on,
-                    "install_script": install_script,
-                    "install_timeout": str(cfg["install_timeout"]),
-                    "rdma_devices": cfg.get("rdma_devices", ""),
-                    "is_cpu": False,
-                    "error": None,
-                }
-            )
+            results.append(_resolve_runner_config(rc, full_path, suite))
         return results
+
+    # Legacy nightly/weekly CUDA suites: single-string `suite=`, no
+    # runner_config. Map each mappable suite to its runner_config and resolve.
+    legacy_suites = _extract_legacy_suites(content)
+    mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
+    if mappable:
+        return [
+            _resolve_runner_config(_LEGACY_SUITE_TO_RUNNER_CONFIG[s], full_path, s)
+            for s in mappable
+        ]
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         return [
@@ -778,13 +844,24 @@ def detect_suite(file_path_from_test):
             }
         ]
 
+    if legacy_suites:
+        suite = legacy_suites[0]
+        return [
+            _dispatch_err(
+                suite,
+                f"Suite `{suite}` in `{full_path}` is not dispatchable via "
+                f"/rerun-test. It has no entry in _LEGACY_SUITE_TO_RUNNER_CONFIG "
+                f"— either it is a non-CUDA suite (npu/amd) or it runs on "
+                f"hardware with no matching runner_config in "
+                f"scripts/ci/runner_configs.yml.",
+            )
+        ]
+
     return [
-        _err(
+        _dispatch_err(
             None,
             f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
-            f"found in `{full_path}`. /rerun-test only supports tests "
-            f"registered via the new-style yml-driven API; nightly/weekly "
-            f"tests aren't dispatchable through this command.",
+            f"found in `{full_path}`. This file may not be a registered CI test.",
         )
     ]
 
