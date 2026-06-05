@@ -49,42 +49,48 @@ clear_cuda_arches(CMAKE_FLAG)
 # cutlass
 FetchContent_Declare(
     repo-cutlass
-    URL https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz
+    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz
+    URL_HASH SHA256=09237099a70f80bff1dc8bb80c843a674bb4fdcb46e43cc6993e711c5ca89bb5
 )
 FetchContent_Populate(repo-cutlass)
 
 # fmt
 FetchContent_Declare(
     repo-fmt
-    URL https://${GITHUB_ARTIFACTORY}/fmtlib/fmt/archive/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28.tar.gz
+    URL      https://${GITHUB_ARTIFACTORY}/fmtlib/fmt/archive/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28.tar.gz
+    URL_HASH SHA256=c314292789d28c3c3b420e75a7b2d1706f685f7fb63289128d46aeaea2c6be71
 )
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    URL https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.6.0.tar.gz
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.6.0.tar.gz
+    URL_HASH SHA256=be270ed11ca5a8fbd9d7941c5bbe9a23a9f6e2ffd372c8398346928bee464774
 )
 FetchContent_Populate(repo-triton)
 
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    URL https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz
+    URL      https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz
+    URL_HASH SHA256=931dfd118f4b6de8c7d98702153c7c03840139170af21a07607693bd9749744d
 )
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    URL https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/bcf72ccc6816b36a5fae2c5a3c027604629785e0.tar.gz
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/bcf72ccc6816b36a5fae2c5a3c027604629785e0.tar.gz
+    URL_HASH SHA256=2110d8ca1ed9b330b9f99c1d4088be12a37e44152c39fdf90dfb6526f532ba96
 )
 FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
-    URL https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp/archive/51eca89d20f0cfb3764ccd764338d7b22cd486a6.tar.gz
+    URL      https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp/archive/51eca89d20f0cfb3764ccd764338d7b22cd486a6.tar.gz
+    URL_HASH SHA256=b064de701da5253e32f4031d16b01a61d78c369327d585ff7bfb521bbe742677
 )
 FetchContent_Populate(repo-mscclpp)
 
