@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -132,13 +132,6 @@ def compute_mrope_position_ids_vision(
 # -----------------------------------------------------------------------------
 
 
-def qwen3_rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Qwen3/Llama-style rotate_half: split first/second half of head_dim."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def qwen3_apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -153,8 +146,19 @@ def qwen3_apply_rotary_pos_emb(
         cos: [1, S, 1, D] or broadcastable
         sin: [1, S, 1, D] or broadcastable
     """
-    q_embed = (q * cos) + (qwen3_rotate_half(q) * sin)
-    k_embed = (k * cos) + (qwen3_rotate_half(k) * sin)
+    half = q.shape[-1] // 2
+    q1 = q[..., :half]
+    q2 = q[..., half:]
+    q_embed = torch.empty_like(q)
+    q_embed[..., :half] = q1 * cos[..., :half] - q2 * sin[..., :half]
+    q_embed[..., half:] = q2 * cos[..., half:] + q1 * sin[..., half:]
+
+    half = k.shape[-1] // 2
+    k1 = k[..., :half]
+    k2 = k[..., half:]
+    k_embed = torch.empty_like(k)
+    k_embed[..., :half] = k1 * cos[..., :half] - k2 * sin[..., :half]
+    k_embed[..., half:] = k2 * cos[..., half:] + k1 * sin[..., half:]
     return q_embed, k_embed
 
 
@@ -555,11 +559,8 @@ class Cosmos3CrossAttention(nn.Module):
         ]
         v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
-        q = F.rms_norm(
-            q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
-        )
-        k = F.rms_norm(
-            k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+        q, k = apply_qk_norm(
+            q.contiguous(), k.contiguous(), self.norm_q, self.norm_k, self.head_dim
         )
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 

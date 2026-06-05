@@ -190,7 +190,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 enabled=autocast_enabled,
             ),
             set_forward_context(
-                current_timestep=0,
+                current_timestep=-1,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ),

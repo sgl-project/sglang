@@ -77,6 +77,14 @@ class MlxModelRunnerStub(ModelRunner):
     the minimal bookkeeping pools needed by the scheduler are created.
     """
 
+    # No KV canary on the MLX path. The base ModelRunner installs it via
+    # install_canary() in its full initialize(), which this lightweight override
+    # skips. Downstream consumers (scheduler, cuda graph runner, speculative
+    # workers) all guard with `canary_manager is not None`, so default to None
+    # as a class attribute to keep those checks working instead of raising
+    # AttributeError.
+    canary_manager = None
+
     def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
         self._mlx_pool_size = mlx_pool_size
         super().__init__(*args, **kwargs)

@@ -91,6 +91,7 @@ docker run \
     --privileged \
     --ipc=host \
     --network=host \
+    --user root \
     --group-add $(getent group video | cut -d: -f3) \
     --device /dev/dri \
     -v /dev/dri/by-path:/dev/dri/by-path \
