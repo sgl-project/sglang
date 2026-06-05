@@ -3153,8 +3153,8 @@ sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
 export SGLANG_SET_CPU_AFFINITY=1
+export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
 
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
@@ -3162,7 +3162,6 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_ALGO="level0:NA;level1:ring"
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export ASCEND_USE_FIA=1
@@ -3174,7 +3173,6 @@ export FORCE_DRAFT_MODEL_NON_QUANT=1
 
 ZBAL_HCCL_OP="allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base"
 export HCCL_BUFFSIZE=64
-unset PYTORCH_NPU_ALLOC_CONF
 export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
@@ -3196,7 +3194,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --disable-radix-cache --max-prefill-tokens 14080 --context-length 26384 \
     --chunked-prefill-size -1 --max-running-requests 300 \
     --mamba-ssm-dtype bfloat16 \
-    --base-gpu-id 4 \
     --quantization modelslim \
     --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  --speculative-draft-model-quantization  unquant \
     --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
@@ -3210,7 +3207,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```shell Command
-python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 80 --random-output-len 1536 --random-input-len 3584 --num-prompts 160 --random-range-ratio 1
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 300 --random-output-len 1536 --random-input-len 3584 --num-prompts 300 --random-range-ratio 1
 ```
 
 ### Qwen3-32B 6K-1_5K 18ms on A2 8 Cards Mixed Mode
