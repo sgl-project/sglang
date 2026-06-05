@@ -868,6 +868,12 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
         raise AssertionError("req did not finish under disabled chunking")
 
 
+# Deterministic flashinfer rounds chunked-prefill splits to its attention
+# alignment size; chunk_size == the align size keeps the req chunking exactly
+# once before the sub-align tail admits as the non-chunked last chunk.
+DETERMINISTIC_ALIGN_SIZE = 4096
+
+
 class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
     # Deterministic inference with flashinfer forces the radix cache off (it is not
     # yet compatible), so the tree_cache is a ChunkCache that the scripted harness's
