@@ -191,6 +191,21 @@ drun -p 30000:30000 \
     --port 30000
 ```
 
+### Running MiMo-V2-Flash
+
+MiMo-V2-Flash uses non-square attention (`qk_head_dim=192`, `v_head_dim=128`) with a
+128-token sliding window. Use TP=4 with the aiter backend:
+
+```bash
+python3 -m sglang.launch_server \
+    --model XiaomiMiMo/MiMo-V2-Flash \
+    --tp 4 \
+    --trust-remote-code \
+    --attention-backend aiter \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
 ### Warmup Step
 
 When the server displays `The server is fired up and ready to roll!`, it means the startup is successful.
