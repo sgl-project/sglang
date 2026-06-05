@@ -47,7 +47,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
+from sglang.srt.mem_cache.utils import (
+    get_eviction_strategy,
+    split_node_hash_value,
+    update_hash_with_extra_key,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -184,6 +188,7 @@ class RadixKey:
         hasher = hashlib.sha256()
         if prior_hash:
             hasher.update(bytes.fromhex(prior_hash))
+        update_hash_with_extra_key(hasher, self.extra_key)
         t = self.token_ids
         if self.is_bigram:
             for j in range(start, end):

@@ -103,11 +103,25 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
-def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
+def update_hash_with_extra_key(hasher: Any, extra_key: Optional[str]) -> None:
+    if extra_key is None:
+        return
+    encoded = extra_key.encode("utf-8")
+    hasher.update(b"extra_key")
+    hasher.update(len(encoded).to_bytes(4, byteorder="little", signed=False))
+    hasher.update(encoded)
+
+
+def get_hash_str(
+    token_ids: List[int],
+    prior_hash: Optional[str] = None,
+    extra_key: Optional[str] = None,
+) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
         hasher.update(bytes.fromhex(prior_hash))
+    update_hash_with_extra_key(hasher, extra_key)
 
     for t in token_ids:
         if isinstance(t, tuple):

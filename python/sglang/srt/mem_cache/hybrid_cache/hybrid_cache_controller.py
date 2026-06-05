@@ -108,9 +108,17 @@ class StorageOperation(BaseStorageOperation):
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            extra_key,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -123,6 +131,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
         self.request_id = request_id
@@ -134,6 +143,7 @@ class PrefetchOperation(StorageOperation):
             token_ids,
             last_hash,
             prefix_keys=prefix_keys,
+            extra_key=extra_key,
             pool_transfers=pool_transfers,
         )
         self.pool_transfers_done = not bool(pool_transfers)
@@ -526,6 +536,7 @@ class HybridCacheController(BaseHiCacheController):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
@@ -534,6 +545,7 @@ class HybridCacheController(BaseHiCacheController):
             new_input_tokens,
             last_hash,
             prefix_keys=prefix_keys,
+            extra_key=extra_key,
             pool_transfers=extra_pools,
         )
         self.prefetch_queue.put(operation)
@@ -562,7 +574,9 @@ class HybridCacheController(BaseHiCacheController):
         hash_value = []
         for start in range(0, len(operation.token_ids), self.page_size):
             last_hash = self.get_hash_str(
-                operation.token_ids[start : start + self.page_size], last_hash
+                operation.token_ids[start : start + self.page_size],
+                last_hash,
+                extra_key=operation.extra_key,
             )
             hash_value.append(last_hash)
 

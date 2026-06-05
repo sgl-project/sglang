@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.utils import get_hash_str
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
@@ -141,6 +142,57 @@ class TestRadixKey(unittest.TestCase):
         key = RadixKey(array("q", long_tokens))
         repr_str = repr(key)
         self.assertIn("...", repr_str)  # Should be truncated
+
+    def test_hash_page_uses_extra_key(self):
+        tokens = [11, 12, 13, 14, 15, 16, 17, 18]
+        page_size = 4
+        key_a = RadixKey(array("q", tokens), "tenant-A")
+        key_b = RadixKey(array("q", tokens), "tenant-B")
+        key_none = RadixKey(array("q", tokens))
+
+        hashes_a = []
+        hashes_b = []
+        hashes_none = []
+        last_a = last_b = last_none = None
+        for start in range(0, len(tokens), page_size):
+            end = start + page_size
+            last_a = key_a.hash_page(start, end, last_a)
+            last_b = key_b.hash_page(start, end, last_b)
+            last_none = key_none.hash_page(start, end, last_none)
+            hashes_a.append(last_a)
+            hashes_b.append(last_b)
+            hashes_none.append(last_none)
+
+        self.assertNotEqual(hashes_a, hashes_b)
+
+        prefetch_hashes = []
+        last = None
+        for start in range(0, len(tokens), page_size):
+            last = get_hash_str(
+                tokens[start : start + page_size],
+                last,
+                extra_key="tenant-A",
+            )
+            prefetch_hashes.append(last)
+        self.assertEqual(hashes_a, prefetch_hashes)
+
+        old_hashes = []
+        last = None
+        for start in range(0, len(tokens), page_size):
+            last = get_hash_str(tokens[start : start + page_size], last)
+            old_hashes.append(last)
+        self.assertEqual(hashes_none, old_hashes)
+
+    def test_prefetch_hash_slice_keeps_bigram_view(self):
+        tokens = [11, 12, 13, 14, 15, 16, 17]
+        key = RadixKey(array("q", tokens), "tenant-A", is_bigram=True)
+
+        page = key[:4]
+        expected = key.hash_page(0, 4)
+        self.assertEqual(get_hash_str(page, extra_key="tenant-A"), expected)
+
+        raw_hash = get_hash_str(page.token_ids[:4], extra_key="tenant-A")
+        self.assertNotEqual(raw_hash, expected)
 
 
 class TestTreeNode(unittest.TestCase):
