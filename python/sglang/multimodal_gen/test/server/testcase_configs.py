@@ -324,18 +324,6 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
     num_frames=9,
     fps=16,
     realtime_num_chunks=4,
-    realtime_events=[
-        {
-            "after_chunk": 0,
-            "kind": "camera_actions",
-            "payload": {"mode": "state", "transitions": [{"actions": ["w"]}]},
-        },
-        {
-            "after_chunk": 2,
-            "kind": "camera_actions",
-            "payload": {"mode": "state", "transitions": [{"actions": []}]},
-        },
-    ],
     realtime_perf_thresholds={
         "p95_chunk_total_ms": 5000.0,
         "p95_scheduler_forward_ms": 4500.0,
@@ -348,6 +336,22 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
         "guidance_scale": 1.0,
         "realtime_causal_sink_size": 9,
         "realtime_causal_kv_cache_num_frames": 18,
+        "condition_inputs": {
+            "camera_actions": [
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            ]
+        },
     },
 )
 

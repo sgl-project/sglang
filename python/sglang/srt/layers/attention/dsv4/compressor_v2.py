@@ -404,9 +404,6 @@ class CompressorBackendMixin:
         super().__init__()
         self.forward_metadata: DSV4Metadata
 
-    # NOTE: Will be overridden
-    def _maybe_upgrade_forward_metadata(self): ...
-
     def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
         return getattr(self.forward_metadata, attr_name)
@@ -483,7 +480,6 @@ class CompressorBackendMixin:
         if forward_batch.forward_mode.is_idle():
             return
 
-        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
@@ -513,7 +509,10 @@ class CompressorBackendMixin:
                 if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                     # The v2 compressor writes directly into the raw C4 KV tensor.
                     # HiSparse C4 therefore needs the physical C4 location here.
-                    out_loc = compress_kv_pool.translate_loc_to_hisparse_device(out_loc)
+                    # The compress kernel requires an int32 write location.
+                    out_loc = compress_kv_pool.translate_loc_to_hisparse_device(
+                        out_loc
+                    ).to(torch.int32)
             self._forward_compress_all_in_one(
                 kv_score_buffer=state_pool.kv_score_buffer.kv_score,
                 kv_score_input=kv_score_input,
