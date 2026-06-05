@@ -85,7 +85,7 @@ class LayerTransferCounter:
     def __init__(
         self,
         num_layers: int,
-        load_stream: torch.cuda.Stream,
+        load_stream: torch.Stream,
         lmc_connector: LMCacheLayerwiseConnector,
         printable: bool = False,
     ):
@@ -385,7 +385,7 @@ class LMCRadixCache(RadixCache):
                 LoadMetadata(
                     token_ids=key.token_ids,  # full page-aligned key
                     slot_mapping=slot_mapping,
-                    offset=value.numel() - prefix_pad,  # LMCache offset convention
+                    offset=value_numel - prefix_pad,  # LMCache offset convention
                 )
             )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
