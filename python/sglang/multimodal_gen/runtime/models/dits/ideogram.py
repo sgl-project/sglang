@@ -8,7 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    USPAttention,
+    build_varlen_mask_meta,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
 )
@@ -61,16 +64,16 @@ class Ideogram4Attention(nn.Module):
         )
         self.o = _linear(hidden_size, hidden_size, bias=False)
 
-    def forward(self, x, segment_ids, cos, sin):
+    def forward(self, x, cos, sin, attn_mask, attn_mask_meta):
         batch_size, seq_len, _ = x.shape
         qkv = self.qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = self.norm_q(q)
         k = self.norm_k(k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, cos, sin)
-        # The Ideogram input builder emits only padding (-1) and one valid
-        # segment (1), so a USP key mask preserves consumed valid-token rows.
-        out = self.attn(q, k, v, attn_mask=segment_ids > 0)
+        out = self.attn(
+            q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
+        )
         out = out.reshape(batch_size, seq_len, self.hidden_size)
         return self.o(out)
 
@@ -110,7 +113,7 @@ class Ideogram4TransformerBlock(nn.Module):
         self.ffn_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.adaln_modulation = _linear(adaln_dim, 4 * hidden_size, bias=True)
 
-    def forward(self, x, segment_ids, cos, sin, adaln_input):
+    def forward(self, x, cos, sin, adaln_input, attn_mask, attn_mask_meta):
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaln_modulation(
             adaln_input
         ).chunk(4, dim=-1)
@@ -118,9 +121,10 @@ class Ideogram4TransformerBlock(nn.Module):
         gate_mlp = torch.tanh(gate_mlp)
         attn_out = self.attention(
             self.attention_norm1(x) * (1.0 + scale_msa),
-            segment_ids=segment_ids,
             cos=cos,
             sin=sin,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
         )
         x = x + gate_msa * self.attention_norm2(attn_out)
         x = x + gate_mlp * self.ffn_norm2(
@@ -278,9 +282,17 @@ class Ideogram4Transformer2DModel(BaseDiT):
         cos, sin = self.rotary_emb(h, position_ids)
         cos = cos.unsqueeze(2)
         sin = sin.unsqueeze(2)
+        # ideogram uses -1 padding; varlen meta enables fa packed attention
+        attn_mask = segment_ids > 0
+        attn_mask_meta = build_varlen_mask_meta(attn_mask)
         for layer in self.layers:
             h = layer(
-                h, segment_ids=segment_ids, cos=cos, sin=sin, adaln_input=adaln_input
+                h,
+                cos=cos,
+                sin=sin,
+                adaln_input=adaln_input,
+                attn_mask=attn_mask,
+                attn_mask_meta=attn_mask_meta,
             )
         return self.final_layer(h, c=adaln_input).to(torch.float32)
 

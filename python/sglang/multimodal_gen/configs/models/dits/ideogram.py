@@ -20,9 +20,11 @@ class Ideogram4DiTArchConfig(DiTArchConfig):
     num_layers: int = 34
     rope_theta: int = 5_000_000
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
-    # Ideogram4 currently builds a dense padding mask, so keep attention SDPA-only.
     _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {AttentionBackendEnum.TORCH_SDPA}
+        default_factory=lambda: {
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.TORCH_SDPA,
+        }
     )
 
     def __post_init__(self) -> None:
