@@ -106,6 +106,7 @@ class LoRAManager:
             target_modules=target_modules,
             lora_paths=lora_paths,
         )
+        self.lora_backend.max_lora_rank = self.max_lora_rank
 
     def init_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
