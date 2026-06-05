@@ -136,7 +136,9 @@ class Conv1dLayer(MultiPlatformOp):
             self.register_parameter("bias", None)
 
         if _is_cpu and _is_cpu_amx_available:
-            self.quant_method = PackWeightMethod(weight_names=["weight"])
+            self.quant_method = PackWeightMethod(
+                weight_names=["weight"], is_conv_weight=True
+            )
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -354,7 +356,9 @@ class Conv3dLayer(MultiPlatformOp):
             self.register_parameter("bias", None)
 
         if _is_cpu and _is_cpu_amx_available and self.bias is not None:
-            self.quant_method = PackWeightMethod(weight_names=["weight"])
+            self.quant_method = PackWeightMethod(
+                weight_names=["weight"], is_conv_weight=True
+            )
         self._reset_parameters()
 
     def _reset_parameters(self):

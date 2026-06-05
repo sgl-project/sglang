@@ -106,7 +106,7 @@ def dtype_is_supported(weight):
 
 
 def is_dim_conv_weight(weight):
-    return weight.dim() == 3 or weight.dim() == 5
+    return (weight.dim() == 3 and weight.size(1) == 1) or weight.dim() == 5
 
 
 def _init_amx_conv_state(conv_state):
@@ -131,6 +131,7 @@ def _amx_process_weight_after_loading(
     weight_names,
     transpose_dims=None,
     qweight_packed_method=None,
+    is_conv_weight=False,
 ) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
@@ -152,7 +153,7 @@ def _amx_process_weight_after_loading(
 
             if transpose_dims and transpose_dims[i]:
                 weight_tensor = weight_tensor.transpose(*transpose_dims[i])
-            is_conv_weight = is_dim_conv_weight(weight_tensor)
+            is_conv_weight = is_conv_weight or is_dim_conv_weight(weight_tensor)
             # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
             if (
                 (not dim_is_supported(weight_tensor))
@@ -219,11 +220,15 @@ def _amx_process_weight_after_loading(
 
 
 class PackWeightMethod:
-    def __init__(self, weight_names, transpose_dims=None):
+    def __init__(self, weight_names, transpose_dims=None, is_conv_weight=False):
         self.weight_names = weight_names
         self.transpose_dims = transpose_dims
+        self.is_conv_weight = is_conv_weight
 
     def process_weights_after_loading(self, module) -> None:
         _amx_process_weight_after_loading(
-            module, self.weight_names, self.transpose_dims
+            module,
+            self.weight_names,
+            self.transpose_dims,
+            is_conv_weight=self.is_conv_weight,
         )
