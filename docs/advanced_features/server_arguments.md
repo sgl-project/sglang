@@ -408,12 +408,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--disable-radix-cache` | Disable RadixAttention for prefix caching. | `False` | bool flag (set to enable) |
-| `--cuda-graph-max-bs` | Set the maximum batch size for cuda graph. It will extend the cuda graph capture batch size to this value. | `None` | Type: int |
-| `--cuda-graph-bs` | Set the list of batch sizes for cuda graph. | `None` | List[int] |
-| `--disable-cuda-graph` | Disable cuda graph. | `False` | bool flag (set to enable) |
+| `--cuda-graph-config` | Canonical per-phase CUDA graph settings as JSON, e.g. `{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}`. JSON wins over the per-phase `--cuda-graph-*` convenience flags and over the legacy flags. Allowed backends: `full`, `breakable`, `tc_piecewise`, `disabled` (`full` is decode-only). | `None` | Type: JSON (dict-of-dicts) |
+| `--cuda-graph-backend-decode` | Backend for the decode phase. Folds into `cuda_graph_config[decode].backend`. | `None` | `full`, `breakable`, `tc_piecewise`, `disabled` |
+| `--cuda-graph-backend-prefill` | Backend for the prefill phase. Folds into `cuda_graph_config[prefill].backend`. | `None` | `breakable`, `tc_piecewise`, `disabled` |
+| `--cuda-graph-max-bs-decode` | Maximum batch size captured for the decode CUDA graph. | `None` | Type: int |
+| `--cuda-graph-max-tokens-prefill` | Maximum token count captured for the prefill CUDA graph. | `None` | Type: int |
+| `--cuda-graph-bs-decode` | Explicit list of batch sizes to capture for the decode CUDA graph. | `None` | List[int] |
+| `--cuda-graph-tokens-prefill` | Explicit list of token counts to capture for the prefill CUDA graph. | `None` | List[int] |
+| `--cuda-graph-tc-compiler` | Compiler used by the `tc_piecewise` backend (only the prefill phase consumes it today). | `None` | `eager`, `inductor` |
 | `--disable-cuda-graph-padding` | Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed. | `False` | bool flag (set to enable) |
 | `--enable-profile-cuda-graph` | Enable profiling of cuda graph capture. | `False` | bool flag (set to enable) |
 | `--enable-cudagraph-gc` | Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process. | `False` | bool flag (set to enable) |
+| `--debug-cuda-graph` | Eager-mode CUDA graph via the breakable backend: graph breaks let every op run eagerly while still going through the capture/replay path. Useful for debugging capture/replay issues. | `False` | bool flag (set to enable) |
 | `--enable-layerwise-nvtx-marker` | Enable layerwise NVTX profiling annotations for the model. This adds NVTX markers to every layer for detailed per-layer performance analysis with Nsight Systems. | `False` | bool flag (set to enable) |
 | `--enable-nccl-nvls` | Enable NCCL NVLS for prefill heavy requests when available. | `False` | bool flag (set to enable) |
 | `--enable-symm-mem` | Enable NCCL symmetric memory for fast collectives. | `False` | bool flag (set to enable) |
@@ -433,12 +439,20 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | `0.48` | Type: float |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | `False` | bool flag (set to enable) |
 | `--enable-torch-compile-debug-mode` | Enable debug mode for torch compile. | `False` | bool flag (set to enable) |
-| `--disable-piecewise-cuda-graph` | Disable piecewise cuda graph for extend/prefill. PCG is enabled by default. | `False` | bool flag (set to disable) |
-| `--enforce-piecewise-cuda-graph` | Enforce piecewise cuda graph, skipping all auto-disable conditions. For testing only. | `False` | bool flag (set to enable) |
-| `--piecewise-cuda-graph-tokens` | Set the list of tokens when using piecewise cuda graph. | `None` | Type: JSON list |
-| `--piecewise-cuda-graph-compiler` | Set the compiler for piecewise cuda graph. Choices are: eager, inductor. | `eager` | `eager`, `inductor` |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | `32` | Type: int |
-| `--piecewise-cuda-graph-max-tokens` | Set the maximum tokens when using piecewise cuda graph. | `4096` | Type: int |
+| `--cuda-graph-max-bs` | **Deprecated alias** for `--cuda-graph-max-bs-decode`. | `None` | Type: int |
+| `--cuda-graph-bs` | **Deprecated alias** for `--cuda-graph-bs-decode`. | `None` | List[int] |
+| `--disable-cuda-graph` | **Deprecated.** Use `--cuda-graph-backend-decode=disabled` and/or `--cuda-graph-backend-prefill=disabled`. | `False` | bool flag (set to enable) |
+| `--enable-breakable-cuda-graph` | **Deprecated alias** for `--cuda-graph-backend-prefill=breakable`. | `False` | bool flag (set to enable) |
+| `--prefill-cuda-graph-backend` | **Deprecated alias** for `--cuda-graph-backend-prefill`. | `None` | `breakable`, `tc_piecewise`, `disabled` |
+| `--decode-cuda-graph-backend` | **Deprecated alias** for `--cuda-graph-backend-decode`. | `None` | `full`, `breakable`, `tc_piecewise`, `disabled` |
+| `--disable-prefill-cuda-graph` | **Deprecated.** Use `--cuda-graph-backend-prefill=disabled`. | `False` | bool flag (set to enable) |
+| `--disable-decode-cuda-graph` | **Deprecated.** Use `--cuda-graph-backend-decode=disabled`. | `False` | bool flag (set to enable) |
+| `--disable-piecewise-cuda-graph` | **Deprecated alias** for `--cuda-graph-backend-prefill=disabled`. | `False` | bool flag (set to enable) |
+| `--enforce-piecewise-cuda-graph` | **Deprecated alias** for `--cuda-graph-backend-prefill=tc_piecewise`. Explicitly setting the prefill backend now skips the auto-disable cascade automatically. | `False` | bool flag (set to enable) |
+| `--piecewise-cuda-graph-tokens` | **Deprecated alias** for `--cuda-graph-tokens-prefill`. | `None` | List[int] |
+| `--piecewise-cuda-graph-compiler` | **Deprecated alias** for `--cuda-graph-tc-compiler`. | `eager` | `eager`, `inductor` |
+| `--piecewise-cuda-graph-max-tokens` | **Deprecated alias** for `--cuda-graph-max-tokens-prefill`. | `4096` | Type: int |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row | `` | Type: str |
 | `--enable-nan-detection` | Enable the NaN detection for debugging purposes. | `False` | bool flag (set to enable) |
 | `--enable-p2p-check` | Enable P2P check for GPU access, otherwise the p2p access is allowed by default. | `False` | bool flag (set to enable) |
