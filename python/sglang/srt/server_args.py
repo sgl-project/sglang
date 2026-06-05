@@ -233,6 +233,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
@@ -3488,7 +3489,7 @@ class ServerArgs:
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        if self.moe_runner_backend == "flashinfer_trtllm":
+        if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
@@ -6121,7 +6122,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-adaptive-config",
             type=str,
-            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs.",
             default=ServerArgs.speculative_adaptive_config,
         )
         parser.add_argument(
@@ -7588,7 +7589,6 @@ class ServerArgs:
         )
 
         candidate_steps = resolve_candidate_steps_from_config(
-            initial_steps=self.speculative_num_steps,
             cfg_path=self.speculative_adaptive_config,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state

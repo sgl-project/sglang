@@ -691,7 +691,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+        # Some EAGLE3 drafts (e.g. nvidia/Kimi-K2.5-Thinking-Eagle3) carry the full DeepSeek-V3
+        # config schema and explicitly set `num_nextn_predict_layers: 0`. Treat that the same as
+        # the field being absent — otherwise the draft worker takes the MTP branch below with
+        # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
+        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
+        _nnpl = self.model_config.num_nextn_predict_layers
+        model_has_mtp_layers = _nnpl is not None and _nnpl > 0
         model_num_layers = (
             self.model_config.num_nextn_predict_layers
             if self.is_draft_worker and model_has_mtp_layers
@@ -1421,14 +1427,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
+        # TODO: Move this online-quantization reporting out of ModelRunner.
+        quantized_layers = getattr(
+            getattr(self.model, "quant_config", None), "quantized_layers", None
+        )
         if (
-            hasattr(self.model, "quant_config")
-            and hasattr(self.model.quant_config, "quantized_layers")
-            and self.server_args.quantization is not None
+            self.server_args.quantization is not None
+            and isinstance(quantized_layers, tuple)
+            and len(quantized_layers) == 2
         ):
-            layer_types, quantized_layers_count = (
-                self.model.quant_config.quantized_layers
-            )
+            layer_types, quantized_layers_count = quantized_layers
             logger.info(
                 f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
             )
