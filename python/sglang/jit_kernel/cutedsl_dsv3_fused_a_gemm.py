@@ -26,7 +26,6 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils
 import torch
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -53,7 +52,7 @@ def _stage_i32(tile_n: int) -> int:
     return (TILE_M + tile_n) * KI
 
 
-def _cp_async(smem_ptr, gmem_ptr):
+def _cp_async_16b(smem_ptr, gmem_ptr):
     llvm.inline_asm(
         None,
         [smem_ptr.toint().ir_value(), gmem_ptr.toint().ir_value()],
@@ -65,7 +64,7 @@ def _cp_async(smem_ptr, gmem_ptr):
     )
 
 
-def _cp_async_pred(smem_ptr, gmem_ptr, pred_i32):
+def _cp_async_16b_pred(smem_ptr, gmem_ptr, pred_i32):
     llvm.inline_asm(
         None,
         [smem_ptr.toint().ir_value(), gmem_ptr.toint().ir_value(), pred_i32.ir_value()],
@@ -78,7 +77,7 @@ def _cp_async_pred(smem_ptr, gmem_ptr, pred_i32):
     )
 
 
-def _ldmatrix(smem_ptr):
+def _ldmatrix_x4(smem_ptr):
     i32 = ir.IntegerType.get_signless(32)
     res = llvm.inline_asm(
         llvm.StructType.get_literal([i32, i32, i32, i32]),
@@ -108,7 +107,7 @@ def _ldmatrix_x2(smem_ptr):
     return [llvm.extractvalue(i32, res, [i]) for i in range(2)]
 
 
-def _mma(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
+def _mma_m16n8k16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
     f32 = ir.F32Type.get()
     res = llvm.inline_asm(
         llvm.StructType.get_literal([f32, f32, f32, f32]),
@@ -123,31 +122,31 @@ def _mma(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
     return [llvm.extractvalue(f32, res, [i]) for i in range(4)]
 
 
-def _swizzle(row, col):
+def _swizzle_343(row, col):
     return col ^ ((row % 8) * 4)
 
 
-def _k_project(tile, col, kgi):
+def _global_k_col(tile, col, kgi):
     kp_warp = KI // SPLITK
     kp_chunk = kgi // SPLITK
     return (col // kp_warp) * kp_chunk + tile * kp_warp + (col % kp_warp)
 
 
-def _load_tile(ltid, feat0, sa, sb, mW, mA, tile, buf, M, kgi, tile_n):
+def _load_stage(ltid, feat0, sa, sb, mW, mA, tile, buf, M, kgi, tile_n):
     for it in range(TILE_M * KI // (LOADER_THREADS * 4)):
         idx = (it * LOADER_THREADS + ltid) * 4
         row, col = idx // KI, idx % KI
-        _cp_async(
-            sa.iterator + (buf * TILE_M * KI + row * KI + _swizzle(row, col)),
-            mW.iterator + ((feat0 + row) * kgi + _k_project(tile, col, kgi)),
+        _cp_async_16b(
+            sa.iterator + (buf * TILE_M * KI + row * KI + _swizzle_343(row, col)),
+            mW.iterator + ((feat0 + row) * kgi + _global_k_col(tile, col, kgi)),
         )
     for it in range(tile_n * KI // (LOADER_THREADS * 4)):
         idx = (it * LOADER_THREADS + ltid) * 4
         row, col = idx // KI, idx % KI
         pred = (row < M).to(cutlass.Int32)
-        _cp_async_pred(
-            sb.iterator + (buf * tile_n * KI + row * KI + _swizzle(row, col)),
-            mA.iterator + (row * pred * kgi + _k_project(tile, col, kgi)),
+        _cp_async_16b_pred(
+            sb.iterator + (buf * tile_n * KI + row * KI + _swizzle_343(row, col)),
+            mA.iterator + (row * pred * kgi + _global_k_col(tile, col, kgi)),
             pred,
         )
 
@@ -207,7 +206,7 @@ def _kernel(
                 nst = (kt + 1) % nstage
                 nph = (((kt + 1) // nstage) & 1) ^ 1
                 need_wait = not cute.arch.mbarrier_try_wait(empty + nst, nph)
-            _load_tile(ltid, feat0, sA, sB, mW, mA, kt, st, M, kgi, tile_n)
+            _load_stage(ltid, feat0, sA, sB, mW, mA, kt, st, M, kgi, tile_n)
             cute.arch.cp_async_mbarrier_arrive_noinc(full + st)
     else:
         acc = [[cutlass.Float32(0.0) for _ in range(4)] for _ in range(NB)]
@@ -220,17 +219,21 @@ def _kernel(
             for step in cutlass.range_constexpr(KSTEPS):
                 kbh = warp * (PWK // 2) + step * 8
                 arow, aoff = lane % 16, (lane // 16) * 4
-                a = _ldmatrix(
+                a = _ldmatrix_x4(
                     sA.iterator
-                    + (buf * TILE_M * KI + arow * KI + _swizzle(arow, kbh + aoff))
+                    + (buf * TILE_M * KI + arow * KI + _swizzle_343(arow, kbh + aoff))
                 )
                 for nb in cutlass.range_constexpr(NB):
                     brow = nb * 8 + brow_lo
                     bb = _ldmatrix_x2(
                         sB.iterator
-                        + (buf * tile_n * KI + brow * KI + _swizzle(brow, kbh + boff))
+                        + (
+                            buf * tile_n * KI
+                            + brow * KI
+                            + _swizzle_343(brow, kbh + boff)
+                        )
                     )
-                    d = _mma(
+                    d = _mma_m16n8k16(
                         a[0],
                         a[1],
                         a[2],
