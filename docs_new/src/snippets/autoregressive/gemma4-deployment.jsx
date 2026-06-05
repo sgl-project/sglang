@@ -3,11 +3,25 @@ export const Gemma4Deployment = () => {
     modelSize: {
       name: 'modelSize',
       title: 'Model Variant',
+      // 12B is a QAT-only release, so it is offered only when the QAT
+      // checkpoint is selected.
+      getDynamicItems: (values) => {
+        const isQat = values.checkpoint === 'qat';
+        return [
+          { id: 'e2b', label: 'E2B (~2B)', default: false },
+          { id: 'e4b', label: 'E4B (~4B)', default: true },
+          ...(isQat ? [{ id: '12b', label: '12B (Dense)', default: false }] : []),
+          { id: '31b', label: '31B (Dense)', default: false },
+          { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
+        ];
+      }
+    },
+    checkpoint: {
+      name: 'checkpoint',
+      title: 'Checkpoint',
       items: [
-        { id: 'e2b', label: 'E2B (~2B)', default: false },
-        { id: 'e4b', label: 'E4B (~4B)', default: true },
-        { id: '31b', label: '31B (Dense)', default: false },
-        { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
+        { id: 'standard', label: 'Standard', subtitle: 'BF16', default: true },
+        { id: 'qat', label: 'QAT', subtitle: 'q4_0-unquantized', default: false },
       ]
     },
     hardware: {
@@ -56,12 +70,14 @@ export const Gemma4Deployment = () => {
     h200: {
       e2b: { tp: 1, mem: 0.85 },
       e4b: { tp: 1, mem: 0.85 },
+      '12b': { tp: 1, mem: 0.85 },
       '31b': { tp: 2, mem: 0.85 },
       '26b-a4b': { tp: 1, mem: 0.85 },
     },
     b200: {
       e2b: { tp: 1, mem: 0.9 },
       e4b: { tp: 1, mem: 0.9 },
+      '12b': { tp: 1, mem: 0.9 },
       '31b': { tp: 1, mem: 0.9 },
       '26b-a4b': { tp: 1, mem: 0.9 },
     },
@@ -82,16 +98,22 @@ export const Gemma4Deployment = () => {
     const modelNames = {
       'e2b': 'google/gemma-4-E2B-it',
       'e4b': 'google/gemma-4-E4B-it',
+      '12b': 'google/gemma-4-12B-it',
       '31b': 'google/gemma-4-31B-it',
       '26b-a4b': 'google/gemma-4-26B-A4B-it',
     };
+
+    // QAT releases keep bf16 weights (q4_0-unquantized), so the only change is
+    // the model-path suffix; TP/memory requirements match the standard checkpoints.
+    const qatSuffix = values.checkpoint === 'qat' ? '-qat-q4_0-unquantized' : '';
+    const modelPath = `${modelNames[modelSize]}${qatSuffix}`;
 
     const mtpEnabled = values.speculative === 'enabled';
     if (mtpEnabled && modelSize === '26b-a4b' && hardware !== 'mi300x') {
       tp = 2;
     }
 
-    let cmd = `sglang serve --model-path ${modelNames[modelSize]}`;
+    let cmd = `sglang serve --model-path ${modelPath}`;
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;
     }
@@ -106,7 +128,7 @@ export const Gemma4Deployment = () => {
 
     if (mtpEnabled) {
       cmd += ` \\\n  --speculative-algorithm NEXTN`;
-      cmd += ` \\\n  --speculative-draft-model-path ${modelNames[modelSize]}-assistant`;
+      cmd += ` \\\n  --speculative-draft-model-path ${modelPath}-assistant`;
       cmd += ` \\\n  --speculative-num-steps 5`;
       cmd += ` \\\n  --speculative-num-draft-tokens 6`;
       cmd += ` \\\n  --speculative-eagle-topk 1`;
@@ -176,7 +198,15 @@ export const Gemma4Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      // 12B exists only as a QAT release; fall back to the default variant when
+      // leaving QAT so modelSize never points at a hidden option.
+      if (optionName === 'checkpoint' && value !== 'qat' && next.modelSize === '12b') {
+        next.modelSize = 'e4b';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
