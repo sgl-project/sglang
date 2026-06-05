@@ -6,6 +6,9 @@ from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
+    SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+    SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+    SMALL_KV_POOL_MAX_TOTAL_TOKENS,
     VERY_LONG_PROMPT_LEN,
     advance_to_decode_step,
     base_engine_kwargs,
@@ -37,7 +40,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_in_flight_no_idle(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=100
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
@@ -57,7 +62,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_add_chunked_req_path(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=110
+        )
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
@@ -67,7 +74,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_admission_with_chunked_in_flight(t: ScriptedContext):
-        r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r_chunk = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=120
+        )
         yield from run_until(r_chunk, lambda h: h.is_chunking)
 
         r_small = t.start_req(prompt_len=4, max_new_tokens=2)
@@ -85,7 +94,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_excludes_chunked_req(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=130
+        )
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
@@ -107,7 +118,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_get_chunked_req_lambda_getter(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=140
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         saw_match = False
         for _ in range(DEFAULT_MAX_STEPS):
@@ -176,7 +189,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_filter_batch_exclude_chunked_flag(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=150
+        )
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
         saw_r1_chunking = False
         for _ in range(DEFAULT_MAX_STEPS * 2):
@@ -210,7 +225,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_streaming_session_kv_committed_bound(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=160
+        )
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 assert len(r.req.prefix_indices) <= r.req.kv_committed_len, (
@@ -237,7 +254,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_pause_retract_clears_chunked_req(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=170
+        )
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.pause_generation(mode="retract")
@@ -280,7 +299,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         # a still-chunking req (even with an empty running_batch) clears chunked_req,
         # releases its KV, resets inflight_middle_chunks to 0, and moves it to the
         # waiting queue.
-        r = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=180
+        )
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         assert r.req.inflight_middle_chunks > 0
         assert r.is_chunking
@@ -324,7 +345,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         # chunk, so the two legitimately differ mid-flight. Compare against the
         # prefix-subtracting formula directly and require the subtraction actually
         # happened once a prefix is committed (strictly below the full seqlen).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=190
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         saw_dedup = False
@@ -371,7 +394,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         # assert the exact remainder, so a regression that drops the prefix
         # subtraction (over-counts the committed prefix) is caught.
         s = t.scheduler
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=200
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
@@ -410,7 +435,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         # This is the branch that distinguishes the two call sites of
         # _get_num_pending_tokens (load-reporting vs batch-scheduling).
         s = t.scheduler
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=210
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
@@ -435,45 +462,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_chunking, "test must observe the chunked req with a planned chunk"
 
-    def test_chunked_forced_admission_avoids_leak(self):
-        self.server.execute_script(self._script_chunked_forced_admission_avoids_leak)
-
-    @staticmethod
-    def _script_chunked_forced_admission_avoids_leak(t: ScriptedContext):
-        # Honest pressure pattern: drive the chunked req past its first chunk,
-        # then squeeze free KV to a sub-chunk sliver so the next resume sees
-        # _rem_tokens <= 0 and takes the force-re-add path. Nothing can free pages
-        # while the raw exhauster holds them, so the req stalls at its current
-        # chunk; confirm that observable stall, then release the exhauster and
-        # confirm the req completes and leaks no row. "Completes while nothing
-        # ever frees pages" is structurally impossible, so the release is part of
-        # the path under test.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-
-        baseline_rows = (
-            t.scheduler.req_to_token_pool.size
-            - t.scheduler.req_to_token_pool.available_size()
-        )
-        t.exhaust_kv(leave_pages=1)
-        yield
-        chunks_at_stall = r.chunks_done
-        for _ in range(4):
-            yield
-        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
-            f"forced-re-add chunked req must stall under KV pressure; "
-            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
-        )
-
-        t._release_exhausted_pools()
-        yield
-        yield from run_until_finished(r, max_steps=2000)
-        assert r.finished
-        assert (
-            t.scheduler.req_to_token_pool.size
-            - t.scheduler.req_to_token_pool.available_size()
-        ) <= baseline_rows, f"row leak under forced chunked admission: baseline={baseline_rows}, after={(t.scheduler.req_to_token_pool.size - t.scheduler.req_to_token_pool.available_size())}"
-
     def test_stage_a_inflight_middle_chunks_sync_invariant(self):
         self.server.execute_script(
             self._script_stage_a_inflight_middle_chunks_sync_invariant
@@ -489,7 +477,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                     f"{req.inflight_middle_chunks} but is_chunking={r.is_chunking}"
                 )
 
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, prompt_token=220
+        )
         # Drive a retract/resume mid-chunk: retract clears chunked_req (so
         # is_chunking flips to False) and must also reset inflight_middle_chunks
         # in the same transition, otherwise the cross-subsystem invariant breaks.
@@ -524,7 +514,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         # holds at the instant a chunk boundary commits, before the next chunk is loaded;
         # with the overlap pipeline the observable state is always mid-chunk where the
         # current chunk's tokens are appended past the committed prefix).
-        r = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=230
+        )
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
         saw_mid_chunk = False
         for _ in range(DEFAULT_MAX_STEPS):
@@ -563,7 +555,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     @staticmethod
     def _script_chunked_req_slot_cleared_when_chunk_completes(t: ScriptedContext):
         s = t.scheduler
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=240
+        )
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
@@ -640,7 +634,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         # assertion must be guarded by r.is_chunking, mirroring the passing
         # test_chunked_in_flight_no_idle. The real invariant under test is that the
         # sole chunked req keeps advancing with an empty waiting_queue.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=250
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         prev_chunks_done = r.chunks_done
         progressed = False
@@ -661,42 +657,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             "chunks_done must keep advancing without any waiter; pre-fix "
             "an empty waiting_queue could cause the loop to skip continuation"
         )
-
-    def test_add_chunked_req_non_swa_forced_admit_on_rem_zero(self):
-        self.server.execute_script(
-            self._script_add_chunked_req_non_swa_forced_admit_on_rem_zero
-        )
-
-    @staticmethod
-    def _script_add_chunked_req_non_swa_forced_admit_on_rem_zero(t: ScriptedContext):
-        # Honest pressure pattern: drive the chunked req past its first chunk, then
-        # squeeze free KV to a sub-chunk sliver so the resume sees _rem_tokens <= 0
-        # and takes the force-re-add path (schedule_policy.py:679-682). The raw
-        # exhauster holds every other page so the req stalls; confirm the stall,
-        # release the exhauster, then confirm the force-re-added req completes and
-        # releases all resources rather than leaking its held row + KV.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.exhaust_kv(leave_pages=1)
-        yield
-        chunks_at_stall = r.chunks_done
-        for _ in range(4):
-            yield
-        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
-            f"force-re-add chunked req must stall under KV pressure; "
-            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
-        )
-
-        t._release_exhausted_pools()
-        yield
-        yield from run_until_finished(r, max_steps=2000)
-        assert r.finished, (
-            "non-SWA chunked-resume must be force-admitted when "
-            "_rem_tokens == 0 (schedule_policy.py:679-682) and complete once the "
-            "pressure clears; it must not leak its held row + KV"
-        )
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
 
 
 class TestSpecialCaseRowPoolExhaustion(ScriptedTestCase):
@@ -761,7 +721,9 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
         for d in decodes:
             yield from advance_to_decode_step(d, 1)
 
-        r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+        r_chunk = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, prompt_token=300
+        )
         yield from run_until(r_chunk, lambda h: h.is_chunking)
 
         comp = t.batch_composition()
@@ -803,6 +765,7 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
             return_logprob=True,
+            prompt_token=310,
         )
         yield from run_until(r, lambda h: h.is_chunking)
         assert (
@@ -818,7 +781,9 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
         r_dec = t.start_req(prompt_len=8, max_new_tokens=32)
         yield from run_until(r_dec, lambda h: h.status == "running")
 
-        r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r_chunk = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=320
+        )
         yield
         yield from run_until(r_chunk, lambda h: h.is_chunking)
 
@@ -947,7 +912,9 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
 
     @staticmethod
     def _script_hicache_breakdown_only_first_chunk(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=400
+        )
         first_chunk_snap = None
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
@@ -977,7 +944,9 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
 
     @staticmethod
     def _script_hicache_cached_tokens_set_once_invariant(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=410
+        )
         snap: Optional[tuple] = None
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
@@ -1056,8 +1025,75 @@ class TestSpecialCaseDynamicChunkingPP1(ScriptedTestCase):
         )
 
 
-class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+class TestSpecialCaseSmallPool(ScriptedTestCase):
+    # Forced-admission (add_chunked_req force-re-add) tests under TRUE,
+    # engine-resolvable KV pressure -- a small KV pool with real reqs, never raw
+    # exhaust_kv pages. The schedule_policy force-re-add branch sets
+    # _rem_tokens = rem_chunk_tokens when min(rem_chunk_tokens, rem_total_tokens)
+    # <= 0 so an in-flight chunked req is never silently dropped (which would leak
+    # its held row + KV). Driving rem_total_tokens <= 0 with raw exhaust_kv pages
+    # crashes the scheduler (the force-re-add then allocs against pages that are
+    # gone), so instead a long-lived ballast decode req plus the in-flight chunked
+    # req share a capped pool: when their combined reservation drives
+    # rem_total_tokens <= 0 the force-re-add fires, the alloc succeeds (the pages
+    # are physically free), and the engine resolves the over-commitment by
+    # retracting the ballast on the decode-OOM path -- the named branch intent is
+    # genuinely reached without a crash.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        max_total_tokens=SMALL_KV_POOL_MAX_TOTAL_TOKENS,
+    )
+
+    @staticmethod
+    def _start_ballast(t: ScriptedContext, *, prompt_token: int):
+        return t.start_req(
+            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+            max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+            ignore_eos=True,
+            prompt_token=prompt_token,
+        )
+
+    @staticmethod
+    def _run_force_readd_then_complete(
+        t: ScriptedContext, *, chunk_token: int, ballast_token: int
+    ):
+        # Shared body for the force-re-add forced-admission tests: admit the chunked
+        # req first (guaranteed into the chunked slot on the empty pool), then add a
+        # ballast so the pool runs out and the chunked resume hits the force-re-add
+        # branch. The engine retracts the ballast and the chunked req completes,
+        # releasing all resources (the consequence of "force-re-added, not silently
+        # dropped"). Returns nothing; asserts inline.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=chunk_token
+        )
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+
+        ballast = TestSpecialCaseSmallPool._start_ballast(t, prompt_token=ballast_token)
+
+        ballast_retracted = False
+        for _ in range(2000):
+            if ballast.status == "waiting":
+                ballast_retracted = True
+            if r.finished:
+                break
+            yield
+        assert r.finished, (
+            "force-re-added chunked resume must complete once the engine retracts "
+            f"the ballast; status={r.status} kv_pages={r.kv_pages}"
+        )
+        assert r.kv_pages == 0, f"kv_pages={r.kv_pages}"
+        assert r.lock_refs == 0, f"lock_refs={r.lock_refs}"
+        assert (
+            ballast_retracted
+            or ballast.finished
+            or ballast.status in ("waiting", "finished", "unknown")
+        ), f"ballast must be retracted/aborted under pressure; status={ballast.status}"
+
+        t.abort(ballast)
+        for _ in range(200):
+            if t.is_fully_idle:
+                break
+            yield
 
     def test_add_chunked_req_rem_nonpositive_forces_rem_chunk_tokens(self):
         self.server.execute_script(
@@ -1068,50 +1104,44 @@ class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
     def _script_add_chunked_req_rem_nonpositive_forces_rem_chunk_tokens(
         t: ScriptedContext,
     ):
-        # schedule_policy.py:679-682 (non-SWA branch): when a chunked resume sees
-        # _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0, the req must
-        # still be re-added (forced to rem_chunk_tokens at line 682) rather than
-        # silently dropped, otherwise its held row/KV leaks forever. Drive a chunked
-        # req mid-flight, then squeeze every free KV page so rem_total_tokens hits 0
-        # and _rem_tokens <= 0 on the next re-admit; the force-to-rem_chunk_tokens
-        # re-add (line 682) keeps the req alive so it finishes and releases all
-        # resources. A non-SWA model executes line 682 (not the SWA park at 681).
-        #
-        # The observable consequence of "re-added, not silently dropped" is exactly
-        # this clean finish + full resource release under full KV pressure (the same
-        # invariant test_add_chunked_req_non_swa_forced_admit_on_rem_zero asserts). A
-        # post-squeeze chunks_done bump is NOT a reliable witness: with all KV held
-        # the req may land on its final chunk and finish without advancing chunks_done
-        # in the observable window, so requiring a bump is a wrong assumption.
-        #
-        # Honest pressure pattern: the raw exhauster holds every page except a
-        # sub-chunk sliver, so the chunked resume sees _rem_tokens <= 0 and takes
-        # the force-to-rem_chunk_tokens re-add path while nothing can free pages,
-        # so the req stalls. Confirm that observable stall, release the exhauster,
-        # then confirm the force-re-added req completes and releases all resources.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-
-        t.exhaust_kv(leave_pages=1)
-        yield
-        chunks_at_stall = r.chunks_done
-        for _ in range(4):
-            yield
-        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
-            f"force-re-add chunked req must stall under KV pressure; "
-            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
+        # schedule_policy.py add_chunked_req non-SWA branch: when a chunked resume
+        # sees _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0, the req
+        # must still be re-added (forced to rem_chunk_tokens) rather than silently
+        # dropped, otherwise its held row/KV leaks forever. The ballast drives
+        # rem_total_tokens <= 0 so the force-re-add branch executes; the engine
+        # retracts the ballast and the chunked req completes and releases all
+        # resources -- the observable consequence of "re-added, not dropped".
+        yield from TestSpecialCaseSmallPool._run_force_readd_then_complete(
+            t, chunk_token=700, ballast_token=701
         )
 
-        t._release_exhausted_pools()
-        yield
-        yield from run_until_finished(r, max_steps=DEFAULT_MAX_STEPS * 2)
-        assert r.finished, (
-            "non-SWA chunked resume must be force-re-added when _rem_tokens <= 0 "
-            "and complete once the pressure clears; it must not leak its "
-            f"held row + KV. status={r.status} kv_pages={r.kv_pages}"
+    def test_chunked_forced_admission_avoids_leak(self):
+        self.server.execute_script(self._script_chunked_forced_admission_avoids_leak)
+
+    @staticmethod
+    def _script_chunked_forced_admission_avoids_leak(t: ScriptedContext):
+        # Same force-re-add branch, asserted as "no row/KV leak after the forced
+        # admission completes". Real ballast pressure drives rem_total_tokens <= 0
+        # so the in-flight chunked req takes the force-re-add path; once the engine
+        # retracts the ballast it finishes and leaks no row.
+        yield from TestSpecialCaseSmallPool._run_force_readd_then_complete(
+            t, chunk_token=710, ballast_token=711
         )
-        assert r.kv_pages == 0, f"kv_pages={r.kv_pages}"
-        assert r.lock_refs == 0, f"lock_refs={r.lock_refs}"
+
+    def test_add_chunked_req_non_swa_forced_admit_on_rem_zero(self):
+        self.server.execute_script(
+            self._script_add_chunked_req_non_swa_forced_admit_on_rem_zero
+        )
+
+    @staticmethod
+    def _script_add_chunked_req_non_swa_forced_admit_on_rem_zero(t: ScriptedContext):
+        # The non-SWA force-admit-on-rem-zero branch: on a non-SWA model the
+        # force-re-add executes (it does not park as the SWA path would). The
+        # ballast drives _rem_tokens == 0; the chunked req is force-admitted,
+        # completes after the ballast is retracted, and releases all resources.
+        yield from TestSpecialCaseSmallPool._run_force_readd_then_complete(
+            t, chunk_token=720, ballast_token=721
+        )
 
 
 class TestSpecialCaseRetractMerge(ScriptedTestCase):

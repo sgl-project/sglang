@@ -82,7 +82,28 @@ def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_ST
 # (>> every max_steps below), yet 1 + this stays within the smallest test model's
 # context window (Qwen3-0.6B is 40960); a larger max_new_tokens is rejected at
 # admission ("exceeds the model's maximum context length") and never holds a row.
+# Use only with a FULL-SIZE KV pool (row-pool pressure), where the KV cost of the
+# huge decode reservation is irrelevant because the row pool exhausts first.
 BALLAST_MAX_NEW_TOKENS: int = 30000
+
+# KV pool cap (in tokens) for the small-KV-pool pressure classes. Small enough
+# that a long-lived ballast decode req plus a chunked prefill req together run the
+# pool out and trip the engine's decode-OOM retract path, large enough that both
+# reqs are admitted in the first place (page_size == 1 on the small test model).
+SMALL_KV_POOL_MAX_TOTAL_TOKENS: int = 4096
+
+# Decode budget for the small-KV-pool ballast. Unlike BALLAST_MAX_NEW_TOKENS this
+# must keep the ballast ADMISSIBLE into the capped pool: add_one_req gates on
+# extend_input_len + min(max_new_tokens, CLIP_MAX_NEW_TOKENS) + page_size <
+# rem_total_tokens, so with prompt_len 1536 and a 4096-token pool the clipped
+# max_new must stay well under ~2500. 512 leaves ample admission headroom while
+# still reserving enough decode space that, once a 2048-token chunked req is also
+# in flight, the combined reservation drives rem_total_tokens <= 0 and trips the
+# add_chunked_req force-re-add branch -- which the engine then resolves by
+# retracting the ballast (decode-OOM path), not by crashing on raw exhaustion.
+SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS: int = 512
+
+SMALL_KV_POOL_BALLAST_PROMPT_LEN: int = 1536
 
 
 def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):

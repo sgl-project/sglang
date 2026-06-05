@@ -41,7 +41,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_waiting_chunked_resume(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=100
+        )
         yield from run_until(r, lambda h: h.is_chunking)
 
         pages_before = r.kv_pages
@@ -69,7 +71,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_at_chunk_0(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=110
+        )
         yield
         yield from run_until(r, lambda h: h.is_chunking)
 
@@ -84,7 +88,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_at_chunk_mid(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=120
+        )
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
 
         t.abort(r)
@@ -97,8 +103,12 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_one_does_not_disturb_other(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=130
+        )
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=131
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
 
         t.abort(r1)
@@ -137,10 +147,14 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_then_start_same_step_new_rid(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=140
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
         t.abort(r1)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=141
+        )
         yield from run_until_finished(r2)
         assert r2.finished
         assert r1.kv_pages == 0
@@ -151,7 +165,10 @@ class TestAbortBasic(ScriptedTestCase):
     @staticmethod
     def _script_abort_then_start_same_step_same_rid(t: ScriptedContext):
         r1 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, rid="abort-reuse"
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=2,
+            rid="abort-reuse",
+            prompt_token=150,
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         t.abort(r1)
@@ -166,8 +183,10 @@ class TestAbortBasic(ScriptedTestCase):
     @staticmethod
     def _script_abort_five_chunked_in_a_row(t: ScriptedContext):
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(5)
+            t.start_req(
+                prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=160 + i
+            )
+            for i in range(5)
         ]
         yield from run_until(reqs[0], lambda h: h.is_chunking)
         for r in reqs:
@@ -316,7 +335,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_chunk_last(t: ScriptedContext):
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
+        r = t.start_req(
+            prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, prompt_token=170
+        )
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
         t.abort(r)
         yield from _drain_until_released(t, r)
@@ -328,7 +349,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_penultimate_chunk(t: ScriptedContext):
-        r = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=180
+        )
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
         t.abort(r)
         yield from _drain_until_released(t, r)
@@ -341,7 +364,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_double_abort_idempotent(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=190
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         t.abort(r)
         t.abort(r)
@@ -383,8 +408,10 @@ class TestAbortBasic(ScriptedTestCase):
     @staticmethod
     def _script_abort_in_separate_yields(t: ScriptedContext):
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(3)
+            t.start_req(
+                prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=200 + i
+            )
+            for i in range(3)
         ]
         yield from run_until(reqs[0], lambda h: h.is_chunking)
         for r in reqs:
@@ -399,7 +426,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_at_chunk_boundary_race(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=210
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
@@ -445,7 +474,9 @@ class TestAbortBasic(ScriptedTestCase):
         # abort must guarantee is that once the req is released it leaves NO radix
         # node still LOCKED on its behalf (the chunk's protective lock is dropped),
         # and that it does not revive.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=220
+        )
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
@@ -481,6 +512,7 @@ class TestAbortBasic(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
             rid="abort-resubmit-same-step",
+            prompt_token=230,
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         t.abort(r1)
@@ -508,7 +540,9 @@ class TestAbortBasic(ScriptedTestCase):
         # transition as the chunked_req slot. Abort while the req is mid-flight in a
         # middle chunk -- inflight_middle_chunks > 0 holds during chunking once at
         # least one chunk has run.
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=240
+        )
         yield from run_until(
             r,
             lambda h: h.is_chunking and h.chunks_done >= 1,
@@ -537,7 +571,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_when_chunked_only_then_idle(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=250
+        )
         yield from run_until(r, lambda h: h.is_chunking)
         assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
@@ -564,7 +600,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_req_then_abort_then_new_short_in_one_yield(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=260
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (
             t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
@@ -590,7 +628,9 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_force_retract_then_abort_same_yield(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=270
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert r1.kv_pages > 0
 
@@ -620,10 +660,10 @@ class TestAbortBasic(ScriptedTestCase):
         # Distinct prompt_token so r2 does not hit r1's partially-cached prefix
         # after r1 is aborted -- it must re-chunk from scratch to take the baton.
         r1 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=1
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=280
         )
         r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=2
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=281
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (1 if t.scheduler.chunked_req is not None else 0) == 1
@@ -651,7 +691,9 @@ class TestAbortPP(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_at_last_chunk_in_flight_pp(t: ScriptedContext):
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
+        r = t.start_req(
+            prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, prompt_token=290
+        )
         yield from run_until(
             r,
             lambda h: h.chunks_done >= 1 and h.is_chunking,
