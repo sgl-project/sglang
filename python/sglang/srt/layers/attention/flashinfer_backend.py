@@ -1641,8 +1641,13 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # Each step packs topk per-branch sequences (prefix + draft) into one row,
+        # so the row must hold topk * max_context_len -- matching the eager path in
+        # init_forward_metadata (batch_size * topk * max_context_len). Without the
+        # topk factor the holey generate_draft_decode_kv_indices kernel overflows
+        # the buffer for topk > 1 at long sequences and corrupts neighboring memory.
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
+            (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
             dtype=torch.int32,
             device="cuda",
         )
