@@ -70,18 +70,36 @@ class TestMultiReqBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
 
-        comp = t.batch_composition()
-        assert r1.rid in comp.get(
-            "chunked", []
-        ), f"r1 should be in chunked subset of batch; got {comp}"
-        assert r2.rid in comp.get(
-            "decode", []
-        ), f"r2 should be in decode subset; got {comp}"
-        chunked_set = set(comp.get("chunked", []))
-        prefill_set = set(comp.get("prefill", []))
-        decode_set = set(comp.get("decode", []))
-        assert chunked_set.isdisjoint(prefill_set)
-        assert chunked_set.isdisjoint(decode_set)
+        # The overlap scheduler may alternate chunk batches and decode batches
+        # rather than landing both subsets in one sampled step, so latch across
+        # r1's whole chunking window: r2's decode must PROGRESS while r1 chunks
+        # (the real coexistence consequence), and whenever a sampled step shows
+        # both, the chunked subset must stay disjoint from prefill/decode.
+        r2_out_before = len(r2.req.output_ids)
+        saw_chunked_r1 = False
+        saw_r2_decode_during_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            comp = t.batch_composition()
+            if r1.rid in comp.get("chunked", []):
+                saw_chunked_r1 = True
+                if r2.rid in comp.get("decode", []):
+                    saw_r2_decode_during_chunking = True
+                chunked_set = set(comp.get("chunked", []))
+                assert chunked_set.isdisjoint(set(comp.get("prefill", [])))
+                assert chunked_set.isdisjoint(set(comp.get("decode", [])))
+            if not r1.is_chunking:
+                break
+            yield
+        assert saw_chunked_r1, "r1 was never observed in the chunked subset"
+        r2_out_after = len(r2.req.output_ids) if r2.req is not None else 64
+        assert r2_out_after > r2_out_before, (
+            f"r2's decode must progress while r1 chunks; output_ids stayed at "
+            f"{r2_out_before}"
+        )
+        assert saw_r2_decode_during_chunking, (
+            "r2 was never observed in the decode subset while r1 held the "
+            "chunked slot"
+        )
 
         # Abort the long-running decoder so the class teardown starts from a clean,
         # drained pool; let r1 finish naturally.

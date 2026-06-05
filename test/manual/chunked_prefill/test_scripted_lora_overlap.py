@@ -208,8 +208,15 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
         # so chunks_done == 0. The first req of each adapter cannot prefix-hit and
         # processes all 2048 tokens in 256-chunks -> exactly 8 chunks.
         expected_first_chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
-        assert reqs[0].chunks_done == expected_first_chunks
-        assert reqs[1].chunks_done == expected_first_chunks
+        chunk_counts = [r.chunks_done for r in reqs]
+        assert reqs[0].chunks_done == expected_first_chunks, (
+            f"first A req must chunk exactly {expected_first_chunks}; "
+            f"per-req chunks_done={chunk_counts}"
+        )
+        assert reqs[1].chunks_done == expected_first_chunks, (
+            f"first B req must chunk exactly {expected_first_chunks}; "
+            f"per-req chunks_done={chunk_counts}"
+        )
         assert reqs[2].chunks_done < expected_first_chunks
         assert reqs[3].chunks_done < expected_first_chunks
         for r, expected_id in zip(reqs, expected_ids):
