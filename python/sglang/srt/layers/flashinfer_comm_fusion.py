@@ -161,6 +161,42 @@ def is_flashinfer_allreduce_unavailable() -> bool:
     return _flashinfer_allreduce_unavailable
 
 
+def _cc_ipc_fusion_enabled() -> bool:
+    """Run FlashInfer's trtllm AR+RMSNorm fusion on a multicast-free IPC
+    workspace under Confidential Computing, so the SAME kernel is used CC-on and
+    CC-off (kernel parity). Auto-enabled whenever CC is detected.
+
+    The trtllm one-shot Lamport fusion kernel is multicast-free (verified: 0
+    `multimem` in trtllm_allreduce_fusion.cuh); the only multicast dependency is
+    the workspace allocator. `create_allreduce_fusion_workspace` hardcodes
+    `use_symm_dev_mem=True` (→ multicast, which fails under CC), but the
+    low-level `trtllm_create_ipc_workspace_for_all_reduce_fusion(
+    use_symm_dev_mem=False)` gives an IPC-only workspace the same kernel runs on.
+
+    Off-CC this returns False, so non-CC behavior is unchanged.
+    """
+    try:
+        from sglang.srt.utils.common import is_confidential_compute
+
+        return is_confidential_compute()
+    except Exception:
+        return False
+
+
+def _resolve_flashinfer_comm_fn(name: str):
+    """Resolve a FlashInfer comm fn from the top-level module or the trtllm_ar
+    submodule (export location varies by FlashInfer version)."""
+    fn = getattr(_flashinfer_comm, name, None)
+    if fn is None:
+        try:
+            import flashinfer.comm.trtllm_ar as _tar
+
+            fn = getattr(_tar, name, None)
+        except Exception:
+            fn = None
+    return fn
+
+
 def _make_flashinfer_workspace_allocation_prop(cuda_driver):
     if _should_force_posix_fd_transport():
         handle_type = (
@@ -340,6 +376,10 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = None
         self.dtype = None
         self.initialized = False
+        # CC IPC fusion: multicast-free workspace state.
+        self.cc_ipc = False
+        self.workspace_tensor = None
+        self.workspace_metadata = None
 
     def initialize(
         self,
@@ -362,6 +402,80 @@ class FlashInferWorkspaceManager:
         self.cleanup()
 
         global _flashinfer_allreduce_unavailable
+
+        # Under CC, build a multicast-free IPC workspace so FlashInfer's own
+        # trtllm fusion kernel runs (cc_off parity). Skips the cuMulticast
+        # preflight — that probe is exactly what disables fusion under CC.
+        if _cc_ipc_fusion_enabled():
+            make_ws = _resolve_flashinfer_comm_fn(
+                "trtllm_create_ipc_workspace_for_all_reduce_fusion"
+            )
+            if make_ws is None:
+                logger.warning(
+                    "CC IPC fusion requested but "
+                    "trtllm_create_ipc_workspace_for_all_reduce_fusion is "
+                    "unavailable; leaving fusion disabled."
+                )
+                _flashinfer_allreduce_unavailable = True
+                self.workspace = None
+                self.initialized = False
+                return
+            ipc_kwargs = dict(
+                use_fp32_lamport=(dtype == torch.float32),
+                # Pin the IPC handle-exchange to the actual TP/EP subgroup.
+                group=device_group,
+                create_metadata=True,
+                use_symm_dev_mem=False,  # <-- no multicast (CC/NVLE-safe)
+            )
+            # CRITICAL: pass the same comm_backend the symm path uses. The IPC
+            # workspace creation does a collective handle exchange; without the
+            # correct backend/group it addresses the wrong peers and HANGS across
+            # ranks (the skipped cuMulticast preflight also voted ranks together).
+            if (
+                _TorchDistBackend is not None
+                and device_group is not None
+                and cpu_group is not None
+            ):
+                ipc_kwargs["comm_backend"] = _TorchDistBackend(
+                    device_group=device_group, cpu_group=cpu_group
+                )
+            try:
+                with _flashinfer_posix_fd_transport_override_if_needed():
+                    ws = make_ws(
+                        rank,
+                        world_size,
+                        max_token_num,
+                        hidden_dim,
+                        **ipc_kwargs,
+                    )
+                # (ipc_handles, workspace_tensor, metadata)
+                self.workspace = ws
+                self.workspace_tensor = ws[1]
+                self.workspace_metadata = ws[2] if len(ws) > 2 else None
+                self.cc_ipc = True
+            except Exception as e:
+                _flashinfer_allreduce_unavailable = True
+                logger.warning(
+                    f"Failed to init CC IPC fusion workspace: {e}. "
+                    "Disabling flashinfer allreduce fusion."
+                )
+                self.workspace = None
+                self.initialized = False
+                return
+
+            self.world_size = world_size
+            self.rank = rank
+            self.group = (device_group, cpu_group)
+            self.max_token_num = max_token_num
+            self.hidden_dim = hidden_dim
+            self.dtype = dtype
+            self.initialized = True
+            logger.info(
+                "FlashInfer CC IPC fusion workspace initialized (multicast-free) "
+                f"for rank {rank}, world_size {world_size}"
+            )
+            return
+
         if not _preflight_check_workspace_memory(
             world_size=world_size,
             max_token_num=max_token_num,
@@ -434,6 +548,14 @@ class FlashInferWorkspaceManager:
     ) -> bool:
         if not self.initialized or self.workspace is None:
             return False
+        if self.cc_ipc:
+            # IPC workspace is a raw tuple (no helper). Manual size check:
+            # workspace holds max_token_num*hidden_dim*dtype; reuse if it fits.
+            return (
+                token_num <= self.max_token_num
+                and hidden_dim == self.hidden_dim
+                and dtype == self.dtype
+            )
         try:
             return self.workspace.is_buffer_size_sufficient(
                 tp_size=self.world_size,
@@ -450,11 +572,26 @@ class FlashInferWorkspaceManager:
         """Clean up workspace"""
         if self.workspace is not None:
             try:
-                self.workspace.destroy()
+                if self.cc_ipc:
+                    # IPC workspace is a raw tuple; free via the destroy helper.
+                    destroy = _resolve_flashinfer_comm_fn(
+                        "trtllm_destroy_ipc_workspace_for_all_reduce_fusion"
+                    )
+                    if destroy is not None:
+                        grp = self.group[0] if self.group else None
+                        try:
+                            destroy(self.workspace, group=grp)
+                        except TypeError:
+                            destroy(self.workspace)
+                else:
+                    self.workspace.destroy()
             except Exception as e:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace = None
+                self.workspace_tensor = None
+                self.workspace_metadata = None
+                self.cc_ipc = False
                 self.initialized = False
                 self.world_size = None
                 self.rank = None
@@ -669,20 +806,49 @@ def flashinfer_allreduce_residual_rmsnorm(
     norm_out = torch.empty_like(input_tensor)
 
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
-    _flashinfer_comm.allreduce_fusion(
-        input=input_tensor,
-        workspace=workspace_manager.workspace,
-        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
-        launch_with_pdl=True,
-        trigger_completion_at_end=trigger_completion_at_end,
-        residual_out=residual_out,
-        norm_out=norm_out,
-        residual_in=residual,
-        rms_gamma=weight,
-        rms_eps=eps,
-        use_oneshot=use_oneshot,
-        fp32_acc=fp32_acc,
-    )
+    if getattr(workspace_manager, "cc_ipc", False):
+        # CC: same FlashInfer kernel on the multicast-free IPC workspace, driven
+        # via the low-level op. We force oneshot (correct for decode-sized
+        # messages); the high-level heuristic is bypassed here.
+        ar_fuse = _resolve_flashinfer_comm_fn("trtllm_allreduce_fusion")
+        ar_fuse(
+            allreduce_in=input_tensor,
+            world_size=workspace_manager.world_size,
+            world_rank=workspace_manager.rank,
+            token_num=input_tensor.shape[0],
+            hidden_dim=input_tensor.shape[-1],
+            workspace_ptrs=workspace_manager.workspace_tensor,
+            launch_with_pdl=True,
+            use_oneshot=True if use_oneshot is None else bool(use_oneshot),
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=fp32_acc,
+            pattern_code=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            allreduce_out=None,
+            residual_in=residual,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            quant_out=None,
+            scale_out=None,
+            rms_gamma=weight,
+            rms_eps=eps,
+            scale_factor=None,
+            layout_code=None,
+        )
+    else:
+        _flashinfer_comm.allreduce_fusion(
+            input=input_tensor,
+            workspace=workspace_manager.workspace,
+            pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            launch_with_pdl=True,
+            trigger_completion_at_end=trigger_completion_at_end,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            residual_in=residual,
+            rms_gamma=weight,
+            rms_eps=eps,
+            use_oneshot=use_oneshot,
+            fp32_acc=fp32_acc,
+        )
 
     return norm_out, residual_out
 
