@@ -3,18 +3,13 @@ export const Gemma4Deployment = () => {
     modelSize: {
       name: 'modelSize',
       title: 'Model Variant',
-      // 12B is a QAT-only release, so it is offered only when the QAT
-      // checkpoint is selected.
-      getDynamicItems: (values) => {
-        const isQat = values.checkpoint === 'qat';
-        return [
-          { id: 'e2b', label: 'E2B (~2B)', default: false },
-          { id: 'e4b', label: 'E4B (~4B)', default: true },
-          ...(isQat ? [{ id: '12b', label: '12B (Dense)', default: false }] : []),
-          { id: '31b', label: '31B (Dense)', default: false },
-          { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
-        ];
-      }
+      items: [
+        { id: 'e2b', label: 'E2B (~2B)', default: false },
+        { id: 'e4b', label: 'E4B (~4B)', default: true },
+        { id: '12b', label: '12B (Dense)', default: false },
+        { id: '31b', label: '31B (Dense)', default: false },
+        { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
+      ]
     },
     checkpoint: {
       name: 'checkpoint',
@@ -198,15 +193,7 @@ export const Gemma4Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => {
-      const next = { ...prev, [optionName]: value };
-      // 12B exists only as a QAT release; fall back to the default variant when
-      // leaving QAT so modelSize never points at a hidden option.
-      if (optionName === 'checkpoint' && value !== 'qat' && next.modelSize === '12b') {
-        next.modelSize = 'e4b';
-      }
-      return next;
-    });
+    setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
