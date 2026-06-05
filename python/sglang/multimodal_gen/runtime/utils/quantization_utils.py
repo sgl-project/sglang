@@ -322,6 +322,7 @@ def _build_nvfp4_config_from_safetensors_files(
     non_quantized_bfl_modules: set[str] = set()
     files_with_nvfp4_signal: list[str] = []
     checkpoint_uses_packed_qkv = False
+    checkpoint_uses_comfy_quant = False
     packed_qkv_pattern = re.compile(
         r"^(double_blocks\.\d+\.(img|txt)_attn\.qkv|single_blocks\.\d+\.linear1)\."
     )
@@ -364,6 +365,8 @@ def _build_nvfp4_config_from_safetensors_files(
             all_keys = set(f.keys())
             if any(packed_qkv_pattern.match(k) for k in all_keys):
                 checkpoint_uses_packed_qkv = True
+            if any(k.endswith(".comfy_quant") for k in all_keys):
+                checkpoint_uses_comfy_quant = True
 
             # Some ModelOpt NVFP4 exports only store a flat config.json plus
             # per-file metadata without the diffusers `layers` section. Infer
@@ -475,28 +478,32 @@ def _build_nvfp4_config_from_safetensors_files(
 
     try:
         quant_cls = get_quantization_config("modelopt_fp4")
+        checkpoint_uses_swizzled_scales = (
+            checkpoint_uses_packed_qkv or checkpoint_uses_comfy_quant
+        )
         result = quant_cls.from_config(
             {
                 "quant_algo": "NVFP4",
                 "group_size": group_size,
                 "ignore": exclude_modules,
                 "checkpoint_uses_packed_qkv": checkpoint_uses_packed_qkv,
-                # The official FLUX.2 mixed NVFP4 export is detected by its
-                # packed QKV tensors and stores block scales in the
-                # FlashInfer/CUTLASS-swizzled layout. SGLang-converted
-                # transformer repos keep the linear layout.
+                # packed-QKV and Comfy NVFP4 checkpoints store serialized
+                # weights/scales in the FlashInfer/CUTLASS checkpoint layout
                 "checkpoint_weight_scale_layout": (
-                    "swizzled" if checkpoint_uses_packed_qkv else "linear"
+                    "swizzled" if checkpoint_uses_swizzled_scales else "linear"
                 ),
+                "swap_weight_nibbles": checkpoint_uses_swizzled_scales,
             }
         )
         logger.info(
-            "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules, packed_qkv=%s, scale_layout=%s",
+            "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules, packed_qkv=%s, comfy_quant=%s, scale_layout=%s, swap_nibbles=%s",
             len(files_with_nvfp4_signal),
             group_size,
             len(exclude_modules),
             checkpoint_uses_packed_qkv,
+            checkpoint_uses_comfy_quant,
             getattr(result, "checkpoint_weight_scale_layout", "linear"),
+            getattr(result, "swap_weight_nibbles", False),
         )
         return result
     except Exception as e:
