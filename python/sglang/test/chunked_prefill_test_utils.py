@@ -140,6 +140,9 @@ class ChunkedTestBase(CustomTestCase):
 class ChunkedTestPDBase(PDDisaggregationServerBase):
     model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
+    # Extra args for the decode server only (e.g. matching its TP to the prefill
+    # side so the transferred KV layout lines up).
+    decode_feature_args: ClassVar[List[str]] = []
 
     chunked_prefill_size: ClassVar[int] = DEFAULT_CHUNKED_PREFILL_SIZE
     num_shots: ClassVar[int] = DEFAULT_NUM_SHOTS
@@ -155,7 +158,9 @@ class ChunkedTestPDBase(PDDisaggregationServerBase):
     def setUpClass(cls):
         cls._simple_tester = _build_simple_tester(cls)
         cls.extra_prefill_args = cls._simple_tester.build_prefill_side_args()
-        cls.extra_decode_args = cls._simple_tester.build_decode_side_args()
+        cls.extra_decode_args = cls._simple_tester.build_decode_side_args() + list(
+            cls.decode_feature_args
+        )
         PDDisaggregationServerBase.setUpClass()
         cls.model = try_cached_model(cls.model)
         cls.launch_all()
