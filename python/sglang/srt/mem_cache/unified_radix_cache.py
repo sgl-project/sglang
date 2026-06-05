@@ -1861,10 +1861,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                states, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
@@ -1890,16 +1887,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             operation
         )
         min_completed_tokens = completed_tokens
+        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
+            # Reduce full completed tokens together with the sidecar pools that
+            # this prefetch actually transferred, in one all_reduce.
+            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
+            packed = torch.tensor(
+                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+                dtype=torch.int,
             )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = int(completed_tokens_tensor.item())
+            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+            min_completed_tokens = int(packed[0].item())
+            for i, p in enumerate(sidecar_pools, start=1):
+                hit_pages[p] = int(packed[i].item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -1972,8 +1972,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+        self._barrier_attn_groups()
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(
@@ -2096,10 +2095,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {

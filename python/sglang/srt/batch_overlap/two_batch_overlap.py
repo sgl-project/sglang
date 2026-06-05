@@ -761,6 +761,12 @@ class TboForwardBatchPreparer:
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
+                # TBO children start unplanned — planned by the TBO-aware init
+                # flow; a stale parent "ready" would wrongly skip that.
+                forward_metadata_ready=False,
+                forward_metadata_planned_bs=None,
+                forward_metadata_planned_num_tokens=None,
+                forward_metadata_replan_equivalent=False,
             )
         )
 

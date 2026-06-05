@@ -807,6 +807,16 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
+        # Hybrid MLA models (Ring/Ling, Kimi-Linear) resolve this via
+        # get_attn_backend(), which returns this wrapper; delegate to the
+        # full-attn backend so its chunked/one-shot prefill metadata is planned.
+        init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
+        if init is not None:
+            init(forward_batch, disable_flashinfer_ragged)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
