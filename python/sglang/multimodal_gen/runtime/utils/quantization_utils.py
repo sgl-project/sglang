@@ -2,6 +2,7 @@ import glob
 import json
 import os
 import re
+import struct
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -38,8 +39,17 @@ def normalize_flat_modelopt_quant_config(
 
 def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
     """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
-    weight_shape = tuple(getattr(weight, "shape", ()))
-    scale_shape = tuple(getattr(scale, "shape", ()))
+    return _infer_nvfp4_group_size_from_shapes(
+        getattr(weight, "shape", ()),
+        getattr(scale, "shape", ()),
+    )
+
+
+def _infer_nvfp4_group_size_from_shapes(
+    weight_shape, scale_shape
+) -> Optional[int]:
+    weight_shape = tuple(weight_shape or ())
+    scale_shape = tuple(scale_shape or ())
     if len(weight_shape) < 2:
         return None
 
@@ -65,6 +75,33 @@ def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
             return input_size // num_groups
 
     return None
+
+
+def _read_safetensors_tensor_metadata(file_path: str) -> dict[str, dict[str, Any]]:
+    with open(file_path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return header
+
+
+def _is_nvfp4_tensor_family(
+    module_name: str,
+    tensor_metadata: dict[str, dict[str, Any]],
+) -> bool:
+    weight_metadata = tensor_metadata.get(f"{module_name}.weight")
+    scale_metadata = tensor_metadata.get(f"{module_name}.weight_scale")
+    if weight_metadata is None or scale_metadata is None:
+        return False
+
+    weight_dtype = str(weight_metadata.get("dtype", "")).upper()
+    scale_dtype = str(scale_metadata.get("dtype", "")).upper()
+    scale_shape = scale_metadata.get("shape", [])
+    return (
+        weight_dtype == "U8"
+        and "F8_E4M3" in scale_dtype
+        and len(scale_shape) >= 2
+    )
 
 
 def _resolve_quant_method_name(quant_cfg: dict) -> str:
@@ -322,6 +359,7 @@ def _build_nvfp4_config_from_safetensors_files(
                 if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
             )
 
+        tensor_metadata = _read_safetensors_tensor_metadata(file_path)
         with safe_open(file_path, framework="pt", device="cpu") as f:
             all_keys = set(f.keys())
             if any(packed_qkv_pattern.match(k) for k in all_keys):
@@ -329,14 +367,16 @@ def _build_nvfp4_config_from_safetensors_files(
 
             # Some ModelOpt NVFP4 exports only store a flat config.json plus
             # per-file metadata without the diffusers `layers` section. Infer
-            # quantized modules directly from tensor families in that case:
-            # quantized modules ship `.weight` + `.weight_scale`, while BF16
-            # fallbacks only ship `.weight`.
+            # quantized modules directly from tensor families in that case.
+            # Mixed checkpoints may also contain FP8 fallback layers with scalar
+            # `.weight_scale`, so require packed uint8 weights and block scales.
             file_quantized_modules.update(
                 key[: -len(".weight_scale")]
                 for key in all_keys
                 if key.endswith(".weight_scale")
-                and f"{key[: -len('.weight_scale')]}.weight" in all_keys
+                and _is_nvfp4_tensor_family(
+                    key[: -len(".weight_scale")], tensor_metadata
+                )
             )
 
             if file_quantized_modules or metadata_signals_nvfp4:
@@ -347,10 +387,13 @@ def _build_nvfp4_config_from_safetensors_files(
                 for layer_name in sorted(file_quantized_modules):
                     weight_key = f"{layer_name}.weight"
                     scale_key = f"{layer_name}.weight_scale"
-                    if weight_key in all_keys and scale_key in all_keys:
-                        w = f.get_tensor(weight_key)
-                        s = f.get_tensor(scale_key)
-                        group_size = _infer_nvfp4_group_size_from_tensors(w, s)
+                    weight_metadata = tensor_metadata.get(weight_key)
+                    scale_metadata = tensor_metadata.get(scale_key)
+                    if weight_metadata is not None and scale_metadata is not None:
+                        group_size = _infer_nvfp4_group_size_from_shapes(
+                            weight_metadata.get("shape"),
+                            scale_metadata.get("shape"),
+                        )
                         if group_size is not None:
                             break
 
