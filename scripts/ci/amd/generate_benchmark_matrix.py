@@ -97,6 +97,7 @@ def main():
                     "framework": cfg["framework"],
                     "model": ov_model or cfg["model"],
                     "runs_on": cfg["runs-on"],
+                    "rocm_version": str(cfg.get("rocm-version", "rocm720")),
                     "variant": variant,
                     "tp": str(cfg.get("tp", 8)),
                     "ep": str(cfg.get("ep", 1)),

@@ -17,6 +17,7 @@
 #   framework     sglang
 #   model         HF id, or local /path (a path starting with / skips download)
 #   runs-on       GitHub Actions runner label
+#   rocm-version  ROCm image to pull via amd_ci_start_container (rocm720 | rocm700)
 #   variants      list of: base (STP) | mtp (EAGLE speculative decoding)
 #   tp / ep       parallel sizes (default 8 / 1)
 #   dp-attn       enable DP-attention path (default false; true for high conc)
@@ -45,6 +46,7 @@ configs:
     framework: sglang
     model: deepseek-ai/DeepSeek-V4-Pro
     runs-on: linux-mi35x-gpu-8
+    rocm-version: rocm720
     variants: [base, mtp]
     tp: 8
     ep: 1
@@ -113,6 +115,39 @@ configs:
     # MTP needs chat-formatted input or EAGLE acceptance silently regresses;
     # --dsv4 routes through InferenceX's encoding_dsv4.py framing.
     mtp-client-args: "--dsv4"
+    bench-backend: vllm
+
+  # MiniMax-M2.5 TP4 on rocm700. InferenceX has no sglang minimax recipe yet, so
+  # the launch spec is lifted from the nightly TP4 test
+  # (test/registered/amd/accuracy/mi35x/test_minimax_m25_tp4_eval_mi35x.py;
+  # TP4 + unified attention + FP8 KV cache). base-only (no MTP variant).
+  - name: minimaxm25-fp8-mi355x-sglang
+    model-prefix: minimaxm25
+    precision: fp8
+    runner: mi355x
+    framework: sglang
+    model: MiniMaxAI/MiniMax-M2.5
+    runs-on: linux-mi35x-gpu-8
+    rocm-version: rocm700
+    variants: [base]
+    tp: 4
+    ep: 1
+    dp-attn: false
+    isl: 1024
+    osl: 1024
+    conc-list: "1 4 16 32"
+    env:
+      SGLANG_USE_AITER: "1"
+      SGLANG_USE_AITER_UNIFIED_ATTN: "1"
+    server-args: >-
+      --dtype bfloat16
+      --trust-remote-code
+      --attention-backend aiter
+      --mem-fraction-static 0.85
+      --disable-radix-cache
+      --kv-cache-dtype fp8_e4m3
+      --page-size 16
+      --watchdog-timeout 1200
     bench-backend: vllm
 
   # --- examples: copy an entry above and adjust to add coverage ---------------

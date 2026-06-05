@@ -147,8 +147,8 @@ SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
     echo ""
     echo "model=\`${MODEL}\` tp=${TP} ep=${EP_SIZE} dp_attn=${DP_ATTENTION} isl=${ISL} osl=${OSL} spec=${SPEC_DECODING}"
     echo ""
-    echo "| conc | completed | total tput (tok/s) | output tput (tok/s) | mean TTFT (ms) | mean TPOT (ms) | mean E2EL (ms) |"
-    echo "| ---- | --------- | ------------------ | ------------------- | -------------- | -------------- | -------------- |"
+    echo "| conc | completed | total tput (tok/s) | output tput (tok/s) | median TTFT (ms) | median TPOT (ms) | median ITL (ms) | median E2EL (ms) |"
+    echo "| ---- | --------- | ------------------ | ------------------- | ---------------- | ---------------- | --------------- | ---------------- |"
 } >> "$SUMMARY_FILE"
 
 overall_rc=0
@@ -188,7 +188,7 @@ try:
     with open(path) as f:
         d = json.load(f)
 except Exception as e:  # noqa: BLE001 - summary row is best-effort
-    row = f"| {conc} | n/a | n/a | n/a | n/a | n/a | n/a |"
+    row = f"| {conc} | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
     print(f"WARN: could not read {path}: {e}", file=sys.stderr)
 else:
     def g(key):
@@ -198,7 +198,7 @@ else:
     row = (
         f"| {d.get('max_concurrency', conc)} | {d.get('completed', 'n/a')} | "
         f"{g('total_token_throughput')} | {g('output_throughput')} | "
-        f"{g('mean_ttft_ms')} | {g('mean_tpot_ms')} | {g('mean_e2el_ms')} |"
+        f"{g('median_ttft_ms')} | {g('median_tpot_ms')} | {g('median_itl_ms')} | {g('median_e2el_ms')} |"
     )
 with open(summary, "a") as f:
     f.write(row + "\n")
