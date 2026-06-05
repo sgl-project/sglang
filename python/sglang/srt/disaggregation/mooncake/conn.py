@@ -1162,19 +1162,24 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Failed
-                ):
-                    continue
-
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
+
+                if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Failed
+                ):
+                    if self.enable_trace:
+                        kv_chunk.trace_ctx.trace_slice_end(
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                            thread_finish_flag=True,
+                        )
+                    continue
 
                 if (
                     self.enable_staging

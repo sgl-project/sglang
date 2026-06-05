@@ -877,7 +877,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
-        self.abort_initiated: bool = False
+        self.abort_notified: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -1063,6 +1063,9 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if not self.abort_notified:
+            self._send_abort_notification()
+            self.abort_notified = True
         return KVPoll.Failed
 
     def failure_exception(self):
@@ -1074,14 +1077,15 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
     def abort(self):
-        self.abort_initiated = True
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
-        self._send_abort_notification()
+        if not self.abort_notified:
+            self._send_abort_notification()
+            self.abort_notified = True
 
     def _send_abort_notification(self):
         if not hasattr(self, "bootstrap_infos") or self.bootstrap_infos is None:

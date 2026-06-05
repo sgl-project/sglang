@@ -1621,10 +1621,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # Defer KV cache release for decode-initiated aborts to prevent
                 # RDMA corruption from in-flight prefill writes
-                is_abort_initiated = getattr(
-                    decode_req.kv_receiver, "abort_initiated", False
+                is_abort_notified = getattr(
+                    decode_req.kv_receiver, "abort_notified", False
                 )
-                if is_abort_initiated and self.abort_grace_period > 0:
+                if is_abort_notified and self.abort_grace_period > 0:
                     self.deferred_releases.append(
                         DeferredRelease(
                             req=decode_req.req,
