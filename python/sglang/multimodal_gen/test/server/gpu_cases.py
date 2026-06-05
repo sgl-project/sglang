@@ -430,7 +430,9 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path="robbyant/lingbot-world-fast-diffusers",
             modality="video",
             num_gpus=1,
-            extras=["--pipeline-class-name LingBotWorldCausalDMDPipeline"],
+            extras=[
+                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup false"
+            ],
             text_encoder_cpu_offload=True,
         ),
         LINGBOT_WORLD_REALTIME_sampling_params,
