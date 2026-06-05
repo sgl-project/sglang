@@ -143,7 +143,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # calculate_mla_kv_cache_dim() correctly accounts for this layout.
             if (
                 is_deepseek_dsa(model_config.hf_config)
-                and kv_cache_dtype == torch.float8_e4m3fn
+                and kv_cache_dtype in [torch.float8_e4m3fn, torch.float8_e4m3fnuz]
             ):
                 kv_cache_dim = mr.calculate_mla_kv_cache_dim()
                 cell_size = kv_cache_dim * num_layers
