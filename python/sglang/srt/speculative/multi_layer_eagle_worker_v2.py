@@ -775,12 +775,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
-        # NOTE: metadata init is skipped here unconditionally, although
-        # prepare_for_v2_verify only plans when cuda-graph replay_prepare ran.
-        # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
-        # worker has not adopted that fix, so preserve its behavior verbatim.
-        verify_forward_batch.mark_forward_metadata_ready()
-        # Run target verify batch in the main compute stream
+        # Run target verify batch in the main compute stream.
+        # Metadata init is skipped iff cuda-graph already ran replay_prepare —
+        # prepare_for_v2_verify marked the batch in exactly that case; the
+        # non-cuda-graph path stays unmarked and gets forward_extend's init
+        # (post-pad), matching eagle_worker_v2.
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
