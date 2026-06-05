@@ -555,6 +555,29 @@ class TestKVPressureSmallPool(ScriptedTestCase):
         yield from run_until(b1, lambda h: h.status == "running")
         yield from run_until(b2, lambda h: h.status == "running")
 
+        # The decode reservations are ratio-discounted, so two big ballasts may
+        # leave admission headroom; top up with small ballasts until the free
+        # pool genuinely cannot admit a 16-token req (prompt + reservation).
+        ballasts = [b1, b2]
+        for i in range(10):
+            if t.engine_stats()["kv_pool_free"] < 20:
+                break
+            extra = t.start_req(
+                prompt_len=128,
+                max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+                ignore_eos=True,
+                prompt_token=630 + i,
+            )
+            ballasts.append(extra)
+            for _ in range(8):
+                if extra.status == "running":
+                    break
+                yield
+        assert t.engine_stats()["kv_pool_free"] < 20, (
+            f"ballasts never drove the pool below the 16-token admission "
+            f"threshold; kv_pool_free={t.engine_stats()['kv_pool_free']}"
+        )
+
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         for _ in range(6):
             yield
@@ -562,8 +585,8 @@ class TestKVPressureSmallPool(ScriptedTestCase):
             r.status == "waiting"
         ), f"req must be unschedulable under a full pool; status={r.status}"
 
-        t.abort(b1)
-        t.abort(b2)
+        for b in ballasts:
+            t.abort(b)
         yield
         yield from run_until(r, lambda h: h.finished, max_steps=3000)
         assert r.finished
