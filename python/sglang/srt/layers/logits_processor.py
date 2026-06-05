@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -64,6 +65,27 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+# When set, LogitsProcessor.forward returns an empty output and skips the
+# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
+# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
+# and its [batch * dp_size, vocab] output OOMs under DP attention with a
+# tight mem_fraction_static.
+_in_autotune_dummy_run = False
+
+
+def get_in_autotune_dummy_run() -> bool:
+    return _in_autotune_dummy_run
+
+
+@contextmanager
+def autotune_dummy_run_mode():
+    global _in_autotune_dummy_run
+    _in_autotune_dummy_run = True
+    try:
+        yield
+    finally:
+        _in_autotune_dummy_run = False
 
 
 @dataclasses.dataclass
@@ -296,6 +318,12 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+
+        # Autotune dummy run discards this output; see _in_autotune_dummy_run.
+        # Placed before the MIS / DLLM / common dispatch so all three LM-head
+        # paths are skipped.
+        if _in_autotune_dummy_run:
+            return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
