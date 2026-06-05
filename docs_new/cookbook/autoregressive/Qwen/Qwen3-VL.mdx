@@ -50,7 +50,7 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 * **Expert Parallelism** : SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
 * **Kernel Tuning** : For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
 
-*Hardware-specific notes:**
+**Hardware-specific notes:**
 - **H100 (FP8):** Use the `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` checkpoint for best memory efficiency.
 - **A100 / H100 (BF16):** Use standard multimodal parameters to manage throughput and GPU memory usage.
 - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
