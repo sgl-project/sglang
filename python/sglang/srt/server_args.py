@@ -5956,7 +5956,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-adaptive-config",
             type=str,
-            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs.",
             default=ServerArgs.speculative_adaptive_config,
         )
         parser.add_argument(
@@ -7310,7 +7310,6 @@ class ServerArgs:
         )
 
         candidate_steps = resolve_candidate_steps_from_config(
-            initial_steps=self.speculative_num_steps,
             cfg_path=self.speculative_adaptive_config,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
