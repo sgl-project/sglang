@@ -6,7 +6,11 @@ Run on a Hopper (SM90+) GPU:
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel import dsv3_router_gemm as sgl_kernel_dsv3_router_gemm
+
+try:
+    from sgl_kernel import dsv3_router_gemm as sgl_kernel_dsv3_router_gemm
+except ImportError:
+    sgl_kernel_dsv3_router_gemm = None
 
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_random
@@ -37,8 +41,11 @@ FN_MAP = {
 @marker.parametrize("out_dtype", [torch.bfloat16, torch.float32])
 @marker.benchmark("provider", ["jit", "sgl_kernel", "torch"])
 def benchmark(num_experts, hidden_dim, num_tokens, out_dtype, provider):
-    if provider == "sgl_kernel" and hidden_dim != SGL_KERNEL_HIDDEN_DIM:
-        marker.skip("sgl_kernel AOT only supports hidden_dim=7168")
+    if provider == "sgl_kernel":
+        if sgl_kernel_dsv3_router_gemm is None:
+            marker.skip("sgl_kernel dsv3_router_gemm not available in this build")
+        if hidden_dim != SGL_KERNEL_HIDDEN_DIM:
+            marker.skip("sgl_kernel AOT only supports hidden_dim=7168")
     mat_a = create_random(num_tokens, hidden_dim)
     mat_b = create_random(num_experts, hidden_dim)
     return marker.do_bench(
