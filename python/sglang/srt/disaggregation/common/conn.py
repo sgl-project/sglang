@@ -1063,7 +1063,11 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        if not self.abort_notified:
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
             self._send_abort_notification()
             self.abort_notified = True
         return KVPoll.Failed
@@ -1083,13 +1087,15 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
-        if not self.abort_notified:
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
             self._send_abort_notification()
             self.abort_notified = True
 
     def _send_abort_notification(self):
-        if not hasattr(self, "bootstrap_infos") or self.bootstrap_infos is None:
-            return
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:
