@@ -299,7 +299,7 @@ RUN cd FlyDSL \
     && bash -lc 'unset LLVM_COMMIT && source /opt/venv/bin/activate \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
-      && SETUPTOOLS_SCM_PRETEND_VERSION_FOR_FLYDSL=0.1.8 python -m pip install -e .;'
+      && FLYDSL_RELEASE_TYPE=release pip install -e .;'
 
 # -----------------------
 # AITER
