@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
+    world_group_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -855,7 +856,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not (active or requested):
             return
 
-        if ctx.is_warmup or get_world_group().local_rank != 0:
+        if ctx.is_warmup or (
+            world_group_is_initialized() and get_world_group().local_rank != 0
+        ):
             return
 
         if active:
@@ -1077,7 +1080,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             not state
             or not state["requested"]
             or ctx.is_warmup
-            or get_world_group().local_rank != 0
+            or (world_group_is_initialized() and get_world_group().local_rank != 0)
         ):
             return
 
