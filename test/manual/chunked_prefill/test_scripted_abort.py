@@ -391,31 +391,29 @@ class TestAbortBasic(ScriptedTestCase):
         )
         assert r.req is None or r.req.req_pool_idx is None
 
-    def test_abort_in_inter_chunk_gap_skips_stash_no_extra_radix_node(self):
+    def test_abort_mid_chunk_no_extra_radix_node(self):
         self.server.execute_script(
-            self._script_abort_in_inter_chunk_gap_skips_stash_no_extra_radix_node
+            self._script_abort_mid_chunk_no_extra_radix_node
         )
 
     @staticmethod
-    def _script_abort_in_inter_chunk_gap_skips_stash_no_extra_radix_node(
+    def _script_abort_mid_chunk_no_extra_radix_node(
         t: ScriptedContext,
     ):
-        """Abort in the inter-chunk waiting gap skips the stash and creates no radix node."""
-        # GPU validation pending.
-        #
-        # Branch under test: scheduler.get_next_batch_to_run, the
-        #   `if self._chunked_req_scheduled_last_iter: stash_chunked_request(...)`
-        # guard. When the chunked req was NOT scheduled last iteration -- the
-        # inter-chunk gap where it sits in the waiting queue while still being
-        # chunked_req -- the flag is False, so stash_chunked_request (which calls
-        # maybe_cache_unfinished_req(..., chunked=True)) is SKIPPED. Aborting here
-        # must therefore not leave behind a freshly cached prefix node for the
-        # unscheduled remainder.
+        """Aborting a chunked req mid-chunk adds no radix node and does not revive it."""
+        # NOTE: this intentionally does NOT exercise the skipped-stash branch
+        # (`if self._chunked_req_scheduled_last_iter: stash_chunked_request(...)`
+        # in get_next_batch_to_run). On a non-SWA engine that flag is only False
+        # when chunked_req is None, so a held chunked_req is always stashed; the
+        # "chunked req parked in waiting_queue with the flag False" inter-chunk gap
+        # is hybrid-SWA-specific and unreachable here. What this asserts is the
+        # reachable invariant: aborting while the req is the in-flight chunked_req
+        # neither caches a new prefix node nor revives the req.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
-        # Snapshot the radix tree before abort. The skipped stash must not add a
-        # node nor bump any node's hit_count for the unscheduled remainder.
+        # Snapshot the radix tree before abort: the abort must not add a node nor
+        # bump any node's hit_count beyond what the already-run chunks cached.
         hit_counts_before = t.get_all_node_hit_counts()
         node_count_before = len(hit_counts_before)
         hit_sum_before = sum(hit_counts_before.values())
@@ -428,21 +426,20 @@ class TestAbortBasic(ScriptedTestCase):
         node_count_after = len(hit_counts_after)
         hit_sum_after = sum(hit_counts_after.values())
 
-        # Witnessing the SKIPPED stash: no extra cached-prefix node, no hit-count
-        # growth for the chunked remainder that was never scheduled.
+        # The abort must not create a new cached-prefix node nor bump hit counts.
         assert node_count_after <= node_count_before, (
-            f"skipped stash must not create a radix node; "
+            f"abort mid-chunk must not create a radix node; "
             f"node count {node_count_before} -> {node_count_after}"
         )
         assert hit_sum_after <= hit_sum_before, (
-            f"skipped stash must not bump radix hit counts; "
+            f"abort mid-chunk must not bump radix hit counts; "
             f"hit sum {hit_sum_before} -> {hit_sum_after}"
         )
         # And the abort itself releases the req and does not revive it.
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
         assert r.chunks_done == chunks_before, (
-            f"aborted gap req revived and ran another chunk; "
+            f"aborted mid-chunk req revived and ran another chunk; "
             f"chunks_done went {chunks_before} -> {r.chunks_done}"
         )
 
