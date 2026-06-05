@@ -33,7 +33,7 @@ dependencies = [
   "gguf",
   "hf_transfer",
   "huggingface_hub",
-  "instanttensor>=0.1.5",
+  "instanttensor>=0.1.9",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
