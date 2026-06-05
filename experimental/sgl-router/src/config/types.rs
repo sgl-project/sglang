@@ -70,7 +70,7 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `cache_aware_zmq`.
+/// `power_of_two` / `load_based` / `cache_aware_zmq`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -80,6 +80,9 @@ pub enum PolicyKind {
     Random,
     #[value(name = "power_of_two")]
     PowerOfTwo,
+    /// Selects the currently least-loaded worker.
+    #[value(name = "load_based")]
+    LoadBased,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
