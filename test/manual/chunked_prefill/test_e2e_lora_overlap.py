@@ -13,7 +13,7 @@ class TestChunkedFeatureLoRAOverlap(ChunkedTestBase):
         "--enable-lora",
         "--enable-lora-overlap-loading",
         "--lora-paths",
-        "winddude/wizardLM-LlaMA-LoRA-7B",
+        "nicoboss/Llama-3.2-1B-Instruct-Uncensored-Lora",
         "codelion/Llama-3.2-1B-Instruct-tool-calling-lora",
         "--max-loras-per-batch",
         "2",
