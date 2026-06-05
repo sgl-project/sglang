@@ -27,6 +27,7 @@ WEBP_FRAME_CONTENT_TYPE = "image/webp"
 JPEG_FRAME_CONTENT_TYPE = "image/jpeg"
 RAW_RGB_CHANNELS = 3
 RAW_RGBA_CHANNELS = 4
+_RAW_RGB_DELTA_GZIP_LEVEL = 0
 
 
 def build_delta_gzip_raw_rgb_payload(
@@ -46,7 +47,10 @@ def build_delta_gzip_raw_rgb_payload(
         if reference_frame is not None
         else None
     )
-    compressor = zlib.compressobj(level=1, method=zlib.DEFLATED, wbits=31)
+    # keep gzip framing for lossless transport without spending realtime budget on compression
+    compressor = zlib.compressobj(
+        level=_RAW_RGB_DELTA_GZIP_LEVEL, method=zlib.DEFLATED, wbits=31
+    )
     compressed_chunks = []
     for frame in frames:
         if len(frame) != frame_size:
