@@ -1167,22 +1167,6 @@ class Scheduler(
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
-        if use_mlx():
-            # MLX: no CUDA streams / FutureMap.
-            self.future_map = None
-            self.result_queue: Deque = deque()
-            return
-
-        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
-        # via scheduler_pp_mixin; init unconditionally to match main.
-        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.forward_stream
-        )
-        self.copy_stream: CudaStream = self.device_module.Stream()
-        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.copy_stream
-        )
-
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
         # override; fall back to target-only so the helper still produces a
@@ -1200,6 +1184,23 @@ class Scheduler(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+        )
+
+        if use_mlx():
+            # MLX uses its own overlap loop and does not create CUDA streams,
+            # but the normal non-overlap scheduler path still relays decode
+            # input IDs through FutureMap.
+            self.result_queue: Deque = deque()
+            return
+
+        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
+        # via scheduler_pp_mixin; init unconditionally to match main.
+        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.forward_stream
+        )
+        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.copy_stream
         )
 
         if not self.enable_overlap:
@@ -2641,6 +2642,9 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is not None:
+            mamba_pool.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2706,6 +2710,9 @@ class Scheduler(
                     )
                     req.mamba_pool_idx = None
                 break
+
+        if mamba_pool is not None:
+            mamba_pool.alloc_group_end()
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -3976,7 +3983,11 @@ def run_scheduler_process(
 
     # Set up tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         thread_label = "Scheduler"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill Scheduler"

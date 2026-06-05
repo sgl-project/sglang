@@ -529,26 +529,10 @@ class SchedulerDisaggregationPrefillMixin:
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
-        if batch.return_logprob:
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.tolist()
-                )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
-            if logits_output.next_token_top_logprobs_val:
-                logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
-                ]
-                logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                ]
-            if logits_output.next_token_token_ids_logprobs_val:
-                logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
-                ]
+        self.batch_result_processor.move_logprobs_to_cpu(
+            batch=batch,
+            logits_output=logits_output,
+        )
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt

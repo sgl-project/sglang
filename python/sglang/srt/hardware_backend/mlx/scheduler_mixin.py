@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional
 import mlx.core as mx
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,13 @@ class SchedulerMlxOverlapMixin:
         pending_next: Optional[MlxPendingJob] = None
 
         def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
+            # Materialize batch.input_ids from CPU staging (prefill) or the
+            # FutureMap relay (decode) before the forward. With deferred input
+            # materialization, get_next_batch_to_run leaves input_ids unset; the
+            # CUDA paths call resolve_forward_inputs for this, but the MLX overlap
+            # loop must do it too, otherwise async_forward_batch_generation_mlx
+            # dereferences a None input_ids.
+            resolve_forward_inputs(batch, self.future_map)
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_forward_batch_generation_mlx(batch)
             )
