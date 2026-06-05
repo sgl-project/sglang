@@ -592,6 +592,7 @@ class ServerArgs:
     dsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
+    dsa_use_cute_dsl_paged_mqa_logits: bool = False
     dsa_topk_backend: str = "sgl-kernel"
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
@@ -5716,6 +5717,13 @@ class ServerArgs:
             type=str,
             choices=DSA_CHOICES,
             help="[Deprecated] Use --dsa-decode-backend instead.",
+        )
+        parser.add_argument(
+            "--dsa-use-cute-dsl-paged-mqa-logits",
+            default=ServerArgs.dsa_use_cute_dsl_paged_mqa_logits,
+            action="store_true",
+            help="Use the CuTe DSL FP8 paged MQA logits kernel inside the DSA "
+            "indexer instead of DeepGEMM. SM 100 (Blackwell) only.",
         )
         parser.add_argument(
             "--dsa-topk-backend",

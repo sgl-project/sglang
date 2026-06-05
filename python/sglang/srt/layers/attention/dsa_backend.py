@@ -153,6 +153,18 @@ class DSAMetadata:
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    # 2D context_lens used to build the schedule above; reused as the
+    # `context_lens` arg in the indexer's `fp8_paged_mqa_logits` call so the
+    # broadcast-and-materialize doesn't run once per layer.
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    # Wave-aware atom-split decision for the CuTe DSL FP8 paged MQA logits
+    # kernel. Decided once per forward batch from (batch, next_n, max_seq_len_k,
+    # num_sms); both the indexer's forward and any per-layer expand reuse it.
+    # `factor == atom == 1` means no atom-split (kernel-native next_n).
+    # `factor > 1`: indexer reshapes Q to [B*factor, atom, H, D] and rebuilds
+    # ctx_lens / block_table / schedule_metadata to match.
+    dsl_expand_factor: int = 1
+    dsl_atom: int = 1
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -199,6 +211,11 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     topk_transform_method: TopkTransformMethod
     topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    # DSL atom-split decision propagated from the underlying DSAMetadata.
+    # See DSAMetadata for semantics (factor == atom == 1 means no split).
+    dsl_expand_factor: int = 1
+    dsl_atom: int = 1
     force_unfused_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -322,6 +339,14 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.use_cute_dsl_paged_mqa_logits = bool(
+            is_cuda()
+            and getattr(
+                model_runner.server_args,
+                "dsa_use_cute_dsl_paged_mqa_logits",
+                False,
+            )
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -379,6 +404,73 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+    def _build_paged_mqa_schedule_2d_ctx_lens(
+        self,
+        forward_mode: ForwardMode,
+        cache_seqlens_int32: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        # cute_dsl target_verify: 1 atom per batch (kernel handles full next_n
+        #   natively in one launch) -> [B, 1] schedule.
+        # DG-native target_verify with next_n>=2: [B, next_n] schedule matching
+        #   DG's ceil-div atom iteration over `q=[B,next_n,H,D]`.
+        # Everything else: per-token [N_total, 1].
+        next_n = self.speculative_num_draft_tokens
+        if forward_mode.is_target_verify():
+            if self.use_cute_dsl_paged_mqa_logits:
+                return _to_2d_context_lens(cache_seqlens_int32, batch_size)
+            if next_n is not None and next_n >= 2:
+                return (
+                    cache_seqlens_int32.contiguous()
+                    .view(-1, 1)
+                    .expand(-1, next_n)
+                    .contiguous()
+                )
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            return _to_2d_context_lens(seqlens_expanded, batch_size)
+        return _to_2d_context_lens(cache_seqlens_int32, batch_size)
+
+    def _pick_dsl_atom_split(
+        self,
+        forward_mode: ForwardMode,
+        batch_size: int,
+        max_seq_len_k: int,
+    ) -> Tuple[int, int]:
+        """Wave-aware atom-split picker for the CuTe DSL FP8 paged MQA logits
+        kernel. Returns ``(factor, atom)``; ``(1, 1)`` when atom-split is N/A
+        (mode != target_verify, next_n < 2, or DSL kernel not enabled).
+
+        Uses ``max_seq_len_k`` (CPU int — already computed for the metadata)
+        for the ``max_ctx`` input, so this is cuda-graph capture safe.
+        """
+        if not self.use_cute_dsl_paged_mqa_logits:
+            return 1, 1
+        if not forward_mode.is_target_verify():
+            return 1, 1
+        next_n = self.speculative_num_draft_tokens
+        if next_n is None or next_n < 2:
+            return 1, 1
+        from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import (
+            _pick_dsl_expand,
+        )
+
+        try:
+            import deep_gemm
+
+            num_sms = deep_gemm.get_num_sms()
+        except (ImportError, ModuleNotFoundError):
+            return 1, 1
+        return _pick_dsl_expand(
+            next_n,
+            batch_size=batch_size,
+            max_ctx=max_seq_len_k,
+            num_sms=num_sms,
+            kernel_atoms=(1, 2, 3, 4),
+        )
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -654,6 +746,7 @@ class DeepseekSparseAttnBackend(
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
         paged_mqa_schedule_metadata = None
+        paged_mqa_ctx_lens_2d = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
         if is_cuda() and (
@@ -665,22 +758,26 @@ class DeepseekSparseAttnBackend(
                 import deep_gemm
 
                 # NOTE: DeepGEMM paged path uses block_size=64.
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else cache_seqlens_int32
-                )
-                seqlens_32_2d = _to_2d_context_lens(
-                    seqlens_32, forward_batch.batch_size
+                paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_batch.forward_mode,
+                    cache_seqlens_int32,
+                    seqlens_expanded,
+                    forward_batch.batch_size,
                 )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
+                paged_mqa_ctx_lens_2d = None
+
+        # Wave-aware atom-split decision for the DSL kernel; constant across
+        # indexer layers, so decide once here.
+        dsl_factor, dsl_atom = self._pick_dsl_atom_split(
+            forward_batch.forward_mode,
+            forward_batch.batch_size,
+            max_seqlen_k,
+        )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -701,6 +798,9 @@ class DeepseekSparseAttnBackend(
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=dsl_factor,
+            dsl_atom=dsl_atom,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -947,6 +1047,7 @@ class DeepseekSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
+        paged_mqa_ctx_lens_2d = None
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
@@ -955,20 +1056,20 @@ class DeepseekSparseAttnBackend(
             try:
                 import deep_gemm
 
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else cache_seqlens_int32
+                paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode, cache_seqlens_int32, seqlens_expanded, bs
                 )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
+                paged_mqa_ctx_lens_2d = None
+
+        # Wave-aware atom-split decision (DSL). Constant across captured replays
+        # of this graph: captured for the worst-case `max_seqlen_k`, so the
+        # picker bias is conservative (closer to factor=1) — safe.
+        dsl_factor, dsl_atom = self._pick_dsl_atom_split(forward_mode, bs, max_seqlen_k)
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -980,6 +1081,9 @@ class DeepseekSparseAttnBackend(
             page_table_1=page_table_1,
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=dsl_factor,
+            dsl_atom=dsl_atom,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -1123,15 +1227,12 @@ class DeepseekSparseAttnBackend(
             try:
                 import deep_gemm
 
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else metadata.cache_seqlens_int32
+                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode,
+                    metadata.cache_seqlens_int32,
+                    seqlens_expanded,
+                    bs,
                 )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1141,8 +1242,16 @@ class DeepseekSparseAttnBackend(
                     )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                # Update the persistent ctx_lens_2d buffer the indexer reads
+                # inside the captured graph; preserve identity so captured
+                # data_ptr stays valid.
+                if metadata.paged_mqa_ctx_lens_2d is None:
+                    object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+                else:
+                    metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
             except (ImportError, ModuleNotFoundError):
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", None)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -1338,12 +1447,18 @@ class DeepseekSparseAttnBackend(
                 import deep_gemm
 
                 if forward_mode.is_decode_or_idle():
-                    seqlens_32 = metadata.cache_seqlens_int32
+                    seqlens_32_2d = _to_2d_context_lens(
+                        metadata.cache_seqlens_int32, bs
+                    )
                 else:
-                    seqlens_32 = metadata.dsa_seqlens_expanded[
-                        : precomputed.seqlens_expanded_size
-                    ]
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
+                    seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                        forward_mode,
+                        metadata.cache_seqlens_int32,
+                        metadata.dsa_seqlens_expanded[
+                            : precomputed.seqlens_expanded_size
+                        ],
+                        bs,
+                    )
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1353,6 +1468,10 @@ class DeepseekSparseAttnBackend(
                     )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                if metadata.paged_mqa_ctx_lens_2d is None:
+                    object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+                else:
+                    metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
             except (ImportError, ModuleNotFoundError):
                 pass
 
@@ -2320,6 +2439,9 @@ class DeepseekSparseAttnBackend(
             ),
             topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=self.forward_metadata.dsl_expand_factor,
+            dsl_atom=self.forward_metadata.dsl_atom,
             force_unfused_topk=force_unfused,
         )
 

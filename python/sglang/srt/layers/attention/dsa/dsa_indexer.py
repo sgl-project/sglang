@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sm100_supported,
 )
 
 logger = logging.getLogger(__name__)
@@ -381,6 +382,12 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        # Optional CuTe DSL FP8 paged MQA logits kernel (Blackwell SM100 only).
+        self.use_cute_dsl_paged_mqa_logits = (
+            get_global_server_args().dsa_use_cute_dsl_paged_mqa_logits
+            and is_sm100_supported()
+        )
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -602,11 +609,35 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
-        # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
-        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
-        # that layout here.
-        if seqlens_32.dim() == 2:
+        assert len(q_fp8.shape) == 3
+        q_offset = sum(metadata.get_dsa_extend_len_cpu())
+
+        # Path selection (mutually exclusive, decode falls through to DG-expanded):
+        #   - cute_dsl (flag opt-in, SM100 only): 1 atom per batch, kernel handles
+        #     full next_n natively. Schedule built from `[B, 1]` in dsa_backend.
+        #   - DG-native: q=[B,next_n,H,D] with DG's ceil-div atom iteration.
+        #     Schedule built from `[B, next_n]` in dsa_backend.
+        #   - DG-expanded: q=[B*next_n,1,H,D]. Schedule from `[N_total, 1]`.
+        B_per_batch = metadata.get_seqlens_int32().shape[0]
+        next_n = q_offset // B_per_batch if B_per_batch > 0 else 0
+        use_cute_dsl = (
+            self.use_cute_dsl_paged_mqa_logits
+            and _is_cuda
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        )
+        use_dg_native = (
+            not use_cute_dsl
+            and _is_cuda
+            and forward_batch.forward_mode.is_target_verify()
+            and next_n >= 2
+        )
+
+        if use_dg_native:
+            # dsa_backend builds this [B, next_n] tensor once per forward and
+            # we reuse it across all layers; same shape invariant since both
+            # sides derive next_n from speculative_num_draft_tokens.
+            seqlens_32_2d = metadata.paged_mqa_ctx_lens_2d
+        elif seqlens_32.dim() == 2:
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
@@ -616,8 +647,6 @@ class Indexer(MultiPlatformOp):
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
-        assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
         block_kv = page_size
         num_heads_kv = 1
@@ -628,12 +657,10 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
-        # and it is necessary to extract the actual q length.
-        q_offset = sum(metadata.get_dsa_extend_len_cpu())
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
+            q_fp8 = q_fp8.unsqueeze(1)
             batch_size, next_n, heads, _ = q_fp8.shape
             logits = torch.empty(
                 (batch_size * next_n, max_seq_len),
@@ -651,7 +678,73 @@ class Indexer(MultiPlatformOp):
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
             )
+        elif use_cute_dsl:
+            from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import (
+                CuteDSLPagedMQALogitsRunner,
+            )
+
+            # 1D context_lens [B], q reshaped to [B, next_n, H, D] for verify
+            # (or [B, 1, H, D] for decode), per-batch block_tables [B, max_blks].
+            ctx_lens_1d = metadata.get_seqlens_int32()
+            schedule_metadata_dsl = schedule_metadata
+            # Wave-aware atom-split decision is computed once per forward batch
+            # in `dsa_backend.init_forward_metadata*` (CPU-side, cuda-graph
+            # safe). `factor > 1` means the picker chose to split; reshape Q +
+            # rebuild ctx_lens / block_tables / schedule_metadata to match.
+            factor = getattr(metadata, "dsl_expand_factor", 1)
+            atom = getattr(metadata, "dsl_atom", 1)
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and next_n >= 2
+                and factor > 1
+            ):
+                exp_B = B_per_batch * factor
+                q_dsl = q_fp8[:q_offset].view(
+                    exp_B, atom, q_fp8.shape[1], q_fp8.shape[2]
+                )
+                ctx_lens_1d = ctx_lens_1d.repeat_interleave(factor)
+                block_tables_dsl = block_tables[::next_n].repeat_interleave(
+                    factor, dim=0
+                )
+                schedule_metadata_dsl = deep_gemm.get_paged_mqa_logits_metadata(
+                    ctx_lens_1d.unsqueeze(-1), blocksize, self.sm_count
+                )
+            elif forward_batch.forward_mode.is_target_verify() and next_n >= 2:
+                q_dsl = q_fp8[:q_offset].view(
+                    B_per_batch, next_n, q_fp8.shape[1], q_fp8.shape[2]
+                )
+                block_tables_dsl = block_tables[::next_n]
+            else:
+                q_dsl = q_fp8[:q_offset].unsqueeze(1)
+                block_tables_dsl = block_tables[:B_per_batch]
+            logits = CuteDSLPagedMQALogitsRunner.forward(
+                q_dsl,
+                kv_cache_fp8.view(torch.uint8),
+                weights[:q_offset],
+                ctx_lens_1d,
+                block_tables_dsl,
+                schedule_metadata_dsl,
+                max_seq_len,
+            )
+        elif use_dg_native:
+            q_native = q_fp8[:q_offset].view(
+                B_per_batch, next_n, q_fp8.shape[1], q_fp8.shape[2]
+            )
+            # dsa_backend repeat_interleaves block_tables to [B*next_n, ...] for
+            # the expanded path; strided slice undoes that. DG only requires
+            # `stride(1) == 1` and reads `stride(0)` explicitly, so no copy.
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_native,
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables[::next_n],
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
         else:
+            q_fp8 = q_fp8.unsqueeze(1)
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,
