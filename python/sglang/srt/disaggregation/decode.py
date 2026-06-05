@@ -1657,6 +1657,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
