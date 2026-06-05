@@ -16,7 +16,7 @@ class TestSamplingBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_max_new_tokens_zero_prefill_only(self):
-        """max_new_tokens=0 over a chunked prompt is prefill-only with no decoded tokens."""
+        """max_new_tokens=0 finishes on prefill with one sampled token and no decode forward."""
         self.server.execute_script(self._script_max_new_tokens_zero_prefill_only)
 
     @staticmethod
@@ -25,9 +25,22 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.req.output_ids) == 0, (
-            f"max_new_tokens=0 must be prefill-only with no decoded tokens; "
-            f"got {len(r.req.output_ids)}"
+        # A generation model always samples one token on the final prefill chunk
+        # (batch_result_processor process_batch_result_prefill, unconditional on
+        # max_new_tokens); a prefill-only (max_new_tokens=0) req then finishes
+        # immediately and never runs a decode forward.
+        assert len(r.req.output_ids) == 1, (
+            f"max_new_tokens=0 finishes on the prefill chunk with one sampled "
+            f"token; got {len(r.req.output_ids)}"
+        )
+        decode_records = [
+            rec
+            for rec in t._scheduler_hook._batch_log
+            if r.rid in rec.rids and rec.mode == "decode"
+        ]
+        assert len(decode_records) == 0, (
+            f"max_new_tokens=0 must run zero decode forwards; got "
+            f"{len(decode_records)}"
         )
 
     def test_max_new_tokens_one_long_chunked(self):
