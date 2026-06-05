@@ -205,8 +205,9 @@ requires `--moe-a2a-backend deepep`.
 DeepSeek-V4 uses the default indexer path unless `--enable-deepseek-v4-fp4-indexer` is set. Enable this flag to use the experimental FP4 C4 indexer on SM100 GPUs with DeepGEMM FP4 indexer support. This path is intended for decode-heavy long-context workloads where reducing indexer cache bandwidth is beneficial.
 
 ```bash Command
-# Please use latest main branch for this feature
-sglang serve deepseek-ai/DeepSeek-V4-Flash \
+# Please use the latest main branch for this feature.
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Flash \
   --tp 4 \
   --moe-runner-backend flashinfer_mxfp4 \
   --enable-deepseek-v4-fp4-indexer

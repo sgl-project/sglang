@@ -6,7 +6,6 @@ export const config = {
 
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
-    "mi300x", "mi325x", "mi350x", "mi355x",
     "rtx6000",
   ],
 

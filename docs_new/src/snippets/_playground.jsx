@@ -956,7 +956,10 @@ export const Playground = ({ config }) => {
       const dockerLines = [
         "docker run --gpus all",
         "  --shm-size 32g",
-        "  -p {{PORT}}:{{PORT}}",
+        // Multi-node needs host networking so the cross-node rendezvous port
+        // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
+        // just maps the serve port.
+        multinode ? "  --network host" : "  -p {{PORT}}:{{PORT}}",
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
