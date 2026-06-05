@@ -972,6 +972,22 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     if obj is None:
         obj = ProfileReqInput()
 
+    # Validate output_dir to prevent path traversal
+    if obj.output_dir is not None:
+        from pathlib import Path
+
+        resolved_dir = Path(obj.output_dir).resolve()
+        # Block obvious traversal attempts and sensitive paths
+        output_dir_str = str(resolved_dir)
+        if any(
+            output_dir_str.startswith(p)
+            for p in ("/etc", "/proc", "/sys", "/dev", "/root")
+        ):
+            return Response(
+                content=f"Invalid output_dir: path not allowed\n",
+                status_code=400,
+            )
+
     await _global_state.tokenizer_manager.start_profile(
         output_dir=obj.output_dir,
         start_step=obj.start_step,
@@ -1348,6 +1364,16 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
+    # Validate lora_path: must be an absolute path, no traversal sequences
+    from pathlib import Path
+
+    lora_path = Path(obj.lora_path).resolve()
+    if ".." in obj.lora_path:
+        return ORJSONResponse(
+            {"success": False, "message": "Invalid lora_path: path traversal detected"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
 
     if result.success:
