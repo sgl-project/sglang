@@ -127,7 +127,9 @@ export const DeepSeekOCRDeployment = () => {
       cmd += ` \\\n  --ep 1`;
     }
 
-    cmd += ` \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable`;
+    if (hardware !== 'xeon') {
+      cmd += ` \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable`;
+    }
 
     return cmd;
   };
@@ -154,7 +156,7 @@ export const DeepSeekOCRDeployment = () => {
                 const isChecked = (values[option.name] || []).includes(item.id);
                 const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
                 const isDisabled = item.required || dynDisabled;
-                return (
+		return (
                   <label key={item.id} title={item.disabledReason || (dynDisabled ? 'Not supported on the selected hardware' : '')} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
                     <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => !dynDisabled && handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
                     {item.label}

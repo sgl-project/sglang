@@ -64,6 +64,9 @@ export const Qwen3CoderNextDeployment = () => {
     }
 
     const quantConfig = hwConfig[quantization];
+    if (!quantConfig) {
+      return '# Configuration not available for the selected hardware/quantization.';
+    }
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
     const modelName = `Qwen/${modelConfigs.default.baseName}${quantSuffix}`;
 

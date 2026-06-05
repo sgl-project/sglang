@@ -87,13 +87,15 @@ export const DeepSeekV31Deployment = () => {
   const handleRadioChange = (optionName, value) => {
     setValues(prev => {
       const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && next.hardware !== 'xeon') {
-        const m = options.modelname.items.find(i => i.id === next.modelname);
-        if (m && m.xeonOnly) {
-          next.modelname = options.modelname.items.find(i => !i.xeonOnly && i.default)?.id || 'v31';
-        }
-      }
       if (optionName === 'hardware') {
+        if (next.hardware === 'xeon') {
+          next.modelname = 'v31terminusint8';
+        } else {
+          const m = options.modelname.items.find(i => i.id === next.modelname);
+          if (m && m.xeonOnly) {
+            next.modelname = options.modelname.items.find(i => !i.xeonOnly && i.default)?.id || 'v31';
+          }
+        }
         const strategyItems = options.strategy.items || [];
         const current = Array.isArray(next.strategy) ? next.strategy : [];
         next.strategy = current.filter(id => {

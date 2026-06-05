@@ -29,12 +29,10 @@ export const Qwen3VLDeployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      getDynamicItems: () => {
-        return [
-          { id: 'bf16', label: 'BF16', default: true },
-          { id: 'fp8', label: 'FP8', default: false }
-        ];
-      }
+      items: [
+        { id: 'bf16', label: 'BF16', default: true },
+        { id: 'fp8', label: 'FP8', default: false }
+      ]
     },
     thinking: {
       name: 'thinking',
@@ -126,19 +124,11 @@ export const Qwen3VLDeployment = () => {
 
 
   // Initialize state
-  const resolveItems = (option, currentValues) => {
-    if (typeof option.getDynamicItems === 'function') {
-      return option.getDynamicItems(currentValues || {});
-    }
-    return option.items || [];
-  };
-
   const getInitialState = () => {
     const initialState = {};
     Object.entries(options).forEach(([key, option]) => {
-      const items = resolveItems(option, initialState);
-      const defaultItem = items.find(item => item.default && !item.disabled) || items.find(item => !item.disabled) || items[0];
-      initialState[key] = defaultItem ? defaultItem.id : '';
+      const defaultItem = option.items.find(item => item.default);
+      initialState[key] = defaultItem ? defaultItem.id : option.items[0].id;
     });
     return initialState;
   };
@@ -162,22 +152,7 @@ export const Qwen3VLDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => {
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware') {
-        for (const [key, option] of Object.entries(options)) {
-          if (key === 'hardware') continue;
-          const items = resolveItems(option, next);
-          if (!items || items.length === 0) continue;
-          const current = items.find(i => i.id === next[key]);
-          if (!current || current.disabled) {
-            const fallback = items.find(i => i.default && !i.disabled) || items.find(i => !i.disabled);
-            if (fallback) next[key] = fallback.id;
-          }
-        }
-      }
-      return next;
-    });
+    setValues(prev => ({ ...prev, [optionName]: value }));
   };
 
   // Generate command
@@ -254,18 +229,16 @@ export const Qwen3VLDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => {
-        const items = resolveItems(option, values);
-        return (
+      {Object.entries(options).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
-            {items.map(item => {
+            {option.items.map(item => {
               const isChecked = values[option.name] === item.id;
               const isDisabled = item.disabled;
               return (
-                <label key={item.id} title={item.disabledReason || ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                  <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                  <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                   {item.label}
                   {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                 </label>
@@ -273,7 +246,7 @@ export const Qwen3VLDeployment = () => {
             })}
           </div>
         </div>
-      )})}
+      ))}
       <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>

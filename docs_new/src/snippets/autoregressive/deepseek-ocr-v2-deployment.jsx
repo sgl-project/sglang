@@ -41,7 +41,7 @@ export const DeepSeekOCR2Deployment = () => {
     let cmd = 'sglang serve \\\n';
     cmd += `  --model-path ${modelPath}`;
     if (hardware === 'xeon') {
-      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --trust-remote-code`;
     }
     cmd += ` \\\n  --enable-multimodal`;
 
@@ -272,12 +272,13 @@ export const DeepSeekOCR2Deployment = () => {
               ) : option.type === 'checkbox' ? (
                 (option.items || []).map((item) => {
                   const isChecked = (values[option.name] || []).includes(item.id);
-                  const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
-                  const isDisabled = item.required || dynDisabled;
+                  const isDisabled =
+                    item.required ||
+                    (typeof item.disabledWhen === 'function' && item.disabledWhen(values));
                   return (
                     <label
                       key={item.id}
-                      title={item.disabledReason || (dynDisabled ? 'Not supported on the selected hardware' : '')}
+                      title={item.disabledReason || ''}
                       style={{
                         ...labelBaseStyle,
                         ...(isChecked ? checkedStyle : {}),
@@ -289,7 +290,7 @@ export const DeepSeekOCR2Deployment = () => {
                         checked={isChecked}
                         disabled={isDisabled}
                         onChange={(event) =>
-                          !dynDisabled && handleCheckboxChange(option.name, item.id, event.target.checked)
+                          handleCheckboxChange(option.name, item.id, event.target.checked)
                         }
                         style={{ display: 'none' }}
                       />

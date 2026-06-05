@@ -143,7 +143,7 @@ import { MiniMaxM27Deployment } from '/src/snippets/autoregressive/minimax-m27-d
 
 **Hardware Requirements: Intel Xeon CPU**
 
-- **Single-node deployment**: Use TP=6 on Intel Xeon CPU. DP/EP are not supported on Xeon in this generator.
+- It is recommended to run the model service on a Granite Rapids (GNR) AP 2-Socket server.
 
 - For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
