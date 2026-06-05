@@ -139,6 +139,7 @@ class RadixKey:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        assert type(t0) is type(t1), (type(t0), type(t1))
         n = min(len(t0), len(t1))
 
         # Exponential search for the first diverging token: gallop in doubling
