@@ -370,13 +370,16 @@ def _verify_combine_stage2(
 
 
 class VerifySplitKV:
-    """Pre-allocates scratch buffers for a fixed problem shape and runs the
-    split-KV verify attention end to end (two Triton launches: prefix split-KV
-    + fused combine/draft/merge)."""
+    """Pre-allocates scratch buffers for a problem shape and runs the split-KV
+    verify attention end to end (two Triton launches: prefix split-KV + fused
+    combine/draft/merge). Buffers are sized by ``max_bs`` (constant for the
+    server lifetime) and reused for every batch size <= max_bs, so their
+    addresses stay fixed (CUDA/HIP-graph safe) and GPU memory does not grow per
+    batch size. The kernel grid uses the actual per-call bs (<= max_bs)."""
 
     def __init__(
         self,
-        bs,
+        max_bs,
         h_q,
         h_kv,
         head_dim,
@@ -387,7 +390,6 @@ class VerifySplitKV:
         block_n=DEFAULT_BLOCK_N,
         num_warps=DEFAULT_NUM_WARPS,
     ):
-        self.bs = bs
         self.h_q = h_q
         self.h_kv = h_kv
         self.group = h_q // h_kv
@@ -399,21 +401,29 @@ class VerifySplitKV:
         self.n_splits = n_splits
         self.block_n = block_n
         self.num_warps = num_warps
+        self._alloc(max_bs)
 
-        # prefix split partials (fp32)
+    def _alloc(self, max_bs):
+        # prefix split partials (fp32), sized for the maximum batch size.
+        self.max_bs = max_bs
         self.att_out = torch.empty(
-            (bs, h_q, n_splits, self.l_pad, v_head_dim),
+            (max_bs, self.h_q, self.n_splits, self.l_pad, self.v_head_dim),
             dtype=torch.float32,
-            device=device,
+            device=self.device,
         )
         self.att_lse = torch.empty(
-            (bs, h_q, n_splits, self.l_pad),
+            (max_bs, self.h_q, self.n_splits, self.l_pad),
             dtype=torch.float32,
-            device=device,
+            device=self.device,
         )
+
+    def grow_buffers(self, max_bs):
+        if max_bs > self.max_bs:
+            self._alloc(max_bs)
 
     def _run_prefix_kernel(
         self,
+        bs,
         q_extend,
         k_buffer,
         v_buffer,
@@ -424,7 +434,7 @@ class VerifySplitKV:
         k_scale,
         v_scale,
     ):
-        grid = (self.bs, self.h_q, self.n_splits)
+        grid = (bs, self.h_q, self.n_splits)
         _verify_prefix_stage1[grid](
             q_extend,
             k_buffer,
@@ -464,9 +474,9 @@ class VerifySplitKV:
         )
 
     def _run_combine_kernel(
-        self, q_extend, k_extend, v_extend, o_out, qo_indptr, sm_scale
+        self, bs, q_extend, k_extend, v_extend, o_out, qo_indptr, sm_scale
     ):
-        grid = (self.bs, self.h_q)
+        grid = (bs, self.h_q)
         _verify_combine_stage2[grid](
             self.att_out,
             self.att_lse,
@@ -521,8 +531,12 @@ class VerifySplitKV:
                 dtype=q_extend.dtype,
                 device=q_extend.device,
             )
+        # actual batch size for this call (<= max_bs); the grid uses it while the
+        # scratch buffers stay max_bs-sized (only the first bs slices are touched).
+        bs = qo_indptr.shape[0] - 1
         # 1. prefix split-KV
         self._run_prefix_kernel(
+            bs,
             q_extend,
             k_buffer,
             v_buffer,
@@ -535,6 +549,7 @@ class VerifySplitKV:
         )
         # 2+3+4. fused combine + draft-draft + merge
         self._run_combine_kernel(
+            bs,
             q_extend,
             k_extend,
             v_extend,
@@ -548,21 +563,23 @@ class VerifySplitKV:
 # ---------------------------------------------------------------------------
 # Live-server dispatch entry.
 # ---------------------------------------------------------------------------
-# Cache one VerifySplitKV instance per (bs, h_q, h_kv, head_dim, v_head_dim,
-# l_ext, device) shape. The scratch buffers are sized by bs/h_q/n_splits/l_pad
-# /v_head_dim only, so this is cheap and reused every verify step.
+# Cache one VerifySplitKV instance per (h_q, h_kv, head_dim, v_head_dim, l_ext,
+# device, n_splits) shape -- NOT keyed on the dynamic batch size. Buffers are
+# sized by the stable max_bs (grown only if a larger one is ever requested), so
+# a single instance serves every batch size: addresses stay fixed (graph-safe)
+# and GPU memory does not grow per batch size.
 _VK_CACHE = {}
 
 
 def _get_vk(
-    bs, h_q, h_kv, head_dim, v_head_dim, l_ext, device, n_splits=DEFAULT_N_SPLITS
+    max_bs, h_q, h_kv, head_dim, v_head_dim, l_ext, device, n_splits=DEFAULT_N_SPLITS
 ):
-    key = (bs, h_q, h_kv, head_dim, v_head_dim, l_ext, str(device), n_splits)
+    key = (h_q, h_kv, head_dim, v_head_dim, l_ext, str(device), n_splits)
     vk = _VK_CACHE.get(key)
     if vk is None:
         block_n, num_warps = block_config(head_dim)
         vk = VerifySplitKV(
-            bs,
+            max_bs,
             h_q,
             h_kv,
             head_dim,
@@ -574,6 +591,8 @@ def _get_vk(
             num_warps=num_warps,
         )
         _VK_CACHE[key] = vk
+    else:
+        vk.grow_buffers(max_bs)
     return vk
 
 
@@ -683,10 +702,15 @@ def verify_splitkv_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    max_bs=None,
 ):
     """Drop-in for extend_attention_fwd on the EAGLE target-verify (topk=1)
     shape. Returns True if it ran (o_extend written), False if the case is
     unsupported and the caller must fall back to extend_attention_fwd.
+
+    ``max_bs`` (optional) is the stable maximum batch size used to size the
+    cached scratch buffers; the backend passes its req_to_token_pool size. If
+    omitted it defaults to this call's bs.
 
     Arg order mirrors extend_attention_fwd exactly so the call site is a
     one-line swap.
@@ -740,8 +764,19 @@ def verify_splitkv_fwd(
     avg_seqlen = kv_indices.shape[0] / max(1, bs)
     n_splits = choose_n_splits(avg_seqlen)
 
+    # Size scratch by the stable max_bs (backend passes req_to_token_pool size);
+    # fall back to this call's bs if not provided / smaller.
+    if max_bs is None or max_bs < bs:
+        max_bs = bs
     vk = _get_vk(
-        bs, h_q, h_kv, head_dim, v_head_dim, l_ext, q_extend.device, n_splits=n_splits
+        max_bs,
+        h_q,
+        h_kv,
+        head_dim,
+        v_head_dim,
+        l_ext,
+        q_extend.device,
+        n_splits=n_splits,
     )
     vk(
         q_extend,
