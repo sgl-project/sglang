@@ -1,9 +1,8 @@
 # flash_mla
 FetchContent_Declare(
     repo-flashmla
-    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG df022ebafb88578eab9f0300606ee765608d8b5c
-    GIT_SHALLOW OFF
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/df022ebafb88578eab9f0300606ee765608d8b5c.tar.gz
+    URL_HASH SHA256=45992d7de7d051dc897aff33156a2b7515d745fc489008adc7924ab884578d52
 )
 FetchContent_Populate(repo-flashmla)
 
