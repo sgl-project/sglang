@@ -1238,6 +1238,8 @@ def attach_hybrid_pool_to_mamba_cache(
     prefetch_threshold: int,
     load_cache_event,
     enable_storage_metrics: bool = False,
+    enable_metrics: bool = False,
+    extra_metric_labels: Optional[dict[str, str]] = None,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
