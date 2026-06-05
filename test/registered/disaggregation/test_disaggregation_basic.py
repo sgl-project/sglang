@@ -95,8 +95,9 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
             None,
         )
         self.assertIsNotNone(first_top_logprobs)
-        self.assertGreater(len(first_top_logprobs), 0)
+        self.assertEqual(len(first_top_logprobs), 5)
         self.assertIsInstance(first_top_logprobs[0].token, str)
+        self.assertIsInstance(first_top_logprobs[0].logprob, float)
 
     def test_structured_output(self):
         json_schema = json.dumps(

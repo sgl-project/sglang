@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import time
 from typing import Dict, Iterable, Optional, Set, Tuple
@@ -32,6 +33,7 @@ class ParallelismInfo(_StrictBaseModel):
 
 class ChecksumInfo(_StrictBaseModel):
     checksums: Dict[str, str]
+    per_gpu_checksum: str
     parallelism_info: ParallelismInfo
 
 
@@ -118,6 +120,12 @@ class WeightChecker:
             if should_compare
         }
 
+        h = hashlib.sha256()
+        for name in sorted(checksums):
+            h.update(name.encode())
+            h.update(checksums[name].encode())
+        overall = h.hexdigest()
+
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         logger.info(
@@ -126,6 +134,7 @@ class WeightChecker:
 
         info = ChecksumInfo(
             checksums=checksums,
+            per_gpu_checksum=overall,
             parallelism_info=self._parallelism_info(),
         )
         return info.model_dump()
@@ -144,7 +153,6 @@ class WeightChecker:
         )
 
     def _model_state(self):
-        # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
         yield from self._model_runner.model.named_buffers()
 

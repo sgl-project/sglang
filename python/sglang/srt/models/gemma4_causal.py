@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
+    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
@@ -220,6 +221,14 @@ class Gemma4MoE(nn.Module):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
             # so we softmax only the top-k logits (fewer kernel launches).
+            if (
+                gating_output.is_cuda
+                and gating_output.dim() == 2
+                and gating_output.dtype
+                in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                return gemma4_fused_routing(gating_output, per_expert_scale, topk)
+
             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
             topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
 

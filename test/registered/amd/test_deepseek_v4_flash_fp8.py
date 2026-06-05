@@ -35,38 +35,32 @@ DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 3600
 
-# Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: tilelang + AITER + ROCm700A).
-# Source of truth: python/run_dsv4.sh.
+# Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: AITER indexer + triton attn + ROCm700A).
 COMMON_ENV_VARS = {
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
-    "SGLANG_OPT_USE_OLD_COMPRESSOR": "true",
-    "SGLANG_OPT_USE_TILELANG_SWA_PREPARE": "false",
-    "SGLANG_OPT_USE_TRITON_SWA_PREPARE": "true",
-    "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "false",
-    "SGLANG_OPT_USE_FUSED_HASH_TOPK": "false",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_AITER_MHC_PRE": "true",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_OPT_USE_AITER_MHC_POST": "true",
-    "SGLANG_ENABLE_THINKING": "1",
-    "SGLANG_USE_AITER": "1",
-    "AITER_BF16_FP8_MOE_BOUND": "1",
-    "SGLANG_USE_ROCM700A": "1",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-    "SGLANG_OPT_DPSK_V4_RADIX": "0",
-    "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "false",
-    "SGLANG_OPT_USE_FUSED_STORE_CACHE": "false",
-    "SGLANG_TOPK_TRANSFORM_512_TORCH": "1",
-    "SGLANG_OPT_USE_TILELANG_INDEXER": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "triton",
+    "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
+    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
+    "SGLANG_USE_AITER": "1",
+    "SGLANG_USE_ROCM700A": "1",
+    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
+    "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
+    "SGLANG_HACK_FLASHMLA_BACKEND": "triton",
+    "SGLANG_OPT_FP8_WO_A_GEMM": "false",
+    "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
+    "SGLANG_OPT_USE_TOPK_V2": "false",
+    "SGLANG_OPT_USE_AITER_INDEXER": "true",
+    "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
+    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
+    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
+    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
+    "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "false",
+    "SGLANG_ROCM_USE_MULTI_STREAM": "false",
+    "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
-# FP8 variant: dense-FP8 experts via the Triton MoE FP8 path.
+# FP8 variant
 FP8_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "false",
-    "SGLANG_FORCE_TRITON_MOE_FP8": "1",
 }
 
 
@@ -86,11 +80,15 @@ class TestDeepseekV4Fp8(CustomTestCase):
             "8",
             "--disable-radix-cache",
             "--attention-backend",
-            "compressed",
+            "dsv4",
             "--max-running-requests",
             "256",
             "--page-size",
             "256",
+            "--mem-fraction-static",
+            "0.90",
+            "--swa-full-tokens-ratio",
+            "0.1",
             "--chunked-prefill-size",
             "8192",
             "--disable-shared-experts-fusion",

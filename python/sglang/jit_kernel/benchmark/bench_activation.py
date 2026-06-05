@@ -1,9 +1,5 @@
-import itertools
-
 import torch
 import torch.nn.functional as F
-import triton
-import triton.testing
 from sgl_kernel import gelu_and_mul as gelu_and_mul_aot
 from sgl_kernel import gelu_tanh_and_mul as gelu_tanh_and_mul_aot
 from sgl_kernel import silu_and_mul as silu_and_mul_aot
@@ -11,12 +7,8 @@ from sgl_kernel import silu_and_mul as silu_and_mul_aot
 from sglang.jit_kernel.activation import gelu_and_mul as gelu_and_mul_jit
 from sglang.jit_kernel.activation import gelu_tanh_and_mul as gelu_tanh_and_mul_jit
 from sglang.jit_kernel.activation import silu_and_mul as silu_and_mul_jit
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    DEFAULT_DTYPE,
-    get_benchmark_range,
-    run_benchmark,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-benchmark-1-gpu-large")
@@ -45,113 +37,56 @@ OPS = {
     "gelu": (gelu_and_mul_aot, gelu_and_mul_jit, gelu_and_mul),
     "gelu_tanh": (gelu_tanh_and_mul_aot, gelu_tanh_and_mul_jit, gelu_tanh_and_mul),
 }
-BS_LIST = get_benchmark_range(full_range=[2**x for x in range(0, 15)], ci_range=[8])
-DIM_LIST = get_benchmark_range(full_range=[1024, 4096, 6144, 8192], ci_range=[4096])
-CONFIGS = list(itertools.product(OPS, DIM_LIST, BS_LIST))
-NUM_LAYERS = 4  # to eliminate L2 effect
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["op_name", "dim", "batch_size"],
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=["aot", "jit", "torch"],
-        line_names=["AOT (sgl-kernel)", "JIT (jit_kernel)", "torch.compile"],
-        styles=[("blue", "--"), ("orange", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="activation-aot-vs-jit",
-        args={},
-    )
-)
-def benchmark(op_name: str, dim: int, batch_size: int, provider: str):
-    x = torch.randn(
-        NUM_LAYERS,
-        batch_size,
-        2 * dim,
-        dtype=DEFAULT_DTYPE,
-        device=DEFAULT_DEVICE,
-    )
+@marker.parametrize("op_name", ["silu", "gelu", "gelu_tanh"])
+@marker.parametrize("dim", [1024, 4096, 6144, 8192], [4096])
+@marker.parametrize("batch_size", [2**x for x in range(0, 15)], [8, 512])
+@marker.benchmark("impl", ["aot", "jit", "torch"])
+def benchmark(op_name: str, dim: int, batch_size: int, impl: str):
+    x = create_random(batch_size, dim * 2)
     aot_op, jit_op, torch_op = OPS[op_name]
-    fn = {"aot": aot_op, "jit": jit_op, "torch": torch_op}[provider]
-
-    def f():
-        for i in range(NUM_LAYERS):
-            fn(x[i])
-
-    return run_benchmark(f, scale=NUM_LAYERS)
-
-
-FILTER_OPS = ["silu", "gelu"]
-FILTER_BS = get_benchmark_range(
-    full_range=[64, 256, 1024, 4096, 16384], ci_range=[1024]
-)
-FILTER_DIMS = get_benchmark_range(full_range=[1024, 4096, 8192], ci_range=[4096])
-FILTER_RATIOS = get_benchmark_range(full_range=[0.0, 0.25, 0.5], ci_range=[0.25])
-FILTER_CONFIGS = list(
-    itertools.product(FILTER_OPS, FILTER_DIMS, FILTER_BS, FILTER_RATIOS)
-)
+    fn = {"aot": aot_op, "jit": jit_op, "torch": torch_op}[impl]
+    return marker.do_bench(fn, input_args=(x,))
 
 
 def _make_expert_ids(num_tokens: int, skip_ratio: float) -> torch.Tensor:
-    expert_ids = torch.randint(
-        low=0, high=8, size=(num_tokens,), dtype=torch.int32, device=DEFAULT_DEVICE
-    )
+    expert_ids = torch.randint(low=0, high=8, size=(num_tokens,), dtype=torch.int32)
     if skip_ratio > 0:
-        skip = torch.rand(num_tokens, device=DEFAULT_DEVICE) < skip_ratio
+        skip = torch.rand(num_tokens) < skip_ratio
         expert_ids[skip] = -1
     return expert_ids
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["op_name", "dim", "batch_size", "skip_ratio"],
-        x_vals=FILTER_CONFIGS,
-        line_arg="provider",
-        line_vals=["unfiltered", "filtered"],
-        line_names=["JIT (no filter_expert)", "JIT (with expert_ids)"],
-        styles=[("blue", "--"), ("orange", "-")],
-        ylabel="us",
-        plot_name="activation-filter-expert",
-        args={},
-    )
-)
+@marker.parametrize("op_name", ["silu", "gelu"])
+@marker.parametrize("dim", [1024, 4096, 8192], [4096])
+@marker.parametrize("batch_size", [64, 256, 1024, 4096, 16384], [1024])
+@marker.parametrize("skip_ratio", [0.0, 0.25, 0.5], [0.25])
+@marker.benchmark("impl", ["unfiltered", "filtered"])
 def benchmark_filter(
-    op_name: str, dim: int, batch_size: int, skip_ratio: float, provider: str
+    op_name: str, dim: int, batch_size: int, skip_ratio: float, impl: str
 ):
-    x = torch.randn(
-        NUM_LAYERS,
-        batch_size,
-        2 * dim,
-        dtype=DEFAULT_DTYPE,
-        device=DEFAULT_DEVICE,
-    )
-    out = torch.empty(
-        NUM_LAYERS,
-        batch_size,
-        dim,
-        dtype=DEFAULT_DTYPE,
-        device=DEFAULT_DEVICE,
-    )
-    expert_ids = _make_expert_ids(batch_size, skip_ratio)
-
+    torch.random.manual_seed(42)
+    x = create_random(batch_size, dim * 2)
     jit_fn = silu_and_mul_jit if op_name == "silu" else gelu_and_mul_jit
+    extra_kwargs = {}
+    expert_ids = _make_expert_ids(batch_size, skip_ratio)
+    if impl == "filtered":
+        extra_kwargs = {"expert_ids": expert_ids.to(x.device), "expert_step": 1}
 
-    if provider == "unfiltered":
-
-        def f():
-            for i in range(NUM_LAYERS):
-                jit_fn(x[i], out[i])
-
-    else:  # filtered
-
-        def f():
-            for i in range(NUM_LAYERS):
-                jit_fn(x[i], out[i], expert_ids=expert_ids, expert_step=1)
-
-    return run_benchmark(f, scale=NUM_LAYERS)
+    # NOTE: get the unmasked part from `experts_ids`
+    real_skip_ratio = (expert_ids == -1).sum().item() / batch_size
+    effective_bytes = int(x.nbytes * (1 - real_skip_ratio) * 1.5)
+    return marker.do_bench(
+        jit_fn,
+        input_args=(x,),
+        input_kwargs=extra_kwargs,
+        memory_args=None,  # x is dynamic (counted in extra_memory_footprint)
+        memory_output=None,  # same, output is dynamic
+        extra_memory_footprint=effective_bytes,
+    )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
-    benchmark_filter.run(print_data=True)
+    benchmark.run()
+    benchmark_filter.run()

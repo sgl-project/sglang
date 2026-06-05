@@ -8,8 +8,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
-from sglang.test.kits.hellaswag_kit import HellaswagMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -29,7 +29,7 @@ class TestBasicSanityEagle3(
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
-    HellaswagMixin,
+    GSM8KMixin,
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_EAGLE3
@@ -38,6 +38,11 @@ class TestBasicSanityEagle3(
     # measurement window to avoid too few non-NaN samples.
     fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 97.0
     fwd_occupancy_max_new_tokens = 4096 if is_in_amd_ci() else 2048
+    fwd_occupancy_acc_length_threshold: float = 1.6
+
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    gsm8k_num_questions = 1400
+    gsm8k_accuracy_thres = 0.74
 
     @classmethod
     def setUpClass(cls):
@@ -59,16 +64,17 @@ class TestBasicSanityEagle3(
                 "--speculative-draft-model-path",
                 DEFAULT_DRAFT_MODEL_EAGLE3,
                 "--speculative-num-steps",
-                "3",
+                "1",
                 "--speculative-eagle-topk",
                 "1",
                 "--speculative-num-draft-tokens",
-                "4",
+                "2",
                 "--cuda-graph-max-bs",
                 "4",
                 "--mem-fraction-static",
                 "0.7",
                 "--enable-metrics",
+                "--disable-piecewise-cuda-graph",
             ],
             env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )

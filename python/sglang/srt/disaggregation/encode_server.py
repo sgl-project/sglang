@@ -1,7 +1,9 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import copy
 import ctypes
+import functools
 import logging
 import multiprocessing as mp
 import os
@@ -56,16 +58,18 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
+from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
+    get_free_port,
     get_local_ip_auto,
     get_zmq_socket,
 )
 
 logger = logging.getLogger(__name__)
 
-HEALTH_CHECK_TIMEOUT = 10
+HEALTH_CHECK_TIMEOUT = 30
 
 # Minimal 32x32 black PNG for health check dummy encode
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
@@ -179,9 +183,36 @@ def _get_mm_feature(mm_inputs, modality):
     )
 
 
+def _normalize_aux_value(val):
+    """Normalize aux values to pickle types compatible with safe_pickle_loads.
+
+    HF multimodal processors (e.g. Qwen3-VL/Omni) emit numpy arrays for
+    fields like ``video_timestamps`` / ``second_per_grid_ts``. ``numpy.*`` is
+    not in SafeUnpickler's allowlist, so the receiver would refuse to load
+    those payloads. Convert numpy values to torch tensors (numeric) or plain
+    Python lists (object dtype) before pickling.
+    """
+    if val is None:
+        return None
+    if isinstance(val, np.ndarray):
+        if val.dtype == object:
+            return val.tolist()
+        return torch.from_numpy(np.ascontiguousarray(val))
+    if isinstance(val, np.generic):
+        return val.item()
+    if isinstance(val, (list, tuple)):
+        return type(val)(_normalize_aux_value(v) for v in val)
+    if isinstance(val, dict):
+        return {k: _normalize_aux_value(v) for k, v in val.items()}
+    return val
+
+
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
-    return {attr: mm_inputs.get(attr) for attr in video_meta_attrs_for(model_type)}
+    return {
+        attr: _normalize_aux_value(mm_inputs.get(attr))
+        for attr in video_meta_attrs_for(model_type)
+    }
 
 
 class MMEncoder:
@@ -250,6 +281,11 @@ class MMEncoder:
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        # Dedicated executor for image preprocessing (resize/normalize).
+        # Separate from self.executor (ZMQ sends) to avoid contention under high concurrency.
+        self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
+        )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
@@ -282,6 +318,14 @@ class MMEncoder:
         else:
             self.mm_global_cache = None
 
+        # Pre-compute embedding metadata (needed by all ranks for mooncake)
+        if self.server_args.encoder_transfer_backend == "mooncake":
+            self._embedding_dims = self._infer_embedding_dims()
+            self._embedding_dtype = next(self.model.parameters()).dtype
+            self._element_size = torch.tensor(
+                [], dtype=self._embedding_dtype
+            ).element_size()
+
         if self.rank == 0:
             logger.info(
                 f"Using transfer backend: {self.server_args.encoder_transfer_backend}"
@@ -306,6 +350,33 @@ class MMEncoder:
                     )
 
             self.embedding_to_send = dict()
+            # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
+            self.encode_dispatch_lock = asyncio.Lock()
+
+            # Async mooncake state: track background VIT forward completion
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._forward_ready_events: Dict[str, asyncio.Event] = {}
+                self._forward_results: Dict[str, dict] = {}
+                # when multiple decoder TP ranks call
+                # POST /encode with the same req_id, only the first triggers
+                # _run_forward(); subsequent callers wait on the event and
+                # return the cached metadata.
+                self._inflight_encode_lock = asyncio.Lock()
+                self._inflight_encode_events: Dict[str, asyncio.Event] = {}
+                self._inflight_encode_meta: Dict[str, Tuple] = {}
+                self._inflight_encode_cleanup_tasks: Dict[str, asyncio.Task] = {}
+
+        # Bind unified encode entry point based on backend and cache config
+        if self.mm_global_cache is not None:
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._encode_fn = self.encode_with_global_cache_mooncake
+            else:
+                self._encode_fn = self.encode_with_global_cache
+        else:
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._encode_fn = self.encode_with_mooncake
+            else:
+                self._encode_fn = self.encode
 
         logger.info(f"rank {rank} init finish ")
 
@@ -681,7 +752,7 @@ class MMEncoder:
 
     def _calculate_hashes_from_features(
         self, mm_feature, grid_thw: List, modality: Modality
-    ) -> List[str]:
+    ) -> List[int]:
         """CPU Task: Compute hashes based on processed feature patches."""
         hashes = []
         if modality == Modality.AUDIO and isinstance(mm_feature, list):
@@ -702,18 +773,21 @@ class MMEncoder:
             offset += num_patches
         return hashes
 
-    async def _encode_missing(
+    def _encode_missing(
         self,
         mm_feature,
         mm_inputs: dict,
         indices: List[int],
         modality: Modality = Modality.IMAGE,
         get_feature_fn=None,
+        grid_thw: Optional[List] = None,
+        keep_on_gpu: bool = False,
     ) -> List[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        if grid_thw is None:
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
         # Audio features are per-item (list of mels for mimo_v2, or batched
         # N x n_mels x T_max for qwen2_audio); slice by item index and keep
@@ -756,7 +830,9 @@ class MMEncoder:
                 mm_item.set(k, val)
 
         with torch.inference_mode():
-            new_embeddings = get_feature_fn([mm_item]).cpu()
+            new_embeddings = get_feature_fn([mm_item])
+            if not keep_on_gpu:
+                new_embeddings = new_embeddings.cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
 
@@ -795,7 +871,9 @@ class MMEncoder:
                 )
             else:
                 mm_hashes = hashes
-            exist_mask = await self.mm_global_cache.batch_is_exist(mm_hashes)
+            # Convert hashes to strings (L2 cache expects string keys for Mooncake)
+            str_mm_hashes = [str(h) for h in mm_hashes]
+            exist_mask = await self.mm_global_cache.batch_is_exist(str_mm_hashes)
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
@@ -817,7 +895,7 @@ class MMEncoder:
         # Step 2: All ranks run ViT together on cache-miss images.
         new_slices = []
         if missing_indices:
-            new_slices = await self._encode_missing(
+            new_slices = self._encode_missing(
                 mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
             )
 
@@ -826,7 +904,7 @@ class MMEncoder:
 
         if self.rank == 0:
             if hit_indices:
-                hit_hashes = [mm_hashes[i] for i in hit_indices]
+                hit_hashes = [str_mm_hashes[i] for i in hit_indices]
                 hit_tokens = [
                     self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
                 ]
@@ -860,7 +938,7 @@ class MMEncoder:
                 f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
                 f"for {len(hit_indices)} mm items."
             )
-            fallback_slices = await self._encode_missing(
+            fallback_slices = self._encode_missing(
                 mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
             )
         else:
@@ -876,7 +954,7 @@ class MMEncoder:
             # Fill in cache-hit embeddings (from prefetch or fallback)
             if prefetch_status.item() == 1 and hit_indices:
                 cached_slices = self.mm_global_cache.get_embeddings(
-                    [mm_hashes[i] for i in hit_indices]
+                    [str_mm_hashes[i] for i in hit_indices]
                 )
                 for i, idx in enumerate(hit_indices):
                     final_slices[idx] = cached_slices[i]
@@ -888,10 +966,10 @@ class MMEncoder:
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
-            all_new_hashes = [mm_hashes[i] for i in missing_indices]
+            all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [mm_hashes[i] for i in hit_indices]
+                all_new_hashes += [str_mm_hashes[i] for i in hit_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
@@ -917,6 +995,8 @@ class MMEncoder:
                 mm_embedding,
                 **aux_data,
             )
+            if self.profiler is not None:
+                self.profiler.step()
             return (
                 mm_embedding.nbytes,
                 mm_embedding.shape[0],
@@ -925,7 +1005,215 @@ class MMEncoder:
                 None,
             )
         else:
+            if self.profiler is not None:
+                self.profiler.step()
             return (0, 0, 0, None, None)
+
+    async def encode_with_global_cache_mooncake(
+        self,
+        mm_items,
+        modality: Modality,
+        req_id: str,
+        num_parts: int,
+        part_idx: int,
+        hashes: Optional[List[str]] = None,
+    ):
+        """Async encode with global cache for mooncake backend.
+        All ranks participate in VIT forward; tp_size > 1 adds broadcasts for sync."""
+        try:
+            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            num_items = len(grid_thw)
+            aux_data = _build_mm_aux_data(mm_inputs)
+
+            # Setup metadata and event management
+            nbytes, total_tokens, embedding_dim, event = (
+                self._setup_mooncake_async_encode(
+                    req_id, num_parts, part_idx, grid_thw, modality, aux_data
+                )
+            )
+
+            # Rank 0: compute hashes
+            if self.rank == 0:
+                if hashes is None:
+                    mm_hashes = self._calculate_hashes_from_features(
+                        mm_feature, grid_thw, modality
+                    )
+                else:
+                    mm_hashes = hashes
+
+            # All ranks: launch background task for cache check + VIT forward.
+            # Do NOT use run_in_executor: get_feature_fn relies on a session
+            # context (CUDA / SGLang inference session) that is bound to the
+            # event-loop main thread and is NOT available inside a
+            # ThreadPoolExecutor worker thread.
+            async def _run_forward_with_cache():
+                try:
+                    # Step 1: Rank 0 checks cache, broadcast mask if TP > 1
+                    if self.rank == 0:
+                        exist_mask = await self.mm_global_cache.batch_is_exist(
+                            mm_hashes
+                        )
+                        mask_tensor = torch.tensor(
+                            [1 if e else 0 for e in exist_mask],
+                            dtype=torch.int32,
+                        )
+                    else:
+                        mask_tensor = torch.zeros(num_items, dtype=torch.int32)
+
+                    if self.server_args.tp_size > 1:
+                        torch.distributed.broadcast(
+                            mask_tensor,
+                            src=0,
+                            group=self.mm_global_cache.prefetch_tp_group,
+                        )
+
+                    exist_mask = [m.item() == 1 for m in mask_tensor]
+                    missing_indices = [i for i, e in enumerate(exist_mask) if not e]
+                    hit_indices = [i for i, e in enumerate(exist_mask) if e]
+                    final_slices = [None] * num_items
+
+                    # Step 2: All ranks run VIT forward for cache misses
+                    # (runs in event loop to preserve session context)
+                    new_slices = []
+                    if missing_indices:
+                        new_slices = self._encode_missing(
+                            mm_feature,
+                            mm_inputs,
+                            missing_indices,
+                            modality,
+                            get_feature_fn,
+                            grid_thw,
+                            keep_on_gpu=True,
+                        )
+                        if self.rank == 0:
+                            for i, idx in enumerate(missing_indices):
+                                final_slices[idx] = new_slices[i]
+
+                    # Step 3: Rank 0 prefetches cache-hit embeddings
+                    prefetch_status = torch.tensor([1], dtype=torch.int32)
+                    if self.rank == 0 and hit_indices:
+                        hit_hashes = [mm_hashes[i] for i in hit_indices]
+                        hit_tokens = [
+                            self.get_num_tokens(grid_thw[i], modality)
+                            for i in hit_indices
+                        ]
+                        self.mm_global_cache.prefetch(
+                            req_id, hit_hashes, hit_tokens, modality
+                        )
+                        try:
+
+                            async def _wait_prefetch():
+                                while not self.mm_global_cache.check_prefetch_progress(
+                                    req_id
+                                ):
+                                    await asyncio.sleep(0.005)
+
+                            await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+                            cached_slices = self.mm_global_cache.get_embeddings(
+                                hit_hashes
+                            )
+                            for i, idx in enumerate(hit_indices):
+                                final_slices[idx] = cached_slices[i]
+                        except (asyncio.TimeoutError, Exception) as e:
+                            logger.error(
+                                f"Prefetch failed for {req_id}: {e}. "
+                                f"Falling back to ViT for "
+                                f"{len(hit_indices)} hit items."
+                            )
+                            prefetch_status[0] = 0
+
+                    # Broadcast prefetch result if TP > 1
+                    if self.server_args.tp_size > 1:
+                        torch.distributed.broadcast(
+                            prefetch_status,
+                            src=0,
+                            group=self.mm_global_cache.prefetch_tp_group,
+                        )
+
+                    # Step 4: All ranks fallback VIT for failed prefetch
+                    # (runs in event loop to preserve session context)
+                    fallback_slices = None
+                    if prefetch_status.item() == 0 and hit_indices:
+                        fallback_slices = self._encode_missing(
+                            mm_feature,
+                            mm_inputs,
+                            hit_indices,
+                            modality,
+                            get_feature_fn,
+                            grid_thw,
+                            keep_on_gpu=True,
+                        )
+                        if self.rank == 0:
+                            for i, idx in enumerate(hit_indices):
+                                final_slices[idx] = fallback_slices[i]
+
+                    # Step 5: Rank 0 assembles and stores result
+                    if self.rank == 0:
+                        mm_embedding = torch.cat(final_slices, dim=0)
+                        # Wait for any pending VIT / cat kernels to finish
+                        # before publishing to /send: mooncake transfer_sync
+                        # is a host-side RDMA read that bypasses CUDA streams
+                        # and would otherwise race with in-flight kernels.
+                        torch.cuda.current_stream(mm_embedding.device).synchronize()
+
+                        # Background insert new embeddings into cache
+                        all_new_hashes = [mm_hashes[i] for i in missing_indices]
+                        all_new_slices = list(new_slices)
+                        if fallback_slices is not None:
+                            all_new_hashes += [mm_hashes[i] for i in hit_indices]
+                            all_new_slices += list(fallback_slices)
+                        if all_new_hashes:
+
+                            async def _background_insert():
+                                await asyncio.to_thread(
+                                    self.mm_global_cache.insert_batch,
+                                    all_new_hashes,
+                                    all_new_slices,
+                                )
+
+                            insert_task = asyncio.create_task(_background_insert())
+                            self.background_tasks.add(insert_task)
+                            insert_task.add_done_callback(self.background_tasks.discard)
+
+                        self._forward_results[req_id]["embedding"] = mm_embedding
+                        logger.info(
+                            f"Global cache + VIT forward completed for "
+                            f"{req_id}, shape={mm_embedding.shape}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Global cache + VIT forward failed for " f"{req_id}: {e}"
+                    )
+                    if self.rank == 0:
+                        self._forward_results[req_id]["error"] = str(e)
+                finally:
+                    if self.rank == 0:
+                        event.set()
+                    if self.profiler is not None:
+                        self.profiler.step()
+
+            self._launch_mooncake_background_task(_run_forward_with_cache())
+
+            if self.rank == 0:
+                logger.info(
+                    f"Returning metadata immediately for {req_id}, "
+                    f"global cache + VIT forward running async"
+                )
+
+            return (nbytes, total_tokens, embedding_dim, None, None)
+
+        except Exception as e:
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+            error_msg = str(e)
+            logger.error(
+                f"Rank {self.rank} encode_with_global_cache_mooncake "
+                f"failed: {error_msg} {error_code = }"
+            )
+            return self._handle_mooncake_encode_error(
+                req_id, num_parts, part_idx, modality, error_msg, error_code
+            )
 
     async def _flatten_and_load_audios(self, mm_items):
         """
@@ -1078,7 +1366,10 @@ class MMEncoder:
         image_config = self.vision_config.get("image", {})
         if self.model_type in ["kimi_k25", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
-        return self.image_processor(images=images, **image_config)
+        return await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(self.image_processor, images=images, **image_config),
+        )
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
@@ -1087,7 +1378,12 @@ class MMEncoder:
             raise ValueError("No video processor available")
 
         videos, video_processor_kwargs = await self._flatten_and_load_videos(mm_items)
-        processor_input = self.video_processor(videos=videos, **video_processor_kwargs)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.video_processor, videos=videos, **video_processor_kwargs
+            ),
+        )
 
         # Get additional video metadata
         if (
@@ -1150,7 +1446,12 @@ class MMEncoder:
             raise ValueError("No audio processor available")
 
         audio_config = self.vision_config.get("audio", {})
-        processor_input = self.audio_processor.feature_extractor(audios, **audio_config)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.audio_processor.feature_extractor, audios, **audio_config
+            ),
+        )
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
@@ -1244,11 +1545,61 @@ class MMEncoder:
         url=None,
     ):
         if self.server_args.encoder_transfer_backend == "mooncake":
-            self.engine.register(embedding.data_ptr(), embedding.nbytes)
-            self.engine.transfer_sync(
-                session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
+            # Wait for async VIT forward completion if needed
+            req_id = mm_data.req_id
+            if req_id in self._forward_ready_events:
+                await self._forward_ready_events[req_id].wait()
+                result = self._forward_results.get(req_id)
+                if result is not None:
+                    if "error" in result:
+                        raise InternalError(f"VIT forward failed: {result['error']}")
+                    embedding = result["embedding"]
+                    # Cache the embedding on mm_data so subsequent /send calls
+                    # from other decoder TP ranks can reuse it.
+                    mm_data.cached_embedding = embedding
+
+            # Retrieve cached embedding for duplicate /send calls from other
+            # decoder TP ranks.
+            if embedding is None:
+                embedding = mm_data.cached_embedding
+            if embedding is None:
+                raise InternalError(
+                    f"No embedding available for Mooncake GPU-direct transfer: {req_id}"
+                )
+
+            expected_nbytes = mm_data.shape[0] * mm_data.shape[1] * self._element_size
+            assert embedding.nbytes == expected_nbytes, (
+                f"Embedding size mismatch for {req_id}: "
+                f"actual={embedding.nbytes}, expected={expected_nbytes} "
+                f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
-            self.engine.deregister(embedding.data_ptr())
+
+            # MR was registered once in _run_forward and is shared across all
+            # sibling-TP /send calls;
+            mr_already_registered = (
+                self._forward_results.get(req_id, {}).get("mr_ptr")
+                == embedding.data_ptr()
+            )
+            if not mr_already_registered:
+                self.engine.register(embedding.data_ptr(), embedding.nbytes)
+            _t_xfer_start = time.monotonic()
+            await asyncio.to_thread(
+                self.engine.transfer_sync,
+                session_id,
+                embedding.data_ptr(),
+                buffer_address,
+                embedding.nbytes,
+            )
+            xfer_ms = (time.monotonic() - _t_xfer_start) * 1000.0
+            if not mr_already_registered:
+                self.engine.deregister(embedding.data_ptr())
+            # Only emit at INFO when transfer is slow or fell back
+            # to per-/send register;
+            if xfer_ms > 200.0 or not mr_already_registered:
+                logger.info(
+                    f"[{req_id}] mooncake transfer_sync={xfer_ms:.1f}ms "
+                    f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
+                )
 
             mm_data.embedding = None
 
@@ -1261,7 +1612,9 @@ class MMEncoder:
 
         # Serialize data
         if self.server_args.encoder_transfer_backend == "mooncake":
-            serialized_data = pickle.dumps(mm_data)
+            # Mooncake already pushed the embedding via RDMA;
+            new_mm_data = mm_data.copy_without_embedding()
+            serialized_data = pickle.dumps(new_mm_data)
             buffer = None
         else:
             new_mm_data = mm_data.copy_without_embedding()
@@ -1288,7 +1641,9 @@ class MMEncoder:
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
-    async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
+    async def encode(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+    ):
         try:
             grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
 
@@ -1328,23 +1683,210 @@ class MMEncoder:
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
 
-    async def encode_request(self, req: dict, modality: Modality):
-        """Single-request encode dispatcher: picks cache vs no-cache path."""
-        if self.mm_global_cache is not None:
-            return await self.encode_with_global_cache(
-                mm_items=req["mm_items"],
-                modality=modality,
-                req_id=req["req_id"],
-                num_parts=req["num_parts"],
-                part_idx=req["part_idx"],
-                hashes=req.get("hashes"),
+    def _setup_mooncake_async_encode(
+        self,
+        req_id: str,
+        num_parts: int,
+        part_idx: int,
+        grid_thw,
+        modality: Modality,
+        aux_data: dict,
+    ):
+        """Setup metadata and event management for mooncake async encode.
+        Returns (nbytes, total_tokens, embedding_dim, event)."""
+        total_tokens = sum(self.get_num_tokens(g, modality) for g in grid_thw)
+        embedding_dim = self._embedding_dims[modality]
+        nbytes = total_tokens * embedding_dim * self._element_size
+
+        event = None
+        if self.rank == 0:
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                grid_thw,
+                modality,
+                embedding=None,
+                embedding_shape=[total_tokens, embedding_dim],
+                **aux_data,
             )
-        return await self.encode(
+            self.embedding_to_send[req_id] = mm_data
+            event = asyncio.Event()
+            self._forward_ready_events[req_id] = event
+            self._forward_results[req_id] = {}
+
+        return nbytes, total_tokens, embedding_dim, event
+
+    def _handle_mooncake_encode_error(
+        self, req_id, num_parts, part_idx, modality, error_msg, error_code
+    ):
+        """Handle outer exception for mooncake async encode methods."""
+        if self.rank == 0:
+            if req_id in self._forward_ready_events:
+                self._forward_results[req_id] = {"error": error_msg}
+                self._forward_ready_events[req_id].set()
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                None,
+                modality,
+                error_msg=error_msg,
+                error_code=error_code,
+            )
+            self.embedding_to_send[req_id] = mm_data
+        return 0, 0, 0, error_msg, error_code
+
+    def _launch_mooncake_background_task(self, coro):
+        """Launch an async background task and track it."""
+        task = asyncio.create_task(coro)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
+    async def _cleanup_inflight_encode_state(self, req_id: str):
+        if not hasattr(self, "_inflight_encode_events"):
+            return
+        async with self._inflight_encode_lock:
+            self._inflight_encode_events.pop(req_id, None)
+            self._inflight_encode_meta.pop(req_id, None)
+            task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+        # Also clean up embedding data and forward state
+        mm_data = self.embedding_to_send.pop(req_id, None)
+        if mm_data is not None:
+            mm_data.cached_embedding = None
+        # Release the rkey after all /send calls have completed.
+        forward_state = self._forward_results.pop(req_id, None)
+        if forward_state is not None:
+            mr_ptr = forward_state.get("mr_ptr")
+            if mr_ptr is not None:
+                try:
+                    self.engine.deregister(mr_ptr)
+                except Exception as dereg_err:
+                    logger.warning(
+                        f"Shared-MR deregister failed for {req_id}: {dereg_err}"
+                    )
+        self._forward_ready_events.pop(req_id, None)
+
+    def _schedule_inflight_encode_cleanup(self, req_id: str):
+        if not hasattr(self, "_inflight_encode_events"):
+            return
+
+        async def _cleanup_later():
+            await asyncio.sleep(self.send_timeout)
+            await self._cleanup_inflight_encode_state(req_id)
+
+        old_task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        task = asyncio.create_task(_cleanup_later())
+        self._inflight_encode_cleanup_tasks[req_id] = task
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+
+    async def encode_with_mooncake(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+    ):
+        """Async encode for mooncake: all ranks participate in VIT forward via background task,
+        rank 0 returns metadata immediately."""
+        try:
+            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            aux_data = _build_mm_aux_data(mm_inputs)
+
+            # Setup metadata and event management
+            nbytes, total_tokens, embedding_dim, event = (
+                self._setup_mooncake_async_encode(
+                    req_id, num_parts, part_idx, grid_thw, modality, aux_data
+                )
+            )
+
+            # Build mm_item (all ranks)
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": modality,
+                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
+                }
+            )
+            for k, v in mm_inputs.items():
+                if k in _mm_feature_attrs.get(modality, []):
+                    continue
+                val = _convert(v)
+                mm_item.set(k, val)
+
+            async def _run_forward():
+                try:
+                    with torch.inference_mode():
+                        emb = get_feature_fn([mm_item])
+                        if len(emb.shape) != 2:
+                            emb = emb.reshape(-1, emb.shape[-1])
+                        # mooncake's transfer_sync is a host-side
+                        # RDMA read that bypasses the CUDA stream. Without an
+                        # explicit sync here, sibling-TP /send handlers can
+                        # invoke transfer_sync while VIT kernels are still
+                        # writing `emb`, producing partial / garbage data on
+                        # the receiver side
+                        if emb.is_cuda:
+                            torch.cuda.current_stream(emb.device).synchronize()
+                    if self.rank == 0:
+                        # Register the MR exactly once here so all sibling-TP /send coroutines share a single registration.
+                        try:
+                            self.engine.register(emb.data_ptr(), emb.nbytes)
+                            self._forward_results[req_id]["mr_ptr"] = emb.data_ptr()
+                        except Exception as reg_err:
+                            logger.warning(
+                                f"Shared-MR register failed for {req_id}, "
+                                f"falling back to per-/send register: {reg_err}"
+                            )
+                            self._forward_results[req_id]["mr_ptr"] = None
+                        self._forward_results[req_id]["embedding"] = emb
+                except Exception as e:
+                    logger.error(f"VIT forward failed for {req_id}: {e}")
+                    if self.rank == 0:
+                        self._forward_results[req_id]["error"] = str(e)
+                finally:
+                    if self.rank == 0:
+                        event.set()
+                    if self.profiler is not None:
+                        self.profiler.step()
+
+            self._launch_mooncake_background_task(_run_forward())
+
+            if self.rank == 0:
+                logger.info(
+                    f"Returning metadata immediately for {req_id}, "
+                    f"VIT forward running async"
+                )
+
+            return (nbytes, total_tokens, embedding_dim, None, None)
+
+        except Exception as e:
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+            error_msg = str(e)
+            logger.error(
+                f"Rank {self.rank} encode_with_mooncake failed: "
+                f"{error_msg} {error_code = }",
+                exc_info=True,
+            )
+            return self._handle_mooncake_encode_error(
+                req_id, num_parts, part_idx, modality, error_msg, error_code
+            )
+
+    async def encode_request(self, req: dict, modality: Modality):
+        """Single-request encode dispatcher.
+
+        Delegates to ``self._encode_fn``, which is bound at ``__init__``
+        time to the correct variant (cache / no-cache / mooncake).
+        """
+        return await self._encode_fn(
             mm_items=req["mm_items"],
             modality=modality,
             req_id=req["req_id"],
             num_parts=req["num_parts"],
             part_idx=req["part_idx"],
+            hashes=req.get("hashes"),
         )
 
     async def batch_encode(
@@ -1389,7 +1931,7 @@ class MMEncoder:
                     ),
                 )
 
-            final_slices = await self._encode_missing(
+            final_slices = self._encode_missing(
                 mm_feature,
                 mm_inputs,
                 list(range(total)),
@@ -1831,10 +2373,712 @@ encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
 encoder_scheduler: Optional[EncoderScheduler] = None
 
+# DP mode (--dp-size > 1): each rank runs as a subprocess with its own
+# MMEncoder on its own GPU; the main process only routes via ZMQ so the
+# asyncio event loop is never blocked by GPU work.
+dp_dispatcher: Optional["DPDispatcher"] = None
+
+
+async def _push_embedding_to_prefill(enc: MMEncoder, request: dict) -> None:
+    # No-op for mooncake (its /send is separate). embedding_port=None is
+    # rejected upfront, so ports is always a concrete list here.
+    req_id = request["req_id"]
+    backend = enc.server_args.encoder_transfer_backend
+
+    if backend == "zmq_to_tokenizer":
+        await enc.send(
+            req_id=req_id,
+            prefill_host=request["prefill_host"],
+            embedding_port=request["embedding_port"],
+        )
+        enc.embedding_to_send.pop(req_id, None)
+        return
+
+    if backend == "zmq_to_scheduler":
+        ports = request["embedding_port"]
+        assert isinstance(ports, list)
+        await asyncio.gather(
+            *(
+                enc.send(
+                    req_id=req_id,
+                    prefill_host=request["prefill_host"],
+                    embedding_port=p,
+                )
+                for p in ports
+            )
+        )
+        enc.embedding_to_send.pop(req_id, None)
+
+
+async def _dp_worker_encode_and_send(
+    enc: MMEncoder,
+    sched: Optional[EncoderScheduler],
+    request: dict,
+) -> Optional[dict]:
+    # Mooncake returns metadata for main to forward; zmq inlines the send.
+    # Soft errors raise MMError so the dispatcher route maps them to HTTP.
+    req_id = request["req_id"]
+    request["enter_time"] = time.time()
+    modality = Modality.from_str(request["modality"])
+    backend = enc.server_args.encoder_transfer_backend
+
+    # URL state lives in main process module globals; workers don't see it.
+    if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
+        raise MMError(
+            "Encoder DP mode does not support zmq_to_scheduler with "
+            "embedding_port=None (URL state isn't synchronised to workers). "
+            "Provide an explicit embedding_port list, switch to mooncake / "
+            "zmq_to_tokenizer, or run without --dp-size.",
+            code=HTTPStatus.BAD_REQUEST,
+        )
+
+    encode_coro = (
+        sched.submit(request)
+        if sched is not None and modality in _BATCHABLE_MODALITIES
+        else enc.encode_request(request, modality)
+    )
+    nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
+
+    if error_msg:
+        # zmq backends still forward an error EmbeddingData to P so it
+        # doesn't block; send failures here are swallowed.
+        try:
+            await _push_embedding_to_prefill(enc, request)
+        except Exception as e:
+            logger.error(
+                f"DP error-send failed for req_id={req_id}: {e}", exc_info=True
+            )
+        # Free the error EmbeddingData stored during encode, or it leaks in
+        # embedding_to_send and pins /health into "busy" (a non-empty
+        # embedding_to_send reads as busy, skipping the probe). Neither path
+        # guarantees cleanup on its own: mooncake's _push_embedding_to_prefill
+        # is a no-op, and a swallowed zmq send failure above skips its own pop.
+        # zmq lacks the inflight attrs so _cleanup_inflight_encode_state would
+        # early-return on it — pop directly. Mirrors the non-DP error path.
+        if backend == "mooncake":
+            await enc._cleanup_inflight_encode_state(req_id)
+        else:
+            enc.embedding_to_send.pop(req_id, None)
+        raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    if backend == "mooncake":
+        request.pop("mm_items", None)
+        request.update(
+            embedding_size=nbytes,
+            embedding_len=embedding_len,
+            embedding_dim=embedding_dim,
+        )
+        # Free the held embedding if the follow-up /send never arrives (same
+        # send_timeout cleanup the non-DP path uses).
+        enc._schedule_inflight_encode_cleanup(req_id)
+        return request
+
+    await _push_embedding_to_prefill(enc, request)
+    return None
+
+
+async def _dp_worker_health_encode(enc: MMEncoder) -> None:
+    """Functional health probe run on a DP worker.
+
+    Process-liveness (proc.sentinel) can't see a worker that's alive but
+    wedged — hung GPU, NCCL deadlock, stalled ZMQ, or a blocked event loop.
+    When idle, run a tiny dummy encode to exercise the VIT forward and surface
+    those stalls. No prefill destination: the embedding is discarded, mirroring
+    the non-DP /health path. Raises on encode failure so the worker envelope
+    carries ``_error`` back to the dispatcher.
+    """
+    # Busy worker: in-flight traffic already proves liveness, so skip the probe
+    # and report healthy — same `embedding_to_send` signal the non-DP /health
+    # path uses. A wedged-but-busy worker never reaches here (it can't service
+    # the recv), so the dispatcher's broadcast still times out → 503.
+    if enc.embedding_to_send:
+        return None
+
+    if enc.image_processor is not None:
+        mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
+        modality = Modality.IMAGE
+    elif enc.audio_processor is not None:
+        mm_items = [f"data:audio/wav;base64,{MINIMUM_WAV_SILENCE_BASE64}"]
+        modality = Modality.AUDIO
+    else:
+        # No processor → can't functionally probe; liveness alone is healthy.
+        return None
+
+    req_id = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+    try:
+        _, _, _, error_msg, error_code = await enc.encode(
+            mm_items=mm_items,
+            modality=modality,
+            req_id=req_id,
+            num_parts=1,
+            part_idx=0,
+        )
+    finally:
+        # Never leave the dummy embedding sitting in the send map.
+        enc.embedding_to_send.pop(req_id, None)
+
+    if error_msg:
+        raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+class DPDispatcher:
+    """Routes encode requests across DP ranks by least-pending count."""
+
+    def __init__(
+        self,
+        dp_size: int,
+        dispatch_sockets: List,
+        result_socket,
+        worker_processes: List[mp.Process],
+    ):
+        self.dp_size = dp_size
+        self.dispatch_sockets = dispatch_sockets
+        self.result_socket = result_socket
+        self.worker_processes = worker_processes
+        # Key = req_id for encode/broadcast, req_id + "_send" for mooncake /send.
+        self.pending_futures: List[Dict[str, asyncio.Future]] = [
+            {} for _ in range(dp_size)
+        ]
+        self.req_id_to_rank: Dict[str, int] = {}
+        self._rr_counter = 0
+        self._broadcast_counter = 0
+        self._dead_ranks: Set[int] = set()
+        # req_id -> monotonic ts a mooncake mapping has waited for its /send.
+        self._pending_send_at: Dict[str, float] = {}
+        # Set when _result_listener gives up; makes alive_ranks report empty.
+        self._listener_failed = False
+
+    @property
+    def pending_counts(self) -> List[int]:
+        return [len(d) for d in self.pending_futures]
+
+    @property
+    def alive_ranks(self) -> List[int]:
+        # Empty if the result listener died; else ranks not marked dead.
+        if self._listener_failed:
+            return []
+        return [r for r in range(self.dp_size) if r not in self._dead_ranks]
+
+    @property
+    def all_ranks_alive(self) -> bool:
+        # Strict health (only /health uses this); routing still degrades.
+        return len(self.alive_ranks) == self.dp_size
+
+    def start(self) -> None:
+        logger.info(f"DP dispatcher started: {self.dp_size} ranks (all remote)")
+        asyncio.create_task(self._result_listener())
+        asyncio.create_task(self._worker_watchdog())
+        asyncio.create_task(self._cleanup_stale_mappings())
+
+    def _drop_pending_and_mapping(self, rank: int, req_id: str) -> None:
+        # dispatch / broadcast failure: no follow-up /send expected.
+        self.pending_futures[rank].pop(req_id, None)
+        self.req_id_to_rank.pop(req_id, None)
+
+    def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
+        # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
+        pending = self.pending_futures[rank]
+        for key, future in list(pending.items()):
+            if not future.done():
+                future.set_result(
+                    {
+                        "req_id": key.removesuffix("_send"),
+                        "_dp_type": "send" if key.endswith("_send") else "encode",
+                        "content": None,
+                        "_error": reason,
+                        "_error_type": error_type,
+                        "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+                    }
+                )
+            pending.pop(key, None)
+
+    def _fail_all_pending(self, reason: str, error_type: str) -> None:
+        for rank in range(self.dp_size):
+            self._fail_pending_for_rank(rank, reason, error_type)
+        self.req_id_to_rank.clear()
+        self._pending_send_at.clear()
+
+    @staticmethod
+    def _timeout_envelope(req_id: str, dp_type: str, reason: str) -> dict:
+        return {
+            "req_id": req_id,
+            "_dp_type": dp_type,
+            "content": None,
+            "_error": reason,
+            "_error_type": "TimeoutError",
+            "_error_code": int(HTTPStatus.GATEWAY_TIMEOUT),
+        }
+
+    async def dispatch(self, request: dict) -> dict:
+        counts = self.pending_counts
+        # Skip ranks whose worker process has died.
+        alive_ranks = self.alive_ranks
+        if not alive_ranks:
+            raise MMError(
+                "All encoder DP workers are dead.",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        min_p = min(counts[r] for r in alive_ranks)
+        candidates = [r for r in alive_ranks if counts[r] == min_p]
+        rank = candidates[self._rr_counter % len(candidates)]
+        self._rr_counter += 1
+        req_id = request["req_id"]
+        self.req_id_to_rank[req_id] = rank
+        future = asyncio.get_running_loop().create_future()
+        self.pending_futures[rank][req_id] = future
+        logger.info(
+            f"MM-Encoder DP dispatch: req_id={req_id}, "
+            f"modality={request.get('modality', 'image')}, "
+            f"dp_rank={rank}, pending={self.pending_counts}"
+        )
+
+        try:
+            await self.dispatch_sockets[rank].send_pyobj(request)
+            # An alive-but-stuck worker (NCCL deadlock etc.) wouldn't trip
+            # the watchdog, so bound the wait explicitly.
+            return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._drop_pending_and_mapping(rank, req_id)
+            return self._timeout_envelope(
+                req_id,
+                "encode",
+                f"Encoder DP rank={rank} timed out after {ENCODER_REQ_TIMEOUT}s",
+            )
+        except BaseException:
+            self._drop_pending_and_mapping(rank, req_id)
+            raise
+
+    async def dispatch_send(self, request: dict) -> dict:
+        req_id = request["req_id"]
+        # /send arrived → stop tracking it for stale-mapping GC.
+        self._pending_send_at.pop(req_id, None)
+        if self._listener_failed:
+            return {
+                "req_id": req_id,
+                "_error": "encoder DP result listener stopped; cannot route /send",
+                "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+            }
+        rank = self.req_id_to_rank.get(req_id)
+        if rank is None:
+            logger.warning(
+                f"MM-Encoder dispatch_send: unknown req_id={req_id}, "
+                f"cannot route to worker"
+            )
+            return {"req_id": req_id, "_error": f"Unknown req_id: {req_id}"}
+        if rank in self._dead_ranks:
+            # Worker died between encode and /send; embedding is gone.
+            self.req_id_to_rank.pop(req_id, None)
+            return {
+                "req_id": req_id,
+                "_error": f"DP worker rank={rank} died before /send for req_id={req_id}",
+                "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+            }
+        key = req_id + "_send"
+        future = asyncio.get_running_loop().create_future()
+        self.pending_futures[rank][key] = future
+        request["_dp_type"] = "send"
+        logger.info(
+            f"MM-Encoder DP dispatch_send: req_id={req_id}, "
+            f"dp_rank={rank}, pending={self.pending_counts}"
+        )
+        try:
+            await self.dispatch_sockets[rank].send_pyobj(request)
+            return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
+        except asyncio.TimeoutError:
+            self.pending_futures[rank].pop(key, None)
+            self.req_id_to_rank.pop(req_id, None)
+            return self._timeout_envelope(
+                req_id,
+                "send",
+                f"Encoder DP rank={rank} /send timed out after {ENCODER_REQ_TIMEOUT}s",
+            )
+        except BaseException:
+            self.pending_futures[rank].pop(key, None)
+            self.req_id_to_rank.pop(req_id, None)
+            raise
+
+    async def broadcast(
+        self, request: dict, timeout: Optional[float] = None
+    ) -> List[dict]:
+        # Skip dead ranks: a PUSH to a gone worker would just buffer and then
+        # surface as a spurious per-rank timeout. All dead → 503 (same as
+        # dispatch), which the profile endpoints turn into an HTTP error.
+        eff_timeout = timeout if timeout is not None else ENCODER_REQ_TIMEOUT
+        alive_ranks = self.alive_ranks
+        if not alive_ranks:
+            raise MMError(
+                "All encoder DP workers are dead.",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        batch_id = self._broadcast_counter
+        self._broadcast_counter += 1
+        rank_keys: List[Tuple[int, str]] = []
+        futures: List[asyncio.Future] = []
+        dp_type = request.get("_dp_type", "unknown")
+        try:
+            for rank in alive_ranks:
+                req_id = f"_broadcast_{batch_id}_{rank}"
+                future = asyncio.get_running_loop().create_future()
+                self.pending_futures[rank][req_id] = future
+                self.req_id_to_rank[req_id] = rank
+                rank_keys.append((rank, req_id))
+                request_copy = {**request, "req_id": req_id}
+                await self.dispatch_sockets[rank].send_pyobj(request_copy)
+                futures.append(future)
+            # Concurrent wait → total bounded by eff_timeout, not
+            # dp_size × eff_timeout.
+            outcomes = await asyncio.gather(
+                *(asyncio.wait_for(fut, timeout=eff_timeout) for fut in futures),
+                return_exceptions=True,
+            )
+            results: List[dict] = []
+            for (rank, req_id), outcome in zip(rank_keys, outcomes):
+                if isinstance(outcome, asyncio.TimeoutError):
+                    self._drop_pending_and_mapping(rank, req_id)
+                    results.append(
+                        self._timeout_envelope(
+                            req_id,
+                            dp_type,
+                            f"Encoder DP rank={rank} broadcast timed out "
+                            f"after {eff_timeout}s",
+                        )
+                    )
+                elif isinstance(outcome, BaseException):
+                    self._drop_pending_and_mapping(rank, req_id)
+                    raise outcome
+                else:
+                    results.append(outcome)
+            return results
+        except BaseException:
+            for rank, req_id in rank_keys:
+                self._drop_pending_and_mapping(rank, req_id)
+            raise
+
+    async def _worker_watchdog(self) -> None:
+        # proc.sentinel becomes readable on process exit; fail this rank's
+        # pending futures so awaiters don't hang on a dead worker.
+        loop = asyncio.get_running_loop()
+        watch: Dict[int, asyncio.Future] = {}
+        for rank, proc in enumerate(self.worker_processes):
+            fut: asyncio.Future = loop.create_future()
+
+            # add_reader is level-triggered, so remove_reader inside the
+            # callback to avoid spinning every loop iteration.
+            def _on_exit(r=rank, f=fut, p=proc, lp=loop):
+                try:
+                    lp.remove_reader(p.sentinel)
+                except (ValueError, OSError):
+                    pass
+                if not f.done():
+                    f.set_result(r)
+
+            try:
+                loop.add_reader(proc.sentinel, _on_exit)
+            except (ValueError, OSError):
+                continue
+            watch[rank] = fut
+
+        while watch:
+            done, _ = await asyncio.wait(
+                watch.values(), return_when=asyncio.FIRST_COMPLETED
+            )
+            for fut in done:
+                rank = fut.result()
+                proc = self.worker_processes[rank]
+                logger.error(
+                    f"DP worker rank={rank} (pid={proc.pid}) exited "
+                    f"with code={proc.exitcode}; failing pending requests"
+                )
+                self._dead_ranks.add(rank)
+                reason = f"DP worker rank={rank} died (exitcode={proc.exitcode})"
+                self._fail_pending_for_rank(rank, reason, "WorkerDied")
+                self.req_id_to_rank = {
+                    r: rk for r, rk in self.req_id_to_rank.items() if rk != rank
+                }
+                watch.pop(rank, None)
+
+    async def _result_listener(self) -> None:
+        # Bounded back-off + give-up so a torn-down context exits in ~3s
+        # rather than spinning forever on recv errors.
+        consecutive_errors = 0
+        while True:
+            try:
+                msg = await self.result_socket.recv_pyobj()
+                consecutive_errors = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                consecutive_errors += 1
+                logger.error("_result_listener recv error", exc_info=True)
+                if consecutive_errors >= 30:
+                    logger.error(
+                        "_result_listener giving up after 30 consecutive errors"
+                    )
+                    self._listener_failed = True
+                    self._fail_all_pending(
+                        "encoder DP result listener stopped after repeated "
+                        "recv errors",
+                        "ResultListenerStopped",
+                    )
+                    return
+                await asyncio.sleep(min(0.1 * consecutive_errors, 1.0))
+                continue
+            req_id = msg.get("req_id", "")
+            dp_type = msg.get("_dp_type", "encode")
+            key = (req_id + "_send") if dp_type == "send" else req_id
+            rank = self.req_id_to_rank.get(req_id)
+            if rank is None or key not in self.pending_futures[rank]:
+                logger.warning(
+                    f"_result_listener: no pending future for "
+                    f"req_id={req_id}, dp_type={dp_type}, dropping"
+                )
+                continue
+            future = self.pending_futures[rank].pop(key)
+            # Only mooncake encode (content=request dict) needs the mapping
+            # kept for the follow-up /send.
+            keep_mapping = dp_type == "encode" and msg.get("content") is not None
+            if keep_mapping:
+                self._pending_send_at[req_id] = time.monotonic()
+            else:
+                self.req_id_to_rank.pop(req_id, None)
+            try:
+                future.set_result(msg)
+
+            except asyncio.InvalidStateError:
+                logger.warning(
+                    f"_result_listener: future already done for "
+                    f"req_id={req_id}, dp_type={dp_type}"
+                )
+
+    async def _cleanup_stale_mappings(self) -> None:
+        # Evict req_id->rank mappings whose /send never came. The worker frees
+        # its own embedding via the send_timeout cleanup scheduled at encode,
+        # so both sides key off the same timeout.
+        ttl = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
+        interval = max(ttl / 4, 30)
+        while True:
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            stale = [rid for rid, ts in self._pending_send_at.items() if now - ts > ttl]
+            for rid in stale:
+                self._pending_send_at.pop(rid, None)
+                self.req_id_to_rank.pop(rid, None)
+            if stale:
+                logger.warning(
+                    f"Evicted {len(stale)} stale encoder DP /send mapping(s) "
+                    f"with no /send within {ttl}s"
+                )
+
+
+async def _dp_worker_handle_profile(
+    enc: MMEncoder, dp_rank: int, dp_type: str, request: dict
+) -> dict:
+    prefix = f"dp_rank={dp_rank}: "
+    if dp_type == "start_profile":
+        obj = request.get("profile_req")
+        # `is None` (not `if not obj`) so empty dict still raises.
+        req = (
+            ProfileReq(**obj)
+            if obj is not None
+            else ProfileReq(ProfileReqType.START_PROFILE)
+        )
+        if enc.profiler is None:
+            enc.profiler = EncoderProfiler(dp_rank)
+        ok, msg = enc.profiler.start(req)
+        detail = (
+            f"started profiling, output_dir={enc.profiler.output_dir}" if ok else msg
+        )
+    else:  # stop_profile
+        if enc.profiler is None:
+            return {"ok": False, "msg": prefix + "profiling not initialized"}
+        ok, msg = enc.profiler.stop()
+        detail = "stopped profiling" if ok else msg
+    return {"ok": ok, "msg": prefix + detail}
+
+
+async def _dp_worker_handle_request(
+    enc: MMEncoder,
+    sched: EncoderScheduler,
+    send_sock,
+    send_lock: asyncio.Lock,
+    dp_rank: int,
+    request: dict,
+    dp_type: str,
+) -> None:
+    t0 = time.time()
+    try:
+        if dp_type in ("start_profile", "stop_profile"):
+            content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
+        elif dp_type == "health_encode":
+            content = await _dp_worker_health_encode(enc)
+        elif dp_type == "send":
+            req_id = request["req_id"]
+            await enc.send(
+                req_id=req_id,
+                prefill_host=request["prefill_host"],
+                embedding_port=request["embedding_port"],
+                session_id=request["session_id"],
+                buffer_address=request["buffer_address"],
+            )
+            # cancels the scheduled cleanup + frees embedding/forward state
+            await enc._cleanup_inflight_encode_state(req_id)
+            content = None
+        else:
+            content = await _dp_worker_encode_and_send(enc, sched, request)
+
+        logger.info(
+            f"MM-Encoder [dp_rank={dp_rank}] {dp_type} done: "
+            f"req_id={request.get('req_id', '?')}, "
+            f"modality={request.get('modality', 'image')}, "
+            f"cost={(time.time() - t0) * 1000:.1f}ms"
+        )
+        envelope = {
+            "req_id": request.get("req_id", ""),
+            "_dp_type": dp_type,
+            "content": content,
+        }
+    except Exception as e:
+        logger.error(
+            f"DP worker {dp_rank} error on {dp_type} "
+            f"req_id={request.get('req_id', '?')}: {e}",
+            exc_info=True,
+        )
+        err_code = int(getattr(e, "code", None) or HTTPStatus.INTERNAL_SERVER_ERROR)
+        envelope = {
+            "req_id": request.get("req_id", ""),
+            "_dp_type": dp_type,
+            "content": None,
+            "_error": str(e),
+            "_error_type": type(e).__name__,
+            "_error_code": err_code,
+        }
+
+    # pyzmq async send_pyobj isn't safe for concurrent senders.
+    try:
+        async with send_lock:
+            await send_sock.send_pyobj(envelope)
+    except Exception:
+        logger.error(
+            f"DP worker {dp_rank} failed to send envelope for "
+            f"req_id={request.get('req_id', '?')}",
+            exc_info=True,
+        )
+
+
+async def run_dp_worker(
+    server_args: ServerArgs,
+    dp_rank: int,
+    gpu_id: int,
+    dispatch_path: str,
+    result_path: str,
+):
+    logger.info(
+        f"DP worker {dp_rank} starting on gpu_id={gpu_id} "
+        f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')})"
+    )
+
+    # gpu_id is the device chosen by maybe_reindex_device_id in the parent:
+    # 0 when CVD is pinned to one GPU, else the absolute id. rank=0, so
+    # MMEncoder runs set_device(base_gpu_id).
+    args = copy.deepcopy(server_args)
+    args.base_gpu_id = gpu_id
+    args.tp_size = 1
+    enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
+    sched = EncoderScheduler(
+        encoder=enc, send_sockets=[], max_batch_size=ENCODER_MAX_BATCH_SIZE
+    )
+
+    ctx = zmq.asyncio.Context(2)
+    recv_sock = get_zmq_socket(ctx, zmq.PULL, dispatch_path, False)
+    send_sock = get_zmq_socket(ctx, zmq.PUSH, result_path, False)
+    send_lock = asyncio.Lock()
+    inflight: Set[asyncio.Task] = set()
+    # Acquire-before-recv → back-pressure propagates to the dispatcher
+    # PUSH buffer. Must be ≥ ENCODER_MAX_BATCH_SIZE or batching degrades.
+    max_inflight = envs.SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT.get()
+    if max_inflight < ENCODER_MAX_BATCH_SIZE:
+        logger.warning(
+            f"SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT={max_inflight} is below "
+            f"ENCODER_MAX_BATCH_SIZE={ENCODER_MAX_BATCH_SIZE}; the encoder "
+            f"will never assemble a full batch."
+        )
+    inflight_sem = asyncio.Semaphore(max_inflight)
+    sched.start()
+    logger.info(f"DP worker {dp_rank} ready")
+
+    # Task-per-request so EncoderScheduler.pending_queue accumulates and
+    # actual cross-request batching can happen.
+    try:
+        while True:
+            await inflight_sem.acquire()
+            # Released by _run on success or the outer finally if not spawned.
+            spawned = False
+            try:
+                try:
+                    request = await recv_sock.recv_pyobj()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.error(f"DP worker {dp_rank} recv error", exc_info=True)
+                    continue
+                if not isinstance(request, dict):
+                    logger.error(
+                        f"DP worker {dp_rank} received non-dict request "
+                        f"({type(request).__name__}); dropping"
+                    )
+                    continue
+                dp_type = request.pop("_dp_type", "encode")
+
+                async def _run(req=request, t=dp_type):
+                    try:
+                        await _dp_worker_handle_request(
+                            enc, sched, send_sock, send_lock, dp_rank, req, t
+                        )
+                    finally:
+                        inflight_sem.release()
+
+                task = asyncio.create_task(_run())
+                # Ownership transferred to _run; mark before any op that could
+                # raise (theoretical: set.add / add_done_callback) and cause a
+                # double-release.
+                spawned = True
+                inflight.add(task)
+                task.add_done_callback(inflight.discard)
+            finally:
+                if not spawned:
+                    inflight_sem.release()
+    finally:
+        # Close zmq on exception/cancellation (normal stop is parent SIGKILL).
+        for task in inflight:
+            task.cancel()
+        ctx.destroy(linger=0)
+
+
+def launch_dp_worker(
+    server_args: ServerArgs,
+    dp_rank: int,
+    gpu_id: int,
+    dispatch_path: str,
+    result_path: str,
+):
+    try:
+        configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
+        asyncio.run(
+            run_dp_worker(server_args, dp_rank, gpu_id, dispatch_path, result_path)
+        )
+    except KeyboardInterrupt:
+        logger.info(f"DP worker {dp_rank} exiting")
+    except Exception:
+        traceback.print_exc()
+
 
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
     global encoder_scheduler
+    if dp_dispatcher is not None:
+        dp_dispatcher.start()
+        yield
+        return
     if encoder is not None:
         encoder_scheduler = EncoderScheduler(
             encoder, send_sockets, max_batch_size=ENCODER_MAX_BATCH_SIZE
@@ -1885,6 +3129,10 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 
 def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
+    if server_args.dp_size > 1:
+        _launch_server_dp(server_args)
+        return
+
     global encoder
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.Context(10)
@@ -1911,6 +3159,105 @@ def launch_server(server_args: ServerArgs):
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
+def _launch_server_dp(server_args: ServerArgs):
+    global dp_dispatcher
+
+    if server_args.dp_size <= 1 or server_args.tp_size != 1:
+        raise ValueError(
+            "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
+            f"dp_size={server_args.dp_size}, tp_size={server_args.tp_size}."
+        )
+    dp_size = server_args.dp_size
+    logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
+
+    ctx = mp.get_context("spawn")
+    ipc_prefix = random_uuid()
+    async_zmq_ctx = zmq.asyncio.Context(dp_size + 1)
+
+    result_path = f"ipc:///tmp/{ipc_prefix}_dp_result"
+    result_socket = get_zmq_socket(async_zmq_ctx, zmq.PULL, result_path, True)
+
+    dispatch_sockets: List[zmq.asyncio.Socket] = [
+        get_zmq_socket(
+            async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{r}", True
+        )
+        for r in range(dp_size)
+    ]
+
+    # Register atexit BEFORE spawn loop so partial spawns get reaped on
+    # exception (atexit holds the list ref and reads it at exit time).
+    import atexit
+
+    worker_processes: List[mp.Process] = []
+
+    def _kill_workers():
+        for p in worker_processes:
+            if p.is_alive():
+                p.kill()
+        for p in worker_processes:
+            p.join(timeout=5)
+
+    atexit.register(_kill_workers)
+
+    for dp_rank in range(dp_size):
+        gpu_id = server_args.base_gpu_id + dp_rank
+        # Pin the device parent-side around spawn (same convention as the
+        # scheduler launcher and DP controller) so the child inherits
+        # CUDA_VISIBLE_DEVICES from its first instruction, before any import
+        # can enumerate CUDA. No-op unless SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS
+        # is set, in which case gpu_id is reindexed to 0 and CVD is pinned.
+        with maybe_reindex_device_id(gpu_id) as gpu_id:
+            proc = ctx.Process(
+                target=launch_dp_worker,
+                args=(
+                    server_args,
+                    dp_rank,
+                    gpu_id,
+                    f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
+                    result_path,
+                ),
+                daemon=False,
+            )
+            proc.start()
+        worker_processes.append(proc)
+
+    dp_dispatcher = DPDispatcher(
+        dp_size,
+        dispatch_sockets,
+        result_socket,
+        worker_processes,
+    )
+
+    uvicorn.run(app, host=server_args.host, port=server_args.port)
+
+
+def _summarise_dp_broadcast(results: List[dict]) -> Response:
+    # Treat missing/None content as failure so a stuck rank doesn't hide
+    # behind the others' "ok". Status = the most severe per-rank error code
+    # (5xx beats 4xx) rather than a blanket 400, so a worker's 500/503/504
+    # isn't misreported as a client error.
+    msgs: List[str] = []
+    error_codes: List[int] = []
+    for r in results:
+        content = r.get("content")
+        if isinstance(content, dict):
+            msgs.append(content.get("msg", ""))
+            if not content.get("ok"):
+                # Worker ran but reported a logical failure; no transport code,
+                # so treat as a bad request (matches the non-DP profile path).
+                error_codes.append(int(r.get("_error_code") or HTTPStatus.BAD_REQUEST))
+        else:
+            msgs.append(r.get("_error", "unknown error"))
+            error_codes.append(
+                int(r.get("_error_code") or HTTPStatus.INTERNAL_SERVER_ERROR)
+            )
+    status_code = 200 if not error_codes else max(error_codes)
+    return Response(
+        content="\n".join(msgs) + "\n",
+        status_code=status_code,
+    )
+
+
 async def get_condition(rid):
     async with cond_dict_lock:
         if rid not in rid_to_cond:
@@ -1922,35 +3269,109 @@ async def get_condition(rid):
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
     start_time = time.monotonic()
+    if dp_dispatcher is not None:
+        try:
+            result = await dp_dispatcher.dispatch(request)
+        except MMError as e:
+            # Surface MMError.code (503 when all workers dead) instead of
+            # FastAPI's default 500.
+            logger.error(f"DP dispatch refused req_id={req_id}: {e}")
+            return ORJSONResponse(
+                status_code=int(e.code),
+                content={"status": "error", "message": str(e), "req_id": req_id},
+            )
+        if result.get("_error"):
+            error_type = result.get("_error_type", "")
+            # `or` (not `dict.get(key, default)`) so explicit None falls back too.
+            status_code = result.get("_error_code") or (
+                HTTPStatus.BAD_REQUEST
+                if error_type == "ValueError"
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            logger.error(f"DP worker error for req_id={req_id}: {result['_error']}")
+            return ORJSONResponse(
+                status_code=status_code,
+                content={
+                    "status": "error",
+                    "message": result["_error"],
+                    "req_id": req_id,
+                },
+            )
+        elapsed = time.monotonic() - start_time
+        logger.info(
+            f"[{req_id}] /encode completed in {elapsed:.3f}s, "
+            f"modality={request.get('modality', 'image')}"
+        )
+        return ORJSONResponse(content=result.get("content"))
     try:
+        # when multiple decoder TP ranks POST /encode
+        # with the same req_id, only the first triggers the VIT forward;
+        # subsequent callers wait and return the same metadata.
+        if encoder.server_args.encoder_transfer_backend == "mooncake":
+            async with encoder._inflight_encode_lock:
+                if req_id in encoder._inflight_encode_events:
+                    event = encoder._inflight_encode_events[req_id]
+                    is_duplicate = True
+                else:
+                    event = asyncio.Event()
+                    encoder._inflight_encode_events[req_id] = event
+                    is_duplicate = False
+
+            if is_duplicate:
+                await event.wait()
+                meta = encoder._inflight_encode_meta.get(req_id)
+                if meta is None:
+                    return ORJSONResponse(
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        content={
+                            "status": "error",
+                            "message": "Encode failed on the first request",
+                            "req_id": req_id,
+                        },
+                    )
+                nbytes, embedding_len, embedding_dim = meta
+                # Build the same metadata response as the first request
+                resp = dict(request)
+                del resp["mm_items"]
+                resp.update(
+                    {
+                        "embedding_size": nbytes,
+                        "embedding_len": embedding_len,
+                        "embedding_dim": embedding_dim,
+                    }
+                )
+                return ORJSONResponse(content=resp)
 
         def start_background_send(req_id):
             task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
-        request.update({"enter_time": time.time()})
-        modality = Modality.from_str(request["modality"])
-        if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
-            try:
+        # broadcast request, lock together with rank0 await so NCCL
+        # launch order matches the ZMQ dispatch order rank>0 sees.
+        async with encoder.encode_dispatch_lock:
+            request.update({"enter_time": time.time()})
+            modality = Modality.from_str(request["modality"])
+            if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
+                try:
+                    nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                        await encoder_scheduler.submit(request)
+                    )
+                except asyncio.TimeoutError:
+                    return ORJSONResponse(
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                        content={
+                            "status": "error",
+                            "message": "encoder batch timed out",
+                            "req_id": req_id,
+                        },
+                    )
+            else:
+                for socket in send_sockets:
+                    socket.send_pyobj(request)
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder_scheduler.submit(request)
+                    await encoder.encode_request(request, modality)
                 )
-            except asyncio.TimeoutError:
-                return ORJSONResponse(
-                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
-                    content={
-                        "status": "error",
-                        "message": "encoder batch timed out",
-                        "req_id": req_id,
-                    },
-                )
-        else:
-            for socket in send_sockets:
-                socket.send_pyobj(request)
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode_request(request, modality)
-            )
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
@@ -1963,11 +3384,28 @@ async def handle_encode_request(request: dict):
                             prefill_host=request["prefill_host"],
                             embedding_port=port,
                         )
+            # Signal waiters on failure for mooncake
+            if encoder.server_args.encoder_transfer_backend == "mooncake":
+                encoder._inflight_encode_meta.pop(req_id, None)
+                evt = encoder._inflight_encode_events.pop(req_id, None)
+                if evt:
+                    evt.set()
+                await encoder._cleanup_inflight_encode_state(req_id)
             return ORJSONResponse(
                 status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
+            # Store metadata for duplicate callers and signal them
+            encoder._inflight_encode_meta[req_id] = (
+                nbytes,
+                embedding_len,
+                embedding_dim,
+            )
+            evt = encoder._inflight_encode_events.get(req_id)
+            if evt:
+                evt.set()
+            encoder._schedule_inflight_encode_cleanup(req_id)
             del request["mm_items"]
             request.update(
                 {
@@ -2014,6 +3452,13 @@ async def handle_encode_request(request: dict):
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         rid_to_err_msg[req_id] = error_msg
+        # Ensure inflight waiters are unblocked on unexpected errors
+        if encoder.server_args.encoder_transfer_backend == "mooncake":
+            encoder._inflight_encode_meta.pop(req_id, None)
+            evt = encoder._inflight_encode_events.pop(req_id, None)
+            if evt:
+                evt.set()
+            await encoder._cleanup_inflight_encode_state(req_id)
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={
@@ -2027,6 +3472,29 @@ async def handle_encode_request(request: dict):
 @app.post("/send")
 async def handle_send_request(request: dict):
     # mooncake backend
+    if dp_dispatcher is not None:
+        try:
+            result = await dp_dispatcher.dispatch_send(request)
+        except MMError as e:
+            req_id = request.get("req_id", "?")
+            logger.error(f"DP dispatch_send refused req_id={req_id}: {e}")
+            return Response(
+                content=f"Encoder DP worker send error: {e}",
+                status_code=int(e.code),
+            )
+        if result.get("_error"):
+            req_id = request.get("req_id", "?")
+            status_code = result.get("_error_code") or int(
+                HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            logger.error(
+                f"DP worker send error for req_id={req_id}: {result['_error']}"
+            )
+            return Response(
+                content=f"Encoder DP worker send error: {result['_error']}",
+                status_code=status_code,
+            )
+        return ORJSONResponse(content=result.get("content"))
     await encoder.send(
         req_id=request["req_id"],
         prefill_host=request["prefill_host"],
@@ -2034,7 +3502,10 @@ async def handle_send_request(request: dict):
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
-    encoder.embedding_to_send.pop(request["req_id"], None)
+    req_id = request["req_id"]
+    # Don't pop embedding_to_send here — other decoder TP ranks may still
+    # need it for their /send calls. Cleanup is handled by the scheduled
+    # timeout task or _cleanup_inflight_encode_state.
     return ORJSONResponse(content=None)
 
 
@@ -2061,6 +3532,24 @@ async def health_generate():
     Performs a dummy encode to verify the encoder is functional.
     Returns 200 if the encoder is healthy, 503 otherwise.
     """
+    if dp_dispatcher is not None:
+        # Strict: any dead (exited) rank fails health → orchestrator restarts.
+        if not dp_dispatcher.all_ranks_alive:
+            return Response(status_code=503)
+        # Process-liveness (proc.sentinel) can't see a worker that's alive but
+        # wedged (hung GPU / NCCL deadlock / stalled ZMQ). Probe every rank with
+        # a tiny dummy encode; each worker runs it only when idle and otherwise
+        # reports healthy at once, keeping the probe off the GPU under load.
+        try:
+            results = await dp_dispatcher.broadcast(
+                {"_dp_type": "health_encode"},
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+        except MMError:
+            return Response(status_code=503)
+        if any(r.get("_error") for r in results):
+            return Response(status_code=503)
+        return Response(status_code=200)
     if encoder is None:
         return Response(status_code=503)
 
@@ -2127,6 +3616,30 @@ async def health_generate():
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+    if dp_dispatcher is not None:
+        profile_req = None
+        if obj is not None:
+            profile_req = {
+                "type": ProfileReqType.START_PROFILE,
+                "output_dir": obj.output_dir,
+                "start_step": obj.start_step,
+                "num_steps": obj.num_steps,
+                "activities": obj.activities,
+                "with_stack": obj.with_stack,
+                "record_shapes": obj.record_shapes,
+                "profile_by_stage": obj.profile_by_stage,
+                "profile_id": str(time.time()),
+                "merge_profiles": obj.merge_profiles,
+                "profile_prefix": obj.profile_prefix,
+                "profile_stages": obj.profile_stages,
+            }
+        try:
+            results = await dp_dispatcher.broadcast(
+                {"_dp_type": "start_profile", "profile_req": profile_req}
+            )
+        except MMError as e:
+            return Response(content=f"{e}\n", status_code=int(e.code))
+        return _summarise_dp_broadcast(results)
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
     req = None
@@ -2165,6 +3678,12 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
+    if dp_dispatcher is not None:
+        try:
+            results = await dp_dispatcher.broadcast({"_dp_type": "stop_profile"})
+        except MMError as e:
+            return Response(content=f"{e}\n", status_code=int(e.code))
+        return _summarise_dp_broadcast(results)
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
     if encoder.profiler is None:
