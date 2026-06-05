@@ -52,6 +52,9 @@ from sglang.multimodal_gen.runtime.models.dits.ideogram import (
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
     IdeogramQwen3VLTextEncoder,
 )
+from sglang.multimodal_gen.runtime.pipelines.ideogram import (
+    _resolve_ideogram4_unconditional_transformer_weights_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ideogram import (
@@ -337,6 +340,7 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
+            component_transformer_weights_paths={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -345,12 +349,18 @@ class TestIdeogram4(unittest.TestCase):
         self.assertIsNone(component_args.transformer_weights_path)
         self.assertIsNone(component_args.nunchaku_config)
 
-    def test_ideogram_nvfp4_unconditional_transformer_uses_sibling_file(self):
+    def test_transformer_component_uses_per_component_weights_override(self):
         server_args = SimpleNamespace(
             transformer_weights_path=(
                 "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
             ),
-            nunchaku_config=None,
+            nunchaku_config={"enabled": True},
+            component_transformer_weights_paths={
+                "unconditional_transformer": (
+                    "/ckpt/diffusion_models/"
+                    "ideogram4_unconditional_nvfp4_mixed.safetensors"
+                )
+            },
         )
 
         component_args = _server_args_for_transformer_component(
@@ -364,6 +374,19 @@ class TestIdeogram4(unittest.TestCase):
             "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
         )
         self.assertIsNone(component_args.nunchaku_config)
+
+    def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
+        self.assertEqual(
+            _resolve_ideogram4_unconditional_transformer_weights_path(
+                "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
+            ),
+            "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
+        )
+        self.assertIsNone(
+            _resolve_ideogram4_unconditional_transformer_weights_path(
+                "/ckpt/custom_transformer.safetensors"
+            )
+        )
 
     def test_ideogram_denoiser_does_not_request_dtype_cast(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
@@ -729,6 +752,7 @@ class TestIdeogram4(unittest.TestCase):
         )
         self.assertTrue(config.arch_config.ideogram_fp8_weight_only)
         self.assertFalse(config.arch_config.ideogram_bnb_4bit_weight_only)
+        self.assertFalse(config.arch_config.requires_gpu_resident_text_encoder)
 
     def test_ideogram_text_encoder_post_config_hook_uses_bnb_for_nf4(self):
         config = Ideogram4TextEncoderConfig()
@@ -747,6 +771,7 @@ class TestIdeogram4(unittest.TestCase):
         )
         self.assertTrue(config.arch_config.ideogram_bnb_4bit_weight_only)
         self.assertFalse(config.arch_config.ideogram_fp8_weight_only)
+        self.assertTrue(config.arch_config.requires_gpu_resident_text_encoder)
 
     def test_ideogram_text_encoder_swaps_linears_to_weight_only_fp8(self):
         config = Ideogram4TextEncoderConfig()

@@ -1,6 +1,5 @@
 import copy
 import logging
-import os
 from typing import Any
 
 import torch
@@ -27,23 +26,6 @@ _is_npu = is_npu()
 
 logger = init_logger(__name__)
 
-_IDEOGRAM4_NVFP4_COND_FILENAME = "ideogram4_nvfp4_mixed.safetensors"
-_IDEOGRAM4_NVFP4_UNCOND_FILENAME = "ideogram4_unconditional_nvfp4_mixed.safetensors"
-
-
-def _ideogram4_unconditional_weights_path(
-    transformer_weights_path: str | None,
-) -> str | None:
-    if (
-        os.path.basename(transformer_weights_path or "")
-        != _IDEOGRAM4_NVFP4_COND_FILENAME
-    ):
-        return None
-    return os.path.join(
-        os.path.dirname(transformer_weights_path),
-        _IDEOGRAM4_NVFP4_UNCOND_FILENAME,
-    )
-
 
 def _server_args_for_transformer_component(
     server_args: ServerArgs, component_name: str
@@ -52,21 +34,20 @@ def _server_args_for_transformer_component(
     if component_name not in ("transformer_2", "unconditional_transformer"):
         return server_args
 
-    if (
-        component_name == "unconditional_transformer"
-        and server_args.nunchaku_config is None
-    ):
-        unconditional_weights_path = _ideogram4_unconditional_weights_path(
-            server_args.transformer_weights_path
+    component_weights_paths = getattr(
+        server_args, "component_transformer_weights_paths", {}
+    )
+    component_weights_path = component_weights_paths.get(component_name)
+    if component_weights_path is not None:
+        component_server_args = copy.copy(server_args)
+        component_server_args.transformer_weights_path = component_weights_path
+        component_server_args.nunchaku_config = None
+        logger.info(
+            "Using transformer_weights_path override for %s: %s",
+            component_name,
+            component_weights_path,
         )
-        if unconditional_weights_path is not None:
-            component_server_args = copy.copy(server_args)
-            component_server_args.transformer_weights_path = unconditional_weights_path
-            logger.info(
-                "Using Ideogram4 unconditional NVFP4 transformer weights from: %s",
-                unconditional_weights_path,
-            )
-            return component_server_args
+        return component_server_args
 
     if (
         server_args.transformer_weights_path is None

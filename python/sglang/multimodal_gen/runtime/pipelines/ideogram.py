@@ -39,6 +39,7 @@ class Ideogram4Nvfp4ModelResolution:
     base_model_name: str
     base_model_path: str
     transformer_weights_path: str
+    unconditional_transformer_weights_path: str | None
 
 
 @lru_cache(maxsize=1)
@@ -46,11 +47,30 @@ def _resolve_ideogram4_base_model_path() -> str:
     return maybe_download_model(_IDEOGRAM4_BASE_MODEL, force_diffusers_model=True)
 
 
-def _resolve_ideogram4_nvfp4_transformer_weights_path(
+def _resolve_ideogram4_unconditional_transformer_weights_path(
+    transformer_weights_path: str,
+) -> str | None:
+    if os.path.basename(transformer_weights_path) != os.path.basename(
+        _IDEOGRAM4_NVFP4_COND_FILE
+    ):
+        return None
+    return os.path.join(
+        os.path.dirname(transformer_weights_path),
+        os.path.basename(_IDEOGRAM4_NVFP4_UNCOND_FILE),
+    )
+
+
+def _resolve_ideogram4_nvfp4_transformer_weights_paths(
     server_args: ServerArgs, model_path: str
-) -> str:
+) -> tuple[str, str | None]:
     if server_args.transformer_weights_path is not None:
-        return server_args.transformer_weights_path
+        transformer_weights_path = server_args.transformer_weights_path
+        return (
+            transformer_weights_path,
+            _resolve_ideogram4_unconditional_transformer_weights_path(
+                transformer_weights_path
+            ),
+        )
 
     local_nvfp4_path = maybe_download_model(
         model_path,
@@ -59,13 +79,19 @@ def _resolve_ideogram4_nvfp4_transformer_weights_path(
             _IDEOGRAM4_NVFP4_UNCOND_FILE,
         ],
     )
-    return os.path.join(local_nvfp4_path, _IDEOGRAM4_NVFP4_COND_FILE)
+    return (
+        os.path.join(local_nvfp4_path, _IDEOGRAM4_NVFP4_COND_FILE),
+        os.path.join(local_nvfp4_path, _IDEOGRAM4_NVFP4_UNCOND_FILE),
+    )
 
 
 def resolve_ideogram4_nvfp4_model(
     server_args: ServerArgs, model_path: str
 ) -> Ideogram4Nvfp4ModelResolution:
-    transformer_weights_path = _resolve_ideogram4_nvfp4_transformer_weights_path(
+    (
+        transformer_weights_path,
+        unconditional_transformer_weights_path,
+    ) = _resolve_ideogram4_nvfp4_transformer_weights_paths(
         server_args,
         model_path,
     )
@@ -73,6 +99,7 @@ def resolve_ideogram4_nvfp4_model(
         base_model_name=_IDEOGRAM4_BASE_MODEL,
         base_model_path=_resolve_ideogram4_base_model_path(),
         transformer_weights_path=transformer_weights_path,
+        unconditional_transformer_weights_path=unconditional_transformer_weights_path,
     )
 
 
@@ -169,9 +196,26 @@ class Ideogram4Nvfp4Pipeline(Ideogram4Pipeline):
     ) -> dict:
         model_resolution = self._get_model_resolution(server_args)
         server_args.transformer_weights_path = model_resolution.transformer_weights_path
+        if model_resolution.unconditional_transformer_weights_path is not None:
+            component_transformer_weights_paths = dict(
+                getattr(server_args, "component_transformer_weights_paths", {})
+            )
+            component_transformer_weights_paths.setdefault(
+                "unconditional_transformer",
+                model_resolution.unconditional_transformer_weights_path,
+            )
+            server_args.component_transformer_weights_paths = (
+                component_transformer_weights_paths
+            )
         logger.info(
             "NVFP4 transformer weights: %s",
             model_resolution.transformer_weights_path,
+        )
+        logger.info(
+            "NVFP4 unconditional transformer weights: %s",
+            server_args.component_transformer_weights_paths.get(
+                "unconditional_transformer"
+            ),
         )
         return super().load_modules(server_args, loaded_modules)
 

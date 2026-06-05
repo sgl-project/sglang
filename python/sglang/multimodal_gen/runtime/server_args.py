@@ -184,6 +184,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
 
     # Quantization method for online quantization
     quantization: str | None = None

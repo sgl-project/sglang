@@ -29,6 +29,7 @@ class Ideogram4TextEncoderConfig(Qwen3VLConfig):
         use_bitsandbytes = "bitsandbytes" in quant_method_name and load_in_4bit
         self.arch_config.ideogram_bnb_4bit_weight_only = use_bitsandbytes
         self.arch_config.ideogram_fp8_weight_only = not use_bitsandbytes
+        self.arch_config.requires_gpu_resident_text_encoder = use_bitsandbytes
 
     def finalize_model_arch(self):
         self.post_diffusers_config_update()

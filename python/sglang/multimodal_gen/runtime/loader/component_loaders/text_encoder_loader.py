@@ -306,13 +306,12 @@ class TextEncoderLoader(ComponentLoader):
             fsdp_cpu_offload = False
             should_offload = False
 
-        if (
-            getattr(model_config.arch_config, "ideogram_bnb_4bit_weight_only", False)
-            and should_offload
-        ):
+        if getattr(
+            model_config.arch_config, "requires_gpu_resident_text_encoder", False
+        ) and should_offload:
             logger.warning(
-                "Keeping bitsandbytes 4-bit Ideogram text encoder GPU-resident; "
-                "text_encoder_cpu_offload is not supported for this checkpoint."
+                "Keeping text encoder GPU-resident; CPU offload is not supported "
+                "for this checkpoint."
             )
             should_offload = False
 
