@@ -22,8 +22,11 @@ matmul. Concretely:
         out  = fused_gate_qmv_silu_mul(x, W_gate, ..., x_up)
                                               # one custom Metal kernel
 
-Saves one kernel launch per MoE layer with no change in matmul kernel shapes,
-so it shouldn't regress at any batch size.
+This removes one kernel launch per MoE layer with no change in matmul kernel
+shapes. The measured end to end decode impact is within run to run noise (bs=1,
+K=12 interleaved trials on Qwen3-30B-A3B-4bit: on minus off 0.4%, a quarter of
+the noise band), so v1 lands off by default as a correct fusion substrate, not
+a measured speedup.
 
 Scope of v1
 -----------
@@ -51,8 +54,8 @@ logger = logging.getLogger(__name__)
 
 # Constants matching MLX's affine_qmv_fast for bits=4, group_size=64.
 # Lifted directly from mlx/include/mlx/backend/metal/kernels/quantized.h
-# (qmv_fast_impl), so the inner-loop layout is bit-for-bit compatible with
-# MLX's own gather_qmm in that regime.
+# (qmv_fast_impl), so the inner-loop layout matches MLX's own gather_qmm in
+# that regime.
 _BITS = 4
 _GROUP_SIZE = 64
 _SIMD_SIZE = 32
@@ -243,7 +246,7 @@ def fused_gate_qmv_silu_mul(
         x_up    : (..., T, 1, N)               pre-computed up output
         y       : (..., T, 1, N)               returned
 
-    Numerical contract: bit-for-bit equivalent to::
+    Numerical contract: equivalent within floating point tolerance to::
 
         x_gate = mx.gather_qmm(x, gate_w, gate_s, gate_b, rhs_indices=indices,
                                transpose=True, group_size=GROUP_SIZE, bits=BITS,
