@@ -2752,8 +2752,11 @@ def draft_decode_set_expand_metadata(
     positions = mask.cumsum(dim=1) - 1
     num_seqs = cache_loc.shape[0]
     if _ASSERT_DRAFT_EXPAND_OOB:
+        # Pad a -1 sentinel so .max() is safe on an empty batch (num_seqs == 0) and
+        # stays graph-break-free under torch.compile; -1 never trips the bound.
+        safe_positions = torch.nn.functional.pad(positions.flatten(), (0, 1), value=-1)
         torch._assert_async(
-            positions.max() < page_table.shape[1],
+            safe_positions.max() < page_table.shape[1],
             "draft expand page_table scatter OOB: per-branch draft slots span more "
             "distinct pages than the (decode_length + 1) columns allocated",
         )
