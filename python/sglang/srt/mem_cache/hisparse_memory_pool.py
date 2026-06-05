@@ -4,7 +4,6 @@ import logging
 import weakref
 from typing import Optional
 
-import psutil
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -17,7 +16,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -77,9 +75,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         )
 
     def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
-            torch.int32
-        )
+        return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
@@ -386,121 +382,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
 
-class DeepSeekV4SingleKVPoolHost(HiSparseHostPoolMixin):
-
-    def __init__(
-        self,
-        device_pool: HiSparseC4DevicePool,
-        host_size: int,
-        page_size: int,
-        pin_memory: bool = True,
-        device: str = "cpu",
-    ):
-
-        assert host_size > 0, "Host size must be specified and greater than 0"
-
-        self.device_pool = device_pool
-        self.size = host_size
-        self.page_size = page_size
-        self.num_pages = (self.size + self.page_size - 1) // self.page_size
-        self.size = self.num_pages * self.page_size
-        self.pin_memory = pin_memory
-        self.device = device
-
-        self.dtype = device_pool.store_dtype
-        self.layer_num = device_pool.layer_num
-        self.kv_cache_total_dim = device_pool.kv_cache_total_dim
-
-        self.kv_buffer = self.init_kv_buffer()
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.clear()
-
-    def clear(self):
-        self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device="cpu"
-        )
-
-    def init_kv_buffer(self):
-        dims = (self.layer_num, self.size + self.page_size, self.kv_cache_total_dim)
-        requested_bytes = (
-            self.layer_num
-            * (self.size + self.page_size)
-            * self.kv_cache_total_dim
-            * self.dtype.itemsize
-        )
-        host_mem = psutil.virtual_memory()
-        # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
-
-        host_pool = torch.empty(dims, dtype=self.dtype, device=self.device)
-        assert self.pin_memory, "DeepSeekV4SingleKVPoolHost requires pin_memory=True"
-        if self.pin_memory:
-            torch.cuda.cudart().cudaHostRegister(
-                host_pool.data_ptr(), host_pool.numel() * host_pool.element_size(), 0
-            )
-        return host_pool
-
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend="kernel"
-    ):
-        if io_backend != "kernel":
-            raise ValueError(f"Unsupported IO backend: {io_backend}")
-
-        from sglang.jit_kernel.dsv4 import hisparse_offload_to_host
-
-        if host_indices.device != device_indices.device:
-            host_indices = host_indices.to(device=device_indices.device)
-        host_indices_i64 = (
-            host_indices.to(torch.int64)
-            if host_indices.dtype != torch.int64
-            else host_indices
-        )
-        device_indices_i64 = (
-            device_indices.to(torch.int64)
-            if device_indices.dtype != torch.int64
-            else device_indices
-        )
-        hisparse_offload_to_host(
-            gpu_ptrs=device_pool.data_ptrs,
-            cpu_ptrs=self.data_ptrs,
-            gpu_indices=device_indices_i64,
-            cpu_indices=host_indices_i64,
-        )
-
-    def available_size(self):
-        return len(self.free_slots)
-
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if need_size > self.available_size():
-            return None
-
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-
-        return select_index
-
-    def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
-        return len(indices)
-
-
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def __init__(
@@ -519,13 +400,16 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.dtype = self.hisparse_kvcache.dtype
         self.device = self.hisparse_kvcache.device
-        self.page_size = self.hisparse_kvcache.page_size
+        # Keep the public page_size as the logical DSV4 full/SWA page size.
+        # C4 HiSparse allocation/device-buffer code must use the compressed page size.
+        self.page_size = logical_attn_allocator.page_size
+        self.hisparse_page_size = self.hisparse_kvcache.page_size
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
         self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_hisparse,
-            self.page_size,
+            self.hisparse_page_size,
             self.dtype,
             self.device,
             self.hisparse_kvcache,
@@ -535,7 +419,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    self._kvcache.c4_logical_size + self.page_size,
+                    self._kvcache.c4_logical_size + self.hisparse_page_size,
                     dtype=torch.int64,
                     device=self.device,
                 ),
@@ -608,12 +492,32 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "use alloc_extend or alloc_decode instead."
         )
 
+    def alloc_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        """Allocate decode logical indices without allocating C4 hisparse device pages."""
+        return self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
-        assert need_size % self.page_size == 0
+        assert need_size % self.hisparse_page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
-        device_buffer_size = need_size - self.page_size
+        device_buffer_size = need_size - self.hisparse_page_size
         P = len(hisparse_indices)
         if P > device_buffer_size + 1:
             newest_src = hisparse_indices[P - 1].clone()
@@ -625,14 +529,16 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             buffer_indices = hisparse_indices[:need_size]
             surplus = hisparse_indices[need_size:]
             if surplus.numel() > 0:
-                buffer_pages = torch.unique(buffer_indices // self.page_size)
-                surplus_pages = torch.unique(surplus // self.page_size)
+                buffer_pages = torch.unique(buffer_indices // self.hisparse_page_size)
+                surplus_pages = torch.unique(surplus // self.hisparse_page_size)
                 pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
                 if pure_surplus.numel() > 0:
                     self.hisparse_attn_allocator.is_not_in_free_group = True
-                    self.hisparse_attn_allocator.free(pure_surplus * self.page_size)
+                    self.hisparse_attn_allocator.free(
+                        pure_surplus * self.hisparse_page_size
+                    )
         else:
-            page_residual_length = len(hisparse_indices) % self.page_size
+            page_residual_length = len(hisparse_indices) % self.hisparse_page_size
             if page_residual_length != 0:
                 hisparse_indices = torch.cat(
                     [
@@ -640,7 +546,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                         torch.arange(
                             hisparse_indices[-1] + 1,
                             hisparse_indices[-1]
-                            + self.page_size
+                            + self.hisparse_page_size
                             - page_residual_length
                             + 1,
                             device=self.device,
@@ -684,7 +590,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         num_new_pages_hisparse = get_num_new_pages(
             seq_lens=seq_lens_cpu // self.compress_ratio,
-            page_size=self.page_size,
+            page_size=self.hisparse_page_size,
             prefix_lens=prefix_lens_cpu // self.compress_ratio,
         )
         if (
@@ -694,7 +600,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
         if (
             num_new_pages_hisparse
-            > self.hisparse_attn_allocator.available_size() // self.page_size
+            > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
         ):
             return None
 

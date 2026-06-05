@@ -72,8 +72,11 @@ from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
     build_raw_rgb_frame_batches,
 )
-from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
+    DiffStage,
+    init_diffusion_tracing,
+    trace_slice,
+)
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -989,9 +992,7 @@ def run_scheduler_process(
     elif current_platform.is_musa():
         set_musa_arch()
 
-    if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-        trace_set_thread_info(f"DiffWorker_rank{rank}")
+    init_diffusion_tracing(server_args, f"DiffWorker_rank{rank}")
 
     port_args = PortArgs.from_server_args(server_args)
 

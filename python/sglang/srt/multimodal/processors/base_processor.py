@@ -416,6 +416,7 @@ class BaseMultimodalProcessor(ABC):
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
                 "Gemma4Processor",
+                "Gemma4UnifiedProcessor",
                 "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
                 "Qwen3ASRProcessor",

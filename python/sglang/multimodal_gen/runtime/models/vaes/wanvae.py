@@ -997,7 +997,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 out = unpatchify(out, patch_size=self.config.patch_size)
 
             out = out.float()
-            out = torch.clamp(out, min=-1.0, max=1.0)
+            out.clamp_(min=-1.0, max=1.0)
             self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)

@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
     mla_quantize_and_rope_for_fp8,
 )
@@ -38,7 +39,6 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -389,7 +389,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        create_flashmla_kv_indices_triton[(batch_size,)](
+        create_flashmla_kv_indices_triton[
+            (
+                batch_size,
+                get_num_kv_index_blocks_flashmla(max_blocks, self.page_size),
+            )
+        ](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -499,83 +504,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Initialize metadata for CUDA graph capture."""
-
-        # Delegate to parent for non-decode modes.
-        if (
-            not forward_mode.is_decode_or_idle()
-            and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend(include_v2=True)
-        ):
-            return super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
-
-        self._init_cuda_graph_metadata(
-            bs, num_tokens, forward_mode, seq_lens, seq_lens.device
-        )
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens.cpu(),
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Replay CUDA graph with new inputs."""
-        # Delegate to parent for non-decode modes.
-        if (
-            not forward_mode.is_decode_or_idle()
-            and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend(include_v2=True)
-        ):
-            return super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
+        """Shared decode / target-verify / draft-extend capture+replay body.
 
+        Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
+        the non-decode-family modes to the FlashInferMLA parent).
+        """
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-            del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
         elif forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_bs
@@ -595,7 +540,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
 
         # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[(bs,)](
+        create_flashmla_kv_indices_triton[
+            (
+                bs,
+                get_num_kv_index_blocks_flashmla(
+                    metadata.block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
             self.req_to_token,
             req_pool_indices[:bs],
             seq_lens,
@@ -617,6 +569,47 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ) or is_in_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        forward_mode = forward_batch.forward_mode
+
+        if (
+            not forward_mode.is_decode_or_idle()
+            and not forward_mode.is_target_verify()
+            and not forward_mode.is_draft_extend(include_v2=True)
+        ):
+            return super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+
+        bs = forward_batch.batch_size
+        if in_capture:
+            num_tokens = forward_batch.positions.numel()
+            seq_lens_cpu = forward_batch.seq_lens.cpu()
+            self._init_cuda_graph_metadata(
+                bs,
+                num_tokens,
+                forward_mode,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens.device,
+            )
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                forward_mode=forward_mode,
+            )
+        else:
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                forward_mode=forward_mode,
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -976,9 +969,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_decode_metadata
         )
 
-        # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-        # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-        # and padding logic in prepare_mlp_sync_batch to avoid this
+        # Backstop: metadata was built pre-pad (marked) and DP padding then
+        # grew the batch. The marker path deliberately does not re-plan
+        # post-pad (DSA can't rebuild on a padded batch, see #27091), so this
+        # local re-plan catches the size mismatch.
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
@@ -1078,9 +1072,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or self.forward_decode_metadata
             )
 
-            # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-            # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-            # and padding logic in prepare_mlp_sync_batch to avoid this
+            # Backstop: metadata was built pre-pad (marked) and DP padding
+            # then grew the batch. The marker path deliberately does not
+            # re-plan post-pad (DSA can't rebuild on a padded batch, see
+            # #27091), so this local re-plan catches the size mismatch.
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
                 self.init_forward_metadata(forward_batch)
@@ -1284,17 +1279,21 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ):
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=None,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        if in_capture:
+            return super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
             )
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+        )
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_out_graph(inner_fb)
