@@ -223,6 +223,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
@@ -2358,12 +2359,12 @@ class ServerArgs:
                     self.attention_backend = default_attention_backend
 
             prefill_backend, decode_backend = self.get_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton")
+            accepted_backends = ("trtllm_mha", "triton", "intel_xpu")
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha or triton attention backend, "
+                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 
@@ -3300,6 +3301,17 @@ class ServerArgs:
                 )
                 self.moe_runner_backend = "flashinfer_trtllm"
 
+        if (
+            self.moe_runner_backend == "auto"
+            and self.quantization == "modelopt_fp4"
+            and is_sm120_supported()
+        ):
+            self.moe_runner_backend = "flashinfer_cutlass"
+            logger.info(
+                "Use flashinfer_cutlass as MoE runner backend on SM120 for "
+                "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
+            )
+
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
@@ -3333,7 +3345,7 @@ class ServerArgs:
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        if self.moe_runner_backend == "flashinfer_trtllm":
+        if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
@@ -5738,7 +5750,7 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "

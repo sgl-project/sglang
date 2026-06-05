@@ -877,6 +877,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
+        self.abort_notified: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -1062,6 +1063,13 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
+            self._send_abort_notification()
+            self.abort_notified = True
         return KVPoll.Failed
 
     def failure_exception(self):
@@ -1079,6 +1087,36 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
+            self._send_abort_notification()
+            self.abort_notified = True
+
+    def _send_abort_notification(self):
+        for bootstrap_info in self.bootstrap_infos:
+            # Best-effort notification to prefill side that this request was aborted.
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"ABORT",
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                        ]
+                    )
+                logger.debug(
+                    f"Sent abort notification for room {self.bootstrap_room} "
+                    f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
+                )
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
