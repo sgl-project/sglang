@@ -445,6 +445,43 @@ def test_causal_kv_cache_update_handles_append_roll_and_recompute():
     assert recompute_view.k.flatten().tolist() == [50.0, 6.0]
 
 
+def test_causal_kv_cache_update_tail_replacement_keeps_sink_without_roll():
+    cache = CausalSelfAttentionKVCache(
+        k=torch.zeros(1, 6, 1, 1),
+        v=torch.zeros(1, 6, 1, 1),
+        global_end_index=torch.zeros(1, dtype=torch.long),
+        local_end_index=torch.zeros(1, dtype=torch.long),
+        global_end_index_int=0,
+        local_end_index_int=0,
+        sink_tokens=3,
+    )
+
+    cache.update_and_get_attention_kv(
+        key=torch.tensor([[[[1.0]], [[2.0]], [[3.0]]]]),
+        value=torch.tensor([[[[10.0]], [[20.0]], [[30.0]]]]),
+        current_chunk_start=0,
+    )
+    cache.update_and_get_attention_kv(
+        key=torch.tensor([[[[4.0]], [[5.0]], [[6.0]]]]),
+        value=torch.tensor([[[[40.0]], [[50.0]], [[60.0]]]]),
+        current_chunk_start=3,
+    )
+    view = cache.update_and_get_attention_kv(
+        key=torch.tensor([[[[7.0]], [[8.0]], [[9.0]]]]),
+        value=torch.tensor([[[[70.0]], [[80.0]], [[90.0]]]]),
+        current_chunk_start=6,
+    )
+
+    assert view.local_start_index == 3
+    assert view.local_end_index == 6
+    assert view.visible_local_end == 6
+    assert view.visible_global_end == 9
+    assert cache.local_end_index_int == 6
+    assert cache.global_end_index_int == 9
+    assert cache.k.flatten().tolist() == [1.0, 2.0, 3.0, 7.0, 8.0, 9.0]
+    assert cache.v.flatten().tolist() == [10.0, 20.0, 30.0, 70.0, 80.0, 90.0]
+
+
 def test_causal_kv_cache_update_grows_without_rolling_when_enabled():
     cache = CausalSelfAttentionKVCache(
         k=torch.zeros(1, 2, 1, 1),

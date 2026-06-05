@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
 
@@ -761,41 +762,54 @@ class CausalDMDDenoisingStage(DenoisingStage):
         prepare_context_input: Callable[[torch.Tensor], torch.Tensor],
         progress_bar=None,
     ) -> torch.Tensor:
-        current_latents, attn_metadata = self._denoise_causal_dmd_chunk(
-            batch,
-            server_args,
-            chunk_latents=chunk_latents,
-            scheduler=scheduler,
-            timesteps=timesteps,
-            prompt_embeds=prompt_embeds,
-            kv_cache=kv_cache,
-            crossattn_cache=crossattn_cache,
-            current_start_tokens=current_start_tokens,
-            start_frame=start_frame,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-            target_dtype=target_dtype,
-            autocast_enabled=autocast_enabled,
-            device=device,
-            attn_raw_latent_shape=attn_raw_latent_shape,
-            prepare_model_input=prepare_model_input,
-            progress_bar=progress_bar,
-        )
-        self._update_causal_context_cache(
-            batch,
-            server_args,
-            context_input=prepare_context_input(current_latents),
-            prompt_embeds=prompt_embeds,
-            kv_cache=kv_cache,
-            crossattn_cache=crossattn_cache,
-            current_start_tokens=current_start_tokens,
-            start_frame=start_frame,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-            attn_metadata=attn_metadata,
-            target_dtype=target_dtype,
-            autocast_enabled=autocast_enabled,
-        )
+        profile_prefix = f"{self.__class__.__name__}.f{start_frame}"
+        with StageProfiler(
+            f"{profile_prefix}.denoise_chunk",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=batch.perf_dump_path is not None,
+        ):
+            current_latents, attn_metadata = self._denoise_causal_dmd_chunk(
+                batch,
+                server_args,
+                chunk_latents=chunk_latents,
+                scheduler=scheduler,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_tokens=current_start_tokens,
+                start_frame=start_frame,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                target_dtype=target_dtype,
+                autocast_enabled=autocast_enabled,
+                device=device,
+                attn_raw_latent_shape=attn_raw_latent_shape,
+                prepare_model_input=prepare_model_input,
+                progress_bar=progress_bar,
+            )
+        with StageProfiler(
+            f"{profile_prefix}.context_cache_update",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=batch.perf_dump_path is not None,
+        ):
+            self._update_causal_context_cache(
+                batch,
+                server_args,
+                context_input=prepare_context_input(current_latents),
+                prompt_embeds=prompt_embeds,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_tokens=current_start_tokens,
+                start_frame=start_frame,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                autocast_enabled=autocast_enabled,
+            )
         return current_latents
 
     def _get_max_text_len(self, server_args: ServerArgs) -> int:

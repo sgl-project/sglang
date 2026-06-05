@@ -139,7 +139,16 @@ class CausalSelfAttentionKVCache:
             if self.allow_growth:
                 self._grow_to_fit(local_end_index_prev + appended_tokens)
                 kv_cache_size = self.cache_size
-            if local_end_index_prev + appended_tokens > kv_cache_size:
+            tail_replacement_without_roll = (
+                local_end_index_prev == kv_cache_size
+                and appended_tokens == num_new_tokens
+                and sink_tokens + num_new_tokens == kv_cache_size
+            )
+            if tail_replacement_without_roll:
+                # Common realtime layout: [sink][current_chunk]. The old tail is
+                # fully evicted, so there is no middle segment to roll.
+                local_end_index = kv_cache_size
+            elif local_end_index_prev + appended_tokens > kv_cache_size:
                 # the new tokens can't fit in the remaining space (after local_end_index_prev), start evicting:
                 # before:
                 # [sink tokens, evicted tokens, rolled tokens, remaining space]
