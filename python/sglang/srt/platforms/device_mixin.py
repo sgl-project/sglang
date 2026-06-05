@@ -156,7 +156,7 @@ class DeviceMixin:
     # ---- Device management ----
 
     def get_device(self, device_id: int = 0) -> str:
-        """[Planned] Return ``torch.device`` for the given local rank."""
+        """[Planned] Return ``torch.device`` for the given device id."""
         raise NotImplementedError
 
     def set_device(self, device: "torch.device") -> None:

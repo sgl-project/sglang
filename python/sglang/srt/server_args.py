@@ -49,6 +49,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -932,12 +933,6 @@ class ServerArgs:
         else:
             self._quantization_explicitly_unset = False
 
-        # This is the first import of the platform plugin and will trigger
-        # loading of the plugin and initialization, this needs to be done
-        # before device detection in _handle_missing_default_values so that
-        # OOT devices are visible
-        from sglang.srt.platforms import current_platform
-
         # Set missing default values.
         self._handle_missing_default_values()
 
@@ -1362,8 +1357,6 @@ class ServerArgs:
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 5b. OOT platforms that don't support piecewise cuda graph
-        from sglang.srt.platforms import current_platform
-
         if current_platform.is_out_of_tree():
             if not current_platform.support_piecewise_cuda_graph():
                 self.disable_piecewise_cuda_graph = True
@@ -2747,8 +2740,6 @@ class ServerArgs:
             2.3 Otherwise, we will use triton backend.
         """
         # OOT platforms provide their own default attention backend.
-        from sglang.srt.platforms import current_platform
-
         if current_platform.is_out_of_tree():
             return current_platform.get_default_attention_backend()
 
