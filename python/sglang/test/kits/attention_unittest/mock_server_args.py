@@ -21,10 +21,6 @@ validation it performs is irrelevant for module-level attention tests.
 
 import dataclasses
 
-from sglang.srt.model_executor.cuda_graph_config import (
-    Phase,
-    default_cuda_graph_config,
-)
 from sglang.srt.server_args import ServerArgs
 
 
@@ -52,21 +48,12 @@ def make_mock_server_args(**overrides) -> ServerArgs:
             setattr(sa, f.name, f.default)
         elif f.default_factory is not dataclasses.MISSING:
             setattr(sa, f.name, f.default_factory())
-    # TODO: drop cuda_graph_bs from the attention unittest kit;
-    # tests should configure cuda_graph_config directly instead.
-    legacy_cuda_graph_bs = overrides.pop("cuda_graph_bs", None)
     for k, v in overrides.items():
         cls_attr = getattr(type(sa), k, None)
         if isinstance(cls_attr, property):
             setattr(sa, f"_{k}", v)
         else:
             setattr(sa, k, v)
-    if sa.cuda_graph_config is None:
-        sa.cuda_graph_config = default_cuda_graph_config()
-        bs = legacy_cuda_graph_bs if legacy_cuda_graph_bs is not None else [4]
-        sa.cuda_graph_config[Phase.DECODE].bs = list(bs)
-        sa.cuda_graph_config[Phase.DECODE].max_bs = max(bs)
-        sa.cuda_graph_config[Phase.PREFILL].max_bs = max(bs)
     if not hasattr(sa, "_cuda_graph_config_locked"):
         sa._cuda_graph_config_locked = set()
     return sa
