@@ -252,16 +252,26 @@ def bench_local_attention_autotune(args: argparse.Namespace) -> None:
             **attention_kwargs,
         ).cuda()
     _LOCAL_ATTENTION_AUTOTUNE_CACHE.clear()
-    forward_batch = (
-        _WarmupBatch() if args.attention_autotune_mode == "warmup_default" else None
-    )
-    with torch.inference_mode(), set_forward_context(0, metadata, forward_batch):
-        layer(q, k, v)
+    if args.attention_autotune_mode == "warmup_then_default":
+        with torch.inference_mode(), set_forward_context(0, metadata, _WarmupBatch()):
+            layer(q, k, v)
         selected = next(
             iter(_LOCAL_ATTENTION_AUTOTUNE_CACHE.values()),
             f"{args.attention_autotune_mode}_uncached",
         )
-        ms = _time_cuda(lambda: layer(q, k, v), args.warmup, args.iters)
+        with torch.inference_mode(), set_forward_context(0, metadata):
+            ms = _time_cuda(lambda: layer(q, k, v), args.warmup, args.iters)
+    else:
+        forward_batch = (
+            _WarmupBatch() if args.attention_autotune_mode == "warmup_default" else None
+        )
+        with torch.inference_mode(), set_forward_context(0, metadata, forward_batch):
+            layer(q, k, v)
+            selected = next(
+                iter(_LOCAL_ATTENTION_AUTOTUNE_CACHE.values()),
+                f"{args.attention_autotune_mode}_uncached",
+            )
+            ms = _time_cuda(lambda: layer(q, k, v), args.warmup, args.iters)
     _emit("local_attention_autotune", selected, ms, args)
 
 
@@ -303,7 +313,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--autotune-min-speedup", type=float, default=1.10)
     parser.add_argument(
         "--attention-autotune-mode",
-        choices=["default", "warmup_default", "explicit", "disabled"],
+        choices=[
+            "default",
+            "warmup_default",
+            "warmup_then_default",
+            "explicit",
+            "disabled",
+        ],
         default="default",
     )
     parser.add_argument(
