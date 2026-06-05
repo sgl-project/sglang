@@ -594,14 +594,13 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            num_pages = min(
-                prefetch_tokens // self.cache.page_size,
-                (self.sliding_window_size + self.cache.page_size - 1)
-                // self.cache.page_size,
-            )
-            if num_pages == 0:
+            # Require a full sliding window.
+            sw_pages = (
+                self.sliding_window_size + self.cache.page_size - 1
+            ) // self.cache.page_size
+            if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
                 return None
-            num_tokens = num_pages * self.cache.page_size
+            num_tokens = sw_pages * self.cache.page_size
             host_indices = self._swa_kv_pool_host.alloc(num_tokens)
             if host_indices is None:
                 self.cache.evict_host(num_tokens, ComponentType.SWA)
@@ -612,7 +611,7 @@ class SWAComponent(TreeComponent):
                 PoolTransfer(
                     name=PoolName.SWA,
                     host_indices=host_indices,
-                    keys=["__placeholder__"] * num_pages,
+                    keys=["__placeholder__"] * sw_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             ]
@@ -694,33 +693,38 @@ class SWAComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
-        """Distribute the prefetched SWA buffer onto the leaf→anchor path.
+        """Fill the prefetched SWA window onto the leaf→anchor path.
 
-        The buffer holds the trailing ``loaded_pages`` of the completed KV
-        prefix, mapped to token range ``[loaded_start, total_len)``. We walk
-        upward from ``inserted_host_node`` to ``anchor`` and, for each node
-        whose token range overlaps the buffer:
-          - SWA tombstone (host_value is None) → fill from buffer (split if
-            the node only partially overlaps at the buffer's left edge)
-          - already has SWA host_value → release the corresponding slice
-        Any leftover buffer beyond the walked range is also released.
+        All-or-nothing over one full window: ``loaded_pages`` is the cross-rank
+        MIN, so ``loaded_pages < window_pages`` drops the whole window (keeps the
+        tree identical across TP ranks). Otherwise map the buffer to token range
+        ``[loaded_start, total_len)`` and walk leaf→anchor, filling SWA
+        tombstones and releasing slices that already have host_value.
         """
         if not transfers:
             return
         ct = self.component_type
+        page_size = self.cache.page_size
         host_indices = transfers[0].host_indices
+        window_require_pages = (
+            host_indices.numel() // page_size if host_indices is not None else 0
+        )
         loaded_pages = (
             pool_storage_result.extra_pool_hit_pages.get(PoolName.SWA, 0)
             if pool_storage_result
             else 0
         )
         target = insert_result.inserted_host_node if insert_result else None
-        if not loaded_pages or target is None:
+        if (
+            target is None
+            or window_require_pages == 0
+            or loaded_pages < window_require_pages
+        ):
             self._release_swa_host(host_indices)
             return
 
         # Buffer covers token range [loaded_start, total_len).
-        loaded_start = insert_result.total_len - loaded_pages * self.cache.page_size
+        loaded_start = insert_result.total_len - window_require_pages * page_size
 
         # Walk leaf → anchor; ``pos`` is the right edge of ``cur`` in tokens.
         pos, cur = insert_result.total_len, target
