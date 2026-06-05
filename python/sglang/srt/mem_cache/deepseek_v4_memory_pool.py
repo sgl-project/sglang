@@ -77,7 +77,6 @@ class DeepSeekV4SingleKVPool(KVCache):
         self._create_buffers()
 
     def _create_buffers(self):
-        num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -85,7 +84,10 @@ class DeepSeekV4SingleKVPool(KVCache):
                 else nullcontext()
             ):
                 self.kv_buffer = [
-                    self.create_buffer(num_pages=num_pages)
+                    self.create_buffer(
+                        self.create_buffer(
+                            num_pages=(self.size + self.page_size + 1) // self.page_size,
+                        )
                     for _ in range(self.layer_num)
                 ]
 
