@@ -236,6 +236,16 @@ def _kernel(
         for kt in cutlass.range_constexpr(num_kt):
             buf = kt % nstage
             cute.arch.mbarrier_wait(full + buf, ph)
+            # Load each 8-wide n-block with its own ldmatrix.x2 (two 8x8 tiles = the
+            # two B regs b0, b1). A single x4 over all 16 n-rows would put the n0-7 and
+            # n8-15 lane groups on the same k-octet, and the row%8 swizzle then collides
+            # their smem banks; the per-block x2 reads two distinct k-octets that
+            # swizzle apart, so it is bank-conflict free (like CUDA). Loads are left
+            # interleaved with the MMAs: the fully-unrolled k-loop already exposes the
+            # whole instruction stream to the scheduler, so hoisting only inflates
+            # register pressure (measured 148 -> 200) without raising the issue rate.
+            brow_lo = lane % 8
+            boff = ((lane // 8) & 1) * 4
             for step in cutlass.range_constexpr(KSTEPS):
                 kbh = warp * (PWK // 2) + step * 8
                 arow, aoff = lane % 16, (lane // 16) * 4
@@ -243,13 +253,6 @@ def _kernel(
                     sA.iterator
                     + (buf * TILE_M * KI + arow * KI + _swizzle(arow, kbh + aoff))
                 )
-                # Load each 8-wide n-block with its own ldmatrix.x2 (two 8x8 tiles =
-                # the two B regs b0, b1). A single x4 over all 16 n-rows would put the
-                # n0-7 and n8-15 lane groups on the same k-octet, and the row%8 swizzle
-                # then collides their smem banks; the per-block x2 reads two distinct
-                # k-octets that swizzle apart, so it is bank-conflict free (like CUDA).
-                brow_lo = lane % 8
-                boff = ((lane // 8) & 1) * 4
                 for nb in cutlass.range_constexpr(NB):
                     brow = nb * 8 + brow_lo
                     bb = _ldmatrix_x2(
