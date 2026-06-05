@@ -536,33 +536,13 @@ def _fused_sigmoid_mul_kernel(
     output_ptr,
     attn_output_ptr,
     gate_ptr,
-    n_ele,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Fuse sigmoid(gate) * attn_output into a single kernel."""
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_ele
-
-    attn = tl.load(attn_output_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    result = attn * tl.sigmoid(g)
-    tl.store(output_ptr + offsets, result, mask=mask)
-
-
-@triton.jit
-def _fused_sigmoid_mul_strided_gate_kernel(
-    output_ptr,
-    attn_output_ptr,
-    gate_ptr,
     gate_stride_row,
     gate_stride_head,
     hidden_dim,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Fuse sigmoid(gate) * attn_output with strided gate access."""
+    """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
     pid_head = tl.program_id(1)
 
@@ -603,33 +583,32 @@ def fused_sigmoid_mul(
         num_tokens, num_heads, head_dim = gate.shape
         hidden_dim = num_heads * head_dim
         assert attn_output.shape == (num_tokens, hidden_dim)
-        out = attn_output if inplace else torch.empty_like(attn_output)
-        BLOCK_D = triton.next_power_of_2(head_dim)
-        grid = (num_tokens, num_heads)
-        _fused_sigmoid_mul_strided_gate_kernel[grid](
-            out,
-            attn_output,
-            gate,
-            gate.stride(0),
-            gate.stride(1),
-            hidden_dim,
-            HEAD_DIM=head_dim,
-            BLOCK_D=BLOCK_D,
-            num_warps=min(max(BLOCK_D // 32, 1), 8),
-        )
-        return out
+        gate_stride_row = gate.stride(0)
+        gate_stride_head = gate.stride(1)
+    else:
+        # Flat path: both tensors have the same shape
+        assert (
+            attn_output.shape == gate.shape
+        ), "attn_output and gate must have the same shape"
+        num_tokens, hidden_dim = attn_output.shape[0], attn_output.shape[-1]
+        num_heads = 1
+        head_dim = hidden_dim
+        gate_stride_row = hidden_dim
+        gate_stride_head = hidden_dim
 
-    # Flat path: both tensors have the same shape
-    assert (
-        attn_output.shape == gate.shape
-    ), "attn_output and gate must have the same shape"
     out = attn_output if inplace else torch.empty_like(attn_output)
-    n_elements = out.numel()
-    BLOCK_SIZE = 1024
-    num_warps = min(max(triton.cdiv(BLOCK_SIZE, 256), 4), 16)
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    grid = (num_tokens, num_heads)
     _fused_sigmoid_mul_kernel[grid](
-        out, attn_output, gate, n_elements, BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps
+        out,
+        attn_output,
+        gate,
+        gate_stride_row,
+        gate_stride_head,
+        hidden_dim,
+        HEAD_DIM=head_dim,
+        BLOCK_D=BLOCK_D,
+        num_warps=min(max(BLOCK_D // 32, 1), 8),
     )
     return out
 
@@ -642,7 +621,7 @@ def _fused_gate_sigmoid_mul_add_kernel(
     final_hidden_states_ptr,  # [num_tokens, hidden_dim]
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    USE_GDC: tl.constexpr = False,
+    USE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
     row_offset = pid * hidden_dim
@@ -652,7 +631,7 @@ def _fused_gate_sigmoid_mul_add_kernel(
 
     w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
-    if USE_GDC:
+    if USE_PDL:
         tl.extra.cuda.gdc_wait()
 
     h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
@@ -665,13 +644,13 @@ def _fused_gate_sigmoid_mul_add_kernel(
         final_hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0
     ).to(tl.float32)
 
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
     result = f + gate_val * s
 
     tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_gate_sigmoid_mul_add(
@@ -705,7 +684,7 @@ def fused_gate_sigmoid_mul_add(
         ),
     }
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
     _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
         hidden_states,
