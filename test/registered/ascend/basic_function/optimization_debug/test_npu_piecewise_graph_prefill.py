@@ -30,7 +30,7 @@ class TestPiecewiseGraphPrefillCorrectness(GSM8KAscendMixin, CustomTestCase):
         "--cuda-graph-bs",
         128,
         "--cuda-graph-backend-prefill=tc_piecewise",
-        "--cuda-graph-num-tokens-prefill",
+        "--cuda-graph-tokens-prefill",
         *TOKENS_TO_CAPTURE,
     ]
     accuracy = 0.84
@@ -46,7 +46,7 @@ class TestPiecewiseGraphPrefillBenchmark(CustomTestCase):
         "--attention-backend",
         "ascend",
         "--cuda-graph-backend-prefill=tc_piecewise",
-        "--cuda-graph-num-tokens-prefill",
+        "--cuda-graph-tokens-prefill",
     ] + TOKENS_TO_CAPTURE
 
     latency = 0.045
