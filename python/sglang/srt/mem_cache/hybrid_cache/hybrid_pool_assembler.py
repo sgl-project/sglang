@@ -4,7 +4,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -737,7 +741,15 @@ class _DeepSeekV4Strategy(StackStrategy):
             enable_storage_metrics=enable_storage_metrics,
         )
         sidecars = [
-            SidecarPoolSpec(pool_name=name, indices_from_pool=src)
+            SidecarPoolSpec(
+                pool_name=name,
+                indices_from_pool=src,
+                hit_policy=(
+                    PoolHitPolicy.TRAILING_PAGES
+                    if src == PoolName.SWA
+                    else PoolHitPolicy.ALL_PAGES
+                ),
+            )
             for name, src in (
                 (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),

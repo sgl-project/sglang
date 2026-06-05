@@ -1,5 +1,9 @@
 """Unit tests for UnifiedRadixCache"""
 
+import json
+import shutil
+import tempfile
+import time
 import unittest
 from array import array
 from dataclasses import dataclass, replace
@@ -18,6 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -37,7 +42,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -167,6 +172,40 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
 
         self.assertIsInstance(tree.components[ComponentType.FULL], _FakeFullComponent)
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
+
+
+class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
+    def test_get_prefix_hash_values_not_shared_across_calls(self):
+        """Regression guard for cached mutable prefix hash lists (#26177)."""
+
+        def make_node():
+            return UnifiedTreeNode(tree_components=(ComponentType.FULL,))
+
+        root = make_node()
+        n1 = make_node()
+        n1.parent = root
+        n1.hash_value = ["h1"]
+        n2 = make_node()
+        n2.parent = n1
+        n2.hash_value = ["h2"]
+        n3 = make_node()
+        n3.parent = n2
+        n3.hash_value = ["h3"]
+
+        first = n3.get_prefix_hash_values(n2)
+        self.assertEqual(first, ["h1", "h2"])
+
+        # Mimic downstream storage code that extends `prefix_keys` in place.
+        first += ["h3"]
+
+        second = n3.get_prefix_hash_values(n2)
+        self.assertEqual(second, ["h1", "h2"])
+        self.assertIsNot(second, first)
+
+        n4 = make_node()
+        n4.parent = n3
+        n4.hash_value = ["h4"]
+        self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
 def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
@@ -427,6 +466,42 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         tree.evict_host(len(seq))
         removed_cpu = self._removed_events(tree, StorageMedium.CPU)
         self.assertCountEqual([e.block_hashes[0] for e in removed_cpu], stored_hashes)
+
+    def test_hicache_split_pending_write_through_publishes_fragments(self):
+        tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        self._init_hicache(tree)
+        tree.take_events()
+
+        self._insert(tree, allocator, [1, 2, 3, 4])
+        node = self._leaf_for(tree, [1, 2, 3, 4])
+        backed_up = tree.write_backup(node, write_back=True)
+        self.assertGreater(backed_up, 0)
+
+        # Split the node while its write-through DMA is still pending.
+        self._insert(tree, allocator, [1, 2, 5, 6])
+        self.assertEqual(self._stored_events(tree, StorageMedium.CPU), [])
+
+        # Each fragment must also be persisted to L3 on ack: lock_node only
+        # holds the suffix after the split.
+        tree.enable_storage = True
+        with mock.patch.object(tree, "write_backup_storage") as backup_storage:
+            tree.writing_check(write_back=True)
+        self.assertEqual(
+            [
+                list(call.args[0].key.token_ids)
+                for call in backup_storage.call_args_list
+            ],
+            [[1, 2], [3, 4]],
+        )
+
+        # Both split fragments must be published, with intact parentage.
+        stored_cpu = self._stored_events(tree, StorageMedium.CPU)
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_cpu],
+            [[1, 2], [3, 4]],
+        )
+        self.assertIsNone(stored_cpu[0].parent_block_hash)
+        self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
 
     def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -1119,6 +1194,51 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
+    def test_swa_leaf_capped_to_window_on_insert(self):
+        """A long SWA leaf is split so locking it protects one window of SWA
+        while full attention still protects the whole sequence."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+
+        for case in ("long_splits", "short_keeps"):
+            with self.subTest(case=case):
+                tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+                num_pages = tail_pages + 2 if case == "long_splits" else tail_pages
+                seq = self._make_seq(1, num_pages)
+                self._insert(tree, allocator, req_to_token_pool, seq)
+                tree.sanity_check()
+
+                leaf = tree.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq)))
+                ).last_device_node
+                swa_val = leaf.component_data[ComponentType.SWA].value
+                self.assertIsNotNone(swa_val)
+
+                if case == "long_splits":
+                    # Capped to one page-aligned window; prefix is a real ancestor.
+                    self.assertEqual(len(swa_val), tail_size)
+                    self.assertIsNot(leaf.parent, tree.root_node)
+                else:
+                    # Already within one window — no split.
+                    self.assertEqual(len(swa_val), len(seq))
+                    self.assertIs(leaf.parent, tree.root_node)
+
+                lock_result = tree.inc_lock_ref(leaf)
+                # SWA pins one window; full attention pins everything.
+                self.assertEqual(tree.swa_protected_size(), len(swa_val))
+                self.assertEqual(tree.full_protected_size(), len(seq))
+                tree.sanity_check()
+                tree.dec_lock_ref(
+                    leaf,
+                    DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+                )
+                tree.sanity_check()
+
     def _swa_lru_order(self, tree):
         lru = tree.lru_lists[ComponentType.SWA]
         pt = lru._pt
@@ -1158,29 +1278,29 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq_side)
 
         pre = self._swa_lru_order(tree)
-        self.assertEqual(len(pre), 4)
-        side_node, c_node, b_node, a_node = pre
+        # Each 8-page segment is cap-split into [prefix, tail]; the tail leads
+        # the pair in MRU order, so segment tails sit at even indices.
+        self.assertEqual(len(pre), 8)
+        side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
 
         seq_abcd = seq_abc + self._make_seq(300, 8)
         self._insert(tree, allocator, req_to_token_pool, seq_abcd)
 
         post = self._swa_lru_order(tree)
-        # new leaf E exists now, length 5
-        self.assertEqual(len(post), 5)
+        # New segment E adds two nodes (prefix + tail).
+        self.assertEqual(len(post), 10)
         # side branch must still appear BEFORE B and A in MRU->LRU order:
-        # bounded refresh on new leaf E (size=8 >= cushion=5) refreshes only E.
+        # walk-down on the new segment must not refresh old ancestors.
         side_pos = post.index(side_node)
-        b_pos = post.index(b_node)
-        a_pos = post.index(a_node)
         self.assertLess(
             side_pos,
-            b_pos,
+            post.index(b_node),
             f"side branch must remain ahead of B (no walk-down refresh); "
             f"post={[n.id for n in post]}, side={side_node.id}, B={b_node.id}",
         )
         self.assertLess(
             side_pos,
-            a_pos,
+            post.index(a_node),
             f"side branch must remain ahead of A (no walk-down refresh); "
             f"post={[n.id for n in post]}, side={side_node.id}, A={a_node.id}",
         )
@@ -1202,26 +1322,30 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq_side)
 
         pre = self._swa_lru_order(tree)
-        self.assertEqual(len(pre), 4)
-        side_node, c_node, b_node, a_node = pre
+        # Each 8-page segment is cap-split into [prefix, tail]; tails lead in
+        # MRU order, so segment tails sit at even indices.
+        self.assertEqual(len(pre), 8)
+        side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
 
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
         self.assertEqual(len(m.device_indices), len(seq_abc))
 
         post = self._swa_lru_order(tree)
-        self.assertIs(post[0], c_node, "C (last matched node) must be MRU")
-        self.assertIs(
-            post[-1],
-            a_node,
-            "Oldest out-of-cushion ancestor A must remain at LRU tail; "
-            f"got post={[n.id for n in post]}, "
-            f"pre={[n.id for n in pre]}",
-        )
+        # Matching seq_abc refreshes only the window cushion (C's capped nodes)
+        # to the MRU side; out-of-cushion ancestors B and A keep their order.
         self.assertIn(
-            side_node,
-            post[:2],
-            "Side branch must NOT be pushed below ancestors after deep match; "
-            f"got post={[n.id for n in post]}",
+            c_node, post[:2], f"C must be refreshed to MRU; post={[n.id for n in post]}"
+        )
+        self.assertLess(
+            post.index(side_node),
+            post.index(b_node),
+            "Side branch must NOT be pushed below ancestors after deep match",
+        )
+        self.assertLess(post.index(b_node), post.index(a_node), "B must stay above A")
+        self.assertGreaterEqual(
+            post.index(a_node),
+            len(post) - 2,
+            "Oldest out-of-cushion ancestor A must stay at the LRU-tail end",
         )
         tree.sanity_check()
 
@@ -1277,20 +1401,24 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq_side)
 
         pre = self._swa_lru_order(tree)
-        self.assertEqual(len(pre), 4)
-        side_node, c_node, b_node, a_node = pre
+        self.assertEqual(len(pre), 8)
+        side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
+        c_prefix = pre[3]  # C's prefix pairs with its tail (c_node) at pre[2:4]
 
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
         self.assertEqual(len(m.device_indices), len(seq_abc))
         post = self._swa_lru_order(tree)
 
         cushion = self.cfg.sliding_window_size + self.cfg.page_size
-        self.assertGreaterEqual(len(c_node.key), cushion)
-        self.assertIs(post[0], c_node, "C alone exhausts cushion → only C refreshed")
-        # B and A: untouched ordering relative to each other AND to side_node
+        # Under leaf-cap no single node exceeds the cushion; it spans C's capped
+        # tail plus its prefix, so both of C's nodes are refreshed to the MRU
+        # side while B and A keep their relative order below.
+        self.assertLess(len(c_node.key), cushion)
+        self.assertIn(c_node, post[:2])
+        self.assertIn(c_prefix, post[:2])
+        side_pos = post.index(side_node)
         b_pos = post.index(b_node)
         a_pos = post.index(a_node)
-        side_pos = post.index(side_node)
         self.assertLess(side_pos, b_pos, "B was below side in pre, must stay below")
         self.assertLess(b_pos, a_pos, "A was below B in pre, must stay below")
         tree.sanity_check()
@@ -1722,6 +1850,294 @@ class UnifiedRadixCacheSuite:
     # HiCache Unit Tests (real cache_controller D<->H backup/load)
     # ================================================================
 
+    # ---------- L3 storage (file backend) helpers ----------
+
+    def _path_chain(self, tree, node):
+        """Return root->node node chain (excluding root)."""
+        chain = []
+        cur = node
+        while cur is not tree.root_node:
+            chain.append(cur)
+            cur = cur.parent
+        chain.reverse()
+        return chain
+
+    def _write_path_to_l3(self, tree, node):
+        """Offload every node on root->node path from host to L3 storage."""
+        for n in self._path_chain(tree, node):
+            tree.write_backup_storage(n)
+
+    def _flush_l3_backups(self, tree, timeout: float = 10.0):
+        """Wait for backup threads to finish, then drain acks (release locks)."""
+        deadline = time.time() + timeout
+        while tree.ongoing_backup and time.time() < deadline:
+            tree.drain_storage_control_queues()
+            if tree.ongoing_backup:
+                time.sleep(0.01)
+        tree.drain_storage_control_queues()
+        self.assertFalse(tree.ongoing_backup, "L3 backups did not complete in time")
+
+    def _run_prefetch_to_completion(self, tree, req_id, timeout: float = 10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if tree.check_prefetch_progress(req_id):
+                return
+            time.sleep(0.01)
+        self.fail(f"prefetch {req_id} did not complete in time")
+
+    def _all_page_hashes(self, tree, node):
+        hashes = []
+        for n in self._path_chain(tree, node):
+            hashes.extend(list(n.hash_value))
+        return hashes
+
+    def test_hicache_l3_write_storage(self):
+        """D->H->L3 offload: every KV page lands in the file storage backend."""
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("mamba L3 offload is out of scope for this unit fixture")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            tree,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+
+        seq = self._make_seq(1, 4)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+
+        # D->H first, then H->L3.
+        self._backup_node(tree, leaf)
+        self.assertTrue(leaf.hash_value)
+        self._write_path_to_l3(tree, leaf)
+        self._flush_l3_backups(tree)
+
+        # Every KV page hash on the path must now exist in storage.
+        backend = tree.cache_controller.storage_backend
+        page_hashes = self._all_page_hashes(tree, leaf)
+        self.assertEqual(len(page_hashes), len(seq) // self.cfg.page_size)
+        self.assertEqual(backend.batch_exists(page_hashes), len(page_hashes))
+        tree.sanity_check()
+
+    def test_hicache_l3_prefetch(self):
+        """L3 round trip: write with one tree, prefetch into a fresh tree.
+
+        Uses two independent trees that share the same file storage dir so the
+        prefetch path genuinely reloads from L3 (no host/device residue).
+        """
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("mamba L3 prefetch is out of scope for this unit fixture")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        num_pages = 4
+        if self.cfg.has_swa:
+            # SWA L3 prefetch is all-or-nothing over one full sliding window.
+            # Keep the generic L3 round trip valid for SWA configs whose window
+            # is larger than the old fixed 4-page request.
+            sw_pages = (
+                self.cfg.sliding_window_size + self.cfg.page_size - 1
+            ) // self.cfg.page_size
+            num_pages = max(num_pages, sw_pages + 1)
+        seq = self._make_seq(1, num_pages)
+
+        # --- Producer tree: fill KV, backup D->H, offload H->L3. ---
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        prod_leaf = mp.last_device_node
+        self._fill_full_kv(prod_alloc, mp.device_indices, marker=7)
+        expected_k, expected_v = self._snapshot_full_kv(prod_alloc, mp.device_indices)
+        self._backup_node(prod, prod_leaf)
+        self._write_path_to_l3(prod, prod_leaf)
+        self._flush_l3_backups(prod)
+
+        # --- Consumer tree: prefetch the same tokens straight from L3. ---
+        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        req_id = "l3-prefetch-req"
+        cons.prefetch_from_storage(req_id, cons.root_node, array("q", seq), None, None)
+        self._run_prefetch_to_completion(cons, req_id)
+        cons.drain_storage_control_queues()
+
+        # The full prefix must now be a host hit (loaded from L3).
+        mc = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(mc.host_hit_length, len(seq))
+        host_node = mc.last_host_node
+        self.assertIsNot(host_node, cons.root_node)
+        self.assertTrue(host_node.evicted)
+
+        # Load the reloaded host prefix back to device and verify KV bytes.
+        self._load_back_node(cons, host_node)
+        loaded_indices = cons.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).device_indices
+        self.assertEqual(len(loaded_indices), len(seq))
+        loaded_k, loaded_v = self._snapshot_full_kv(cons_alloc, loaded_indices)
+        self.assertTrue(torch.equal(loaded_k, expected_k))
+        self.assertTrue(torch.equal(loaded_v, expected_v))
+        cons.sanity_check()
+
+    # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
+
+    def _patch_tp_all_reduce(self, tree, drop_swa: bool):
+        """Fake all_reduce so check_prefetch_progress runs the tp>1 path."""
+        import torch.distributed as dist
+
+        min_sizes = []
+
+        def swa_packed_index():
+            # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
+            # matches comp_xfers stored in ongoing_prefetch (one live entry).
+            for info in tree.ongoing_prefetch.values():
+                comp_xfers = info[-1]
+                names = [t.name for xfers in comp_xfers.values() for t in xfers]
+                if PoolName.SWA in names:
+                    return 1 + names.index(PoolName.SWA)
+            return None
+
+        def fake(tensor, op=None, group=None):
+            if op == dist.ReduceOp.MIN:
+                min_sizes.append(tensor.numel())
+                if drop_swa:
+                    idx = swa_packed_index()
+                    if idx is not None and idx < tensor.numel():
+                        tensor[idx] = 0
+            return None
+
+        p = mock.patch.object(dist, "all_reduce", side_effect=fake)
+        p.start()
+        self.addCleanup(p.stop)
+        return min_sizes
+
+    def _swa_host_on_path(self, tree, seq):
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_host_node
+        while node is not tree.root_node:
+            if node.component_data[ComponentType.SWA].host_value is not None:
+                return True
+            node = node.parent
+        return False
+
+    def _l3_produce(self, storage_dir, seq):
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        leaf = prod.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(prod, leaf)
+        self._write_path_to_l3(prod, leaf)
+        self._flush_l3_backups(prod)
+
+    def _l3_consumer(self, storage_dir):
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        return cons
+
+    def _consume_prefetch(self, cons, seq, req_id):
+        cons.prefetch_from_storage(req_id, cons.root_node, array("q", seq), None, None)
+        self._run_prefetch_to_completion(cons, req_id)
+        cons.drain_storage_control_queues()
+
+    def _setup_swa_tp_prefetch(self):
+        """Skip non-SWA fixtures; produce one full SWA window+1 page to L3.
+
+        Returns (storage_dir, seq) or None when this fixture cannot exercise
+        SWA L3 prefetch (then the caller skips).
+        """
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only fixture required")
+        if self._skip_unsupported_hicache_test():
+            return None
+        sw_pages = (
+            self.cfg.sliding_window_size + self.cfg.page_size - 1
+        ) // self.cfg.page_size
+        seq = self._make_seq(1, sw_pages + 1)
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        self._l3_produce(storage_dir, seq)
+
+        # Baseline (single rank) must actually adopt SWA, else the TP assertions
+        # below would be vacuous -> skip.
+        base = self._l3_consumer(storage_dir)
+        self._consume_prefetch(base, seq, "base")
+        if not self._swa_host_on_path(base, seq):
+            self.skipTest("fixture does not exercise SWA L3 prefetch")
+        return storage_dir, seq
+
+    def test_tp_swa_prefetch_dropped_when_peer_misses(self):
+        """A peer rank missing the SWA window drops the whole prefetch result
+        on every rank (TP-consistent all-or-nothing)."""
+        setup = self._setup_swa_tp_prefetch()
+        if setup is None:
+            return
+        storage_dir, seq = setup
+
+        cons = self._l3_consumer(storage_dir)
+        cons.tp_world_size = 2
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=True)
+        self._consume_prefetch(cons, seq, "drop")
+
+        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.host_hit_length, 0)
+        self.assertFalse(
+            self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
+        )
+        # Full + sidecars must be synced through a packed MIN all_reduce. The
+        # poll loop may observe more than one completed check, so do not pin the
+        # exact number of reductions.
+        self.assertIn(2, min_sizes)
+        cons.sanity_check()
+
+    def test_tp_swa_prefetch_adopted_when_peer_present(self):
+        """When every rank has the full SWA window, SWA is adopted under tp>1
+        (the single packed all_reduce path still works)."""
+        setup = self._setup_swa_tp_prefetch()
+        if setup is None:
+            return
+        storage_dir, seq = setup
+
+        cons = self._l3_consumer(storage_dir)
+        cons.tp_world_size = 2
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=False)  # peer == local
+        self._consume_prefetch(cons, seq, "keep")
+
+        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.host_hit_length, len(seq))
+        self.assertTrue(
+            self._swa_host_on_path(cons, seq),
+            "SWA must be adopted when all ranks have it",
+        )
+        self.assertIn(2, min_sizes)
+        cons.sanity_check()
+
     def _skip_unsupported_hicache_test(self):
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
@@ -1751,7 +2167,16 @@ class UnifiedRadixCacheSuite:
                 self._simulate_backup(tree, node)
             stack.extend(node.children.values())
 
-    def _init_hicache(self, tree, *, write_policy: str = "write_through"):
+    def _init_hicache(
+        self,
+        tree,
+        *,
+        write_policy: str = "write_through",
+        storage_backend: Optional[str] = None,
+        storage_dir: Optional[str] = None,
+        prefetch_threshold: Optional[int] = None,
+        prefetch_policy: str = "wait_complete",
+    ):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         orig_kv_host_pool = assembler.MHATokenToKVPoolHost
@@ -1781,11 +2206,42 @@ class UnifiedRadixCacheSuite:
             patcher.start()
             self.addCleanup(patcher.stop)
 
+        storage_extra_config = None
+        if storage_backend == "file":
+            import sglang.srt.managers.cache_controller as cache_controller
+
+            # The file-backend storage config records TP rank/size.  These unit
+            # fixtures run without initializing distributed parallel state, so
+            # provide the local single-rank values that the fixture represents.
+            tp_rank_patcher = mock.patch.object(
+                cache_controller, "get_tensor_model_parallel_rank", return_value=0
+            )
+            tp_size_patcher = mock.patch.object(
+                cache_controller, "get_tensor_model_parallel_world_size", return_value=1
+            )
+            tp_rank_patcher.start()
+            tp_size_patcher.start()
+            self.addCleanup(tp_rank_patcher.stop)
+            self.addCleanup(tp_size_patcher.stop)
+
+            assert storage_dir is not None, "file backend needs a storage_dir"
+            # HiCacheFile reads the directory from this env var.
+            cm = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(storage_dir)
+            cm.__enter__()
+            self.addCleanup(cm.__exit__, None, None, None)
+            extra = {}
+            if prefetch_threshold is not None:
+                extra["prefetch_threshold"] = prefetch_threshold
+            storage_extra_config = json.dumps(extra) if extra else None
+
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
             hicache_write_policy=write_policy,
+            hicache_storage_backend=storage_backend,
+            hicache_storage_backend_extra_config=storage_extra_config,
+            hicache_storage_prefetch_policy=prefetch_policy,
         )
         # See build_fixture for why _mamba_cache_chunk_size is preset.
         server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
@@ -1793,6 +2249,17 @@ class UnifiedRadixCacheSuite:
         tree.init_hicache(server_args, tree.cache_init_params)
         tree.write_through_threshold = 1 << 30
         tree.load_back_threshold = 0
+        if storage_backend is not None:
+            # Unit fixtures size host/device pools equally, which makes the
+            # production prefetch capacity limit (host - device) zero.  Keep the
+            # L3 tests focused on storage round trips by allowing one fixture
+            # worth of prefetch tokens.
+            tree.cache_controller.prefetch_capacity_limit = max(
+                tree.cache_controller.prefetch_capacity_limit,
+                tree.cache_controller.mem_pool_host.size,
+            )
+            # Background prefetch/backup threads are daemon; stop them per-test.
+            self.addCleanup(tree.cache_controller._stop_storage_threads)
 
     def _build_hicache_fixture(self):
         fixture = build_fixture(self.cfg)
