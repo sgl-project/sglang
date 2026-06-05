@@ -32,6 +32,7 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
 
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1

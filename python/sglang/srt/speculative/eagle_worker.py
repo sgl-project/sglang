@@ -9,6 +9,7 @@ import torch
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
@@ -376,7 +377,8 @@ class EAGLEWorker(TpModelWorker):
 
             target_graph_runner = None
             if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
+                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else CudaGraphRunner
+                target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
@@ -781,6 +783,7 @@ class EAGLEWorker(TpModelWorker):
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
@@ -896,7 +899,7 @@ class EAGLEWorker(TpModelWorker):
                 ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
             ):
                 logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -1218,6 +1221,7 @@ class EAGLEWorker(TpModelWorker):
                     or self.draft_model_runner.attn_backend
                 )
                 attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
             # Publish the chosen backend via ForwardContext so model code
             # picks it up for this forward (no runner-attr mutation).
             if attn_backend is not None:
@@ -1226,7 +1230,7 @@ class EAGLEWorker(TpModelWorker):
                 ctx_mgr = contextlib.nullcontext()
             with ctx_mgr:
                 logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 ).logits_output
             # Non-cuda-graph path: compute topk_p / topk_index inline.
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
