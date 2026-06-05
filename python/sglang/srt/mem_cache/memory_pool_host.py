@@ -1463,7 +1463,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
-        """ "
+        """
         meta data for zero copy
         """
         assert len(indices) % self.page_size == 0

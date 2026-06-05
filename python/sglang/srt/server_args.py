@@ -2432,12 +2432,11 @@ class ServerArgs:
                         "to enable --enable-hierarchical-cache for this model."
                     )
 
-                # MiMoV2 has head_dim != v_head_dim, so the host KV pool must
-                # use the asymmetric K/V allocation path which is only wired
-                # for `page_first_direct` (and `page_first`); and the AOT
-                # `kernel` transfer path passes a single `item_size` that
-                # silently mis-strides V transfers when v_head_dim differs.
-                # Force the only safe combination here.
+                # MiMoV2 has head_dim != v_head_dim, so the host KV pool must use
+                # asymmetric K/V allocation. The AOT (non-JIT) 'kernel' transfer
+                # path passes a single item_size and would silently mis-stride V
+                # transfers when v_head_dim differs, so force io_backend='direct'.
+                # The direct transfer path for HiCache requires layout='page_first_direct'.
                 if self.hicache_io_backend != "direct":
                     logger.warning(
                         f"Force hicache_io_backend to 'direct' for MiMoV2 model "

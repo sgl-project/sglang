@@ -25,7 +25,7 @@ MIMO_V2_OTHER_ARGS = [
     "--hicache-ratio",
     "1.5",
     "--hicache-mem-layout",
-    "page_first",
+    "page_first_direct",
     "--hicache-io-backend",
     "direct",
 ]
