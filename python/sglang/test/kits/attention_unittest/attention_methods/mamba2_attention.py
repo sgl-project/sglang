@@ -333,6 +333,7 @@ class MockMamba2ModelRunner(ModelRunner):
         else:
             speculative_num_draft_tokens = 0
         self.server_args = make_mock_server_args(
+            cuda_graph_bs=[4],
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,
