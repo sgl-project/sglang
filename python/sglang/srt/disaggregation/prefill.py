@@ -517,18 +517,9 @@ class SchedulerDisaggregationPrefillMixin:
         if self.ps.pp_size > 1:
             return 0
 
-        # Only models that explicitly opt in can use layer-pipelined transfer.
-        # A plain forward_split_prefill method is too broad: several models use
-        # it for other split-prefill flows but have not been audited for per-layer
-        # KV handoff ordering.
+        # Models without split-prefill support safely fall back to the normal path.
         model_runner = self.tp_worker.model_runner
         model = model_runner.model
-        if not getattr(model, "supports_layer_pipelined_kv_transfer", False):
-            logger.debug(
-                "Pipeline skip: model %s does not opt in to layer-pipelined KV transfer",
-                type(model).__name__,
-            )
-            return 0
         if not hasattr(model, "forward_split_prefill"):
             return 0
 
@@ -692,7 +683,6 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        pipelined: bool = False,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue.

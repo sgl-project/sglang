@@ -517,7 +517,6 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         self.capture_aux_hidden_states = False
-        self.supports_layer_pipelined_kv_transfer = type(self) is LlamaForCausalLM
 
     def _init_model(
         self,
