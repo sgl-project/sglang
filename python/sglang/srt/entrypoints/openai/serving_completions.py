@@ -263,10 +263,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     self.tokenizer_manager.server_args.enable_spec_decode_usage
                     and "spec_num_proposed_drafts" in content["meta_info"]
                 ):
-                    proposed = content["meta_info"]["spec_num_proposed_drafts"]
-                    accepted = content["meta_info"].get("spec_num_correct_drafts", 0)
-                    accepted_prediction_tokens[index] = accepted
-                    rejected_prediction_tokens[index] = max(proposed - accepted, 0)
+                    num_proposed_drafts = content["meta_info"][
+                        "spec_num_proposed_drafts"
+                    ]
+                    num_correct_drafts = content["meta_info"].get(
+                        "spec_num_correct_drafts", 0
+                    )
+                    accepted_prediction_tokens[index] = num_correct_drafts
+                    rejected_prediction_tokens[index] = max(
+                        num_proposed_drafts - num_correct_drafts, 0
+                    )
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)

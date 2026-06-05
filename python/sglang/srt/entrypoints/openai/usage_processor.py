@@ -25,19 +25,21 @@ class UsageProcessor:
         """Aggregate spec-decode counts from meta_info dicts into a
         CompletionTokensDetails. Returns None when no response carried spec
         metrics (i.e. speculative decoding was off or never verified)."""
-        accepted = 0
-        proposed = 0
-        saw_any = False
-        for mi in meta_infos:
-            if "spec_num_proposed_drafts" in mi:
-                accepted += mi.get("spec_num_correct_drafts", 0)
-                proposed += mi["spec_num_proposed_drafts"]
-                saw_any = True
-        if not saw_any:
+        total_correct_drafts = 0
+        total_proposed_drafts = 0
+        any_spec_response = False
+        for meta_info in meta_infos:
+            if "spec_num_proposed_drafts" in meta_info:
+                total_correct_drafts += meta_info.get("spec_num_correct_drafts", 0)
+                total_proposed_drafts += meta_info["spec_num_proposed_drafts"]
+                any_spec_response = True
+        if not any_spec_response:
             return None
         return CompletionTokensDetails(
-            accepted_prediction_tokens=accepted,
-            rejected_prediction_tokens=max(proposed - accepted, 0),
+            accepted_prediction_tokens=total_correct_drafts,
+            rejected_prediction_tokens=max(
+                total_proposed_drafts - total_correct_drafts, 0
+            ),
         )
 
     @staticmethod
