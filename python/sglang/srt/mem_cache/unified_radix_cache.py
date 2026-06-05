@@ -1121,9 +1121,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if len(key):
                 child_key = key.child_key(self.page_size)
 
-        result = InsertResult(
-            prefix_len=matched_length,
-        )
+        result = InsertResult(prefix_len=matched_length, total_len=total_len)
         if len(key) == 0:
             if (
                 node is not self.root_node
@@ -1662,6 +1660,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             transfers.append(
                 PoolTransfer(
                     name=spec.pool_name,
+                    keys=indices_source.keys,
                     hit_policy=spec.hit_policy,
                     indices_from_pool=spec.indices_from_pool,
                 )
@@ -1850,6 +1849,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             return True
+        if (
+            completed
+            and getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+        ):
+            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
@@ -1885,16 +1890,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             operation
         )
         min_completed_tokens = completed_tokens
+        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
+            # Reduce full completed tokens together with the sidecar pools that
+            # this prefetch actually transferred, in one all_reduce.
+            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
+            packed = torch.tensor(
+                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+                dtype=torch.int,
             )
             torch.distributed.all_reduce(
-                completed_tokens_tensor,
+                packed,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
-            min_completed_tokens = int(completed_tokens_tensor.item())
+            min_completed_tokens = int(packed[0].item())
+            for i, p in enumerate(sidecar_pools, start=1):
+                hit_pages[p] = int(packed[i].item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
