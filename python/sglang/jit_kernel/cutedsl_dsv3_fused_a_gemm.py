@@ -23,6 +23,7 @@ pipeline, ldmatrix + mma.sync.m16n8k16, 3-4-3 swizzle.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -213,9 +214,10 @@ def _kernel(mW: cute.Tensor, mA: cute.Tensor, mOut: cute.Tensor, M: cutlass.Int3
 
 @cute.jit
 def _launch(mW: cute.Tensor, mA: cute.Tensor, mOut: cute.Tensor, M: cutlass.Int32,
-            num_kt: cutlass.Constexpr, smem_bytes: cutlass.Constexpr):
+            stream: cuda.CUstream, num_kt: cutlass.Constexpr, smem_bytes: cutlass.Constexpr):
     _kernel(mW, mA, mOut, M, num_kt).launch(
-        grid=[GEMM_M // TILE_M, 1, 1], block=[NTHREADS, 1, 1], smem=smem_bytes, use_pdl=True)
+        grid=[GEMM_M // TILE_M, 1, 1], block=[NTHREADS, 1, 1], smem=smem_bytes,
+        use_pdl=True, stream=stream)
 
 
 _compiled: dict[int, object] = {}
@@ -230,9 +232,10 @@ def _compiled_kernel(num_kt: int):
         w = torch.empty(GEMM_M, k, dtype=torch.bfloat16, device="cuda")
         a = torch.empty(16, k, dtype=torch.bfloat16, device="cuda")
         o = torch.empty(16, GEMM_M, dtype=torch.bfloat16, device="cuda")
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         _compiled[num_kt] = cute.compile(
             _launch, from_dlpack(w.view(torch.int32)), from_dlpack(a.view(torch.int32)),
-            from_dlpack(o), cutlass.Int32(16), num_kt, smem_bytes)
+            from_dlpack(o), cutlass.Int32(16), stream, num_kt, smem_bytes)
     return _compiled[num_kt]
 
 
@@ -253,7 +256,8 @@ def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor,
     if out is None:
         out = torch.empty(M, GEMM_M, dtype=torch.bfloat16, device=mat_a.device)
 
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     _compiled_kernel(K // TILE_K)(
         from_dlpack(weight.view(torch.int32)), from_dlpack(mat_a.view(torch.int32)),
-        from_dlpack(out), M)
+        from_dlpack(out), M, stream)
     return out
