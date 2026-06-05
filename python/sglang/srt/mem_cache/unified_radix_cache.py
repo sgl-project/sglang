@@ -1861,10 +1861,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                states, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
@@ -1899,11 +1896,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
                 dtype=torch.int,
             )
-            torch.distributed.all_reduce(
-                packed,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
+            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
             min_completed_tokens = int(packed[0].item())
             for i, p in enumerate(sidecar_pools, start=1):
                 hit_pages[p] = int(packed[i].item())
@@ -1979,8 +1972,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+        self._barrier_attn_groups()
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(
@@ -2103,10 +2095,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
