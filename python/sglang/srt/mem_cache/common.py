@@ -3,77 +3,62 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
-import triton
-import triton.language as tl
 
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache, _is_streaming
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.triton_ops.common import (
+    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
+    get_last_loc_kernel as get_last_loc_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
+    get_last_loc_triton,
+    get_last_loc_triton_safe,
+    write_req_to_token_pool_triton,
+)
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import support_triton
+from sglang.srt.utils import is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+# Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
-def write_req_to_token_pool_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices,
-    prefix_tensors,
-    pre_lens,
-    seq_lens,
-    extend_lens,
-    out_cache_loc,
-    req_to_token_ptr_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0)
+def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
+    # The page is guaranteed to be full except the last page.
+    if page_size == 1:
+        return kv_indices
 
-    req_pool_index = tl.load(req_pool_indices + pid)
-    pre_len = tl.load(pre_lens + pid)
-    seq_len = tl.load(seq_lens + pid)
-    prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int64))
+    return kv_indices[::page_size] // page_size
 
-    # write prefix
-    num_loop = tl.cdiv(pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < pre_len
-        value = tl.load(prefix_tensor + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + offset,
-            value,
-            mask=mask,
-        )
 
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_lens + i)
+def kv_to_page_num(num_kv_indices: int, page_size: int):
+    return (num_kv_indices + page_size - 1) // page_size
 
-    num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < (seq_len - pre_len)
-        value = tl.load(out_cache_loc + cumsum_start + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + offset
-            + pre_len,
-            value,
-            mask=mask,
-        )
+
+def page_align_floor(length: int, page_size: int) -> int:
+    return (length // page_size) * page_size
+
+
+def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+    if getattr(req, "skip_radix_cache_insert", False):
+        return
+
+    tree_cache.cache_unfinished_req(req, **kwargs)
 
 
 def write_cache_indices(
@@ -130,10 +115,24 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if (
-        get_global_server_args().attention_backend != "ascend"
-        and get_global_server_args().attention_backend != "torch_native"
-    ):
+    attn_backend = get_global_server_args().attention_backend
+    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+
+    if _is_hip and uses_triton_dispatch:
+        # HIP-only: the legacy get_last_loc_triton kernel emits a
+        # mixed-width int32->int64 store that Triton mis-compiles on HIP,
+        # producing out-of-range last_loc values under EAGLE +
+        # page_size>1 (e.g. with aiter unified attention or the triton
+        # attention backend). The bug is in the Triton HIP codegen, not
+        # in any particular attention backend, so route every HIP path
+        # that would otherwise use get_last_loc_triton through the
+        # int32-safe variant. Non-HIP hardware keeps the original
+        # dispatcher below.
+        return get_last_loc_triton_safe(
+            req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+        )
+
+    if uses_triton_dispatch:
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch
@@ -151,52 +150,6 @@ def get_last_loc_torch(
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
-
-
-@triton.jit
-def get_last_loc_kernel(
-    req_to_token,
-    req_pool_indices_tensor,
-    prefix_lens_tensor,
-    result,
-    num_tokens,
-    req_to_token_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
-    mask = offset < num_tokens
-
-    prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
-    req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
-
-    token_mask = prefix_lens > 0
-    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
-    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
-
-    tl.store(result + offset, tokens, mask=mask)
-
-
-def get_last_loc_triton(
-    req_to_token: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-) -> torch.Tensor:
-    BLOCK_SIZE = 256
-    num_tokens = prefix_lens_tensor.shape[0]
-    result = torch.empty_like(prefix_lens_tensor)
-    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
-
-    get_last_loc_kernel[grid](
-        req_to_token,
-        req_pool_indices_tensor,
-        prefix_lens_tensor,
-        result,
-        num_tokens,
-        req_to_token.stride(0),
-        BLOCK_SIZE,
-    )
-    return result
 
 
 def alloc_token_slots(
@@ -304,11 +257,14 @@ def alloc_req_slots(
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
-        factor = (
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            if tree_cache.supports_mamba()
-            else MAMBA_STATE_PER_REQ_NO_CACHE
-        )
+        if tree_cache.supports_mamba():
+            factor = (
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                if req_to_token_pool.enable_mamba_extra_buffer_lazy
+                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            )
+        else:
+            factor = MAMBA_STATE_PER_REQ_NO_CACHE
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
@@ -328,14 +284,14 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
     Returns:
         out_cache_loc: allocated cache locations
-        req_pool_indices_device: request pool indices at a device tensor
-        req_pool_indices: request pool indices as list
+        req_pool_indices_device: request pool indices as a device tensor
+        req_pool_indices_cpu: request pool indices as a CPU tensor (host mirror)
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -389,7 +345,7 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
 def alloc_paged_token_slots_decode(
@@ -431,7 +387,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    bs = batch.seq_lens.shape[0]
+    seq_lens_gpu = batch.seq_lens
+    bs = seq_lens_gpu.shape[0]
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
@@ -439,9 +396,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
+            batch.req_pool_indices, seq_lens_gpu - 1
         ]
-        seq_lens_next = batch.seq_lens + token_per_req
+        seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
@@ -452,9 +409,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + batch.seq_lens
+        locs = batch.encoder_lens + seq_lens_gpu
     else:
-        locs = batch.seq_lens.clone()
+        locs = seq_lens_gpu.clone()
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
@@ -477,50 +434,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    # Streaming sessions transfer req_pool ownership into SessionSlot objects.
-    # Trim any speculative tail before that transfer, otherwise later turns
-    # restore only the committed prefix and can strand unreachable KV pages.
-    #
-    # Aborted streaming-session requests (e.g. input too long) skip the
-    # streaming path entirely.  match_prefix did not restore the slot's KV
-    # state, so the request has a fresh pool slot that should be freed by
-    # cache_finished_req below (which also sets req_pool_idx = None).
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-    is_streaming_session = isinstance(tree_cache, SessionAwareCache) and _is_streaming(
-        req
+    tree_cache.cache_finished_req(
+        req,
+        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
     )
-    is_aborted_streaming = is_streaming_session and isinstance(
-        getattr(req, "finished_reason", None), FINISH_ABORT
-    )
-    if is_streaming_session and not is_aborted_streaming:
-        start_p, end_p = req.pop_overallocated_kv_cache()
-        page_size = get_global_server_args().page_size
-        if page_size > 1:
-            start_p = ceil_align(start_p, page_size)
-        if start_p < end_p:
-            indices_to_free = tree_cache.req_to_token_pool.req_to_token[
-                req.req_pool_idx
-            ][start_p:end_p]
-            tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
-        req.kv_allocated_len = req.kv_committed_len
 
-    tree_cache.cache_finished_req(req, is_insert=is_insert)
-
-    # SessionAwareCache.cache_finished_req sets req_pool_idx = None to transfer
-    # KV ownership to the SessionSlot, so the remaining cleanup is skipped.
-    # Streaming-session specific overalloc trimming must therefore happen
-    # before cache_finished_req above.
+    # StreamingSession.cache_finished_req handles speculative tail trim
+    # and bookkeeping flag sync internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
-        if is_streaming_session:
-            # The request no longer owns any KV once SessionAwareCache either
-            # transfers it into the session slot or frees it on abort. Mark
-            # both bookkeeping flags so busy-time memory checks do not keep
-            # counting this finished request as uncached KV.
-            if not req.kv_committed_freed:
-                req.pop_committed_kv_cache()
-            if not req.kv_overallocated_freed:
-                req.pop_overallocated_kv_cache()
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
@@ -529,7 +450,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    if spec_algo is None:
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path below (#22373).
+    if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"

@@ -46,7 +46,7 @@ class MLP(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
-            prefix=add_prefix("0.proj", prefix),
+            prefix=add_prefix("fc_in", prefix),
         )
 
         self.act = get_act_fn(act_type)
@@ -58,7 +58,7 @@ class MLP(nn.Module):
             bias=True,
             input_is_parallel=True,
             quant_config=quant_config,
-            prefix=add_prefix("2", prefix),
+            prefix=add_prefix("fc_out", prefix),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

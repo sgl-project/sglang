@@ -1,8 +1,8 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
-#include <ATen/record_function.h>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -44,6 +44,14 @@ namespace {
       }                                                                  \
     }                                                                    \
   }()
+
+// Half + BFloat16, plus one extra scalar type
+#define AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, ...) \
+  AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES(__VA_ARGS__)               \
+  AT_DISPATCH_CASE(SCALARTYPE, __VA_ARGS__)
+
+#define AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, __VA_ARGS__))
 
 // dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
@@ -98,6 +106,43 @@ namespace {
       TORCH_CHECK(false, "Unsupported floating data type."); \
   }
 
+// Helper MICRO for CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT:
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: defined as PARAM_T input
+#define CPU_DISPATCH_TYPE1_WITH_PARAM_REDUCED(TYPE1, PARAM_T, ...) \
+  switch (TYPE1) {                                                 \
+    case at::ScalarType::BFloat16: {                               \
+      using scalar_t = at::BFloat16;                               \
+      using param_t = PARAM_T;                                     \
+      return __VA_ARGS__();                                        \
+    }                                                              \
+    case at::ScalarType::Half: {                                   \
+      using scalar_t = at::Half;                                   \
+      using param_t = PARAM_T;                                     \
+      return __VA_ARGS__();                                        \
+    }                                                              \
+    default:                                                       \
+      TORCH_CHECK(false, "Unsupported floating data type.");       \
+  }
+
+// Helper MICRO for CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT:
+//   TYPE1: the dtype both for scalar_t and param_t
+#define CPU_DISPATCH_TYPE1_WITH_SAME_PARAM_REDUCED(TYPE1, ...)       \
+  switch (TYPE1) {                                                   \
+    case at::ScalarType::BFloat16: {                                 \
+      using scalar_t = at::BFloat16;                                 \
+      using param_t = at::BFloat16;                                  \
+      return __VA_ARGS__();                                          \
+    }                                                                \
+    case at::ScalarType::Half: {                                     \
+      using scalar_t = at::Half;                                     \
+      using param_t = at::Half;                                      \
+      return __VA_ARGS__();                                          \
+    }                                                                \
+    default:                                                         \
+      TORCH_CHECK(false, "Unsupported reduced floating data type."); \
+  }
+
 // dispatch with mixed dtypes (TYPE1, TYPE2):
 //   TYPE1: the primary dtype (input, output, weight);
 //   TYPE2: the secondary dtype (bias, etc.).
@@ -112,6 +157,19 @@ namespace {
     } else {                                                          \
       TORCH_CHECK(false, "Unsupported floating data type.");          \
     }                                                                 \
+  }()
+
+// dispatch with mixed dtypes (reduced one, no float for TYPE1) (TYPE1, TYPE2):
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: the secondary dtype (bias, etc.).
+#define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...)     \
+  [&] {                                                                \
+    if (TYPE2 == at::kFloat) {                                         \
+      CPU_DISPATCH_TYPE1_WITH_PARAM_REDUCED(TYPE1, float, __VA_ARGS__) \
+    } else {                                                           \
+      TORCH_CHECK(TYPE1 == TYPE2);                                     \
+      CPU_DISPATCH_TYPE1_WITH_SAME_PARAM_REDUCED(TYPE1, __VA_ARGS__)   \
+    }                                                                  \
   }()
 
 #define UNUSED(x) (void)(x)
@@ -290,6 +348,13 @@ inline int get_cache_blocks(int chunk_size) {
 template <>
 inline int get_cache_blocks<at::Float8_e4m3fn>(int chunk_size) {
   // fp8 uses bf16 as accumulate type
+  int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
+}
+
+template <>
+inline int get_cache_blocks<uint8_t>(int chunk_size) {
+  // mxfp4 uses bf16 as accumulate type
   int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
   return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
 }

@@ -4,6 +4,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
     SlidingTileAttnConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
@@ -27,6 +28,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
@@ -43,6 +47,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 
 __all__ = [
+    "Cosmos3Config",
     "DiffusersGenericPipelineConfig",
     "HeliosDistilledConfig",
     "HeliosMidConfig",
@@ -66,4 +71,5 @@ __all__ = [
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
     "LTX2PipelineConfig",
+    "LingBotWorldCausalDMDConfig",
 ]

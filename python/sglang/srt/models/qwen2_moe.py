@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,8 +32,12 @@ from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_pp_indices,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_attn_context_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -57,8 +63,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_use_dp_reduce_scatterv,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -66,6 +71,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputCheck
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -92,9 +98,18 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     make_layers,
     use_intel_amx_backend,
 )
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.cmo import (
+        shared_expert_on_independent_stream,
+        wait_share_stream,
+    )
+
+from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -108,6 +123,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def can_fuse_shared_expert(
     config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
 
@@ -120,6 +136,20 @@ def can_fuse_shared_expert(
         or get_moe_a2a_backend().is_deepep()
     ):
         return False
+
+    # If the shared expert is excluded from quantization (stored as FP32 in the
+    # checkpoint), fusing it into the quantized MoE weight tensor requires online
+    # quantization which is not supported. Disable fusion in this case.
+    if quant_config is not None:
+        exclude_layers = getattr(quant_config, "exclude_layers", [])
+        if any(
+            "shared_expert" in layer
+            and "shared_expert_gate" not in layer
+            and not layer.startswith("mtp.")
+            for layer in exclude_layers
+        ):
+            return False
+
     return True
 
 
@@ -212,7 +242,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if _use_aiter:
             # enable shared expert fusion when use aiter
             self.enable_shared_expert_fusion = (
-                support_shared_expert_fusion and can_fuse_shared_expert(config)
+                support_shared_expert_fusion
+                and can_fuse_shared_expert(config, quant_config)
             )
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
@@ -268,7 +299,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_expert", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
+                    if (
+                        get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_flashinfer()
+                    )
                     else {}
                 ),
             )
@@ -310,7 +344,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return None
         shared_out = self.shared_expert_gate(hidden_states)
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
-        return F.sigmoid(shared_logits)
+        w = F.sigmoid(shared_logits)
+        # This block runs only on the AMD AITER shared_expert_fusion path
+        # Allreduce-EP path: the fused shared expert occupies a single global
+        # slot loaded onto every EP rank (see FusedMoE.__init__: num_shared_slots
+        # == num_fused_shared_experts when not is_deepep_class_backend()). Every
+        # rank therefore computes the same full shared output, and the
+        # post-experts all_reduce sums it ep_size times. Pre-scale the per-token
+        # routing weight by 1/ep_size to cancel this, mirroring DeepSeek-V2's
+        # fused_shared_experts_scaling_factor pattern.
+        moe_ep_size = get_moe_expert_parallel_world_size()
+        if moe_ep_size > 1 and not is_deepep_class_backend():
+            w = w / float(moe_ep_size)
+        return w
 
     def _append_shared_to_topk_output(
         self,
@@ -323,20 +369,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_weights = self._get_shared_expert_weights(hidden_states)
         if shared_weights is None:
             return topk_output
-        M = topk_output.topk_ids.shape[0]
-        shared_expert_id = self.num_experts
-        shared_ids = torch.full(
-            (M, self.num_fused_shared_experts),
-            shared_expert_id,
-            dtype=topk_output.topk_ids.dtype,
-            device=topk_output.topk_ids.device,
+
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            fused_append_shared_experts_with_weights,
         )
-        shared_weights = shared_weights.expand(M, self.num_fused_shared_experts).to(
-            topk_output.topk_weights.dtype
-        )
-        fused_topk_ids = torch.cat([topk_output.topk_ids, shared_ids], dim=-1)
-        fused_topk_weights = torch.cat(
-            [topk_output.topk_weights, shared_weights], dim=-1
+
+        fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            shared_weights,
+            self.num_fused_shared_experts,
+            N=self.num_experts,
         )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,
@@ -366,11 +409,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        enable_dual_stream = (
+            is_npu()
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and forward_batch.forward_mode.is_cuda_graph()
+        )
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if enable_dual_stream:
+                shared_output = shared_expert_on_independent_stream(
+                    hidden_states.clone(), self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -389,6 +442,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        if enable_dual_stream:
+            wait_share_stream()
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
@@ -433,11 +488,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
-        if (
-            self.alt_stream is not None
-            and hidden_states.shape[0] > 0
-            and get_is_capture_mode()
-        ):
+        if hidden_states.shape[0] == 0:
+            # M=0 guard for idle DP ranks: skip shared_experts and gate
+            # (which crash on empty tensors in FP4 GEMM), but still call
+            # self.experts() to participate in alltoall collective.
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        elif self.alt_stream is not None and get_is_capture_mode():
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states
             )
@@ -446,19 +504,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:
-            # In-place add is required to keep final_hidden_states in the
-            # symmetric memory pool (when --enable-symm-mem is used).
-            # An out-of-place add would allocate a new tensor outside symm
-            # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
         if (
             self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-            and not should_use_dp_reduce_scatterv()
+            and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+                use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
+            )
+            and not get_moe_a2a_backend().is_flashinfer()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        # Debug removed - was causing issues during CUDA graph capture
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -564,6 +622,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -571,6 +630,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        self.start_layer = start_layer
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
@@ -696,12 +756,14 @@ class Qwen2MoeModel(nn.Module):
         self.pp_group = get_pp_group()
 
         self.moe_dp_size = get_moe_data_parallel_world_size()
+        self.attn_cp_size = get_attn_context_model_parallel_world_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 use_attn_tp_group=is_dp_attention_enabled(),
+                quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -709,10 +771,16 @@ class Qwen2MoeModel(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
+                start_layer=pp_start_layer,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
@@ -817,7 +885,7 @@ class Qwen2MoeModel(nn.Module):
         ):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
-                self.moe_dp_size,
+                self.attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )

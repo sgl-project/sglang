@@ -29,40 +29,6 @@ class InputLogprobsResult:
     input_token_ids_logprobs_idx: Optional[List] = None
 
 
-def compute_temp_top_p_normalized_logprobs(
-    last_logits: torch.Tensor,
-    logits_metadata: LogitsMetadata,
-    top_p: Optional[torch.Tensor] = None,
-    temperature: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    compute logprobs for the output token from the given logits.
-
-    Returns:
-        torch.Tensor: logprobs from logits
-    """
-    if top_p is None:
-        top_p = logits_metadata.top_p
-    if temperature is None:
-        temperature = logits_metadata.temperature
-
-    # Scale logits if temperature scaling is enabled
-    if logits_metadata.temp_scaled_logprobs:
-        last_logits = last_logits / temperature
-
-    # Normalize logprobs if top_p normalization is enabled
-    # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
-    if logits_metadata.top_p_normalized_logprobs and (top_p != 1.0).any():
-        from sglang.srt.layers.sampler import top_p_normalize_probs_torch
-
-        probs = torch.softmax(last_logits, dim=-1)
-        del last_logits
-        probs = top_p_normalize_probs_torch(probs, top_p)
-        return torch.log(probs)
-    else:
-        return torch.nn.functional.log_softmax(last_logits, dim=-1)
-
-
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
@@ -338,22 +304,22 @@ def add_output_logprobs_for_spec_v1(
     if logits_output is None:
         logits_output = res.logits_output
 
-    if hasattr(res, "accept_length_per_req_cpu"):
-        accept_length_per_req_cpu = res.accept_length_per_req_cpu
+    if hasattr(res, "num_correct_drafts_per_req_cpu"):
+        num_correct_drafts_per_req_cpu = res.num_correct_drafts_per_req_cpu
     else:
         # FIXME: Get a NgramVerifyOutput class and use that instead of this hack.
-        accept_length_per_req_cpu = res.accept_length.tolist()
+        num_correct_drafts_per_req_cpu = res.num_correct_drafts.tolist()
 
     top_logprobs_nums = batch.top_logprobs_nums
     token_ids_logprobs = batch.token_ids_logprobs
-    accepted_indices = res.accepted_indices
-    assert len(accepted_indices) == len(logits_output.next_token_logits)
+    accept_indices = res.accept_indices
+    assert len(accept_indices) == len(logits_output.next_token_logits)
 
     temperatures = batch.sampling_info.temperatures
     num_draft_tokens = batch.spec_info.draft_token_num
     # acceptance indices are the indices in a "flattened" batch.
     # dividing it to num_draft_tokens will yield the actual batch index.
-    temperatures = temperatures[accepted_indices // num_draft_tokens]
+    temperatures = temperatures[accept_indices // num_draft_tokens]
     if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         logprobs = torch.nn.functional.log_softmax(
             logits_output.next_token_logits, dim=-1
@@ -362,8 +328,8 @@ def add_output_logprobs_for_spec_v1(
         logprobs = torch.nn.functional.log_softmax(
             logits_output.next_token_logits / temperatures, dim=-1
         )
-    batch_next_token_ids = res.verified_id
-    num_tokens_per_req = [accept + 1 for accept in accept_length_per_req_cpu]
+    batch_next_token_ids = res.accept_tokens
+    num_tokens_per_req = [accept + 1 for accept in num_correct_drafts_per_req_cpu]
 
     # We should repeat top_logprobs_nums to match num_tokens_per_req.
     top_logprobs_nums_repeat_interleaved = [
@@ -407,7 +373,7 @@ def add_output_logprobs_for_spec_v1(
     # Add output logprobs to the request
     pt = 0
     next_token_logprobs = logits_output.next_token_logprobs.tolist()
-    verified_ids = batch_next_token_ids.tolist()
+    accept_tokens_list = batch_next_token_ids.tolist()
     token_top_logprobs_val = logits_output.next_token_top_logprobs_val
     token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
     token_ids_logprobs_val = logits_output.next_token_token_ids_logprobs_val
@@ -415,17 +381,28 @@ def add_output_logprobs_for_spec_v1(
     for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
         for _ in range(num_tokens):
             if req.return_logprob:
-                req.output_token_logprobs_val.append(next_token_logprobs[pt])
-                req.output_token_logprobs_idx.append(verified_ids[pt])
-                if req.top_logprobs_num > 0:
+                req.logprob.output_token_logprobs_val.append(next_token_logprobs[pt])
+                req.logprob.output_token_logprobs_idx.append(accept_tokens_list[pt])
+                if req.logprob.top_logprobs_num > 0:
                     assert (
                         should_top_logprobs
                     ), "Inconsistent state: should_top_logprobs is False"
-                    req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
-                    req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
-                if req.token_ids_logprob is not None and should_token_ids_logprobs:
-                    req.output_token_ids_logprobs_val.append(token_ids_logprobs_val[pt])
-                    req.output_token_ids_logprobs_idx.append(token_ids_logprobs_idx[pt])
+                    req.logprob.output_top_logprobs_val.append(
+                        token_top_logprobs_val[pt]
+                    )
+                    req.logprob.output_top_logprobs_idx.append(
+                        token_top_logprobs_idx[pt]
+                    )
+                if (
+                    req.logprob.token_ids_logprob is not None
+                    and should_token_ids_logprobs
+                ):
+                    req.logprob.output_token_ids_logprobs_val.append(
+                        token_ids_logprobs_val[pt]
+                    )
+                    req.logprob.output_token_ids_logprobs_idx.append(
+                        token_ids_logprobs_idx[pt]
+                    )
             pt += 1
 
 

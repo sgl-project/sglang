@@ -8,14 +8,17 @@ Output: JSON array written to stdout, consumed by the workflow setup job as
 a dynamic matrix via fromJson(needs.setup.outputs.matrix).
 
 Usage:
-    python3 generate_matrix.py <path-to-nightly-configs.yaml> --runner <label>
+    python3 generate_matrix.py <path-to-nightly-configs.yaml> --runner <label> [--filter NAMES]
 
 Example:
     python3 generate_matrix.py scripts/ci/slurm/nightly-configs.yaml --runner gb200
+    python3 generate_matrix.py scripts/ci/slurm/nightly-configs.yaml --runner gb200 \\
+        --filter dsr1-fp8-1k1k-max-tpt,dsr1-fp4-1k1k-mid-curve
 """
 
 import argparse
 import json
+import sys
 
 import yaml
 
@@ -34,6 +37,14 @@ def main():
         "--runner",
         required=True,
         help="Filter configs by runner label (e.g. gb200, b200)",
+    )
+    parser.add_argument(
+        "--filter",
+        default="",
+        help=(
+            "Optional comma-separated list of matrix entry names to include "
+            "(e.g. 'dsr1-fp8-1k1k-max-tpt'). Names must match exactly."
+        ),
     )
     args = parser.parse_args()
 
@@ -65,6 +76,19 @@ def main():
                         "config_file": config_file,
                     }
                 )
+
+    wanted = [n.strip() for n in args.filter.split(",") if n.strip()]
+    if wanted:
+        available = [e["name"] for e in matrix]
+        unknown = [n for n in wanted if n not in available]
+        if unknown:
+            print(
+                f"ERROR: unknown config name(s): {', '.join(unknown)}. "
+                f"Available for runner '{args.runner}': {', '.join(available)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        matrix = [e for e in matrix if e["name"] in wanted]
 
     print(json.dumps(matrix))
 
