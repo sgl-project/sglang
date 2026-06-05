@@ -269,39 +269,6 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             x = _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
         return x
 
-    def update_cache_from_kv(
-        self,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        freqs_cis: tuple[torch.Tensor, ...],
-        kv_cache: CausalSelfAttentionKVCache,
-        current_start: int = 0,
-    ) -> None:
-        cos, sin = freqs_cis[:2]
-        cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
-        if _is_cuda and k.dim() == 4:
-            if cos_sin_cache is None:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-            _, roped_key = apply_flashinfer_rope_qk_inplace(
-                torch.empty_like(k), k, cos_sin_cache, is_neox=False
-            )
-            roped_key = roped_key.type_as(v)
-        else:
-            roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
-
-        kv_cache.update_and_get_attention_kv(
-            key=roped_key,
-            value=v,
-            current_chunk_start=current_start,
-            debug_name="LingBot KV cache",
-        )
-
 
 class LingBotWorldTransformerBlock(nn.Module):
     def __init__(
@@ -926,35 +893,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         value, _ = self.to_v(hidden_states)
         return query, key, value
 
-    def _project_kv(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.fuse_qkv_projection():
-            hidden_dim = self._fused_qkv_weight.shape[0] // 3
-            kv_weight = self._fused_qkv_weight[hidden_dim:]
-            kv_bias = (
-                None
-                if self._fused_qkv_bias is None
-                else self._fused_qkv_bias[hidden_dim:]
-            )
-            key, value = F.linear(hidden_states, kv_weight, kv_bias).chunk(2, dim=-1)
-            return key, value
-
-        key, _ = self.to_k(hidden_states)
-        value, _ = self.to_v(hidden_states)
-        return key, value
-
-    @staticmethod
-    def _can_update_cache_from_kv(kv_cache: CausalSelfAttentionKVCache | None) -> bool:
-        if kv_cache is None:
-            return False
-        forward_batch = get_forward_context().forward_batch
-        return not (
-            forward_batch is not None
-            and getattr(forward_batch, "enable_sequence_shard", False)
-            and get_ulysses_parallel_world_size() > 1
-        )
-
     def _cross_attn_with_cache(
         self,
         hidden_states: torch.Tensor,
@@ -1071,20 +1009,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             .flatten(1, 2)
             .to(orig_dtype)
         )
-        if update_cache_only and self._can_update_cache_from_kv(kv_cache):
-            key, value = self._project_kv(norm_hidden_states)
-            key = self.norm_k(key)
-            key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-            value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-            self.attn1.update_cache_from_kv(
-                key,
-                value,
-                freqs_cis,
-                kv_cache,
-                current_start,
-            )
-            return hidden_states
-
         query, key, value = self._project_qkv(norm_hidden_states)
         query = self.norm_q(query)
         key = self.norm_k(key)
