@@ -305,9 +305,9 @@ except:
     is_intel_amx_backend_available = False
 
 try:
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+    is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
 
@@ -1159,7 +1159,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.11.post1")
+        min_version: Minimum version required (e.g., "0.6.12")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -2515,22 +2515,6 @@ def human_readable_int(value: str) -> int:
         )
 
 
-def pyspy_dump_schedulers():
-    """py-spy dump on all scheduler in a local node."""
-    pid = psutil.Process().pid
-    for attempt, native_flag in enumerate(["--native", ""]):
-        try:
-            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, check=True
-            )
-            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-            return
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
-
-
 def kill_itself_when_parent_died():
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies
@@ -3652,6 +3636,18 @@ def is_gfx95_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
         return False
 
