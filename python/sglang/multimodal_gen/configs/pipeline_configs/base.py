@@ -317,6 +317,12 @@ class PipelineConfig:
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
 
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        """Realtime hook: optionally preprocess the first-frame condition image
+        in-place. Return True if handled (skip the standard path), False to fall
+        back to the normal condition-image preprocessing. Default: not handled."""
+        return False
+
     def prepare_image_processor_kwargs(self, batch, neg=False):
         return {}
 
@@ -966,6 +972,30 @@ class PipelineConfig:
                 )
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
+            # If an explicit pipeline_class_name refines the model-default config
+            # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
+            # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
+            # config so realtime-only wiring (the /v1/realtime_video adapter) is
+            # selected. Only applies when the explicit config strictly subclasses
+            # the model default, so non-realtime pipelines are unaffected.
+            if pipeline_class_name:
+                explicit_config_classes = get_pipeline_config_classes(
+                    pipeline_class_name
+                )
+                if explicit_config_classes is not None:
+                    explicit_config_cls = explicit_config_classes[0]
+                    if (
+                        isinstance(explicit_config_cls, type)
+                        and isinstance(pipeline_config_cls, type)
+                        and explicit_config_cls is not pipeline_config_cls
+                        and issubclass(explicit_config_cls, pipeline_config_cls)
+                    ):
+                        logger.info(
+                            f"Refining pipeline config {pipeline_config_cls.__name__} "
+                            f"-> {explicit_config_cls.__name__} for explicit "
+                            f"pipeline_class_name={pipeline_class_name}"
+                        )
+                        pipeline_config_cls = explicit_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
         if vae_path is None:
             component_paths = kwargs.get(
