@@ -14,12 +14,17 @@ let currentMetricType = 'throughput'; // throughput, latency, ttft, inputThrough
 
 // Metric type definitions
 const metricTypes = {
-    throughput: { label: 'Overall Throughput', unit: 'tokens/sec', field: 'throughput' },
-    outputThroughput: { label: 'Output Throughput', unit: 'tokens/sec', field: 'outputThroughput' },
-    inputThroughput: { label: 'Input Throughput', unit: 'tokens/sec', field: 'inputThroughput' },
-    latency: { label: 'Latency', unit: 'ms', field: 'latency' },
-    ttft: { label: 'Time to First Token', unit: 'ms', field: 'ttft' },
-    accLength: { label: 'Accept Length', unit: 'tokens', field: 'accLength', filterInvalid: true }
+    // Text/VLM metrics
+    throughput: { label: 'Overall Throughput', unit: 'tokens/sec', field: 'throughput', type: 'text' },
+    outputThroughput: { label: 'Output Throughput', unit: 'tokens/sec', field: 'outputThroughput', type: 'text' },
+    inputThroughput: { label: 'Input Throughput', unit: 'tokens/sec', field: 'inputThroughput', type: 'text' },
+    latency: { label: 'Latency', unit: 'ms', field: 'latency', type: 'text' },
+    ttft: { label: 'Time to First Token', unit: 'ms', field: 'ttft', type: 'text' },
+    accLength: { label: 'Accept Length', unit: 'tokens', field: 'accLength', filterInvalid: true, type: 'text' },
+    // Diffusion metrics
+    e2eMs: { label: 'End-to-End Time', unit: 'ms', field: 'e2e_ms', type: 'diffusion' },
+    avgDenoiseMs: { label: 'Avg Denoise Time', unit: 'ms', field: 'avg_denoise_ms', type: 'diffusion' },
+    medianDenoiseMs: { label: 'Median Denoise Time', unit: 'ms', field: 'median_denoise_ms', type: 'diffusion' }
 };
 
 // Chart.js default configuration for dark theme
@@ -142,32 +147,51 @@ async function fetchMetricsForRun(run) {
     }
 }
 
+// Helper function to detect if result is diffusion type
+function isDiffusionResult(result) {
+    return result.test_type === 'diffusion' || (result.tests && !result.benchmarks);
+}
+
 // Populate filter dropdowns
 function populateFilters() {
     const gpuConfigs = new Set();
     const models = new Set();
+    const testNames = new Set(); // For diffusion tests
     const batchSizes = new Set();
     const ioLengths = new Set();
 
     allMetricsData.forEach(run => {
         run.results.forEach(result => {
             gpuConfigs.add(result.gpu_config);
-            models.add(result.model);
-            // Try new structure first (benchmarks_by_io_len), fall back to flat benchmarks
-            if (result.benchmarks_by_io_len) {
-                Object.entries(result.benchmarks_by_io_len).forEach(([ioKey, ioData]) => {
-                    ioLengths.add(ioKey);
-                    ioData.benchmarks.forEach(bench => {
-                        batchSizes.add(bench.batch_size);
+
+            // Handle diffusion results
+            if (isDiffusionResult(result)) {
+                models.add(result.test_suite || 'diffusion');
+                if (result.tests) {
+                    result.tests.forEach(test => {
+                        testNames.add(test.test_name);
                     });
-                });
-            } else if (result.benchmarks) {
-                result.benchmarks.forEach(bench => {
-                    batchSizes.add(bench.batch_size);
-                    if (bench.input_len && bench.output_len) {
-                        ioLengths.add(`${bench.input_len}_${bench.output_len}`);
-                    }
-                });
+                }
+            }
+            // Handle text/VLM results
+            else {
+                models.add(result.model);
+                // Try new structure first (benchmarks_by_io_len), fall back to flat benchmarks
+                if (result.benchmarks_by_io_len) {
+                    Object.entries(result.benchmarks_by_io_len).forEach(([ioKey, ioData]) => {
+                        ioLengths.add(ioKey);
+                        ioData.benchmarks.forEach(bench => {
+                            batchSizes.add(bench.batch_size);
+                        });
+                    });
+                } else if (result.benchmarks) {
+                    result.benchmarks.forEach(bench => {
+                        batchSizes.add(bench.batch_size);
+                        if (bench.input_len && bench.output_len) {
+                            ioLengths.add(`${bench.input_len}_${bench.output_len}`);
+                        }
+                    });
+                }
             }
         });
     });
@@ -345,7 +369,16 @@ function createMetricTabs() {
     const tabsContainer = document.getElementById('metric-tabs');
     tabsContainer.innerHTML = '';
 
-    Object.entries(metricTypes).forEach(([key, metric], index) => {
+    // Detect if current data is diffusion or text
+    const isDiffusion = detectCurrentDataType() === 'diffusion';
+    const dataType = isDiffusion ? 'diffusion' : 'text';
+
+    // Filter metrics based on data type
+    const relevantMetrics = Object.entries(metricTypes).filter(([key, metric]) =>
+        metric.type === dataType
+    );
+
+    relevantMetrics.forEach(([key, metric], index) => {
         const tab = document.createElement('div');
         tab.className = index === 0 ? 'tab active' : 'tab';
         tab.textContent = metric.label;
@@ -353,6 +386,31 @@ function createMetricTabs() {
         tab.onclick = () => selectMetricTab(key, tab);
         tabsContainer.appendChild(tab);
     });
+
+    // Set initial metric type
+    if (relevantMetrics.length > 0) {
+        currentMetricType = relevantMetrics[0][0];
+    }
+}
+
+function detectCurrentDataType() {
+    // Check if currently selected model/GPU config has diffusion data
+    const gpuFilter = document.getElementById('gpu-filter')?.value;
+    const modelFilter = currentModel;
+
+    if (!gpuFilter || !modelFilter) return 'text';
+
+    for (const run of allMetricsData) {
+        for (const result of run.results) {
+            if (result.gpu_config === gpuFilter) {
+                const resultModel = result.test_suite || result.model;
+                if (resultModel === modelFilter && isDiffusionResult(result)) {
+                    return 'diffusion';
+                }
+            }
+        }
+    }
+    return 'text';
 }
 
 function selectMetricTab(metricKey, tabElement) {
@@ -374,6 +432,8 @@ function handleModelFilterChange(model) {
     updateVariantFilter();
     // Update IO length filter based on new model selection
     updateIoLenFilter();
+    // Recreate metric tabs in case data type changed (text vs diffusion)
+    createMetricTabs();
     updateCharts();
 }
 
@@ -383,6 +443,8 @@ function handleGpuFilterChange() {
     updateVariantFilter();
     // Update IO length filter based on new GPU selection
     updateIoLenFilter();
+    // Recreate metric tabs in case data type changed (text vs diffusion)
+    createMetricTabs();
     updateCharts();
 }
 
@@ -518,6 +580,7 @@ function prepareChartData(gpuFilter, modelFilter, variantFilter, ioLenFilter, ba
 // Prepare chart data grouped by batch size - each batch size is a separate series
 function prepareChartDataByBatch(gpuFilter, modelFilter, variantFilter, ioLenFilter, batchFilter) {
     const batchDataMap = new Map(); // batch_size -> Map of variant -> data
+    const testDataMap = new Map(); // For diffusion: test_name -> data
 
     allMetricsData.forEach(run => {
         const runDate = new Date(run.run_date);
@@ -525,6 +588,37 @@ function prepareChartDataByBatch(gpuFilter, modelFilter, variantFilter, ioLenFil
         run.results.forEach(result => {
             // Apply filters - GPU and Model are required (no "all" option)
             if (result.gpu_config !== gpuFilter) return;
+
+            // Handle diffusion results
+            if (isDiffusionResult(result)) {
+                const resultModel = result.test_suite || 'diffusion';
+                if (resultModel !== modelFilter) return;
+
+                if (result.tests) {
+                    result.tests.forEach(test => {
+                        const testName = test.test_name;
+                        if (!testDataMap.has(testName)) {
+                            testDataMap.set(testName, {
+                                label: testName,
+                                data: [],
+                                model: resultModel,
+                                testName: testName
+                            });
+                        }
+
+                        testDataMap.get(testName).data.push({
+                            x: runDate,
+                            e2e_ms: test.e2e_ms,
+                            avg_denoise_ms: test.avg_denoise_ms,
+                            median_denoise_ms: test.median_denoise_ms,
+                            runId: run.run_id
+                        });
+                    });
+                }
+                return;
+            }
+
+            // Handle text/VLM results
             if (result.model !== modelFilter) return;
             if (variantFilter !== 'all' && result.variant !== variantFilter) return;
 
@@ -622,6 +716,17 @@ function prepareChartDataByBatch(gpuFilter, modelFilter, variantFilter, ioLenFil
 
     // Sort data points by date and convert to array format
     const result = {};
+
+    // For diffusion data, use test names as "batch sizes"
+    if (testDataMap.size > 0) {
+        testDataMap.forEach((series, testName) => {
+            series.data.sort((a, b) => a.x - b.x);
+            result[testName] = [series]; // Each test is its own series
+        });
+        return result;
+    }
+
+    // For text/VLM data, use batch sizes
     batchDataMap.forEach((variantMap, batchSize) => {
         variantMap.forEach(series => {
             series.data.sort((a, b) => a.x - b.x);
@@ -642,7 +747,16 @@ function updateMetricChart(chartDataByBatch, metricType) {
     activeCharts = [];
 
     const metric = metricTypes[metricType];
-    const batchSizes = Object.keys(chartDataByBatch).sort((a, b) => parseInt(a) - parseInt(b));
+    const isDiffusion = metric.type === 'diffusion';
+
+    // For diffusion, keys are test names; for text, keys are batch sizes
+    const keys = Object.keys(chartDataByBatch);
+    if (!isDiffusion) {
+        keys.sort((a, b) => parseInt(a) - parseInt(b));
+    } else {
+        keys.sort(); // Alphabetical sort for test names
+    }
+    const batchSizes = keys; // Keep variable name for compatibility
 
     if (batchSizes.length === 0) {
         container.innerHTML = '<div class="no-data">No data available for the selected filters</div>';
@@ -682,7 +796,8 @@ function updateMetricChart(chartDataByBatch, metricType) {
 
         const title = document.createElement('div');
         title.className = 'batch-chart-title';
-        title.textContent = `Batch Size: ${batchSize}`;
+        // For diffusion, show test name; for text, show batch size
+        title.textContent = isDiffusion ? `Test: ${batchSize}` : `Batch Size: ${batchSize}`;
         chartWrapper.appendChild(title);
 
         const chartContainer = document.createElement('div');

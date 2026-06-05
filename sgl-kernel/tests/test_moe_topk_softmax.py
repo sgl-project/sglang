@@ -1,4 +1,5 @@
 import itertools
+import sys
 
 import pytest
 import torch
@@ -17,7 +18,7 @@ def compare_topk_values(gating_output, topk_indices_ref, topk_indices):
         itertools.product(
             [1, 16, 128, 512, 1024, 2048],  # num_tokens
             [512],  # num_experts
-            [1, 2, 3, 4, 5, 8],  # topk
+            [1, 2, 3, 4, 5, 8, 10],  # topk
         )
     ),
 )
@@ -180,4 +181,4 @@ def test_topk_softmax_renormalize(num_tokens, num_experts, topk):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

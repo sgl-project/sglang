@@ -4,11 +4,13 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
+    get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
 from sglang.srt.utils.common import torch_release
@@ -37,13 +39,31 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
-    x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
+    x = x.flatten().contiguous()
+    output = torch.empty_like(x)
+    # USP calls this collective many times per denoising step and waits
+    # immediately, so avoid the extra wrapper overhead of functional collectives.
+    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    return output.reshape(x_shape)
+
+
+def _usp_all_to_all_single_varlen(
+    x: torch.Tensor,
+    output_split_sizes: list[int],
+    input_split_sizes: list[int],
+) -> torch.Tensor:
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    x = x.flatten().contiguous()
+    output = torch.empty(sum(output_split_sizes), dtype=x.dtype, device=x.device)
+    dist.all_to_all_single(
+        output,
+        x,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=ulysses_pg,
     )
-    x = _maybe_wait(x)
-    x = x.reshape(x_shape)
-    return x
+    return output
 
 
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
@@ -70,38 +90,113 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    seq_dim = 1 if head_dim == 2 else 2
 
-    # Bring to canonical [b, h, s, d]
-    if head_dim == 1 and seq_dim == 2:
-        x_c = x
-    else:
-        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+    # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
+    if head_dim == 1:
+        b, h_global, s_local, d = x.shape
+        # Shape transition: [b, h_global, s_local, d] -> [h_global, b, s_local, d]
+        permute_order = (1, 0, 2, 3)
+    else:  # head_dim == 2
+        b, s_local, h_global, d = x.shape
+        # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
+        permute_order = (2, 0, 1, 3)
 
-    b, h, s, d = x_c.shape
     assert (
-        h % world_size == 0
-    ), f"h ({h}) must be divisible by world_size ({world_size})"
+        h_global % world_size == 0
+    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
 
-    # [b, h, s_local, d] -> [h, b, s_local, d]
-    x_c = x_c.permute(1, 0, 2, 3).contiguous()
-    # all-to-all along h
-    x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h_local, s, d]
-    x_c = (
-        x_c.reshape(world_size, h // world_size, b, -1, d)
-        .permute(2, 1, 0, 3, 4)
-        .reshape(b, h // world_size, -1, d)
-    )
+    h_local, s_global = h_global // world_size, s_local * world_size
 
-    if head_dim == 1 and seq_dim == 2:
-        return x_c
+    x = x.permute(permute_order).contiguous()
+    x = _usp_all_to_all_single(x)
+    x = x.reshape(world_size, h_local, b, s_local, d)
 
-    # Map back to original ordering, preserving head/seq positions
-    new_order = [0, None, None, 3]
-    new_order[head_dim] = 1
-    new_order[seq_dim] = 2
-    return x_c.permute(tuple(new_order)).contiguous()
+    # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
+    if head_dim == 1:
+        # Shape transition: [world_size, h_local, b, s_local, d] -> [b, h_local, world_size, s_local, d]
+        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
+    else:  # head_dim == 2
+        # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
+        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
+
+    return x
+
+
+def _usp_input_all_to_all_varlen(
+    x: torch.Tensor, seq_lens: list[int], head_dim: int = 1
+) -> torch.Tensor:
+    """
+    Perform Ulysses-style input all-to-all over the head dimension with variable
+    local sequence lengths.
+
+    Default layout expects heads at dim=1 and sequence at dim=2:
+        [b, h, s_local, d] -> [b, h_local, s_global, d]
+
+    If heads are at dim=2 (input is [b, s_local, h, d]), set head_dim=2, and the
+    function returns [b, s_global, h_local, d], preserving the original
+    head/sequence dim ordering.
+
+    Args:
+        x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
+        seq_lens: Local sequence lengths for each rank in the Ulysses group
+        head_dim: Which dimension index corresponds to heads (1 or 2)
+
+    Returns:
+        Tensor with the same dim order as input, with heads sharded and sequence gathered.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    assert (
+        len(seq_lens) == world_size
+    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+
+    rank = get_ulysses_parallel_rank()
+
+    # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
+    if head_dim == 1:
+        b, h_global, s_local, d = x.shape
+        # Shape transition: [b, h_global, s_local, d] -> [h_global, b, s_local, d]
+        permute_order = (1, 0, 2, 3)
+    else:  # head_dim == 2
+        b, s_local, h_global, d = x.shape
+        # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
+        permute_order = (2, 0, 1, 3)
+
+    assert (
+        s_local == seq_lens[rank]
+    ), f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
+    assert (
+        h_global % world_size == 0
+    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+
+    h_local = h_global // world_size
+
+    x = x.permute(permute_order).contiguous()
+    x = x.reshape(world_size, h_local, b, s_local, d)
+    input_split_sizes = [h_local * b * s_local * d] * world_size
+    output_split_sizes = [h_local * b * seq_len * d for seq_len in seq_lens]
+    x = _usp_all_to_all_single_varlen(x, output_split_sizes, input_split_sizes)
+
+    chunks = []
+    offset = 0
+    for seq_len, split_size in zip(seq_lens, output_split_sizes):
+        chunk = x[offset : offset + split_size].reshape(h_local, b, seq_len, d)
+        chunks.append(chunk)
+        offset += split_size
+    x = torch.cat(chunks, dim=2)
+
+    if head_dim == 1:
+        # Shape transition: [h_local, b, s_global, d] -> [b, h_local, s_global, d]
+        x = x.permute(1, 0, 2, 3).contiguous()
+    else:  # head_dim == 2
+        # Shape transition: [h_local, b, s_global, d] -> [b, s_global, h_local, d]
+        x = x.permute(1, 2, 0, 3).contiguous()
+
+    return x
 
 
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
@@ -128,37 +223,116 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    seq_dim = 1 if head_dim == 2 else 2
 
-    # Bring to canonical [b, h, s, d]
-    if head_dim == 1 and seq_dim == 2:
-        x_c = x
-    else:
-        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+    # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
+    if head_dim == 1:
+        b, h_local, s_global, d = x.shape
+        # Shape transition: [b, h_local, s_global, d] -> [s_global, b, h_local, d]
+        permute_order = (2, 0, 1, 3)
+    else:  # head_dim == 2
+        b, s_global, h_local, d = x.shape
+        # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
+        permute_order = (1, 0, 2, 3)
 
-    b, h, s, d = x_c.shape
     assert (
-        s % world_size == 0
-    ), f"s ({s}) must be divisible by world_size ({world_size})"
+        s_global % world_size == 0
+    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
 
-    # [b, h_local, s, d] -> [s, b, h_local, d]
-    x_c = x_c.permute(2, 0, 1, 3).contiguous()
-    x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h, s_local, d]
-    x_c = (
-        x_c.reshape(world_size, s // world_size, b, -1, d)
-        .permute(2, 0, 3, 1, 4)
-        .reshape(b, -1, s // world_size, d)
-    )
+    s_local, h_global = s_global // world_size, h_local * world_size
 
-    if head_dim == 1 and seq_dim == 2:
-        return x_c
+    x = x.permute(permute_order).contiguous()
+    x = _usp_all_to_all_single(x)
+    x = x.reshape(world_size, s_local, b, h_local, d)
 
-    # Map back to original ordering, preserving head/seq positions
-    new_order = [0, None, None, 3]
-    new_order[head_dim] = 1
-    new_order[seq_dim] = 2
-    return x_c.permute(tuple(new_order)).contiguous()
+    # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'
+    if head_dim == 1:
+        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, world_size, h_local, s_local, d]
+        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
+    else:  # head_dim == 2
+        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
+        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
+
+    return x
+
+
+def _usp_output_all_to_all_varlen(
+    x: torch.Tensor, seq_lens: list[int], head_dim: int = 1
+) -> torch.Tensor:
+    """
+    Perform Ulysses-style output all-to-all over the head dimension (inverse of input)
+    with variable local sequence lengths.
+
+    Default layout expects heads at dim=1 and sequence at dim=2:
+        [b, h_local, s, d] -> [b, h, s_local, d]
+
+    If heads are at dim=2 (input is [b, s_global, h // world_size, d]), set head_dim=2,
+    and the function returns [b, s_local, h, d], preserving the original head/sequence
+    dim ordering.
+
+    Args:
+        x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
+        seq_lens: Local sequence lengths for each rank in the Ulysses group
+        head_dim: Which dimension index corresponds to heads (1 or 2)
+
+    Returns:
+        Tensor with the same dim order as input, with heads gathered and sequence sharded.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    assert (
+        len(seq_lens) == world_size
+    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+
+    rank = get_ulysses_parallel_rank()
+
+    # Move the sequence dimension to dim 2 for splitting across seq_lens
+    if head_dim == 1:
+        b, h_local, s_global, d = x.shape
+        # Shape transition: [b, h_local, s_global, d] -> [h_local, b, s_global, d]
+        permute_order = (1, 0, 2, 3)
+    else:  # head_dim == 2
+        b, s_global, h_local, d = x.shape
+        # Shape transition: [b, s_global, h_local, d] -> [h_local, b, s_global, d]
+        permute_order = (2, 0, 1, 3)
+
+    assert s_global == sum(
+        seq_lens
+    ), f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+
+    s_local = seq_lens[rank]
+
+    x = x.permute(permute_order).contiguous()
+    input_chunks = []
+    start = 0
+    for seq_len in seq_lens:
+        end = start + seq_len
+        input_chunks.append(x[:, :, start:end, :].contiguous().reshape(-1))
+        start = end
+    x = torch.cat(input_chunks, dim=0)
+    input_split_sizes = [h_local * b * seq_len * d for seq_len in seq_lens]
+    output_split_sizes = [h_local * b * s_local * d] * world_size
+    x = _usp_all_to_all_single_varlen(x, output_split_sizes, input_split_sizes)
+
+    chunks = []
+    offset = 0
+    for split_size in output_split_sizes:
+        chunk = x[offset : offset + split_size].reshape(h_local, b, s_local, d)
+        chunks.append(chunk)
+        offset += split_size
+    x = torch.cat(chunks, dim=0)
+
+    if head_dim == 1:
+        # Shape transition: [h_global, b, s_local, d] -> [b, h_global, s_local, d]
+        x = x.permute(1, 0, 2, 3).contiguous()
+    else:  # head_dim == 2
+        # Shape transition: [h_global, b, s_local, d] -> [b, s_local, h_global, d]
+        x = x.permute(1, 2, 0, 3).contiguous()
+
+    return x
 
 
 def ring_attn(
@@ -213,7 +387,7 @@ def ring_attn(
         q = torch.permute(q, [0, 2, 1, 3])
         k = torch.permute(k, [0, 2, 1, 3])
         v = torch.permute(v, [0, 2, 1, 3])
-        # logger.warning(f"Warning: return_s·oftmax_lse is only supported for FlashAttentionImpl")
+        # logger.warning(f"Warning: return_softmax_lse is only supported for FlashAttentionImpl")
         output, softmax_lse, *rest = attn_impl.forward(
             q,
             k,

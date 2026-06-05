@@ -8,6 +8,9 @@ class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
 
 class Qwen3_5TextConfig(Qwen3NextConfig):
     model_type = "qwen3_5_text"
@@ -17,9 +20,18 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         self,
         **kwargs,
     ):
+        # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
+        # Normalize it before parent init so downstream code sees the expected values.
+        rope_parameters = kwargs.pop("rope_parameters", None)
+        if kwargs.get("rope_scaling") is None and rope_parameters is not None:
+            kwargs["rope_scaling"] = rope_parameters
+
         super().__init__(**kwargs)
         if self.rope_scaling is None:
-            self.rope_scaling = {}
+            self.rope_scaling = rope_parameters or {}
+
+        # Keep both names for compatibility with model code paths that read either.
+        self.rope_parameters = rope_parameters or self.rope_scaling
 
 
 class Qwen3_5Config(PretrainedConfig):
@@ -100,14 +112,27 @@ class Qwen3_5Config(PretrainedConfig):
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
     model_type = "qwen3_5_moe"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
 
 class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
     model_type = "qwen3_5_moe_text"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
+
+# All Moe variant classes need explicit __init__ because the kw_only=True
+# dataclass decorator in transformers v5.5.3+ auto-generates __init__ for
+# subclasses, bypassing parent __init__ methods that set up attributes
+# (e.g. norm_topk_prob, rope_scaling) and convert sub-config dicts to objects.
 class Qwen3_5MoeConfig(Qwen3_5Config):
     model_type = "qwen3_5_moe"
     sub_configs = {
         "vision_config": Qwen3_5MoeVisionConfig,
         "text_config": Qwen3_5MoeTextConfig,
     }
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)

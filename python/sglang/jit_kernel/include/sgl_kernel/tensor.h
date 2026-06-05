@@ -1,3 +1,14 @@
+/// \file tensor.h
+/// \brief Tensor validation and symbolic matching utilities.
+///
+/// Provides the `TensorMatcher` fluent API for validating tensor shapes,
+/// strides, dtypes, and devices at kernel entry points, along with
+/// `SymbolicSize`, `SymbolicDType`, and `SymbolicDevice` for capturing
+/// and cross-checking tensor metadata across multiple tensors.
+///
+/// See the "Tensor Checking" section in the JIT kernel dev guide for
+/// usage examples.
+
 #pragma once
 #include <sgl_kernel/utils.h>
 
@@ -21,6 +32,8 @@
 #include <utility>
 
 #ifdef __CUDACC__
+#include <sgl_kernel/utils.cuh>
+#elif defined(__HIPCC__)
 #include <sgl_kernel/utils.cuh>
 #endif
 
@@ -67,6 +80,15 @@ struct _dtype_trait<bf16_t> {
 template <>
 struct _dtype_trait<fp8_e4m3_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
+};
+#elif defined(__HIPCC__)
+template <>
+struct _dtype_trait<fp16_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct _dtype_trait<bf16_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
 #endif
 
@@ -151,11 +173,25 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
 
 }  // namespace details
 
+/// \brief Check whether `dtype` matches the DLDataType for C++ type `T`.
 template <typename T>
 inline bool is_type(DLDataType dtype) {
   return dtype == details::_dtype_trait<T>::value;
 }
 
+/**
+ * \brief A symbolic dimension size that can be bound once and
+ *        verified across multiple tensors.
+ *
+ * Create with an optional annotation string for error messages:
+ * \code
+ *   auto N = SymbolicSize{"num_tokens"};
+ * \endcode
+ *
+ * Call `verify()` during tensor matching to either bind the first
+ * observed value or check subsequent values match. Call `unwrap()`
+ * to retrieve the bound value (panics if unset).
+ */
 struct SymbolicSize {
  public:
   SymbolicSize(std::string_view annotation = {}) : m_value(details::kNullSize), m_annotation(annotation) {}
@@ -219,6 +255,12 @@ inline auto operator==(DLDevice lhs, DLDevice rhs) -> bool {
   return lhs.device_type == rhs.device_type && lhs.device_id == rhs.device_id;
 }
 
+/**
+ * \brief A symbolic data type that can be constrained and verified.
+ *
+ * Optionally restrict allowed types via `set_options<fp16_t, bf16_t>()`.
+ * Use `verify()` to bind/check the dtype, and `unwrap()` to retrieve it.
+ */
 struct SymbolicDType {
  public:
   SymbolicDType() : m_value({details::kNullDType, 0, 0}) {}
@@ -276,6 +318,12 @@ struct SymbolicDType {
   DLDataType m_value;
 };
 
+/**
+ * \brief A symbolic device that can be constrained and verified.
+ *
+ * Optionally restrict allowed device types via
+ * `set_options<kDLCUDA, kDLCPU>()`. The device id can be wildcarded.
+ */
 struct SymbolicDevice {
  public:
   SymbolicDevice() : m_value({details::kNullDevice, details::kAnyDeviceID}) {}
@@ -407,6 +455,24 @@ struct DeviceRef : BaseRef<SymbolicDevice> {
 
 }  // namespace details
 
+/**
+ * \brief Fluent API for validating tensor shape, strides, dtype, and device.
+ *
+ * Construct with the expected shape (using `SymbolicSize` or literal
+ * integers), chain `.with_strides()`, `.with_dtype<...>()`, and
+ * `.with_device<...>()`, then call `.verify(tensor)`.
+ *
+ * Example:
+ * \code
+ *   auto N = SymbolicSize{"N"};
+ *   TensorMatcher({N, 128})
+ *       .with_dtype<fp16_t, bf16_t>()
+ *       .with_device<kDLCUDA>()
+ *       .verify(input_tensor);
+ * \endcode
+ *
+ * \note `TensorMatcher` is a move-only temporary. Do not store in a variable.
+ */
 struct TensorMatcher {
  private:
   using SizeRef = details::SizeRef;

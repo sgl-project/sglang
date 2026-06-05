@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     get_rotary_pos_embed,
@@ -34,13 +37,15 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     unpatchify,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import modulate
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -57,6 +62,7 @@ class MMDoubleStreamBlock(nn.Module):
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -90,6 +96,8 @@ class MMDoubleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.img_attn_qkv",
+            quant_config=quant_config,
+            output_sizes=[hidden_size] * 3,
         )
 
         self.img_attn_q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
@@ -101,6 +109,7 @@ class MMDoubleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.img_attn_proj",
+            quant_config=quant_config,
         )
 
         self.img_mlp = MLP(
@@ -109,6 +118,7 @@ class MMDoubleStreamBlock(nn.Module):
             bias=True,
             dtype=dtype,
             prefix=f"{prefix}.img_mlp",
+            quant_config=quant_config,
         )
 
         # Text modulation components
@@ -131,7 +141,13 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Text attention components
         self.txt_attn_qkv = ReplicatedLinear(
-            hidden_size, hidden_size * 3, bias=True, params_dtype=dtype
+            hidden_size,
+            hidden_size * 3,
+            bias=True,
+            params_dtype=dtype,
+            prefix=f"{prefix}.txt_attn_qkv",
+            quant_config=quant_config,
+            output_sizes=[hidden_size] * 3,
         )
 
         # QK norm layers for text
@@ -139,10 +155,22 @@ class MMDoubleStreamBlock(nn.Module):
         self.txt_attn_k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
         self.txt_attn_proj = ReplicatedLinear(
-            hidden_size, hidden_size, bias=True, params_dtype=dtype
+            hidden_size,
+            hidden_size,
+            bias=True,
+            params_dtype=dtype,
+            prefix=f"{prefix}.txt_attn_proj",
+            quant_config=quant_config,
         )
 
-        self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, bias=True, dtype=dtype)
+        self.txt_mlp = MLP(
+            hidden_size,
+            mlp_hidden_dim,
+            bias=True,
+            dtype=dtype,
+            prefix=f"{prefix}.txt_mlp",
+            quant_config=quant_config,
+        )
 
         # Use UlyssesAttention to replace Distributed attention
         self.attn = UlyssesAttention(
@@ -199,9 +227,10 @@ class MMDoubleStreamBlock(nn.Module):
         img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb(
-            img_q, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
+        img_q, img_k = (
+            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
+            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
+        )
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -222,7 +251,7 @@ class MMDoubleStreamBlock(nn.Module):
         # Run distributed attention
         img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
         img_attn_out, _ = self.img_attn_proj(
-            img_attn.view(batch_size, image_seq_len, -1)
+            img_attn.reshape(batch_size, image_seq_len, -1)
         )
         # Use fused operation for residual connection, normalization, and modulation
         img_mlp_input, img_residual = self.img_attn_residual_mlp_norm(
@@ -264,6 +293,7 @@ class MMSingleStreamBlock(nn.Module):
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -281,6 +311,8 @@ class MMSingleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.linear1",
+            quant_config=quant_config,
+            output_sizes=[hidden_size] * 3 + [mlp_hidden_dim],
         )
 
         # Combined projection and MLP output
@@ -290,6 +322,7 @@ class MMSingleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.linear2",
+            quant_config=quant_config,
         )
 
         # QK norm layers
@@ -362,9 +395,10 @@ class MMSingleStreamBlock(nn.Module):
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
         # Apply rotary embeddings to image parts
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb(
-            img_q, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
+        img_q, img_k = (
+            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
+            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
+        )
 
         # Run distributed attention
         img_attn_output, txt_attn_output = self.attn(
@@ -386,7 +420,7 @@ class MMSingleStreamBlock(nn.Module):
         return self.output_residual(output, mod_gate, x)
 
 
-class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     HunyuanVideo Transformer backbone adapted for distributed training.
 
@@ -408,7 +442,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = HunyuanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = HunyuanVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: HunyuanVideoConfig, hf_config: dict[str, Any]):
+    def __init__(
+        self,
+        config: HunyuanVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__(config=config, hf_config=hf_config)
 
         self.patch_size = [config.patch_size_t, config.patch_size, config.patch_size]
@@ -494,6 +533,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=f"{config.prefix}.double_blocks.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_layers)
             ]
@@ -509,6 +549,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=f"{config.prefix}.single_blocks.{i + config.num_layers}",
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_single_layers)
             ]
@@ -651,7 +692,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.previous_residual = hidden_states - original_hidden_states
 
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
         if forward_batch is None:

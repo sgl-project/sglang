@@ -1,7 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/7193774b1ff8603ad5bf4598e5efba0d9a39b436/vllm/model_executor/models/mllama.py
 """PyTorch Mllama model."""
+
+from __future__ import annotations
+
 import math
+from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -562,6 +568,7 @@ class MllamaTextCrossAttention(nn.Module):
         )
 
         output = self.attn(q, k, v, forward_batch)
+        output = output.view(-1, self.num_local_heads * self.head_dim)
         out, _ = self.o_proj(output)
         return out
 
@@ -819,9 +826,11 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
+        pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
 
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
@@ -862,9 +871,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 self.image_size,
                 dtype=torch.float32,
             )
-            batched_ar_ids = torch.ones(
-                bs, max_num_images, dtype=torch.int64, device="cuda"
-            )
+            batched_ar_ids = torch.ones(bs, max_num_images, dtype=torch.int64)
             batched_ar_mask = torch.zeros(
                 bs, max_num_images, max_num_tiles, dtype=torch.int64
             )
@@ -883,11 +890,13 @@ class MllamaForConditionalGeneration(nn.Module):
                     img = pixel_values[0, j]
                     num_tiles = img.shape[0]
                     batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].aspect_ratio_ids[0, j]
+                    batched_ar_ids[i, j] = mm_input.mm_items[0].model_specific_data[
+                        "aspect_ratio_ids"
+                    ][0, j]
 
                     batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
                         0
-                    ].aspect_ratio_mask[0, j]
+                    ].model_specific_data["aspect_ratio_mask"][0, j]
                 i += 1
 
         return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need

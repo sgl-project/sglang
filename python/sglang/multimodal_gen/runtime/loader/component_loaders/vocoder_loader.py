@@ -32,7 +32,7 @@ class VocoderLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
-        config = get_diffusers_component_config(model_path=component_model_path)
+        config = get_diffusers_component_config(component_path=component_model_path)
         class_name = config.pop("_class_name", None)
         assert (
             class_name is not None

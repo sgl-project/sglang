@@ -30,7 +30,7 @@ class BridgeLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
-        config = get_diffusers_component_config(model_path=component_model_path)
+        config = get_diffusers_component_config(component_path=component_model_path)
         hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)
         if class_name is None:
@@ -71,11 +71,10 @@ class BridgeLoader(ComponentLoader):
             default_dtype,
         )
 
-        # Check if FSDP loading is available
-        if (
-            server_args.hsdp_shard_dim is not None
-            and hasattr(model_cls, "_fsdp_shard_conditions")
-            and model_cls._fsdp_shard_conditions
+        # Use the FSDP loader when FSDP is requested or shard rules are declared.
+        fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
+        if server_args.use_fsdp_inference or (
+            server_args.hsdp_shard_dim is not None and fsdp_shard_conditions
         ):
             # Load with FSDP support
             model = maybe_load_fsdp_model(

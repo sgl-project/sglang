@@ -8,6 +8,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -67,6 +70,11 @@ class StandaloneDraftWorker(EagleDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        self._topk1_parents_prealloc = None
+        self._topk1_score_indices_prealloc = None
+        self._rebuild_topk1_chain_buffers()
+
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -90,7 +98,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
@@ -99,6 +107,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         # Alias for better readability
@@ -112,9 +121,10 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
@@ -147,7 +157,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -183,3 +192,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+        # TODO: Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None

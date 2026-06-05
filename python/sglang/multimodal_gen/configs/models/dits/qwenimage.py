@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 
 
 @dataclass
@@ -22,12 +23,18 @@ class QwenImageArchConfig(DiTArchConfig):
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
     zero_cond_t: bool = False
 
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_transformer_block])
+
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
+            # SVDquant mappings
+            r"(.*)\.add_qkv_proj\.(.+)$": r"\1.to_added_qkv.\2",
+            r"(transformer_blocks\.\d+\.(img_mlp|txt_mlp)\..*\.(smooth_factor_orig|wcscales))$": r"\1",
+            r".*\.wtscale$": r"",
         }
     )
 
@@ -39,7 +46,7 @@ class QwenImageArchConfig(DiTArchConfig):
 
 
 @dataclass
-class QwenImageEditPlus_2511_ArchConfig(DiTArchConfig):
+class QwenImageEditPlus_2511_ArchConfig(QwenImageArchConfig):
     zero_cond_t: bool = True
 
 

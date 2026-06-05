@@ -2,6 +2,7 @@
 """
 Copyright (c) Ant Financial Service Group and its affiliates.
 """
+
 # Copied from https://code.alipay.com/pia/PainlessInferenceAcceleration/blob/v0.0.6/flood/flood/ops/seg_la.py
 
 from dataclasses import dataclass

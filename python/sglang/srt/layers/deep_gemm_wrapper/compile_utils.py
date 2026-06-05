@@ -1,6 +1,7 @@
 import logging
 import os
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
 
@@ -13,10 +14,13 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory
+from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
+
+_is_musa = is_musa()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -95,7 +99,11 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_BF16_MASKED = auto()
+    GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
+    GEMM_NT_BF16BF16F32 = auto()
+    TF32_HC_PRENORM_GEMM = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -161,6 +169,9 @@ def _compile_deep_gemm_one_type_all(
         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
+            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
         memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
@@ -193,12 +204,18 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
+        has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
+            deep_gemm, "set_compile_mode"
+        )
+        if has_compile_mode_api:
+            old_compile_mode = deep_gemm.get_compile_mode()
+            deep_gemm.set_compile_mode(1)
+
         # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
+        for m in tqdm(m_list, desc="DeepGEMM warmup"):
             executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        if has_compile_mode_api:
+            deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -216,6 +233,10 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.TF32_HC_PRENORM_GEMM: _TF32HcPrenormWarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -228,6 +249,10 @@ class _BaseWarmupExecutor:
             return (max_m * k + n * k + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
+            return (
+                max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
             return (
                 num_groups * max_m * k
@@ -235,6 +260,21 @@ class _BaseWarmupExecutor:
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
+        elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
+            # bf16 lhs + bf16 rhs + fp32 out
+            return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
+            return (
+                num_groups * max_m * k * 2
+                + num_groups * n * k * 2
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.TF32_HC_PRENORM_GEMM:
+            # The generic hook's fourth dimension is num_splits for MHC.
+            # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
+            num_splits = num_groups if num_groups > 0 else 1
+            return (max_m * k * 2 + n * k * 4 + num_splits * max_m * (n + 1) * 4) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
 
@@ -293,7 +333,23 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
+        )
+
+
+class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+            self.a[:m],
+            self.b,
+            self.out[:m],
+            self.m_indices[:m],
         )
 
 
@@ -317,10 +373,142 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
-@contextmanager
+class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.float32)
+
+    def execute(self, m):
+        deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
+
+
+class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty(
+            (num_groups, max_m, k), device="cuda", dtype=torch.bfloat16
+        )
+        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            self.a,
+            self.b,
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+class _TF32HcPrenormWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.x = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.fn = torch.empty((n, k), device="cuda", dtype=torch.float32)
+        self.n = n
+        # The generic warmup executor's num_groups argument is num_splits here.
+        # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
+        self.num_splits = num_groups if num_groups > 0 else None
+
+    def execute(self, m):
+        if self.num_splits is None:
+            out = torch.empty((m, self.n), device="cuda", dtype=torch.float32)
+            sqrsum = torch.empty((m,), device="cuda", dtype=torch.float32)
+        else:
+            # Slicing the middle dimension of a preallocated
+            # (num_splits, max_m, n) output would create a strided view.
+            out = torch.empty(
+                (self.num_splits, m, self.n), device="cuda", dtype=torch.float32
+            )
+            sqrsum = torch.empty(
+                (self.num_splits, m), device="cuda", dtype=torch.float32
+            )
+        deep_gemm.tf32_hc_prenorm_gemm(
+            self.x[:m],
+            self.fn,
+            out,
+            sqrsum,
+            num_splits=self.num_splits,
+        )
+
+
 def deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    if _is_musa:
+        return nullcontext()
+
+    return _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type)
+
+
+@contextmanager
+def _deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
     if m > 0:
         _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield
+
+
+def pp_parallel_deep_gemm_warmup(model_runner) -> None:
+    """Run per-PP-rank dummy DECODE+EXTEND forwards so each rank's
+    DeepGEMM JIT compiles in parallel instead of serially via the warmup
+    /generate flowing through the pipeline. Opt-in via
+    SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.
+    """
+    # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
+    # cover the brackets real /generate hits (smallest decode shape,
+    # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
+    # to attn_cp_size for DSA prefill CP's seq_len % cp_size == 0 assert.
+    n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+    block_m = 64
+    cp = max(model_runner.attn_cp_size, 1)
+    batch_sizes = sorted(
+        {
+            ceil_align(bs, cp)
+            for bs in (
+                1,
+                2 * block_m,
+                max(n_sms // 8, 2) * block_m,
+                max(n_sms // 4, 4) * block_m,
+                n_sms * block_m,
+            )
+        }
+    )
+
+    # In PD, prefill-only nodes never decode (indexer would OOM at large
+    # bs) and decode-only nodes never extend.
+    disagg_mode = model_runner.server_args.disaggregation_mode
+    run_decode = model_runner.is_generation and disagg_mode != "prefill"
+    run_extend = disagg_mode != "decode"
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup start "
+        "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
+        model_runner.pp_rank,
+        model_runner.tp_rank,
+        batch_sizes,
+        disagg_mode,
+    )
+
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for bs in batch_sizes:
+            if run_decode:
+                model_runner._dummy_run(
+                    batch_size=bs, forward_mode_override=ForwardMode.DECODE
+                )
+            if run_extend:
+                model_runner._dummy_run(
+                    batch_size=bs, forward_mode_override=ForwardMode.EXTEND
+                )
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
+        time.perf_counter() - t0,
+        model_runner.pp_rank,
+    )

@@ -34,9 +34,11 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor gemma4_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps, double scale_shift, bool with_scale);
 
 // layernorm
-void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor
+layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps);
 
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
@@ -46,7 +48,12 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
 // fused_add_layernorm
-void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
+at::Tensor fused_add_layernorm_cpu(
+    const at::Tensor& input,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    double eps);
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
@@ -83,20 +90,24 @@ void decode_attention_cpu(
     at::Tensor& k_cache,
     at::Tensor& v_cache,
     at::Tensor& output,
-    at::Tensor& key,
-    at::Tensor& value,
+    const std::optional<at::Tensor>& key,
+    const std::optional<at::Tensor>& value,
     at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t slidling_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
+    const std::optional<at::Tensor>& k_extend,
+    const std::optional<at::Tensor>& v_extend,
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
@@ -107,7 +118,11 @@ void extend_attention_cpu(
     at::Tensor& extend_start_loc,
     int64_t max_len_extend,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t sliding_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -137,20 +152,11 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+// scale prepack for mxfp4
+at::Tensor convert_scale_packed(at::Tensor& scale);
+
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
-
-// gemm
-at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
-
-// gemm fusion
-at::Tensor fused_linear_sigmoid_mul(
-    at::Tensor& mat1,
-    at::Tensor& mat2,
-    const std::optional<at::Tensor>& bias,
-    bool is_vnni,
-    const at::Tensor& post_mul_mat);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -172,6 +178,10 @@ at::Tensor fp8_scaled_mm_cpu(
     at::ScalarType out_dtype,
     bool is_vnni);
 
+// mxfp4 gemm
+at::Tensor mxfp4_scaled_mm_cpu(
+    at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni);
+
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -181,16 +191,35 @@ at::Tensor int8_scaled_mm_with_quant(
     at::ScalarType out_dtype,
     bool is_vnni);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 // int4 gemm
 at::Tensor int4_scaled_mm_cpu(
     at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
 
 // weight prepack for int4 weights
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
+    at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
+    at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
+    at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
+    int64_t quant_method_4bit);
+#endif
+
+// gemm
+at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
+
+// gemm fusion
+at::Tensor fused_linear_sigmoid_mul(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    const at::Tensor& post_mul_mat);
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
+
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 
 // fused moe
 at::Tensor fused_experts_cpu(
@@ -206,14 +235,17 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
     bool is_vnni);
-
 at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
     at::Tensor& w2,
-    at::Tensor& fused_experts_out,
-    double routed_scaling_factor,
+    const std::optional<at::Tensor>& fused_experts_out,
+    const std::optional<double> routed_scaling_factor,
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
@@ -239,6 +271,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> q_a_proj_scale,
     std::optional<at::Tensor> q_b_proj_scale,
     std::optional<at::Tensor> kv_a_proj_scale,
+    std::optional<at::Tensor> w_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size);
 
@@ -256,6 +289,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     bool use_fp8_w8a16,
     std::optional<at::Tensor> qkv_a_proj_scale,
     std::optional<at::Tensor> q_b_proj_scale,
+    std::optional<at::Tensor> w_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size,
     int64_t q_lora_rank,
@@ -287,6 +321,29 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+#else
+
+// fused moe
+at::Tensor fused_experts_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    bool inplace,
+    int64_t moe_comp_method,
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
+    const std::optional<std::vector<int64_t>> block_size,
+    bool is_vnni);
+#endif
+
+// conv3d fast path for patch embedding
+at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight);
+
+at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni);
 
 // shared memory init
 void initialize(int64_t size, int64_t rank);
@@ -304,6 +361,19 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& key,
     int64_t head_size,
     at::Tensor& cos_sin_cache,
+    bool is_neox);
+std::tuple<at::Tensor, at::Tensor>
+apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+
+// mrope
+std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
+    int64_t head_size,
+    at::Tensor& cos_sin_cache,
+    const std::optional<std::vector<int64_t>>& mrope_section,
+    bool mrope_interleaved,
     bool is_neox);
 
 // CPU and memory binding
@@ -337,6 +407,46 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t head_qk,
     int64_t head_v);
 
+// fused_qkvzba_split_reshape_cat_cpu_contiguous
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_reshape_cat_contiguous_cpu(
+    const at::Tensor& mixed_qkvz,
+    const at::Tensor& mixed_ba,
+    int64_t num_heads_qk,
+    int64_t num_heads_v,
+    int64_t head_qk,
+    int64_t head_v);
+
+// image preprocessor
+std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
+    at::TensorList images,
+    bool do_convert_rgb,
+    bool do_resize,
+    int64_t shortest_edge,
+    int64_t longest_edge,
+    const std::string& interpolation,
+    bool do_rescale,
+    double rescale_factor,
+    bool do_normalize,
+    c10::ArrayRef<double> image_mean,
+    c10::ArrayRef<double> image_std,
+    int64_t patch_size,
+    int64_t temporal_patch_size,
+    int64_t merge_size,
+    bool disable_grouping,
+    at::ScalarType out_dtype);
+
+// kvcache
+void store_cache_cpu(
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& indices,
+    std::optional<int64_t> row_dim);
+
+// [NOTE] When registering kernels, we should accurately describe the in-place information.
+// Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
+// will be modified in-place to avoid incorrect fusing and execution order on graph mode.
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
@@ -353,17 +463,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_rmsnorm_cpu", torch::kCPU, &gemma_rmsnorm_cpu);
   m.def("gemma3_rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
   m.impl("gemma3_rmsnorm_cpu", torch::kCPU, &gemma3_rmsnorm_cpu);
-  m.def("layernorm_cpu(Tensor(a!) input, Tensor weight, float eps) -> ()");
+  m.def("gemma4_rmsnorm_cpu(Tensor input, Tensor weight, float eps, float scale_shift, bool with_scale) -> Tensor");
+  m.impl("gemma4_rmsnorm_cpu", torch::kCPU, &gemma4_rmsnorm_cpu);
+  m.def("layernorm_cpu(Tensor input, Tensor weight, Tensor? bias, float eps) -> Tensor");
   m.impl("layernorm_cpu", torch::kCPU, &layernorm_cpu);
   m.def("l2norm_cpu(Tensor input, float eps) -> Tensor");
   m.impl("l2norm_cpu", torch::kCPU, &l2norm_cpu);
   m.def("fused_rmsnorm_gated_cpu(Tensor input, Tensor weight, Tensor gate, float eps) -> Tensor");
   m.impl("fused_rmsnorm_gated_cpu", torch::kCPU, &fused_rmsnorm_gated_cpu);
-  m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor residual, Tensor weight, float eps) -> ()");
+  m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
-  m.def("gemma_fused_add_rmsnorm_cpu(Tensor input, Tensor residual, Tensor weight, float eps) -> ()");
+  m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
-  m.def("fused_add_layernorm_cpu(Tensor(a!) input, Tensor residual, Tensor weight, float eps) -> ()");
+  m.def(
+      "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
+      "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
 
   // topk
@@ -386,16 +500,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
+      "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap) -> ()");
+      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
   m.def(
-      "extend_attention_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
+      "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
+      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
+      "sliding_window_size, Tensor? "
+      "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -415,18 +532,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
   m.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed);
 
+  // scale prepack for mxfp4
+  m.def("convert_scale_packed(Tensor scale) -> Tensor");
+  m.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed);
+
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
-
-  // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
-  m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
-
-  // gemm fusion
-  m.def(
-      "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
-  m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
 
   // igemm
   m.def(
@@ -440,53 +552,69 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
 
+  // mxfp4 gemm
+  m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.impl("mxfp4_scaled_mm_cpu", torch::kCPU, &mxfp4_scaled_mm_cpu);
+
   // quant + igemm
   m.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType out_dtype, bool "
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // int4 gemm
   m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
   m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
 
   // weight prepack for int4 weights
   m.def(
-      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales) -> (Tensor, Tensor, "
-      "Tensor)");
+      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, int quant_method_4bit) -> (Tensor, "
+      "Tensor, Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
+#endif
+
+  // gemm
+  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
+
+  // gemm fusion
+  m.def(
+      "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
+  m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
 
   // bmm
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
+      "limit, bool is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
-
   // weight absorption
   m.def(
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
       "kv_a_proj_weight, Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
       "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? q_a_proj_scale, Tensor? "
-      "q_b_proj_scale, Tensor? "
-      "kv_a_proj_scale, bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
+      "q_b_proj_scale, Tensor? kv_a_proj_scale, Tensor? w_scale, "
+      "bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope", torch::kCPU, &qkv_proj_with_rope);
   m.def(
       "qkv_proj_with_rope_fused_weight(Tensor hidden_states, Tensor qkv_a_proj_weight, Tensor q_b_proj_weight, "
       "Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
       "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? qkv_a_proj_scale, Tensor? "
-      "q_b_proj_scale,"
+      "q_b_proj_scale, Tensor? w_scale,"
       "bool is_vnni, int[]? block_size, int q_lora_rank, int kv_lora_rank,"
       "int qk_rope_head_dim) -> (Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope_fused_weight", torch::kCPU, &qkv_proj_with_rope_fused_weight);
 
   // shared expert
   m.def(
-      "shared_expert_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor fused_experts_out, float "
+      "shared_expert_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor? fused_experts_out, float? "
       "routed_scaling_factor, bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? w1_scale, Tensor? "
       "w2_scale, int[]? block_size, bool is_vnni) -> Tensor");
   m.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu);
@@ -502,9 +630,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
 
   m.def(
-      "causal_conv1d_update_cpu(Tensor x, Tensor conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
+      "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+#else
+  // moe
+  m.def(
+      "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
+      "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
+  m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+#endif
+
+  // conv3d fast path for patch embedding
+  m.def("conv3d_embed_weight_pack(Tensor weight) -> Tensor");
+  m.impl("conv3d_embed_weight_pack", torch::kCPU, &conv3d_embed_weight_pack);
+  m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
+  m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
@@ -518,6 +660,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
+  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
+
+  // multimodal rope
+  m.def(
+      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+  m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
@@ -536,6 +686,26 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
+  // fused_qkvzba_split_reshape_cat_contiguous_cpu
+  m.def(
+      "fused_qkvzba_split_reshape_cat_contiguous_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int "
+      "num_heads_v, int "
+      "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("fused_qkvzba_split_reshape_cat_contiguous_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_contiguous_cpu);
+
+  // image preprocessor
+  m.def(
+      "image_preprocess_cpu(Tensor[] images, bool do_convert_rgb, bool do_resize, int shortest_edge, int longest_edge,"
+      "str interpolation, bool do_rescale, float rescale_factor, bool do_normalize, float[] image_mean, float[] "
+      "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
+      "out_dtype) -> (Tensor, Tensor)");
+  m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // kvcache
+  m.def(
+      "store_cache_cpu(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor indices, int? row_dim) -> "
+      "()");
+  m.impl("store_cache_cpu", torch::kCPU, &store_cache_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {

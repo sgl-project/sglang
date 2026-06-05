@@ -46,6 +46,24 @@ register_cuda_ci(
 class TestEmbeddingLoraSupport(unittest.TestCase):
     """Test LoRA support in embedding request structures."""
 
+    def test_engine_encode_validates_enable_lora(self):
+        """Test Engine.encode() validates enable_lora before processing lora_path."""
+        # Use a simple non-gated model for this validation test
+        with SRTRunner(
+            MODEL_PATH,
+            torch_dtype=torch.float16,
+            model_type="embedding",
+            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+        ) as runner:
+            # Should raise ValueError because enable_lora was not set for the server
+            with self.assertRaises(ValueError) as context:
+                runner.engine.encode(prompt="Test", lora_path="fake-adapter")
+
+            error_msg = str(context.exception)
+            self.assertIn("not enabled", error_msg.lower())
+            self.assertIn("--enable-lora", error_msg)
+            self.assertIn("fake-adapter", error_msg)
+
     def test_embedding_lora_fields(self):
         """Test LoRA fields exist and work correctly across all embedding structures."""
         # EmbeddingReqInput: fields exist, normalization expands single to batch, indexing works
