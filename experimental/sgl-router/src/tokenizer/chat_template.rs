@@ -14,11 +14,12 @@
 //! `tokenizer_config.json` — the HuggingFace built-in template, which is what
 //! the engine uses unless launched with an explicit chat-template override.
 //!
-//! Tokenization runs with `add_special_tokens = false` (see [`super::adapter::encode`]),
-//! so the rendered text must already contain `bos_token` and the role markers as
-//! literal text. That matches HuggingFace `apply_chat_template(tokenize=True)`
-//! semantics, where the template — not the tokenizer's special-token insertion —
-//! is the single source of the leading specials.
+//! Tokenization does not auto-prepend special tokens (the tokenizer's default;
+//! [`super::adapter::encode`] adds none of its own), so the rendered text must
+//! already contain `bos_token` and the role markers as literal text. That
+//! matches HuggingFace `apply_chat_template(tokenize=True)` semantics, where the
+//! template — not the tokenizer's special-token insertion — is the single source
+//! of the leading specials.
 
 use anyhow::{Context, Result};
 use minijinja::{context, Environment, Error as JinjaError, ErrorKind as JinjaErrorKind};

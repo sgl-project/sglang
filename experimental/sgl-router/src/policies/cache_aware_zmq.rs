@@ -17,12 +17,12 @@
 //!    balance_rel_threshold`, skip the cache lookup and pick the
 //!    lowest-load worker. This prevents one hot worker from dominating
 //!    cache-aware selection while every other worker idles.
-//! 2. **Tokenize.** For chat requests (`messages`) on a model that ships a
-//!    chat template, render the template and tokenize the result so the query
-//!    tokens match what the engine cached (BOS + role markers + content);
-//!    otherwise tokenize the raw `prompt`/`text`. On any failure (no body, no
-//!    tokenizer, encode error, empty tokens), fall through to step 4 (min-load
-//!    fallback).
+//! 2. **Tokenize.** For chat requests (`messages`) on a model with a chat
+//!    encoder (a Jinja template, or a built-in encoder like DeepSeek-V4's),
+//!    render it and tokenize the result so the query tokens match what the
+//!    engine cached (BOS + role markers + content); otherwise tokenize the raw
+//!    `prompt`/`text`. On any failure (no body, no tokenizer, encode error,
+//!    empty tokens), fall through to step 4 (min-load fallback).
 //! 3. **Hash + match.** Compute block hashes via
 //!    [`super::kv_events::compute_block_hashes`], query the shared hash tree
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
@@ -212,7 +212,7 @@ impl CacheAwareZmqPolicy {
     /// falls through to the raw path rather than failing the request.
     fn tokens_for_request(&self, model_id: &ModelId, body: &[u8]) -> Option<Vec<u32>> {
         let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-        if self.tokenizers.has_chat_template(&model_id.0) {
+        if self.tokenizers.has_chat_encoder(&model_id.0) {
             if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
                 if let Some(tokens) = self.tokenizers.encode_chat(&model_id.0, messages) {
                     return Some(tokens);
@@ -827,6 +827,50 @@ mod tests {
         );
     }
 
+    /// The DeepSeek-V4 built-in encoder is dispatched for chat requests when a
+    /// model has it (no Jinja template). The query tokens come from the V4
+    /// encoder, so a worker holding that encoded prefix is matched. (The V4
+    /// markers aren't special tokens in the tiny fixture, but the dispatch +
+    /// routing wiring is what's under test; byte-exact V4 token parity is pinned
+    /// by `dsv4`'s string goldens and validated live.)
+    #[test]
+    fn chat_request_routes_via_dsv4_encoder() {
+        let registry = tokenizer_registry_with_tiny();
+        registry.attach_chat_encoder_for_test("tiny", crate::tokenizer::ChatEncoder::DeepSeekV4);
+        assert!(registry.has_chat_encoder("tiny"));
+
+        let messages =
+            serde_json::json!([{"role":"user","content":"hello world hello world hello world"}]);
+        let encoded = registry.encode_chat("tiny", &messages).unwrap();
+        let block_size = 4u32;
+        let hashes = compute_block_hashes(&encoded, block_size as usize);
+        assert!(!hashes.is_empty());
+
+        let tree = Arc::new(HashTree::new());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(block_size),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "messages": messages })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "dsv4 chat request must route by the V4-encoded prefix"
+        );
+    }
+
     /// Helper: a tree holding `content`'s RAW-tokenized block hashes on w0, the
     /// two workers, and a policy — the fixture the raw-fallback routing tests
     /// share. Returns (policy, workers, model).
@@ -895,7 +939,7 @@ mod tests {
     #[test]
     fn chat_on_template_less_model_routes_by_raw_content() {
         let registry = tokenizer_registry_with_tiny(); // no template attached
-        assert!(!registry.has_chat_template("tiny"));
+        assert!(!registry.has_chat_encoder("tiny"));
         let content = "hello world hello world hello world";
         let (policy, workers, model) = raw_prefix_fixture(registry, content);
         let body = serde_json::to_vec(&serde_json::json!({

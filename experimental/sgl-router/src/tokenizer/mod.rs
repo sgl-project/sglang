@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod chat_template;
+pub mod dsv4;
 
 use anyhow::Result;
 use chat_template::ChatTemplate;
@@ -10,14 +11,37 @@ use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
 use std::sync::Arc;
 
+/// How to turn a chat request's `messages` into the prompt the engine tokenizes
+/// and caches. Cache-aware routing renders this before hashing so its query
+/// tokens match the engine's stored blocks.
+pub enum ChatEncoder {
+    /// HuggingFace Jinja chat template from `tokenizer_config.json` (most
+    /// models). Boxed: it holds a minijinja `Environment`, far larger than the
+    /// other variants.
+    Jinja(Box<ChatTemplate>),
+    /// DeepSeek-V4 ships no template; the engine encodes in code. See [`dsv4`].
+    DeepSeekV4,
+}
+
+impl ChatEncoder {
+    /// Render `messages` into the engine-equivalent prompt text.
+    fn render(&self, messages: &serde_json::Value) -> Result<String> {
+        match self {
+            ChatEncoder::Jinja(t) => t.render(messages),
+            ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages)),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TokenizerRegistry {
     inner: DashMap<String, Arc<Tokenizer>>,
-    /// Per-model chat template, present only when the model's
-    /// `tokenizer_config.json` ships a `chat_template`. Cache-aware routing
-    /// uses it to tokenize chat requests the way the engine does; models
-    /// without one fall back to raw prompt-text tokenization.
-    templates: DashMap<String, Arc<ChatTemplate>>,
+    /// Per-model chat encoder, present only when the model's prompt format is
+    /// known (a `tokenizer_config.json` chat template, or a built-in encoder
+    /// like DeepSeek-V4's). Cache-aware routing uses it to tokenize chat
+    /// requests the way the engine does; models without one fall back to raw
+    /// prompt-text tokenization.
+    encoders: DashMap<String, Arc<ChatEncoder>>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -34,60 +58,74 @@ impl TokenizerRegistry {
         let m = &cfg.model;
         let t = adapter::load(&m.tokenizer_path)?;
         me.inner.insert(m.id.clone(), t);
-        // Best-effort: a model without a chat template (or without a readable
-        // tokenizer_config.json) simply routes chat traffic via raw text.
-        // Every arm logs its outcome: whether chat-template routing is live for
-        // this model is the single most useful signal for diagnosing
-        // "cache-aware routing degraded to overlap=0 on chat traffic", so it
-        // must never be silent.
-        match adapter::load_tokenizer_config(&m.tokenizer_path) {
-            Ok(Some(cfg_json)) => match ChatTemplate::from_tokenizer_config(&cfg_json) {
-                Ok(Some(tmpl)) => {
-                    me.templates.insert(m.id.clone(), Arc::new(tmpl));
-                    tracing::info!(model = %m.id,
-                        "chat-template routing enabled; chat requests route by templated tokens");
-                }
-                Ok(None) => tracing::info!(model = %m.id,
-                    "tokenizer_config.json has no chat_template; chat traffic routes via raw prompt text"),
-                Err(e) => tracing::warn!(model = %m.id, error = %e,
-                    "failed to compile chat template; chat traffic for this model routes via raw prompt text"),
-            },
-            Ok(None) => tracing::info!(model = %m.id,
-                "no tokenizer_config.json found; chat traffic routes via raw prompt text"),
-            Err(e) => tracing::warn!(model = %m.id, error = %e,
-                "failed to load tokenizer_config.json; chat traffic for this model routes via raw prompt text"),
+        // Resolve the chat encoder, best-effort: a Jinja template from
+        // tokenizer_config.json, else a built-in encoder for a recognized model
+        // (DeepSeek-V4), else none (chat traffic routes via raw text). Every
+        // path logs its outcome — whether chat-aware routing is live for this
+        // model is the single most useful signal for diagnosing "cache-aware
+        // routing degraded to overlap=0 on chat traffic", so it must never be
+        // silent.
+        if let Some(encoder) = me.resolve_chat_encoder(&m.id, &m.tokenizer_path) {
+            me.encoders.insert(m.id.clone(), Arc::new(encoder));
         }
         Ok(me)
+    }
+
+    /// Pick the chat encoder for a model, logging the outcome on every branch.
+    fn resolve_chat_encoder(&self, model_id: &str, tokenizer_path: &str) -> Option<ChatEncoder> {
+        match adapter::load_tokenizer_config(tokenizer_path) {
+            Ok(Some(cfg_json)) => match ChatTemplate::from_tokenizer_config(&cfg_json) {
+                Ok(Some(tmpl)) => {
+                    tracing::info!(model = %model_id,
+                        "chat-template routing enabled; chat requests route by templated tokens");
+                    return Some(ChatEncoder::Jinja(Box::new(tmpl)));
+                }
+                Ok(None) => {} // no template — fall through to built-in detection
+                Err(e) => tracing::warn!(model = %model_id, error = %e,
+                    "failed to compile chat template; falling back to built-in detection"),
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!(model = %model_id, error = %e,
+                "failed to load tokenizer_config.json; falling back to built-in detection"),
+        }
+        if is_deepseek_v4(model_id) {
+            tracing::info!(model = %model_id,
+                "DeepSeek-V4 routing enabled; chat requests route via the built-in V4 encoder");
+            return Some(ChatEncoder::DeepSeekV4);
+        }
+        tracing::info!(model = %model_id,
+            "no chat template or built-in encoder; chat traffic routes via raw prompt text");
+        None
     }
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
         self.inner.get(model_id).map(|r| Arc::clone(&*r))
     }
 
-    /// Whether this model has a chat template (and thus the chat-aware
+    /// Whether this model has a chat encoder (and thus the chat-aware
     /// tokenization path is available for it).
-    pub fn has_chat_template(&self, model_id: &str) -> bool {
-        self.templates.contains_key(model_id)
+    pub fn has_chat_encoder(&self, model_id: &str) -> bool {
+        self.encoders.contains_key(model_id)
     }
 
-    /// Render `messages` through the model's chat template, then tokenize the
+    /// Render `messages` through the model's chat encoder, then tokenize the
     /// result the same way the engine does (`add_special_tokens = false`, so the
-    /// template's literal `bos_token`/role markers carry the specials). Returns
+    /// encoder's literal `bos_token`/role markers carry the specials). Returns
     /// `None` — caller falls back to raw routing — when the model has no
-    /// template, no tokenizer, or rendering/encoding produced no tokens.
+    /// encoder, no tokenizer, or rendering/encoding produced no tokens.
     pub fn encode_chat(&self, model_id: &str, messages: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
-        let template = Arc::clone(&*self.templates.get(model_id)?);
+        let encoder = Arc::clone(&*self.encoders.get(model_id)?);
         let tokenizer = self.get(model_id)?;
-        let rendered = template
+        let rendered = encoder
             .render(messages)
             .inspect_err(|e| {
                 // `?e` prints the full anyhow chain, so the underlying minijinja
                 // cause (e.g. a `raise_exception` message) is visible, not just
                 // the "render chat template" context.
                 tracing::debug!(model = %model_id, error = ?e,
-                    "chat-template render failed; falling back to raw prompt text")
+                    "chat-encoder render failed; falling back to raw prompt text")
             })
             .ok()?;
         match adapter::encode(&tokenizer, &rendered) {
@@ -95,7 +133,7 @@ impl TokenizerRegistry {
             Ok(_) => None,
             Err(e) => {
                 tracing::debug!(model = %model_id, error = %e,
-                    "chat-template tokenize failed; falling back to raw prompt text");
+                    "chat-encoder tokenize failed; falling back to raw prompt text");
                 None
             }
         }
@@ -105,9 +143,17 @@ impl TokenizerRegistry {
         self.inner.iter().map(|kv| kv.key().clone()).collect()
     }
 
-    /// Attach a chat template (built from an inline `tokenizer_config.json`
-    /// value) to an already-loaded model. Lets policy tests in other modules
-    /// exercise the chat-template routing path without a co-located fixture.
+    /// Attach a chat encoder to an already-loaded model. Lets policy tests in
+    /// other modules exercise the chat-aware routing path without a co-located
+    /// fixture.
+    #[cfg(test)]
+    pub(crate) fn attach_chat_encoder_for_test(&self, model_id: &str, encoder: ChatEncoder) {
+        self.encoders
+            .insert(model_id.to_string(), Arc::new(encoder));
+    }
+
+    /// Convenience: attach a Jinja chat encoder built from an inline
+    /// `tokenizer_config.json` value.
     #[cfg(test)]
     pub(crate) fn attach_chat_template_for_test(
         &self,
@@ -117,9 +163,18 @@ impl TokenizerRegistry {
         let template = ChatTemplate::from_tokenizer_config(tokenizer_config)
             .expect("valid test chat template")
             .expect("test tokenizer_config has a chat_template");
-        self.templates
-            .insert(model_id.to_string(), Arc::new(template));
+        self.attach_chat_encoder_for_test(model_id, ChatEncoder::Jinja(Box::new(template)));
     }
+}
+
+/// Whether `model_id` denotes a DeepSeek-V4 model, which the engine encodes via
+/// the built-in [`dsv4`] encoder rather than a Jinja template. Heuristic on the
+/// served model id (the router has no model architecture from `/server_info`);
+/// scoped to "deepseek" + "v4" so it doesn't claim V3-family models, whose
+/// encoding differs.
+fn is_deepseek_v4(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("deepseek") && id.contains("v4")
 }
 
 #[cfg(test)]
@@ -318,7 +373,7 @@ mod tests {
             "bos_token": "<s>",
         });
         reg.attach_chat_template_for_test("tiny", &cfg);
-        assert!(reg.has_chat_template("tiny"));
+        assert!(reg.has_chat_encoder("tiny"));
 
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         let chat_ids = reg.encode_chat("tiny", &messages).expect("encode_chat");
@@ -332,12 +387,7 @@ mod tests {
         );
 
         // encode_chat is exactly tokenize(render(messages)).
-        let rendered = reg
-            .templates
-            .get("tiny")
-            .unwrap()
-            .render(&messages)
-            .unwrap();
+        let rendered = reg.encoders.get("tiny").unwrap().render(&messages).unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
     }
 
@@ -348,7 +398,7 @@ mod tests {
             "tiny".into(),
             adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
         );
-        assert!(!reg.has_chat_template("tiny"));
+        assert!(!reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(reg.encode_chat("tiny", &messages).is_none());
     }
@@ -370,11 +420,21 @@ mod tests {
                 "bos_token": "<s>",
             }),
         );
-        assert!(reg.has_chat_template("tiny"));
+        assert!(reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(
             reg.encode_chat("tiny", &messages).is_none(),
             "a failing render must yield None so routing falls back to raw text"
         );
+    }
+
+    #[test]
+    fn is_deepseek_v4_matches_v4_only() {
+        assert!(is_deepseek_v4("deepseek-ai/DeepSeek-V4-Flash"));
+        assert!(is_deepseek_v4("DeepSeek-V4-Pro"));
+        // Not V4-family models.
+        assert!(!is_deepseek_v4("deepseek-ai/DeepSeek-V3.2"));
+        assert!(!is_deepseek_v4("Qwen/Qwen3-0.6B"));
+        assert!(!is_deepseek_v4("tiny"));
     }
 }
