@@ -154,9 +154,8 @@ if _is_hip:
     # import aiter
     try:
         from aiter.ops.shuffle import (
-            shuffle_scale_a16w4,
+            shuffle_scale,
             shuffle_weight,
-            shuffle_weight_a16w4,
         )
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
         from aiter.utility.fp4_utils import e8m0_shuffle
@@ -774,6 +773,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             return
         if _use_aiter:
+            # Bias must be fp32 for the AITER kernels.
             if layer.w13_weight_bias is not None:
                 layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(
                     torch.float32
@@ -781,6 +781,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if layer.w2_weight_bias is not None:
                 layer.w2_weight_bias.data = layer.w2_weight_bias.data.to(torch.float32)
 
+            # HF GPT-OSS stores w13 as gate/up *interleaved* row pairs
+            # [(g0, u0), (g1, u1), ...]. The AITER MXFP4 fused MoE kernels
+            # (FlyDSL `gate_mode="separated"` and CK `preshuffle_on`) expect
+            # the *separated* layout [gate_0..gate_{N-1}, up_0..up_{N-1}].
+            # De-interleave weights, scales, and bias before the tile shuffle
+            # so the post-shuffle bytes land in the layout the kernel reads.
             e, n, k = layer.w13_weight.shape
             layer.w13_weight.view(torch.uint8).copy_(
                 layer.w13_weight.data.view(torch.uint8)
@@ -795,26 +801,38 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(e, n, -1)
             )
-
-            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
-            shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-                self.num_experts,
-                True,
-            )
-
-            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
-            shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-                self.num_experts,
-                False,
-            )
-
             layer.w13_weight_bias.data = (
                 layer.w13_weight_bias.data.view(-1, n // 2, 2)
                 .permute(0, 2, 1)
                 .contiguous()
                 .view(-1, n)
+            )
+
+            # ATOM-aligned MXFP4 preshuffle (is_guinterleave=False). Both
+            # `gptoss_fp4_tuned_fmoe.csv` flydsl entries (e.g.
+            # flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2) and the CK
+            # `module_moe_ck2stages_*_preshuffle_on_*` fallback use the
+            # standard (16,16) tile layout produced here. The previous
+            # shuffle_weight_a16w4 path produced a gate/up-interleaved tile
+            # layout that does not match the separated-gate kernels and
+            # caused silent accuracy loss.
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight, is_guinterleave=False, gate_up=True
+            )
+            shuffled_w13_scale = shuffle_scale(
+                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                experts_cnt=self.num_experts,
+                is_guinterleave=False,
+                gate_up=True,
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight, is_guinterleave=False, gate_up=False
+            )
+            shuffled_w2_scale = shuffle_scale(
+                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                experts_cnt=self.num_experts,
+                is_guinterleave=False,
+                gate_up=False,
             )
 
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -823,6 +841,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = torch.nn.Parameter(
                 shuffled_w2_scale, requires_grad=False
             )
+
+            # Tell aiter.fused_moe these weights are already preshuffled so it
+            # picks the preshuffle_on CK / FlyDSL kernels (which match the
+            # actual layout) instead of falling back to preshuffle_off kernels
+            # that interpret the shuffled bytes as a non-shuffled tensor and
+            # produce garbage / OOB accesses.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
             return
 
@@ -1233,6 +1259,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight = layer.w13_weight
                 w2_weight = layer.w2_weight
 
+            # `.view()` creates a fresh tensor that drops the `is_shuffled`
+            # marker we set in process_weights_after_loading. Re-tag it so the
+            # downstream aiter.fused_moe selects preshuffle_on kernels.
+            if getattr(layer.w13_weight, "is_shuffled", False):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+
             x_padded = torch.nn.functional.pad(
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
@@ -1248,6 +1281,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
+                swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             )
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
