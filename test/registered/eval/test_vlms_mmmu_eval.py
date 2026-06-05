@@ -94,7 +94,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                         eval_name="mmmu",
                         num_examples=100,
                         num_threads=64,
-                        max_tokens=30,
+                        max_tokens=1024,
                     )
 
                     args.return_latency = True
