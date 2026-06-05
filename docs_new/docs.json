@@ -1054,7 +1054,6 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/autoregressive/OpenBMB/MiniCPM5-1B",
-                      "cookbook/autoregressive/OpenBMB/MiniCPM-SALA",
                       "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
                   },
