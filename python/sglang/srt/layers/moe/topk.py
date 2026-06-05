@@ -128,6 +128,11 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
+
+def _uses_per_rank_fused_shared_slots() -> bool:
+    return use_rank_local_fused_shared_experts()
+
+
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
@@ -1140,7 +1145,7 @@ def biased_grouped_topk_gpu(
         if num_fused_shared_experts > 0:
             # Append shared expert columns: ID = num_experts (first shared slot),
             # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
-            # DeepEP fusion will overwrite both in _remap_topk_ids_for_deepep_fusion.
+            # Per-rank shared-slot fusion will overwrite both in post-process.
             topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
             topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
             if routed_scaling_factor is not None:
@@ -1327,18 +1332,18 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
-def _remap_topk_for_deepep(
+def _remap_topk_for_per_rank_shared_slots(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_fused_shared_experts: int,
     num_physical_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remap TopK output to DeepEP interleaved expert layout.
+    """Remap TopK output to an interleaved per-rank shared expert layout.
 
-    DeepEP dispatch needs each rank's shared expert at a unique ID so tokens
-    route to the correct rank. The layout interleaves shared slots among
-    routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
+    DeepEP and MegaMoE dispatch need each rank's shared expert at a unique ID
+    so tokens route to the correct rank. The layout interleaves shared slots
+    among routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
 
     Routed IDs:  e -> e + e // num_local_routed
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
@@ -1351,7 +1356,7 @@ def _remap_topk_for_deepep(
     ep_rank = get_moe_expert_parallel_rank()
     # Static EPLB may add redundant physical experts. At this point routed
     # topk_ids have already been remapped from logical to physical ids, so the
-    # DeepEP interleaved layout must use the physical routed count.
+    # The interleaved layout must use the physical routed count.
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
@@ -1438,7 +1443,7 @@ def _post_process_topk_ids(
             if expert_location_dispatch_info is not None
             else router_logits.shape[1]
         )
-        topk_ids, topk_weights = _remap_topk_for_deepep(
+        topk_ids, topk_weights = _remap_topk_for_per_rank_shared_slots(
             topk_ids,
             topk_weights,
             num_fused_shared_experts,

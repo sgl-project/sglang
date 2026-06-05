@@ -358,17 +358,7 @@ def is_sbo_enabled() -> bool:
 def use_rank_local_fused_shared_experts() -> bool:
     """Whether fused shared experts need one physical slot per EP rank."""
     b = get_moe_a2a_backend()
-    if b.is_deepep() or b.is_mooncake() or b.is_mori():
-        return True
-    try:
-        server_args = get_global_server_args()
-    except ValueError:
-        return False
-    return (
-        b.is_megamoe()
-        and server_args is not None
-        and server_args.enable_deepep_waterfill
-    )
+    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_megamoe()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
