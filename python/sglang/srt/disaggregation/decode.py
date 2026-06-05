@@ -397,6 +397,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        if self.scheduler.enable_hisparse and isinstance(
+            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ):
+            device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            c4_layer_num = self.scheduler.hisparse_coordinator.mem_pool_host.layer_num
+            kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
+            kv_data_lens += device_kv_data_lens[c4_layer_num:]
+            kv_item_lens += device_kv_item_lens[c4_layer_num:]
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -932,7 +942,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
+            kv_transfer_page_size = page_size
             if self.scheduler.enable_hisparse:
+                # Direct-to-host sends host/C4 rows; keep allocator.page_size
+                # logical and use the compressed page size only for these indices.
+                kv_transfer_page_size = getattr(
+                    self.token_to_kv_pool_allocator,
+                    "hisparse_page_size",
+                    page_size,
+                )
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
                     dst_kv_indices[: origin_input_len - prefix_len]
@@ -1003,7 +1021,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1299,13 +1317,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
+
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                fill_len,
+                coordinator.host_token_len(fill_len),
             )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)

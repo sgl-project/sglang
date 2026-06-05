@@ -675,6 +675,8 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_prompt_token_ids: bool = False
+    return_meta_info: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -723,6 +725,11 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+
+    # Pre-computed prompt token IDs: when provided, bypasses chat template
+    # tokenization entirely.  Messages are still used to derive stop tokens
+    # and tool_call_constraint.
+    input_ids: Optional[List[int]] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -948,12 +955,18 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    prompt_token_ids: Optional[List[int]] = None
+    meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
+        if self.meta_info is None:
+            data.pop("meta_info", None)
         return data
 
 
