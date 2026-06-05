@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -37,6 +38,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Set instead of copy_done when the D2H readback is offloaded to the async
+    # copy worker (confidential-compute path). worker-done => copy-done.
+    copy_ready_cpu: Optional["threading.Event"] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
     speculative_num_draft_tokens: Optional[int] = None

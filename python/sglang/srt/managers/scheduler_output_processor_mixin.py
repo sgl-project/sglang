@@ -186,8 +186,7 @@ class SchedulerOutputProcessorMixin:
         skip_stream_req = None
 
         if self.is_generation:
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
+            self._wait_result_copy(result)
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -343,8 +342,7 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         else:  # embedding or reward model
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
+            self._wait_result_copy(result)
 
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -453,13 +451,24 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    def _wait_result_copy(self: Scheduler, result):
+        """Block until the result's D2H readback is complete.
+
+        Under confidential computing the copy was offloaded to the worker thread
+        (``copy_ready_cpu`` set); wait on that. Otherwise wait on the inline
+        CUDA event (``copy_done``).
+        """
+        if getattr(result, "copy_ready_cpu", None) is not None:
+            result.copy_ready_cpu.wait()
+        elif result.copy_done is not None:
+            result.copy_done.synchronize()
+
     def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+        self._wait_result_copy(result)
 
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -470,8 +479,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+        self._wait_result_copy(result)
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

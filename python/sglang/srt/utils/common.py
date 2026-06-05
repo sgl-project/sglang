@@ -661,6 +661,37 @@ def is_pin_memory_available(device=None) -> bool:
     return True
 
 
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Under bounce-buffer CC, device<->host copies are forced synchronous even
+    with ``non_blocking=True`` (the host destination is staged through an
+    encrypted bounce buffer). That breaks the overlap scheduler's per-step D2H
+    token readback. Detected once via NVML and cached. Overridable with
+    ``SGLANG_CONFIDENTIAL_COMPUTE=1/0`` (lets non-CC CI exercise the CC path,
+    and lets the NVML query be bypassed where pynvml is unavailable).
+    """
+    forced = os.environ.get("SGLANG_CONFIDENTIAL_COMPUTE")
+    if forced is not None:
+        return forced == "1"
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            # ccFeature != 0 means CC is enabled (ON or devtools).
+            return int(getattr(state, "ccFeature", 0)) != 0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("Confidential-compute detection failed: %r", e)
+        return False
+
+
 class LayerFn(Protocol):
 
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
