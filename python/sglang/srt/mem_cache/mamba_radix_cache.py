@@ -1169,9 +1169,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_store_event(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
+            # Decoding radix cache does not lock mamba ref at match.
+            direct_locks = node.full_lock_ref - sum(
+                c.full_lock_ref for c in node.children.values()
+            )
+            node.mamba_lock_ref = direct_locks
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
-            self.mamba_evictable_size_ += len(mamba_value)
+            if direct_locks > 0:
+                self.mamba_protected_size_ += len(mamba_value)
+            else:
+                self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
         else:  # mamba value already exists
             mamba_value_exist = True

@@ -888,5 +888,115 @@ class TestDecodeMambaLockRefScenarios(unittest.TestCase):
         queue._pre_alloc.assert_called_once()
 
 
+    def test_tombstone_restoration_lock_ref(self):
+        """Restoring a tombstone via cache_unfinished_req must not crash.
+
+        When skip_mamba_match=True matches to a tombstone (mamba_value=None,
+        created by _split_node), inc_lock_ref skips mamba_lock_ref. The
+        subsequent cache_unfinished_req inserts a mamba_value on that node
+        (_insert_helper tombstone restoration). Without the direct_locks fix
+        in _insert_helper, dec_lock_ref would assert mamba_lock_ref > 0.
+        """
+        tree, allocator, req_to_token_pool = self._make_mamba_cache()
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        # Insert [1,2,3,4,5] → single leaf node with mamba_value
+        mamba_slot = mamba_pool.alloc(1)
+        self._insert_with_mamba(tree, allocator, [1, 2, 3, 4, 5], mamba_slot)
+
+        # Match [1,2,3] with skip_mamba_match=True → _split_node creates:
+        #   [1,2,3] (tombstone, mamba_value=None) → [4,5] (has mamba_value)
+        result = tree.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                skip_mamba_match=True,
+            )
+        )
+        tombstone = result.last_device_node
+        self.assertEqual(len(result.device_indices), 3)
+        self.assertIsNone(tombstone.mamba_value)
+
+        # Simulate _match_prefix_and_lock: lock the tombstone
+        tree.inc_lock_ref(tombstone)
+        self.assertEqual(tombstone.mamba_lock_ref, 0)
+
+        # Create request with fill_ids=[1,2,3], write KV indices
+        req = self._make_mamba_req(req_to_token_pool, [1, 2, 3])
+        kv_indices = allocator.alloc(3)
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, 3)),
+            kv_indices,
+        )
+        req.last_node = tombstone
+        req.cache_protected_len = 0
+
+        # cache_unfinished_req restores tombstone's mamba_value, then
+        # dec_lock_ref + inc_lock_ref — must not crash
+        tree.cache_unfinished_req(req)
+
+        # Finish the request
+        tree.cache_finished_req(req)
+
+        self.assertEqual(tree.full_protected_size(), 0)
+        self.assertEqual(tree.mamba_protected_size(), 0)
+
+    def test_tombstone_restoration_multiple_locks(self):
+        """Multiple requests locked at a tombstone via skip_mamba_match.
+
+        direct_locks > 1: _insert_helper must set mamba_lock_ref for all
+        requests, not just the one whose cache_unfinished_req triggers the
+        tombstone restoration.
+        """
+        tree, allocator, req_to_token_pool = self._make_mamba_cache()
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        # Insert [1,2,3,4,5] → single leaf
+        mamba_slot = mamba_pool.alloc(1)
+        self._insert_with_mamba(tree, allocator, [1, 2, 3, 4, 5], mamba_slot)
+
+        # Match [1,2,3] → split, creating tombstone
+        result = tree.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                skip_mamba_match=True,
+            )
+        )
+        tombstone = result.last_device_node
+        self.assertIsNone(tombstone.mamba_value)
+
+        # Two requests lock the same tombstone
+        tree.inc_lock_ref(tombstone)
+        tree.inc_lock_ref(tombstone)
+        self.assertEqual(tombstone.mamba_lock_ref, 0)
+
+        # Request A restores the tombstone
+        req_a = self._make_mamba_req(req_to_token_pool, [1, 2, 3], req_pool_idx=0)
+        kv_a = allocator.alloc(3)
+        req_to_token_pool.write((req_a.req_pool_idx, slice(0, 3)), kv_a)
+        req_a.last_node = tombstone
+        req_a.cache_protected_len = 0
+
+        tree.cache_unfinished_req(req_a)
+        # After restoration, mamba_lock_ref should account for both locks
+        # (req A's dec+inc leaves net 1, plus req B's original lock = 1)
+
+        # Request B: tombstone already restored, insert finds mamba exists
+        req_b = self._make_mamba_req(req_to_token_pool, [1, 2, 3], req_pool_idx=1)
+        kv_b = allocator.alloc(3)
+        req_to_token_pool.write((req_b.req_pool_idx, slice(0, 3)), kv_b)
+        req_b.last_node = tombstone
+        req_b.cache_protected_len = 0
+
+        # Must not crash — req B's dec_lock_ref needs mamba_lock_ref > 0
+        tree.cache_unfinished_req(req_b)
+
+        # Finish both
+        tree.cache_finished_req(req_a)
+        tree.cache_finished_req(req_b)
+
+        self.assertEqual(tree.full_protected_size(), 0)
+        self.assertEqual(tree.mamba_protected_size(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
