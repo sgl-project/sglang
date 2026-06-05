@@ -51,6 +51,18 @@ if _is_musa:
 if _is_npu:
     import torch_npu
 
+# Optional fused variable-length flash-attention kernel for Intel XPU, provided
+# by sgl-kernel-xpu. When present it is the preferred vision-attention backend
+# on XPU; otherwise we fall back to triton_attn.
+_xpu_flash_attn_varlen_func = None
+if _is_xpu:
+    try:
+        from sgl_kernel.flash_attn import (
+            flash_attn_varlen_func as _xpu_flash_attn_varlen_func,
+        )
+    except ImportError:
+        _xpu_flash_attn_varlen_func = None
+
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -449,6 +461,105 @@ class VisionFlash3Attention(nn.Module):
         return output
 
 
+# Head sizes supported by the XPU flash-attention kernel. Other sizes (e.g.
+# Qwen3-VL vision uses 72) are zero-padded up to the nearest supported size.
+_XPU_FLASH_SUPPORTED_HEAD_DIMS = (64, 128, 256)
+
+
+def _xpu_pad_head_dim(head_dim: int) -> int:
+    """Round a head dim up to the nearest size the XPU flash kernel supports.
+
+    Returns ``head_dim`` unchanged if it is already supported or larger than any
+    supported size (the kernel will raise for the latter).
+    """
+    for supported in _XPU_FLASH_SUPPORTED_HEAD_DIMS:
+        if head_dim <= supported:
+            return supported
+    return head_dim
+
+
+class VisionXpuFlashAttention(nn.Module):
+    """Fused variable-length flash attention for Intel XPU.
+
+    Uses the mask-free, cu_seqlens-based varlen kernel from sgl-kernel-xpu (the
+    same kernel SGLang's text attention backend uses on XPU). Block-diagonal
+    attention is expressed via cu_seqlens, so multiple images packed in one
+    sequence are handled correctly with no attention mask and O(n) memory.
+    """
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_xpu:
+            raise Exception("VisionXpuFlashAttention is only available for xpu")
+        if _xpu_flash_attn_varlen_func is None:
+            raise Exception(
+                "VisionXpuFlashAttention requires sgl-kernel-xpu "
+                "(sgl_kernel.flash_attn.flash_attn_varlen_func)"
+            )
+        super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = int(seq_lens.max().item())
+
+        # The XPU flash kernel only supports certain head sizes (e.g. 64/128/256)
+        # and rejects others (Qwen3-VL vision uses head_dim=72). Zero-pad the head
+        # dim up to the next supported size and slice the output back. This is
+        # mathematically exact: padded dims contribute 0 to Q.K^T, and the
+        # explicit softmax_scale (1/sqrt(original head_dim)) is preserved.
+        head_dim = q.shape[-1]
+        padded_dim = _xpu_pad_head_dim(head_dim)
+        if softmax_scale is None:
+            softmax_scale = head_dim**-0.5
+        if padded_dim != head_dim:
+            pad = padded_dim - head_dim
+            q = F.pad(q, (0, pad))
+            k = F.pad(k, (0, pad))
+            v = F.pad(v, (0, pad))
+
+        output = _xpu_flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            causal=False,
+        )
+        # Some flash kernels return (output, lse, ...) tuples; take the tensor.
+        if isinstance(output, tuple):
+            output = output[0]
+        if padded_dim != head_dim:
+            output = output[..., :head_dim]
+        return output
+
+
 class VisionFlash4Attention(nn.Module):
     def __init__(
         self,
@@ -735,6 +846,7 @@ QKV_BACKEND_IMPL = {
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
     "fa4": VisionFlash4Attention,
+    "xpu_flash": VisionXpuFlashAttention,
     "flashinfer_cudnn": VisionFlashInferAttention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
@@ -940,6 +1052,7 @@ class VisionAttention(nn.Module):
         - CUDA (Hopper SM90): "fa3"
         - CUDA (Blackwell SM100): "fa4"
         - CUDA (other): "triton_attn"
+        - XPU: "xpu_flash" if sgl-kernel-xpu is present, else "triton_attn"
         - Non-CUDA: "sdpa"
         """
         override_backend = get_global_server_args().mm_attention_backend
@@ -966,7 +1079,12 @@ class VisionAttention(nn.Module):
             else:
                 backend = "triton_attn"
         elif _is_xpu:
-            backend = "triton_attn"
+            # Prefer the fused sgl-kernel-xpu varlen flash attention when
+            # available; otherwise fall back to the Triton kernel.
+            if _xpu_flash_attn_varlen_func is not None:
+                backend = "xpu_flash"
+            else:
+                backend = "triton_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():
