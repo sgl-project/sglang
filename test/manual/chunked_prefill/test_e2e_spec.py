@@ -1,7 +1,6 @@
 import unittest
 
 from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
-from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MODEL_EAGLE
 
 
 class TestChunkedFeatureSpec(ChunkedTestBase):
@@ -10,13 +9,16 @@ class TestChunkedFeatureSpec(ChunkedTestBase):
     # (positions are bs*topk vs the canary's bs-sized plan); same opt-out as
     # the scripted TestSpecBasic.
     use_kv_canary = False
-    model = DEFAULT_TARGET_MODEL_EAGLE
+    # The same proven EAGLE3 stack as the scripted TestSpecBasic: the legacy
+    # EAGLE(v1) Llama-2 pairing hits an illegal memory access under chunked
+    # prefill on this image and Llama-2-7b-chat cannot clear a gsm8k bar anyway.
+    model = "Qwen/Qwen3-8B"
     gsm8k_threshold = 0.50
     feature_args = [
         "--speculative-algorithm",
-        "EAGLE",
+        "EAGLE3",
         "--speculative-draft-model-path",
-        DEFAULT_DRAFT_MODEL_EAGLE,
+        "Tengyunw/qwen3_8b_eagle3",
         "--speculative-num-steps",
         "5",
         "--speculative-eagle-topk",
