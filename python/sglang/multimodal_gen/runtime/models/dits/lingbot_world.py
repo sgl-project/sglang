@@ -238,6 +238,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
+        self._profile_index = -1
 
     def forward(
         self,
@@ -251,6 +252,22 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         cache_start: int | None = None,
         update_cache_only: bool = False,
     ):
+        forward_context = get_forward_context()
+        profile_prefix = None
+        if (
+            os.environ.get("SGLANG_DIFFUSION_PROFILE_LINGBOT_SECTIONS", "0") == "1"
+            and forward_context.current_timestep < 0
+        ):
+            profile_prefix = (
+                f"LingBotTransformer.context.block{self._profile_index:02d}.self_attn"
+            )
+        section_profile = None
+        if profile_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{profile_prefix}.rope",
+                q,
+                forward_context,
+            )
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
         if _is_cuda and q.dim() == 4 and q.shape == k.shape:
@@ -270,7 +287,11 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         else:
             roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
             roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
-        forward_batch = get_forward_context().forward_batch
+        if profile_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, roped_query, forward_context
+            )
+        forward_batch = forward_context.forward_batch
         seq_splits = None
         sequence_shard_enabled = (
             kv_cache is not None
@@ -307,20 +328,42 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             qkv = _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
+        section_profile = None
+        if profile_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{profile_prefix}.kv_update",
+                roped_key,
+                forward_context,
+            )
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
             current_chunk_start=current_start,
             debug_name="LingBot KV cache",
         )
+        if profile_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, roped_key, forward_context
+            )
         if update_cache_only:
             return v
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
+        section_profile = None
+        if profile_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{profile_prefix}.attention",
+                roped_query,
+                forward_context,
+            )
         x = attn_impl(
             roped_query,
             cache_view.k,
             cache_view.v,
         )
+        if profile_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, x, forward_context
+            )
         if sequence_shard_enabled:
             assert seq_splits is not None
             x = _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
@@ -1275,6 +1318,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         )
         for block_index, block in enumerate(self.blocks):
             block._profile_index = block_index
+            block.attn1._profile_index = block_index
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
