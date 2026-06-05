@@ -377,6 +377,37 @@ class RefinerChunkRunner:
 
     @torch.inference_mode()
     def refine_block(self, *, block_idx, clean_block, block_start, block_end, sink_seed_frames=None):
+        # parity harness (env-gated, no-op in prod): per-block input/config/output
+        # checksums; both the batch stage and the realtime stage run through here.
+        _probe_dir = __import__("os").environ.get("SANAWM_RT_DUMP_DIR") or __import__(
+            "os"
+        ).environ.get("SANAWM_FORK_DUMP_DIR")
+        _probe = None
+        if _probe_dir:
+            def _ck(t):
+                return (
+                    (tuple(t.shape), float(t.detach().float().double().sum().item()))
+                    if t is not None
+                    else None
+                )
+            _probe = {
+                "block_idx": int(block_idx),
+                "block_start": int(block_start),
+                "block_end": int(block_end),
+                "clean_block": _ck(clean_block),
+                "sink_seed_frames": _ck(sink_seed_frames),
+                "prompt_embeds": _ck(self.prompt_embeds),
+                "prompt_attention_mask": _ck(self.prompt_attention_mask),
+                "fps": self.fps,
+                "sigmas": [float(s) for s in self.sigmas],
+                "source_sink_frames": self.source_sink_frames,
+                "block_size": self.block_size,
+                "kv_max_frames": self.kv_max_frames,
+                "history_frames": self.history_frames,
+                "generator_state": float(
+                    self.generator.get_state().double().sum().item()
+                ),
+            }
         del block_idx
         refiner = self.refiner
         if block_start < self.source_sink_frames:
@@ -447,6 +478,14 @@ class RefinerChunkRunner:
                 if old is not None:
                     self.history_kv_post[layer_idx] = (old[0][:, -keep_tokens:], old[1][:, -keep_tokens:])
             self.history_frames = self.max_history_frames
+        if _probe is not None:
+            _probe["refined"] = (
+                tuple(x_t.shape),
+                float(x_t.detach().float().double().sum().item()),
+            )
+            torch.save(
+                _probe, f"{_probe_dir}/refiner_probe_{_probe['block_idx']:03d}.pt"
+            )
         return x_t
 
 

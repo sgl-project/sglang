@@ -946,33 +946,52 @@ class SanaWMRealtimeStage(PipelineStage):
             return None
         _, end_f = advanced
 
-        # Refine the freshly generated stage-1 chunk, carrying sink/history KV.
-        # ``refined_full`` holds sink frame(s) + all refined frames so far, so its
-        # length is the next block's start.
-        start_f = state.refined_full.shape[2]
-        clean = state.session.latents[:, :, start_f:end_f].contiguous()
-        sink_seed = (
-            state.session.latents[:, :, : state.sink_size]
-            if start_f == state.sink_size
-            else None
-        )
-        refined = state.refiner_runner.refine_block(
-            block_idx=start_f,
-            clean_block=clean,
-            block_start=start_f,
-            block_end=end_f,
-            sink_seed_frames=sink_seed,
-        )
-        state.refined_full = torch.cat(
-            [state.refined_full, refined.to(state.refined_full.dtype)], dim=2
-        )
-        state.next_ref_idx += 1
+        # Refine on the UNIFORM block grid (sink + i*block_size), exactly like the
+        # batch SanaWMStreamingRefinerStage and the official streaming reference —
+        # NOT on the (front-loaded) stage-1 chunk grid. Refining per stage-1 chunk
+        # made block 0 span 4 frames ([1,5) instead of [1,4)), shifting every block
+        # boundary, the refiner KV history, and the per-block noise draws — the
+        # refined latents diverged from batch even with bitwise-identical stage-1.
+        # Frames past the last complete block stay buffered in session.latents
+        # until the next chunk supplies the rest of their block (the short tail
+        # at the horizon end is refined as-is, mirroring batch's last block).
+        block_size = int(state.refiner_block_size)
+        horizon = int(state.latent_t)
+        frontier = state.refined_full.shape[2]
+        while True:
+            block_start = frontier
+            block_end = min(block_start + block_size, horizon)
+            if block_end <= block_start or block_end > end_f:
+                break
+            sink_seed = (
+                state.session.latents[:, :, : state.sink_size]
+                if block_start == state.sink_size
+                else None
+            )
+            refined = state.refiner_runner.refine_block(
+                block_idx=state.next_ref_idx,
+                clean_block=state.session.latents[
+                    :, :, block_start:block_end
+                ].contiguous(),
+                block_start=block_start,
+                block_end=block_end,
+                sink_seed_frames=sink_seed,
+            )
+            state.refined_full = torch.cat(
+                [state.refined_full, refined.to(state.refined_full.dtype)], dim=2
+            )
+            state.next_ref_idx += 1
+            frontier = block_end
 
+        # Decode the newly refined region (the official streaming reference also
+        # decodes on the refiner-block grid: decode_chunks == refiner_blocks).
+        if frontier <= state.next_dec_idx:
+            return None
         src = state.refined_full
-        seg = src[:, :, state.next_dec_idx : end_f]
+        seg = src[:, :, state.next_dec_idx : frontier]
         frames = self._decode_chunk(seg, state, server_args, vae_dtype=vae_dtype)
-        self._store_rollover_first_latent(state, src, end_f - 1)
-        state.next_dec_idx = end_f
+        self._store_rollover_first_latent(state, src, frontier - 1)
+        state.next_dec_idx = frontier
         return frames
 
     @torch.inference_mode()
