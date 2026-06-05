@@ -37,6 +37,11 @@ class TestKVPressureBasic(ScriptedTestCase):
             prompt_len=warm_len, max_new_tokens=1, prompt_token=warm_token
         )
         yield from run_until_finished(r_warm)
+        # A second, distinct warm prefix: with a single cached node in the tree,
+        # exhaust_lock_refs(leave_refs=1) would leave exactly that node unpinned
+        # and pin nothing.
+        r_warm2 = t.start_req(prompt_len=warm_len, max_new_tokens=1, prompt_token=8)
+        yield from run_until_finished(r_warm2)
         assert r_warm.finished
         # the overlap scheduler drops the finished req's protective lock a few
         # steps after the finish is observed; drain before asserting.
@@ -92,52 +97,6 @@ class TestKVPressureBasic(ScriptedTestCase):
                 f"node {node_id} lock_ref leaked: baseline={baseline}, "
                 f"final={final_lock_refs.get(node_id, 0)}"
             )
-
-    def test_kv_recovery_after_full(self):
-        self.server.execute_script(self._script_kv_recovery_after_full)
-
-    @staticmethod
-    def _script_kv_recovery_after_full(t: ScriptedContext):
-        baseline = t.engine_stats()["kv_pool_free"]
-        # Honest pressure pattern: the raw exhauster takes every free page (leave
-        # zero), so a fresh non-chunked 16-token req cannot be admitted at all and
-        # is stuck waiting. Confirm it stays waiting under the full pool, release
-        # the exhauster, then confirm it is admitted, completes, and the pool
-        # recovers to baseline.
-        # leave_pages must stay positive: the kv-canary integrity layer itself
-        # allocates a few pages during its sweep, and a literally-zero pool
-        # wedges the engine; 8 pages still keep a 16-token req unadmittable.
-        t.exhaust_kv(leave_pages=8)
-        yield
-
-        r = t.start_req(prompt_len=16, max_new_tokens=2)
-        for _ in range(6):
-            yield
-        assert (
-            r.status == "waiting"
-        ), f"req must be unschedulable under a full pool; status={r.status}"
-
-        t._release_exhausted_pools()
-        yield
-        yield from run_until(r, lambda h: h.finished, max_steps=3000)
-        assert r.finished
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
-
-        # The finished prompt stays cached in the radix tree; drain to idle and
-        # flush before the leak check so the pool returns to its pre-pressure
-        # baseline.
-        for _ in range(40):
-            if t.is_fully_idle:
-                break
-            yield
-        t.flush_cache()
-        yield
-        final = t.engine_stats()["kv_pool_free"]
-        assert final >= baseline, (
-            f"KV pool failed to recover post-pressure: baseline={baseline}, "
-            f"final={final}"
-        )
 
     def test_kv_pressure_with_retract_resume(self):
         self.server.execute_script(self._script_kv_pressure_with_retract_resume)
@@ -568,6 +527,62 @@ class TestKVPressureSmallPool(ScriptedTestCase):
         assert final >= baseline, (
             f"KV pool not recovered after abort-under-pressure: "
             f"baseline={baseline}, final={final}"
+        )
+
+    def test_kv_recovery_after_full(self):
+        self.server.execute_script(self._script_kv_recovery_after_full)
+
+    @staticmethod
+    def _script_kv_recovery_after_full(t: ScriptedContext):
+        baseline = t.engine_stats()["kv_pool_free"]
+        # Engine-native pressure: two long-lived ballast decode reqs fill the
+        # small pool's rem_total (held tokens + clipped decode reservations), so
+        # a fresh 16-token req cannot admit and parks in waiting_queue. Aborting
+        # the ballasts is the real release path; the newcomer then completes and
+        # the pool recovers to baseline.
+        b1 = t.start_req(
+            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+            max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+            ignore_eos=True,
+            prompt_token=620,
+        )
+        b2 = t.start_req(
+            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+            max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+            ignore_eos=True,
+            prompt_token=621,
+        )
+        yield from run_until(b1, lambda h: h.status == "running")
+        yield from run_until(b2, lambda h: h.status == "running")
+
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+        for _ in range(6):
+            yield
+        assert (
+            r.status == "waiting"
+        ), f"req must be unschedulable under a full pool; status={r.status}"
+
+        t.abort(b1)
+        t.abort(b2)
+        yield
+        yield from run_until(r, lambda h: h.finished, max_steps=3000)
+        assert r.finished
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+
+        # The finished prompt stays cached in the radix tree; drain to idle and
+        # flush before the leak check so the pool returns to its pre-pressure
+        # baseline.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        t.flush_cache()
+        yield
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"KV pool failed to recover post-pressure: baseline={baseline}, "
+            f"final={final}"
         )
 
 

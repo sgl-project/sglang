@@ -7,6 +7,9 @@ from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
+    SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+    SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+    SMALL_KV_POOL_MAX_TOTAL_TOKENS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -253,85 +256,6 @@ class TestAbortBasic(ScriptedTestCase):
             f"abort-after-finish must not move KV pool; "
             f"before={kv_pool_free_before} after={kv_pool_free_after}"
         )
-
-    def test_waiting_timeout_sweep_aborts_pressured_waiting_req(self):
-        self.server.execute_script(
-            self._script_waiting_timeout_sweep_aborts_pressured_waiting_req
-        )
-
-    @staticmethod
-    def _script_waiting_timeout_sweep_aborts_pressured_waiting_req(t: ScriptedContext):
-        # NOTE: source-true behavior of the waiting-timeout sweep. The scheduler
-        # runs _abort_on_waiting_timeout() at the top of get_next_batch_to_run on
-        # every NON-paused iteration (only when SGLANG_REQ_WAITING_TIMEOUT > 0).
-        # It scans the WHOLE waiting_queue and aborts every req whose
-        # wait_queue_entry_time is older than the deadline -- there is NO
-        # chunked-resume immunity guard, so a parked chunked-resume req (which
-        # also lives in waiting_queue carrying its original entry_time) is swept
-        # out exactly like any other waiting req. This test drives that sweep
-        # through the REAL event loop -- no pause, no scheduler-private call -- by
-        # holding a req in waiting_queue under real KV pressure and letting the
-        # loop's own sweep abort it.
-        #
-        # The timeout-abort path only notifies the tokenizer and drops the req
-        # from waiting_queue; it does NOT itself release KV/row (the req under
-        # test never held any, since it never got admitted). So the observable
-        # consequence asserted here is removal from waiting_queue + aborted status.
-
-        # Real admission pressure: grab every free KV page so the scheduler can
-        # never admit the req, yet the loop keeps running get_next_batch_to_run
-        # (and thus the sweep) every iteration.
-        # leave_pages must stay positive: the kv-canary integrity layer itself
-        # allocates a few pages during its sweep, and a literally-zero pool
-        # wedges the engine; 8 pages still keep a 16-token req unadmittable.
-        t.exhaust_kv(leave_pages=8)
-
-        r = t.start_req(prompt_len=16, max_new_tokens=2)
-
-        def waiting_rids():
-            return {req.rid for req in t.scheduler.waiting_queue}
-
-        # The req parks in waiting_queue with a real wait_queue_entry_time set by
-        # _add_request_to_queue; it cannot be admitted because there is no free KV.
-        yield from run_until(r, lambda h: r.rid in waiting_rids())
-        assert r.kv_pages == 0, "pressured waiting req must not own KV before admission"
-
-        # Enable the timeout with a value tiny enough that, after the req has been
-        # queued and a couple of real-time yields pass, entry_time is already past
-        # perf_counter() - timeout_s. The override stays active across the yields
-        # below (the script frame is suspended inside the with-block), so the
-        # scheduler reads it when it runs the sweep at the top of
-        # get_next_batch_to_run on each non-paused iteration.
-        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-6):
-            # Drive the REAL loop until the scheduler's own sweep removes the req
-            # from waiting_queue.
-            for _ in range(DEFAULT_MAX_STEPS):
-                if r.rid not in waiting_rids():
-                    break
-                yield
-            else:
-                raise AssertionError(
-                    f"waiting-timeout sweep never removed the req from "
-                    f"waiting_queue after {DEFAULT_MAX_STEPS} steps; "
-                    f"waiting_rids={waiting_rids()!r}"
-                )
-
-        assert r.rid not in waiting_rids(), (
-            f"the loop's waiting-timeout sweep must drop the timed-out waiting "
-            f"req from waiting_queue; got {waiting_rids()!r}"
-        )
-        assert r.status in ("finished", "unknown"), (
-            f"swept-out req must be aborted (gone from every live scheduler "
-            f"structure); got status={r.status!r}"
-        )
-        assert r.kv_pages == 0, "timeout-abort of an unadmitted req owns no KV"
-
-        # exhaust_kv(leave_pages=0) holds raw KV pages with no backing Req, so
-        # nothing in the engine ever frees them. As the last alphabetical method in
-        # this class there is no subsequent _reset_engine_state to release them, and
-        # the graceful-shutdown drain in tearDownClass would hang on the held pool.
-        # Release the exhausted pages explicitly so shutdown can complete.
-        t._release_exhausted_pools()
 
     def test_abort_chunk_last(self):
         self.server.execute_script(self._script_abort_chunk_last)
@@ -709,6 +633,104 @@ class TestAbortPP(ScriptedTestCase):
         assert r.req is None or r.req.req_pool_idx is None
         assert r.lock_refs == 0
         assert r.finished
+
+
+class TestAbortSmallPool(ScriptedTestCase):
+    # A capped KV pool lets two real ballast decode reqs create genuine,
+    # engine-resolvable admission pressure; raw exhaust_kv pages have no backing
+    # Req and repeatedly wedged the engine (unkillable teardown hangs).
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        max_total_tokens=SMALL_KV_POOL_MAX_TOTAL_TOKENS,
+    )
+
+    def test_waiting_timeout_sweep_aborts_pressured_waiting_req(self):
+        self.server.execute_script(
+            self._script_waiting_timeout_sweep_aborts_pressured_waiting_req
+        )
+
+    @staticmethod
+    def _script_waiting_timeout_sweep_aborts_pressured_waiting_req(t: ScriptedContext):
+        # NOTE: source-true behavior of the waiting-timeout sweep. The scheduler
+        # runs _abort_on_waiting_timeout() at the top of get_next_batch_to_run on
+        # every NON-paused iteration (only when SGLANG_REQ_WAITING_TIMEOUT > 0).
+        # It scans the WHOLE waiting_queue and aborts every req whose
+        # wait_queue_entry_time is older than the deadline -- there is NO
+        # chunked-resume immunity guard, so a parked chunked-resume req (which
+        # also lives in waiting_queue carrying its original entry_time) is swept
+        # out exactly like any other waiting req. This test drives that sweep
+        # through the REAL event loop -- no pause, no scheduler-private call -- by
+        # holding a req in waiting_queue under real KV pressure and letting the
+        # loop's own sweep abort it.
+        #
+        # The timeout-abort path only notifies the tokenizer and drops the req
+        # from waiting_queue; it does NOT itself release KV/row (the req under
+        # test never held any, since it never got admitted). So the observable
+        # consequence asserted here is removal from waiting_queue + aborted status.
+
+        # Real admission pressure, engine-native: two long-lived ballast decode
+        # reqs fill the small pool's rem_total (held tokens + clipped decode
+        # reservations), so the 16-token newcomer cannot admit -- yet the loop
+        # keeps running get_next_batch_to_run (and thus the sweep) every step.
+        b1 = t.start_req(
+            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+            max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+            ignore_eos=True,
+            prompt_token=300,
+        )
+        b2 = t.start_req(
+            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+            max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
+            ignore_eos=True,
+            prompt_token=301,
+        )
+        yield from run_until(b1, lambda h: h.status == "running")
+        yield from run_until(b2, lambda h: h.status == "running")
+
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+
+        def waiting_rids():
+            return {req.rid for req in t.scheduler.waiting_queue}
+
+        # The req parks in waiting_queue with a real wait_queue_entry_time set by
+        # _add_request_to_queue; it cannot be admitted because there is no free KV.
+        yield from run_until(r, lambda h: r.rid in waiting_rids())
+        assert r.kv_pages == 0, "pressured waiting req must not own KV before admission"
+
+        # Enable the timeout with a value tiny enough that, after the req has been
+        # queued and a couple of real-time yields pass, entry_time is already past
+        # perf_counter() - timeout_s. The override stays active across the yields
+        # below (the script frame is suspended inside the with-block), so the
+        # scheduler reads it when it runs the sweep at the top of
+        # get_next_batch_to_run on each non-paused iteration.
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-6):
+            # Drive the REAL loop until the scheduler's own sweep removes the req
+            # from waiting_queue.
+            for _ in range(DEFAULT_MAX_STEPS):
+                if r.rid not in waiting_rids():
+                    break
+                yield
+            else:
+                raise AssertionError(
+                    f"waiting-timeout sweep never removed the req from "
+                    f"waiting_queue after {DEFAULT_MAX_STEPS} steps; "
+                    f"waiting_rids={waiting_rids()!r}"
+                )
+
+        assert r.rid not in waiting_rids(), (
+            f"the loop's waiting-timeout sweep must drop the timed-out waiting "
+            f"req from waiting_queue; got {waiting_rids()!r}"
+        )
+        assert r.status in ("finished", "unknown"), (
+            f"swept-out req must be aborted (gone from every live scheduler "
+            f"structure); got status={r.status!r}"
+        )
+        assert r.kv_pages == 0, "timeout-abort of an unadmitted req owns no KV"
+
+        # Clean up the ballasts so teardown starts from a drained engine.
+        t.abort(b1)
+        t.abort(b2)
+        yield from _drain_until_released(t, b1, b2)
 
 
 if __name__ == "__main__":
