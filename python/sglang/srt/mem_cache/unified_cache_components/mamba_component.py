@@ -52,6 +52,7 @@ class MambaComponent(TreeComponent):
             ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {cache.page_size}"
         super().__init__(cache, params)
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -307,8 +308,8 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
+                    req
                 )
                 mamba_value = (
                     req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
@@ -322,16 +323,12 @@ class MambaComponent(TreeComponent):
                 return 0
             # Donate the mamba index to the radix cache instead of copying.
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
+                new_slot = self._alloc_mamba_slot()
                 mamba_value_donated = (
-                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                    self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
+                        req, new_slot
+                    )
                 )
-                req.mamba_ping_pong_track_buffer[keep_idx] = self._alloc_mamba_slot()[0]
-                self.cache.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                    req.req_pool_idx
-                ] = req.mamba_ping_pong_track_buffer
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
                 self.cache.req_to_token_pool.mamba_pool.copy_from(
@@ -352,8 +349,8 @@ class MambaComponent(TreeComponent):
                 insert_result.mamba_exist if insert_result is not None else True
             )
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
+                    req
                 )
             else:
                 keep_idx = None
