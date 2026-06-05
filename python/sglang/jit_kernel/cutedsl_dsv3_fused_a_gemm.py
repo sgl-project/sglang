@@ -32,6 +32,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 
 from sglang.srt.utils import get_device_sm
+from sglang.srt.utils.common import direct_register_custom_op
 
 TILE_M = 16
 TILE_K = 256
@@ -334,12 +335,7 @@ def _compiled_kernel(num_kt: int, gemm_m: int, tile_n: int):
     return _compiled[(num_kt, gemm_m, tile_n)]
 
 
-def dsv3_fused_a_gemm(
-    mat_a: torch.Tensor, mat_b: torch.Tensor, out: torch.Tensor | None = None
-) -> torch.Tensor:
-    """out[M, N] = mat_a[M, K] @ mat_b, with mat_a row-major [M, K] (M in [1, 16]),
-    mat_b column-major [K, N] (the weight, stride(0) == 1), N a multiple of 16
-    (e.g. 2112, 6144), K a multiple of 1024."""
+def _dsv3_fused_a_gemm_run(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     M, K = mat_a.shape
     N = mat_b.shape[1]
     assert mat_a.dtype == torch.bfloat16 and mat_b.dtype == torch.bfloat16
@@ -354,8 +350,7 @@ def dsv3_fused_a_gemm(
     weight = mat_b.t()
     if not weight.is_contiguous():
         weight = weight.contiguous()
-    if out is None:
-        out = torch.empty(M, N, dtype=torch.bfloat16, device=mat_a.device)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device=mat_a.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     _compiled_kernel(K // TILE_K, N, _pick_tile_n(M))(
@@ -366,3 +361,28 @@ def dsv3_fused_a_gemm(
         stream,
     )
     return out
+
+
+def _dsv3_fused_a_gemm_fake(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+    return mat_a.new_empty((mat_a.shape[0], mat_b.shape[1]), dtype=torch.bfloat16)
+
+
+direct_register_custom_op(
+    op_name="cutedsl_dsv3_fused_a_gemm",
+    op_func=_dsv3_fused_a_gemm_run,
+    mutates_args=[],
+    fake_impl=_dsv3_fused_a_gemm_fake,
+)
+
+
+def dsv3_fused_a_gemm(
+    mat_a: torch.Tensor, mat_b: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """out[M, N] = mat_a[M, K] @ mat_b, with mat_a row-major [M, K] (M in [1, 16]),
+    mat_b column-major [K, N] (the weight, stride(0) == 1), N a multiple of 16
+    (e.g. 2112, 6144), K a multiple of 1024."""
+    result = torch.ops.sglang.cutedsl_dsv3_fused_a_gemm(mat_a, mat_b)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
