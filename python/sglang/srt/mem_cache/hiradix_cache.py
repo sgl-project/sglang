@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
@@ -77,6 +77,10 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        raw_storage_extra_config = self._load_storage_backend_extra_config(
+            server_args.hicache_storage_backend_extra_config
+        )
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -85,6 +89,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                allocator_config=raw_storage_extra_config,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
@@ -97,6 +102,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                allocator_config=raw_storage_extra_config,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
@@ -116,9 +122,7 @@ class HiRadixCache(RadixCache):
             prefetch_threshold,
             prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
-        ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
-        )
+        ) = self._parse_storage_backend_extra_config(raw_storage_extra_config)
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
@@ -541,47 +545,62 @@ class HiRadixCache(RadixCache):
         _drain_backup()
         _drain_release()
 
-    def _parse_storage_backend_extra_config(
+    def _load_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
+    ) -> Dict[str, Any]:
+        """Load storage backend extra config from a JSON string or @file pointer.
+
+        Centralized so callers that need the dict (e.g. allocator_config for the
+        pool host) and callers that just want extracted fields share one parse.
+        Accepts a JSON string or "@<path>.{json,toml,yaml,yml}".
+        """
+        if not storage_backend_extra_config:
+            return {}
+        try:
+            if storage_backend_extra_config.startswith("@"):
+                path = storage_backend_extra_config[1:]
+                ext = os.path.splitext(path)[1].lower()
+                with open(path, "rb" if ext == ".toml" else "r") as f:
+                    if ext == ".json":
+                        return json.load(f)
+                    elif ext == ".toml":
+                        import tomllib
+
+                        return tomllib.load(f)
+                    elif ext in (".yaml", ".yml"):
+                        import yaml
+
+                        return yaml.safe_load(f)
+                    else:
+                        raise ValueError(
+                            f"Unsupported config file {path} (config format: {ext})"
+                        )
+            return json.loads(storage_backend_extra_config)
+        except Exception as e:
+            logger.error(f"Invalid backend extra config JSON: {e}")
+            raise
+
+    def _parse_storage_backend_extra_config(
+        self, storage_backend_extra_config: Optional[Dict[str, Any] | str]
     ):
         """
         Parse storage backend extra config JSON and extract specific parameters.
 
         Args:
-            storage_backend_extra_config: JSON string containing extra configuration
+            storage_backend_extra_config: JSON string, "@<path>.{json,toml,yaml}"
+                file pointer, or an already-loaded dict (the latter avoids a
+                redundant parse when the caller has already invoked
+                ``_load_storage_backend_extra_config``).
 
         Returns:
             tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_config, hicache_storage_pass_prefix_keys)
         """
-        # Parse extra config if provided. Extra config can be a JSON string or a json/toml/yaml file path prefixed with "@".
-        extra_config = {}
-        if storage_backend_extra_config:
-            try:
-                if storage_backend_extra_config.startswith("@"):
-                    # Read config from a json/toml/yaml file
-                    path = storage_backend_extra_config[1:]
-                    ext = os.path.splitext(path)[1].lower()
-                    with open(path, "rb" if ext == ".toml" else "r") as f:
-                        if ext == ".json":
-                            extra_config = json.load(f)
-                        elif ext == ".toml":
-                            import tomllib
-
-                            extra_config = tomllib.load(f)
-                        elif ext in (".yaml", ".yml"):
-                            import yaml
-
-                            extra_config = yaml.safe_load(f)
-                        else:
-                            raise ValueError(
-                                f"Unsupported config file {path} (config format: {ext})"
-                            )
-                else:
-                    # read config from JSON string
-                    extra_config = json.loads(storage_backend_extra_config)
-            except Exception as e:
-                logger.error(f"Invalid backend extra config JSON: {e}")
-                raise e
+        if isinstance(storage_backend_extra_config, str):
+            extra_config = self._load_storage_backend_extra_config(
+                storage_backend_extra_config
+            )
+        else:
+            extra_config = dict(storage_backend_extra_config or {})
 
         defaults = PrefetchTimeoutConfig()
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)  # tokens
@@ -1334,6 +1353,15 @@ class HiRadixCache(RadixCache):
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
+        logger.debug(
+            "HiCache prefetch finalized for rid=%s min_completed_tokens=%d matched_length=%d "
+            "inserted_host_tokens=%d",
+            req_id,
+            min_completed_tokens,
+            matched_length,
+            loaded_from_storage,
+        )
+
         return True
 
     def terminate_prefetch(self, req_id: str):
@@ -1407,6 +1435,15 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
+            logger.debug(
+                "HiCache prefetch not enqueued for rid=%s enable_storage=%s prefetch_length=%d "
+                "threshold=%d rate_limited=%s",
+                req_id,
+                self.enable_storage,
+                prefetch_length,
+                self.prefetch_threshold,
+                self.cache_controller.prefetch_rate_limited(),
+            )
             return
 
         last_host_node.protect_host()
@@ -1436,6 +1473,13 @@ class HiRadixCache(RadixCache):
             last_hash,
             prefix_keys,
             **self._get_extra_pools(),
+        )
+        logger.debug(
+            "HiCache prefetch enqueued for rid=%s prefetch_length=%d last_hash=%s prefix_keys=%d",
+            req_id,
+            prefetch_length,
+            last_hash,
+            len(prefix_keys) if prefix_keys is not None else 0,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
