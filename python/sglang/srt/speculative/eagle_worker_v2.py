@@ -16,6 +16,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
@@ -365,10 +366,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
-            isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
-            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
-            or isinstance(self.draft_extend_attn_backend, TokenspeedMLABackend)
+        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and isinstance(
+            self.draft_extend_attn_backend,
+            (
+                TritonAttnBackend,
+                TRTLLMMLABackend,
+                TRTLLMHAAttnBackend,
+                TokenspeedMLABackend,
+            ),
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
@@ -769,6 +774,8 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
+        # The draft-extend graph only anchors full logits; selected-row topk is
+        # owned by the worker for both graph and eager paths.
         if self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
