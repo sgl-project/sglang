@@ -242,7 +242,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
 
     def forward(
         self,
-        q: torch.Tensor | None,
+        q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, ...],
@@ -265,15 +265,12 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         if profile_prefix is not None:
             section_profile = _profile_lingbot_context_section(
                 f"{profile_prefix}.rope",
-                q if q is not None else k,
+                q,
                 forward_context,
             )
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
-        if q is None:
-            roped_query = None
-            roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
-        elif _is_cuda and q.dim() == 4 and q.shape == k.shape:
+        if _is_cuda and q.dim() == 4 and q.shape == k.shape:
             if cos_sin_cache is None:
                 cos_sin_cache = torch.cat(
                     [
@@ -292,9 +289,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
         if profile_prefix is not None:
             _record_lingbot_context_section_profile(
-                section_profile,
-                roped_query if roped_query is not None else roped_key,
-                forward_context,
+                section_profile, roped_query, forward_context
             )
         forward_batch = forward_context.forward_batch
         seq_splits = None
@@ -328,15 +323,10 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                     "LingBot causal sequence sharding requires forward_batch.sequence_shard_splits."
                 )
             seq_splits = list(seq_splits)
-            if roped_query is None:
-                kv = torch.cat([roped_key, v], dim=-1)
-                kv = _usp_input_all_to_all_varlen(kv, seq_splits, head_dim=2)
-                roped_key, v = kv.chunk(2, dim=-1)
-            else:
-                # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
-                qkv = torch.cat([roped_query, roped_key, v], dim=-1)
-                qkv = _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
-                roped_query, roped_key, v = qkv.chunk(3, dim=-1)
+            # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
+            qkv = torch.cat([roped_query, roped_key, v], dim=-1)
+            qkv = _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
+            roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
         section_profile = None
         if profile_prefix is not None:
@@ -357,7 +347,6 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
         if update_cache_only:
             return v
-        assert roped_query is not None
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         section_profile = None
         if profile_prefix is not None:
@@ -1132,16 +1121,10 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             .flatten(1, 2)
             .to(orig_dtype)
         )
-        if update_cache_only:
-            query = None
-            key, _ = self.to_k(norm_hidden_states)
-            value, _ = self.to_v(norm_hidden_states)
-        else:
-            query, key, value = self._project_qkv(norm_hidden_states)
-            query = self.norm_q(query)
+        query, key, value = self._project_qkv(norm_hidden_states)
+        query = self.norm_q(query)
         key = self.norm_k(key)
-        if query is not None:
-            query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         if block_prefix is not None:
