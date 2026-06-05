@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ProfileReq,
+    RpcReqInput,
+    RpcReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -177,6 +179,20 @@ class DataParallelController:
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
 
+        # RPC fan-out: the controller relays rpc calls from the Engine to every
+        # dp worker and aggregates their responses. The per-dp-rank rpc sockets
+        # are bound (node 0 only) in launch_dp_attention_schedulers /
+        # launch_dp_schedulers depending on the parallelism mode.
+        self.rpc_workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.rpc_results: List[Optional[RpcReqOutput]] = [None] * server_args.dp_size
+        self.rpc_poller = zmq.Poller()
+        self.recv_from_rpc = None
+        if server_args.node_rank == 0:
+            # Connect to the rpc socket bound by the Engine (top-level rpc port).
+            self.recv_from_rpc = get_zmq_socket(
+                self.context, zmq.DEALER, port_args.rpc_ipc_name, False
+            )
+
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
@@ -189,6 +205,10 @@ class DataParallelController:
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        # rpc_results is indexed in lockstep with rpc_workers: a single global
+        # entry under dp attention, one per replica under plain DP.
+        self.rpc_results = [None] * len(self.rpc_workers)
 
         self.init_dispatcher()
 
@@ -304,6 +324,15 @@ class DataParallelController:
                     tmp_port_args.scheduler_input_ipc_name,
                     True,
                 )
+                # Bind a per-dp-rank rpc socket so rpc calls can fan out to
+                # every dp worker; the scheduler (rank 0) connects to this.
+                self.rpc_workers[dp_rank] = get_zmq_socket(
+                    self.context,
+                    zmq.DEALER,
+                    tmp_port_args.rpc_ipc_name,
+                    True,
+                )
+                self.rpc_poller.register(self.rpc_workers[dp_rank], zmq.POLLIN)
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:
@@ -332,20 +361,21 @@ class DataParallelController:
             time.sleep(30 * 24 * 3600)
 
     def _broadcast_worker_ports(
-        self, server_args: ServerArgs, worker_ports: Optional[List[int]] = None
-    ) -> List[int]:
-        """Broadcast worker ports from node 0 to all other nodes.
+        self, server_args: ServerArgs, ports: Optional[dict] = None
+    ) -> dict:
+        """Broadcast pre-allocated ports from node 0 to all other nodes.
 
         Node 0 acts as the server, waiting for all other nodes to connect and
-        sending them the pre-allocated worker ports. Other nodes act as clients,
-        connecting to node 0 to receive their copy of the worker ports.
+        sending them the pre-allocated ports. Other nodes act as clients,
+        connecting to node 0 to receive their copy of the ports.
 
         Args:
             server_args: Server arguments containing node configuration.
-            worker_ports: Pre-allocated worker ports to broadcast.
+            ports: Pre-allocated ports to broadcast, a dict with keys
+                "worker_ports" and "rpc_ports" (each a list indexed by dp_rank).
 
         Returns:
-            List of worker ports (same on all nodes after broadcast).
+            Dict of ports (same on all nodes after broadcast).
         """
         # Determine the endpoint for inter-node communication
         if server_args.dist_init_addr is None:
@@ -359,20 +389,20 @@ class DataParallelController:
         endpoint = na.to_tcp()
 
         if server_args.node_rank == 0:
-            # Node 0: Broadcast worker ports to all other nodes
+            # Node 0: Broadcast ports to all other nodes
             return self._broadcast_ports_as_server(
-                endpoint, server_args.nnodes - 1, worker_ports
+                endpoint, server_args.nnodes - 1, ports
             )
         else:
-            # Other nodes: Receive worker ports from node 0
+            # Other nodes: Receive ports from node 0
             return self._receive_ports_as_client(endpoint, server_args.node_rank)
 
     def _broadcast_ports_as_server(
-        self, endpoint: str, expected_clients: int, worker_ports: List[int]
-    ) -> List[int]:
-        """Broadcast worker ports to all client nodes."""
-        logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
-        logger.debug(f"Worker ports: {worker_ports}")
+        self, endpoint: str, expected_clients: int, ports: dict
+    ) -> dict:
+        """Broadcast ports to all client nodes."""
+        logger.debug(f"Broadcasting ports to {expected_clients} client nodes")
+        logger.debug(f"Ports: {ports}")
 
         rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
 
@@ -383,28 +413,31 @@ class DataParallelController:
                 client_rank = rep_socket.recv().decode()
                 logger.debug(f"Received handshake from node {client_rank}")
 
-                # Send worker ports to client
-                rep_socket.send_pyobj(worker_ports)
+                # Send ports to client
+                rep_socket.send_pyobj(ports)
                 connected_clients += 1
                 logger.debug(
-                    f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
+                    f"Sent ports to {connected_clients}/{expected_clients} nodes"
                 )
 
-            logger.debug("Worker port broadcast completed")
-            return worker_ports
+            logger.debug("Port broadcast completed")
+            return ports
         finally:
             if self.server_args.elastic_ep_backend is None:
                 rep_socket.close()
             else:
                 threading.Thread(
                     target=self._reply_ports_as_server,
-                    args=(rep_socket, worker_ports),
+                    args=(rep_socket, ports),
                     daemon=True,
                 ).start()
 
-    def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: List[int]):
+    def _reply_ports_as_server(self, rep_socket: zmq.Socket, ports: dict):
         """
-        Runs as a background thread to broadcast worker ports for recovered EP ranks
+        Runs as a background thread to broadcast ports for recovered EP ranks.
+
+        Sends the same ``ports`` dict (``worker_ports`` + ``rpc_ports``) that the
+        initial broadcast does, so reconnecting ranks parse it identically.
         """
         while True:
             # Wait for client handshake
@@ -417,13 +450,13 @@ class DataParallelController:
                 continue
             logger.debug(f"Received handshake from node {client_rank}")
 
-            # Send worker ports to client
-            rep_socket.send_pyobj(worker_ports)
-            logger.debug(f"Sent worker ports to node {client_rank}")
+            # Send ports to client
+            rep_socket.send_pyobj(ports)
+            logger.debug(f"Sent ports to node {client_rank}")
 
-    def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
-        """Receive worker ports from the server node."""
-        logger.debug(f"Connecting to node 0 to receive worker ports")
+    def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> dict:
+        """Receive ports from the server node."""
+        logger.debug(f"Connecting to node 0 to receive ports")
 
         req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
         req_socket.setsockopt(zmq.RCVTIMEO, 600 * 1000)  # 10 minute timeout
@@ -433,10 +466,10 @@ class DataParallelController:
             # Send handshake with our node rank
             req_socket.send(str(node_rank).encode())
 
-            # Receive worker ports
-            worker_ports = req_socket.recv_pyobj()
-            logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
-            return worker_ports
+            # Receive ports
+            ports = req_socket.recv_pyobj()
+            logger.debug(f"Received ports from node 0: {ports}")
+            return ports
         except zmq.Again:
             logger.error("Timeout waiting for worker ports from node 0")
             raise RuntimeError(
@@ -453,8 +486,10 @@ class DataParallelController:
         else:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts
+        # Pre-allocate per-dp-rank worker and rpc ports on node 0 to avoid
+        # conflicts.
         worker_ports = []
+        rpc_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
                 worker_port, worker_socket = get_zmq_socket_on_host(
@@ -462,18 +497,43 @@ class DataParallelController:
                 )
                 worker_ports.append(worker_port)
                 self.workers[dp_rank] = worker_socket
+
+                # One rpc socket per dp rank: each dp group's leader
+                # (attn_tp_rank == 0) connects to its own socket, so the
+                # controller fans the rpc out to every dp group and collects one
+                # response per group. The leader then forwards the rpc within its
+                # group (attn_tp_group / full tp_group) so every rank saves its
+                # own shard. A single shared socket would instead let the DEALER
+                # round-robin deliver to one arbitrary leader.
+                rpc_port, rpc_socket = get_zmq_socket_on_host(
+                    self.context, zmq.DEALER, host=bind_host
+                )
+                rpc_ports.append(rpc_port)
+                self.rpc_workers[dp_rank] = rpc_socket
+                self.rpc_poller.register(rpc_socket, zmq.POLLIN)
                 logger.debug(
-                    "Assigned port %s to worker %s on host %s",
+                    "Assigned worker port %s and rpc port %s to dp rank %s on host %s",
                     worker_port,
+                    rpc_port,
                     dp_rank,
                     bind_host,
                 )
 
         broadcasted_ports = self._broadcast_worker_ports(
-            server_args, worker_ports if worker_ports else None
+            server_args,
+            (
+                {"worker_ports": worker_ports, "rpc_ports": rpc_ports}
+                if server_args.node_rank == 0
+                else None
+            ),
         )
         self.launch_tensor_parallel_group(
-            server_args, port_args, 0, None, broadcasted_ports
+            server_args,
+            port_args,
+            0,
+            None,
+            broadcasted_ports["worker_ports"],
+            broadcasted_ports["rpc_ports"],
         )
 
     def launch_tensor_parallel_group(
@@ -483,6 +543,7 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
+        rpc_ports: Optional[List[int]] = None,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -524,7 +585,7 @@ class DataParallelController:
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
-                        server_args, dp_rank, worker_ports
+                        server_args, dp_rank, worker_ports, rpc_ports
                     )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
@@ -643,6 +704,63 @@ class DataParallelController:
         )
         self.workers[target_worker].send_pyobj(req)
 
+    def handle_rpc(self):
+        """Relay rpc calls from the Engine to the dp rpc workers and aggregate.
+
+        The Engine sends a single RpcReqInput and blocks for a single
+        RpcReqOutput. This controller fans the request out to ``rpc_workers``,
+        collects each worker's response, and replies once with an aggregated
+        result. Active for both dp-attention and plain dp (dp_size > 1).
+
+        ``rpc_workers`` holds one socket per dp group, so the fan-out and the
+        reply collection are uniform across modes:
+          - plain DP: one rpc socket per replica (independent process groups).
+          - dp attention: one rpc socket per dp rank; each dp group's leader
+            (attn_tp_rank == 0) connects to its own socket and forwards the rpc
+            within its group so every rank still executes it.
+        Exactly one leader per socket replies, so the send count and the reply
+        count stay aligned.
+        """
+        if self.recv_from_rpc is None:
+            return
+
+        # 1) Forward any new rpc requests from the Engine to the rpc workers.
+        while True:
+            try:
+                recv_req = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            assert isinstance(recv_req, RpcReqInput)
+            for rpc_worker in self.rpc_workers:
+                rpc_worker.send_pyobj(recv_req)
+
+        # 2) Non-blocking collect responses. Results accumulate in
+        #    self.rpc_results across event-loop iterations until all arrive.
+        socks = dict(self.rpc_poller.poll(timeout=0))
+        if not socks:
+            return
+
+        for index, worker in enumerate(self.rpc_workers):
+            if worker in socks:
+                res = worker.recv_pyobj()
+                assert isinstance(res, RpcReqOutput)
+                self.rpc_results[index] = res
+                if res.success:
+                    logger.info(f"rpc success for worker{index}: {res.message}")
+                else:
+                    logger.error(f"rpc failed for worker{index}: {res.message}")
+
+        # 3) Once every rpc worker has replied, send one aggregated result back.
+        if all(self.rpc_results):
+            failed = next((r for r in self.rpc_results if not r.success), None)
+            if failed is not None:
+                self.recv_from_rpc.send_pyobj(RpcReqOutput(False, failed.message))
+            else:
+                self.recv_from_rpc.send_pyobj(
+                    RpcReqOutput(True, "all rpc call success")
+                )
+            self.rpc_results = [None] * len(self.rpc_workers)
+
     def event_loop(self):
         while True:
             while True:
@@ -652,6 +770,8 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+            self.handle_rpc()
 
 
 def run_data_parallel_controller_process(

@@ -8346,6 +8346,7 @@ class PortArgs:
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
+        rpc_ports: Optional[List[int]] = None,
     ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = get_free_port()
@@ -8399,15 +8400,17 @@ class PortArgs:
                 port_base = dist_init_port + 1
 
             detokenizer_port = port_base + 1
-            rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+                rpc_port = port_base + 2
             else:
                 assert worker_ports is not None
+                assert rpc_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
+                rpc_port = rpc_ports[dp_rank]
 
             try:
                 if dp_rank is None:
