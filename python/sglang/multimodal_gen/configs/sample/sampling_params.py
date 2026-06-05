@@ -216,9 +216,20 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = field(default=False, metadata={"batch_sig_exclude": True})
 
+    # return output file paths directly to client
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
     diffusers_kwargs: dict | None = None
+    max_sequence_length: int | None = None
+    flow_shift: float | None = None
+
+    # cosmos-related
+    use_duration_template: bool | None = None
+    use_resolution_template: bool | None = None
+    use_system_prompt: bool | None = None
+    use_guardrails: bool | None = None
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+    realtime_chunk_size: int | None = None
 
     # Prompt enhancement (ErnieImage)
     use_pe: bool | None = None
@@ -301,6 +312,10 @@ class SamplingParams:
     def apply_request_extra(self, req: Any) -> None:
         """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
         req.extra.update(self.build_request_extra())
+        if self.condition_inputs:
+            req.condition_inputs.update(self.condition_inputs)
+        if self.realtime_chunk_size is not None:
+            req.realtime_chunk_size = self.realtime_chunk_size
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
@@ -341,7 +356,7 @@ class SamplingParams:
             or self.seed < 0
         ):
             raise ValueError(
-                "seed must be a non-negative int or list of ints, " f"got {self.seed!r}"
+                f"seed must be a non-negative int or list of ints, got {self.seed!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -511,6 +526,7 @@ class SamplingParams:
             "wan" in pipeline_name_lower
             or "helios" in pipeline_name_lower
             or "joy" in pipeline_name_lower
+            or "cosmos3" in pipeline_name_lower
         ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")
@@ -520,13 +536,13 @@ class SamplingParams:
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
+                "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
-                logger.debug(f"Setting `num_frames` to 1 for image generation model")
+                logger.debug("Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
         else:
@@ -1029,26 +1045,29 @@ class SamplingParams:
 
         # global switch: if True, allow overriding protected fields
         allow_override_protected = not user_params.no_override_protected_fields
-        for field in dataclasses.fields(user_params):
-            field_name = field.name
+        for field_info in dataclasses.fields(user_params):
+            field_name = field_info.name
             user_value = getattr(user_params, field_name)
             if hasattr(SamplingParams, field_name):
                 default_class_value = getattr(SamplingParams, field_name)
-            elif field.default is not dataclasses.MISSING:
-                default_class_value = field.default
-            elif field.default_factory is not dataclasses.MISSING:
-                default_class_value = field.default_factory()
+            elif field_info.default is not dataclasses.MISSING:
+                default_class_value = field_info.default
+            elif field_info.default_factory is not dataclasses.MISSING:
+                default_class_value = field_info.default_factory()
             else:
                 default_class_value = dataclasses.MISSING
 
-            is_user_modified = user_value != default_class_value or (
-                explicit_fields is not None and field_name in explicit_fields
-            )
+            if explicit_fields is not None:
+                is_user_modified = field_name in explicit_fields
+            else:
+                is_user_modified = user_value != default_class_value
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
+        if explicit_fields is not None:
+            self._explicit_fields = set(explicit_fields)
         self.__post_init__()
 
     @property

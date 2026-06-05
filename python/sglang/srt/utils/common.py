@@ -45,6 +45,7 @@ import traceback
 import types
 import uuid
 import warnings
+from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
+from unittest.case import _ShouldStop
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -99,6 +101,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
+    """Flatten array.array('q') buffers into one int64 CPU tensor.
+
+    NumPy memcpy instead of a per-element PyLong-to-int64 walk. Stays on
+    (optionally pinned) CPU; H2D is the caller's job.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor on `device`."""
+    return flatten_arrays_to_pinned_cpu(parts, pin).to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -261,6 +283,11 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+is_sm80_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+    )
+)
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -278,9 +305,9 @@ except:
     is_intel_amx_backend_available = False
 
 try:
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+    is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
 
@@ -1060,6 +1087,33 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
+    # which bypasses filterwarnings; override showwarning to drop them too.
+    cutlass_dsl_noisy = {
+        (
+            DeprecationWarning,
+            "Use explicit `struct.scalar.ptr` for pointer instead.",
+        ),
+        (
+            UserWarning,
+            "NamedBarrier wait also arrives on the barrier. "
+            "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+    }
+    for cat, msg in cutlass_dsl_noisy:
+        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+
+    if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
+        prev_showwarning = warnings.showwarning
+
+        def _filtered_showwarning(message, category, *args, **kwargs):
+            if (category, str(message)) in cutlass_dsl_noisy:
+                return
+            prev_showwarning(message, category, *args, **kwargs)
+
+        _filtered_showwarning._sglang_patched_cutlass_dsl = True
+        warnings.showwarning = _filtered_showwarning
+
     # Suppress noisy third-party HTTP loggers.
     # huggingface_hub uses httpx which logs every HTTP request at INFO level.
     for name in ("httpx", "httpcore"):
@@ -1105,7 +1159,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.11.post1")
+        min_version: Minimum version required (e.g., "0.6.12")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1117,33 +1171,59 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
+def _still_holding_resources(procs):
+    """Procs still holding GPU context, pinned memory or fds.
+
+    A zombie has already had its resources freed by the kernel (only the exit
+    status lingers), so it counts as gone; NoSuchProcess / OSError (see
+    _wait_for_reap_or_raise) mean the same.
+    """
+    alive = []
+    for p in procs:
+        try:
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                alive.append(p)
+        except (psutil.NoSuchProcess, OSError):
+            pass
+    return alive
+
+
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
     SIGKILL is asynchronous -- children hold GPU context, pinned memory and
     fds until the kernel reaps them. Raise on timeout so a stuck process
     surfaces instead of leaving a latent race.
+
+    Polls /proc via is_running()/status() rather than psutil.wait_procs, whose
+    os.pidfd_open path (used for non-child procs) raises OSError(EINVAL) against
+    a just-killed process on some kernels and aborts the whole wait.
     """
     warn_at = min(10.0, wait_timeout / 2)
-    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
-    if not alive:
-        return
-    logger.warning(
-        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
-        "continuing to wait up to %.1fs total. pids=%s",
-        len(alive),
-        warn_at,
-        wait_timeout,
-        [p.pid for p in alive],
-    )
-    remaining = wait_timeout - warn_at
-    if remaining > 0:
-        _, alive = psutil.wait_procs(alive, timeout=remaining)
-    if alive:
-        raise RuntimeError(
-            f"kill_process_tree: {len(alive)} process(es) not reaped within "
-            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
-        )
+    deadline = time.monotonic() + wait_timeout
+    warn_deadline = time.monotonic() + warn_at
+    warned = False
+    while True:
+        alive = _still_holding_resources(procs)
+        if not alive:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"kill_process_tree: {len(alive)} process(es) not reaped within "
+                f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+            )
+        if not warned and now >= warn_deadline:
+            logger.warning(
+                "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+                "continuing to wait up to %.1fs total. pids=%s",
+                len(alive),
+                warn_at,
+                wait_timeout,
+                [p.pid for p in alive],
+            )
+            warned = True
+        time.sleep(0.1)
 
 
 def kill_process_tree(
@@ -1159,6 +1239,11 @@ def kill_process_tree(
     `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
     for itself -- use `include_parent=False` if child reap must finish first.
     """
+    logger.info(
+        f"kill_process_tree called: parent_pid={parent_pid}, "
+        f"include_parent={include_parent}, pid={os.getpid()}"
+    )
+
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -2310,6 +2395,8 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "sglang.srt.disaggregation.",
+        "sglang.srt.managers.",
         "torch_npu.",
     }
 
@@ -2348,6 +2435,16 @@ class SafeUnpickler(pickle.Unpickler):
 def safe_pickle_load(fp):
     """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
     return SafeUnpickler(fp).load()
+
+
+def safe_pickle_loads(data):
+    """Drop-in replacement for pickle.loads() that blocks unsafe class loading."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        buf = bytes(data)
+    else:
+        # zmq.Frame and other buffer-protocol objects
+        buf = bytes(memoryview(data))
+    return SafeUnpickler(io.BytesIO(buf)).load()
 
 
 def debug_timing(func):
@@ -2416,22 +2513,6 @@ def human_readable_int(value: str) -> int:
             "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
             "Suffixes are case-sensitive."
         )
-
-
-def pyspy_dump_schedulers():
-    """py-spy dump on all scheduler in a local node."""
-    pid = psutil.Process().pid
-    for attempt, native_flag in enumerate(["--native", ""]):
-        try:
-            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, check=True
-            )
-            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-            return
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
 def kill_itself_when_parent_died():
@@ -2728,6 +2809,13 @@ def retry(
         except SkipTest:
             # Do NOT retry skipped tests - used in CI and unittest
             raise
+        except _ShouldStop:
+            # `unittest.case._ShouldStop` is raised by `subTest.__exit__`
+            # when a subtest fails/skips and `result.failfast` is True
+            # (CI invokes `python3 file.py -f`). It signals the outer
+            # `testPartExecutor` to stop the test method cleanly; do
+            # NOT retry, just propagate so unittest handles it.
+            raise
         except Exception as e:
             traceback.print_exc()
 
@@ -2918,6 +3006,7 @@ def is_fa3_default_architecture(hf_config):
         "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
         "StepVLForConditionalGeneration",
+        "Step3p7ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     }
@@ -3046,10 +3135,16 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    # Opt-out for models that manage SP scatter/gather at the model level
+    # and do not consume the upstream gathered_buffer. Without this, the
+    # cuda graph runner pads num_tokens to attn_tp_size, which can cause
+    # autotuners to pick suboptimal kernel variants at small batches.
+    if server_args.disable_attn_tp_gather:
+        return False
+
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    assert server_args.moe_dense_tp_size in [1, None]
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -3541,6 +3636,18 @@ def is_gfx95_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
         return False
 

@@ -22,6 +22,13 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -83,16 +90,25 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            unified_linear_attention_with_output(
-                mixed_qkv,
-                a,
-                b,
-                output,
-                self.layer_id,
-            )
+            if is_in_breakable_cuda_graph():
+                bcg_unified_linear_attention_with_output(
+                    mixed_qkv,
+                    a,
+                    b,
+                    output,
+                    self.layer_id,
+                )
+            else:
+                unified_linear_attention_with_output(
+                    mixed_qkv,
+                    a,
+                    b,
+                    output,
+                    self.layer_id,
+                )
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            return get_attn_backend().forward(
                 layer=self,
                 forward_batch=forward_batch,
                 mixed_qkv=mixed_qkv,
@@ -124,7 +140,7 @@ def unified_linear_attention_with_output(
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
-    ret = forward_batch.attn_backend.forward(
+    ret = get_attn_backend().forward(
         layer=attention_layer,
         forward_batch=forward_batch,
         mixed_qkv=mixed_qkv[:real_num_tokens],
@@ -135,3 +151,8 @@ def unified_linear_attention_with_output(
 
     output[:, :real_num_tokens].copy_(ret)
     return
+
+
+bcg_unified_linear_attention_with_output = eager_on_graph(True)(
+    unified_linear_attention_with_output
+)

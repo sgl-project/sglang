@@ -283,6 +283,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         prefix: str = "",
     ):
         nn.Module.__init__(self)
+        config = config.get_mtp_config()
         self.config = config
         self.quant_config = quant_config
         # Required for parent's load_weights

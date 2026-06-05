@@ -29,12 +29,14 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
+    Cosmos3Config,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
     HeliosMidConfig,
     HeliosT2VConfig,
     HunyuanConfig,
+    LingBotWorldCausalDMDConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -46,6 +48,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinBasePipelineConfig,
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
 )
@@ -54,6 +57,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
@@ -83,8 +89,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2KleinBaseSamplingParams,
     Flux2KleinSamplingParams,
     Flux2SamplingParams,
     FluxSamplingParams,
@@ -100,8 +108,12 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.lingbot_world import (
+    LingBotWorldSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
@@ -396,7 +408,7 @@ def _get_config_info(
     if len(matched_model_names) >= 1:
         if len(matched_model_names) > 1:
             logger.warning(
-                f"More than one model name is matched, using the first matched"
+                "More than one model name is matched, using the first matched"
             )
         model_id = matched_model_names[0]
         return _CONFIG_REGISTRY.get(model_id)
@@ -750,6 +762,14 @@ def _register_configs():
         hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
     )
     register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldCausalDMDConfig,
+        hf_model_paths=[
+            "IPostYellow/lingbot-world-fast-diffusers",
+            "robbyant/lingbot-world-fast-diffusers",
+        ],
+    )
+    register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
@@ -788,8 +808,24 @@ def _register_configs():
             "black-forest-labs/FLUX.2-klein-9B",
         ],
         model_detectors=[
-            lambda hf_id: "flux.2-klein" in hf_id.lower()
-            or "flux2-klein" in hf_id.lower()
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinBaseSamplingParams,
+        pipeline_config_cls=Flux2KleinBasePipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-base-4B",
+            "black-forest-labs/FLUX.2-klein-base-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" in hf_id.lower()
+            )
         ],
     )
     register_configs(
@@ -827,10 +863,12 @@ def _register_configs():
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
         model_detectors=[
-            lambda hf_id: "qwen-image" in hf_id.lower()
-            and "edit" not in hf_id.lower()
-            and "layered" not in hf_id.lower()
-            and "2512" not in hf_id.lower()
+            lambda hf_id: (
+                "qwen-image" in hf_id.lower()
+                and "edit" not in hf_id.lower()
+                and "layered" not in hf_id.lower()
+                and "2512" not in hf_id.lower()
+            )
         ],
     )
     register_configs(
@@ -844,9 +882,11 @@ def _register_configs():
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
         model_detectors=[
-            lambda hf_id: "qwen-image-edit" in hf_id.lower()
-            and "2509" not in hf_id.lower()
-            and "2511" not in hf_id.lower()
+            lambda hf_id: (
+                "qwen-image-edit" in hf_id.lower()
+                and "2509" not in hf_id.lower()
+                and "2511" not in hf_id.lower()
+            )
         ],
     )
 
@@ -882,12 +922,14 @@ def _register_configs():
             "stabilityai/stable-diffusion-3.5-large-diffusers",
         ],
         model_detectors=[
-            lambda hf_id: "stable-diffusion-3-medium" in hf_id.lower()
-            or "stable-diffusion-3.5-medium" in hf_id.lower()
-            or "stable-diffusion-3.5-large" in hf_id.lower()
-            or "sd3-medium" in hf_id.lower()
-            or "sd3.5-medium" in hf_id.lower()
-            or "sd3.5-large" in hf_id.lower()
+            lambda hf_id: (
+                "stable-diffusion-3-medium" in hf_id.lower()
+                or "stable-diffusion-3.5-medium" in hf_id.lower()
+                or "stable-diffusion-3.5-large" in hf_id.lower()
+                or "sd3-medium" in hf_id.lower()
+                or "sd3.5-medium" in hf_id.lower()
+                or "sd3.5-large" in hf_id.lower()
+            )
         ],
     )
 
@@ -913,9 +955,11 @@ def _register_configs():
             "BestWishYsh/Helios-Base",
         ],
         model_detectors=[
-            lambda hf_id: "helios" in hf_id.lower()
-            and "mid" not in hf_id.lower()
-            and "distill" not in hf_id.lower()
+            lambda hf_id: (
+                "helios" in hf_id.lower()
+                and "mid" not in hf_id.lower()
+                and "distill" not in hf_id.lower()
+            )
         ],
     )
     register_configs(
@@ -931,6 +975,22 @@ def _register_configs():
         hf_model_paths=[
             "BestWishYsh/Helios-Distilled",
         ],
+    )
+
+    # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
+    # per-request inside the pipeline from ``num_frames`` and ``image_path``.
+    # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
+    # come from ``transformer/config.json`` via ``update_model_arch``.
+    register_configs(
+        sampling_param_cls=Cosmos3SamplingParams,
+        pipeline_config_cls=Cosmos3Config,
+        hf_model_paths=[
+            "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Super",
+            "nvidia/Cosmos3-Super-Text2Image",
+            "nvidia/Cosmos3-Super-Image2Video",
+        ],
+        model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
     )
 
     # SANA
@@ -980,6 +1040,19 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "joyai-image-edit" in hf_id.lower(),
+        ],
+    )
+
+    # Ideogram 4
+    register_configs(
+        sampling_param_cls=Ideogram4SamplingParams,
+        pipeline_config_cls=Ideogram4PipelineConfig,
+        hf_model_paths=[
+            "ideogram-ai/ideogram-4-fp8",
+        ],
+        model_detectors=[
+            lambda hf_id: "ideogram4pipeline" in hf_id.lower(),
+            lambda hf_id: "ideogram-4-fp8" in hf_id.lower(),
         ],
     )
 

@@ -245,6 +245,9 @@ def maybe_load_fsdp_model(
         )
 
     weight_iterator = safetensors_weights_iterator(weight_dir_list)
+    preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
+    if preprocess_loaded_state_dict is not None:
+        weight_iterator = preprocess_loaded_state_dict(weight_iterator)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     load_model_from_full_model_state_dict(
         model,
@@ -625,6 +628,13 @@ def load_model_from_full_model_state_dict(
             if actual_param is not None
             else None
         )
+
+        if missing_param_init == "error":
+            raise ValueError(
+                f"Required checkpoint parameter '{new_param_name}' was not loaded. "
+                "This usually indicates a checkpoint/model-arch mismatch or a "
+                "broken weight-name mapping."
+            )
 
         if missing_param_init is None and not any(
             pattern in new_param_name for pattern in LEGACY_ALLOWED_NEW_PARAM_PATTERNS

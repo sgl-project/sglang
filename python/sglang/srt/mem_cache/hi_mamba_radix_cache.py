@@ -46,7 +46,11 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_STORAGE,
+    StorageMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1252,7 +1256,14 @@ class HiMambaRadixCache(MambaRadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            storage_metrics_collector = StorageMetricsCollector(labels=labels)
+            from sglang.srt.server_args import get_global_server_args
+
+            storage_cls = resolve_collector_class(
+                get_global_server_args(),
+                STAT_LOGGER_ROLE_STORAGE,
+                StorageMetricsCollector,
+            )
+            storage_metrics_collector = storage_cls(labels=labels)
 
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
@@ -1651,6 +1662,9 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             return True
 
+        if completed and operation.pool_transfers and not operation.pool_transfers_done:
+            can_terminate = False
+
         operation_terminated = operation.is_terminated()
         if self.tp_world_size > 1:
             states = torch.tensor(
@@ -1724,6 +1738,16 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_length,
             self.evict_host,
         )
+        if host_indices is None:
+            # truncate the prefetch length to the page-aligned available host size
+            available_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = available_size - (available_size % self.page_size)
+            if prefetch_length < self.prefetch_threshold:
+                self._release_host_node(last_host_node, release_mamba=False)
+                return
+            new_input_tokens = new_input_tokens[:prefetch_length]
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+
         if host_indices is None:
             self._release_host_node(last_host_node, release_mamba=False)
             return
