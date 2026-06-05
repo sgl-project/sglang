@@ -23,13 +23,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlam
 register_cuda_ci(est_time=1180, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestEagle3Topk16(
-    Eagle3Base,
-    SpecCorrectnessKit,
-    SpecAccuracyKit,
-    SpecLogprobKit,
-    SpecDraftKvOverflowKit,
-):
+class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
     """EAGLE3 topk=16 tree (spec v1): correctness + gsm8k + logprob losslessness."""
 
     spec_topk = 16
@@ -56,7 +50,6 @@ class TestEagleLlama2Suite(
     SpecLogprobKit,
     SpecPenaltyKit,
     SpecFeatureKit,
-    SpecDraftKvOverflowKit,
 ):
     """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases)."""
 
@@ -83,6 +76,19 @@ class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
         "--speculative-token-map",
         "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
     )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+
+
+class TestEagleDraftKvIndicesOverflow(EagleLlama2Base, SpecDraftKvOverflowKit):
+    """Deterministic kv_indices overflow regression (topk=8 page1). A small context
+    (2048) + cuda_graph_max_bs=1 makes topk*seq_len exceed max_bs*max_context_len at
+    moderate seq, overflowing the pre-*topk cuda-graph draft buffer -- crashes pre-fix,
+    caught by the common_template size invariant post-fix."""
+
+    disable_overlap = True  # topk>1 -> spec v1
+    cuda_graph_max_bs = 1
+    max_running_requests = 1
+    extra_args = ("--context-length", "2048")
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
