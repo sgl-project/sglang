@@ -951,7 +951,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
         self._fused_qkv_bias = None
-        self._use_fused_kv_projection = False
         self._profile_index = -1
 
     def _can_fuse_qkv_projection(self) -> bool:
@@ -1005,32 +1004,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         key, _ = self.to_k(hidden_states)
         value, _ = self.to_v(hidden_states)
         return query, key, value
-
-    def fuse_kv_projection(self) -> bool:
-        if self._use_fused_kv_projection:
-            return True
-        if not self.fuse_qkv_projection():
-            return False
-        self._use_fused_kv_projection = True
-        return True
-
-    def _project_kv(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._use_fused_kv_projection and self._fused_qkv_weight is not None:
-            q_size = self._fused_qkv_weight.shape[0] // 3
-            kv_weight = self._fused_qkv_weight.narrow(0, q_size, 2 * q_size)
-            kv_bias = (
-                None
-                if self._fused_qkv_bias is None
-                else self._fused_qkv_bias.narrow(0, q_size, 2 * q_size)
-            )
-            kv = F.linear(hidden_states, kv_weight, kv_bias)
-            return kv.chunk(2, dim=-1)
-
-        key, _ = self.to_k(hidden_states)
-        value, _ = self.to_v(hidden_states)
-        return key, value
 
     def _cross_attn_with_cache(
         self,
@@ -1161,7 +1134,8 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         )
         if update_cache_only:
             query = None
-            key, value = self._project_kv(norm_hidden_states)
+            key, _ = self.to_k(norm_hidden_states)
+            value, _ = self.to_v(norm_hidden_states)
         else:
             query, key, value = self._project_qkv(norm_hidden_states)
             query = self.norm_q(query)
@@ -1362,11 +1336,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
-        last_block_index = len(self.blocks) - 1
-        for block_index, block in enumerate(self.blocks):
+        for block in self.blocks:
             block.fuse_qkv_projection()
-            if block_index == last_block_index:
-                block.fuse_kv_projection()
 
     @lru_cache(maxsize=8)
     def _compute_rope_for_sequence_shard_with_offset(
