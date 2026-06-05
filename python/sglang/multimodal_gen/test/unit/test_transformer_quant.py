@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
+    get_quant_config,
 )
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
@@ -263,6 +264,23 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertFalse(config.swap_weight_nibbles)
+
+    def test_bitsandbytes_quant_config_resolves_from_hf_config(self):
+        config = get_quant_config(
+            {
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                    "bnb_4bit_quant_storage": "uint8",
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertEqual(config.get_name(), "bitsandbytes")
+        self.assertTrue(config.load_in_4bit)
+        self.assertEqual(config.bnb_4bit_quant_type, "nf4")
 
     def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:

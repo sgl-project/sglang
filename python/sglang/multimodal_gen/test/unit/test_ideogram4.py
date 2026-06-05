@@ -168,6 +168,23 @@ class TestIdeogram4(unittest.TestCase):
         self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
         self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
 
+    def test_registry_resolves_official_nf4_repo_to_native_pipeline(self):
+        get_model_info.cache_clear()
+        _get_config_info.cache_clear()
+
+        with patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={
+                "_class_name": "Ideogram4Pipeline",
+                "_diffusers_version": "0.0.0",
+            },
+        ):
+            info = get_model_info("ideogram-ai/ideogram-4-nf4", backend="sglang")
+
+        self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Pipeline")
+        self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
+        self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
+
     def test_rowwise_fp8_dequant_uses_output_channel_scale(self):
         weight = torch.tensor(
             [[1.0, 2.0, -3.0], [4.0, -5.0, 6.0]], dtype=FP8_WEIGHT_DTYPE
@@ -711,6 +728,25 @@ class TestIdeogram4(unittest.TestCase):
             config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
         )
         self.assertTrue(config.arch_config.ideogram_fp8_weight_only)
+        self.assertFalse(config.arch_config.ideogram_bnb_4bit_weight_only)
+
+    def test_ideogram_text_encoder_post_config_hook_uses_bnb_for_nf4(self):
+        config = Ideogram4TextEncoderConfig()
+        config.update_model_arch(
+            {
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                }
+            }
+        )
+
+        self.assertEqual(
+            config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
+        )
+        self.assertTrue(config.arch_config.ideogram_bnb_4bit_weight_only)
+        self.assertFalse(config.arch_config.ideogram_fp8_weight_only)
 
     def test_ideogram_text_encoder_swaps_linears_to_weight_only_fp8(self):
         config = Ideogram4TextEncoderConfig()

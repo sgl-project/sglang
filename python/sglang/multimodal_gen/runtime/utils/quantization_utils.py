@@ -45,9 +45,7 @@ def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
     )
 
 
-def _infer_nvfp4_group_size_from_shapes(
-    weight_shape, scale_shape
-) -> Optional[int]:
+def _infer_nvfp4_group_size_from_shapes(weight_shape, scale_shape) -> Optional[int]:
     weight_shape = tuple(weight_shape or ())
     scale_shape = tuple(scale_shape or ())
     if len(weight_shape) < 2:
@@ -97,16 +95,14 @@ def _is_nvfp4_tensor_family(
     weight_dtype = str(weight_metadata.get("dtype", "")).upper()
     scale_dtype = str(scale_metadata.get("dtype", "")).upper()
     scale_shape = scale_metadata.get("shape", [])
-    return (
-        weight_dtype == "U8"
-        and "F8_E4M3" in scale_dtype
-        and len(scale_shape) >= 2
-    )
+    return weight_dtype == "U8" and "F8_E4M3" in scale_dtype and len(scale_shape) >= 2
 
 
 def _resolve_quant_method_name(quant_cfg: dict) -> str:
     quant_cfg = normalize_flat_modelopt_quant_config(quant_cfg) or quant_cfg
     quant_method = quant_cfg.get("quant_method")
+    if quant_method == "bitsandbytes":
+        return "bitsandbytes"
     if quant_method != "modelopt":
         return quant_method
 
