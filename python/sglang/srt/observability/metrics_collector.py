@@ -451,6 +451,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of paused requests by async weight sync.",
             labelnames=labels.keys(),
         )
+        self.weight_load_duration_seconds = Gauge(
+            name="sglang:weight_load_duration_seconds",
+            documentation=(
+                "Wall time of the most recent update_weights_from_<source> call on "
+                "this scheduler rank (seconds). `source` label is one of: disk, "
+                "distributed, tensor, ipc. Detect events via "
+                "changes(...[<range>]) > 0 — no separate counter needed."
+            ),
+            labelnames=[*labels.keys(), "source"],
+            multiprocess_mode="mostrecent",
+        )
 
         # =================================================================
         # PD disaggregation
@@ -1071,6 +1082,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
+
+    def observe_weight_load(self, duration_seconds: float, source: str) -> None:
+        # Edge-triggered: engine is paused during the update, so report_stats
+        # won't fire — write the gauge inline at end of update_weights_from_*.
+        # `source` is "disk" | "distributed" | "tensor" | "ipc".
+        self.weight_load_duration_seconds.labels(**self.labels, source=source).set(
+            duration_seconds
+        )
 
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
         # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".

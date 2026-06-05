@@ -1581,6 +1581,7 @@ class Scheduler(
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
+            metrics_collector=self.metrics_collector if self.enable_metrics else None,
         )
 
     def init_lora_drainer(self) -> None:
