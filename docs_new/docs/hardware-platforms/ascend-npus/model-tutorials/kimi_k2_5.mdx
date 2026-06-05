@@ -1,0 +1,230 @@
+---
+title: "Kimi-K2.5"
+metatags:
+  description: "Deploy Kimi-K2.5 model with SGLang on Ascend NPUs, including single-node deployment modes."
+---
+
+## Introduction
+
+Kimi-K2.5 is an open-source, native multimodal agentic model developed by Moonshot AI, built through continual
+pretraining on approximately 15 trillion mixed visual and text tokens atop Kimi-K2-Base. It is a Mixture-of-Experts
+(MoE) model featuring Multi-head Latent Attention (MLA) and MoE architecture, with 1T total parameters and 32B
+active parameters. The model seamlessly integrates vision and language understanding with advanced agentic
+capabilities, supporting both instant and thinking modes as well as conversational and agentic paradigms.
+
+This document demonstrates the deployment of Kimi-K2.5 on Ascend NPUs using SGLang, including single-node PD mixed
+mode, feature configuration, and performance optimization.
+
+This document is validated and written based on **SGLang v0.5.10**. The current model (Kimi-K2.5) is fully supported in
+this version. To use the latest features (e.g., speculative decoding, multimodal), it is recommended to use
+v0.5.10 or a later version.
+
+## Supported features
+
+| Feature                       | Usage                                                                                         |
+|-------------------------------|-----------------------------------------------------------------------------------------------|
+| Tensor Parallelism            | `--tp-size 16`                                                                                |
+| Data Parallelism              | `--enable-dp-attention --dp-size 16`                                                          |
+| Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
+| Quantization                  | `--quantization modelslim`                                                                    |
+| Chunked Prefill               | `--chunked-prefill-size 32768 --max-prefill-tokens 16384`                                     |
+| NPU Graph                     | `--cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120`                                            |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 --speculative-draft-model-quantization unquant` |
+| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
+| MLAPO                         | `export SGLANG_NPU_USE_MLAPO=1`                                                               |
+| Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                                        |
+
+<Note>
+For feature compatibility and conflict information between features,
+see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
+</Note>
+
+## Prerequisites
+
+### Model weights
+
+<Warning>
+If you need to download model weights, check the model size before downloading to reserve enough space.
+</Warning>
+
+- [Kimi-K2.5](https://modelers.cn/models/moonshotai/Kimi-K2.5) (BF16, available on [HuggingFace](https://huggingface.co/moonshotai/Kimi-K2.5) and [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Kimi-K2.5-w4a8))
+- [Kimi-K2.5-w4a8](https://modelers.cn/models/Eco-Tech/Kimi-K2.5-w4a8) (W4A8 quantized version, available on [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Kimi-K2.5-w4a8))
+
+You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize `Kimi-K2.5-w4a8` from `Kimi-K2.5`.
+
+Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
+refer to the [best practice configurations](#best-practices) which may require additional cards.
+
+It is recommended to download the model weights to a shared directory across multiple nodes.
+
+## Installation
+
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+</Warning>
+
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
+online platform. You can directly pull it.
+
+We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
+For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
+
+If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+container, for example: `-v /path/to/models:/models`.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci8:/dev/davinci8  \
+--device=/dev/davinci9:/dev/davinci9  \
+--device=/dev/davinci10:/dev/davinci10  \
+--device=/dev/davinci11:/dev/davinci11  \
+--device=/dev/davinci12:/dev/davinci12  \
+--device=/dev/davinci13:/dev/davinci13  \
+--device=/dev/davinci14:/dev/davinci14  \
+--device=/dev/davinci15:/dev/davinci15  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+</Tabs>
+
+## Online service deployment
+
+### Single-node online deployment
+
+Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
+with limited hardware resources. The following command is based on the W4A8 quantized model.
+
+```bash Launch server
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export STREAMS_PER_DEVICE=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+export HCCL_BUFFSIZE=1200
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+
+MODEL_PATH=xxx
+DRAFT_PATH=xxx
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
+    --host 0.0.0.0 --port 6699 \
+    --trust-remote-code --device npu --attention-backend ascend \
+    --tp-size 16 --base-gpu-id 0 --mem-fraction-static 0.7 --max-running-requests 120 \
+    --chunked-prefill-size 32768 --context-length 8192 --max-prefill-tokens 16384 \
+    --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
+    --enable-dp-attention --dp-size 16 \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120 --disable-radix-cache \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_PATH \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --speculative-draft-model-quantization unquant
+```
+
+<Tip>
+For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+</Tip>
+
+## Functional verification
+
+After the service is started, you can invoke the model by sending a prompt:
+
+```shell
+curl http://localhost:6699/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+Expected result: an HTTP 200 response with the generated text containing "Paris".
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
+testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
+see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+## Accuracy evaluation
+
+For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation).
+
+## Performance
+
+For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
+
+## Best practices
+
+### Best practice configuration reference
+
+For complete optimal configurations with deployment scripts and benchmark commands, see the
+[Kimi Series Models](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#kimi-series-models) section
+on the Best Practice page.
+
+#### Scenario overview
+
+| Scenario                      | Deployment mode | Total NPUs | Weight version |
+|-------------------------------|-----------------|------------|----------------|
+| Low latency (3.5K+1.5K)       | PD mixed        | 8 (A3)     | W4A8 INT8      |
+| High throughput (3.5K+1.5K)   | PD mixed        | 8 (A3)     | W4A8 INT8      |
+
+<Note>
+`Total NPUs` indicates the total number of NPUs used across all nodes.
+</Note>
+
+## Performance tuning
+
+For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
+guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
+## FAQ
+
+For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
+This section only covers model-specific issues.

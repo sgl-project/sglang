@@ -1,0 +1,214 @@
+---
+title: "Qwen3-30B-A3B"
+metatags:
+  description: "Deploy Qwen3-30B-A3B model with SGLang on Ascend NPUs, including single-node deployment modes."
+---
+
+## Introduction
+
+Qwen3-30B-A3B is a Mixture-of-Experts (MoE) large language model developed by Alibaba, featuring 30B total
+parameters with 3B active parameters. It employs Grouped-Query Attention (GQA) and Qwen3MoE architecture, with
+support for EAGLE3 speculative decoding for accelerated inference. The model excels at instruction following,
+logical reasoning, text comprehension, mathematics, science, coding, and tool usage, available in both standard
+and thinking/reasoning-enhanced editions.
+
+This document demonstrates the deployment of Qwen3-30B-A3B on Ascend NPUs using SGLang, including single-node PD mixed
+mode, feature configuration, and performance optimization.
+
+This document is validated and written based on **SGLang v0.5.10**. The current model (Qwen3-30B-A3B) is fully supported in
+this version. To use the latest features (e.g., speculative decoding), it is recommended to use
+v0.5.10 or a later version.
+
+## Supported features
+
+| Feature                       | Usage                                                                                         |
+|-------------------------------|-----------------------------------------------------------------------------------------------|
+| Tensor Parallelism            | `--tp-size 2`                                                                                 |
+| Quantization                  | `--quantization modelslim`                                                                    |
+| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
+| NPU Graph                     | `--cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
+| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
+| PrefixCache                   | `--disable-radix-cache`                                                                       |
+
+<Note>
+For feature compatibility and conflict information between features,
+see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
+</Note>
+
+## Prerequisites
+
+### Model weights
+
+<Warning>
+If you need to download model weights, check the model size before downloading to reserve enough space.
+</Warning>
+
+- [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) (BF16)
+- [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) (BF16, recommended)
+
+Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
+refer to the [best practice configurations](#best-practices) which may require additional cards.
+
+It is recommended to download the model weights to a shared directory across multiple nodes.
+
+## Installation
+
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+</Warning>
+
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
+online platform. You can directly pull it.
+
+We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
+For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
+
+If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+container, for example: `-v /path/to/models:/models`.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+</Tabs>
+
+## Online service deployment
+
+### Single-node online deployment
+
+Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
+with limited hardware resources. The following command is based on the W8A8 quantized model with 1 Atlas 800I A3 card.
+
+```bash Launch server
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+MODEL_PATH=xxx
+
+export SGLANG_SET_CPU_AFFINITY=1
+export ASCEND_LAUNCH_BLOCKING=0
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export HCCL_BUFFSIZE=400
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+export SGLANG_ENABLE_SPEC_V2=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
+    --attention-backend ascend --device npu  --quantization modelslim  \
+    --max-running-requests 162 \
+    --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --chunked-prefill-size -1 --max-prefill-tokens 35000 \
+    --tp-size 2 --mem-fraction-static 0.87 --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
+    --dtype bfloat16
+```
+
+<Tip>
+For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+</Tip>
+
+## Functional verification
+
+After the service is started, you can invoke the model by sending a prompt:
+
+```shell
+curl http://localhost:7239/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+Expected result: an HTTP 200 response with the generated text containing "Paris".
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
+testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
+see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+## Accuracy evaluation
+
+For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation).
+
+## Performance
+
+For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
+
+## Best practices
+
+### Best practice configuration reference
+
+For complete optimal configurations with deployment scripts and benchmark commands, see the
+[Qwen Series Models](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#qwen-series-models) section
+on the Best Practice page.
+
+#### Scenario overview
+
+| Scenario                      | Deployment mode | Total NPUs | Weight version |
+|-------------------------------|-----------------|------------|----------------|
+| Low latency (6K+1.5K)         | PD mixed        | 1 (A3)     | W8A8 INT8      |
+| Low latency (1K+0.3K)         | PD mixed        | 1 (A3)     | W8A8 INT8      |
+| High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8 INT8      |
+
+<Note>
+`Total NPUs` indicates the total number of NPUs used across all nodes.
+</Note>
+
+## Performance tuning
+
+For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
+guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
+## FAQ
+
+For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
+This section only covers model-specific issues.
