@@ -152,7 +152,7 @@ def _load_stage(ltid, feat0, sa, sb, mW, mA, tile, buf, M, kgi, tile_n):
 
 
 @cute.kernel
-def _kernel(
+def _dsv3_fused_a_gemm_kernel(
     mW: cute.Tensor,
     mA: cute.Tensor,
     mOut: cute.Tensor,
@@ -273,7 +273,7 @@ def _kernel(
 
 
 @cute.jit
-def _launch(
+def _dsv3_fused_a_gemm_host(
     mW: cute.Tensor,
     mA: cute.Tensor,
     mOut: cute.Tensor,
@@ -285,7 +285,7 @@ def _launch(
     nstage: cutlass.Constexpr,
     tile_n: cutlass.Constexpr,
 ):
-    _kernel(mW, mA, mOut, M, num_kt, nstage, tile_n).launch(
+    _dsv3_fused_a_gemm_kernel(mW, mA, mOut, M, num_kt, nstage, tile_n).launch(
         grid=[gemm_m // TILE_M, 1, 1],
         block=[NTHREADS, 1, 1],
         smem=smem_bytes,
@@ -319,7 +319,7 @@ def _compiled_kernel(num_kt: int, gemm_m: int, tile_n: int):
         o = torch.empty(16, gemm_m, dtype=torch.bfloat16, device="cuda")
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         _compiled[(num_kt, gemm_m, tile_n)] = cute.compile(
-            _launch,
+            _dsv3_fused_a_gemm_host,
             from_dlpack(w.view(torch.int32)),
             from_dlpack(a.view(torch.int32)),
             from_dlpack(o),
