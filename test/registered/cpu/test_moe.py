@@ -8,7 +8,7 @@ from sglang.srt.layers.amx_utils import CPUQuantMethod
 
 kernel = torch.ops.sgl_kernel
 
-torch.manual_seed(1183)
+torch.manual_seed(800)
 
 from utils import (
     BLOCK_K,
