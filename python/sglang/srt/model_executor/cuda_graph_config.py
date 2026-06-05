@@ -85,11 +85,22 @@ class CudaGraphConfig:
         return getattr(self, phase)
 
     def to_dict(self) -> Dict[str, Dict[str, Any]]:
-        """Serialize to the legacy {phase: {key: value}} shape (used
-        by the parser pipeline that re-applies explicit input)."""
+        """Serialize to the legacy {phase: {key: value}} shape used by
+        the parser pipeline that re-applies explicit input.
+
+        Emits only fields that differ from the per-phase default. The
+        parser locks every (phase, key) it sees in the returned dict and
+        the prefill safety cascade skips locked keys, so emitting
+        defaults via dataclasses.asdict would silently bypass the
+        cascade for any caller that constructed a CudaGraphConfig
+        object touching only one phase (e.g.
+        CudaGraphConfig(decode=PhaseConfig(max_bs=256)) would also lock
+        prefill.backend at its default tc_piecewise).
+        """
+        baseline = default_cuda_graph_config()
         return {
-            Phase.DECODE: dataclasses.asdict(self.decode),
-            Phase.PREFILL: dataclasses.asdict(self.prefill),
+            Phase.DECODE: _diff_phase(self.decode, baseline.decode),
+            Phase.PREFILL: _diff_phase(self.prefill, baseline.prefill),
         }
 
     @classmethod
@@ -114,6 +125,15 @@ class CudaGraphConfig:
 def default_cuda_graph_config() -> CudaGraphConfig:
     """Fresh CudaGraphConfig populated with canonical defaults."""
     return CudaGraphConfig()
+
+
+def _diff_phase(actual: PhaseConfig, baseline: PhaseConfig) -> Dict[str, Any]:
+    """Return only fields whose value differs from the per-phase default."""
+    return {
+        f.name: getattr(actual, f.name)
+        for f in dataclasses.fields(actual)
+        if getattr(actual, f.name) != getattr(baseline, f.name)
+    }
 
 
 def check_cuda_graph_backend(phase: str, backend: str) -> bool:
