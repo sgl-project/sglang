@@ -83,6 +83,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend &#123;BACKEND&#125;`: attention backend for native SGLang pipelines
 - `--component-attention-backends &#123;MAP&#125;`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config &#123;CONFIG&#125;`: attention backend configuration
+- `--acceleration-config &#123;CONFIG&#125;`: experimental diffusion acceleration policy. cuDNN SDPA auto mode and warmup-time dense LocalAttention autotune are enabled by default on eligible CUDA fp16/bf16 inference paths; use `attention_autotune=false` or `allow_cudnn_sdp=false` to disable them. Real-request cache misses fall back to native attention unless `attention_autotune_live_miss=true` is set. Kernel-wise `torch.compile` remains opt-in, for example `kernel_compile_policy=auto,kernel_compile_ops=LayerNormScaleShift`.
 
 ### Sampling and output
 
@@ -265,6 +266,11 @@ Use `--backend diffusers` to force vanilla diffusers pipelines when no native SG
       <td><code>--enable-torch-compile</code></td>
       <td>flag</td>
       <td>Enable <code>torch.compile</code></td>
+    </tr>
+    <tr>
+      <td><code>--acceleration-config</code></td>
+      <td><code>&#123;CONFIG&#125;</code></td>
+      <td>Experimental framework-level acceleration policy</td>
     </tr>
     <tr>
       <td><code>--cache-dit-config</code></td>
