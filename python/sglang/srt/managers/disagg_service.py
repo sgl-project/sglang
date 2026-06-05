@@ -23,11 +23,6 @@ def start_disagg_service(
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
-        if kv_bootstrap_server_class is None:
-            # The "fake" transfer backend has no bootstrap server (it completes the
-            # handshake/transfer in-process). Used only by the scripted-runtime test
-            # harness, which runs a standalone prefill server with no decode peer.
-            return None
         bootstrap_server = kv_bootstrap_server_class(
             host=server_args.host,
             port=server_args.disaggregation_bootstrap_port,

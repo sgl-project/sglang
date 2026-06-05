@@ -62,14 +62,8 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                 server_args.mamba_scheduler_strategy = "no_buffer"
 
     elif server_args.disaggregation_mode == "prefill":
-        # The scripted-runtime test harness runs a standalone prefill server with no
-        # decode peer. It uses the fully-implemented FakeKVSender to drive the real
-        # prefill-side disagg bookkeeping (chunking, start_send_idx, inflight queue)
-        # while faking only the network transfer; production prefill servers still
-        # reject 'fake'.
         assert (
             server_args.disaggregation_transfer_backend != "fake"
-            or envs.SGLANG_TEST_SCRIPTED_RUNTIME.get()
         ), "Prefill server does not support 'fake' as the transfer backend"
 
         server_args.disable_cuda_graph = True
