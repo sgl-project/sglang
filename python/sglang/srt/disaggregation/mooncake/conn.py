@@ -1162,6 +1162,13 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+
+                if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Failed
+                ):
+                    continue
+
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1392,7 +1399,11 @@ class MooncakeKVManager(CommonKVManager):
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    if room_to_be_aborted in self.request_status:
+                    # No need to abort the room if it has already succeeded
+                    if (
+                        room_to_be_aborted in self.request_status
+                        and self.check_status(room_to_be_aborted) != KVPoll.Success
+                    ):
                         self.update_status(room_to_be_aborted, KVPoll.Failed)
                         logger.debug(
                             f"Received abort notification for room {room_to_be_aborted}, "

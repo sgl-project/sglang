@@ -1729,6 +1729,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 remaining.append(entry)
 
         self.deferred_releases = remaining
+        # Prune late ACKs" that arrived after the request was already aborted
+        if acked_rooms:
+            active_rooms = {d.bootstrap_room for d in self.deferred_releases}
+            acked_rooms -= acked_rooms - active_rooms
 
 
 class SchedulerDisaggregationDecodeMixin:
