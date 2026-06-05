@@ -6,6 +6,7 @@ export const Gemma4Deployment = () => {
       items: [
         { id: 'e2b', label: 'E2B (~2B)', default: false },
         { id: 'e4b', label: 'E4B (~4B)', default: true },
+        { id: '12b', label: '12B (Dense)', default: false },
         { id: '31b', label: '31B (Dense)', default: false },
         { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
       ]
@@ -56,12 +57,14 @@ export const Gemma4Deployment = () => {
     h200: {
       e2b: { tp: 1, mem: 0.85 },
       e4b: { tp: 1, mem: 0.85 },
+      '12b': { tp: 1, mem: 0.85 },
       '31b': { tp: 2, mem: 0.85 },
       '26b-a4b': { tp: 1, mem: 0.85 },
     },
     b200: {
       e2b: { tp: 1, mem: 0.9 },
       e4b: { tp: 1, mem: 0.9 },
+      '12b': { tp: 1, mem: 0.9 },
       '31b': { tp: 1, mem: 0.9 },
       '26b-a4b': { tp: 1, mem: 0.9 },
     },
@@ -82,6 +85,7 @@ export const Gemma4Deployment = () => {
     const modelNames = {
       'e2b': 'google/gemma-4-E2B-it',
       'e4b': 'google/gemma-4-E4B-it',
+      '12b': 'google/gemma-4-12B-it',
       '31b': 'google/gemma-4-31B-it',
       '26b-a4b': 'google/gemma-4-26B-A4B-it',
     };

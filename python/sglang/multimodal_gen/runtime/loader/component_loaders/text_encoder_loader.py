@@ -163,7 +163,9 @@ class TextEncoderLoader(ComponentLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+        # Sort weight files when SGLANG_SORT_WEIGHT_FILES >= 0 (default).
+        # Staggering is not applicable to text-encoder loading (no TP split).
+        if envs.SGLANG_SORT_WEIGHT_FILES.get() >= 0:
             hf_weights_files.sort()
 
         return hf_folder, hf_weights_files, use_safetensors
@@ -244,6 +246,11 @@ class TextEncoderLoader(ComponentLoader):
         if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
+        post_diffusers_config_update = getattr(
+            encoder_config, "post_diffusers_config_update", None
+        )
+        if post_diffusers_config_update is not None:
+            post_diffusers_config_update()
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]
