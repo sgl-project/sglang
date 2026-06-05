@@ -953,16 +953,23 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        if positions.dim() == 2 and positions.shape[0] == 3:
+            positions_fusable = not forward_batch.contains_mm_inputs()
+            fused_positions = positions[0]
+        else:
+            # defensive fallback
+            positions_fusable = positions.dim() == 1
+            fused_positions = positions
+
         use_aiter_fused = (
             _aiter_fused_qkv_split_qk_norm_rope_cache is not None
-            and positions.dim() == 1 # keep VL models out of it
-            and self.partial_rotary_factor == 1.0 # kernel supports this only
+            and positions_fusable
             and forward_batch.out_cache_loc is not None
         )
 
         if use_aiter_fused:
             q, k, v, gate = self._prepare_qkv_aiter_fused(
-                positions=positions,
+                positions=fused_positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
