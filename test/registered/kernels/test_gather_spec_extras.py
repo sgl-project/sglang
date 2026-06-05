@@ -6,16 +6,8 @@ import unittest
 
 import torch
 
+from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.test.test_utils import CustomTestCase
-
-try:
-    from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
-
-    _IMPORT_ERROR = None
-except Exception as e:  # pragma: no cover
-    gather_spec_extras = None
-    _IMPORT_ERROR = e
-
 
 _OUTPUT_NAMES = ("topk_p", "topk_index", "bonus_tokens", "hidden_states")
 
@@ -77,10 +69,6 @@ class TestGatherSpecExtras(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        if gather_spec_extras is None:
-            raise unittest.SkipTest(
-                f"gather_spec_extras import failed: {_IMPORT_ERROR}"
-            )
         cls.device = torch.device("cuda")
 
     def _assert_matches_reference(self, indices, bufs):
