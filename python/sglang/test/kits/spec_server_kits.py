@@ -519,11 +519,8 @@ class SpecPenaltyKit:
 
 
 class SpecDraftKvOverflowKit:
-    """Drive draft sequences into the ``topk * seq_len`` kv_indices overflow regime
-    so the in-kernel size invariant (FlashInferMultiStepDraftBackend.common_template)
-    deterministically catches an undersized draft buffer, instead of relying on the
-    flaky out-of-vocab crash. Only meaningful for topk > 1; a no-op-ish sweep for
-    topk == 1 (one branch per row never overflows)."""
+    """topk>1 draft kv_indices overflow probe; relies on the common_template size
+    invariant for deterministic detection. Only meaningful for topk>1."""
 
     def test_draft_kv_indices_overflow(self):
         run_draft_kv_overflow_test(self.base_url, self.page_size, self.spec_steps)

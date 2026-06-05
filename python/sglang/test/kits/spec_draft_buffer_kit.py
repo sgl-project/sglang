@@ -1,22 +1,10 @@
-"""Draft-buffer overflow probe for EAGLE/EAGLE3 topk>1 spec decoding.
+"""Draft kv_indices overflow probe for EAGLE topk>1 spec decoding.
 
-Background: the multi-step draft attention packs ``topk`` per-branch sequences
-(prefix + draft) into each row of its ``kv_indices`` buffer, so the row must hold
-``topk * seq_len``. If the buffer is allocated without the ``topk`` factor (e.g. a
-cuda-graph buffer sized ``max_bs * max_context_len`` instead of
-``max_bs * topk * max_context_len``) the index-building kernel writes out of bounds
-once ``topk * seq_len`` exceeds the row width. That corruption is usually SILENT --
-it stomps a neighboring kv-index row (wrong attention, still in-vocab tokens, no
-crash) and only sometimes lands on the int64 draft token list, producing an
-out-of-vocab token id that crashes the target verify embedding gather. A test that
-only checks "server stayed alive" therefore misses most of the damage.
-
-This probe drives draft sequences into the overflow regime (long sequences, and
-for page_size>1 the page-boundary residues where num_new_pages>=2). The reliable
-detector is the in-kernel size invariant in
-``FlashInferMultiStepDraftBackend.common_template`` (it fails fast and
-deterministically when a row is too narrow). This kit's job is to make sure some
-request actually reaches that regime so the invariant has something to catch.
+An undersized draft kv_indices row (e.g. a cuda-graph buffer missing the topk
+factor) is written out of bounds and *silently* corrupts memory, so "server
+stayed alive" doesn't catch it. This probe drives sequences into the overflow
+regime; the deterministic detector is the size invariant in
+FlashInferMultiStepDraftBackend.common_template.
 """
 
 import requests
@@ -29,9 +17,8 @@ def run_draft_kv_overflow_test(
     max_len: int = 1536,
 ):
     if page_size > 1:
-        # last_page_len in [page-num_steps+1, page-1] -> num_new_pages >= 2 (the
-        # holey boundary). Sweep that band at every page multiple up to max_len so
-        # the per-row required length keeps growing with seq_len.
+        # Sweep the holey page boundary (last_page_len in [page-num_steps+1, page-1],
+        # num_new_pages>=2) at every page multiple, so required row length grows with seq.
         lo = max(1, page_size - num_steps + 1)
         residues = list(range(lo, page_size))
         lens = sorted(
@@ -61,9 +48,8 @@ def run_draft_kv_overflow_test(
             },
             timeout=120,
         )
-        # 200 = ok. A scheduler-side size-invariant failure or device assert kills
-        # the worker -> the request errors / the connection drops, which surfaces
-        # here as a non-200 or a RequestException (caught by the test runner).
+        # Non-200 / dropped connection = the scheduler hit the size invariant or a
+        # device assert, i.e. the bug.
         assert res.status_code == 200, (
             f"draft kv-indices overflow probe failed at input_len={n}: "
             f"status={res.status_code} body={res.text[:300]}"

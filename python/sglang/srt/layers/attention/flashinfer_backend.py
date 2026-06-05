@@ -1584,12 +1584,8 @@ class FlashInferMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        # Size invariant: generate_draft_decode_kv_indices packs topk per-branch
-        # sequences (prefix + draft) into each row, writing up to this many entries.
-        # If the row is narrower (e.g. a cuda-graph buffer allocated without the topk
-        # factor) the kernel writes out of bounds and silently corrupts neighboring
-        # memory -- which only sometimes surfaces as an out-of-vocab draft token crash.
-        # Fail fast and deterministically here instead of relying on that crash.
+        # Fail fast on an undersized kv_indices row: the kernel would otherwise write
+        # OOB and *silently* corrupt memory, only sometimes surfacing as a crash.
         required_kv_indices_len = (
             seq_lens_sum * self.topk + bs * self.speculative_num_steps
         )
@@ -1658,11 +1654,9 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        # Each step packs topk per-branch sequences (prefix + draft) into one row,
-        # so the row must hold topk * max_context_len -- matching the eager path in
-        # init_forward_metadata (batch_size * topk * max_context_len). Without the
-        # topk factor the holey generate_draft_decode_kv_indices kernel overflows
-        # the buffer for topk > 1 at long sequences and corrupts neighboring memory.
+        # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
+        # so the row needs the topk factor -- same as the eager init_forward_metadata
+        # (batch_size * topk * max_context_len). Dropping it overflows the buffer.
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
             dtype=torch.int32,
