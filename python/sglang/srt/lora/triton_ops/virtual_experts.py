@@ -692,6 +692,31 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
+    # Gated MLP (gate_up): lora_a stacks gate+up A-weights along the rank dim
+    # (rank = 2r) while lora_b keeps the original rank r. The shrink produces both
+    # gate-shrink [:, 0:r] and up-shrink [:, r:2r], but the expand contracts only
+    # K = lora_b.shape[-1] = r columns of A. Without the gated remap a single call
+    # feeds the gate-shrink [:, 0:r] to BOTH the gate and up output halves, dropping
+    # up_A entirely (up delta computed from gate_A -- wrong whenever gate_A != up_A,
+    # the normal independently-trained gate/up LoRA case). `gated_a_input` makes the
+    # up output tiles read the up-shrink columns [r:2r] IN-KERNEL, so one launch (one
+    # routing pass, weights read once) yields the correct gate (gate_A) and up (up_A)
+    # deltas. This matches the classic path (_add_lora_gate_up_delta) numerically.
+    expand_rank = lora_b_virtual.shape[-1]
+    is_gated = max_lora_rank > expand_rank
+    gated_a_n_half = (lora_b_virtual.shape[1] // 2) if is_gated else 0
+    expand_config = b_stage_config
+    if is_gated:
+        # The in-kernel gate/up split needs the gate/up output boundary (gated_a_n_half)
+        # to land on a BLOCK_SIZE_N tile boundary, else a tile would straddle the two
+        # halves. Clamp the expand tile to a power-of-2 divisor of n_half (n_half is a
+        # power-of-2-multiple MLP dim, so this terminates) instead of crashing on an
+        # ill-aligned tuned config. BLOCK_SIZE_N only affects this expand's tiling.
+        block_n = b_stage_config["BLOCK_SIZE_N"]
+        while gated_a_n_half % block_n != 0:
+            block_n //= 2
+        if block_n != b_stage_config["BLOCK_SIZE_N"]:
+            expand_config = {**b_stage_config, "BLOCK_SIZE_N": block_n}
     invoke_fused_moe_kernel(
         intermediate.view(-1, max_lora_rank),
         lora_b_virtual,
@@ -707,7 +732,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         num_tokens_post_padded,
         mul_routed_weight,
         1,
-        b_stage_config,
+        expand_config,
         tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
         False,
         False,
@@ -718,6 +743,8 @@ def _merged_experts_fused_moe_lora_add_impl(
         fuse_add_to_output=True,
         add_output_mask=token_lora_mask,
         router_topk=topk_ids.shape[1],
+        gated_a_input=is_gated,
+        gated_a_n_half=gated_a_n_half,
     )
 
 

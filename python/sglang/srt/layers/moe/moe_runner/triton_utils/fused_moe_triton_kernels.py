@@ -381,6 +381,8 @@ def fused_moe_kernel(
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
+    GATED_A_INPUT: tl.constexpr,
+    GATED_A_N_HALF: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -465,8 +467,18 @@ def fused_moe_kernel(
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
         start_offs_m = pid_m * BLOCK_SIZE_M
     else:
+        # Gated gate_up LoRA expand: A holds [gate_shrink | up_shrink] (2*K columns).
+        # Output N tiles in the up half (pid_n past the gate/up boundary) contract the
+        # up-shrink columns [K:2K] instead of [0:K], so a single launch produces the
+        # correct gate (from gate_A) and up (from up_A) deltas. GATED_A_INPUT=False
+        # (the default) leaves the offset at 0 -- identical to the non-gated path.
+        if GATED_A_INPUT:
+            a_k_offset = tl.where(pid_n * BLOCK_SIZE_N >= GATED_A_N_HALF, K, 0)
+        else:
+            a_k_offset = 0
         a_ptrs = a_ptr + (
-            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+            offs_token[:, None] // top_k * stride_am
+            + (offs_k[None, :] + a_k_offset) * stride_ak
         )
 
     if b_desc is not None:
@@ -731,9 +743,26 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
+    gated_a_input: bool = False,
+    gated_a_n_half: int = 0,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+    if gated_a_input:
+        # A holds [gate_shrink | up_shrink] = 2*K columns; the kernel selects [0:K]
+        # for the gate output half and [K:2K] for the up half via GATED_A_N_HALF.
+        assert not (
+            use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16
+        ), "gated A remap is only supported for unquantized LoRA expand kernels"
+        # The A-TMA path (a_desc) loads A in the `a_desc is not None` branch, which
+        # bypasses the GATED_A_INPUT column remap entirely -- it would silently fall
+        # back to reading gate-shrink for the up half. Disallow the combination.
+        assert not a_use_tma, "gated A remap is not supported with A TMA"
+        assert A.shape[1] >= 2 * B.shape[2]
+        assert gated_a_n_half > 0
+        assert (
+            gated_a_n_half % config["BLOCK_SIZE_N"] == 0
+        ), "gated A remap requires the gate/up output boundary to align to BLOCK_SIZE_N"
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -926,6 +955,8 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            GATED_A_INPUT=gated_a_input,
+            GATED_A_N_HALF=gated_a_n_half,
             **config,
         )
 

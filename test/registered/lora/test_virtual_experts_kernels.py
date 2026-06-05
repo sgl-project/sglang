@@ -15,6 +15,10 @@ Covers two regression bugs that surface only with `--lora-use-virtual-experts`
   wrap, or past-end) and don't get assigned to a real expert in the
   consumer-block table.
 
+It also covers the gated gate_up expand math: the up output half must contract
+the up_A shrink slice (`[r:2r]`), not gate_A (`[0:r]`). The pre-fix expand fed
+gate_A's shrink to both halves, dropping up_A entirely.
+
 Both kernels run on CUDA. The fallback is gated on `virtual_num_experts >= 1024`
 in production, but we exercise it directly here at smaller sizes for cheaper
 iteration; one test sticks to the >1024 regime to mirror the production trigger.
@@ -37,6 +41,7 @@ from sglang.srt.lora.triton_ops.virtual_experts import (
     _align_block_size_torch,
     _fused_virtual_topk_ids,
     fused_sanitize_expert_ids,
+    merged_experts_fused_moe_lora_add,
 )
 
 
@@ -274,6 +279,164 @@ class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
         )
         expert_ids = fused_sanitize_expert_ids(expert_ids, num_experts)
         return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+
+class TestMergedExpertsGatedGateUpLoRA(CustomTestCase):
+    """Gated gate_up MoE-LoRA expand must use up_A for the up half, gate_A for gate.
+
+    Regression for the bug where the virtual-experts expand contracted only the
+    first `rank` shrink columns (gate_A) and fed them to BOTH output halves, so
+    the up-projection LoRA delta was computed from gate_A and up_A was dropped.
+    Builds independently-initialized gate_A != up_A and checks both output halves
+    against a plain-PyTorch PEFT reference (gate = x@gate_A^T@gate_B^T,
+    up = x@up_A^T@up_B^T), including the EP-dispatch `topk_ids == -1` sentinels and
+    no-LoRA tokens (`token_lora_mapping == -1`) that gate the production trigger.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA required")
+        cls.device = "cuda:0"
+
+    def _run_gated(self, r, E, with_sentinels):
+        """Build a gated gate_up adapter (gate_A != up_A), run the real dispatch,
+        and assert each output half matches its own A/B vs a PEFT reference.
+
+        ``with_sentinels`` injects EP-dropped experts (topk_ids == -1) and a
+        no-LoRA token (token_lora_mapping == -1); both must yield a zero delta.
+        """
+        device, dtype = self.device, torch.bfloat16
+        top_k, K, inter, bs = 4, 256, 128, 16
+        gen = torch.Generator(device=device).manual_seed(r + int(with_sentinels))
+
+        def rnd(*shape):
+            return torch.randn(*shape, generator=gen, device=device, dtype=dtype) * 0.1
+
+        gate_a, up_a = rnd(E, r, K), rnd(E, r, K)  # independent: gate_A != up_A
+        self.assertFalse(
+            torch.equal(gate_a, up_a), "test invariant: gate_A must differ from up_A"
+        )
+        gate_b, up_b = rnd(E, inter, r), rnd(E, inter, r)
+        # Stacked buffers as the loader builds them: lora_a rank-dim = 2r, lora_b N = 2*inter.
+        lora_a = torch.empty(1, E, 2 * r, K, device=device, dtype=dtype)
+        lora_a[0, :, 0:r, :], lora_a[0, :, r : 2 * r, :] = gate_a, up_a
+        lora_b = torch.empty(1, E, 2 * inter, r, device=device, dtype=dtype)
+        lora_b[0, :, 0:inter, :], lora_b[0, :, inter : 2 * inter, :] = gate_b, up_b
+
+        hidden = rnd(bs, K)
+        topk_ids = torch.topk(
+            torch.rand(bs, E, generator=gen, device=device), k=top_k, dim=1
+        ).indices.to(torch.int32)
+        topk_weights = torch.ones(bs, top_k, device=device, dtype=torch.float32)
+        tlm = torch.zeros(bs, device=device, dtype=torch.int32)
+        if with_sentinels:
+            topk_ids[0, 0] = -1  # EP-dropped (non-owned) expert
+            topk_ids[1, :] = -1  # whole token dropped
+            tlm[2] = -1  # no-LoRA token
+
+        output = torch.zeros(bs, top_k, 2 * inter, device=device, dtype=dtype)
+        merged_experts_fused_moe_lora_add(
+            output,
+            hidden,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            tlm,
+            False,
+            False,
+            False,
+        )
+
+        xf = hidden.float()
+        gate_a_f, up_a_f, gate_b_f, up_b_f = (
+            gate_a.float(),
+            up_a.float(),
+            gate_b.float(),
+            up_b.float(),
+        )
+        zero = torch.zeros(inter, device=device, dtype=torch.float32)
+        for m in range(bs):
+            for k in range(top_k):
+                e = int(topk_ids[m, k].item())
+                if e < 0 or int(tlm[m].item()) < 0:
+                    gate_ref = up_ref = zero  # sentinel / no-LoRA -> no delta
+                else:
+                    gate_ref = (xf[m] @ gate_a_f[e].t()) @ gate_b_f[e].t()
+                    up_ref = (xf[m] @ up_a_f[e].t()) @ up_b_f[e].t()
+                got = output[m, k].float()
+                torch.testing.assert_close(
+                    got[:inter],
+                    gate_ref,
+                    rtol=2e-2,
+                    atol=2e-3,
+                    msg=f"gate half mismatch (r={r}, m={m}, k={k}, e={e})",
+                )
+                torch.testing.assert_close(
+                    got[inter:],
+                    up_ref,
+                    rtol=2e-2,
+                    atol=2e-3,
+                    msg=f"up half mismatch (r={r}, m={m}, k={k}, e={e}) -- up must use up_A",
+                )
+
+    def test_up_half_uses_up_a_rank16(self):
+        """Gated gate_up LoRA (rank 16): gate and up halves each match their own A/B."""
+        self._run_gated(r=16, E=8, with_sentinels=False)
+
+    def test_up_half_uses_up_a_rank64(self):
+        """Gated gate_up LoRA (rank 64, production max): up half must use up_A."""
+        self._run_gated(r=64, E=8, with_sentinels=False)
+
+    def test_gated_with_ep_sentinels(self):
+        """Split expand + masked add stays correct under EP -1 sentinels / no-LoRA tokens."""
+        self._run_gated(r=16, E=8, with_sentinels=True)
+
+    def test_non_gated_no_regression(self):
+        """Non-gated (lora_a rank == lora_b rank) keeps the single-expand path correct."""
+        device, dtype = self.device, torch.bfloat16
+        E, top_k, K, N, r, bs = 8, 4, 256, 256, 16, 16
+        gen = torch.Generator(device=device).manual_seed(7)
+
+        def rnd(*shape):
+            return torch.randn(*shape, generator=gen, device=device, dtype=dtype) * 0.1
+
+        a, b = rnd(E, r, K), rnd(E, N, r)  # rank-dim r == lora_b rank -> non-gated
+        lora_a = a.unsqueeze(0).clone()
+        lora_b = b.unsqueeze(0).clone()
+        hidden = rnd(bs, K)
+        topk_ids = torch.topk(
+            torch.rand(bs, E, generator=gen, device=device), k=top_k, dim=1
+        ).indices.to(torch.int32)
+        topk_weights = torch.ones(bs, top_k, device=device, dtype=torch.float32)
+        tlm = torch.zeros(bs, device=device, dtype=torch.int32)
+
+        output = torch.zeros(bs, top_k, N, device=device, dtype=dtype)
+        merged_experts_fused_moe_lora_add(
+            output,
+            hidden,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            tlm,
+            False,
+            False,
+            False,
+        )
+        xf, af, bf = hidden.float(), a.float(), b.float()
+        for m in range(bs):
+            for k in range(top_k):
+                e = int(topk_ids[m, k].item())
+                ref = (xf[m] @ af[e].t()) @ bf[e].t()
+                torch.testing.assert_close(
+                    output[m, k].float(),
+                    ref,
+                    rtol=2e-2,
+                    atol=2e-3,
+                    msg=f"non-gated mismatch (m={m}, k={k}, e={e})",
+                )
 
 
 if __name__ == "__main__":
