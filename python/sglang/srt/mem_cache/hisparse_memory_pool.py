@@ -2,7 +2,7 @@
 
 import logging
 import weakref
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import psutil
 import torch
@@ -497,6 +497,19 @@ class DeepSeekV4SingleKVPoolHost(HiSparseHostPoolMixin):
     def free(self, indices: torch.Tensor) -> int:
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
+
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+
+        for buf in self.kv_buffer:
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(self.page_size * buf[0].nbytes)
+
+        return data_ptrs, data_lens, item_lens
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
