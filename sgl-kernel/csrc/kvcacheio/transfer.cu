@@ -221,6 +221,9 @@ __global__ void transfer_kernel_impl(
     int64_t item_size_bytes,
     int64_t src_layout_dim,
     int64_t dst_layout_dim,
+    int64_t v_item_size_bytes,
+    int64_t v_src_layout_dim,
+    int64_t v_dst_layout_dim,
     const uintptr_t* __restrict__ src_k_layer_tbl,
     const uintptr_t* __restrict__ dst_k_layer_tbl,
     const uintptr_t* __restrict__ src_v_layer_tbl,
@@ -247,10 +250,15 @@ __global__ void transfer_kernel_impl(
 
       if constexpr (!IsMLA) {
         const char* src_v_ptr = SrcOffsetFn(
-            static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
+            static_cast<const char*>(src_v),
+            src_v_layer_tbl,
+            layer_id,
+            v_src_layout_dim,
+            src_page_id,
+            v_item_size_bytes);
         char* dst_v_ptr = DstOffsetFn(
-            static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+            static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, v_dst_layout_dim, dst_page_id, v_item_size_bytes);
+        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, v_item_size_bytes);
       }
     }
   }
@@ -276,7 +284,10 @@ void transfer_kv_launcher(
     int64_t block_quota,
     int64_t num_warps_per_block,
     const int64_t page_size = 16,
-    const int64_t head_num = 1) {
+    const int64_t head_num = 1,
+    const int64_t k_head_dim = 0,
+    const int64_t v_head_dim = 0,
+    bool device2host = true) {
   TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
   TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
@@ -300,8 +311,36 @@ void transfer_kv_launcher(
   const uintptr_t* src_v_tbl_ptr = IsMLA || !src_v_layers.defined() ? nullptr : src_v_layers.data_ptr<uintptr_t>();
   const uintptr_t* dst_v_tbl_ptr = IsMLA || !dst_v_layers.defined() ? nullptr : dst_v_layers.data_ptr<uintptr_t>();
 
+  // Asymmetric K/V (head_dim != v_head_dim, e.g. MiMo V2):
+  // public ops pass K-sized ``item_size`` and ``src/dst_layout_dim`` for ABI
+  // compatibility. Rescale them to V-sized counterparts by
+  // ``v_head_dim / k_head_dim``. Only the page-first ("K-shaped") side
+  // actually uses ``layout_dim`` for addressing -- ``device2host`` tells us
+  // which side that is (true=backup, pf on dst; false=load, pf on src). The
+  // other "L-shaped" side uses a per-layer base table (``lf_tbl``) or a dummy
+  // 0, so its ``layout_dim`` is left untouched. Symmetric K/V short-circuits
+  // to ``v_* = *`` and is bit-identical to the pre-asymmetric behavior.
+  int64_t v_src_layout_dim;
+  int64_t v_dst_layout_dim;
+  bool different_head_dim = k_head_dim != v_head_dim;
+  if (device2host) {
+    TORCH_CHECK(
+        !different_head_dim || dst_layout_dim % k_head_dim == 0,
+        "Destination layout dimension must be divisible by k head dimension");
+    v_src_layout_dim = src_layout_dim;
+    v_dst_layout_dim = different_head_dim ? dst_layout_dim / k_head_dim * v_head_dim : dst_layout_dim;
+  } else {
+    TORCH_CHECK(
+        !different_head_dim || src_layout_dim % k_head_dim == 0,
+        "Source layout dimension must be divisible by k head dimension");
+    v_src_layout_dim = different_head_dim ? src_layout_dim / k_head_dim * v_head_dim : src_layout_dim;
+    v_dst_layout_dim = dst_layout_dim;
+  }
+  int64_t v_item_size = different_head_dim ? item_size / k_head_dim * v_head_dim : item_size;
+
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   if constexpr (PageHeadLayout) {
+    TORCH_CHECK(!different_head_dim, "Page head layout does not support different head dimension between k and v");
     transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
         src_k_ptr,
         dst_k_ptr,
@@ -337,6 +376,9 @@ void transfer_kv_launcher(
         item_size,
         src_layout_dim,
         dst_layout_dim,
+        v_item_size,
+        v_src_layout_dim,
+        v_dst_layout_dim,
         src_k_tbl_ptr,
         dst_k_tbl_ptr,
         src_v_tbl_ptr,
@@ -389,6 +431,12 @@ void transfer_kv_per_layer_pf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty;
+  // Auto-derive K/V head_dim from the per-layer destination tensors so that
+  // asymmetric K/V (head_dim != v_head_dim) works without a public ABI bump.
+  // Symmetric K/V is unaffected: when both equal, the launcher's
+  // ``different_head_dim`` branch is a no-op.
+  const int64_t k_head_dim = dst_k.size(-1);
+  const int64_t v_head_dim = dst_v.size(-1);
   transfer_kv_launcher<get_global_offset_pf<const char>, get_global_offset_lf<char>, false>(
       src_k,
       dst_k,
@@ -406,7 +454,12 @@ void transfer_kv_per_layer_pf_lf(
       empty,
       empty,
       block_quota,
-      num_warps_per_block);
+      num_warps_per_block,
+      /*page_size=*/16,
+      /*head_num=*/1,
+      k_head_dim,
+      v_head_dim,
+      /*device2host=*/false);
 }
 
 void transfer_kv_per_layer_ph_lf(
@@ -493,6 +546,9 @@ void transfer_kv_all_layer_lf_pf(
     int64_t num_warps_per_block) {
   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
   at::Tensor empty;
+  // Auto-derive K/V head_dim from the destination tensors.
+  const int64_t k_head_dim = dst_k.size(-1);
+  const int64_t v_head_dim = dst_v.size(-1);
   transfer_kv_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_pf<char>, false>(
       empty,
       dst_k,
@@ -510,7 +566,12 @@ void transfer_kv_all_layer_lf_pf(
       src_v_layers,
       empty,
       block_quota,
-      num_warps_per_block);
+      num_warps_per_block,
+      /*page_size=*/16,
+      /*head_num=*/1,
+      k_head_dim,
+      v_head_dim,
+      /*device2host=*/true);
 }
 
 void transfer_kv_all_layer_lf_ph(

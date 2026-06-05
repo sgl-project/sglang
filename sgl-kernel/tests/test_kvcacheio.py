@@ -5,12 +5,14 @@ import torch
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_lf_pf,
     transfer_kv_all_layer_lf_ph,
     transfer_kv_all_layer_mla,
     transfer_kv_direct,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_pf_lf,
 )
 
 from sglang.srt.utils import get_cuda_version, is_hip
@@ -709,6 +711,201 @@ def test_transfer_kv_page_head(
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Asymmetric K/V (head_dim != v_head_dim) tests for the HiCache transfer
+# kernels touched by the MiMo V2 fix. Covers transfer_kv_per_layer_pf_lf and
+# transfer_kv_all_layer_lf_pf, each in symmetric (128, 128) and MiMo V2
+# asymmetric (192, 128) flavors. Reference is plain PyTorch indexed copy, the
+# kernel only memcpys, so equality is byte-exact.
+# ---------------------------------------------------------------------------
+
+_ASYM_NUM_LAYERS = 4
+_ASYM_HEAD_NUM = 2
+_ASYM_PAGE_SIZE = 16
+_ASYM_TOTAL_PAGES = 32
+
+
+def _asym_layout_sizes(head_num, head_dim, num_layers, dtype):
+    token_stride = head_num * head_dim * dtype.itemsize
+    layout_dim = token_stride * num_layers
+    return token_stride, layout_dim
+
+
+def _asym_make_indices(num_pages_to_transfer, page_size, total_pages, device):
+    perm = torch.randperm(total_pages, dtype=torch.int64)
+    src_pages = perm[:num_pages_to_transfer]
+    dst_pages = perm[num_pages_to_transfer : 2 * num_pages_to_transfer]
+    src = torch.cat(
+        [torch.arange(int(p) * page_size, (int(p) + 1) * page_size) for p in src_pages]
+    )
+    dst = torch.cat(
+        [torch.arange(int(p) * page_size, (int(p) + 1) * page_size) for p in dst_pages]
+    )
+    return src.to(device), dst.to(device)
+
+
+def _asym_data_ptrs(per_layer_tensors, device):
+    return torch.tensor(
+        [t.data_ptr() for t in per_layer_tensors],
+        dtype=torch.uint64,
+        device=device,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "head_dim, v_head_dim",
+    # (192, 128) matches MiMo-V2-Flash's real qk_head_dim / v_head_dim.
+    [(128, 128), (192, 128)],
+    ids=["symmetric", "asymmetric_mimo_v2_flash"],
+)
+def test_transfer_kv_per_layer_pf_lf_asymmetric(dtype, head_dim, v_head_dim):
+    """H (page_first, separate K/V) -> D (layer_first, per-layer view)."""
+    torch.cuda.manual_seed(42)
+    device = "cuda"
+    layer_id = 1
+    num_pages_to_transfer = 4
+    total_tokens = _ASYM_TOTAL_PAGES * _ASYM_PAGE_SIZE
+
+    src_indices, dst_indices = _asym_make_indices(
+        num_pages_to_transfer, _ASYM_PAGE_SIZE, _ASYM_TOTAL_PAGES, device
+    )
+
+    # Asymmetric K/V is exercised by allocating K and V independently with
+    # their own trailing dim. The symmetric case uses the same two-tensor
+    # shape so the reference path stays uniform; this matches the production
+    # MHATokenToKVPoolHost.k_buffer / .v_buffer accessors which yield K and V
+    # slices regardless of whether the underlying allocation is fused.
+    src_k_host = torch.randn(
+        total_tokens,
+        _ASYM_NUM_LAYERS,
+        _ASYM_HEAD_NUM,
+        head_dim,
+        dtype=dtype,
+        pin_memory=True,
+    )
+    src_v_host = torch.randn(
+        total_tokens,
+        _ASYM_NUM_LAYERS,
+        _ASYM_HEAD_NUM,
+        v_head_dim,
+        dtype=dtype,
+        pin_memory=True,
+    )
+    dst_k_dev = torch.zeros(
+        _ASYM_NUM_LAYERS,
+        total_tokens,
+        _ASYM_HEAD_NUM,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    dst_v_dev = torch.zeros(
+        _ASYM_NUM_LAYERS,
+        total_tokens,
+        _ASYM_HEAD_NUM,
+        v_head_dim,
+        dtype=dtype,
+        device=device,
+    )
+
+    k_token_stride, k_layout_dim = _asym_layout_sizes(
+        _ASYM_HEAD_NUM, head_dim, _ASYM_NUM_LAYERS, dtype
+    )
+    transfer_kv_per_layer_pf_lf(
+        src_k=src_k_host,
+        dst_k=dst_k_dev[layer_id],
+        src_v=src_v_host,
+        dst_v=dst_v_dev[layer_id],
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        layer_id=layer_id,
+        item_size=k_token_stride,
+        src_layout_dim=k_layout_dim,
+    )
+    torch.cuda.synchronize()
+
+    expected_k = src_k_host[src_indices.cpu(), layer_id].to(device)
+    expected_v = src_v_host[src_indices.cpu(), layer_id].to(device)
+    torch.testing.assert_close(dst_k_dev[layer_id, dst_indices], expected_k)
+    torch.testing.assert_close(dst_v_dev[layer_id, dst_indices], expected_v)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "head_dim, v_head_dim",
+    [(128, 128), (192, 128)],
+    ids=["symmetric", "asymmetric_mimo_v2_flash"],
+)
+def test_transfer_kv_all_layer_lf_pf_asymmetric(dtype, head_dim, v_head_dim):
+    """D (layer_first, layer-ptr table) -> H (page_first, separate K/V)."""
+    torch.cuda.manual_seed(42)
+    device = "cuda"
+    num_pages_to_transfer = 4
+    total_tokens = _ASYM_TOTAL_PAGES * _ASYM_PAGE_SIZE
+
+    src_indices, dst_indices = _asym_make_indices(
+        num_pages_to_transfer, _ASYM_PAGE_SIZE, _ASYM_TOTAL_PAGES, device
+    )
+
+    src_k_layers = [
+        torch.randn(total_tokens, _ASYM_HEAD_NUM, head_dim, dtype=dtype, device=device)
+        for _ in range(_ASYM_NUM_LAYERS)
+    ]
+    src_v_layers = [
+        torch.randn(
+            total_tokens, _ASYM_HEAD_NUM, v_head_dim, dtype=dtype, device=device
+        )
+        for _ in range(_ASYM_NUM_LAYERS)
+    ]
+    src_k_ptrs = _asym_data_ptrs(src_k_layers, device)
+    src_v_ptrs = _asym_data_ptrs(src_v_layers, device)
+
+    dst_k_host = torch.zeros(
+        total_tokens,
+        _ASYM_NUM_LAYERS,
+        _ASYM_HEAD_NUM,
+        head_dim,
+        dtype=dtype,
+        pin_memory=True,
+    )
+    dst_v_host = torch.zeros(
+        total_tokens,
+        _ASYM_NUM_LAYERS,
+        _ASYM_HEAD_NUM,
+        v_head_dim,
+        dtype=dtype,
+        pin_memory=True,
+    )
+
+    k_token_stride, k_layout_dim = _asym_layout_sizes(
+        _ASYM_HEAD_NUM, head_dim, _ASYM_NUM_LAYERS, dtype
+    )
+    transfer_kv_all_layer_lf_pf(
+        src_k_layers=src_k_ptrs,
+        dst_k=dst_k_host,
+        src_v_layers=src_v_ptrs,
+        dst_v=dst_v_host,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        item_size=k_token_stride,
+        dst_layout_dim=k_layout_dim,
+        num_layers=_ASYM_NUM_LAYERS,
+    )
+    torch.cuda.synchronize()
+
+    dst_idx_cpu = dst_indices.cpu()
+    for layer_id in range(_ASYM_NUM_LAYERS):
+        torch.testing.assert_close(
+            dst_k_host[dst_idx_cpu, layer_id],
+            src_k_layers[layer_id][src_indices].cpu(),
+        )
+        torch.testing.assert_close(
+            dst_v_host[dst_idx_cpu, layer_id],
+            src_v_layers[layer_id][src_indices].cpu(),
+        )
 
 
 if __name__ == "__main__":
