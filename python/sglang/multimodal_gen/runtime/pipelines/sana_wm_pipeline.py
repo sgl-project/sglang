@@ -94,8 +94,16 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
             "sana_wm_before_denoising",
         )
 
+        if getattr(server_args.pipeline_config, "streaming", False):
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
+                SanaWMStreamingDenoisingStage,
+            )
+
+            DenoiseStage = SanaWMStreamingDenoisingStage
+        else:
+            DenoiseStage = SanaWMDenoisingStage
         self.add_stage(
-            SanaWMDenoisingStage(
+            DenoiseStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),
@@ -108,8 +116,18 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         self._add_decoding_stage(server_args)
 
     def _add_decoding_stage(self, server_args: ServerArgs = None) -> None:
+        if server_args is not None and getattr(
+            server_args.pipeline_config, "streaming", False
+        ):
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
+                SanaWMStreamingDecodingStage,
+            )
+
+            DecodeStage = SanaWMStreamingDecodingStage
+        else:
+            DecodeStage = SanaWMDecodingStage
         self.add_stage(
-            SanaWMDecodingStage(
+            DecodeStage(
                 vae=self.get_module("vae"),
                 pipeline=self,
                 component_name="vae",
@@ -263,6 +281,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
     def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
         if sana_wm_skip_refiner_enabled():
             return
+        pc = server_args.pipeline_config
         common = dict(
             transformer=self.get_module("transformer_2"),
             connectors=self.get_module("connectors"),
@@ -270,13 +289,29 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             tokenizer=self.get_module("tokenizer_2"),
             dtype=default_sana_wm_refiner_dtype(server_args),
         )
-        stage = SanaWMLTX2RefinerStage(**common)
+        if getattr(pc, "streaming", False) and getattr(pc, "refiner_chunked", True):
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming_refiner import (
+                SanaWMStreamingRefinerStage,
+            )
+
+            stage = SanaWMStreamingRefinerStage(
+                **common,
+                block_size=int(getattr(pc, "refiner_block_size", 3)),
+                kv_max_frames=int(getattr(pc, "refiner_kv_max_frames", 11)),
+                sink_size=int(getattr(pc, "sink_size", 1)),
+                seed=int(getattr(pc, "refiner_seed", 42)),
+            )
+        else:
+            stage = SanaWMLTX2RefinerStage(**common)
         self.add_stage(stage, "sana_wm_refiner")
 
     def _add_decoding_stage(self, server_args: ServerArgs = None) -> None:
-        # Skip-refiner uses the base dense decode; otherwise the dense
-        # refiner-decode (drops the sink frame after the LTX-2 refiner).
-        if sana_wm_skip_refiner_enabled():
+        # Streaming and skip-refiner both route to the base decode
+        # (SanaWMStreamingDecodingStage / dense decode); otherwise dense refiner-decode.
+        streaming = server_args is not None and getattr(
+            server_args.pipeline_config, "streaming", False
+        )
+        if streaming or sana_wm_skip_refiner_enabled():
             return super()._add_decoding_stage(server_args)
         self.add_stage(
             SanaWMRefinerDecodingStage(
