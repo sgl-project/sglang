@@ -257,3 +257,43 @@ def test_can_fuse_declines_nonstock_call():
     sw_custom = _quantized_switch_glu(512, 64, 4, gate_bias=False)
     sw_custom.__class__ = _CustomSwitchGLU  # same swap mechanism the patch uses
     assert can_fuse(sw_custom) is False, "non-stock __call__ must fall back"
+
+
+def test_fused_forward_falls_back_on_dtype_mismatch():
+    """A runtime activation dtype the fused kernel rejects but gather_qmm
+    tolerates (bf16 gate params, fp16 activations) must fall back, not crash,
+    and match the unfused forward."""
+    import types
+
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
+        patch_switch_glu_with_fused_swiglu,
+    )
+
+    mx.random.seed(0)
+    in_dim, hidden, n_experts, top_k, B = 512, 64, 4, 4, 2  # 2*4=8 < 64 -> unsorted
+    sw = SwitchGLU(in_dim, hidden, n_experts, bias=False)
+    for name in ("up_proj", "gate_proj", "down_proj"):
+        lin = getattr(sw, name)
+        lin.weight = lin.weight.astype(mx.bfloat16)  # bf16 weight -> bf16 scales
+        setattr(sw, name, lin.to_quantized(group_size=64, bits=4, mode="affine"))
+    assert sw.gate_proj.scales.dtype == mx.bfloat16
+
+    # fp16 activations mismatch the bf16 gate params: the fused kernel raises,
+    # the unfused gather_qmm tolerates it.
+    x = mx.random.normal((B, in_dim)).astype(mx.float16)
+    indices = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+
+    out_ref = sw(x, indices)  # stock forward, unpatched
+    mx.eval(out_ref)
+
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+    assert patch_switch_glu_with_fused_swiglu(model) == 1, "layer should patch"
+
+    out_fb = sw(x, indices)  # patched -> kernel raises -> fallback, no crash
+    mx.eval(out_fb)
+    max_abs, rel = _max_rel_diff(out_ref, out_fb)
+    assert rel < 1e-3, f"fallback != unfused: max_abs={max_abs:.3e} rel={rel:.2%}"

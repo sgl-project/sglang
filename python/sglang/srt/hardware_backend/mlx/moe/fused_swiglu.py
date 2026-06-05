@@ -427,6 +427,51 @@ def can_fuse(switch_mlp) -> bool:
     return True
 
 
+# Warn once per process when the fused kernel declines runtime inputs and we
+# fall back, so a decode loop does not log per token.
+_fallback_warned = False
+
+
+def _fused_gate_or_fallback(gate_proj, x, gate_idx, x_up, sorted_indices=False):
+    """``silu(gate_qmv(x)) * x_up`` via the fused kernel, falling back to the
+    unfused ``gather_qmm`` + ``silu * x_up`` when the kernel rejects the inputs.
+
+    can_fuse gates the structural regime at patch time, but it cannot see the
+    runtime activation dtype, which the fused kernel requires to equal the gate
+    quant-param dtype. MLX's quantized gather_qmm tolerates that mismatch, so on
+    such a ValueError fall back rather than crash, from an opt-in flag, a model
+    the unfused path would have served. Warns once per process, not per token. A
+    genuine shape-contract bug raises AssertionError and is left to propagate.
+    """
+    gw = gate_proj["weight"]
+    gs = gate_proj["scales"]
+    gb = gate_proj.get("biases")
+    try:
+        return fused_gate_qmv_silu_mul(x, gw, gs, gb, gate_idx, x_up)
+    except ValueError as e:
+        global _fallback_warned
+        if not _fallback_warned:
+            logger.warning(
+                "Path B: fused gate kernel declined inputs (%s); using the "
+                "unfused gate path for this and matching calls.",
+                e,
+            )
+            _fallback_warned = True
+        x_gate = mx.gather_qmm(
+            x,
+            gw,
+            gs,
+            gb,
+            rhs_indices=gate_idx,
+            transpose=True,
+            group_size=_GROUP_SIZE,
+            bits=_BITS,
+            mode="affine",
+            sorted_indices=sorted_indices,
+        )
+        return nn.silu(x_gate) * x_up
+
+
 class FusedSwitchSwiGLU(nn.Module):
     """SwitchGLU forward with Path B fusion installed.
 
@@ -464,35 +509,20 @@ class FusedSwitchSwiGLU(nn.Module):
         # Up projection: unchanged.
         x_up = sw.up_proj(x, idx, sorted_indices=do_sort)
 
-        # Gate projection + silu + multiply: fused.
-        # Note: after _gather_sort, x has shape (M_tok, 1, 1, K) (no batch dim
-        # interleaved with topk), and idx is 1-D (M_tok,). x_up has shape
-        # (M_tok, 1, 1, N) in the sorted case — top_k axis is folded into M_tok.
-        if do_sort:
-            # In sorted mode, each row in x is already a (token, expert) pair
-            # so there's no extra TOPK fan-out. Treat as TOPK=1.
-            x_gate_in = x  # (M_tok, 1, 1, K)
-            idx_in = idx.reshape(-1, 1)  # (M_tok, 1)
-            x_up_in = x_up  # (M_tok, 1, 1, N)
-            swiglu = fused_gate_qmv_silu_mul(
-                x_gate_in,
-                sw.gate_proj["weight"],
-                sw.gate_proj["scales"],
-                sw.gate_proj.get("biases"),
-                idx_in,
-                x_up_in,
-            )
-            # swiglu shape: (M_tok, 1, 1, N). Down expects same.
+        # Gate projection + silu + multiply, fused into one kernel. Common
+        # (unsorted/decode) path first. x and x_up already carry the right
+        # shapes for both paths; only the index shape differs.
+        if not do_sort:
+            # Unsorted: x is (..., 1, 1, K), idx is (..., TOPK).
+            gate_idx = idx
         else:
-            # Unsorted: x has shape (..., 1, 1, K), idx has shape (..., TOPK).
-            swiglu = fused_gate_qmv_silu_mul(
-                x,
-                sw.gate_proj["weight"],
-                sw.gate_proj["scales"],
-                sw.gate_proj.get("biases"),
-                idx,
-                x_up,
-            )
+            # Sorted: _gather_sort folded the top_k axis into M_tok, so x is
+            # (M_tok, 1, 1, K), x_up is (M_tok, 1, 1, N), and each row is a
+            # (token, expert) pair — reshape idx to (M_tok, 1) (TOPK=1).
+            gate_idx = idx.reshape(-1, 1)
+        swiglu = _fused_gate_or_fallback(
+            sw.gate_proj, x, gate_idx, x_up, sorted_indices=do_sort
+        )
 
         out = sw.down_proj(swiglu, idx, sorted_indices=do_sort)
 
