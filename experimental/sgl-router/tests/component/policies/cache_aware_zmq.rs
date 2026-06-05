@@ -65,20 +65,18 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             port: 0,
         },
         observability: Default::default(),
-        models: vec![sgl_router::config::ModelConfig {
+        model: sgl_router::config::ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: sgl_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,
-        }],
-        discovery: sgl_router::config::DiscoveryConfig {
-            backend: sgl_router::config::DiscoveryBackend::StaticUrls(
-                sgl_router::config::StaticUrlsDiscoveryConfig {
-                    urls: vec!["http://placeholder:0".into()],
-                },
-            ),
         },
+        discovery: sgl_router::config::DiscoveryBackend::StaticUrls(
+            sgl_router::config::StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
+            },
+        ),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
     };
@@ -127,6 +125,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         topic: String::new(),
         block_size,
         dp_size: 1,
+        is_bigram: false,
     };
     kv_index.add_worker(url_a, Some(preresolved.clone())).await;
     kv_index.add_worker(url_b, Some(preresolved)).await;
