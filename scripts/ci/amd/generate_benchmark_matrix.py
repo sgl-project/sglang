@@ -3,8 +3,12 @@
 
 Reads ``scripts/ci/amd/benchmark-configs.yaml`` and prints a JSON array (one
 entry per ``config x variant``) suitable for a GitHub Actions
-``strategy.matrix``. Each emitted row carries everything
-``scripts/ci/amd/run_benchmark.sh`` needs.
+``strategy.matrix``. Each row carries the override-able per-run knobs plus a
+base64-encoded ``launch_spec`` (env + server/client args) that
+``scripts/ci/amd/run_benchmark.sh`` decodes to launch the sglang server itself.
+
+The base/​mtp launch spec is merged here (so the launcher stays variant-agnostic)
+and base64-encoded so it survives ``-e`` / ``docker exec`` without quoting issues.
 
 Filtering / overrides come from environment variables so the workflow can pass
 optional ``workflow_dispatch`` inputs without fragile shell quoting:
@@ -21,6 +25,7 @@ To add a model, edit ``benchmark-configs.yaml`` -- not this script or the
 workflow YAML.
 """
 
+import base64
 import json
 import os
 import sys
@@ -30,6 +35,32 @@ import yaml
 
 def _csv(value):
     return [x for x in (value or "").replace(" ", "").split(",") if x]
+
+
+def _join(*parts):
+    """Join non-empty arg strings with single spaces."""
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
+def _launch_spec_b64(cfg, variant):
+    """Merge the base + variant launch spec and return it base64(JSON)-encoded."""
+    env = dict(cfg.get("env") or {})
+    server_args = cfg.get("server-args", "") or ""
+    client_args = cfg.get("client-args", "") or ""
+
+    if variant == "mtp":
+        env.update(cfg.get("mtp-env") or {})
+        server_args = _join(server_args, cfg.get("mtp-server-args", ""))
+        client_args = _join(client_args, cfg.get("mtp-client-args", ""))
+
+    spec = {
+        "env": {str(k): str(v) for k, v in env.items()},
+        "server_args": server_args,
+        "client_args": client_args,
+        "chat_template": str(cfg.get("chat-template", "") or ""),
+        "bench_backend": str(cfg.get("bench-backend", "vllm") or "vllm"),
+    }
+    return base64.b64encode(json.dumps(spec).encode()).decode()
 
 
 def main():
@@ -73,6 +104,7 @@ def main():
                     "osl": ov_osl or str(cfg.get("osl", 1024)),
                     "dp_attn": (ov_dp or str(cfg.get("dp-attn", False))).lower(),
                     "conc_list": ov_conc or str(cfg.get("conc-list", "32")),
+                    "launch_spec_b64": _launch_spec_b64(cfg, variant),
                 }
             )
 

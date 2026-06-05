@@ -190,6 +190,7 @@ jobs:
             -e OSL="${{ matrix.config.osl }}" \
             -e DP_ATTENTION="${{ matrix.config.dp_attn }}" \
             -e CONC_LIST="${{ matrix.config.conc_list }}" \
+            -e LAUNCH_SPEC_B64="${{ matrix.config.launch_spec_b64 }}" \
             -e RESULT_OUT_DIR="/sglang-checkout/benchmark_results" \
             bash scripts/ci/amd/run_benchmark.sh
           RC=$?
