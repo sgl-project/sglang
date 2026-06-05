@@ -1,0 +1,674 @@
+"""
+Configuration and data structures for diffusion performance tests.
+
+Usage:
+
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
+# for a single testcase, look for the name of the testcase in ONE_GPU_CASES,
+# ONE_GPU_MODELOPT_FP8_CASES, ONE_GPU_B200_CASES, or TWO_GPU_CASES
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
+
+
+To add a new testcase:
+1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_FP8_CASES`, `ONE_GPU_B200_CASES`, or `TWO_GPU_CASES`
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
+3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
+
+
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import statistics
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Sequence
+
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.registry import (
+    get_model_info,
+    get_pipeline_config_classes,
+)
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+
+
+@dataclass
+class ToleranceConfig:
+    """Tolerance ratios for performance validation."""
+
+    e2e: float
+    denoise_stage: float
+    non_denoise_stage: float
+    denoise_step: float
+    denoise_agg: float
+
+    @classmethod
+    def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
+        """Load a specific tolerance profile from a dictionary of profiles."""
+        # Support both flat structure (backward compatibility) and profiled structure
+        if "e2e" in all_tolerances and not isinstance(all_tolerances["e2e"], dict):
+            tol_data = all_tolerances
+            actual_profile = "legacy/flat"
+        else:
+            tol_data = all_tolerances.get(
+                profile_name, all_tolerances.get("pr_test", {})
+            )
+            actual_profile = (
+                profile_name if profile_name in all_tolerances else "pr_test"
+            )
+
+        if not tol_data:
+            raise ValueError(
+                f"No tolerance profile found for '{profile_name}' and no default 'pr_test' profile exists."
+            )
+
+        print(f"--- Performance Tolerance Profile: {actual_profile} ---")
+
+        return cls(
+            e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
+            denoise_stage=float(
+                os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])
+            ),
+            non_denoise_stage=float(
+                os.getenv(
+                    "SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE",
+                    tol_data["non_denoise_stage"],
+                )
+            ),
+            denoise_step=float(
+                os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", tol_data["denoise_step"])
+            ),
+            denoise_agg=float(
+                os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", tol_data["denoise_agg"])
+            ),
+        )
+
+
+@dataclass
+class ScenarioConfig:
+    """Expected performance metrics for a test scenario."""
+
+    stages_ms: dict[str, float]
+    denoise_step_ms: dict[int, float]
+    expected_e2e_ms: float
+    expected_avg_denoise_ms: float
+    expected_median_denoise_ms: float
+    estimated_full_test_time_s: float | None = None
+
+
+@dataclass
+class BaselineConfig:
+    """Full baseline configuration."""
+
+    scenarios: dict[str, ScenarioConfig]
+    step_fractions: Sequence[float]
+    tolerances: ToleranceConfig
+    improvement_threshold: float
+
+    @classmethod
+    def load(cls, path: Path) -> BaselineConfig:
+        """Load baseline configuration from JSON file."""
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        # Get tolerance profile, defaulting to 'pr_test'
+        profile_name = "pr_test"
+        tolerances = ToleranceConfig.load_profile(
+            data.get("tolerances", {}), profile_name
+        )
+
+        scenarios = {}
+        for name, cfg in data["scenarios"].items():
+            scenarios[name] = ScenarioConfig(
+                stages_ms=cfg["stages_ms"],
+                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
+            )
+
+        return cls(
+            scenarios=scenarios,
+            step_fractions=tuple(data["sampling"]["step_fractions"]),
+            tolerances=tolerances,
+            improvement_threshold=data.get("improvement_reporting", {}).get(
+                "threshold", 0.2
+            ),
+        )
+
+    def update(self, path: Path):
+        """Load baseline configuration from JSON file."""
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        scenarios_new = {}
+        for name, cfg in data["scenarios"].items():
+            scenarios_new[name] = ScenarioConfig(
+                stages_ms=cfg["stages_ms"],
+                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
+            )
+
+        self.scenarios.update(scenarios_new)
+        return self
+
+
+@dataclass
+class DiffusionServerArgs:
+    """Configuration for a single model/scenario test case."""
+
+    model_path: str  # HF repo or local path
+    modality: str | None = None  # auto-inferred: "image" or "video" or "3d"
+
+    custom_validator: str | None = None  # auto-derived unless explicitly overridden
+    # resources
+    num_gpus: int = 1
+    tp_size: int | None = None
+    ulysses_degree: int | None = None
+    ring_degree: int | None = None
+    cfg_parallel: bool | None = None
+    # LoRA
+    lora_path: str | None = (
+        None  # LoRA adapter path (HF repo or local path, loaded at startup)
+    )
+    dynamic_lora_path: str | None = (
+        None  # LoRA path for dynamic loading test (loaded via set_lora after startup)
+    )
+    second_lora_path: str | None = (
+        None  # Second LoRA adapter path for multi-LoRA testing
+    )
+
+    dit_layerwise_offload: bool = False
+    dit_offload_prefetch_size: int | float | None = None
+    enable_cache_dit: bool = False
+    text_encoder_cpu_offload: bool = False
+
+    extras: list[str] = field(default_factory=lambda: [])
+    env_vars: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.modality is None:
+            self.modality = _infer_modality_from_model_path(self.model_path)
+
+        if self.custom_validator is not None:
+            return
+
+        if self.modality == "image":
+            self.custom_validator = "image"
+        elif self.modality == "video":
+            self.custom_validator = "video"
+        elif self.modality == "3d":
+            self.custom_validator = "mesh"
+
+
+@lru_cache(maxsize=None)
+def _infer_modality_from_model_path(model_path: str) -> str:
+    model_info = get_model_info(model_path)
+    if model_info is None:
+        raise ValueError(f"Could not resolve model info for {model_path!r}")
+
+    task_type = model_info.pipeline_config_cls.task_type
+    if task_type == ModelTaskType.I2M:
+        return "3d"
+    if task_type.is_image_gen():
+        return "image"
+    return "video"
+
+
+@dataclass(frozen=True)
+class DiffusionSamplingParams:
+    """Configuration for a single model/scenario test case."""
+
+    output_size: str = ""
+
+    # inputs and conditioning
+    prompt: str | None = None  # text prompt for generation
+    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+
+    # duration
+    seconds: int = 1  # for video: duration in seconds
+    num_frames: int | None = None  # for video: number of frames
+    fps: int | None = None  # for video: frames per second
+
+    # URL direct test flag - if True, don't pre-download URL images
+    direct_url_test: bool = False
+
+    # output format
+    output_format: str | None = None  # "png", "jpeg", "mp4", etc.
+
+    num_outputs_per_prompt: int = 1
+
+    # Realtime video consistency harness. When set, server tests use
+    # /v1/realtime_video/generate and fold streamed chunks back into mp4 bytes.
+    realtime_num_chunks: int | None = None
+    realtime_events: list[dict[str, Any]] = field(default_factory=list)
+    realtime_perf_thresholds: dict[str, float] = field(default_factory=dict)
+    realtime_perf_ignore_initial_chunks: int = 0
+    # None keeps the lossless/raw transport used by GT-backed consistency checks.
+    realtime_output_format: str | None = None
+
+    # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
+    # merged directly into the OpenAI extra_body dict.
+    extras: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DiffusionTestCase:
+    """Configuration for a single model/scenario test case."""
+
+    id: str  # pytest test id and scenario name
+    server_args: DiffusionServerArgs
+    sampling_params: DiffusionSamplingParams | None = None
+    run_perf_check: bool = True
+    run_consistency_check: bool = True
+    run_component_accuracy_check: bool = True
+    run_models_api_check: bool = True
+    run_t2v_input_reference_check: bool = True
+    run_lora_basic_api_check: bool = False
+    run_lora_dynamic_load_check: bool = False
+    run_lora_dynamic_switch_check: bool = False
+    run_multi_lora_api_check: bool = False
+
+    def __post_init__(self) -> None:
+        if self.sampling_params is None:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                get_default_sampling_params_for_server_args(self.server_args),
+            )
+
+        has_startup_lora = self.server_args.lora_path is not None
+        has_dynamic_lora = self.server_args.dynamic_lora_path is not None
+        has_second_lora = self.server_args.second_lora_path is not None
+
+        if self.run_lora_basic_api_check and not (has_startup_lora or has_dynamic_lora):
+            raise ValueError(
+                f"{self.id}: run_lora_basic_api_check requires lora_path or dynamic_lora_path"
+            )
+
+        if self.run_lora_dynamic_load_check and not has_dynamic_lora:
+            raise ValueError(
+                f"{self.id}: run_lora_dynamic_load_check requires dynamic_lora_path"
+            )
+
+        if self.run_lora_dynamic_switch_check and not has_second_lora:
+            raise ValueError(
+                f"{self.id}: run_lora_dynamic_switch_check requires second_lora_path"
+            )
+
+        if self.run_multi_lora_api_check and not (has_startup_lora and has_second_lora):
+            raise ValueError(
+                f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
+            )
+
+
+LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "A slow aerial orbit around a pastel floating island hotel in the open "
+        "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
+        "clean horizon, cinematic but playful."
+    ),
+    image_path=(
+        "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/"
+        "b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg"
+    ),
+    output_size="832x480",
+    num_frames=9,
+    fps=16,
+    realtime_num_chunks=4,
+    realtime_perf_thresholds={
+        "p95_chunk_total_ms": 5000.0,
+        "p95_scheduler_forward_ms": 4500.0,
+        "p95_ws_payload_mb": 16.0,
+    },
+    realtime_perf_ignore_initial_chunks=2,
+    extras={
+        "seed": 42,
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "realtime_causal_sink_size": 9,
+        "realtime_causal_kv_cache_num_frames": 18,
+        "condition_inputs": {
+            "camera_actions": [
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            ]
+        },
+    },
+)
+
+
+def sample_step_indices(
+    step_map: dict[int, float], fractions: Sequence[float]
+) -> list[int]:
+    if not step_map:
+        return []
+    max_idx = max(step_map.keys())
+    indices = set()
+    for fraction in fractions:
+        idx = min(max_idx, max(0, int(round(fraction * max_idx))))
+        if idx in step_map:
+            indices.add(idx)
+    return sorted(indices)
+
+
+@dataclass
+class PerformanceSummary:
+    """Summary of performance of a request, built from RequestPerfRecord"""
+
+    e2e_ms: float
+    avg_denoise_ms: float
+    median_denoise_ms: float
+    # { "stage_1": time_1, "stage_2": time_2 }
+    stage_metrics: dict[str, float]
+    step_metrics: list[float]
+    sampled_steps: dict[int, float]
+    all_denoise_steps: dict[int, float]
+    frames_per_second: float | None = None
+    total_frames: int | None = None
+    avg_frame_time_ms: float | None = None
+
+    @staticmethod
+    def from_req_perf_record(
+        record: RequestPerfRecord, step_fractions: Sequence[float]
+    ):
+        """Collect all performance metrics into a summary without validation."""
+        e2e_ms = record.total_duration_ms
+
+        step_durations = record.steps
+        avg_denoise = 0.0
+        median_denoise = 0.0
+        if step_durations:
+            avg_denoise = sum(step_durations) / len(step_durations)
+            median_denoise = statistics.median(step_durations)
+
+        per_step = {index: s for index, s in enumerate(step_durations)}
+        sample_indices = sample_step_indices(per_step, step_fractions)
+        sampled_steps = {idx: per_step[idx] for idx in sample_indices}
+
+        # convert from list to dict
+        stage_metrics = {}
+        for item in record.stages:
+            if isinstance(item, dict) and "name" in item:
+                val = item.get("execution_time_ms", 0.0)
+                stage_metrics[item["name"]] = val
+
+        return PerformanceSummary(
+            e2e_ms=e2e_ms,
+            avg_denoise_ms=avg_denoise,
+            median_denoise_ms=median_denoise,
+            stage_metrics=stage_metrics,
+            step_metrics=step_durations,
+            sampled_steps=sampled_steps,
+            all_denoise_steps=per_step,
+        )
+
+
+T2I_sampling_params = DiffusionSamplingParams(
+    prompt="Doraemon is eating dorayaki",
+    output_size="1024x1024",
+)
+
+IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
+
+IDEOGRAM4_CI_PROMPT = json.dumps(
+    {
+        "high_level_description": IDEOGRAM4_CI_TEXT_PROMPT,
+        "style_description": {
+            "aesthetics": "warm, peaceful, vibrant",
+            "lighting": "bright afternoon sunlight, long soft shadows",
+            "photo": "shallow depth of field, eye-level, 85mm lens",
+            "medium": "photograph",
+            "color_palette": [
+                "#F5C542",
+                "#87CEEB",
+                "#4A4A4A",
+                "#FFFFFF",
+                "#2E8B57",
+            ],
+        },
+        "compositional_deconstruction": {
+            "background": (
+                "A sunlit garden path with green hedges and a wooden bench. "
+                "Dappled light filters through overhead trees."
+            ),
+            "elements": [
+                {
+                    "type": "obj",
+                    "bbox": [260, 260, 760, 780],
+                    "desc": (
+                        "A small tabby cat sitting calmly on a wooden bench, "
+                        "looking toward the camera."
+                    ),
+                },
+                {
+                    "type": "obj",
+                    "bbox": [180, 580, 840, 840],
+                    "desc": (
+                        "A weathered wooden garden bench with soft sunlight "
+                        "falling across the seat."
+                    ),
+                },
+            ],
+        },
+    },
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
+
+IDEOGRAM4_CI_sampling_params = replace(
+    T2I_sampling_params,
+    prompt=IDEOGRAM4_CI_PROMPT,
+    output_size="1024x1024",
+    output_format="png",
+    extras={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
+MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Doraemon is eating dorayaki",
+    output_size="768x768",
+    extras={"num_inference_steps": 12, "seed": 0},
+)
+
+MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Convert 2D style to 3D style",
+    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    output_size="512x512",
+    extras={"num_inference_steps": 8, "seed": 0},
+)
+
+TI2I_sampling_params = DiffusionSamplingParams(
+    prompt="Convert 2D style to 3D style",
+    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+)
+
+MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
+    direct_url_test=True,
+)
+MULTI_IMAGE_TI2I_UPLOAD_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
+)
+MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
+    prompt="a high quality, cute halloween themed illustration, consistent style and lighting",
+    image_path=[
+        "https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png"
+    ],
+    num_frames=4,
+    direct_url_test=True,
+    output_format="png",
+)
+
+T2V_PROMPT = "A curious raccoon"
+
+T2V_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+)
+
+MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    seconds=5,
+    num_frames=17,
+    extras={"num_inference_steps": 12, "seed": 0},
+)
+
+TI2V_sampling_params = DiffusionSamplingParams(
+    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
+    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
+)
+
+TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
+    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
+    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
+    output_size="960x960",
+    num_frames=4,
+    fps=4,
+)
+
+HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
+    prompt="",
+    image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
+)
+
+
+def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:
+    tokens: list[str] = []
+    for item in extras:
+        tokens.extend(shlex.split(item))
+
+    option_prefix = f"{option_name}="
+    for index, token in enumerate(tokens):
+        if token.startswith(option_prefix):
+            return token[len(option_prefix) :]
+        if token == option_name and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def get_model_task_type_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> ModelTaskType:
+    pipeline_class_name = _get_extra_arg_value(
+        server_args.extras, "--pipeline-class-name"
+    )
+    if pipeline_class_name:
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            pipeline_config_cls, _ = config_classes
+            return pipeline_config_cls.task_type
+
+    model_info = get_model_info(server_args.model_path)
+    if model_info is None:
+        raise ValueError(f"Could not resolve model info for {server_args.model_path!r}")
+    return model_info.pipeline_config_cls.task_type
+
+
+def get_default_sampling_params_for_model_task(
+    task_type: ModelTaskType,
+) -> DiffusionSamplingParams:
+    if task_type == ModelTaskType.T2I:
+        return T2I_sampling_params
+    if task_type in (ModelTaskType.I2I, ModelTaskType.TI2I):
+        return TI2I_sampling_params
+    if task_type == ModelTaskType.T2V:
+        return T2V_sampling_params
+    if task_type in (ModelTaskType.I2V, ModelTaskType.TI2V):
+        return TI2V_sampling_params
+    if task_type == ModelTaskType.I2M:
+        return HUNYUAN3D_SHAPE_sampling_params
+    raise ValueError(f"No default sampling params for model task {task_type!r}")
+
+
+def get_default_sampling_params_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> DiffusionSamplingParams:
+    task_type = get_model_task_type_for_server_args(server_args)
+    return get_default_sampling_params_for_model_task(task_type)
+
+
+MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
+MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
+    "lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer"
+)
+MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER = "lmsys/qwen-image-modelopt-fp8-sglang-transformer"
+MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
+    "lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer"
+)
+MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
+MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
+MODELOPT_NVFP4_B200_ENV_VARS = {}
+MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}
+
+
+def _make_modelopt_ci_case(
+    case_id: str,
+    *,
+    model_path: str,
+    modality: str,
+    sampling_params: DiffusionSamplingParams,
+    extras: list[str],
+    env_vars: dict[str, str] | None = None,
+    run_consistency_check: bool = False,
+) -> DiffusionTestCase:
+    return DiffusionTestCase(
+        case_id,
+        DiffusionServerArgs(
+            model_path=model_path,
+            modality=modality,
+            extras=extras,
+            env_vars=env_vars or {},
+        ),
+        sampling_params,
+        run_perf_check=False,
+        run_consistency_check=run_consistency_check,
+        run_component_accuracy_check=False,
+    )
+
+
+def _with_default_num_gpus(
+    cases: list[DiffusionTestCase], num_gpus: int
+) -> list[DiffusionTestCase]:
+    return [
+        replace(case, server_args=replace(case.server_args, num_gpus=num_gpus))
+        for case in cases
+    ]
+
+
+# Load global configuration
+BASELINE_CONFIG = (
+    BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
+    .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
+)

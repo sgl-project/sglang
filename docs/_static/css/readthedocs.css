@@ -1,0 +1,9 @@
+table.autosummary td {
+  width: 50%
+}
+
+img.align-center {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+}

@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+class IntelAMXAttnBackend(AttentionBackend):
+    def __init__(self, model_runner: ModelRunner):
+        import sgl_kernel  # noqa: F401
+
+        super().__init__()
+        self.forward_metadata = None
+        self.device = model_runner.device
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+        self.num_head = (
+            model_runner.model_config.num_attention_heads // model_runner.tp_size
+        )
+
+        # [NB]: `layer_id` set to 0 for qwen3-next models, as not all attn layers require kv pool
+        # using "full_attention_layer_id_mapping" to map which layer needs kv pool
+        layer_id = 0
+        if hasattr(model_runner.token_to_kv_pool, "full_attention_layer_id_mapping"):
+            layer_id = [*model_runner.token_to_kv_pool.full_attention_layer_id_mapping][
+                0
+            ]
+        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
+            layer_id
+        ).shape[-1]
+        self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
+        self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Init the metadata for a forward pass."""
+
+        bs = forward_batch.batch_size
+        attn_logits = torch.zeros(
+            (
+                bs,
+                self.num_head,
+                8,  # self.num_kv_splits,
+                self.v_head_dim + 1,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if forward_batch.forward_mode.is_decode_or_idle():
+            max_extend_len = None
+        else:
+            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+        self.forward_metadata = (attn_logits, max_extend_len)
+
+    def get_cpu_graph_seq_len_fill_value(self):
+        return 1
+
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        attn_logits = torch.zeros(
+            (
+                bs,
+                self.num_head,
+                8,  # self.num_kv_splits,
+                self.v_head_dim + 1,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        max_extend_len = None
+        self.forward_metadata = (attn_logits, max_extend_len)
+
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        pass
+
+    def forward_extend(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        sinks=None,
+    ):
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        if save_kv_cache and k is not None and v is not None:
+            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        _, max_extend_len = self.forward_metadata
+        self.extend_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k,
+            v,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_start_loc,
+            max_extend_len,
+            layer.scaling,
+            layer.logit_cap,
+            layer.is_cross_attention,
+            layer.sliding_window_size + 1,
+            forward_batch.encoder_lens,
+            sinks,
+        )
+        return o
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        sinks=None,
+    ):
+        attn_logits, _ = self.forward_metadata
+
+        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        self.decode_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k,
+            v,
+            cache_loc,
+            attn_logits,
+            self.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            layer.scaling,
+            layer.logit_cap,
+            layer.is_cross_attention,
+            layer.sliding_window_size + 1,
+            forward_batch.encoder_lens,
+            sinks,
+        )
+        return o
+
+    def support_triton(self):
+        return False
