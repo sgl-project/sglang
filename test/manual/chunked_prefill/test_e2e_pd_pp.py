@@ -4,6 +4,7 @@ from sglang.test.chunked_prefill_test_utils import ChunkedTestPDBase
 
 
 class TestChunkedFeaturePDPP(ChunkedTestPDBase):
+    __test__ = True  # re-enable: the shared base sets __test__ = False
     # PD disaggregation with pipeline parallelism on the prefill side. The shared
     # base already forces chunked prefill (chunked_prefill_size=256), so each
     # prompt's per-chunk KV is sent across the real prefill -> decode boundary while

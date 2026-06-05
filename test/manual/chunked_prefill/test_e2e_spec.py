@@ -5,6 +5,7 @@ from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MOD
 
 
 class TestChunkedFeatureSpec(ChunkedTestBase):
+    __test__ = True  # re-enable: the shared base sets __test__ = False
     model = DEFAULT_TARGET_MODEL_EAGLE
     gsm8k_threshold = 0.50
     feature_args = [

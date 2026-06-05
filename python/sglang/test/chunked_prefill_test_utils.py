@@ -28,7 +28,16 @@ DEFAULT_NUM_THREADS: int = 128
 DEFAULT_MAX_TOKENS: int = 512
 DEFAULT_SEED: int = 42
 
-KV_CANARY_ARGS: List[str] = ["--enable-kv-canary"]
+# The canary CLI is --kv-canary <mode> (+ companions); --enable-kv-canary does
+# not exist and made every launched server exit at argparse.
+KV_CANARY_ARGS: List[str] = [
+    "--kv-canary",
+    "raise",
+    "--kv-canary-real-data",
+    "partial",
+    "--kv-canary-sweep-interval",
+    "100",
+]
 
 
 @dataclass
@@ -99,6 +108,8 @@ def _build_simple_tester(cls) -> ChunkedSimpleTester:
 
 
 class ChunkedTestBase(CustomTestCase):
+    # base class: not collectible as a test on its own
+    __test__ = False
     model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
 
@@ -138,6 +149,8 @@ class ChunkedTestBase(CustomTestCase):
 
 
 class ChunkedTestPDBase(PDDisaggregationServerBase):
+    # base class: not collectible as a test on its own
+    __test__ = False
     model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
     # Extra args for the decode server only (e.g. matching its TP to the prefill

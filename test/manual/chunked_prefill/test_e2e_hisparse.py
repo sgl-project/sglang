@@ -7,6 +7,7 @@ from sglang.test.chunked_prefill_test_utils import (
 
 
 class TestChunkedFeatureHiSparse(ChunkedTestBase):
+    __test__ = True  # re-enable: the shared base sets __test__ = False
     model = "deepseek-ai/DeepSeek-V4-Flash"
     num_shots = LONG_PROMPT_NUM_SHOTS
     max_tokens = 4000

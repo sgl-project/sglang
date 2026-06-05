@@ -5,6 +5,7 @@ from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
 
 class TestChunkedFeatureDPAttention(ChunkedTestBase):
+    __test__ = True  # re-enable: the shared base sets __test__ = False
     model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
     gsm8k_threshold = 0.50
     feature_args = [
