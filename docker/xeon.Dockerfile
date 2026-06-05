@@ -26,9 +26,9 @@ WORKDIR /opt
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uv /root/.local/bin/uvx /usr/local/bin/ && \
-    uv venv --python 3.12 /opt/.venv
+    uv venv --python 3.12
 
-RUN echo -e '[[index]]\nname = "torch"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchvision"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchaudio"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "triton"\nurl = "https://download.pytorch.org/whl/cpu"' > /opt/.venv/uv.toml
+RUN echo -e '[[index]]\nname = "torch"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchvision"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "torchaudio"\nurl = "https://download.pytorch.org/whl/cpu"\n\n[[index]]\nname = "triton"\nurl = "https://download.pytorch.org/whl/cpu"' > .venv/uv.toml
 
 ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
 
