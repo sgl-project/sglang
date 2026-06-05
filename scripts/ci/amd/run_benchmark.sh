@@ -147,8 +147,8 @@ SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
     echo ""
     echo "model=\`${MODEL}\` tp=${TP} ep=${EP_SIZE} dp_attn=${DP_ATTENTION} isl=${ISL} osl=${OSL} spec=${SPEC_DECODING}"
     echo ""
-    echo "| conc | completed | total tput (tok/s) | output tput (tok/s) | median TTFT (ms) | median TPOT (ms) | median ITL (ms) | median E2EL (ms) |"
-    echo "| ---- | --------- | ------------------ | ------------------- | ---------------- | ---------------- | --------------- | ---------------- |"
+    echo "| conc | completed | total tput (tok/s) | total tput/gpu (tok/s/gpu) | output tput (tok/s) | median TTFT (ms) | median TPOT (ms) | interactivity (tok/s/user) | median ITL (ms) | median E2EL (ms) |"
+    echo "| ---- | --------- | ------------------ | -------------------------- | ------------------- | ---------------- | ---------------- | -------------------------- | --------------- | ---------------- |"
 } >> "$SUMMARY_FILE"
 
 overall_rc=0
@@ -179,26 +179,35 @@ for CONC in $CONC_LIST; do
     cp -f "/workspace/${RESULT_FILENAME}.json" "$RESULT_OUT_DIR/" 2>/dev/null \
         || echo "WARN: no result json produced for conc=${CONC}" >&2
 
-    python3 - "$RESULT_OUT_DIR/${RESULT_FILENAME}.json" "$CONC" "$SUMMARY_FILE" <<'PY' || true
+    python3 - "$RESULT_OUT_DIR/${RESULT_FILENAME}.json" "$CONC" "$SUMMARY_FILE" "$TP" <<'PY' || true
 import json
 import sys
 
 path, conc, summary = sys.argv[1], sys.argv[2], sys.argv[3]
+gpus = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 0
 try:
     with open(path) as f:
         d = json.load(f)
 except Exception as e:  # noqa: BLE001 - summary row is best-effort
-    row = f"| {conc} | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
+    row = f"| {conc} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
     print(f"WARN: could not read {path}: {e}", file=sys.stderr)
 else:
     def g(key):
         v = d.get(key)
         return f"{v:.2f}" if isinstance(v, (int, float)) else "n/a"
 
+    # total throughput per GPU (single-node: GPUs == tensor-parallel size)
+    tt = d.get("total_token_throughput")
+    tput_per_gpu = f"{tt / gpus:.2f}" if isinstance(tt, (int, float)) and gpus > 0 else "n/a"
+    # interactivity = 1s / TPOT = output tokens/s for a single user
+    tpot = d.get("median_tpot_ms")
+    interactivity = f"{1000.0 / tpot:.2f}" if isinstance(tpot, (int, float)) and tpot > 0 else "n/a"
+
     row = (
         f"| {d.get('max_concurrency', conc)} | {d.get('completed', 'n/a')} | "
-        f"{g('total_token_throughput')} | {g('output_throughput')} | "
-        f"{g('median_ttft_ms')} | {g('median_tpot_ms')} | {g('median_itl_ms')} | {g('median_e2el_ms')} |"
+        f"{g('total_token_throughput')} | {tput_per_gpu} | {g('output_throughput')} | "
+        f"{g('median_ttft_ms')} | {g('median_tpot_ms')} | {interactivity} | "
+        f"{g('median_itl_ms')} | {g('median_e2el_ms')} |"
     )
 with open(summary, "a") as f:
     f.write(row + "\n")

@@ -149,6 +149,8 @@ configs:
       --disable-radix-cache
       --kv-cache-dtype fp8_e4m3
       --page-size 16
+      --stream-interval 10
+      --scheduler-recv-interval 10
       --watchdog-timeout 1200
     bench-backend: vllm
 
