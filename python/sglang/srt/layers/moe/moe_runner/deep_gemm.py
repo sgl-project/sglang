@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -564,6 +565,85 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.DEEP_GEMM
 
 
+def _ep_scatter_to_contiguous(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_recv_tokens_per_expert_gpu: torch.Tensor,
+    running_state: dict,
+    all_tokens: Optional[int] = None,
+) -> DeepGemmRunnerInput:
+    """Common helper: ep_scatter tokens into contiguous DeepGEMM layout.
+
+    Used by both Standard BF16 and DeepEP Normal pre_permute paths.
+    """
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+
+    if all_tokens is None:
+        all_tokens = int(num_recv_tokens_per_expert_gpu.sum().item())
+    K = hidden_states.shape[1]
+    hidden_states_shape = hidden_states.shape
+    hidden_states_device = hidden_states.device
+    hidden_states_dtype = hidden_states.dtype
+
+    running_state["all_tokens"] = all_tokens
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    input_tensor = torch.empty(
+        (all_tokens, K), device=hidden_states_device, dtype=hidden_states_dtype
+    )
+    if hidden_states_scale is None:
+        input_tensor_scale = torch.empty((1, 1), device=hidden_states_device, dtype=torch.float32)
+    elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        input_tensor_scale = torch.zeros(
+            (ceil_div(K // 128, 4), all_tokens),
+            device=hidden_states_device,
+            dtype=torch.int,
+        ).transpose(0, 1)
+    else:
+        input_tensor_scale = torch.empty(
+            (all_tokens, K // 128), device=hidden_states_device, dtype=torch.float32
+        )
+    m_indices = torch.empty(all_tokens, device=hidden_states_device, dtype=torch.int32)
+    output_index = torch.empty_like(topk_ids)
+    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+    # BF16 path: scale is not used, but ep_scatter needs a valid tensor argument
+    orig_scale = hidden_states_scale
+    if hidden_states_scale is None:
+        hidden_states_scale = input_tensor_scale
+
+    ep_scatter(
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        num_recv_tokens_per_expert_gpu,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    dispose_tensor(hidden_states)
+    if orig_scale is not None:
+        dispose_tensor(orig_scale)
+
+    running_state["output_index"] = output_index
+
+    return DeepGemmRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
 @register_pre_permute("standard", "deep_gemm")
 def pre_permute_standard_to_deep_gemm(
     dispatch_output: StandardDispatchOutput,
@@ -571,8 +651,6 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
-
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
@@ -582,9 +660,45 @@ def pre_permute_standard_to_deep_gemm(
     hidden_states_shape = hidden_states.shape
     hidden_states_dtype = hidden_states.dtype
     hidden_states_device = hidden_states.device
-    hidden_states_ref = hidden_states
 
-    topk_weights, topk_ids = topk_weights, topk_ids
+    weight_dtype = quant_info.w13_weight.dtype
+
+    # BF16 weights: use contiguous path when not in CUDA graph capture (avoids OOM
+    # from masked buffer allocation). During CUDA graph capture, use masked path
+    # (fixed-shape, required for capture/replay).
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    if weight_dtype == torch.bfloat16 and not get_is_capture_mode():
+        num_local_experts = runner_config.num_local_experts
+        BLOCK_E = 128
+
+        # Compute per-expert token counts from topk_ids
+        expert_counts = torch.zeros(
+            num_local_experts + 1, dtype=torch.int32, device=hidden_states_device
+        )
+        flat_ids = torch.where(topk_ids >= 0, topk_ids, num_local_experts).view(-1).to(torch.int64)
+        expert_counts.scatter_add_(
+            0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int32)
+        )
+        expert_counts = expert_counts[:num_local_experts]
+        # Pad to 128 alignment (required by DeepGEMM contiguous kernel)
+        num_recv_tokens_per_expert_gpu = (
+            (expert_counts + BLOCK_E - 1) // BLOCK_E * BLOCK_E
+        ).to(torch.int32)
+
+        return _ep_scatter_to_contiguous(
+            hidden_states,
+            None,  # BF16 has no scale
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert_gpu,
+            running_state,
+        )
+
+    # FP8 weights or BF16 decode: use masked_gemm path (CUDA graph compatible)
+    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
+
+    hidden_states_ref = hidden_states
 
     # PreReorder
     output_dtype = (
@@ -611,6 +725,7 @@ def pre_permute_standard_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
+    running_state["use_contiguous_path"] = False
 
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
@@ -628,31 +743,56 @@ def post_permute_deep_gemm_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]
     hidden_states_device = running_state["hidden_states_device"]
-    src2dst = running_state["src2dst"]
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
 
-    output = torch.empty(
-        hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-    )
-    post_reorder_triton_kernel[(hidden_states_shape[0],)](
-        runner_output.hidden_states,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        runner_config.top_k,
-        hidden_states_shape[1],
-        BLOCK_SIZE=512,
-    )
+    # BF16 contiguous sets output_index, FP8 masked sets use_contiguous_path=False
+    use_contiguous = running_state.get("use_contiguous_path", True)
 
-    dispose_tensor(runner_output.hidden_states)
+    if use_contiguous:
+        # BF16 contiguous path: use ep_gather
+        from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
+
+        output_index = running_state["output_index"]
+        output = torch.empty(
+            hidden_states_shape,
+            dtype=hidden_states_dtype,
+            device=hidden_states_device,
+        )
+        ep_gather(
+            runner_output.hidden_states,
+            topk_ids,
+            topk_weights,
+            output_index,
+            output,
+        )
+        dispose_tensor(runner_output.hidden_states)
+    else:
+        # FP8 masked path: use post_reorder_triton_kernel
+        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+
+        src2dst = running_state["src2dst"]
+        output = torch.empty(
+            hidden_states_shape,
+            dtype=hidden_states_dtype,
+            device=hidden_states_device,
+        )
+        post_reorder_triton_kernel[(hidden_states_shape[0],)](
+            runner_output.hidden_states,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            hidden_states_shape[1],
+            BLOCK_SIZE=512,
+        )
+        dispose_tensor(runner_output.hidden_states)
 
     if runner_config.routed_scaling_factor is not None:
         output *= runner_config.routed_scaling_factor
@@ -711,8 +851,6 @@ def pre_permute_deepep_normal_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
-
     (
         hidden_states,
         hidden_states_scale,
@@ -721,42 +859,6 @@ def pre_permute_deepep_normal_to_deep_gemm(
         num_recv_tokens_per_expert,
     ) = dispatch_output
     assert runner_config.activation == "silu"
-
-    all_tokens = sum(num_recv_tokens_per_expert)
-    running_state["all_tokens"] = all_tokens
-
-    K = hidden_states.shape[1]
-
-    hidden_states_shape = hidden_states.shape
-    hidden_states_device = hidden_states.device
-    hidden_states_dtype = hidden_states.dtype
-
-    running_state["hidden_states_shape"] = hidden_states_shape
-    running_state["hidden_states_device"] = hidden_states_device
-    running_state["hidden_states_dtype"] = hidden_states_dtype
-    running_state["topk_ids"] = topk_ids
-    running_state["topk_weights"] = topk_weights
-
-    input_tensor = torch.empty(
-        (all_tokens, K),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        # TODO check whether need `zeros`
-        input_tensor_scale = torch.zeros(
-            (ceil_div(K // 128, 4), all_tokens),
-            device=hidden_states.device,
-            dtype=torch.int,
-        ).transpose(0, 1)
-    else:
-        input_tensor_scale = torch.empty(
-            (all_tokens, K // 128),
-            device=hidden_states.device,
-            dtype=torch.float32,
-        )
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
-    output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:
         num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
@@ -769,31 +871,15 @@ def pre_permute_deepep_normal_to_deep_gemm(
             pin_memory=True,
             device="cpu",
         ).cuda(non_blocking=True)
-    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
-    ep_scatter(
+    return _ep_scatter_to_contiguous(
         hidden_states,
         hidden_states_scale,
         topk_ids,
+        topk_weights,
         num_recv_tokens_per_expert_gpu,
-        expert_start_loc,
-        input_tensor,
-        input_tensor_scale,
-        m_indices,
-        output_index,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
-    dispose_tensor(hidden_states)
-    if hidden_states_scale is not None:
-        dispose_tensor(hidden_states_scale)
-
-    running_state["output_index"] = output_index
-
-    return DeepGemmRunnerInput(
-        hidden_states=input_tensor,
-        hidden_states_scale=input_tensor_scale,
-        use_masked_gemm=False,
-        m_indices=m_indices,
+        running_state,
+        all_tokens=sum(num_recv_tokens_per_expert),
     )
 
 
