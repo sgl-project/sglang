@@ -12,7 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Type
+from typing import TYPE_CHECKING, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
@@ -87,8 +87,12 @@ class SRTPlatform(DeviceMixin):
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
 
-    def get_quantization_config(self, quantization: str) -> Type[QuantizationConfig]:
-        """Return the quantization config class for this platform."""
+    def get_quantization_config(
+        self, quantization: str
+    ) -> Optional[Type[QuantizationConfig]]:
+        """Return hardware-specific quantization config for the specific
+        quantization scheme, raise an error if not supported or return None
+        to use the default config."""
         raise NotImplementedError
 
     # ------------------------------------------------------------------
