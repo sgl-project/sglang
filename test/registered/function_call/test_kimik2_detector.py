@@ -247,6 +247,64 @@ class TestKimiK2DetectorStreaming(unittest.TestCase):
         self.assertEqual(detector._buffer, "")
         self.assertEqual(detector.current_tool_id, 1)
 
+    def test_streaming_two_complete_calls_and_section_end_one_chunk(self):
+        """Regression: two complete tool calls + section-end in a SINGLE chunk.
+
+        Previously the section-end token in the buffer triggered a state reset
+        right after the first call, dropping the second call entirely.
+        """
+        detector = KimiK2FuncDetector()
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.ReadFile:0"
+            '<|tool_call_argument_begin|>{"path": "/a.py"}<|tool_call_end|>'
+            "<|tool_call_begin|>functions.get_weather:1"
+            '<|tool_call_argument_begin|>{"city": "Tokyo"}<|tool_call_end|>'
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, self.tools)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "ReadFile")
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"path": "/a.py"})
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Tokyo"})
+
+    def test_streaming_section_end_shares_last_call_chunk(self):
+        """Section-end arriving in the same chunk as the last call's end token
+        must still emit that last call (not reset it away)."""
+        detector = KimiK2FuncDetector()
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.ReadFile:0"
+            '<|tool_call_argument_begin|>{"path": "/a.py"}',
+            "<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_weather:1"
+            '<|tool_call_argument_begin|>{"city": "Paris"}'
+            "<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, self.tools)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Paris"})
+
+    def test_reset_streaming_state_clears_cursor_keeps_id(self):
+        """_reset_streaming_state clears the buffer and per-call cursor but
+        keeps current_tool_id monotonic."""
+        detector = KimiK2FuncDetector()
+        detector.current_tool_id = 2
+        detector.current_tool_name_sent = True
+        detector._last_arguments = '{"a": 1}'
+        detector._current_stream_function_name = "f"
+        detector._buffer = "leftover"
+
+        detector._reset_streaming_state()
+
+        self.assertEqual(detector._buffer, "")
+        self.assertFalse(detector.current_tool_name_sent)
+        self.assertEqual(detector._last_arguments, "")
+        self.assertIsNone(detector._current_stream_function_name)
+        self.assertEqual(detector.current_tool_id, 2)
+
 
 class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
     """Verify special tokens are never leaked into normal_text output."""

@@ -231,8 +231,17 @@ class KimiK2Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            match = self.stream_tool_call_portion_regex.search(current_text)
-            if match:
+            # A single streaming chunk can carry more than one *complete* tool
+            # call (and the section-end token). Drain every complete call in the
+            # buffer instead of returning after the first one; otherwise calls
+            # after the first are silently dropped when the section-end token
+            # arrives in the same chunk.
+            while True:
+                current_text = self._buffer
+                match = self.stream_tool_call_portion_regex.search(current_text)
+                if not match:
+                    break
+
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
 
@@ -247,17 +256,7 @@ class KimiK2Detector(BaseFormatDetector):
                 if function_name is None:
                     return StreamingParseResult(normal_text="", calls=calls)
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
-
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+                self._ensure_tracking_slots()
 
                 if not self.current_tool_name_sent:
                     calls.append(
@@ -273,61 +272,39 @@ class KimiK2Detector(BaseFormatDetector):
                         "name": function_name,
                         "arguments": {},
                     }
-                else:
-                    argument_diff = (
-                        function_args[len(self._last_arguments) :]
-                        if function_args.startswith(self._last_arguments)
-                        else function_args
+                    # Re-enter the loop so this call's arguments are parsed from
+                    # the buffer in the same increment when already present.
+                    continue
+
+                argument_diff = (
+                    function_args[len(self._last_arguments) :]
+                    if function_args.startswith(self._last_arguments)
+                    else function_args
+                )
+
+                parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[0]
+
+                if parsed_args_diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=parsed_args_diff,
+                        )
                     )
+                    self._last_arguments += parsed_args_diff
+                    self.streamed_args_for_tool[
+                        self.current_tool_id
+                    ] += parsed_args_diff
 
-                    parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
-                        0
-                    ]
+                parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
+                if not _is_complete_json(parsed_args):
+                    # Arguments for the current call are not finished yet.
+                    break
 
-                    if parsed_args_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=parsed_args_diff,
-                            )
-                        )
-                        self._last_arguments += parsed_args_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += parsed_args_diff
-
-                    parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
-                    if _is_complete_json(parsed_args):
-                        try:
-                            parsed_args = json.loads(parsed_args)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
-
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
-                        )
-                        end_match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if end_match:
-                            self._buffer = current_text[end_match.end() :]
-                        else:
-                            self._buffer = ""
-
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        if self.eot_token in self._buffer:
-                            self._reset_streaming_state()
-                        else:
-                            self.current_tool_id += 1
-                            self._last_arguments = ""
-                            self.current_tool_name_sent = False
-                            self._current_stream_function_name = None
-                        return result
+                if self._finalize_completed_call(parsed_args, current_text):
+                    # Section ended; nothing more to drain in this increment.
+                    break
 
             return StreamingParseResult(normal_text="", calls=calls)
 
@@ -335,21 +312,69 @@ class KimiK2Detector(BaseFormatDetector):
             logger.error("Error in parse_streaming_increment: %s", e, exc_info=True)
             return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
 
-    def _reset_streaming_state(self) -> None:
-        """Reset per-request streaming state when the tool-call section ends.
+    def _ensure_tracking_slots(self) -> None:
+        """Initialize the per-call tracking arrays and grow them to cover
+        ``current_tool_id``."""
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = [""]
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
 
-        Detector instances are reused across requests; without this, state
-        from a prior request can leak into the next and corrupt parsing.
+    def _finalize_completed_call(self, parsed_args: str, current_text: str) -> bool:
+        """Record a finished tool call, drop it from the buffer, and either
+        reset (the section ended) or advance to the next call.
+
+        Returns True when the tool-call section has ended and draining should
+        stop for this increment.
         """
-        self.current_tool_id = -1
+        try:
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = json.loads(
+                parsed_args
+            )
+        except json.JSONDecodeError:
+            pass
+
+        # Remove only the finished call from the buffer.
+        end_match = re.search(
+            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>", current_text, re.DOTALL
+        )
+        self._buffer = current_text[end_match.end() :] if end_match else ""
+
+        # Reset only when the section has ended and no further tool call remains;
+        # otherwise advance so a call sharing the chunk with the section-end
+        # token is not dropped.
+        if (
+            self.eot_token in self._buffer
+            and self.tool_call_start_token not in self._buffer
+        ):
+            self._reset_streaming_state()
+            return True
+
+        self.current_tool_id += 1
+        self._last_arguments = ""
         self.current_tool_name_sent = False
-        self.prev_tool_call_arr = []
-        self.streamed_args_for_tool = []
+        self._current_stream_function_name = None
+        return False
+
+    def _reset_streaming_state(self) -> None:
+        """Clear the buffer and the per-call streaming cursor at a tool-call
+        section boundary so the next call (or a subsequent section) parses
+        cleanly.
+
+        ``current_tool_id`` and the per-index tracking arrays
+        (``prev_tool_call_arr`` / ``streamed_args_for_tool``) are intentionally
+        kept so tool indices stay monotonic within a single response; a new
+        request uses a fresh detector instance, so there is no cross-request
+        state to wipe here.
+        """
+        self.current_tool_name_sent = False
         self._last_arguments = ""
         self._current_stream_function_name = None
         self._buffer = ""
-        if hasattr(self, "_tool_indices"):
-            del self._tool_indices
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
