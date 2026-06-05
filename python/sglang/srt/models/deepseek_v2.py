@@ -724,10 +724,8 @@ class DeepseekV2MoE(nn.Module):
                 )
                 and fc1_n % 128 == 0
                 and get_global_server_args().disable_piecewise_cuda_graph
-                # LoRA wraps gate_up_proj/down_proj in *WithLoRA modules that
-                # don't expose input_scale_inv, and the fused path would bypass
-                # the LoRA delta anyway (the unfused weight storage is freed
-                # once the interleaved copy is built, so no runtime fallback).
+                # LoRA wraps gate_up/down_proj so the fused swiglu path can't see
+                # input_scale_inv and would bypass the LoRA delta; disable under LoRA.
                 and not get_global_server_args().enable_lora
                 and not get_global_server_args().lora_paths
             ):

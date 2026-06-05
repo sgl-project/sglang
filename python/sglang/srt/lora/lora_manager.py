@@ -121,15 +121,18 @@ class LoRAManager:
             num_tokens_per_bs=num_tokens_per_bs,
         )
 
-        # Pre-capture: create the LoRA two-stream side stream now (experimental,
-        # gated by SGLANG_EXPERIMENTAL_LORA_OPTI) so the torch.cuda.Stream() driver
-        # call never lands inside a cuda-graph capture region.
+        # ===== TO BE REFACTORED ====
+        # Pre-create the experimental LoRA two-stream side stream now (gated) so the
+        # torch.cuda.Stream() call never lands inside a cuda-graph capture region.
         from sglang.srt.environ import envs as _sgl_envs
 
         if _sgl_envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
-            from sglang.srt.lora.trtllm_lora import init_lora_two_stream_resources
+            from sglang.srt.lora.trtllm_lora_temp import (
+                init_lora_two_stream_resources,
+            )
 
             init_lora_two_stream_resources(self.device)
+        # ===== END TO BE REFACTORED ====
 
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer

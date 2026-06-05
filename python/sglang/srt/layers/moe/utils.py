@@ -113,11 +113,8 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
-        # sgl_flashinfer_trtllm runs the same TRT-LLM FP8 kernels with the same
-        # weight layout, so it must inherit all trtllm weight-prep and dispatch
-        # behavior here. The few sites where it diverges (topk output format,
-        # token dispatcher, LoRA mem pool, LoRA MoE dispatch) check
-        # is_sgl_flashinfer_trtllm() explicitly, ordered before this predicate.
+        # sgl_flashinfer_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_sgl_flashinfer_trtllm() first.
         return self in (
             MoeRunnerBackend.FLASHINFER_TRTLLM,
             MoeRunnerBackend.SGL_FLASHINFER_TRTLLM,

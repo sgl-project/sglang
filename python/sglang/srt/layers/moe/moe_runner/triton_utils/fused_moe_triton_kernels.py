@@ -442,12 +442,9 @@ def fused_moe_kernel(
     off_experts = off_experts_i32.to(tl.int64)
 
     if filter_expert and off_experts == -1:
-        # -----------------------------------------------------------
         if not FUSE_ADD_TO_OUTPUT and not (FUSE_SUM_ALL_REDUCE and LORA_PRESERVE_BASE):
-            # Write zeros only when this kernel owns the full output buffer.
-            # Upstream (LORA_PRESERVE_BASE=False) zeroes missing-expert rows even
-            # under sum-all-reduce; the experimental LoRA add path sets it True to
-            # preserve the base output written by the prior MoE kernel.
+            # Write zeros only when this kernel owns the full output; the experimental LoRA
+            # add path (LORA_PRESERVE_BASE) keeps the base output from the prior MoE kernel.
             write_zeros_to_output(
                 c_ptr,
                 stride_cm,
@@ -619,6 +616,7 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
         existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
         tl.store(c_ptrs, existing + accumulator, mask=c_mask)
+    # ===== TO BE REFACTORED ====
     elif MASK_OUTPUT:
         # Store a fresh output while zeroing rows whose request has no active LoRA.
         offs_token_out = offs_token // ROUTER_TOPK
@@ -629,6 +627,7 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         accumulator = tl.where(output_mask[:, None], accumulator, 0.0)
         tl.store(c_ptrs, accumulator, mask=c_mask)
+    # ===== END TO BE REFACTORED ====
     elif FUSE_SUM_ALL_REDUCE:
         offs_token_out = offs_token // ROUTER_TOPK
         c_ptrs = (
@@ -822,6 +821,7 @@ def invoke_fused_moe_kernel(
         assert (
             add_output_mask is not None
         ), "add_output_mask required when fuse_add_to_output=True"
+    # ===== TO BE REFACTORED ====
     if mask_output:
         assert (
             not fuse_add_to_output
@@ -829,7 +829,10 @@ def invoke_fused_moe_kernel(
         assert (
             not fuse_sum_all_reduce
         ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        assert add_output_mask is not None, "add_output_mask required when mask_output=True"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when mask_output=True"
+    # ===== END TO BE REFACTORED ====
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)

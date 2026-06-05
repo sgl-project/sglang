@@ -1182,11 +1182,8 @@ class LoRAMemoryPool:
                         )
                     load_lora_weight_tensor(buffer_view, weights)
                     if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
-                        # Zero beyond loaded rank -- the experimental dense LoRA-B
-                        # kernel (sgemm_lora_b / qkv_lora_b) contracts over the full
-                        # padded max_rank, so the [lora_rank:] tail must be clean.
-                        # Gated by the master switch so the default LoRA path (whose
-                        # segmented kernels never read the tail) stays untouched.
+                        # Zero beyond loaded rank: the experimental dense LoRA-B kernel
+                        # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()
 
         if lora_adapter.embedding_layers:

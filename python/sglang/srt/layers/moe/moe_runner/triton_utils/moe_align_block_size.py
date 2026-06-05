@@ -5,7 +5,7 @@ from typing import Tuple
 import torch
 import triton
 
-from sglang.srt.lora.trtllm_lora.environ import lora_envs
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
 
 _is_cuda = is_cuda()
@@ -75,7 +75,13 @@ def moe_align_block_size(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
-    if lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get():
+    # ===== TO BE REFACTORED ====
+    use_jit_align = False
+    if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+    if use_jit_align:
         from sglang.jit_kernel.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,
         )
@@ -90,6 +96,7 @@ def moe_align_block_size(
             cumsum_buffer,
             True,
         )
+    # ===== END TO BE REFACTORED ====
     else:
         sgl_moe_align_block_size(
             topk_ids,

@@ -1218,9 +1218,7 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     )
 
 
-# Register the experimental sgl_flashinfer_trtllm MoE fused-func at model-build time
-# (MoeRunner.__init__ requires it registered even for LoRA; dispatch body in trtllm_lora).
-# Gated by the master switch: when EXPERIMENTAL_LORA_OPTI is off, the upstream
-# flashinfer_trtllm path never imports trtllm_lora and this backend stays unavailable.
+# Register the experimental sgl_flashinfer_trtllm MoE fused-func (MoeRunner needs it at
+# build time even for LoRA); gated by the master switch so the upstream path is untouched.
 if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
-    from sglang.srt.lora.trtllm_lora import sgl_backend  # noqa: E402,F401
+    from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401
