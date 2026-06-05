@@ -949,12 +949,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        *,
-        skip_attn_backend_init: bool = False,
     ):
         self.deepep_adapter.replay()
 
-        if skip_attn_backend_init:
+        if not forward_batch.needs_forward_metadata_init():
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -1051,7 +1049,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def replay(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         timer_ctx = (
@@ -1062,11 +1059,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx, self.backend.replay_session():
-            self.replay_prepare(
-                forward_batch,
-                pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
-            )
+            self.replay_prepare(forward_batch, pp_proxy_tensors)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
