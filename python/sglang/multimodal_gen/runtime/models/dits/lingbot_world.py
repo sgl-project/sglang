@@ -1037,9 +1037,11 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         hidden_states = self.cam_conditioner(
             hidden_states.to(orig_dtype),
             c2ws_plucker_emb,
-            cam_conditioner_scale_shift
-            if cam_conditioner_scale_shift is not None
-            else self._cam_conditioner_scale_shift(c2ws_plucker_emb),
+            (
+                cam_conditioner_scale_shift
+                if cam_conditioner_scale_shift is not None
+                else self._cam_conditioner_scale_shift(c2ws_plucker_emb)
+            ),
         )
         norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
             orig_dtype

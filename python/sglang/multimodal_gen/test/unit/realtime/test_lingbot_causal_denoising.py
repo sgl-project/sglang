@@ -314,9 +314,7 @@ def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
     )
 
     c2ws_plucker_emb = torch.ones(1, 2, 3)
-    first = model._prepare_cam_conditioner_scale_shifts(
-        c2ws_plucker_emb, forward_batch
-    )
+    first = model._prepare_cam_conditioner_scale_shifts(c2ws_plucker_emb, forward_batch)
     second = model._prepare_cam_conditioner_scale_shifts(
         c2ws_plucker_emb, forward_batch
     )
