@@ -85,11 +85,11 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     kill_process_tree,
+    maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
-    maybe_reindex_device_id,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.tensor_bridge import use_mlx
