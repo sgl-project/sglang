@@ -508,3 +508,83 @@ def test_lingbot_context_cache_update_skips_unused_projection(monkeypatch):
     assert kwargs["encoder_hidden_states_image"] == "image"
     assert kwargs["c2ws_plucker_emb"] == "pose"
     assert kwargs["skip_final_projection"] is True
+
+
+def test_lingbot_last_context_block_projects_kv_only(monkeypatch):
+    class _Identity:
+        def __call__(self, x):
+            return x
+
+    class _Linear:
+        def __init__(self, name, calls, offset):
+            self.name = name
+            self.calls = calls
+            self.offset = offset
+
+        def __call__(self, x):
+            self.calls.append(self.name)
+            return x + self.offset, None
+
+    class _FailIfCalled:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("unused Q path should not run")
+
+    class _KVOnlyAttention:
+        def __init__(self):
+            self.query = object()
+            self.update_cache_only = False
+
+        def __call__(
+            self,
+            query,
+            key,
+            value,
+            _freqs_cis,
+            _block_mask,
+            _kv_cache,
+            _current_start,
+            _cache_start,
+            *,
+            update_cache_only,
+        ):
+            self.query = query
+            self.update_cache_only = update_cache_only
+            assert key.shape == (1, 2, 1, 4)
+            assert value.shape == (1, 2, 1, 4)
+            return value
+
+    calls = []
+    block = CausalLingBotWorldTransformerBlock.__new__(
+        CausalLingBotWorldTransformerBlock
+    )
+    block._profile_index = 0
+    block.scale_shift_table = torch.zeros(1, 6, 4)
+    block.norm1 = _Identity()
+    block.to_q = _FailIfCalled()
+    block.to_k = _Linear("to_k", calls, 1.0)
+    block.to_v = _Linear("to_v", calls, 2.0)
+    block.norm_q = _FailIfCalled()
+    block.norm_k = _Identity()
+    block.num_attention_heads = 1
+    block.attn1 = _KVOnlyAttention()
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(current_timestep=-1, forward_batch=None),
+    )
+
+    hidden_states = torch.ones(1, 2, 4)
+    output = CausalLingBotWorldTransformerBlock.forward(
+        block,
+        hidden_states,
+        encoder_hidden_states=torch.empty(1, 0, 4),
+        temb=torch.zeros(1, 1, 6, 4),
+        freqs_cis=(torch.ones(2, 4), torch.zeros(2, 4)),
+        block_mask=None,
+        update_cache_only=True,
+    )
+
+    assert output is hidden_states
+    assert calls == ["to_k", "to_v"]
+    assert block.attn1.query is None
+    assert block.attn1.update_cache_only is True
