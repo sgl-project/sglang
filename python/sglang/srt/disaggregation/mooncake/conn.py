@@ -242,7 +242,6 @@ class MooncakeKVManager(CommonKVManager):
                 self._init_staging_allocator()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
-            self._abort_acked_rooms: set = set()
             self.start_decode_thread()
 
     def init_engine(self):
@@ -1511,7 +1510,6 @@ class MooncakeKVManager(CommonKVManager):
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
                     ack_aborted_room = int(msg[1].decode("ascii"))
-                    self._abort_acked_rooms.add(ack_aborted_room)
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
                     continue
 
