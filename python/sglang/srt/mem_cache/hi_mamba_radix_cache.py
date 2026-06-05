@@ -1041,7 +1041,6 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_host_hit = (
             1 if (last_host_node.mamba_evicted and last_host_node.mamba_backuped) else 0
         )
-        host_hit_length = max(kv_host_hit_length, mamba_host_hit)
 
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
@@ -1069,7 +1068,8 @@ class HiMambaRadixCache(MambaRadixCache):
             last_host_node=last_host_node,
             # TODO(ispobock): use best_match_node as start node for load_back
             best_match_node=last_host_node,
-            host_hit_length=host_hit_length,
+            host_hit_length=kv_host_hit_length,
+            mamba_host_hit_length=mamba_host_hit,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 

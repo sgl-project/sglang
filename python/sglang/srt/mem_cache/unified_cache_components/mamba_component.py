@@ -113,10 +113,10 @@ class MambaComponent(TreeComponent):
             req.mamba_needs_clear = False
 
         # HiCache: if mamba was evicted from device but has host backup,
-        # ensure host_hit_length >= 1 so load_back is triggered.
+        # ensure mamba_host_hit_length >= 1 so load_back is triggered.
         cd = last_node.component_data[self.component_type]
         if cd.value is None and cd.host_value is not None:
-            result = result._replace(host_hit_length=max(result.host_hit_length, 1))
+            result = result._replace(mamba_host_hit_length=max(result.mamba_host_hit_length, 1))
 
         return result._replace(mamba_branching_seqlen=branching_seqlen)
 

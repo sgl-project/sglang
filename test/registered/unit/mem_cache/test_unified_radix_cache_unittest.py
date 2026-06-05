@@ -2845,7 +2845,9 @@ class UnifiedRadixCacheSuite:
         self.assertIs(result.best_match_node, leaf)
         self.assertIs(result.last_device_node, parent)
         self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
-        self.assertEqual(result.host_hit_length, 1)
+        # host_hit_length is Full-KV only; SWA host hit lands in swa_host_hit_length.
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -3101,14 +3103,10 @@ class UnifiedRadixCacheSuite:
         return tree, allocator, req_to_token_pool, chain, window_pages
 
     def test_hicache_swa_finalize_match_result(self):
-        """finalize_match_result bumps host_hit_length to 1 iff some SWA node
-        within the trailing window is tombstoned (cd.value is None,
-        cd.host_value is not None). Out-of-window tombstones and chains fully
-        on device must leave host_hit_length untouched.
-
-        Sentinel only — never the real SWA token count, since SWA load-back
-        does not grow req.prefix_indices and any non-zero value gets
-        subtracted from extend_input_len in schedule_policy.
+        """finalize_match_result accumulates host_value lengths of SWA tombstones
+        within the trailing sliding window into ``swa_host_hit_length``. Out-of-window
+        tombstones and chains fully on device must leave ``swa_host_hit_length`` at 0.
+        ``host_hit_length`` is Full-KV only and is never written by SWA.
         """
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
@@ -3117,11 +3115,12 @@ class UnifiedRadixCacheSuite:
 
         tree, _, _, chain, window_pages = self._swa_finalize_setup()
         leaf = chain[-1]
+        ps = self.cfg.page_size
         swa_comp = tree.components[ComponentType.SWA]
 
         cases = [
             ("all_on_device", None, 0),
-            ("tombstone_in_window", chain[-window_pages], 1),
+            ("tombstone_in_window", chain[-window_pages], ps),
             ("tombstone_outside_window", chain[-(window_pages + 1)], 0),
         ]
         for name, victim, expected in cases:
@@ -3151,7 +3150,8 @@ class UnifiedRadixCacheSuite:
                     value_chunks=[],
                     best_value_len=0,
                 )
-                self.assertEqual(result.host_hit_length, expected)
+                self.assertEqual(result.host_hit_length, 0)
+                self.assertEqual(result.swa_host_hit_length, expected)
 
     def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
         """LOAD_BACK commit must:
@@ -3300,6 +3300,7 @@ class UnifiedRadixCacheSuite:
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         tree, _, _, y, x, _ = self._swa_anchor_setup()
         swa_comp = tree.components[ComponentType.SWA]
+        ps = self.cfg.page_size
 
         base = MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64, device=tree.device),
@@ -3314,7 +3315,9 @@ class UnifiedRadixCacheSuite:
             value_chunks=[],
             best_value_len=0,
         )
-        self.assertEqual(result.host_hit_length, 1)
+        # SWA host hit goes to swa_host_hit_length; host_hit_length stays at 0.
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, ps)
 
     def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a SWA tombstone must not

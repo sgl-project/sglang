@@ -815,7 +815,10 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
+        # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1001,6 +1004,14 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    def needs_host_load_back(self) -> bool:
+        """Whether any cache layer has a host hit that needs L2 H2D load_back."""
+        return (
+            self.host_hit_length > 0
+            or self.swa_host_hit_length > 0
+            or self.mamba_host_hit_length > 0
+        )
+
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
@@ -1106,6 +1117,8 @@ class Req(ReqDllmMixin):
                 self.last_host_node,
                 self.best_match_node,
                 self.host_hit_length,
+                self.swa_host_hit_length,
+                self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
@@ -1113,6 +1126,8 @@ class Req(ReqDllmMixin):
                 match_result.last_host_node,
                 match_result.best_match_node,
                 match_result.host_hit_length,
+                match_result.swa_host_hit_length,
+                match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:

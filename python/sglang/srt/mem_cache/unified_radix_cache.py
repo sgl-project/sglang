@@ -2275,7 +2275,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_chunks.reverse()
             return torch.cat(prefix_chunks)
 
-        if best_match_node.evicted or params.host_hit_length > 0:
+        if (
+            best_match_node.evicted
+            or params.host_hit_length > 0
+            or (req is not None and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0))
+        ):
             if self.load_back(best_match_node, mem_quota, req=req):
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
