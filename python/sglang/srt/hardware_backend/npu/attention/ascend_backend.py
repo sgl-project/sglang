@@ -1002,11 +1002,14 @@ class AscendAttnBackend(AttentionBackend):
         k_ = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v_ = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
         causal = not (
             layer.is_cross_attention
             or layer.attn_type == AttentionType.ENCODER_ONLY
         )
+
+        seq_lens = forward_batch.extend_seq_lens_cpu or forward_batch.extend_seq_lens
+        if not hasattr(seq_lens, "shape"):
+            seq_lens = torch.tensor(seq_lens, device=q_.device)
 
         if layer.qk_head_dim != layer.v_head_dim:
             attn_output = q.new_empty(
@@ -1019,33 +1022,72 @@ class AscendAttnBackend(AttentionBackend):
 
         o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        q_t = q_.movedim(0, q_.dim() - 2)
-        k_t = k_.movedim(0, k_.dim() - 2)
-        v_t = v_.movedim(0, v_.dim() - 2)
+        if not causal and len(seq_lens) > 1:
+            B = len(seq_lens)
+            max_len = int(seq_lens.max().item())
 
-        seq_lens = forward_batch.extend_seq_lens_cpu or forward_batch.extend_seq_lens
-        if not hasattr(seq_lens, "shape"):
-            seq_lens = torch.tensor(seq_lens)
-        start = 0
-        for idx in range(seq_lens.shape[0]):
-            seq_len = int(seq_lens[idx].item())
-            end = start + seq_len
-
-            per_q = q_t[:, start:end, :].unsqueeze(0)
-            per_k = k_t[:, start:end, :].unsqueeze(0)
-            per_v = v_t[:, start:end, :].unsqueeze(0)
-
-            per_out = torch.nn.functional.scaled_dot_product_attention(
-                per_q,
-                per_k,
-                per_v,
-                enable_gqa=use_gqa,
-                is_causal=causal,
-                scale=layer.scaling,
+            q_pad = q_.new_zeros(
+                B, layer.tp_q_head_num, max_len, layer.qk_head_dim
+            )
+            k_pad = q_.new_zeros(
+                B, layer.tp_k_head_num, max_len, layer.qk_head_dim
+            )
+            v_pad = q_.new_zeros(
+                B, layer.tp_v_head_num, max_len, layer.v_head_dim
             )
 
-            o_[start:end] = per_out.squeeze(0).movedim(o_.dim() - 2, 0)
-            start = end
+            offset = 0
+            for i in range(B):
+                sl = int(seq_lens[i].item())
+                q_pad[i, :, :sl] = q_[offset : offset + sl].transpose(0, 1)
+                k_pad[i, :, :sl] = k_[offset : offset + sl].transpose(0, 1)
+                v_pad[i, :, :sl] = v_[offset : offset + sl].transpose(0, 1)
+                offset += sl
+
+            out = torch.ops.npu.npu_prompt_flash_attention(
+                q_pad,
+                k_pad,
+                v_pad,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                scale_value=layer.scaling,
+                pre_tokens=2147483647,
+                next_tokens=2147483647,
+                input_layout="BNSD",
+                sparse_mode=0,
+            )
+
+            offset = 0
+            for i in range(B):
+                sl = int(seq_lens[i].item())
+                o_[offset : offset + sl] = out[i, :, :sl].transpose(0, 1)
+                offset += sl
+        else:
+            use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+            q_t = q_.movedim(0, q_.dim() - 2)
+            k_t = k_.movedim(0, k_.dim() - 2)
+            v_t = v_.movedim(0, v_.dim() - 2)
+
+            start = 0
+            for idx in range(len(seq_lens)):
+                seq_len = int(seq_lens[idx].item())
+                end = start + seq_len
+
+                per_q = q_t[:, start:end, :].unsqueeze(0)
+                per_k = k_t[:, start:end, :].unsqueeze(0)
+                per_v = v_t[:, start:end, :].unsqueeze(0)
+
+                per_out = torch.nn.functional.scaled_dot_product_attention(
+                    per_q,
+                    per_k,
+                    per_v,
+                    enable_gqa=use_gqa,
+                    is_causal=causal,
+                    scale=layer.scaling,
+                )
+
+                o_[start:end] = per_out.squeeze(0).movedim(o_.dim() - 2, 0)
+                start = end
 
         return attn_output
 
