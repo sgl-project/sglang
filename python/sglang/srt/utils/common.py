@@ -283,6 +283,11 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+is_sm80_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+    )
+)
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -300,9 +305,9 @@ except:
     is_intel_amx_backend_available = False
 
 try:
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+    is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
 
@@ -1154,7 +1159,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.11.post1")
+        min_version: Minimum version required (e.g., "0.6.12")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1166,33 +1171,59 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
+def _still_holding_resources(procs):
+    """Procs still holding GPU context, pinned memory or fds.
+
+    A zombie has already had its resources freed by the kernel (only the exit
+    status lingers), so it counts as gone; NoSuchProcess / OSError (see
+    _wait_for_reap_or_raise) mean the same.
+    """
+    alive = []
+    for p in procs:
+        try:
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                alive.append(p)
+        except (psutil.NoSuchProcess, OSError):
+            pass
+    return alive
+
+
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
     SIGKILL is asynchronous -- children hold GPU context, pinned memory and
     fds until the kernel reaps them. Raise on timeout so a stuck process
     surfaces instead of leaving a latent race.
+
+    Polls /proc via is_running()/status() rather than psutil.wait_procs, whose
+    os.pidfd_open path (used for non-child procs) raises OSError(EINVAL) against
+    a just-killed process on some kernels and aborts the whole wait.
     """
     warn_at = min(10.0, wait_timeout / 2)
-    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
-    if not alive:
-        return
-    logger.warning(
-        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
-        "continuing to wait up to %.1fs total. pids=%s",
-        len(alive),
-        warn_at,
-        wait_timeout,
-        [p.pid for p in alive],
-    )
-    remaining = wait_timeout - warn_at
-    if remaining > 0:
-        _, alive = psutil.wait_procs(alive, timeout=remaining)
-    if alive:
-        raise RuntimeError(
-            f"kill_process_tree: {len(alive)} process(es) not reaped within "
-            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
-        )
+    deadline = time.monotonic() + wait_timeout
+    warn_deadline = time.monotonic() + warn_at
+    warned = False
+    while True:
+        alive = _still_holding_resources(procs)
+        if not alive:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"kill_process_tree: {len(alive)} process(es) not reaped within "
+                f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+            )
+        if not warned and now >= warn_deadline:
+            logger.warning(
+                "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+                "continuing to wait up to %.1fs total. pids=%s",
+                len(alive),
+                warn_at,
+                wait_timeout,
+                [p.pid for p in alive],
+            )
+            warned = True
+        time.sleep(0.1)
 
 
 def kill_process_tree(
@@ -2484,22 +2515,6 @@ def human_readable_int(value: str) -> int:
         )
 
 
-def pyspy_dump_schedulers():
-    """py-spy dump on all scheduler in a local node."""
-    pid = psutil.Process().pid
-    for attempt, native_flag in enumerate(["--native", ""]):
-        try:
-            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, check=True
-            )
-            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-            return
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
-
-
 def kill_itself_when_parent_died():
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies
@@ -3621,6 +3636,18 @@ def is_gfx95_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
         return False
 
