@@ -23,7 +23,7 @@ v0.5.10 or a later version.
 
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
-| Tensor Parallelism            | `--tp 16`                                                                                     |
+| Tensor Parallelism            | `--tp-size 16`                                                                                |
 | Data Parallelism              | `--dp-size 16 --enable-dp-attention`                                                          |
 | Expert Parallelism            | `--moe-a2a-backend ascend_fuseep`                                                             |
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
@@ -164,7 +164,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --disable-radix-cache --moe-a2a-backend ascend_fuseep --speculative-draft-model-quantization unquant \
-    --tp 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 1 2 4 8 16 20 24 26 27
+    --tp-size 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 1 2 4 8 16 20 24 26 27
 ```
 
 <Tip>

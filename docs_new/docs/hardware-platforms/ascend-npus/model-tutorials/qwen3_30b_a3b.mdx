@@ -96,7 +96,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the W8A8 quantized model with 1 Atlas 800I A3 card.
+with limited hardware resources. The following command is based on the W8A8 quantized model with 2 NPUs on a single Atlas 800I A3 node.
 
 ```bash Launch server
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor

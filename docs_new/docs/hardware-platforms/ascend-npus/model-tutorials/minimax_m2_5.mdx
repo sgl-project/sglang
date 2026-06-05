@@ -28,7 +28,7 @@ v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend ascend_fuseep --deepep-mode auto`                                          |
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-token 8192`                                          |
+| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 8192`                                          |
 | NPU Graph                     | `--cuda-graph-bs 8 16 24 32 48 64 80`                                                         |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
@@ -163,7 +163,7 @@ python -m sglang.launch_server \
    --disable-radix-cache \
    --prefill-delayer-max-delay-passes 500 \
    --enable-prefill-delayer \
-   --chunked-prefill-size -1 --max-prefill-token 8192 \
+    --chunked-prefill-size -1 --max-prefill-tokens 8192 \
    --cuda-graph-bs 8 16 24 32 48 64 80 \
    --moe-a2a-backend ascend_fuseep --deepep-mode auto --quantization modelslim \
    --speculative-algorithm EAGLE3 \
