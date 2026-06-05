@@ -31,7 +31,7 @@ dependencies = [
   "flashinfer_python[cu13]==0.6.11.post1", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.11.post1",
   "gguf",
-  "instanttensor>=0.1.5",
+  "instanttensor>=0.1.9",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",

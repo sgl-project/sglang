@@ -96,7 +96,7 @@ srt_hip = [
   "torch",
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
-  "instanttensor>=0.1.5",
+  "instanttensor>=0.1.9",
   # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
   # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable
   # ancient setuptools sdist; an exact pin keeps the resolver converging.

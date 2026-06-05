@@ -1020,6 +1020,8 @@ def instanttensor_weights_iterator(
     with instanttensor.safe_open(
         hf_weights_files, framework="pt", device=device, process_group=process_group
     ) as f:
+        # Since InstantTensor 0.1.9, tensors are cloned internally by default,
+        # so no extra clone is needed here.
         yield from tqdm(
             f.tensors(),
             desc="Loading safetensors using InstantTensor loader",
