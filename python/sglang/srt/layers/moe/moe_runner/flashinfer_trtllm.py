@@ -1216,3 +1216,11 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
     )
+
+
+# Register the experimental sgl_flashinfer_trtllm MoE fused-func at model-build time
+# (MoeRunner.__init__ requires it registered even for LoRA; dispatch body in trtllm_lora).
+# Gated by the master switch: when EXPERIMENTAL_LORA_OPTI is off, the upstream
+# flashinfer_trtllm path never imports trtllm_lora and this backend stays unavailable.
+if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+    from sglang.srt.lora.trtllm_lora import sgl_backend  # noqa: E402,F401

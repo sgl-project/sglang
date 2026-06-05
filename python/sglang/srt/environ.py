@@ -421,6 +421,11 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Master switch for the experimental TRT-LLM LoRA fast path (the sgl_flashinfer_trtllm
+    # MoE backend + LoRA on qwen3.5 / kimi). When OFF (default), every fine-grained opt
+    # switch (defined in sglang.srt.lora.trtllm_lora.environ) reads False, so the no-LoRA
+    # path, other MoE backends, and the default LoRA path stay byte-identical to upstream.
+    SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)

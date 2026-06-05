@@ -14,14 +14,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
-from sglang.srt.lora.deepseek_mla_correction import (
-    apply_q_correction as apply_kv_b_lora_q_correction,
-)
-from sglang.srt.lora.deepseek_mla_correction import (
-    apply_v_correction as apply_kv_b_lora_v_correction,
-)
-from sglang.srt.lora.deepseek_mla_correction import (
-    is_kv_b_lora_active,
+from sglang.srt.lora.trtllm_lora.deepseek_mla_correction import (
+    kv_b_lora_q_apply,
+    kv_b_lora_q_prepare,
+    kv_b_lora_v_apply,
+    kv_b_lora_v_prepare,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -284,6 +281,10 @@ class DeepseekMLAForwardMixin:
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
+        # O12-q: fork the kv_b q-correction A-step onto the LoRA side stream so it
+        # overlaps the q_nope @ w_kc bmm below. None (serial) when two-stream off.
+        _kvb_q = kv_b_lora_q_prepare(self, q_nope)
+
         if self.use_deep_gemm_bmm:
             (
                 q_nope_val,
@@ -367,8 +368,7 @@ class DeepseekMLAForwardMixin:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-        if is_kv_b_lora_active(self):
-            q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+        q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
 
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
@@ -548,6 +548,10 @@ class DeepseekMLAForwardMixin:
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
+        # O12-v: fork the kv_b v-correction A-step onto the LoRA side stream so it
+        # overlaps the attn_output @ w_vc bmm below. None (serial) when off.
+        _kvb_v = kv_b_lora_v_prepare(self, attn_output)
+
         if self.use_deep_gemm_bmm:
             (
                 attn_output_val,
@@ -686,10 +690,9 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        if is_kv_b_lora_active(self):
-            attn_bmm_output = apply_kv_b_lora_v_correction(
-                self, attn_output, attn_bmm_output
-            )
+        attn_bmm_output = kv_b_lora_v_apply(
+            self, attn_output, attn_bmm_output, _kvb_v
+        )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

@@ -23,6 +23,7 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -119,6 +120,7 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return (
             b.is_flashinfer_cutlass()
             or b.is_flashinfer_cutedsl()
+            or b.is_sgl_flashinfer_trtllm()
             or b.is_flashinfer_trtllm_routed()
         )
     except Exception:  # pragma: no cover - backend not initialized
@@ -1179,6 +1181,13 @@ class LoRAMemoryPool:
                             weights,
                         )
                     load_lora_weight_tensor(buffer_view, weights)
+                    if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+                        # Zero beyond loaded rank -- the experimental dense LoRA-B
+                        # kernel (sgemm_lora_b / qkv_lora_b) contracts over the full
+                        # padded max_rank, so the [lora_rank:] tail must be clean.
+                        # Gated by the master switch so the default LoRA path (whose
+                        # segmented kernels never read the tail) stays untouched.
+                        target_buffer[buffer_id, :, lora_rank:].zero_()
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size

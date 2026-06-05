@@ -868,6 +868,23 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     rather than computed independently and added at the end.
     """
 
+    def __getattr__(self, name: str):
+        # Transparent-wrapper fallback: delegate any attribute not defined on this
+        # wrapper to the wrapped base ``FusedMoE`` so model code that treats
+        # ``experts`` as a plain FusedMoE works (e.g. DeepSeek-V2/V3 reads
+        # ``experts.moe_runner_config`` / ``.dispatcher``). The actual MoE compute
+        # still flows through this wrapper's ``forward``/``run`` (LoRA applied) —
+        # the model's standard paths call ``self.experts(...)``, not
+        # ``experts.run_moe_core`` directly (that is the DeepEP/TBO path).
+        # nn.Module.__getattr__ resolves registered params/buffers/submodules first.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            modules = self.__dict__.get("_modules")
+            if modules is not None and "base_layer" in modules:
+                return getattr(modules["base_layer"], name)
+            raise
+
     def __init__(
         self,
         base_layer: FusedMoE,
@@ -909,13 +926,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
-        self._lora_runner = MoeRunner(
-            runner_backend,
-            base_layer.moe_runner_config,
-            lora_enabled=True,
-        )
+        self._lora_runner_backend = runner_backend
 
-        if runner_backend.is_marlin():
+        if runner_backend.is_sgl_flashinfer_trtllm():
+            # sgl_flashinfer_trtllm LoRA setup lives in lora/trtllm_lora/.
+            from sglang.srt.lora.trtllm_lora.lora_layer import (
+                init_sgl_flashinfer_trtllm_lora,
+            )
+
+            init_sgl_flashinfer_trtllm_lora(self, base_layer)
+        elif runner_backend.is_marlin():
+            self._lora_runner = MoeRunner(
+                runner_backend,
+                base_layer.moe_runner_config,
+                lora_enabled=True,
+            )
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsFusedMoEMethod,
             )
@@ -928,6 +953,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             )
             self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
         elif runner_backend.is_triton():
+            self._lora_runner = MoeRunner(
+                runner_backend,
+                base_layer.moe_runner_config,
+                lora_enabled=True,
+            )
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
         else:
@@ -961,6 +991,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         moe_lora_info = batch_info.moe_lora_info
         assert moe_lora_info is not None
 
+        # NOTE: rank-0 (dummy/inactive) adapters are already disabled at the single
+        # build site of moe_lora_info — _compute_moe_lora_info() zeroes adapter_enabled
+        # and only sets (rank > 0) entries (both the Triton kernel and the eager
+        # scatter path; see backend/base_backend.py). The per-batch buffer is rebuilt
+        # every prepare_lora_batch (including the persistent cuda-graph buffer), so no
+        # stale rank-0 "1" can survive into a captured decode. A per-layer
+        # adapter_enabled.mul_(rank > 0) here would therefore be a no-op repeated once
+        # per MoE layer (3 CUDA launches × N layers, also baked into the CUDA graph),
+        # so it is intentionally omitted.
+
         # Single source of truth: lora_manager precomputes this per-batch from
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
@@ -976,7 +1016,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             adapter_enabled=moe_lora_info.adapter_enabled,
             token_lora_mapping=moe_lora_info.token_lora_mapping,
             max_lora_rank=max_lora_rank,
-            num_experts=self.base_layer.num_experts,
+            # Local (per-rank) expert count the LoRA buffers are indexed by — not
+            # the global num_experts — so virtual-experts indexing matches the
+            # buffers under EP. Matches the NVFP4 GB200 cookbook fix.
+            num_experts=(
+                self.down_lora_a_weights.shape[1]
+                if self.down_lora_a_weights is not None
+                else self.base_layer.num_local_experts
+            ),
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
@@ -1022,10 +1069,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
 
-        # Run the only lora moe runner (Triton)
-        combine_input = self._lora_runner.run(
-            dispatch_output, quant_info, lora_info=lora_info
-        )
+        if self._lora_runner_backend.is_sgl_flashinfer_trtllm():
+            from sglang.srt.lora.trtllm_lora.lora_layer import (
+                dispatch_sgl_flashinfer_trtllm_lora,
+            )
+
+            combine_input = dispatch_sgl_flashinfer_trtllm_lora(
+                dispatch_output, quant_info, base_layer, lora_info
+            )
+        else:
+            combine_input = self._lora_runner.run(
+                dispatch_output, quant_info, lora_info=lora_info
+            )
 
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
 
@@ -1157,3 +1212,17 @@ def get_lora_layer(
             ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
+
+
+# === Two-stream LoRA overlap (O1 + O7 + O8) — experimental, gated by SGLANG_EXPERIMENTAL_LORA_OPTI ===
+# All logic lives in `sglang/srt/lora/trtllm_lora/`. Installed ONLY when the
+# experimental master switch is set; otherwise this is a no-op and the default
+# single-stream LoRA forwards above run unchanged (byte-identical to upstream).
+from sglang.srt.environ import envs as _sgl_envs  # noqa: E402
+
+if _sgl_envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+    from sglang.srt.lora.trtllm_lora import (  # noqa: E402
+        install_two_stream_overrides as _install_lora_two_stream,
+    )
+
+    _install_lora_two_stream()

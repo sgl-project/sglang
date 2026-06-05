@@ -77,6 +77,10 @@ class LoRABatchInfo:
     # MoE LoRA batch info
     moe_lora_info: Optional[MoELoRABatchInfo] = None
 
+    # CPU-side (buffer_id, rank) when every request in the batch uses the same
+    # active adapter (rank > 0); None otherwise.
+    single_adapter: Optional[Tuple[int, int]] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0

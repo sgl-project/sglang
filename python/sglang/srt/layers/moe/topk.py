@@ -89,6 +89,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.lora.trtllm_lora.environ import lora_envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
@@ -255,6 +256,11 @@ class StandardTopKOutput(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
+    # FlashInfer routed-MoE packed topk ((id << 16) | bf16_bits(weight)),
+    # produced fused inside the gating kernel when SGLANG_OPT_LORA_FUSED_TOPK_PACK=1
+    # (see jit_kernel/topk_softmax_pack.py). None on every other path; consumers
+    # fall back to _pack_topk_for_flashinfer_routed when absent.
+    packed_topk_ids: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -430,12 +436,25 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        moe_runner_backend = get_moe_runner_backend()
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernels():
+        elif moe_runner_backend.is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
-        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
+        elif moe_runner_backend.is_sgl_flashinfer_trtllm():
+            try:
+                from sglang.srt.server_args import get_global_server_args
+
+                use_standard_for_lora = bool(get_global_server_args().enable_lora)
+            except ValueError:
+                use_standard_for_lora = False
+            output_format = (
+                TopKOutputFormat.STANDARD
+                if use_standard_for_lora
+                else TopKOutputFormat.BYPASSED
+            )
+        elif moe_runner_backend.is_flashinfer_trtllm() or (
+            moe_runner_backend.is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:
@@ -672,6 +691,8 @@ def fused_topk(
     renormalize: bool,
     correction_bias: Optional[torch.Tensor] = None,
     scoring_func: str = "softmax",
+    packed_out: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -693,6 +714,21 @@ def fused_topk(
                 renormalize,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
+            )
+        elif packed_out is not None:
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT
+            # kernel writes topk_weights/topk_ids AND the FlashInfer packed topk
+            # (with the padded-region id=-1 mask baked in via num_token_non_padded),
+            # eliminating the separate per-layer _pack_topk_kernel launch.
+            from sglang.jit_kernel.trtllm_lora.topk_softmax_pack import topk_softmax_pack
+
+            topk_softmax_pack(
+                topk_weights,
+                topk_ids,
+                packed_out,
+                gating_output,
+                renormalize,
+                num_token_non_padded=num_token_non_padded,
             )
         else:
             topk_softmax(
@@ -1206,14 +1242,41 @@ def biased_grouped_topk_gpu(
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
-            return kimi_k2_moe_fused_gate(
-                gating_output.to(dtype=torch.float32),
-                correction_bias,
+            if lora_envs.SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE.get():
+                from sglang.jit_kernel.trtllm_lora.kimi_k2_moe_fused_gate import (
+                    kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
+                )
+
+                # The JIT kernel widens bf16/fp16 inputs to fp32 internally; the toggle
+                # lets us A/B bisect against the old host-upcast path.
+                use_bf16_input = lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
+            else:
+                # The AOT kernel requires fp32 input and bias.
+                _kimi_k2_moe_fused_gate = kimi_k2_moe_fused_gate
+                use_bf16_input = False
+                assert not lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
+
+            if use_bf16_input:
+                # Pass gating_output and correction_bias through untouched, dropping the
+                # two host-side elementwise upcast kernels.
+                _gi = gating_output
+                _cb = correction_bias
+            else:
+                _gi = gating_output.to(dtype=torch.float32)
+                _cb = (
+                    correction_bias.to(dtype=torch.float32)
+                    if correction_bias is not None
+                    else correction_bias
+                )
+            _ret = _kimi_k2_moe_fused_gate(
+                _gi,
+                _cb,
                 topk=topk,
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
+            return _ret
         elif (
             _is_cuda
             and num_expert_group == 1
@@ -1471,6 +1534,10 @@ def select_experts(
 
     scoring_func = topk_config.scoring_func
 
+    # Set by the fused-gating+pack branch below (SGLANG_OPT_LORA_FUSED_TOPK_PACK);
+    # None everywhere else.
+    packed_topk = None
+
     (
         router_logits,
         correction_bias,
@@ -1562,6 +1629,30 @@ def select_experts(
                 renormalize=renormalize,
             )
         else:
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): only on
+            # the plain CUDA softmax path where the post-process is id-identity
+            # apart from the padded-region mask (which the kernel bakes into the
+            # packed tensor itself): no EPLB remap, no fused shared experts, no
+            # bias, pow-2 expert count, and no benchmark routing overrides.
+            if (
+                lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()
+                and _is_cuda
+                and not _use_aiter
+                and scoring_func == "softmax"
+                and correction_bias is None
+                and expert_location_dispatch_info is None
+                and num_fused_shared_experts == 0
+                and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+                and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            ):
+                num_experts = router_logits.shape[-1]
+                if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
+                    packed_topk = torch.empty(
+                        (hidden_states.shape[0], top_k),
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+
             # Qwen3MOE uses fused_topk
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
@@ -1570,6 +1661,8 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
+                packed_out=packed_topk,
+                num_token_non_padded=num_token_non_padded,
             )
     else:
         assert (
@@ -1633,7 +1726,7 @@ def select_experts(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits, packed_topk)
 
 
 # Register fake implementations for torch.compile support
