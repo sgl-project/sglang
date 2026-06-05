@@ -352,6 +352,15 @@ class FrozenKVMTPWorker(TpModelWorker):
     ) -> None:
         capture_for_decode(logits_output, draft_input, self.topk)
 
+    def _draft_preprocess_idle(self, batch: ScheduleBatch) -> None:
+        batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
+            device=self.device,
+            hidden_size=self._recurrent_hidden_size,
+            dtype=self.model_config.dtype,
+            topk=self.topk,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+
     def _run_assistant_seed_step(
         self,
         batch: ScheduleBatch,
@@ -457,6 +466,13 @@ class FrozenKVMTPWorker(TpModelWorker):
                 # `FrozenKVMTPDraftInput` for next iter.
                 batch.spec_info = draft_extend_input
                 self.forward_draft_extend_after_decode(batch)
+            else:
+                # All reqs finished and dp_attention isn't forcing extend.
+                # Install an idle FrozenKVMTPDraftInput so next iter's scheduler
+                # ops (merge_batch / filter_batch) see well-typed empty
+                # tensors instead of None.
+                self._draft_preprocess_idle(batch)
+
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
