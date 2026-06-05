@@ -242,6 +242,7 @@ class MooncakeKVManager(CommonKVManager):
                 self._init_staging_allocator()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
+            self._abort_acked_rooms: set = set()
             self.start_decode_thread()
 
     def init_engine(self):
@@ -1386,6 +1387,40 @@ class MooncakeKVManager(CommonKVManager):
 
                     handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
+                # Decode-side abort notification: mark room as failed and ACK
+                if room == "ABORT":
+                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                    decode_ip = waiting_req_bytes[2].decode("ascii")
+                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    if room_to_be_aborted in self.request_status:
+                        self.update_status(room_to_be_aborted, KVPoll.Failed)
+                        logger.debug(
+                            f"Received abort notification for room {room_to_be_aborted}, "
+                            f"marked as Failed"
+                        )
+                    else:
+                        logger.debug(
+                            f"Received abort notification for unknown room {room_to_be_aborted}, "
+                            f"ignoring"
+                        )
+                    # Send ACK back to decode endpoint
+                    try:
+                        na = NetworkAddress(decode_ip, decode_port)
+                        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                            [
+                                b"ABORT_ACK",
+                                str(room_to_be_aborted).encode("ascii"),
+                            ]
+                        )
+                        logger.debug(
+                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
+                            f"{decode_ip}:{decode_port}"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                        )
+                    continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
@@ -1455,6 +1490,13 @@ class MooncakeKVManager(CommonKVManager):
                 # Staging: prefill pre-requests staging allocation before forward
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
+                    continue
+
+                # Prefill acknowledges abort notification
+                if msg[0] == b"ABORT_ACK":
+                    ack_aborted_room = int(msg[1].decode("ascii"))
+                    self._abort_acked_rooms.add(ack_aborted_room)
+                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
                     continue
 
                 bootstrap_room, status, prefill_rank = msg

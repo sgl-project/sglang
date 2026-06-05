@@ -303,6 +303,10 @@ class Envs:
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
     SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
+    # Grace period (seconds) before releasing KV cache slots after a decode-initiated
+    # abort. The decode side holds resources until the prefill side ACKs or this timeout
+    # expires. Set to 0 to disable deferred release (immediate release on abort).
+    SGLANG_DISAGGREGATION_ABORT_GRACE_PERIOD = EnvFloat(5.0)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

@@ -245,6 +245,14 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
 
 @dataclass
+class DeferredRelease:
+    req: Req
+    bootstrap_room: int
+    metadata_buffer_index: int
+    enqueue_time: float
+
+
+@dataclass
 class DecodeRequest:
     req: Req
     kv_receiver: CommonKVReceiver
@@ -1404,6 +1412,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.deferred_releases: List[DeferredRelease] = []
+        self.abort_grace_period = envs.SGLANG_DISAGGREGATION_ABORT_GRACE_PERIOD.get()
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1609,8 +1619,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                # Defer KV cache release for decode-initiated aborts to prevent
+                # RDMA corruption from in-flight prefill writes
+                is_decode_initiated_abort = getattr(
+                    decode_req.kv_receiver, "decode_initiated_abort", False
+                )
+                if is_decode_initiated_abort and self.abort_grace_period > 0:
+                    self.deferred_releases.append(
+                        DeferredRelease(
+                            req=decode_req.req,
+                            bootstrap_room=decode_req.req.bootstrap_room,
+                            metadata_buffer_index=decode_req.metadata_buffer_index,
+                            enqueue_time=time.monotonic(),
+                        )
+                    )
+                    logger.debug(
+                        f"Deferred KV release for room {decode_req.req.bootstrap_room}, "
+                        f"waiting for ABORT_ACK or timeout"
+                    )
+                else:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -1648,6 +1676,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+        deferred_rooms = {d.bootstrap_room for d in self.deferred_releases}
         for i in indices_to_remove:
             if self.enable_staging and self.staging_handler.is_staging_room(
                 self.queue[i].req.bootstrap_room
@@ -1657,13 +1686,49 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
-            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            if self.queue[i].req.bootstrap_room not in deferred_rooms:
+                self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
         return transferred_reqs
+
+    def process_deferred_releases(self) -> None:
+        """Release deferred KV cache slots whose ABORT_ACK arrived or timeout expired."""
+        if not self.deferred_releases:
+            return
+
+        now = time.monotonic()
+        remaining = []
+        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+        kv_mgr = prealloc_queue.kv_manager if prealloc_queue else None
+        acked_rooms = getattr(kv_mgr, "_abort_acked_rooms", set()) if kv_mgr else set()
+
+        for entry in self.deferred_releases:
+            acked = entry.bootstrap_room in acked_rooms
+            timed_out = (now - entry.enqueue_time) >= self.abort_grace_period
+            if acked or timed_out:
+                release_kv_cache(entry.req, self.tree_cache, is_insert=False)
+                self.req_to_metadata_buffer_idx_allocator.free(
+                    entry.metadata_buffer_index
+                )
+                if acked:
+                    acked_rooms.discard(entry.bootstrap_room)
+                    logger.debug(
+                        f"Released deferred KV for room {entry.bootstrap_room} "
+                        f"(ABORT_ACK received)"
+                    )
+                else:
+                    logger.debug(
+                        f"Released deferred KV for room {entry.bootstrap_room} "
+                        f"(timeout after {self.abort_grace_period}s)"
+                    )
+            else:
+                remaining.append(entry)
+
+        self.deferred_releases = remaining
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -1878,6 +1943,7 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            self.disagg_decode_transfer_queue.process_deferred_releases()
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
