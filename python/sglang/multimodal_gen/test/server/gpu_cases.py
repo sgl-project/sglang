@@ -154,8 +154,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             output_format="png",
             extras={"preset": "V4_QUALITY_48", "seed": 0},
         ),
-        run_perf_check=False,
-        run_consistency_check=False,
+        run_perf_check=True,
+        run_consistency_check=True,
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(

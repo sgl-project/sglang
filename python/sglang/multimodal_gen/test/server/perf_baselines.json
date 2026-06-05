@@ -167,6 +167,14 @@
             "expected_median_denoise_ms": 190.02,
             "estimated_full_test_time_s": 133.2
         },
+        "ideogram4_fp8_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 1200000.0,
+            "expected_avg_denoise_ms": 20000.0,
+            "expected_median_denoise_ms": 20000.0,
+            "estimated_full_test_time_s": 900.0
+        },
         "flux_image_t2i": {
             "stages_ms": {
                 "TimestepPreparationStage": 32.58,
