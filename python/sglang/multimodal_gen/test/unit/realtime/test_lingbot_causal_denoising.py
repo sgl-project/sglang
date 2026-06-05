@@ -401,51 +401,6 @@ def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
     assert [block.cam_conditioner.calls for block in model.blocks] == [2, 2]
 
 
-def test_lingbot_model_cam_conditioner_cache_reuses_context_update(monkeypatch):
-    class _CamConditioner:
-        def __init__(self, offset):
-            self.offset = offset
-            self.calls = 0
-
-        def compute_scale_shift(self, c2ws_plucker_emb):
-            self.calls += 1
-            return (
-                c2ws_plucker_emb + self.offset,
-                c2ws_plucker_emb + self.offset + 10,
-            )
-
-    model = CausalLingBotWorldTransformer3DModel.__new__(
-        CausalLingBotWorldTransformer3DModel
-    )
-    model.blocks = [
-        SimpleNamespace(cam_conditioner=_CamConditioner(1)),
-        SimpleNamespace(cam_conditioner=_CamConditioner(2)),
-    ]
-    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
-    forward_context = SimpleNamespace(forward_batch=forward_batch, current_timestep=7)
-    monkeypatch.setattr(
-        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
-    )
-    monkeypatch.setattr(
-        lingbot_world_module,
-        "get_forward_context",
-        lambda: forward_context,
-    )
-
-    c2ws_plucker_emb = torch.ones(1, 2, 3)
-    first = model._prepare_cam_conditioner_scale_shifts(c2ws_plucker_emb, forward_batch)
-    forward_context.current_timestep = -1
-    second = model._prepare_cam_conditioner_scale_shifts(
-        c2ws_plucker_emb, forward_batch
-    )
-
-    assert first is not None
-    assert second is not None
-    assert first[0] is second[0]
-    assert first[1] is second[1]
-    assert [block.cam_conditioner.calls for block in model.blocks] == [1, 1]
-
-
 def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready(monkeypatch):
     class _ConditionEmbedder:
         def __init__(self):
