@@ -141,7 +141,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # For DSA models with FP8 KV cache, the nope part is stored in FP8 with
             # per-block scales, and the rope part is stored in BF16 (not FP8).
             # calculate_mla_kv_cache_dim() correctly accounts for this layout.
-            if is_deepseek_dsa(model_config.hf_config) and kv_cache_dtype == torch.float8_e4m3fn:
+            if (
+                is_deepseek_dsa(model_config.hf_config)
+                and kv_cache_dtype == torch.float8_e4m3fn
+            ):
                 kv_cache_dim = mr.calculate_mla_kv_cache_dim()
                 cell_size = kv_cache_dim * num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
