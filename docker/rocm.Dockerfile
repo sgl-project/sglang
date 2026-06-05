@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         gnupg \
         build-essential \
-        python3 python3-dev python3-pip python-is-python3 \
+        python3 python3-dev python3-pip python-is-python3 python3.12-venv \
         wget git \
         ca-certificates \
         libstdc++-12-dev \
@@ -59,7 +59,7 @@ RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 # ROCm SDK and PyTorch dependencies
 ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/v2/gfx950-dcgpu/"
 # Pin to a specific ROCm SDK version (e.g. 7.13.0a20260415). Leave empty for latest.
-ARG ROCM_SDK_VERSION="7.13.0a20260515"
+ARG ROCM_SDK_VERSION="7.14.0a20260604"
 ARG TORCH_VERSION="2.10.0"
 ARG TORCHVISION_VERSION="0.25.0"
 ARG TORCHAUDIO_VERSION="2.10.0"
@@ -270,7 +270,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 # -----------------------
 # FlyDSL
-RUN apt update && apt install -y ninja-build patchelf cmake \
+RUN apt-get update && apt-get install -y ninja-build patchelf cmake \
     && git clone https://github.com/ROCm/FlyDSL.git --branch v0.1.8
 RUN cd FlyDSL \
     && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
@@ -278,7 +278,7 @@ RUN cd FlyDSL \
     && bash -lc 'unset LLVM_COMMIT && source /opt/venv/bin/activate \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
-      && pip install -e .;'
+      && SETUPTOOLS_SCM_PRETEND_VERSION_FOR_FLYDSL=0.1.8 python -m pip install -e .;'
 
 # -----------------------
 # AITER
