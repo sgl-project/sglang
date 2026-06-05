@@ -85,18 +85,8 @@ class CudaGraphConfig:
         return getattr(self, phase)
 
     def to_dict(self) -> Dict[str, Dict[str, Any]]:
-        """Serialize to the legacy {phase: {key: value}} shape used by
-        the parser pipeline that re-applies explicit input.
-
-        Emits only fields that differ from the per-phase default. The
-        parser locks every (phase, key) it sees in the returned dict and
-        the prefill safety cascade skips locked keys, so emitting
-        defaults via dataclasses.asdict would silently bypass the
-        cascade for any caller that constructed a CudaGraphConfig
-        object touching only one phase (e.g.
-        CudaGraphConfig(decode=PhaseConfig(max_bs=256)) would also lock
-        prefill.backend at its default tc_piecewise).
-        """
+        # Diff-only, not asdict: the parser locks every (phase, key) it sees,
+        # so emitting defaults would lock fields the caller never set.
         baseline = default_cuda_graph_config()
         return {
             Phase.DECODE: _diff_phase(self.decode, baseline.decode),
