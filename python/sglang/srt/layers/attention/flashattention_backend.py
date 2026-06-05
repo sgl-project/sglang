@@ -24,12 +24,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 
-# Opt-in (SGLANG_ENABLE_ASYNC_ASSERT=1) device-side guard for the draft-decode
-# expand page_table scatter: that buffer is allocated step-tight
-# (decode_length + 1 columns); if a branch's draft slots span more distinct pages
-# than that, the scatter writes out of bounds and silently corrupts the cuda-graph
-# pool. Read once at import so the @torch.compile helper does not graph-break on an
-# env lookup; when off the assert is elided entirely.
+# Opt-in (SGLANG_ENABLE_ASYNC_ASSERT=1) guard for the draft-decode expand scatter OOB
+# below. Read at import so the @torch.compile helper doesn't graph-break on the env lookup.
 _ASSERT_DRAFT_EXPAND_OOB = envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
 
 if TYPE_CHECKING:
@@ -2740,11 +2736,9 @@ def draft_decode_set_expand_metadata(
     cache_loc = (cache_loc // page_size).to(torch.int32)
     if cache_loc.dim() == 1:
         cache_loc = cache_loc.unsqueeze(0)
-    # Only the draft tokens produced up to this step participate (decode_length of
-    # them); cache_loc arrives num_steps-wide (out_cache_loc.view(-1, num_steps)).
-    # The page_size == 1 path slices identically. Without this slice the full
-    # num_steps-wide cache_loc is compacted into the step-tight (decode_length + 1)
-    # page_table, so the extra distinct pages overflow the row -> scatter_ OOB.
+    # cache_loc is num_steps-wide (out_cache_loc.view(-1, num_steps)); only decode_length
+    # tokens are live this step. Slice to match the page_size==1 path -- else the extra
+    # distinct pages overflow the step-tight (decode_length + 1) page_table on scatter_.
     cache_loc = cache_loc[:, :decode_length]
     # Vectorized torch.unique_consecutive: track value change points then scatter
     mask = torch.ones_like(cache_loc, dtype=torch.bool)
