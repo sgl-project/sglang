@@ -108,6 +108,14 @@ class SchedulerBatchResultProcessor:
         `[start_len, seqlen - 1)`. The default start_len is 0, which returns
         the full sequence.
 
+        If the request was retracted at least once during decode, the host
+        cache slots that backed its pre-retract tokens have been freed and
+        reused. ``ScheduleBatch.release_req`` snapshots the routed experts
+        for those tokens into ``req._retract_routed_experts_prefix`` before
+        each retract; when ``start_len == 0`` we stitch that prefix in front
+        of the post-re-prefill suffix so the final response exposes the
+        complete per-token routing trajectory.
+
         Logs a soft warning if the resulting tensor's row count differs from
         the expected `seqlen - 1 - start_len`, to catch silent regressions.
         """
@@ -118,12 +126,26 @@ class SchedulerBatchResultProcessor:
             return
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
-        req.routed_experts = capturer.get_topk(
+        suffix = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
         )
+
+        prefix = getattr(req, "_retract_routed_experts_prefix", None)
+        if prefix is None or start_len != 0:
+            req.routed_experts = suffix
+        elif suffix is None:
+            req.routed_experts = prefix
+        else:
+            # ``prefix`` covers tokens [0, snap_seqlen - 1); ``suffix`` covers
+            # the full [0, seqlen - 1) when start_len == 0. Slice the suffix
+            # so we do not double-count tokens that were also captured during
+            # re-prefill after retraction.
+            snap = max(0, getattr(req, "_retract_snapshot_seqlen", 0) - 1)
+            tail = suffix[snap:] if snap < suffix.shape[0] else suffix[0:0]
+            req.routed_experts = torch.cat([prefix, tail], dim=0)
 
         expected_rows = max(0, seqlen - 1 - start_len)
         if (
