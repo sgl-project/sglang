@@ -1560,10 +1560,6 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         if c2ws_plucker_emb is None:
             return None
 
-        forward_context = get_forward_context()
-        if forward_context.current_timestep < 0:
-            return None
-
         if not self._should_cache_cam_conditioner(forward_batch):
             return None
 
