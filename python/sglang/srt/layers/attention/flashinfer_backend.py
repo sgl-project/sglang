@@ -1584,6 +1584,23 @@ class FlashInferMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
+        # Size invariant: generate_draft_decode_kv_indices packs topk per-branch
+        # sequences (prefix + draft) into each row, writing up to this many entries.
+        # If the row is narrower (e.g. a cuda-graph buffer allocated without the topk
+        # factor) the kernel writes out of bounds and silently corrupts neighboring
+        # memory -- which only sometimes surfaces as an out-of-vocab draft token crash.
+        # Fail fast and deterministically here instead of relying on that crash.
+        required_kv_indices_len = (
+            seq_lens_sum * self.topk + bs * self.speculative_num_steps
+        )
+        assert required_kv_indices_len <= kv_indices_buffer.shape[1], (
+            f"EAGLE draft kv_indices row too small: need {required_kv_indices_len} "
+            f"but row width is {kv_indices_buffer.shape[1]} (topk={self.topk}, "
+            f"num_seqs={num_seqs}, seq_lens_sum={seq_lens_sum}, "
+            f"num_steps={self.speculative_num_steps}); the buffer must be sized "
+            f"max_bs * topk * max_context_len."
+        )
+
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](

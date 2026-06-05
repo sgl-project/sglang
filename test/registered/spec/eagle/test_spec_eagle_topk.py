@@ -13,6 +13,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecCorrectnessKit,
+    SpecDraftKvOverflowKit,
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
@@ -22,7 +23,13 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlam
 register_cuda_ci(est_time=1180, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
+class TestEagle3Topk16(
+    Eagle3Base,
+    SpecCorrectnessKit,
+    SpecAccuracyKit,
+    SpecLogprobKit,
+    SpecDraftKvOverflowKit,
+):
     """EAGLE3 topk=16 tree (spec v1): correctness + gsm8k + logprob losslessness."""
 
     spec_topk = 16
@@ -49,6 +56,7 @@ class TestEagleLlama2Suite(
     SpecLogprobKit,
     SpecPenaltyKit,
     SpecFeatureKit,
+    SpecDraftKvOverflowKit,
 ):
     """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases)."""
 

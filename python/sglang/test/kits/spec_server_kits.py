@@ -20,6 +20,7 @@ import requests
 
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.kits.spec_draft_buffer_kit import run_draft_kv_overflow_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -515,6 +516,18 @@ class SpecPenaltyKit:
         random.shuffle(args * 5)
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(self.run_decode, args))
+
+
+class SpecDraftKvOverflowKit:
+    """Drive draft sequences into the ``topk * seq_len`` kv_indices overflow regime
+    so the in-kernel size invariant (FlashInferMultiStepDraftBackend.common_template)
+    deterministically catches an undersized draft buffer, instead of relying on the
+    flaky out-of-vocab crash. Only meaningful for topk > 1; a no-op-ish sweep for
+    topk == 1 (one branch per row never overflows)."""
+
+    def test_draft_kv_indices_overflow(self):
+        run_draft_kv_overflow_test(self.base_url, self.page_size, self.spec_steps)
+        self.assertIsNone(self.process.poll())
 
 
 class SpecFeatureKit:
