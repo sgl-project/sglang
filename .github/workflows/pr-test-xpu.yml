@@ -96,6 +96,7 @@ jobs:
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-deps -e /sglang-checkout/python
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
