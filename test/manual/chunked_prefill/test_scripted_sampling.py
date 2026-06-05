@@ -181,10 +181,17 @@ class TestSamplingBasic(ScriptedTestCase):
     @staticmethod
     def _script_chunked_logprob_input_accumulates_across_chunks(t: ScriptedContext):
         prompt_len = VERY_LONG_PROMPT_LEN
+        # logprob_start_len=0 requests an input logprob for every prompt token;
+        # the default (-1) resolves to len(origin_input_ids), which starts
+        # logprob computation at the end of the prompt and returns NO input
+        # logprobs (schedule_batch compute_extend_logprob, ~L1973). The
+        # one-per-token-after-the-first count below is only well-defined when
+        # logprobs begin at the prompt start, so request that explicitly.
         r = t.start_req(
             prompt_len=prompt_len,
             max_new_tokens=4,
             return_logprob=True,
+            logprob_start_len=0,
         )
         yield from run_until_finished(r)
         assert r.finished
@@ -232,10 +239,39 @@ class TestSamplingBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_finish_reason_value_eos_vs_length_chunked(t: ScriptedContext):
+        # FINISH_MATCHED_TOKEN must be reached deterministically. Relying on the
+        # model emitting its real EOS within a token budget is model/prompt
+        # dependent (Qwen3-0.6B on a synthetic repeated-token prompt never emits
+        # EOS within 999 tokens, so it hit the length cap instead). Instead, probe
+        # the model's deterministic FIRST output token under greedy sampling
+        # (temperature=0 makes the token a pure function of the prompt, immune to
+        # the engine's random seed), flush the radix cache so the real request
+        # re-chunks the full prompt instead of cache-hitting the probe's prefix,
+        # then issue the real request with THAT token as a stop token. The engine
+        # finishes via the matched-token path (schedule_batch ~L1224-1233 sets
+        # FINISH_MATCHED_TOKEN when an output token is in stop_token_ids) on the
+        # first decode step, exactly exercising the matched-token finish.
+        probe = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=1,
+            ignore_eos=True,
+            prompt_token=7,
+            temperature=0.0,
+        )
+        yield from run_until_finished(probe)
+        assert probe.finished
+        first_token = probe.req.output_ids[0]
+
+        t.flush_cache()
+        yield
+
         r_eos = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=999,
             ignore_eos=False,
+            prompt_token=7,
+            stop_token_ids=[first_token],
+            temperature=0.0,
         )
         yield from run_until_finished(r_eos, max_steps=2000)
         assert r_eos.finished
@@ -243,8 +279,8 @@ class TestSamplingBasic(ScriptedTestCase):
             r_eos.chunks_done >= 2
         ), f"scenario 1 should chunk; got chunks_done={r_eos.chunks_done}"
         assert isinstance(r_eos.req.finished_reason, FINISH_MATCHED_TOKEN), (
-            f"ignore_eos=False + max_new_tokens=999 chunked must finish via "
-            f"EOS (matched token); got {r_eos.req.finished_reason!r}"
+            f"a stop token the model deterministically produces under greedy must "
+            f"finish via the matched-token path; got {r_eos.req.finished_reason!r}"
         )
 
         r_length = t.start_req(

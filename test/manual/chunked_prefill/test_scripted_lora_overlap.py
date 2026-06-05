@@ -185,16 +185,32 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
             for adapter in adapters
         ]
         expected_ids = [_expected_lora_id(adapter) for adapter in adapters]
-        yield from run_until_all_finished(handles=reqs, max_steps=2400)
-        assert all(r.finished for r in reqs)
-        # The adapter list repeats A/B, so the second A and second B reqs share a
-        # radix namespace with their identical all-ones twins and can prefix-hit
-        # the chunks those twins commit while running concurrently. The exact
-        # chunk count per req is thus order-dependent; keep a tight lower bound
-        # rather than guess an exact ==.
-        assert all(r.chunks_done >= 2 for r in reqs)
+        # Capture each req's lora_id live (a finished req is removed from the
+        # scheduler, so r.req becomes None) while probing every handle every
+        # step so the faster reqs stay registered.
+        lora_id_by_rid: dict = {}
+        done = [False] * len(reqs)
+        for _ in range(2400):
+            for i, r in enumerate(reqs):
+                req = r.req
+                if req is not None:
+                    lora_id_by_rid[r.rid] = req.lora_id
+                done[i] = done[i] or r.finished
+            if all(done):
+                break
+            yield
+        assert all(done)
+        # Identical all-ones prompts + repeated A/B adapters under
+        # max_loras_per_batch=1: adapters run one at a time, so the second A and
+        # second B each run only after their twin commits the full 2048-token
+        # prefix to radix and thus prefix-hit into a single completing chunk.
+        # The first req of each adapter cannot prefix-hit and does the full
+        # multi-chunk prefill.
+        assert all(r.chunks_done >= 1 for r in reqs)
+        assert reqs[0].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        assert reqs[1].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
         for r, expected_id in zip(reqs, expected_ids):
-            assert r.req.lora_id == expected_id
+            assert lora_id_by_rid.get(r.rid) == expected_id
 
 
 if __name__ == "__main__":

@@ -71,11 +71,17 @@ class TestMaxNewTokensDecodeForwardLaw(ScriptedTestCase):
         # carries the finishing req into one trailing dead decode) is the key
         # discriminator: it catches an mnt==1 that runs two decodes, or an
         # mnt==2 that drops one.
+        # Each iteration uses a DISTINCT prompt token so its prompt cannot
+        # radix-cache-hit a prior iteration's committed prefix in this shared
+        # engine: a cache hit would let the second+ request skip a chunk and run
+        # a single extend, breaking the >= 2 extend-record check below. Distinct
+        # prompts force every iteration to chunk its full 2*chunk_size prompt.
         for max_new_tokens in (1, 2, 3, 4):
             r = t.start_req(
                 prompt_len=2 * DEFAULT_CHUNK_SIZE,
                 max_new_tokens=max_new_tokens,
                 ignore_eos=True,
+                prompt_token=10 + max_new_tokens,
             )
             yield from run_until_finished(r)
             assert r.finished

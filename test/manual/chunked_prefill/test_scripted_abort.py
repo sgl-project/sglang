@@ -19,11 +19,14 @@ def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
     # Under the overlap scheduler an abort is injected at the top of the next
     # get_next_batch_to_run, but the actual KV/row/lock release lands a couple of
     # forward steps later -- the in-flight forward's result must drain first. Step
-    # the loop until every aborted handle is fully released instead of asserting
-    # after a single yield.
+    # the loop until every aborted handle is fully released (KV pages, req-pool row,
+    # AND the last_node lock ref, which can linger one extra step past the row)
+    # instead of asserting after a single yield.
     for _ in range(12):
         if all(
-            h.kv_pages == 0 and (h.req is None or h.req.req_pool_idx is None)
+            h.kv_pages == 0
+            and h.lock_refs == 0
+            and (h.req is None or h.req.req_pool_idx is None)
             for h in handles
         ):
             return
@@ -185,6 +188,12 @@ class TestAbortBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
+        # The finished req's KV/row/lock release lands a couple of steps after the
+        # finished flag flips under overlap; drain before asserting full release.
+        for _ in range(12):
+            if r.kv_pages == 0 and r.lock_refs == 0:
+                break
+            yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -199,6 +208,15 @@ class TestAbortBasic(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
+        # run_until_finished returns the step `finished` flips; the finished req's
+        # KV release and any lazy radix bookkeeping land a couple of forward steps
+        # later. Drain to a fully-idle, stable pool before snapshotting the
+        # baseline, so the abort-is-noop comparison is not corrupted by background
+        # release that was still in flight.
+        for _ in range(12):
+            if t.is_fully_idle:
+                break
+            yield
         kv_pool_free_before = t.engine_stats()["kv_pool_free"]
 
         t.abort(r)
@@ -512,6 +530,15 @@ class TestAbortBasic(ScriptedTestCase):
 
         t.abort(r)
         yield from _drain_until_released(t, r)
+
+        # The handle's KV/row/lock are released by the drain above, but the
+        # scheduler-wide idle state (chunked slot cleared, waiting_queue and
+        # running_batch drained) can settle one extra step later under overlap.
+        # Step until idle instead of asserting immediately after release.
+        for _ in range(12):
+            if t.scheduler.chunked_req is None and t.is_idle:
+                break
+            yield
 
         assert r.kv_pages == 0
         assert (1 if t.scheduler.chunked_req is not None else 0) == 0

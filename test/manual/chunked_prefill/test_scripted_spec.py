@@ -17,14 +17,30 @@ _SPEC_DRAFT = "Tengyunw/qwen3_8b_eagle3"
 
 
 def _spec_engine_kwargs(**overrides):
+    # The harness KV-canary walker assumes a decode forward batch has one
+    # `positions` entry per request, but the EAGLE draft decode expands each
+    # request to `speculative_eagle_topk` draft-tree branches, so the draft
+    # model's decode CUDA-graph capture feeds bs*topk positions into a bs-sized
+    # canary buffer and crashes at launch (kv_canary/plan_input.py
+    # _extract_prefix_lens_and_extend_seq_lens). The canary is a harness-side
+    # integrity layer, not part of the v1 engine under test (same rationale as
+    # TestRadixDisabled in test_scripted_radix.py), so turn it off here so the
+    # spec path can use a realistic topk>1 tree. sweep_interval must also drop to
+    # 0 or server_args validation rejects the combination.
+    #
+    # speculative params follow the Tengyunw/qwen3_8b_eagle3 model card's
+    # recommended EAGLE3 configuration (steps=6, topk=10, draft_tokens=32).
     return base_engine_kwargs(
         model_path=_SPEC_MODEL,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         speculative_algorithm="EAGLE3",
         speculative_draft_model_path=_SPEC_DRAFT,
-        speculative_num_steps=3,
-        speculative_eagle_topk=4,
-        speculative_num_draft_tokens=8,
+        speculative_num_steps=6,
+        speculative_eagle_topk=10,
+        speculative_num_draft_tokens=32,
+        kv_canary="none",
+        kv_canary_real_data="none",
+        kv_canary_sweep_interval=0,
         **overrides,
     )
 

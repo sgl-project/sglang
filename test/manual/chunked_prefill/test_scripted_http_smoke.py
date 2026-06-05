@@ -5,6 +5,7 @@ from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     base_engine_kwargs,
+    run_until_finished,
 )
 
 
@@ -35,23 +36,17 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
     @staticmethod
     def _script_two_reqs_finish(t: ScriptedContext):
         r1 = t.start_req(prompt_len=8, max_new_tokens=4)
+        yield from run_until_finished(r1)
         r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
-        # Probe BOTH handles every step (no short-circuit): a handle is only
-        # registered for post-recycle finished-tracking by probing it, so the
-        # faster req must not go unprobed while waiting on the slower one.
-        done = {r1.rid: False, r2.rid: False}
-        for _ in range(800):
-            done[r1.rid] = done[r1.rid] or r1.finished
-            done[r2.rid] = done[r2.rid] or r2.finished
-            if all(done.values()):
-                break
-            yield
-        assert done[r1.rid]
-        assert done[r2.rid]
+        yield from run_until_finished(r2)
+        assert r1.finished
+        assert r2.finished
         assert r1.chunks_done == 0
-        # r2's prompt is 2 * DEFAULT_CHUNK_SIZE (512), an exact multiple of the
-        # 256 chunk size, so it chunks into ceil(512 / 256) = 2 partial prefill
-        # iterations regardless of co-batching with r1.
+        # r2 prefills alone (r1 already finished), so its 512-token prompt
+        # chunks into exactly ceil(512 / 256) = 2 partial-prefill iterations.
+        # When r1 co-batches into r2's first chunk it steals chunk budget (8 of
+        # 256) and splits r2 into 3 chunks -- run r1 to completion first to
+        # keep the count exact.
         assert r2.chunks_done == 2
 
 

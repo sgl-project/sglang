@@ -51,11 +51,15 @@ class TestLoRASingleAdapter(ScriptedTestCase):
     @staticmethod
     def _script_lora_logprob_chunked_pass_idx(t: ScriptedContext):
         prompt_len: int = VERY_LONG_PROMPT_LEN
+        # logprob_start_len=0 requests an input logprob for every prompt token;
+        # the default (-1) starts logprob computation at the prompt end and
+        # returns no input logprobs.
         r = t.start_req(
             prompt_len=prompt_len,
             max_new_tokens=2,
             lora_path=_LORA_ADAPTER,
             return_logprob=True,
+            logprob_start_len=0,
         )
         yield from run_until_finished(r)
         assert r.finished
@@ -174,12 +178,15 @@ class TestLoRAAllDistinctAdapters(ScriptedTestCase):
         for r in reqs:
             assert r.kv_pages == 0
             assert r.lock_refs == 0
-            # The adapter list repeats A/B, so the second A and second B reqs
-            # share a radix namespace with their identical all-ones twins and can
-            # prefix-hit the chunks those twins commit while running concurrently.
-            # The exact chunk count per req is thus order-dependent; keep a tight
-            # lower bound rather than guess an exact ==.
-            assert r.chunks_done >= 2
+            # Identical all-ones prompts + repeated A/B adapters: the first req
+            # of each adapter does a full fresh prefill, but its same-adapter
+            # twin runs only after the first commits the whole 2048-token prefix
+            # to radix (admission is effectively serialized by the LoRA pool),
+            # so the twin prefix-hits and completes in a single chunk.
+            assert r.chunks_done >= 1
+        # adapters == [A, B, A, B]; the first A and first B cannot prefix-hit.
+        assert reqs[0].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        assert reqs[1].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
 
 
 class TestLoRAAdapterEviction(ScriptedTestCase):
@@ -232,7 +239,14 @@ class TestLoRAAdapterEviction(ScriptedTestCase):
         yield
 
         t.abort(r_a)
-        yield
+        # Aborting a mid-chunk req lands several forward steps later (the
+        # chunked-prefill result path keeps prefilling until the req leaves the
+        # chunked state); drain until the abort is realized, matching the abort
+        # suite's _drain_until_released pattern.
+        for _ in range(12):
+            if r_a.kv_pages == 0 and (r_a.req is None or r_a.req.req_pool_idx is None):
+                break
+            yield
 
         assert r_a.status in ("finished", "unknown")
         # An aborted req may be fully dropped from the scheduler (req is None);

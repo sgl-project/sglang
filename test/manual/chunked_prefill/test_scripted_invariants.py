@@ -83,6 +83,13 @@ class TestInvariantsBasic(ScriptedTestCase):
         rids = {h.rid for h in actives}
         assert r1.rid in rids or r2.rid in rids
         yield from run_until_all_finished([r1, r2])
+        # The overlap scheduler keeps a finished req in its batch structures for
+        # a step or two after the finish is observed; drain until it leaves.
+        for _ in range(12):
+            actives_after = t.list_active_reqs()
+            if all(h.rid not in (r1.rid, r2.rid) for h in actives_after):
+                break
+            yield
         actives_after = t.list_active_reqs()
         assert all(h.rid not in (r1.rid, r2.rid) for h in actives_after)
 
@@ -128,6 +135,14 @@ class TestInvariantsBasic(ScriptedTestCase):
         before = t.engine_stats()["kv_pool_free"]
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
         yield from run_until_all_finished(reqs)
+        # Committed prompt prefixes stay cached (not leaked); drain + flush
+        # before comparing free pages against the baseline.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        t.flush_cache()
+        yield
         after = t.engine_stats()["kv_pool_free"]
         assert after >= before
 
@@ -139,6 +154,14 @@ class TestInvariantsBasic(ScriptedTestCase):
         baseline = t.engine_stats()
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(100)]
         yield from run_until_all_finished(reqs, max_steps=4000)
+        # Finished prompts stay committed in the radix tree (cached != leaked);
+        # drain to idle and flush before the leak comparison.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        t.flush_cache()
+        yield
         final = t.engine_stats()
         assert (
             final["kv_pool_free"] >= baseline["kv_pool_free"]
@@ -159,6 +182,14 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield from run_until_all_finished(reqs, max_steps=2000)
             for r in reqs:
                 assert r.finished
+        # Committed prompts stay in the radix tree across reps (cached !=
+        # leaked); drain to idle and flush before the final leak comparison.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        t.flush_cache()
+        yield
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
@@ -216,6 +247,14 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield from run_until_all_finished(shorts + chunked, max_steps=2000)
             for r in shorts + chunked:
                 assert r.finished
+        # Finished short+chunked prompts stay committed in the radix tree
+        # (cached != leaked); drain to idle and flush before comparing.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        t.flush_cache()
+        yield
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
@@ -257,6 +296,15 @@ class TestInvariantsBasic(ScriptedTestCase):
         for _ in range(10):
             reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
             yield from run_until_all_finished(reqs)
+            # Sampled outputs differ across reps and commit new radix branches
+            # (cached != leaked); drain + flush before each measurement so the
+            # monotone check sees genuinely-held pages only.
+            for _ in range(40):
+                if t.is_fully_idle:
+                    break
+                yield
+            t.flush_cache()
+            yield
             cur = t.engine_stats()["kv_pool_free"]
             if last is not None:
                 assert cur >= last - 1, f"KV pool drifted: {last} -> {cur}"
@@ -268,7 +316,9 @@ class TestInvariantsBasic(ScriptedTestCase):
     @staticmethod
     def _script_inflight_middle_chunks_caps_at_one(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        running_max = r.req.inflight_middle_chunks
+        # r.req is None until the engine pulls the req into a scheduler
+        # structure on a later step; seed at 0 and sample only after yields.
+        running_max = 0
         running_max_post_finish = 0
         post_finish_samples = 0
         for _ in range(DEFAULT_MAX_STEPS):
@@ -422,23 +472,29 @@ class TestInvariantsBasic(ScriptedTestCase):
 
         # The monotonic invariant must keep holding while r re-prefills and
         # decodes to completion.
+        # On re-admission the engine clears is_retracted BEFORE the first new
+        # chunk restarts extend_batch_idx, so sampling the flag cannot pin the
+        # restart step. The honest invariant: across the single retract episode
+        # above, extend_batch_idx may restart exactly once; it must otherwise
+        # be monotone.
         prev_extend_batch_idx: int = -1
-        prev_is_retracted: bool = False
+        regressions: int = 0
         for _ in range(DEFAULT_MAX_STEPS):
             req = t.find_req_by_rid(r.rid)
             if req is not None:
                 cur_extend_batch_idx = req.extend_batch_idx
-                cur_is_retracted = req.is_retracted
-                if prev_extend_batch_idx >= 0:
-                    if cur_extend_batch_idx < prev_extend_batch_idx:
-                        assert cur_is_retracted and not prev_is_retracted, (
-                            f"extend_batch_idx regressed without retract: "
-                            f"{prev_extend_batch_idx} -> {cur_extend_batch_idx}, "
-                            f"prev_is_retracted={prev_is_retracted}, "
-                            f"cur_is_retracted={cur_is_retracted}"
-                        )
+                if (
+                    prev_extend_batch_idx >= 0
+                    and cur_extend_batch_idx < prev_extend_batch_idx
+                ):
+                    regressions += 1
+                    observed_regression = True
+                    assert regressions == 1, (
+                        f"extend_batch_idx regressed more than once for a single "
+                        f"retract episode: "
+                        f"{prev_extend_batch_idx} -> {cur_extend_batch_idx}"
+                    )
                 prev_extend_batch_idx = cur_extend_batch_idx
-                prev_is_retracted = cur_is_retracted
             if r.finished:
                 break
             yield

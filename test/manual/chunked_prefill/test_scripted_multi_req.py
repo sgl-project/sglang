@@ -60,7 +60,16 @@ class TestMultiReqBasic(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.is_chunking)
 
         r2 = t.start_req(prompt_len=8, max_new_tokens=4)
-        yield
+        # r1's first chunk fills the whole 256-token budget, so r2 sits in the
+        # waiting queue for a step before the scheduler co-batches it; advance
+        # until r2 actually runs (prefill or decode) while r1 still holds the
+        # single chunked slot.
+        yield from run_until(
+            r2,
+            lambda h: h.rid
+            in t.batch_composition().get("prefill", [])
+            + t.batch_composition().get("decode", []),
+        )
 
         comp = t.batch_composition()
         assert r1.rid in comp.get(
