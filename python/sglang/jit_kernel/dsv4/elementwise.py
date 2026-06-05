@@ -141,21 +141,25 @@ def fused_q_indexer_rope_hadamard_quant(
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    q_fp8 = torch.empty(q_input.shape, dtype=torch.uint8, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
+    use_jit = not _is_hip
     if _is_hip:
-        torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
-            q_input,
-            q_fp8,
-            weight,
-            weights_out,
-            float(weight_scale),
-            freqs_real,
-            positions,
-        )
-    else:
+        try:
+            torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+                q_input,
+                q_fp8,
+                weight,
+                weights_out,
+                float(weight_scale),
+                freqs_real,
+                positions,
+            )
+        except AttributeError:
+            use_jit = True
+    if use_jit:
         module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
         module.forward(
             q_input,
@@ -166,7 +170,7 @@ def fused_q_indexer_rope_hadamard_quant(
             freqs_real,
             positions,
         )
-    return q_fp8, weights_out
+    return q_fp8.view(torch.float8_e4m3fn), weights_out
 
 
 def fused_q_indexer_rope_hadamard_fp4_quant(

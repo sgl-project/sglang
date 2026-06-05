@@ -321,7 +321,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, data[i], mask, kWarpThreads);
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }

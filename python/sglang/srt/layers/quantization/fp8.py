@@ -125,11 +125,8 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale_a16w4,
-        shuffle_weight,
-        shuffle_weight_a16w4,
-    )
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility.fp4_utils import e8m0_shuffle
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1220,10 +1217,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
                 scale = getattr(layer, scale_name)
                 num_experts, num_rows, _ = scale.shape
-                # a8w4: aiter flydsl scale layout
-                is_w13_scale = scale_name == "w13_weight_scale_inv"
-                scale.data = shuffle_scale_a16w4(
-                    scale.view(num_experts * num_rows, -1), num_experts, is_w13_scale
+                scale.data = e8m0_shuffle(scale.view(num_experts * num_rows, -1)).view(
+                    num_experts, num_rows, -1
                 )
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
@@ -1231,12 +1226,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             is_shuffled = _is_shuffle_moe_mxfp4
             if is_shuffled:
-                # a8w4: aiter flydsl weight layout
-                layer.w13_weight.data = shuffle_weight_a16w4(
-                    layer.w13_weight.contiguous(), 16, True
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
                 )
-                layer.w2_weight.data = shuffle_weight_a16w4(
-                    layer.w2_weight.contiguous(), 16, False
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
                 )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
@@ -1833,6 +1827,40 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        if _is_hip and _use_aiter and self.block_quant and self.is_fp4_expert:
+            from aiter import ActivationType, QuantType
+            from aiter.fused_moe import fused_moe
+
+            assert (
+                not moe_runner_config.no_combine
+            ), "no_combine=True is not supported by AITER"
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+            fp4_weight_dtype = _require_fp4_dtype()
+            w13_weight = w13_weight.view(fp4_weight_dtype)
+            w2_weight = w2_weight.view(fp4_weight_dtype)
+            if getattr(layer.w13_weight, "is_shuffled", False):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+            output = fused_moe(
+                x,
+                w13_weight,
+                w2_weight,
+                topk_weights.to(torch.float32),
+                topk_ids,
+                w1_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                quant_type=QuantType.per_1x32,
+                activation=(
+                    ActivationType.Silu
+                    if self.moe_runner_config.activation == "silu"
+                    else ActivationType.Gelu
+                ),
+                expert_mask=layer.dispatcher.expert_mask_gpu,
             )
             return StandardCombineInput(hidden_states=output)
 

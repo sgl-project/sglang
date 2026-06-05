@@ -262,15 +262,12 @@ class ModelConfig:
                         self.is_fp4_experts,
                     )
 
-            # HF config.json inherits topk_group=4 from the V3 template, but
-            # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
-            # top-k). Force topk_group == n_group so deepseek_v2.py:531's
-            # `n_group > topk_group` evaluates False and routes to the
-            # ungrouped sqrtsoftplus path. The grouped impl only supports
-            # sigmoid scoring (topk.py:722) and would silently corrupt expert
-            # weights if hit.
             n_group = getattr(self.hf_config, "n_group", None)
-            if n_group is not None:
+            if self.is_fp4_experts:
+                assert n_group is not None, "DSV4 FP4 experts require n_group"
+                assert n_group >= 4, "DSV4 FP4 experts require topk_group=4"
+                self.hf_config.topk_group = 4
+            elif n_group is not None:
                 self.hf_config.topk_group = n_group
 
         # Check model type
