@@ -185,3 +185,75 @@ def test_patch_falls_back_on_gate_bias():
     d = mx.abs(out_before.astype(mx.float32) - out_after.astype(mx.float32))
     diff = d.max().item()
     assert diff == 0.0, f"forward changed after (no-op) patch: max|delta|={diff:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# Model-free numerical equivalence + non-stock-forward guard (synthetic, no
+# model). Gives the kernel's central correctness claim a check that runs on any
+# MLX-present machine without a model download (skips where Metal is absent).
+# ---------------------------------------------------------------------------
+def test_fused_matches_unfused_synthetic():
+    """Synthetic quantized gate weights: fused kernel vs the unfused
+    gather_qmm + silu*x_up path, within the kernel's bf16 bound, plus finiteness."""
+    import mlx.nn as nn
+
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
+        fused_gate_qmv_silu_mul,
+    )
+
+    # Gate regime: K%512==0, N%8==0, bits=4, group_size=64, affine.
+    E, N, K, TOPK = 4, 16, 512, 2
+    dtype = mx.bfloat16
+    gate_w = (mx.random.normal((E, N, K)) * 0.02).astype(dtype)
+    gwq, gs, gb = mx.quantize(gate_w, group_size=64, bits=4)
+    mx.eval(gwq, gs, gb)
+
+    # Two routing patterns: spread (hi=E) and collisions (many tokens, few experts).
+    for B, hi in [(2, E), (4, max(1, E // 2))]:
+        x = mx.random.normal((B, 1, 1, K)).astype(dtype)
+        idx = mx.random.randint(0, hi, shape=(B, TOPK)).astype(mx.uint32)
+        x_up = mx.random.normal((B, TOPK, 1, N)).astype(dtype)
+
+        x_gate = mx.gather_qmm(
+            x,
+            gwq,
+            gs,
+            gb,
+            rhs_indices=idx,
+            transpose=True,
+            group_size=64,
+            bits=4,
+            mode="affine",
+        )
+        y_ref = nn.silu(x_gate) * x_up
+        y_fused = fused_gate_qmv_silu_mul(x, gwq, gs, gb, idx, x_up)
+        mx.eval(y_ref, y_fused)
+
+        assert y_ref.shape == y_fused.shape
+        # A broken kernel must not leak NaN/Inf into the downstream down_proj matmul.
+        assert bool(
+            mx.all(mx.isfinite(y_fused.astype(mx.float32))).item()
+        ), f"B={B} hi={hi}: non-finite fused output"
+        # Same bf16 bound as the @requires_model kernel test.
+        max_abs, rel = _max_rel_diff(y_ref, y_fused)
+        assert rel < 2e-2, f"B={B} hi={hi}: max_abs={max_abs:.3e} rel={rel:.2%}"
+
+
+def test_can_fuse_declines_nonstock_call():
+    """can_fuse: False when SwitchGLU.__call__ is overridden (the fused subclass
+    would impose stock semantics and silently bypass the override), True for stock."""
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import can_fuse
+
+    # hidden=64 keeps down_proj's input dim divisible by the quant group size.
+    sw_stock = _quantized_switch_glu(512, 64, 4, gate_bias=False)
+    assert can_fuse(sw_stock) is True, "stock in-regime SwitchGLU should fuse"
+
+    class _CustomSwitchGLU(SwitchGLU):
+        def __call__(self, x, indices):  # overridden forward
+            return super().__call__(x, indices)
+
+    sw_custom = _quantized_switch_glu(512, 64, 4, gate_bias=False)
+    sw_custom.__class__ = _CustomSwitchGLU  # same swap mechanism the patch uses
+    assert can_fuse(sw_custom) is False, "non-stock __call__ must fall back"

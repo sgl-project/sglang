@@ -371,7 +371,7 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
 def can_fuse(switch_mlp) -> bool:
     """Cheap structural check: does this SwitchGLU match the Path B v1 regime?"""
     try:
-        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
     except ImportError:
         return False
     up = switch_mlp.up_proj
@@ -379,6 +379,13 @@ def can_fuse(switch_mlp) -> bool:
     if not isinstance(up, QuantizedSwitchLinear) or not isinstance(
         gate, QuantizedSwitchLinear
     ):
+        return False
+    # A model that overrides SwitchGLU.__call__ runs a custom forward, but the
+    # patch installs a subclass __call__ that imposes the stock semantics
+    # fused_forward reimplements, silently bypassing the override. Decline when
+    # the forward is not the stock SwitchGLU.__call__ (evaluated at patch time,
+    # before the class swap, so this sees the model's real class).
+    if type(switch_mlp).__call__ is not SwitchGLU.__call__:
         return False
     # Learned per-expert bias, added after the matmul in
     # QuantizedSwitchLinear.__call__ as ``x + bias[indices]`` whenever
@@ -409,8 +416,12 @@ def can_fuse(switch_mlp) -> bool:
         or up.biases.dtype != param_dtype
     ):
         return False
-    K = up.scales.shape[-1] * _GROUP_SIZE
-    N = up.weight.shape[-2]
+    # Validate from the gate projection: fused_gate_qmv_silu_mul recomputes the
+    # gate matmul and keys K/N off gate dims, so the gate is the operand that
+    # must satisfy the tiling constraints (equivalent to up only while
+    # up.shape == gate.shape).
+    K = gate.scales.shape[-1] * _GROUP_SIZE
+    N = gate.weight.shape[-2]
     if K % _BLOCK_SIZE != 0 or N % _ROWS_PER_TG != 0:
         return False
     return True
