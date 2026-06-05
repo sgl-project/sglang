@@ -37,16 +37,16 @@ from sglang.srt.utils import get_device_sm
 TILE_M = 16
 TILE_K = 256
 SPLITK = 4
-LOAD_WARPS = 4  # 4 loader + 4 compute warps -> 256-thread block (matches CUDA)
-MAX_NSTAGE = 16  # upper bound on the pipeline depth
+LOAD_WARPS = 4
+MAX_NSTAGE = 16
 PWK = TILE_K // SPLITK
 KSTEPS = PWK // 16
 COMPUTE_THREADS = SPLITK * 32
 LOADER_THREADS = LOAD_WARPS * 32
 NTHREADS = COMPUTE_THREADS + LOADER_THREADS
-KI = TILE_K // 2  # int32 cols per K-tile (a bf16 pair per int32)
+KI = TILE_K // 2
 
-_BAR_I32 = 2 * MAX_NSTAGE * 2  # full[] + empty[] mbarriers (int64 = 2 int32 each)
+_BAR_I32 = 2 * MAX_NSTAGE * 2
 
 
 def _stage_i32(tile_n: int) -> int:
@@ -124,24 +124,16 @@ def _mma(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
 
 
 def _swizzle(row, col):
-    # 3-4-3 swizzle (bank-conflict-free ldmatrix; the XOR is a multiple of 4 so
-    # each 16B group stays contiguous).
     return col ^ ((row % 8) * 4)
 
 
 def _k_project(tile, col, kgi):
-    # Within-tile int32 col -> global-K int32, so compute warp (col // kp_warp)
-    # reduces a contiguous global-K region.
     kp_warp = KI // SPLITK
     kp_chunk = kgi // SPLITK
     return (col // kp_warp) * kp_chunk + tile * kp_warp + (col % kp_warp)
 
 
 def _load_tile(ltid, feat0, sa, sb, mW, mA, tile, buf, M, kgi, tile_n):
-    # All loader threads stream the weight tile first (the bandwidth-critical load, so
-    # it gets the full loader-thread count for maximum cp.async parallelism), then the
-    # activation tile (rows >= num_tokens predicated off). A 50/50 A/B warp split, as
-    # in the CUDA reference, was measured to halve weight-load MLP and regress badly.
     for it in range(TILE_M * KI // (LOADER_THREADS * 4)):
         idx = (it * LOADER_THREADS + ltid) * 4
         row, col = idx // KI, idx % KI
@@ -178,17 +170,10 @@ def _kernel(
     feat0 = bid * TILE_M
     kgi = num_kt * KI
 
-    # Pipeline ring carved from raw dynamic smem. nstage is a compile-time constant
-    # (chosen host-side from the device's opt-in smem) so the stage wrap / phase-flip
-    # logic constant-folds, matching the CUDA reference's templated stage_cnt. The
-    # epilogue accumulator sC aliases the start of the sA stage region (reused after
-    # the k-loop, as in the CUDA reference) so it costs no extra smem -> +1 stage.
     base = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
     bar = cute.recast_ptr(base, dtype=cutlass.Int64)
     full, empty = bar, bar + MAX_NSTAGE
     sa_off = _BAR_I32
-    # Pad the split-K partial stride (as the CUDA reference does) so the four warps'
-    # partials sit in different smem banks for the epilogue reduction.
     sc_warp_stride = TILE_M * tile_n + 2
     sC = cute.make_tensor(
         cute.recast_ptr(base + sa_off, dtype=cutlass.Float32),
@@ -210,14 +195,8 @@ def _kernel(
     cute.arch.barrier()
 
     if warp >= SPLITK:
-        # Loaders read global memory, so they (not the compute warps) gate on the
-        # programmatic-dependent launch barrier.
         cute.arch.griddepcontrol_wait()
         ltid = tid - COMPUTE_THREADS
-        # The k-loop is fully unrolled (range_constexpr) so the compiler can
-        # software-pipeline cp.async across iterations, and uses the CUDA reference's
-        # try_wait look-ahead: peek the next stage's empty barrier to skip the blocking
-        # wait whenever the consumer is keeping up. lph(kt) = ((kt//nstage)&1)^1.
         need_wait = cutlass.Boolean(True)
         for kt in cutlass.range_constexpr(num_kt):
             st = kt % nstage
@@ -236,14 +215,6 @@ def _kernel(
         for kt in cutlass.range_constexpr(num_kt):
             buf = kt % nstage
             cute.arch.mbarrier_wait(full + buf, ph)
-            # Load each 8-wide n-block with its own ldmatrix.x2 (two 8x8 tiles = the
-            # two B regs b0, b1). A single x4 over all 16 n-rows would put the n0-7 and
-            # n8-15 lane groups on the same k-octet, and the row%8 swizzle then collides
-            # their smem banks; the per-block x2 reads two distinct k-octets that
-            # swizzle apart, so it is bank-conflict free (like CUDA). Loads are left
-            # interleaved with the MMAs: the fully-unrolled k-loop already exposes the
-            # whole instruction stream to the scheduler, so hoisting only inflates
-            # register pressure (measured 148 -> 200) without raising the issue rate.
             brow_lo = lane % 8
             boff = ((lane // 8) & 1) * 4
             for step in cutlass.range_constexpr(KSTEPS):
@@ -281,12 +252,6 @@ def _kernel(
                 n = nb * 8 + cc * 2 + (i % 2)
                 sC[warp, m, n] = acc[nb][i]
 
-        # Epilogue runs entirely within the compute warps behind a named barrier
-        # (bar.sync 1, COMPUTE_THREADS), matching the CUDA reference; the loader
-        # warps do not participate, so no full-block sync is needed here. The
-        # split-K reduction uses all COMPUTE_THREADS (not the CUDA reference's
-        # warp-0-only path, which serializes the output stores and was measured
-        # slower) over the bank-padded sC.
         cute.arch.barrier(barrier_id=1, number_of_threads=COMPUTE_THREADS)
         nred = TILE_M * tile_n
         for it in cutlass.range_constexpr(
@@ -330,14 +295,11 @@ _compiled: dict[tuple[int, int, int], object] = {}
 
 
 def _pick_nstage(num_kt: int, smem_optin_bytes: int, tile_n: int) -> int:
-    # sC aliases the sA region, so it does not consume budget beyond one stage.
     nstage = (smem_optin_bytes // 4 - _BAR_I32) // _stage_i32(tile_n)
     return min(nstage, MAX_NSTAGE, num_kt)
 
 
 def _pick_tile_n(num_tokens: int) -> int:
-    # Match the CUDA reference: a narrow 8-wide token tile (1 MMA n-block) for the
-    # small-batch case, the 16-wide tile (2 n-blocks) otherwise.
     return 8 if num_tokens <= 8 else 16
 
 

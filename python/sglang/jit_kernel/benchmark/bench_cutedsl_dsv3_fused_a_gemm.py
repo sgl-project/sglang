@@ -45,9 +45,8 @@ def benchmark():
 
     for gemm_k in GEMM_K_LIST:
         weight = torch.randn(GEMM_M, gemm_k, dtype=torch.bfloat16, device="cuda")
-        mat_b = weight.t()  # [gemm_k, GEMM_M] column-major (the weight)
+        mat_b = weight.t()
 
-        # The AOT kernel hardcodes K=7168; skip it for other K.
         has_aot = gemm_k == 7168
 
         print(f"dsv3 fused-A GEMM  K={gemm_k} N={GEMM_M}  (CUPTI cold-L2, us)")
