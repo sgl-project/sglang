@@ -364,6 +364,9 @@ class Ideogram4DenoisingStage(DenoisingStage):
         batch.num_inference_steps = num_steps
 
         ctx = super()._prepare_denoising_loop(batch, server_args)
+        # ideogram fp8 denoising keeps explicit fp32 latent/scheduler math;
+        # wrapping the full loop in bf16 autocast collapses latent variance
+        ctx.autocast_enabled = False
 
         data = batch.extra["ideogram4"]
         z = ctx.latents.to(device, dtype=torch.float32)

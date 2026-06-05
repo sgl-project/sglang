@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "e797cbb8da5e6dc786df12151aebe2a7770ec80c"
+SGL_TEST_FILES_CI_DATA_REVISION = "44b5174704f3e2dd14b1485b485ad1b2a8111e6d"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
