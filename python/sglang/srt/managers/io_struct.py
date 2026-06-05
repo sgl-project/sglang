@@ -163,6 +163,15 @@ class GenerateReqInput(BaseReq):
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Per-position token ids to return logprob for (e.g. OPD top-k scoring): one
+    # id-list per scored input position (List[List[int]]), instead of a single flat
+    # id-list broadcast to every position. When set, this is folded into
+    # token_ids_logprob during normalization (single, non-parallel request only) and
+    # the logprob gather returns each position's own ids (sparse [R, k] rather than the
+    # dense [R, |union|] of a flat global union).
+    token_ids_logprob_positions: Optional[
+        Union[List[List[List[int]]], List[List[int]]]
+    ] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
@@ -298,6 +307,23 @@ class GenerateReqInput(BaseReq):
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
+
+        # OPD per-position scoring: fold the per-position id-lists into the single
+        # token_ids_logprob slot BEFORE the single/batch split, so both paths carry it
+        # (single requests skip _normalize_logprob_params). The logprob gather detects the
+        # nested per-position form. Mutually exclusive with the flat field; single-request
+        # only (is_single is resolved by _handle_parallel_sampling above).
+        if self.token_ids_logprob_positions is not None:
+            if self.token_ids_logprob is not None:
+                raise ValueError(
+                    "Set only one of token_ids_logprob or token_ids_logprob_positions, not both."
+                )
+            if not self.is_single:
+                raise ValueError(
+                    "token_ids_logprob_positions supports only a single request; send one per sample."
+                )
+            self.token_ids_logprob = self.token_ids_logprob_positions
+            self.token_ids_logprob_positions = None
 
         if self.is_single:
             self._normalize_single_inputs()

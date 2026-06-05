@@ -122,6 +122,12 @@ class LogitsMetadata:
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
+    # Absolute position of each request's first pruned (input-logprob) row
+    # (= len(prefix_indices) + extend_logprob_start_len). Used by per-position
+    # token_ids_logprob to align the per-position id-list (indexed by absolute input
+    # position) to the pruned rows under chunked prefill, where pruned lengths are
+    # per-forward-pass but the id-list spans the full sequence.
+    extend_logprob_start_pos_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
@@ -174,10 +180,23 @@ class LogitsMetadata:
                 if extend_len - start_len > 0:
                     extend_return_logprob = True
                 extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
+            # Absolute position of each request's first pruned row, for per-position
+            # token_ids_logprob alignment under chunked prefill (see LogitsMetadata).
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                extend_logprob_start_pos_cpu = [
+                    prefix_len + start_len
+                    for prefix_len, start_len in zip(
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_logprob_start_lens_cpu,
+                    )
+                ]
+            else:
+                extend_logprob_start_pos_cpu = None
         else:
             extend_return_logprob = extend_return_top_logprob = (
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
+            extend_logprob_start_pos_cpu = None
 
         return cls(
             forward_mode=forward_batch.forward_mode,
@@ -190,6 +209,7 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+            extend_logprob_start_pos_cpu=extend_logprob_start_pos_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
@@ -802,6 +822,11 @@ class LogitsProcessor(nn.Module):
                 pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
                     chunk_slice
                 ]
+                global_start_pos = (
+                    logits_metadata.extend_logprob_start_pos_cpu[chunk_slice]
+                    if logits_metadata.extend_logprob_start_pos_cpu is not None
+                    else None
+                )
                 split_len_token_ids = get_token_ids_logprobs_chunk(
                     chunk_input_logprobs,
                     token_ids_logprobs,
@@ -809,6 +834,7 @@ class LogitsProcessor(nn.Module):
                     input_token_ids_logprobs_val,
                     input_token_ids_logprobs_idx,
                     split_len_token_ids,
+                    global_start_pos,
                 )
 
             # Get the logprob of the requested token ids
