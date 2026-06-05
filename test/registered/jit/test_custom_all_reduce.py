@@ -38,7 +38,7 @@ from sglang.jit_kernel.all_reduce import (
 )
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once
+from sglang.jit_kernel.utils import cache_once, get_ci_test_range
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -80,6 +80,8 @@ USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
 TEST_LOOP = 16
 
+TEST_SIZES = get_ci_test_range(TEST_SIZES, [16, 1024, 32 * 1024, 2 * 1024 * 1024])
+TEST_DTYPES = get_ci_test_range(TEST_DTYPES, [torch.bfloat16])
 
 # ---------------------------------------------------------------------------
 # Parallel JIT precompile (outer process, before any torchrun child starts)

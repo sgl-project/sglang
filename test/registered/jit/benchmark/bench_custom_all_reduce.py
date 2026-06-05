@@ -26,7 +26,7 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import multigpu_bench_main
+from sglang.jit_kernel.benchmark.utils import get_benchmark_range, multigpu_bench_main
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -63,13 +63,14 @@ MESSAGE_SIZES_BYTES = [
     16 * 1024 * 1024,  # 16M
     32 * 1024 * 1024,  # 32M
 ]
+WORLD_SIZES = list(range(2, 9))
 MAX_BYTES = max(MESSAGE_SIZES_BYTES)
 # trtllm allreduce_fusion only supports these world sizes.
 FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
 # AOT custom_all_reduce (v1) only supports these world sizes.
 AOT_SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
 PROVIDERS = ["nccl", "aot", "jit", "fi"]
-
+WORLD_SIZES = get_benchmark_range(WORLD_SIZES, [2, 4, 8])
 
 # ---------------------------------------------------------------------------
 # Per-rank distributed init (run once per torchrun worker)
@@ -286,6 +287,6 @@ if __name__ == "__main__":
     multigpu_bench_main(
         name=__name__,
         file=__file__,
-        num_gpus=range(2, 9),
+        num_gpus=WORLD_SIZES,
         main_fn=benchmark.run,
     )
