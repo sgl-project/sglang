@@ -12,14 +12,14 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.3
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.0
+ARG SGL_DEEP_GEMM_VERSION=0.1.2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.11.post1
+ARG FLASHINFER_VERSION=0.6.12
 ARG MOONCAKE_VERSION=0.3.11.post1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -784,6 +784,9 @@ COPY --from=framework_final /sgl-workspace /sgl-workspace
 
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+
+# Copy sglang binary
+COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
 
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy

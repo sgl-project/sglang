@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+        TreeComponent,
+    )
 
 
 @dataclasses.dataclass
@@ -30,6 +33,7 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
 
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1
@@ -50,3 +54,6 @@ class CacheInitParams:
     prealloc_host_kv_pool: Optional["HostKVCache"] = None
 
     tree_components: Optional[tuple[ComponentType, ...]] = None
+    component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
+        None
+    )

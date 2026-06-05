@@ -15,7 +15,6 @@ name: PR Test Extra
 
 on:
   pull_request:
-    branches: [main]
     # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
     # is added after the latest push — otherwise GHA leaves the stale
     # skipped run in place and there's no way to enable extra without

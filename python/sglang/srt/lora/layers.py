@@ -881,6 +881,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
+        self.moe_runner_config = base_layer.moe_runner_config
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
