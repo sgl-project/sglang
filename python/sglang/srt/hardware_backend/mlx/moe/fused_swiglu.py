@@ -427,21 +427,14 @@ def can_fuse(switch_mlp) -> bool:
     return True
 
 
-# Warn once per process when the fused kernel declines runtime inputs and we
-# fall back, so a decode loop does not log per token.
 _fallback_warned = False
 
 
 def _fused_gate_or_fallback(gate_proj, x, gate_idx, x_up, sorted_indices=False):
-    """``silu(gate_qmv(x)) * x_up`` via the fused kernel, falling back to the
-    unfused ``gather_qmm`` + ``silu * x_up`` when the kernel rejects the inputs.
-
-    can_fuse gates the structural regime at patch time, but it cannot see the
-    runtime activation dtype, which the fused kernel requires to equal the gate
-    quant-param dtype. MLX's quantized gather_qmm tolerates that mismatch, so on
-    such a ValueError fall back rather than crash, from an opt-in flag, a model
-    the unfused path would have served. Warns once per process, not per token. A
-    genuine shape-contract bug raises AssertionError and is left to propagate.
+    """silu(gate_qmv(x)) * x_up via the fused kernel; on ValueError fall back to
+    the unfused gather_qmm + silu*x_up. gather_qmm tolerates the activation dtype
+    the fused kernel rejects, which can_fuse cannot pre-check at patch time. Warns
+    once.
     """
     gw = gate_proj["weight"]
     gs = gate_proj["scales"]
@@ -486,12 +479,8 @@ class FusedSwitchSwiGLU(nn.Module):
 
     def __init__(self, switch_mlp):
         super().__init__()
-        # Hold the SwitchGLU weakly. The patch helper assigns
-        # sw._path_b_call = FusedSwitchSwiGLU(sw).fused_forward, which would
-        # otherwise form a cycle (sw -> bound method -> self -> sw). Proxy
-        # access is transparent for the gate_proj / up_proj / down_proj
-        # reads in fused_forward, and sw is always alive while __call__
-        # dispatches into the bound method.
+        # Weak ref: sw stores the bound fused_forward, so a strong ref here would
+        # cycle (sw -> method -> self -> sw). sw outlives every call into it.
         self._switch_mlp = weakref.proxy(switch_mlp)
 
     def fused_forward(self, x, indices):
@@ -506,19 +495,15 @@ class FusedSwitchSwiGLU(nn.Module):
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
 
-        # Up projection: unchanged.
         x_up = sw.up_proj(x, idx, sorted_indices=do_sort)
 
-        # Gate projection + silu + multiply, fused into one kernel. Common
-        # (unsorted/decode) path first. x and x_up already carry the right
-        # shapes for both paths; only the index shape differs.
+        # Common (unsorted/decode) path first; x and x_up are already shaped for
+        # both, only the gate index differs.
         if not do_sort:
-            # Unsorted: x is (..., 1, 1, K), idx is (..., TOPK).
             gate_idx = idx
         else:
-            # Sorted: _gather_sort folded the top_k axis into M_tok, so x is
-            # (M_tok, 1, 1, K), x_up is (M_tok, 1, 1, N), and each row is a
-            # (token, expert) pair — reshape idx to (M_tok, 1) (TOPK=1).
+            # _gather_sort folded top_k into M_tok, so each row is a
+            # (token, expert) pair: reshape idx to (M_tok, 1) (TOPK=1).
             gate_idx = idx.reshape(-1, 1)
         swiglu = _fused_gate_or_fallback(
             sw.gate_proj, x, gate_idx, x_up, sorted_indices=do_sort
@@ -562,13 +547,14 @@ def patch_switch_glu_with_fused_swiglu(model) -> int:
         top_k = getattr(mlp, "top_k", None)
         if top_k is not None:
             _aot_warm_kernel(sw, int(top_k))
-        # Per-instance override of __call__ via a one-off subclass. Python
-        # looks up __call__ on the type, so attribute assignment on the
-        # instance won't take effect — we swap sw.__class__ to a subclass
-        # whose __call__ dispatches to the bound wrapper. Cache the subclass
-        # on the exact class (cls.__dict__, not hasattr, which walks the MRO)
-        # so a SwitchGLU subclass gets its own entry instead of inheriting the
-        # base's — otherwise its instances would be downcast to the base class.
+        # One-off SwitchGLU subclass rather than rewriting up_proj/gate_proj: the
+        # activation fusion folds silu(gate)*x_up into the gate matmul, which has
+        # to intercept the forward (the projection level can't express it).
+        # can_fuse declines a non-stock __call__, so a customized forward falls
+        # back unpatched. Python resolves __call__ on the type, so swap
+        # sw.__class__ to a subclass; cache it on the exact class (cls.__dict__,
+        # not hasattr which walks the MRO) so a SwitchGLU subclass gets its own
+        # entry instead of being downcast to the base.
         sw._path_b_call = FusedSwitchSwiGLU(sw).fused_forward
         cls = type(sw)
         if "_PathBSubclass" not in cls.__dict__:

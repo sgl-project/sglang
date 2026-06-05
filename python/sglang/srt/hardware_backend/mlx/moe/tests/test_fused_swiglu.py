@@ -117,13 +117,8 @@ def test_patched_switchglu_matches_unpatched():
         assert rel < 5e-2, f"full forward {label}: max_abs={max_abs:.3e} rel={rel:.2%}"
 
 
-# ---------------------------------------------------------------------------
-# Learned-bias fallback (synthetic, no model). Guards the regression where a
-# gate_proj carrying a learned per-expert bias gets fused: the kernel recomputes
-# the gate matmul and has no slot for the bias QuantizedSwitchLinear adds after
-# the matmul, so it would silently compute silu(gate_without_bias) * x_up.
-# can_fuse must exclude such a gate and the patch must leave it unfused.
-# ---------------------------------------------------------------------------
+# Learned-bias fallback (synthetic, no model): a gate with a learned bias must
+# not fuse, since the kernel has no slot for the bias added after the matmul.
 def _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias):
     """Small quantized SwitchGLU; gate carries a learned bias iff gate_bias.
 
@@ -187,11 +182,8 @@ def test_patch_falls_back_on_gate_bias():
     assert diff == 0.0, f"forward changed after (no-op) patch: max|delta|={diff:.3e}"
 
 
-# ---------------------------------------------------------------------------
-# Model-free numerical equivalence + non-stock-forward guard (synthetic, no
-# model). Gives the kernel's central correctness claim a check that runs on any
-# MLX-present machine without a model download (skips where Metal is absent).
-# ---------------------------------------------------------------------------
+# Model-free numerical equivalence + non-stock-forward guard: the central
+# correctness check, runs without a model download (skips where Metal is absent).
 def test_fused_matches_unfused_synthetic():
     """Synthetic quantized gate weights: fused kernel vs the unfused
     gather_qmm + silu*x_up path, within the kernel's bf16 bound, plus finiteness."""
