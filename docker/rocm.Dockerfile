@@ -278,6 +278,18 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
     fi
 
 # -----------------------
+# FlyDSL
+RUN apt update && apt install -y ninja-build patchelf cmake \
+    && git clone https://github.com/ROCm/FlyDSL.git --branch v0.1.8
+RUN cd FlyDSL \
+    && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
+    && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
+    && bash -lc 'source /opt/venv/bin/activate \
+      && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
+      && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
+      && pip install -e .;'
+
+# -----------------------
 # AITER
 # Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
