@@ -136,6 +136,8 @@ class HiRadixCache(RadixCache):
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
+                enable_metrics=self._enable_metrics_flag,
+                extra_metric_labels=self.extra_metric_labels,
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
