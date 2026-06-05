@@ -482,6 +482,28 @@ def test_causal_kv_cache_update_tail_replacement_keeps_sink_without_roll():
     assert cache.v.flatten().tolist() == [10.0, 20.0, 30.0, 70.0, 80.0, 90.0]
 
 
+def test_lingbot_update_cache_only_kv_projection_matches_fused_qkv_tail():
+    from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+        CausalLingBotWorldTransformerBlock,
+    )
+
+    block = CausalLingBotWorldTransformerBlock.__new__(
+        CausalLingBotWorldTransformerBlock
+    )
+    torch.nn.Module.__init__(block)
+    block._fused_qkv_weight = torch.nn.Parameter(
+        torch.randn(12, 4), requires_grad=False
+    )
+    block._fused_qkv_bias = torch.nn.Parameter(torch.randn(12), requires_grad=False)
+
+    hidden_states = torch.randn(2, 5, 4)
+    _, expected_key, expected_value = block._project_qkv(hidden_states)
+    key, value = block._project_kv(hidden_states)
+
+    torch.testing.assert_close(key, expected_key)
+    torch.testing.assert_close(value, expected_value)
+
+
 def test_causal_kv_cache_update_grows_without_rolling_when_enabled():
     cache = CausalSelfAttentionKVCache(
         k=torch.zeros(1, 2, 1, 1),
