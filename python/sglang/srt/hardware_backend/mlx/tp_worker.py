@@ -98,7 +98,7 @@ class MlxTpModelWorker(TpModelWorker):
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
-        skip_attn_backend_init=False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
