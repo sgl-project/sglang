@@ -38,7 +38,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
-    qwen3_apply_rotary_pos_emb,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
