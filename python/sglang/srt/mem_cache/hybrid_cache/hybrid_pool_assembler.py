@@ -284,7 +284,6 @@ def build_deepseek_v4_hicache_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    # TODO(hzh0425): Support PP for deepseek v4 with hicache
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
     swa_layer_mapping = {
@@ -377,7 +376,7 @@ def build_deepseek_v4_hicache_stack(
         c4_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
             state_pools=[
-                kvcache.compress_state_pools[layer_id]
+                kvcache.compress_state_pools[layer_id + kvcache.start_layer]
                 for layer_id in c4_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
@@ -388,7 +387,7 @@ def build_deepseek_v4_hicache_stack(
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
             state_pools=[
-                kvcache.indexer_compress_state_pools[layer_id]
+                kvcache.indexer_compress_state_pools[layer_id + kvcache.start_layer]
                 for layer_id in c4_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
@@ -439,8 +438,6 @@ def build_deepseek_v4_hicache_stack(
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
-        # C128 state pool is intentionally not registered with hicache.
-        # page_size=256 % 128 == 0, so state pool is not consumed on load.
         entries.extend(
             [
                 build_pool_entry(
