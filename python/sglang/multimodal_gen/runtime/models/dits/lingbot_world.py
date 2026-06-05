@@ -118,6 +118,32 @@ def _record_lingbot_context_block_profile(
     stage_name, start_time = profile_state
     forward_batch.metrics.record_stage(stage_name, time.perf_counter() - start_time)
 
+
+def _profile_lingbot_context_section(
+    stage_name: str,
+    hidden_states: torch.Tensor,
+    forward_context,
+):
+    if not stage_name or forward_context.current_timestep >= 0:
+        return None
+    return _profile_lingbot_context_block(
+        stage_name,
+        hidden_states,
+        forward_context.forward_batch,
+    )
+
+
+def _record_lingbot_context_section_profile(
+    profile_state,
+    hidden_states: torch.Tensor,
+    forward_context,
+) -> None:
+    _record_lingbot_context_block_profile(
+        profile_state,
+        hidden_states,
+        forward_context.forward_batch,
+    )
+
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
@@ -871,6 +897,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
         self._fused_qkv_bias = None
+        self._profile_index = -1
 
     def _can_fuse_qkv_projection(self) -> bool:
         if self._fused_qkv_weight is not None:
@@ -1020,11 +1047,25 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         cam_conditioner_scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
         update_cache_only: bool = False,
     ) -> torch.Tensor:
+        forward_context = get_forward_context()
+        block_prefix = None
+        if (
+            os.environ.get("SGLANG_DIFFUSION_PROFILE_LINGBOT_SECTIONS", "0") == "1"
+            and forward_context.current_timestep < 0
+        ):
+            block_prefix = f"LingBotTransformer.context.block{self._profile_index:02d}"
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         num_frames = temb.shape[1]
         seqlen_per_frame = hidden_states.shape[1] // num_frames
         orig_dtype = hidden_states.dtype
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.qkv",
+                hidden_states,
+                forward_context,
+            )
         e = self.scale_shift_table + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
             6, dim=2
@@ -1046,7 +1087,18 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
 
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.self_attn_kv",
+                hidden_states,
+                forward_context,
+            )
         attn_output = self.attn1(
             query,
             key,
@@ -1058,8 +1110,19 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             cache_start,
             update_cache_only=update_cache_only,
         )
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
         if update_cache_only:
             return hidden_states
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.self_out_norm",
+                hidden_states,
+                forward_context,
+            )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -1070,6 +1133,17 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, residual_zero, residual_zero
         )
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.cam_conditioner",
+                hidden_states,
+                forward_context,
+            )
         hidden_states = self.cam_conditioner(
             hidden_states.to(orig_dtype),
             c2ws_plucker_emb,
@@ -1079,20 +1153,68 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
                 else self._cam_conditioner_scale_shift(c2ws_plucker_emb)
             ),
         )
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.cross_norm",
+                hidden_states,
+                forward_context,
+            )
         norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
             orig_dtype
         )
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
 
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.cross_attn",
+                hidden_states,
+                forward_context,
+            )
         attn_output = self._cross_attn_with_cache(
             norm_hidden_states, encoder_hidden_states, crossattn_cache
         )
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.cross_out_norm",
+                hidden_states,
+                forward_context,
+            )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
+        section_profile = None
+        if block_prefix is not None:
+            section_profile = _profile_lingbot_context_section(
+                f"{block_prefix}.ffn",
+                hidden_states,
+                forward_context,
+            )
         ff_output = self.ffn(norm_hidden_states.to(orig_dtype))
         hidden_states = self.mlp_residual(
             ff_output, c_gate_msa, hidden_states.to(orig_dtype)
         )
+        if block_prefix is not None:
+            _record_lingbot_context_section_profile(
+                section_profile, hidden_states, forward_context
+            )
         return hidden_states.to(orig_dtype)
 
 
@@ -1151,6 +1273,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 for i in range(config.num_layers)
             ]
         )
+        for block_index, block in enumerate(self.blocks):
+            block._profile_index = block_index
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
