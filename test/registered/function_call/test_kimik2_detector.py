@@ -183,6 +183,15 @@ class TestKimiK2DetectorHyphenatedNames(unittest.TestCase):
 class TestKimiK2DetectorStreaming(unittest.TestCase):
     """Streaming incremental parsing tests for KimiK2Detector."""
 
+    def test_streaming_trailing_literal_left_angle_is_not_dropped(self):
+        """A final literal '<' must remain in normal_text instead of being buffered away."""
+        detector = KimiK2FuncDetector()
+
+        result = detector.parse_streaming_increment("normal text <", [])
+
+        self.assertEqual(result.normal_text, "normal text <")
+        self.assertEqual(detector._buffer, "")
+
     def setUp(self):
         self.tools = [
             _make_tool("ReadFile"),
@@ -1003,18 +1012,20 @@ class TestKimiK2EndToEnd(unittest.TestCase):
             "<|tool_calls_section_end|>"
         ]
 
-        # Force an exception on the SECOND drain iteration by making
-        # ``_parse_tool_call_id`` raise the second time it is invoked.
+        # Force an exception on the SECOND resolution step by making
+        # ``_resolve_function_name`` raise the second time it is invoked.
         call_count = {"n": 0}
-        real_parse = tc_det._parse_tool_call_id
+        real_resolve = tc_det._resolve_function_name
 
-        def flaky_parse(function_id, tools, function_args=None):
+        def flaky_resolve(function_id, tools, function_args=None):
             call_count["n"] += 1
             if call_count["n"] >= 2:
                 raise RuntimeError("forced mid-drain failure")
-            return real_parse(function_id, tools, function_args)
+            return real_resolve(function_id, tools, function_args)
 
-        with mock.patch.object(tc_det, "_parse_tool_call_id", side_effect=flaky_parse):
+        with mock.patch.object(
+            tc_det, "_resolve_function_name", side_effect=flaky_resolve
+        ):
             tool_calls, all_content = _collect_streaming_tool_calls(
                 tc_det, chunks, self.tools
             )
