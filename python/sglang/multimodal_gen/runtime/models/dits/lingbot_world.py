@@ -941,6 +941,11 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
 
         forward_batch = forward_context.forward_batch
+        if not CausalLingBotWorldTransformer3DModel._should_cache_cam_conditioner(
+            forward_batch
+        ):
+            return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
+
         cache = CausalLingBotWorldTransformer3DModel._get_request_cache(
             forward_batch, "lingbot_cam_conditioner"
         )
@@ -1189,6 +1194,12 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         return extra.setdefault(name, {})
 
     @staticmethod
+    def _should_cache_cam_conditioner(forward_batch) -> bool:
+        return forward_batch is not None and getattr(
+            forward_batch, "enable_sequence_shard", False
+        )
+
+    @staticmethod
     def _all_crossattn_caches_initialized(
         crossattn_cache: list[CrossAttentionKVCache] | None,
     ) -> bool:
@@ -1353,6 +1364,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
 
         forward_context = get_forward_context()
         if forward_context.current_timestep < 0:
+            return None
+
+        if not self._should_cache_cam_conditioner(forward_batch):
             return None
 
         cache = self._get_request_cache(forward_batch, "lingbot_cam_conditioner")
