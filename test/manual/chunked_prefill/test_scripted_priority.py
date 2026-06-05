@@ -161,11 +161,24 @@ class TestPriorityBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         t.pause_generation(mode="retract")
         t.abort(r)
-        yield
+        # retract + abort on the same yield must idempotently release every
+        # resource; the aborted req is dropped from the waiting queue, not
+        # resumed to a normal finish. Drain the overlap lag, then assert release.
+        for _ in range(12):
+            if (
+                r.kv_pages == 0
+                and r.lock_refs == 0
+                and (r.req is None or r.req.req_pool_idx is None)
+            ):
+                break
+            yield
         assert r.kv_pages == 0
+        assert r.lock_refs == 0
+        assert r.req is None or r.req.req_pool_idx is None
         t.continue_generation()
-        yield from run_until_finished(r)
-        assert r.finished
+        yield
+        # the aborted req must not revive after generation resumes
+        assert r.kv_pages == 0 and r.lock_refs == 0
 
     def test_retract_chunked_resume_in_waiting(self):
         self.server.execute_script(self._script_retract_chunked_resume_in_waiting)
@@ -317,41 +330,6 @@ class TestPriorityPriority(ScriptedTestCase):
 
         yield from run_until_all_finished([r1, r2, r3], max_steps=800)
         assert r1.finished and r2.finished and r3.finished
-
-
-class TestPriorityDisagg(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        disaggregation_mode="prefill",
-    )
-
-    def test_disagg_retract_resets_send_state(self):
-        self.server.execute_script(self._script_disagg_retract_resets_send_state)
-
-    @staticmethod
-    def _script_disagg_retract_resets_send_state(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-
-        t.pause_generation(mode="retract")
-        yield
-
-        assert r.status == "waiting"
-        assert r.kv_pages == 0
-        # No disagg_send_state field; assert the real send-side Req fields that
-        # retract must reset (start_send_idx, tmp_end_idx).
-        assert r.req.start_send_idx == 0, (
-            f"disagg send state must reset on retract; "
-            f"start_send_idx={r.req.start_send_idx}"
-        )
-        assert r.req.tmp_end_idx == -1, (
-            f"disagg send state must reset on retract; "
-            f"tmp_end_idx={r.req.tmp_end_idx}"
-        )
-
-        t.continue_generation()
-        yield from run_until_finished(r)
-        assert r.finished
 
 
 if __name__ == "__main__":

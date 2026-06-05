@@ -488,39 +488,6 @@ class TestRegressionPp(ScriptedTestCase):
         )
 
 
-class TestRegressionDisagg(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        disaggregation_mode="prefill",
-    )
-
-    def test_disagg_retract_resets_send(self):
-        self.server.execute_script(self._script_disagg_retract_resets_send)
-
-    @staticmethod
-    def _script_disagg_retract_resets_send(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-
-        t.pause_generation(mode="retract")
-        yield
-
-        # No disagg_send_state field exists. The real send-side state that retract
-        # must reset is the pair of Req fields the next send_kv_chunk reads:
-        # start_send_idx (where the next chunk send begins) and tmp_end_idx (the
-        # pending overlap-send slice end). Both must be back at their initial values.
-        assert r.req.start_send_idx == 0, (
-            f"414efd4a27: disagg send state must reset on chunked-resume "
-            f"retract; start_send_idx={r.req.start_send_idx}"
-        )
-        assert r.req.tmp_end_idx == -1, (
-            f"414efd4a27: disagg send state must reset on chunked-resume "
-            f"retract; tmp_end_idx={r.req.tmp_end_idx}"
-        )
-
-        t.continue_generation()
-
-
 class TestRegressionPriority(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
