@@ -2783,7 +2783,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if not self.is_generation:
                 kwargs["get_embedding"] = True
 
-            logits_output_or_pp_proxy_tensors = self.model.forward(
+            logits_output_or_pp_proxy_tensors = self.model(
                 buffers.input_ids,
                 forward_batch.positions,
                 forward_batch,
@@ -3104,7 +3104,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         def _do_forward():
-            return self.model.forward(
+            return self.model(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
@@ -3178,7 +3178,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            ret = self.model.forward(
+            ret = self.model(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
@@ -3210,7 +3210,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            return self.model.forward(
+            return self.model(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
