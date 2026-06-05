@@ -103,8 +103,7 @@ class TestScriptedCore(ScriptedTestCase):
                 yield
                 req = r.req
                 assert (
-                    req is not None
-                    and len(req.output_ids) == output_tokens_after_pause
+                    req is not None and len(req.output_ids) == output_tokens_after_pause
                 ), (
                     f"stage={stage}: paused engine advanced the req "
                     f"({len(req.output_ids) if req is not None else None} output "
