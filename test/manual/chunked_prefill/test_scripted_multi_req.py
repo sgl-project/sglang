@@ -526,17 +526,6 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
             f"got {long_req.chunks_done}"
         )
 
-
-class TestMultiReqMixedChunk(ScriptedTestCase):
-    # Default v1 scheduling runs chunk batches back-to-back and starves decode
-    # until the prefill completes; co-running decode WITH an in-flight chunked
-    # prefill is exactly what --enable-mixed-chunk provides, so the coexistence
-    # test runs on a mixed-chunk engine.
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        enable_mixed_chunk=True,
-    )
-
     def test_chunked_plus_decode_in_batch(self):
         self.server.execute_script(self._script_chunked_plus_decode_in_batch)
 
