@@ -24,37 +24,42 @@ from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType, get_module_role
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    Qwen3VLTextRotaryEmbedding,
-    qwen3_apply_rotary_pos_emb,
-)
-from sglang.multimodal_gen.runtime.layers.weight_only_fp8 import (
+from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     FP8_WEIGHT_DTYPE,
     WeightOnlyFP8Linear,
     dequantize_rowwise_fp8_weight,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import (
-    load_model_from_full_model_state_dict,
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    Qwen3VLTextRotaryEmbedding,
+    qwen3_apply_rotary_pos_emb,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
     _server_args_for_transformer_component,
 )
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    load_model_from_full_model_state_dict,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ideogram import (
     Ideogram4Transformer2DModel,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
     IdeogramQwen3VLTextEncoder,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ideogram import (
     IMAGE_POSITION_OFFSET,
     LLM_TOKEN_INDICATOR,
     OUTPUT_IMAGE_INDICATOR,
-    Ideogram4DenoisingStage,
     Ideogram4DecodingStage,
+    Ideogram4DenoisingStage,
     Ideogram4TextEncodingStage,
     make_step_intervals,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
@@ -95,6 +100,28 @@ class FakeIdeogramTransformer(torch.nn.Module):
 class FakeIdeogramVAE(torch.nn.Module):
     def decode(self, z):
         return z[:, :3]
+
+
+class FakeIdeogramPipeline:
+    def __init__(self, transformer, unconditional_transformer):
+        self.modules = {
+            "transformer": transformer,
+            "unconditional_transformer": unconditional_transformer,
+        }
+
+
+def _fake_server_args(cfg=None):
+    return SimpleNamespace(
+        pipeline_config=cfg or Ideogram4PipelineConfig(),
+        comfyui_mode=False,
+        enable_torch_compile=False,
+        attention_backend="torch_sdpa",
+        enable_layerwise_nvtx_marker=False,
+    )
+
+
+def _fake_ideogram_pipeline(transformer, unconditional_transformer):
+    return FakeIdeogramPipeline(transformer, unconditional_transformer)
 
 
 class TestIdeogram4(unittest.TestCase):
@@ -286,11 +313,17 @@ class TestIdeogram4(unittest.TestCase):
 
         prev_args = server_args_module._global_server_args
         try:
-            set_global_server_args(SimpleNamespace(comfyui_mode=False))
+            set_global_server_args(_fake_server_args())
+            transformer = FakeIdeogramTransformer()
+            unconditional_transformer = FakeIdeogramTransformer()
             stage = Ideogram4DenoisingStage(
-                transformer=None, unconditional_transformer=None
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=_fake_ideogram_pipeline(
+                    transformer, unconditional_transformer
+                ),
             )
-            uses = stage.component_uses(SimpleNamespace(), "stage")
+            uses = stage.component_uses(_fake_server_args(), "stage")
         finally:
             set_global_server_args(prev_args)
         self.assertEqual(
@@ -301,6 +334,195 @@ class TestIdeogram4(unittest.TestCase):
             ],
         )
         self.assertTrue(all(use.target_dtype is None for use in uses))
+
+    def test_ideogram_stages_inherit_common_stage_bases(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(_fake_server_args())
+            text_stage = Ideogram4TextEncodingStage(
+                text_encoder=None, tokenizer=DummyTokenizer()
+            )
+            denoising_stage = Ideogram4DenoisingStage(
+                transformer=FakeIdeogramTransformer(),
+                unconditional_transformer=FakeIdeogramTransformer(),
+            )
+        finally:
+            set_global_server_args(prev_args)
+        self.assertIsInstance(text_stage, TextEncodingStage)
+        self.assertIsInstance(denoising_stage, DenoisingStage)
+
+    def test_ideogram_text_encoding_dedup_fingerprint_and_extra_copy(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        cfg = Ideogram4PipelineConfig()
+        args = _fake_server_args(cfg)
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(args)
+            stage = Ideogram4TextEncodingStage(
+                text_encoder=None, tokenizer=DummyTokenizer()
+            )
+        finally:
+            set_global_server_args(prev_args)
+        base = Req(
+            sampling_params=Ideogram4SamplingParams(
+                prompt="11 12",
+                height=256,
+                width=256,
+                num_outputs_per_prompt=1,
+            )
+        )
+        same = Req(
+            sampling_params=Ideogram4SamplingParams(
+                prompt="11 12",
+                height=256,
+                width=256,
+                num_outputs_per_prompt=1,
+            )
+        )
+        different_height = Req(
+            sampling_params=Ideogram4SamplingParams(
+                prompt="11 12",
+                height=512,
+                width=256,
+                num_outputs_per_prompt=1,
+            )
+        )
+        different_width = Req(
+            sampling_params=Ideogram4SamplingParams(
+                prompt="11 12",
+                height=256,
+                width=512,
+                num_outputs_per_prompt=1,
+            )
+        )
+        different_outputs = Req(
+            sampling_params=Ideogram4SamplingParams(
+                prompt="11 12",
+                height=256,
+                width=256,
+                num_outputs_per_prompt=2,
+            )
+        )
+
+        base_fingerprint = stage.build_dedup_fingerprint(base, args)
+        self.assertEqual(base_fingerprint, stage.build_dedup_fingerprint(same, args))
+        self.assertNotEqual(
+            base_fingerprint, stage.build_dedup_fingerprint(different_height, args)
+        )
+        self.assertNotEqual(
+            base_fingerprint, stage.build_dedup_fingerprint(different_width, args)
+        )
+        self.assertNotEqual(
+            base_fingerprint, stage.build_dedup_fingerprint(different_outputs, args)
+        )
+
+        base.prompt_embeds = [torch.tensor([1.0])]
+        base.prompt_embeds_mask = [torch.tensor([True])]
+        base.extra["ideogram4"] = {
+            "position_ids": torch.tensor([[1]]),
+            "metadata": {"grid_h": 16},
+        }
+        stage.copy_deduplicated_outputs(base, same)
+
+        self.assertIn("ideogram4", same.extra)
+        self.assertTrue(
+            torch.equal(
+                same.extra["ideogram4"]["position_ids"],
+                base.extra["ideogram4"]["position_ids"],
+            )
+        )
+        self.assertIsNot(
+            same.extra["ideogram4"]["position_ids"],
+            base.extra["ideogram4"]["position_ids"],
+        )
+
+    def test_ideogram_text_encoding_verifies_custom_outputs(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        args = _fake_server_args()
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(args)
+            stage = Ideogram4TextEncodingStage(
+                text_encoder=None, tokenizer=DummyTokenizer()
+            )
+        finally:
+            set_global_server_args(prev_args)
+
+        batch = Req(
+            sampling_params=Ideogram4SamplingParams(
+                prompt="11 12",
+                height=256,
+                width=256,
+                num_outputs_per_prompt=1,
+            )
+        )
+        self.assertTrue(stage.verify_input(batch, args).is_valid())
+
+        batch.do_classifier_free_guidance = True
+        batch.negative_prompt = []
+        batch.negative_prompt_embeds = []
+        batch.prompt_embeds = [torch.zeros(1, 4, 8)]
+        batch.prompt_embeds_mask = [torch.ones(1, 4, dtype=torch.bool)]
+        batch.extra["ideogram4"] = {"position_ids": torch.zeros(1, 4, 3)}
+
+        self.assertTrue(stage.verify_output(batch, args).is_valid())
+
+    def test_ideogram_denoising_component_names_from_pipeline_modules(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        transformer = FakeIdeogramTransformer()
+        unconditional_transformer = FakeIdeogramTransformer()
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(_fake_server_args())
+            stage = Ideogram4DenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=_fake_ideogram_pipeline(
+                    transformer, unconditional_transformer
+                ),
+            )
+            uses = stage.component_uses(_fake_server_args(), "stage")
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertEqual(
+            [use.component_name for use in uses],
+            ["transformer", "unconditional_transformer"],
+        )
+
+    def test_ideogram_attention_backend_is_passed_from_config(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        config = Ideogram4DiTConfig()
+        self.assertEqual(
+            config.arch_config._supported_attention_backends,
+            {AttentionBackendEnum.TORCH_SDPA},
+        )
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(_fake_server_args())
+            with patch(
+                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                return_value=1,
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(config, {})
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertEqual(
+            model.supported_attention_backends,
+            config.arch_config._supported_attention_backends,
+        )
+        self.assertEqual(
+            model.layers[0].attention.attn.backend,
+            AttentionBackendEnum.TORCH_SDPA,
+        )
 
     def test_ideogram_dit_meta_state_dict_matches_checkpoint_shapes(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
@@ -423,14 +645,19 @@ class TestIdeogram4(unittest.TestCase):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         cfg = Ideogram4PipelineConfig()
-        args = SimpleNamespace(pipeline_config=cfg, comfyui_mode=False)
+        args = _fake_server_args(cfg)
         device = get_local_torch_device()
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(args)
+            transformer = FakeIdeogramTransformer()
+            unconditional_transformer = FakeIdeogramTransformer()
             denoise_stage = Ideogram4DenoisingStage(
-                transformer=FakeIdeogramTransformer(),
-                unconditional_transformer=FakeIdeogramTransformer(),
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=_fake_ideogram_pipeline(
+                    transformer, unconditional_transformer
+                ),
             )
             decode_stage = Ideogram4DecodingStage(vae=FakeIdeogramVAE())
             batch = SimpleNamespace(

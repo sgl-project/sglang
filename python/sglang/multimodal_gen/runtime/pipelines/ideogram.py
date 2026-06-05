@@ -44,6 +44,7 @@ class Ideogram4Pipeline(LoRAPipeline, ComposedPipelineBase):
             lambda: Ideogram4DenoisingStage(
                 transformer=self.get_module("transformer"),
                 unconditional_transformer=self.get_module("unconditional_transformer"),
+                pipeline=self,
             ),
             "ideogram4_denoising_stage",
         )

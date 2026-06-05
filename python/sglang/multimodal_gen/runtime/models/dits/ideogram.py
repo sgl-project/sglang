@@ -9,13 +9,14 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
+    WeightOnlyFP8Linear,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
     qwen3_apply_rotary_pos_emb,
 )
-from sglang.multimodal_gen.runtime.layers.weight_only_fp8 import WeightOnlyFP8Linear
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
@@ -36,7 +37,13 @@ def _linear(in_features: int, out_features: int, bias: bool = True):
 
 
 class Ideogram4Attention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, eps: float) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        eps: float,
+        supported_attention_backends,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -50,7 +57,7 @@ class Ideogram4Attention(nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends={AttentionBackendEnum.TORCH_SDPA},
+            supported_attention_backends=supported_attention_backends,
         )
         self.o = _linear(hidden_size, hidden_size, bias=False)
 
@@ -80,9 +87,22 @@ class Ideogram4MLP(nn.Module):
 
 
 class Ideogram4TransformerBlock(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, num_heads, norm_eps, adaln_dim):
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        num_heads,
+        norm_eps,
+        adaln_dim,
+        supported_attention_backends,
+    ):
         super().__init__()
-        self.attention = Ideogram4Attention(hidden_size, num_heads, eps=1e-5)
+        self.attention = Ideogram4Attention(
+            hidden_size,
+            num_heads,
+            eps=1e-5,
+            supported_attention_backends=supported_attention_backends,
+        )
         self.feed_forward = Ideogram4MLP(hidden_size, intermediate_size)
         self.attention_norm1 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.ffn_norm1 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
@@ -153,6 +173,9 @@ class Ideogram4Transformer2DModel(BaseDiT):
     _repeated_blocks = ["Ideogram4TransformerBlock"]
     _fsdp_shard_conditions = Ideogram4DiTConfig().arch_config._fsdp_shard_conditions
     _compile_conditions = Ideogram4DiTConfig().arch_config._compile_conditions
+    _supported_attention_backends = (
+        Ideogram4DiTConfig().arch_config._supported_attention_backends
+    )
     param_names_mapping = {}
     reverse_param_names_mapping = {}
     handles_checkpoint_quantization = True
@@ -165,6 +188,7 @@ class Ideogram4Transformer2DModel(BaseDiT):
     ) -> None:
         super().__init__(config, hf_config, **kwargs)
         cfg = config.arch_config
+        self._supported_attention_backends = cfg._supported_attention_backends
         hidden_size = cfg.num_attention_heads * cfg.attention_head_dim
         self.hidden_size = hidden_size
         self.num_attention_heads = cfg.num_attention_heads
@@ -188,6 +212,7 @@ class Ideogram4Transformer2DModel(BaseDiT):
                     num_heads=cfg.num_attention_heads,
                     norm_eps=cfg.norm_eps,
                     adaln_dim=cfg.adaln_dim,
+                    supported_attention_backends=self._supported_attention_backends,
                 )
                 for _ in range(cfg.num_layers)
             ]

@@ -10,7 +10,7 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
-from sglang.multimodal_gen.runtime.layers.weight_only_fp8 import (
+from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     swap_linears_to_weight_only_fp8,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader

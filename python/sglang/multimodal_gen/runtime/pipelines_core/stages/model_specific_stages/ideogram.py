@@ -5,20 +5,27 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.multimodal_gen.configs.sample.ideogram import IDEOGRAM4_PRESETS
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     LATENT_SCALE,
     LATENT_SHIFT,
 )
+from sglang.multimodal_gen.configs.sample.ideogram import IDEOGRAM4_PRESETS
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -49,6 +56,17 @@ class LogitNormalSchedule:
         return t_.clamp(t_min, t_max).to(torch.float32)
 
 
+@dataclass(frozen=True)
+class Ideogram4TextEncodingFingerprint:
+    prompt: object
+    height: int
+    width: int
+    num_outputs_per_prompt: int
+    max_text_tokens: int
+    patch_size: int
+    ae_scale_factor: int
+
+
 def get_schedule_for_resolution(image_resolution, known_mean: float, std: float):
     num_pixels = image_resolution[0] * image_resolution[1]
     known_pixels = 512 * 512
@@ -60,29 +78,20 @@ def make_step_intervals(num_steps: int) -> torch.Tensor:
     return torch.linspace(0.0, 1.0, num_steps + 1, dtype=torch.float32)
 
 
-class Ideogram4TextEncodingStage(PipelineStage):
-    def __init__(self, text_encoder, tokenizer) -> None:
-        super().__init__()
-        self.text_encoder = text_encoder
-        self.tokenizer = tokenizer
+class Ideogram4TextEncodingStage(TextEncodingStage):
+    deduplicated_extra_tensor_tree_output_keys = ("ideogram4",)
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [
-            ComponentUse(
-                stage_name=self._component_stage_name(stage_name),
-                component_name="text_encoder",
-                preferred_ready_after_request=True,
-            )
-        ]
+    def __init__(self, text_encoder, tokenizer) -> None:
+        super().__init__([text_encoder], [tokenizer])
 
     def _tokenize(self, prompt: str, max_text_tokens: int):
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-        text = self.tokenizer.apply_chat_template(
+        text = self.tokenizers[0].apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
         )
-        encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        encoded = self.tokenizers[0](
+            text, return_tensors="pt", add_special_tokens=False
+        )
         token_ids = encoded["input_ids"][0]
         num_text_tokens = int(token_ids.shape[0])
         if num_text_tokens > max_text_tokens:
@@ -160,7 +169,7 @@ class Ideogram4TextEncodingStage(PipelineStage):
             ]
         inputs = self._build_inputs(prompts, batch.height, batch.width, server_args)
         with self.use_declared_component(
-            component_name="text_encoder", module=self.text_encoder
+            component_name="text_encoder", module=self.text_encoders[0]
         ) as text_encoder:
             llm_features = text_encoder.encode_ideogram_features(
                 inputs["token_ids"],
@@ -175,27 +184,61 @@ class Ideogram4TextEncodingStage(PipelineStage):
         batch.extra["ideogram4"] = inputs
         return batch
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("prompt", batch.prompt, V.string_or_list_strings)
+        result.add_check("height", batch.height, V.positive_int)
+        result.add_check("width", batch.width, V.positive_int)
+        result.add_check(
+            "num_outputs_per_prompt", batch.num_outputs_per_prompt, V.positive_int
+        )
+        return result
 
-class Ideogram4DenoisingStage(PipelineStage):
-    @property
-    def role_affinity(self):
-        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check(
+            "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
+        )
+        result.add_check(
+            "prompt_embeds_mask",
+            batch.prompt_embeds_mask,
+            V.list_of_tensors_min_dims(2),
+        )
+        result.add_check(
+            "ideogram4_extra",
+            batch.extra.get("ideogram4"),
+            lambda x: isinstance(x, dict),
+        )
+        return result
 
-        return RoleType.DENOISER
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Ideogram4TextEncodingFingerprint:
+        cfg = server_args.pipeline_config
+        return Ideogram4TextEncodingFingerprint(
+            prompt=self.freeze_for_dedup(batch.prompt),
+            height=int(batch.height),
+            width=int(batch.width),
+            num_outputs_per_prompt=int(batch.num_outputs_per_prompt),
+            max_text_tokens=int(cfg.max_text_tokens),
+            patch_size=int(cfg.patch_size),
+            ae_scale_factor=int(cfg.ae_scale_factor),
+        )
 
-    def __init__(self, transformer, unconditional_transformer) -> None:
-        super().__init__()
-        self.transformer = transformer
-        self.unconditional_transformer = unconditional_transformer
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        stage_name = self._component_stage_name(stage_name)
-        return [
-            ComponentUse(stage_name, "transformer"),
-            ComponentUse(stage_name, "unconditional_transformer"),
-        ]
+class Ideogram4DenoisingStage(DenoisingStage):
+    def __init__(self, transformer, unconditional_transformer, pipeline=None) -> None:
+        super().__init__(
+            transformer=transformer,
+            scheduler=None,
+            transformer_2=unconditional_transformer,
+            pipeline=pipeline,
+        )
+
+    def _component_name_for_stage_module(self, module, default_name: str) -> str:
+        if default_name == "transformer_2":
+            return "unconditional_transformer"
+        return super()._component_name_for_stage_module(module, default_name)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         return VerificationResult()
@@ -252,7 +295,7 @@ class Ideogram4DenoisingStage(PipelineStage):
             ) as transformer,
             self.use_declared_component(
                 component_name="unconditional_transformer",
-                module=self.unconditional_transformer,
+                module=self.transformer_2,
             ) as unconditional_transformer,
         ):
             for i in self.progress_bar(
