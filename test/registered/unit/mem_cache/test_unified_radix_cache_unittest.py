@@ -2070,7 +2070,9 @@ class UnifiedRadixCacheSuite:
                 cache_controller, "get_pipeline_model_parallel_rank", return_value=0
             )
             pp_size_patcher = mock.patch.object(
-                cache_controller, "get_pipeline_model_parallel_world_size", return_value=1
+                cache_controller,
+                "get_pipeline_model_parallel_world_size",
+                return_value=1,
             )
             tp_rank_patcher.start()
             tp_size_patcher.start()
