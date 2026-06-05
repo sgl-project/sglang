@@ -13,7 +13,10 @@ import triton
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -116,7 +119,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 dtype=torch.int32,
                 device=forward_batch.seq_lens.device,
             )
-            create_flashmla_kv_indices_triton[(bs,)](
+            create_flashmla_kv_indices_triton[
+                (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+            ](
                 self.req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -147,7 +152,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
-            create_flashmla_kv_indices_triton[(bs,)](
+            create_flashmla_kv_indices_triton[
+                (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+            ](
                 self.req_to_token,
                 forward_batch.req_pool_indices,
                 seq_lens,
@@ -233,7 +240,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             max_seqlen_pad = triton.cdiv(seq_max, PAGE_SIZE)
 
-            create_flashmla_kv_indices_triton[(bs,)](
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+                    ),
+                )
+            ](
                 self.req_to_token,
                 req_pool_indices[:bs],
                 seq_lens,
