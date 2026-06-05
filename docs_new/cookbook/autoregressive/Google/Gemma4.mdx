@@ -67,11 +67,14 @@ Gemma 4 is Google's next-generation family of open models, building on the Gemma
 
 ## 2. SGLang Installation
 
-Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main:
+Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main. Install it together with the matching transformers commit:
 
 ```bash Command
 # Install SGLang from main
 pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+
+# Install transformers with Gemma 4 support (encoder-free unified family included)
+pip install 'git+https://github.com/huggingface/transformers.git@1423d22f7a3b62e8c70ad67b58ec25cd9b675897'
 ```
 
 ### Docker (prebuilt dev image)
