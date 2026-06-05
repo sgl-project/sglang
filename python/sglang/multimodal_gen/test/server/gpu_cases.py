@@ -18,6 +18,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
+    IDEOGRAM4_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
@@ -94,6 +95,16 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "ideogram4_fp8_t2i",
+        DiffusionServerArgs(
+            model_path="ideogram-ai/ideogram-4-fp8",
+        ),
+        IDEOGRAM4_CI_sampling_params,
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
