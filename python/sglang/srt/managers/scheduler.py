@@ -2379,7 +2379,7 @@ class Scheduler(
 
         batch.req_pool_indices_cpu = torch.tensor(
             [r.req_pool_idx for r in reqs], dtype=torch.int64
-        )
+        ).pin_memory()
         batch.req_pool_indices = batch.req_pool_indices_cpu.to(
             device=device, non_blocking=True
         )
