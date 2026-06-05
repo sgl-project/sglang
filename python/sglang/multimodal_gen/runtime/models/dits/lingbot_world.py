@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
+import time
 from functools import lru_cache
 from typing import Any
 
@@ -86,6 +88,35 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+
+def _profile_lingbot_context_block(
+    stage_name: str,
+    hidden_states: torch.Tensor,
+    forward_batch,
+):
+    if (
+        os.environ.get("SGLANG_DIFFUSION_PROFILE_LINGBOT_BLOCKS", "0") != "1"
+        or forward_batch is None
+        or getattr(forward_batch, "metrics", None) is None
+    ):
+        return None
+    if hidden_states.is_cuda:
+        torch.cuda.synchronize(hidden_states.device)
+    return stage_name, time.perf_counter()
+
+
+def _record_lingbot_context_block_profile(
+    profile_state,
+    hidden_states: torch.Tensor,
+    forward_batch,
+) -> None:
+    if profile_state is None:
+        return
+    if hidden_states.is_cuda:
+        torch.cuda.synchronize(hidden_states.device)
+    stage_name, start_time = profile_state
+    forward_batch.metrics.record_stage(stage_name, time.perf_counter() - start_time)
 
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -1416,7 +1447,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         c2ws_plucker_emb: torch.Tensor | None = None,
         skip_final_projection: bool = False,
     ) -> torch.Tensor:
-        forward_batch = get_forward_context().forward_batch
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
         sequence_shard_enabled = (
             forward_batch is not None
             and getattr(forward_batch, "enable_sequence_shard", False)
@@ -1514,6 +1546,13 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         )
 
         for block_index, block in enumerate(self.blocks):
+            block_profile = None
+            if forward_context.current_timestep < 0:
+                block_profile = _profile_lingbot_context_block(
+                    f"LingBotTransformer.context.f{start_frame}.block{block_index:02d}",
+                    hidden_states,
+                    forward_batch,
+                )
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -1532,6 +1571,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 ),
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
+            )
+            _record_lingbot_context_block_profile(
+                block_profile, hidden_states, forward_batch
             )
 
         if skip_final_projection:
