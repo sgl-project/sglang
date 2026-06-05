@@ -39,6 +39,8 @@ class SpeculativeAlgorithm(Enum):
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
+    PEAGLE = auto()
+    PEAGLE_DSL = auto()
 
     @classmethod
     def from_string(
@@ -94,14 +96,20 @@ class SpeculativeAlgorithm(Enum):
     def is_eagle(self) -> bool:
         # FIXME(kpham_sgl): Remove FROZEN_KV_MTP here once we
         # have established support for it in the scheduler.
+        # P-EAGLE variants share EAGLE-3's draft-head infrastructure.
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.FROZEN_KV_MTP,
+            SpeculativeAlgorithm.PEAGLE,
+            SpeculativeAlgorithm.PEAGLE_DSL,
         )
 
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
+
+    def is_peagle(self) -> bool:
+        return self in (SpeculativeAlgorithm.PEAGLE, SpeculativeAlgorithm.PEAGLE_DSL)
 
     def is_frozen_kv_mtp(self) -> bool:
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
@@ -233,6 +241,16 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+
+        elif self.is_peagle():
+            if self == SpeculativeAlgorithm.PEAGLE_DSL:
+                from sglang.srt.speculative.p_eagle_worker import PEAGLEDSLWorker
+
+                return PEAGLEDSLWorker
+            else:
+                from sglang.srt.speculative.p_eagle_worker import PEAGLEWorker
+
+                return PEAGLEWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

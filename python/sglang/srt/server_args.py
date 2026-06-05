@@ -617,6 +617,9 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+    # P-EAGLE DSL: confidence threshold for sync-free early exit
+    # (used when --speculative-algorithm PEAGLE_DSL)
+    peagle_dsl_threshold: float = 2.0
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
