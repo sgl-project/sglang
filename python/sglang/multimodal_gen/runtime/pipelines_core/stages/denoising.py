@@ -852,6 +852,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             "invalidations": 0,
         }
 
+        if not (active or requested):
+            return
+
         if ctx.is_warmup or get_world_group().local_rank != 0:
             return
 
