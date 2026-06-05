@@ -240,10 +240,11 @@ def alloc_with_pin_memory(
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
-    assert dims is not None, "dims should be provided"
-    assert (
-        k_dims is None and v_dims is None
-    ), "alloc_with_pin_memory does not support asymmetric K/V allocation yet"
+    if dims is None:
+        raise NotImplementedError(
+            "alloc_with_pin_memory does not support asymmetric K/V allocation yet"
+        )
+    assert k_dims is None and v_dims is None
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
