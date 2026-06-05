@@ -1,0 +1,245 @@
+---
+title: "Qwen3-235B-A22B"
+metatags:
+  description: "Deploy Qwen3-235B-A22B model with SGLang on Ascend NPUs, including single-node, multi-node, and PD disaggregation modes."
+---
+
+## Introduction
+
+Qwen3-235B-A22B is a Mixture-of-Experts (MoE) large language model developed by Alibaba, featuring 235B total
+parameters with 22B active parameters. It employs Grouped-Query Attention (GQA) and Qwen3MoE architecture, with
+support for EAGLE3 speculative decoding for accelerated inference. The model excels at instruction following,
+logical reasoning, text comprehension, mathematics, science, coding, and tool usage, available in both standard
+and thinking/reasoning-enhanced editions.
+
+This document demonstrates the deployment of Qwen3-235B-A22B on Ascend NPUs using SGLang, including single-node PD mixed
+mode, multi-node PD disaggregation mode, feature configuration, and performance optimization.
+
+This document is validated and written based on **SGLang v0.5.10**. The current model (Qwen3-235B-A22B) is fully supported in
+this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is recommended to use
+v0.5.10 or a later version.
+
+## Supported features
+
+| Feature                       | Usage                                                                                         |
+|-------------------------------|-----------------------------------------------------------------------------------------------|
+| Tensor Parallelism            | `--tp 16`                                                                                     |
+| Data Parallelism              | `--dp-size 16 --enable-dp-attention`                                                          |
+| Expert Parallelism            | `--moe-a2a-backend ascend_fuseep`                                                             |
+| PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
+| Quantization                  | `--quantization modelslim`                                                                    |
+| Chunked Prefill               | `--chunked-prefill-size 94208 --max-prefill-tokens 458880`                                    |
+| NPU Graph                     | `--cuda-graph-bs 1 2 4 8 16 20 24 26 27`                                                      |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
+| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
+| DP LM Head                    | `--enable-dp-lm-head`                                                                         |
+
+<Note>
+For feature compatibility and conflict information between features,
+see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
+</Note>
+
+## Prerequisites
+
+### Model weights
+
+<Warning>
+If you need to download model weights, check the model size before downloading to reserve enough space.
+</Warning>
+
+- [Qwen3-235B-A22B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507) (BF16)
+- [Qwen3-235B-A22B-Instruct-2507-W8A8](https://modelscope.cn/models/zcgy26/Qwen3-235B-A22B-Instruct-2507-w8a8) (W8A8 quantized version)
+
+Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
+refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
+
+It is recommended to download the model weights to a shared directory across multiple nodes.
+
+## Installation
+
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+</Warning>
+
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
+online platform. You can directly pull it.
+
+We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
+For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
+
+If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+container, for example: `-v /path/to/models:/models`.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci8:/dev/davinci8  \
+--device=/dev/davinci9:/dev/davinci9  \
+--device=/dev/davinci10:/dev/davinci10  \
+--device=/dev/davinci11:/dev/davinci11  \
+--device=/dev/davinci12:/dev/davinci12  \
+--device=/dev/davinci13:/dev/davinci13  \
+--device=/dev/davinci14:/dev/davinci14  \
+--device=/dev/davinci15:/dev/davinci15  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+</Tabs>
+
+## Online service deployment
+
+### Single-node online deployment
+
+Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
+with limited hardware resources. The following command is based on the W8A8 quantized model.
+
+```bash Launch server
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+export SGLANG_SET_CPU_AFFINITY=1
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+MODEL_PATH=xxx
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export HCCL_BUFFSIZE=570
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
+
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
+export SGLANG_NPU_FUSED_MOE_MODE=2
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
+    --attention-backend ascend --device npu --quantization modelslim  \
+    --max-running-requests 432 --context-length 8192 --dtype bfloat16 \
+    --chunked-prefill-size 94208 --max-prefill-tokens 458880 --sampling-backend ascend \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --disable-radix-cache --moe-a2a-backend ascend_fuseep --speculative-draft-model-quantization unquant \
+    --tp 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 1 2 4 8 16 20 24 26 27
+```
+
+<Tip>
+For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+</Tip>
+
+### Multi-node PD disaggregation deployment
+
+PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
+throughput for high-concurrency scenarios. The following command is based on the W8A8 quantized model.
+
+#### 3 x Atlas 800I A3
+
+This configuration uses 1 node for prefill (TP=16) and 2 nodes for decode (TP=32 across 2 nodes). For the full
+deployment script and benchmark commands, see the
+[3.5K+1.5K high-throughput 24-card disaggregation configuration](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-24-cards-disaggregation-mode).
+
+## Functional verification
+
+After the service is started, you can invoke the model by sending a prompt:
+
+```shell
+curl http://localhost:7439/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+Expected result: an HTTP 200 response with the generated text containing "Paris".
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
+testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
+see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+## Accuracy evaluation
+
+For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation).
+
+## Performance
+
+For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
+
+## Best practices
+
+### Best practice configuration reference
+
+For complete optimal configurations with deployment scripts and benchmark commands, see the
+[Qwen Series Models](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#qwen-series-models) section
+on the Best Practice page.
+
+#### Scenario overview
+
+| Scenario                      | Deployment mode     | Total NPUs  | Weight version |
+|-------------------------------|---------------------|-------------|----------------|
+| Low latency (11K+1K)          | PD mixed            | 8 (A3)      | BF16           |
+| High throughput (3.5K+1.5K)   | PD disaggregation   | 24 (A3)     | W8A8 INT8      |
+| High throughput (3.5K+1.5K)   | PD mixed            | 8 (A3)      | W8A8 INT8      |
+| High throughput (2K+2K)       | PD mixed            | 8 (A3)      | W8A8 INT8      |
+| High throughput (2K+2K)       | PD mixed            | 16 (A3)     | W8A8 INT8      |
+
+<Note>
+`Total NPUs` indicates the total number of NPUs used across all nodes.
+</Note>
+
+## Performance tuning
+
+For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
+guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
+## FAQ
+
+For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
+This section only covers model-specific issues.

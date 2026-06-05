@@ -1,0 +1,355 @@
+---
+title: "DeepSeek V3/V3.1"
+metatags:
+  description: "Deploy DeepSeek V3/V3.1 model with SGLang on Ascend NPUs, including single-node, multi-node, and PD disaggregation modes."
+---
+
+## Introduction
+
+DeepSeek V3 is a Mixture-of-Experts (MoE) large language model developed by DeepSeek, featuring 671B total parameters
+with 37B active parameters. It employs Multi-head Latent Attention (MLA) and DeepSeekMoE architecture, with built-in
+multi-token prediction (MTP) for speculative decoding. The model delivers strong general-purpose reasoning, coding, and
+tool-augmented capabilities with high training and inference efficiency. DeepSeek V3.1 (DeepSeek-V3-0324) is an updated
+checkpoint with further performance improvements.
+
+This document demonstrates the deployment of DeepSeek V3/V3.1 on Ascend NPUs using SGLang, including single-node PD mixed
+mode, multi-node PD disaggregation mode, feature configuration, and performance optimization.
+
+This document is validated and written based on **SGLang v0.5.10**. The current model (DeepSeek V3/V3.1) is fully supported in
+this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is recommended to use
+v0.5.10 or a later version.
+
+## Supported features
+
+| Feature                       | Usage                                                                                         |
+|-------------------------------|-----------------------------------------------------------------------------------------------|
+| Tensor Parallelism            | `--tp 16`                                                                                     |
+| Data Parallelism              | `--enable-dp-attention --dp-size 4`                                                           |
+| Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
+| PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
+| NPU Graph                     | `--cuda-graph-bs 8 16 24 28 32`                                                               |
+| Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` |
+| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
+| DP LM Head                    | `--enable-dp-lm-head`                                                                         |
+| MLAPO                         | `export SGLANG_NPU_USE_MLAPO=1`                                                               |
+| NZ Weight Format              | `export SGLANG_USE_FIA_NZ=1`                                                                  |
+
+<Note>
+For feature compatibility and conflict information between features,
+see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
+</Note>
+
+## Prerequisites
+
+### Model weights
+
+<Warning>
+If you need to download model weights, check the model size before downloading to reserve enough space.
+</Warning>
+
+- [DeepSeek-V3](https://huggingface.co/deepseek-ai/DeepSeek-V3) (Original FP8 weights)
+- [DeepSeek-V3-0324](https://huggingface.co/deepseek-ai/DeepSeek-V3-0324) (Updated checkpoint, also known as V3.1)
+
+Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
+refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
+
+It is recommended to download the model weights to a shared directory across multiple nodes.
+
+## Installation
+
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+</Warning>
+
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
+online platform. You can directly pull it.
+
+We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
+For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
+
+If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+container, for example: `-v /path/to/models:/models`.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci8:/dev/davinci8  \
+--device=/dev/davinci9:/dev/davinci9  \
+--device=/dev/davinci10:/dev/davinci10  \
+--device=/dev/davinci11:/dev/davinci11  \
+--device=/dev/davinci12:/dev/davinci12  \
+--device=/dev/davinci13:/dev/davinci13  \
+--device=/dev/davinci14:/dev/davinci14  \
+--device=/dev/davinci15:/dev/davinci15  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+```
+
+  </Tab>
+</Tabs>
+
+## Online service deployment
+
+### Single-node online deployment
+
+Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
+with limited hardware resources. The following command is based on the BF16 model.
+
+```bash Launch server
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+export HCCL_BUFFSIZE=1600
+
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
+export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
+
+MODEL_PATH=xxx
+
+python3 -m sglang.launch_server \
+    --model-path ${MODEL_PATH} \
+    --tp 16 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6688 \
+    --cuda-graph-bs 8 16 24 28 32 \
+    --mem-fraction-static 0.68 \
+    --max-running-requests 128 \
+    --context-length 8188 \
+    --disable-radix-cache \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 16384 \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --enable-dp-attention \
+    --dp-size 4 \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --dtype bfloat16
+```
+
+<Tip>
+For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+</Tip>
+
+### Multi-node PD disaggregation deployment
+
+PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
+throughput for high-concurrency scenarios. The following command is based on the W4A8 quantized model.
+
+#### 2 x Atlas 800I A3
+
+The prefill node and decode node will each run on one Atlas 800I A3.
+
+1. Run the following command on both prefill and decode nodes.
+
+```bash Prefill node
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24667"
+
+P_IP=('your prefill ip1')
+
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export HCCL_BUFFSIZE=1536
+        export TASK_QUEUE_ENABLE=2
+
+        export HCCL_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=lo
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8996+$i)) \
+        --disaggregation-transfer-backend ascend \
+        --trust-remote-code --nnodes 1 --node-rank 0 \
+        --tp-size 16 --mem-fraction-static 0.6 --attention-backend ascend --device npu \
+        --load-balance-method round_robin \
+        --max-running-requests 8 --context-length 8192 --disable-radix-cache \
+        --chunked-prefill-size -1 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --dp-size 2 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=720
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=88
+        export HCCL_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=xxx
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
+        --mem-fraction-static 0.8 --max-running-requests 352 --attention-backend ascend --device npu \
+        --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
+        --cuda-graph-bs 8 10 12 14 16 18 20 22 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+2. Launch the SGLang Router (on any reachable node):
+
+```bash Router
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8996 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688
+```
+
+The full sglang server will serve on `http://127.0.0.1:6688`.
+
+#### 4 x Atlas 800I A3 (W8A8, large-scale deployment)
+
+This configuration uses 2 nodes for prefill (TP=16 per node) and 2 nodes for decode (TP=32 across 2 nodes). For the full
+deployment script, see
+[Running DeepSeek with PD disaggregation on 4 x Atlas 800I A3](/docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example#running-deepseek-with-pd-disaggregation-on-4-x-atlas-800i-a3).
+
+## Functional verification
+
+After the service is started, you can invoke the model by sending a prompt:
+
+```shell
+curl http://localhost:6688/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+Expected result: an HTTP 200 response with the generated text containing "Paris".
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
+testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
+see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+## Accuracy evaluation
+
+For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation).
+
+## Performance
+
+For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
+
+## Best practices
+
+### Best practice configuration reference
+
+For complete optimal configurations with deployment scripts, see the
+[DeepSeek Series Models](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#deepseek-series-models) section
+on the Best Practice page, and the
+[DeepSeek Examples](/docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example) page for additional deployment
+examples.
+
+#### Scenario overview
+
+| Scenario               | Deployment mode   | Total NPUs | Weight version |
+|------------------------|-------------------|------------|----------------|
+| General-purpose serving | PD mixed          | 16 (A3)    | BF16           |
+| Standard disaggregation | PD disaggregation | 32 (A3)    | W4A8           |
+| Large-scale deployment  | PD disaggregation | 64 (A3)    | W8A8           |
+
+<Note>
+`Total NPUs` indicates the total number of NPUs used across all nodes.
+</Note>
+
+## Performance tuning
+
+For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
+guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
+## FAQ
+
+For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
+This section only covers model-specific issues.
