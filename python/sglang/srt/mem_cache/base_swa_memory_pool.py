@@ -16,9 +16,6 @@ class BaseSWAKVPool(KVCache):
 
     swa_kv_pool: KVCache
 
-    def invalidate_loc_cache(self) -> None:
-        pass
-
     @abc.abstractmethod
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
         raise NotImplementedError()

@@ -625,7 +625,15 @@ class HiCacheController:
             self.dp_rank = 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
-        is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
+        # data. storage only needs rank 0 to write it back.
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        is_compressed_mla_model = isinstance(
+            self.mem_pool_device, DeepSeekV4TokenToKVPool
+        )
+        is_rank_replicated = is_mla_model or is_compressed_mla_model
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False
@@ -635,7 +643,7 @@ class HiCacheController:
                 tp_lcm_size % self.tp_size == 0
             ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
-                not is_mla_backend
+                not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
                 and tp_lcm_size > self.tp_size
             )
@@ -649,7 +657,8 @@ class HiCacheController:
             pp_size=self.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
-            is_mla_model=is_mla_backend,
+            # TODO(hzh): Rename is_mla_model to is_rank_replicated.
+            is_mla_model=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
