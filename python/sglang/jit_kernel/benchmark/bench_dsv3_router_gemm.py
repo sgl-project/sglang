@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.testing
+from sgl_kernel import dsv3_router_gemm as sgl_kernel_dsv3_router_gemm
 
 from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
@@ -33,18 +34,26 @@ else:
     NUM_EXPERTS_LIST = [256, 384]
     HIDDEN_DIM_LIST = [6144, 7168]
 
-LINE_VALS = ["jit", "torch"]
-LINE_NAMES = ["SGL JIT Kernel", "torch F.linear"]
-STYLES = [("blue", "--"), ("green", "-.")]
+# sgl_kernel AOT kernel is specialized for hidden_dim=7168 only.
+SGL_KERNEL_HIDDEN_DIM = 7168
+
+LINE_VALS = ["jit", "sgl_kernel", "torch"]
+LINE_NAMES = ["SGL JIT Kernel", "sgl_kernel AOT", "torch F.linear"]
+STYLES = [("blue", "--"), ("red", ":"), ("green", "-.")]
 
 configs = list(itertools.product(NUM_EXPERTS_LIST, HIDDEN_DIM_LIST, NUM_TOKENS_LIST))
 
 
 def _bench(num_experts, hidden_dim, num_tokens, provider, out_dtype):
+    if provider == "sgl_kernel" and hidden_dim != SGL_KERNEL_HIDDEN_DIM:
+        return float("nan"), float("nan"), float("nan")
     mat_a = torch.randn((num_tokens, hidden_dim), dtype=DTYPE, device=DEVICE)
     mat_b = torch.randn((num_experts, hidden_dim), dtype=DTYPE, device=DEVICE)
     fn_map = {
         "jit": lambda: dsv3_router_gemm(mat_a, mat_b, out_dtype=out_dtype),
+        "sgl_kernel": lambda: sgl_kernel_dsv3_router_gemm(
+            mat_a, mat_b, out_dtype=out_dtype
+        ),
         "torch": lambda: F.linear(mat_a, mat_b).to(out_dtype),
     }
     return run_benchmark(fn_map[provider])
