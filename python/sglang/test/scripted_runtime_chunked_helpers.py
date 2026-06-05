@@ -113,15 +113,20 @@ LIFECYCLE_STAGES = (
 
 
 def advance_to_nth_chunk(r, target_chunk: int, *, max_steps: int = DEFAULT_MAX_STEPS):
-    seen = 0
+    # Drive until the hook has recorded `target_chunk` chunked-prefill batches.
+    # chunks_done is accumulated from on_run_batch (every forward batch), so it
+    # never misses a chunk the way sampling the instantaneous is_chunking flag
+    # once per yield can: on the step the req leaves chunked_req, is_chunking is
+    # already False, so `seen` undercounted and the req could race to completion
+    # on slower CI before the loop caught up.
     for _ in range(max_steps):
         assert not r.finished, f"req finished before reaching chunk {target_chunk}"
-        if r.is_chunking:
-            seen += 1
-            if seen >= target_chunk:
-                return
+        if r.chunks_done >= target_chunk:
+            return
         yield
-    raise AssertionError(f"never reached chunk {target_chunk} (saw {seen})")
+    raise AssertionError(
+        f"never reached chunk {target_chunk} (chunks_done={r.chunks_done})"
+    )
 
 
 def advance_to_decode_step(

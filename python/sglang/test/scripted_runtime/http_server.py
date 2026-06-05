@@ -3,9 +3,11 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+import requests
 import zmq
 
 from sglang.srt.entrypoints.http_server import launch_server
@@ -25,6 +27,8 @@ from sglang.test.scripted_runtime.utils import close_zmq_socket
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
 SHUTDOWN_JOIN_TIMEOUT_S: float = 60.0
 LISTENER_ACCEPT_TIMEOUT_S: float = 300.0
+HTTP_READY_TIMEOUT_S: float = 300.0
+HTTP_READY_POLL_INTERVAL_S: float = 0.5
 SERVER_HOST: str = "127.0.0.1"
 
 
@@ -37,11 +41,13 @@ class ScriptedHttpServer:
         socket: zmq.Socket,
         server_process: mp.process.BaseProcess,
         out_of_band_error_path: Path,
+        http_port: int,
     ) -> None:
         self._ctx = ctx
         self._socket = socket
         self._server_process = server_process
         self._out_of_band_error_path = out_of_band_error_path
+        self._base_url = f"http://{SERVER_HOST}:{http_port}"
         self._shutdown_done = False
         self._dirty: Optional[str] = None
 
@@ -51,7 +57,7 @@ class ScriptedHttpServer:
 
         ctx = zmq.Context()
         dispatch_port, socket = get_zmq_socket_on_host(ctx, zmq.PAIR, host=SERVER_HOST)
-        server_process = _spawn_server_process(
+        server_process, http_port = _spawn_server_process(
             endpoint=f"tcp://{SERVER_HOST}:{dispatch_port}",
             out_of_band_error_path=out_of_band_error_path,
             engine_kwargs=engine_kwargs,
@@ -62,9 +68,11 @@ class ScriptedHttpServer:
             socket=socket,
             server_process=server_process,
             out_of_band_error_path=out_of_band_error_path,
+            http_port=http_port,
         )
         try:
             self._await_handshake()
+            self._await_http_ready()
         except BaseException:
             self._teardown()
             raise
@@ -137,6 +145,36 @@ class ScriptedHttpServer:
                 f"ScriptedHttpServer: expected HookReady handshake, got {ready!r}"
             )
 
+    def _await_http_ready(self) -> None:
+        # HookReady only means the scheduler dispatch loop started; the uvicorn
+        # entrypoint may not be bound yet. The first script runs
+        # _reset_engine_state, which POSTs to this server's own HTTP port, so
+        # block until the port is bound and routing before any script can run.
+        #
+        # Wait for *any* HTTP response, not status 200: in scripted mode the
+        # scheduler is driven by the script, so normal warmup never completes
+        # and /health stays 503 (server_status == Starting) for the whole run.
+        # A 503 still proves the socket is bound and routes are registered,
+        # which is all the control POSTs need.
+        url = f"{self._base_url}/health"
+        deadline = time.monotonic() + HTTP_READY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if not self._server_process.is_alive():
+                raise RuntimeError(
+                    "ScriptedHttpServer: server process died during HTTP startup"
+                )
+            try:
+                requests.get(url, timeout=2.0)
+                return
+            except requests.RequestException:
+                pass
+            time.sleep(HTTP_READY_POLL_INTERVAL_S)
+
+        raise TimeoutError(
+            f"ScriptedHttpServer: HTTP endpoint {url} not bound within "
+            f"{HTTP_READY_TIMEOUT_S}s"
+        )
+
     def _teardown(self) -> None:
         try:
             close_zmq_socket(self._socket, self._ctx)
@@ -183,7 +221,7 @@ def _spawn_server_process(
     endpoint: str,
     out_of_band_error_path: Path,
     engine_kwargs: Dict[str, Any],
-) -> mp.process.BaseProcess:
+) -> Tuple[mp.process.BaseProcess, int]:
     mp_ctx = mp.get_context("spawn")
     # The scripted runtime MUST run with the overlap scheduler -- it is the
     # production default and the behaviour the harness exists to exercise (decode
@@ -201,6 +239,7 @@ def _spawn_server_process(
         disable_piecewise_cuda_graph=True,
     )
     launch_kwargs.update(engine_kwargs)
+    http_port = launch_kwargs["port"]
     server_process = mp_ctx.Process(
         target=_launch_scripted_http_server,
         kwargs=launch_kwargs,
@@ -219,7 +258,7 @@ def _spawn_server_process(
     ):
         server_process.start()
 
-    return server_process
+    return server_process, http_port
 
 
 def _launch_scripted_http_server(**engine_kwargs: Any) -> None:

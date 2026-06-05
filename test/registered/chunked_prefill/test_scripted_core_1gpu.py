@@ -83,9 +83,15 @@ class TestScriptedCore(ScriptedTestCase):
         # other stage the req has tokens left, so the retract parks it and the
         # paused engine must not advance it afterwards.
         if r.finished:
-            assert (
-                len(r.req.output_ids) == _LIFECYCLE_MAX_NEW_TOKENS
-            ), f"stage={stage}: finished req has wrong output length {r.req.output_ids!r}"
+            # A finished req may already be removed from the scheduler during the
+            # retract (r.req is None), leaving output_ids unobservable; clean
+            # completion is then covered by the run_until_finished tail below. When
+            # still observable, the final token must have reached max_new_tokens.
+            req = r.req
+            assert req is None or len(req.output_ids) == _LIFECYCLE_MAX_NEW_TOKENS, (
+                f"stage={stage}: finished req has wrong output length "
+                f"{req.output_ids!r}"
+            )
         else:
             req = r.req
             assert req is not None and req in t.scheduler.waiting_queue, (
