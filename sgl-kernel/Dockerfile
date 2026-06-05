@@ -103,6 +103,8 @@ ARG USE_CCACHE=1
 #   NVCC_THREADS: per-compilation-unit NVCC --threads (multi-arch PTXAS)
 ARG BUILD_JOBS=0
 ARG NVCC_THREADS=32
+# Re-declare so CMake third-party FetchContent uses the same mirror as deps stage
+ARG GITHUB_ARTIFACTORY=github.com
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
@@ -131,7 +133,7 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     else \
       export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk '{print ($1 < $2) ? $1 : $2}'); \
     fi; \
-    export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}"; \
+    export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} -DGITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"; \
     if [ -n "${ENABLE_CMAKE_PROFILE:-}" ]; then \
       echo "CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json"; \
       export CMAKE_ARGS="${CMAKE_ARGS} --profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \

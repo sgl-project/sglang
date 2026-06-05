@@ -13,6 +13,9 @@ set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
+# GitHub Artifactory
+set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
+
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
@@ -46,54 +49,42 @@ clear_cuda_arches(CMAKE_FLAG)
 # cutlass
 FetchContent_Declare(
     repo-cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz
 )
 FetchContent_Populate(repo-cutlass)
 
 # fmt
 FetchContent_Declare(
     repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/fmtlib/fmt/archive/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28.tar.gz
 )
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.6.0
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.6.0.tar.gz
 )
 FetchContent_Populate(repo-triton)
 
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz
 )
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/bcf72ccc6816b36a5fae2c5a3c027604629785e0.tar.gz
 )
 FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp/archive/51eca89d20f0cfb3764ccd764338d7b22cd486a6.tar.gz
 )
 FetchContent_Populate(repo-mscclpp)
 
