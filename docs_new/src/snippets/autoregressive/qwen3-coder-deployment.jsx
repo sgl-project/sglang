@@ -45,8 +45,8 @@ export const Qwen3CoderDeployment = () => {
       mi300x: { tp: 8 },
       mi325x: { tp: 8 },
       mi355x: { tp: 8 },
-      b200: { tp: 8 },
-      gb200: { tp: 8 }
+      b200: { tp: 8, ep: 8 },
+      gb200: { tp: 4, ep: 4 }
     },
     '30b': {
       baseName: '30B-A3B',
@@ -97,24 +97,26 @@ export const Qwen3CoderDeployment = () => {
     // TP setting
     cmd += ` \\\n  --tp ${hwConfig.tp}`;
 
-    // EP and DP attention settings
-    if (quantization === 'nvfp4') {
-      cmd += ` \\\n  --ep 1`;
-      cmd += ` \\\n  --enable-dp-attention`;
+    // EP settings
+    const ep = hwConfig.ep || (quantization === 'nvfp4' ? 1 : null);
+    if (ep) {
+      cmd += ` \\\n  --ep ${ep}`;
     } else if (modelSize === '480b' && quantization === 'fp8') {
       // FP8 requires EP=2 for 480B model due to MoE dimension alignment
       // moe_intermediate_size=2560, with tp=8 ep=1: 2560/8=320, 320%128!=0
-      // with tp=8 ep=2: 2560/4=640, 640%128=0 ✓
+      // with tp=8 ep=2: 2560/4=640, 640%128=0
       cmd += ` \\\n  --ep 2`;
+    }
+
+    // DP attention setting
+    if (quantization === 'nvfp4') {
+      cmd += ` \\\n  --enable-dp-attention`;
     }
 
     // MOE runner backend for NVIDIA
     if (isNvidia) {
       if (quantization === 'nvfp4') {
-        cmd += ` \\\n  --moe-runner-backend flashinfer_cutlass`;
         cmd += ` \\\n  --quantization modelopt_fp4`;
-      } else if (quantization === 'fp8') {
-        cmd += ` \\\n  --moe-runner-backend triton`;
       }
     }
 
