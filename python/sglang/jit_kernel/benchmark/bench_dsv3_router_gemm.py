@@ -12,10 +12,8 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import run_benchmark
-from sglang.jit_kernel.dsv3_router_gemm import (
-    can_use_dsv3_router_gemm,
-    dsv3_router_gemm,
-)
+from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
+from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -25,25 +23,36 @@ IS_CI = is_in_ci()
 
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
-HIDDEN_DIM = 7168
 
 if IS_CI:
     NUM_TOKENS_LIST = [1, 8, 16]
     NUM_EXPERTS_LIST = [256]
+    HIDDEN_DIM_LIST = [7168]
 else:
     NUM_TOKENS_LIST = list(range(1, 17))
     NUM_EXPERTS_LIST = [256, 384]
+    HIDDEN_DIM_LIST = [6144, 7168]
 
 LINE_VALS = ["jit", "torch"]
 LINE_NAMES = ["SGL JIT Kernel", "torch F.linear"]
 STYLES = [("blue", "--"), ("green", "-.")]
 
-configs = list(itertools.product(NUM_EXPERTS_LIST, NUM_TOKENS_LIST))
+configs = list(itertools.product(NUM_EXPERTS_LIST, HIDDEN_DIM_LIST, NUM_TOKENS_LIST))
+
+
+def _bench(num_experts, hidden_dim, num_tokens, provider, out_dtype):
+    mat_a = torch.randn((num_tokens, hidden_dim), dtype=DTYPE, device=DEVICE)
+    mat_b = torch.randn((num_experts, hidden_dim), dtype=DTYPE, device=DEVICE)
+    fn_map = {
+        "jit": lambda: dsv3_router_gemm(mat_a, mat_b, out_dtype=out_dtype),
+        "torch": lambda: F.linear(mat_a, mat_b).to(out_dtype),
+    }
+    return run_benchmark(fn_map[provider])
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["num_experts", "num_tokens"],
+        x_names=["num_experts", "hidden_dim", "num_tokens"],
         x_vals=configs,
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -54,21 +63,13 @@ configs = list(itertools.product(NUM_EXPERTS_LIST, NUM_TOKENS_LIST))
         args={"out_dtype": torch.bfloat16},
     )
 )
-def benchmark_bf16_output(
-    num_experts: int, num_tokens: int, provider: str, out_dtype: torch.dtype
-):
-    mat_a = torch.randn((num_tokens, HIDDEN_DIM), dtype=DTYPE, device=DEVICE)
-    mat_b = torch.randn((num_experts, HIDDEN_DIM), dtype=DTYPE, device=DEVICE)
-    FN_MAP = {
-        "jit": lambda: dsv3_router_gemm(mat_a, mat_b, out_dtype=out_dtype),
-        "torch": lambda: F.linear(mat_a, mat_b).to(out_dtype),
-    }
-    return run_benchmark(FN_MAP[provider])
+def benchmark_bf16_output(num_experts, hidden_dim, num_tokens, provider, out_dtype):
+    return _bench(num_experts, hidden_dim, num_tokens, provider, out_dtype)
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["num_experts", "num_tokens"],
+        x_names=["num_experts", "hidden_dim", "num_tokens"],
         x_vals=configs,
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -79,20 +80,12 @@ def benchmark_bf16_output(
         args={"out_dtype": torch.float32},
     )
 )
-def benchmark_float32_output(
-    num_experts: int, num_tokens: int, provider: str, out_dtype: torch.dtype
-):
-    mat_a = torch.randn((num_tokens, HIDDEN_DIM), dtype=DTYPE, device=DEVICE)
-    mat_b = torch.randn((num_experts, HIDDEN_DIM), dtype=DTYPE, device=DEVICE)
-    FN_MAP = {
-        "jit": lambda: dsv3_router_gemm(mat_a, mat_b, out_dtype=out_dtype),
-        "torch": lambda: F.linear(mat_a, mat_b).to(out_dtype),
-    }
-    return run_benchmark(FN_MAP[provider])
+def benchmark_float32_output(num_experts, hidden_dim, num_tokens, provider, out_dtype):
+    return _bench(num_experts, hidden_dim, num_tokens, provider, out_dtype)
 
 
 if __name__ == "__main__":
-    if not can_use_dsv3_router_gemm(256, HIDDEN_DIM):
+    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
         print(
             "dsv3_router_gemm JIT kernel requires SM90+ (Hopper). Skipping benchmark."
         )

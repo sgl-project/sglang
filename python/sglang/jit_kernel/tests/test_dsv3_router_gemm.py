@@ -5,16 +5,14 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv3_router_gemm import (
-    can_use_dsv3_router_gemm,
-    dsv3_router_gemm,
-)
+from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
+from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=37, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
 
-HIDDEN_DIM = 7168
+HIDDEN_DIMS = [1024, 4096, 5120, 6144, 7168]
 ATOL = 1e-2
 RTOL = 1e-2
 
@@ -25,14 +23,15 @@ def _ref(hidden_states, router_weights, out_dtype):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("num_experts", [256, 384])
+@pytest.mark.parametrize("hidden_dim", HIDDEN_DIMS)
 @pytest.mark.parametrize("num_tokens", list(range(1, 17)))
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
-def test_dsv3_router_gemm(num_experts, num_tokens, out_dtype):
-    if not can_use_dsv3_router_gemm(num_experts, HIDDEN_DIM):
+def test_dsv3_router_gemm(num_experts, hidden_dim, num_tokens, out_dtype):
+    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
         pytest.skip("SM90+ required")
 
-    mat_a = torch.randn(num_tokens, HIDDEN_DIM, dtype=torch.bfloat16, device="cuda")
-    mat_b = torch.randn(num_experts, HIDDEN_DIM, dtype=torch.bfloat16, device="cuda")
+    mat_a = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+    mat_b = torch.randn(num_experts, hidden_dim, dtype=torch.bfloat16, device="cuda")
 
     ref = _ref(mat_a, mat_b, out_dtype)
     out = dsv3_router_gemm(mat_a, mat_b, out_dtype=out_dtype)

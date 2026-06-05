@@ -81,14 +81,12 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    get_device_sm,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-_device_sm = get_device_sm()
 logger = logging.getLogger(__name__)
 
 
@@ -170,24 +168,6 @@ class Glm4MoeLiteGate(nn.Module):
         self.register_buffer("_weight_fp32", None, persistent=False)
 
     def forward(self, hidden_states):
-        if (
-            _is_cuda
-            and not self.is_nextn
-            and hidden_states.shape[0] < 4
-            and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
-            and _device_sm >= 90
-        ):
-            from sglang.jit_kernel.dsv3_router_gemm import (
-                can_use_dsv3_router_gemm,
-                dsv3_router_gemm,
-            )
-
-            if can_use_dsv3_router_gemm(self.weight.shape[0], hidden_states.shape[1]):
-                return dsv3_router_gemm(
-                    hidden_states, self.weight, out_dtype=torch.float32
-                )
-
         if self._weight_fp32 is None:
             self._weight_fp32 = self.weight.data.to(torch.float32)
         logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)

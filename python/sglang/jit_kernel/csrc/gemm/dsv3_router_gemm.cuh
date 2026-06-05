@@ -143,7 +143,7 @@ struct RouterGemmDispatcher<kEnd, kEnd, OutT, kNumExperts, kHiddenDim, kUsePDL> 
 };
 
 // kNumExperts: compile-time 256 or 384
-// kHiddenDim: compile-time 7168
+// kHiddenDim: compile-time hidden dim, any multiple of one K iteration (1024)
 // kUsePDL: compile-time bool (true on SM90+)
 // kOutFloat: compile-time bool (true = float32 output, false = bfloat16 output)
 template <int kNumExperts, int kHiddenDim, bool kUsePDL, bool kOutFloat>
