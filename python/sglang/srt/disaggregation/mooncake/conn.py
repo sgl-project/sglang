@@ -1418,8 +1418,8 @@ class MooncakeKVManager(CommonKVManager):
                         )
                     else:
                         logger.debug(
-                            f"Received abort notification for unknown room {room_to_be_aborted}, "
-                            f"ignoring"
+                            f"Received abort notification for room {room_to_be_aborted}, "
+                            f"ignoring (already completed or unknown)"
                         )
                     # Send ACK back to decode endpoint
                     try:
@@ -1512,6 +1512,7 @@ class MooncakeKVManager(CommonKVManager):
 
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
+                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
                     ack_aborted_room = int(msg[1].decode("ascii"))
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
                     continue
