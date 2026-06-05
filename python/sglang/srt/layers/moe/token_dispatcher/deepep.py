@@ -294,6 +294,7 @@ class DeepEPConfig(BaseDispatcherConfig):
             self.normal_dispatch_config = None
             self.normal_combine_config = None
             self.num_sms = Buffer.num_sms
+        self.normal_quant_type = None
 
     @classmethod
     def get_instance(cls):
@@ -409,9 +410,14 @@ class _DeepEPDispatcherImplBase:
         self.use_fp8 = config["use_fp8"]
         self.use_nvfp4 = config["use_nvfp4"]
 
-        # Handle environment variables
-        if _is_npu:
-            self._update_int8_quant_env()
+    def get_normal_quant_type(self) -> str:
+        quant_type_map = {
+            DeepEPOutputDtype.BF16: "bf16",
+            DeepEPOutputDtype.FP8: "fp8",
+            DeepEPOutputDtype.INT8: "int8",
+            DeepEPOutputDtype.NVFP4: "nvfp4",
+        }
+        return quant_type_map[self.deepep_output_dtype]
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
@@ -434,10 +440,6 @@ class _DeepEPDispatcherImplBase:
                 )
                 self.deepep_output_dtype = DeepEPOutputDtype.FP8
             # NVFP4 is supported on GPU, no adjustment needed
-
-    def _update_int8_quant_env(self) -> None:
-        """TODO adapt different quantization schemes for base model and draft model on NPU"""
-        pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
@@ -524,6 +526,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
+        dispatch_config = DeepEPConfig.get_instance().normal_dispatch_config
+        if dispatch_config is None:
+            # Use the default dispatch config for this group size
+            # (Buffer is the deep_ep / zbal buffer already imported)
+            dispatch_config = Buffer.get_dispatch_config(self.group.size())
+
+        # Now set the quant type if the config supports it (safe for CUDA)
+        if dispatch_config is not None and hasattr(
+            dispatch_config, "normal_quant_type"
+        ):
+            dispatch_config.normal_quant_type = self.get_normal_quant_type()
 
         _deepep_precompile_tp_barrier()
         (
@@ -545,7 +558,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
-            config=DeepEPConfig.get_instance().normal_dispatch_config,
+            config=dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
