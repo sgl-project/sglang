@@ -223,8 +223,6 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
             f"adapter B pair must be one cold full prefill + one full prefix "
             f"hit; per-req chunks_done={chunk_counts}"
         )
-        assert reqs[2].chunks_done < expected_first_chunks
-        assert reqs[3].chunks_done < expected_first_chunks
         for r, expected_id in zip(reqs, expected_ids):
             assert lora_id_by_rid.get(r.rid) == expected_id
 

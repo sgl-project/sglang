@@ -568,7 +568,10 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
             comp = t.batch_composition()
             if r1.rid in comp.get("chunked", []):
                 saw_chunked_r1 = True
-                if r2.rid in comp.get("decode", []):
+                # a MIXED batch's forward_mode is in the extend family, so a
+                # co-batched decode req lands in the 'prefill' bucket of
+                # batch_composition; accept either bucket as the witness.
+                if r2.rid in comp.get("decode", []) + comp.get("prefill", []):
                     saw_r2_decode_during_chunking = True
                 chunked_set = set(comp.get("chunked", []))
                 assert chunked_set.isdisjoint(set(comp.get("prefill", [])))
@@ -583,8 +586,8 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
             f"{r2_out_before}"
         )
         assert saw_r2_decode_during_chunking, (
-            "r2 was never observed in the decode subset while r1 held the "
-            "chunked slot"
+            "r2 was never observed co-batched (decode/mixed) while r1 held "
+            "the chunked slot"
         )
 
         # Abort the long-running decoder so the class teardown starts from a clean,
