@@ -44,6 +44,9 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaLaunchKernel hipLaunchKernel
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #endif
 
 #ifndef USE_ROCM
@@ -83,15 +86,49 @@ using fp32x4_t = float4;
 #define SGLANG_LDG(arg) *(arg)
 #endif
 
+// DLPack device type for the current platform
+#ifndef USE_ROCM
+inline constexpr auto kDLGPU = kDLCUDA;
+#else
+inline constexpr auto kDLGPU = kDLROCM;
+#endif
+
 namespace device {
 
 /// \brief Macro: forced-inline device function qualifier.
 #define SGL_DEVICE __forceinline__ __device__
 
+// Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
+// available in both host and device compilation passes, whereas __CUDA_ARCH__
+// is only defined by nvcc during the device pass.
+#if !defined(USE_ROCM)
+#if !defined(SGL_CUDA_ARCH)
+#error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
+#endif
+#if defined(__CUDA_ARCH__)
+static_assert(
+    __CUDA_ARCH__ == SGL_CUDA_ARCH, "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
+#endif
+#define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
+#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+#else  // USE_ROCM
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
+#endif
+
+// Maximum vector size in bytes supported by current architecture.
+// Pre-Blackwell / AMD: 128-bit (16 bytes)
+// Blackwell or greater: 256-bit (32 bytes)
+inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
+
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).
+#ifndef USE_ROCM
 inline constexpr auto kFullMask = 0xffffffffu;
+#else
+inline constexpr auto kFullMask = 0xffffffffffffffffULL;
+#endif
 
 /**
  * \brief PDL (Programmatic Dependent Launch): wait for the primary kernel.
@@ -102,7 +139,7 @@ inline constexpr auto kFullMask = 0xffffffffu;
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
-#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
@@ -117,11 +154,16 @@ SGL_DEVICE void PDLWaitPrimary() {
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
-#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
 #endif
+}
+
+template <std::integral T, std::integral U>
+SGL_DEVICE constexpr auto div_ceil(T a, U b) {
+  return (a + b - 1) / b;
 }
 
 /**
@@ -231,13 +273,23 @@ struct LaunchKernel {
     m_config.numAttrs = 0;
 #else
     if (enabled) {
-      m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      m_attrs[0].val.programmaticStreamSerializationAllowed = true;
-      m_config.numAttrs = 1;
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
-    } else {
-      m_config.numAttrs = 0;
     }
+#endif
+    return *this;
+  }
+
+  auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
+#ifdef USE_ROCM
+    (void)cluster_dim;
+#else
+    auto& attr = m_attrs[m_config.numAttrs++];
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
+    m_config.attrs = m_attrs;
 #endif
     return *this;
   }
@@ -275,7 +327,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[1];
+  cudaLaunchAttribute m_attrs[2];
 };
 
 }  // namespace host

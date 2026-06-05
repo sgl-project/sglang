@@ -1,12 +1,34 @@
 import argparse
 import math
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    is_ltx23_native_variant,
+    sync_ltx23_runtime_vae_markers,
+)
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2KleinSamplingParams,
+    Flux2SamplingParams,
+    FluxSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    _json_safe,
+)
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.configs.sample.wan import (
+    WanI2V_14B_480P_SamplingParam,
+    WanI2V_14B_720P_SamplingParam,
+    WanT2V_1_3B_SamplingParams,
+    WanT2V_14B_SamplingParams,
+)
 
 
 class TestSamplingParamsValidate(unittest.TestCase):
@@ -17,6 +39,14 @@ class TestSamplingParamsValidate(unittest.TestCase):
     def test_num_outputs_per_prompt_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
+
+    def test_seed_accepts_int_or_non_empty_int_list(self):
+        self.assertEqual(SamplingParams(seed=7).seed, 7)
+        self.assertEqual(SamplingParams(seed=[7, 8]).seed, [7, 8])
+        with self.assertRaisesRegex(ValueError, r"seed list"):
+            SamplingParams(seed=[])
+        with self.assertRaisesRegex(ValueError, r"seed"):
+            SamplingParams(seed=[1, -1])
 
     def test_fps_must_be_positive_int(self):
         with self.assertRaisesRegex(ValueError, r"\bfps\b"):
@@ -63,86 +93,236 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual(params.height, 640)
         self.assertEqual(params.width, 768)
 
+    def test_flux_guidance_defaults_match_model_defaults(self):
+        self.assertEqual(FluxSamplingParams().guidance_scale, 3.5)
+        self.assertEqual(Flux2SamplingParams().guidance_scale, 4.0)
+        self.assertEqual(Flux2KleinSamplingParams().guidance_scale, 1.0)
+
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
 
+    def test_output_file_name_supports_callable_teacache_params(self):
+        def coefficients_callback(_: TeaCacheParams) -> list[float]:
+            return [1.0, 2.0, 3.0, 4.0, 5.0]
 
-class TestNegativePromptMerge(unittest.TestCase):
-    """Regression tests for negative_prompt not being passed through CLI"""
+        params = SamplingParams(
+            prompt="callable teacache",
+            teacache_params=TeaCacheParams(
+                coefficients_callback=coefficients_callback,
+            ),
+        )
 
-    def test_get_cli_args_filters_none(self):
-        ns = argparse.Namespace(negative_prompt=None, prompt="hello")
-        result = SamplingParams.get_cli_args(ns)
-        self.assertNotIn("negative_prompt", result)
-        self.assertEqual(result["prompt"], "hello")
+        params._set_output_file_name()
 
-    def test_get_cli_args_keeps_explicit_value(self):
-        ns = argparse.Namespace(negative_prompt="ugly, blurry")
-        result = SamplingParams.get_cli_args(ns)
-        self.assertEqual(result["negative_prompt"], "ugly, blurry")
+        self.assertTrue(params.output_file_name.endswith(".mp4"))
+        self.assertIn(
+            "test_sampling_params.TestSamplingParamsSubclass.test_output_file_name_supports_callable_teacache_params",
+            _json_safe(coefficients_callback),
+        )
 
-    def test_merge_preserves_subclass_default_when_not_explicit(self):
-        """Without explicit_fields, value matching base default is not merged,
-        so the subclass default (empty string) is preserved."""
+    def test_teacache_callback_takes_precedence_over_static_coefficients(self):
+        def coefficients_callback(_: TeaCacheParams) -> list[float]:
+            return [9.0, 8.0, 7.0, 6.0, 5.0]
+
+        params = TeaCacheParams(
+            coefficients=[1.0, 2.0, 3.0, 4.0, 5.0],
+            coefficients_callback=coefficients_callback,
+        )
+
+        self.assertEqual(params.get_coefficients(), [9.0, 8.0, 7.0, 6.0, 5.0])
+
+    def test_wan_teacache_boundaries_match_legacy_behavior(self):
+        legacy_equivalent_cases = [
+            (WanT2V_1_3B_SamplingParams().teacache_params, False, (5, 50)),
+            (WanT2V_1_3B_SamplingParams().teacache_params, True, (10, 100)),
+            (WanT2V_14B_SamplingParams().teacache_params, False, (1, 49)),
+            (WanT2V_14B_SamplingParams().teacache_params, True, (2, 98)),
+            (WanI2V_14B_480P_SamplingParam().teacache_params, False, (5, 50)),
+            (WanI2V_14B_480P_SamplingParam().teacache_params, True, (10, 100)),
+            (WanI2V_14B_720P_SamplingParam().teacache_params, False, (5, 50)),
+            (WanI2V_14B_720P_SamplingParam().teacache_params, True, (10, 100)),
+        ]
+
+        for teacache_params, do_cfg, expected in legacy_equivalent_cases:
+            with self.subTest(
+                use_ret_steps=teacache_params.use_ret_steps,
+                do_cfg=do_cfg,
+                expected=expected,
+            ):
+                self.assertEqual(
+                    teacache_params.get_skip_boundaries(50, do_cfg),
+                    expected,
+                )
+
+    def test_ltx23_runtime_vae_markers_sync_variant_and_decoder_metadata(self):
+        arch_config = LTX2PipelineConfig().vae_config.arch_config
+
+        self.assertFalse(is_ltx23_native_variant(arch_config))
+        self.assertEqual(arch_config.video_decoder_variant, "ltx_2")
+        self.assertEqual(arch_config.condition_encoder_subdir, "")
+
+        sync_ltx23_runtime_vae_markers(
+            arch_config,
+            SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    ltx_variant="ltx_2_3",
+                    condition_encoder_subdir="ltx23_image_encoder",
+                    video_decoder_variant="ltx_2_3",
+                    video_decoder_config={"_class_name": "AutoencoderKLLTX2Video"},
+                )
+            ),
+        )
+
+        self.assertTrue(is_ltx23_native_variant(arch_config))
+        self.assertEqual(arch_config.condition_encoder_subdir, "ltx23_image_encoder")
+        self.assertEqual(arch_config.video_decoder_variant, "ltx_2_3")
+        self.assertEqual(
+            arch_config.video_decoder_config,
+            {"_class_name": "AutoencoderKLLTX2Video"},
+        )
+
+
+class TestSamplingParamsCliArgs(unittest.TestCase):
+    def _parse_cli_kwargs(self, argv: list[str]) -> dict:
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args(argv)
+        return SamplingParams.get_cli_args(args)
+
+    def _make_qwen_image_params(self, argv: list[str]) -> QwenImageSamplingParams:
+        return QwenImageSamplingParams(**self._parse_cli_kwargs(argv))
+
+    def test_get_cli_args_drops_unset_sampling_params(self):
+        self.assertEqual(self._parse_cli_kwargs([]), {})
+
+    def test_get_cli_args_keeps_explicit_sampling_params(self):
+        kwargs = self._parse_cli_kwargs(
+            [
+                "--guidance-scale",
+                str(SamplingParams.guidance_scale),
+                "--negative-prompt",
+                SamplingParams.negative_prompt,
+                "--save-output",
+            ]
+        )
+
+        self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
+        self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
+        self.assertTrue(kwargs["save_output"])
+
+    def test_get_cli_args_accepts_seed_list(self):
+        self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)
+        self.assertEqual(
+            self._parse_cli_kwargs(["--seed", "7", "8"])["seed"],
+            [7, 8],
+        )
+
+    def test_qwen_image_cli_path_preserves_model_defaults(self):
+        params = self._make_qwen_image_params([])
+
+        self.assertEqual(params.negative_prompt, " ")
+        self.assertEqual(params.guidance_scale, 4.0)
+
+    def test_qwen_image_cli_path_allows_explicit_override_to_base_defaults(self):
+        params = self._make_qwen_image_params(
+            [
+                "--guidance-scale",
+                str(SamplingParams.guidance_scale),
+                "--negative-prompt",
+                SamplingParams.negative_prompt,
+            ]
+        )
+
+        self.assertEqual(params.guidance_scale, SamplingParams.guidance_scale)
+        self.assertEqual(params.negative_prompt, SamplingParams.negative_prompt)
+
+    def test_merge_allows_explicit_field_matching_base_default(self):
         target = DiffusersGenericSamplingParams()
-        self.assertEqual(target.negative_prompt, "")
+        user = SamplingParams(negative_prompt=SamplingParams.negative_prompt)
 
-        user = SamplingParams()
-        target._merge_with_user_params(user)
-        self.assertEqual(target.negative_prompt, "")
-
-    def test_merge_applies_different_negative_prompt(self):
-        target = DiffusersGenericSamplingParams()
-        user = SamplingParams(negative_prompt="ugly, blurry")
-        target._merge_with_user_params(user)
-        self.assertEqual(target.negative_prompt, "ugly, blurry")
-
-    def test_merge_explicit_field_matching_base_default(self):
-        """Even when the user value matches the base-class default, it should
-        still be applied if listed in explicit_fields."""
-        base_default = SamplingParams.negative_prompt
-        target = DiffusersGenericSamplingParams()
-        self.assertEqual(target.negative_prompt, "")
-
-        user = SamplingParams(negative_prompt=base_default)
         target._merge_with_user_params(user, explicit_fields={"negative_prompt"})
-        self.assertEqual(target.negative_prompt, base_default)
 
-    def test_cli_roundtrip_no_negative_prompt(self):
-        """Simulate CLI without --negative-prompt: subclass default is kept."""
-        ns = argparse.Namespace(negative_prompt=None, width=512, height=512)
-        kwargs = SamplingParams.get_cli_args(ns)
-        self.assertNotIn("negative_prompt", kwargs)
+        self.assertEqual(target.negative_prompt, SamplingParams.negative_prompt)
 
-        user = SamplingParams(**kwargs)
-        target = DiffusersGenericSamplingParams()
-        target._merge_with_user_params(user, explicit_fields=set(kwargs.keys()))
-        self.assertEqual(target.negative_prompt, "")
+    def test_cli_path_tracks_explicit_width_height_fields(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
 
-    def test_cli_roundtrip_with_negative_prompt(self):
-        """Simulate CLI with --negative-prompt: user value is applied."""
-        user_neg = "bad quality, watermark"
-        ns = argparse.Namespace(negative_prompt=user_neg, width=512, height=512)
-        kwargs = SamplingParams.get_cli_args(ns)
-        user = SamplingParams(**kwargs)
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            implicit_size = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+            )
+            explicit_size = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+                width=768,
+                height=512,
+            )
 
-        target = DiffusersGenericSamplingParams()
-        target._merge_with_user_params(user, explicit_fields=set(kwargs.keys()))
-        self.assertEqual(target.negative_prompt, user_neg)
+        implicit_fields = set(implicit_size.build_request_extra()["explicit_fields"])
+        explicit_fields = set(explicit_size.build_request_extra()["explicit_fields"])
 
-    def test_cli_roundtrip_with_base_default_negative_prompt(self):
-        """Simulate CLI where --negative-prompt value matches the base default:
-        user value should still be applied (not dropped)."""
-        base_default = SamplingParams.negative_prompt
-        ns = argparse.Namespace(negative_prompt=base_default, width=512, height=512)
-        kwargs = SamplingParams.get_cli_args(ns)
-        self.assertIn("negative_prompt", kwargs)
+        self.assertNotIn("width", implicit_fields)
+        self.assertNotIn("height", implicit_fields)
+        self.assertIn("width", explicit_fields)
+        self.assertIn("height", explicit_fields)
 
-        user = SamplingParams(**kwargs)
-        target = DiffusersGenericSamplingParams()
-        target._merge_with_user_params(user, explicit_fields=set(kwargs.keys()))
-        self.assertEqual(target.negative_prompt, base_default)
+    def test_dataclasses_replace_preserves_explicit_fields(self):
+        """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""
+        import dataclasses
+
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            sampling_params_orig = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="orig",
+                image_path="/tmp/in.png",
+                width=768,
+                height=512,
+            )
+
+        self.assertIn("width", sampling_params_orig._explicit_fields)
+        self.assertIn("height", sampling_params_orig._explicit_fields)
+
+        cloned = dataclasses.replace(
+            sampling_params_orig,
+            prompt="new",
+            output_file_name=None,
+            image_path="/tmp/in2.png",
+        )
+        self.assertFalse(hasattr(cloned, "_explicit_fields"))
+
+        # Mirror the restore done in DiffGenerator.generate().
+        cloned._explicit_fields = getattr(
+            sampling_params_orig, "_explicit_fields", set()
+        ) | {"prompt", "output_file_name", "image_path"}
+
+        explicit = set(cloned.build_request_extra()["explicit_fields"])
+        self.assertIn("width", explicit)
+        self.assertIn("height", explicit)
+        self.assertIn("prompt", explicit)
+        self.assertIn("image_path", explicit)
 
 
 if __name__ == "__main__":

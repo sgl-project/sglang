@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
 from typing import Any, Dict, Optional, Tuple, Union
@@ -5,12 +7,22 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.distributed
 
-from .parallel_state import get_tp_group
+from .parallel_state import (
+    get_attn_tp_group,
+    get_moe_ep_group,
+    get_moe_tp_group,
+    get_tp_group,
+)
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_)
+
+
+def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across model parallel group."""
+    return get_tp_group().quant_all_reduce(input_)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
@@ -48,3 +60,25 @@ def broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across attention parallel group."""
+    return get_attn_tp_group().all_reduce(input_)
+
+
+def attention_tensor_model_parallel_quant_all_reduce(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """All-reduce the input tensor across attention parallel group."""
+    return get_attn_tp_group().quant_all_reduce(input_)
+
+
+def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe parallel group."""
+    return get_moe_tp_group().all_reduce(input_)
+
+
+def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe expert parallel group."""
+    return get_moe_ep_group().all_reduce(input_)

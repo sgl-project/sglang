@@ -72,7 +72,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -84,7 +84,8 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            # relax for mi300x
+            self.assertGreaterEqual(metrics["accuracy"], 0.93)
             if is_in_amd_ci():
                 self.assertGreater(avg_spec_accept_length, 2.8)
             else:

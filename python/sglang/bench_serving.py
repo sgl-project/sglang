@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
@@ -15,6 +17,7 @@ import asyncio
 import copy
 import importlib.util
 import json
+import math
 import os
 import random
 import shutil
@@ -44,6 +47,8 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.utils.network import NetworkAddress
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
@@ -125,6 +130,10 @@ def get_request_headers() -> Dict[str, str]:
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
     return headers
+
+
+def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
+    return (message.get("reasoning_content") or "") + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -436,9 +445,8 @@ async def async_request_openai_chat_completions(
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
-                        output.generated_text = response_json["choices"][0]["message"][
-                            "content"
-                        ]
+                        message = response_json["choices"][0]["message"]
+                        output.generated_text = _combine_openai_chat_content(message)
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = (
@@ -460,10 +468,20 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                # Check for usage info in final chunks. OpenAI-compatible
+                                # servers may emit usage-only chunks with choices=[].
+                                output_len = (data.get("usage") or {}).get(
+                                    "completion_tokens", output_len
+                                )
 
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+
+                                # Reasoning models stream thoughts via
+                                # `reasoning_content`; count them like content.
+                                delta = choices[0].get("delta") or {}
+                                content = _combine_openai_chat_content(delta)
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -481,11 +499,6 @@ async def async_request_openai_chat_completions(
 
                                     most_recent_timestamp = timestamp
                                     generated_text += content
-
-                                # Check for usage info in final chunk
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
 
                         output.generated_text = generated_text
                         output.success = True
@@ -603,13 +616,16 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        sampling_params = {
+            "temperature": args.temperature,
+            "max_new_tokens": request_func_input.output_len,
+            "ignore_eos": not args.disable_ignore_eos,
+        }
+        if args.top_p < 1.0:
+            sampling_params["top_p"] = args.top_p
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
@@ -1127,6 +1143,24 @@ def calculate_metrics(
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
 
 
+def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
+    """Normalize a multi-turn round to a list of message dicts.
+
+    Accepts ``str`` (single user message) or ``List[Dict]`` with role/content
+    (e.g. multiple tool observations bundled into one round). Returns ``None``
+    on any other shape so callers can also use it as a predicate.
+    """
+    if isinstance(turn, str):
+        return [{"role": "user", "content": turn}]
+    if (
+        isinstance(turn, list)
+        and turn
+        and all(isinstance(m, dict) and "role" in m and "content" in m for m in turn)
+    ):
+        return [{"role": m["role"], "content": m["content"]} for m in turn]
+    return None
+
+
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
     assert (
         backend in MULTI_TURN_BACKENDS
@@ -1136,12 +1170,19 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         request_func_input: RequestFuncInput,
         pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
-        prompts: List[str] = request_func_input.prompt
+        prompts = request_func_input.prompt
         prev_messages: List[Dict[str, str]] = []
         outputs = []
 
         for round_index in range(len(prompts)):
-            prev_messages.append({"role": "user", "content": prompts[round_index]})
+            normalized = _normalize_round_messages(prompts[round_index])
+            if normalized is None:
+                raise ValueError(
+                    f"Multi-turn round {round_index} must be a str or a "
+                    "non-empty List[Dict] of role/content messages, got: "
+                    f"{type(prompts[round_index]).__name__}"
+                )
+            prev_messages.extend(normalized)
 
             inner_input = replace(
                 copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
@@ -1189,14 +1230,13 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    # Check for multi-turn: prompt is a list of strings (not OpenAI messages dicts)
-    # Multi-turn format: ["turn1", "turn2", ...] - list of strings
-    # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
+    # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
+    # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
     first_prompt = input_requests[0].prompt
     is_multi_turn = (
         isinstance(first_prompt, list)
-        and len(first_prompt) > 0
-        and isinstance(first_prompt[0], str)
+        and bool(first_prompt)
+        and _normalize_round_messages(first_prompt[0]) is not None
     )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
@@ -1401,7 +1441,7 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
+            base_url + "/server_info", headers=get_auth_headers()
         )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
@@ -1537,7 +1577,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
     server_info = resp.json() if resp.status_code == 200 else None
 
     if (
@@ -1680,6 +1720,11 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "return_logprob"):
         args.return_logprob = False
 
+    if not hasattr(args, "temperature"):
+        args.temperature = 0.0
+    if not hasattr(args, "top_p"):
+        args.top_p = 1.0
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -1708,6 +1753,11 @@ def run_benchmark(args_: argparse.Namespace):
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
 
+    # Inject bootstrap fields for fake decode benchmarking
+    if getattr(args, "fake_prefill", False):
+        extra_request_body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
+        extra_request_body["bootstrap_room"] = 0
+
     if args.tokenize_prompt:
         assert (
             args.backend == "sglang"
@@ -1726,10 +1776,16 @@ def run_benchmark(args_: argparse.Namespace):
             "truss": 8080,
         }.get(args.backend, 30000)
 
+    # Build base URL with proper IPv6 bracket wrapping (only when base_url is not provided)
+    if not args.base_url:
+        _na = NetworkAddress(args.host, args.port)
+        _host_base = _na.to_url()
+    else:
+        _na = None
+        _host_base = None
+
     model_url = (
-        f"{args.base_url}/v1/models"
-        if args.base_url
-        else f"http://{args.host}:{args.port}/v1/models"
+        f"{args.base_url}/v1/models" if args.base_url else f"{_host_base}/v1/models"
     )
 
     if args.backend == "sglang-embedding":
@@ -1740,43 +1796,39 @@ def run_benchmark(args_: argparse.Namespace):
         )
     elif args.backend in ["sglang", "sglang-native"]:
         api_url = (
-            f"{args.base_url}/generate"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/generate"
+            f"{args.base_url}/generate" if args.base_url else f"{_host_base}/generate"
         )
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/completions"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/completions"
+            else f"{_host_base}/v1/completions"
         )
     elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
         api_url = (
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/chat/completions"
+            else f"{_host_base}/v1/chat/completions"
         )
     elif args.backend == "trt":
         api_url = (
             f"{args.base_url}/v2/models/ensemble/generate_stream"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v2/models/ensemble/generate_stream"
+            else f"{_host_base}/v2/models/ensemble/generate_stream"
         )
         if args.model is None:
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
     elif args.backend == "gserver":
-        api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
+        api_url = args.base_url if args.base_url else _na.to_host_port_str()
         args.model = args.model or "default"
     elif args.backend == "truss":
         api_url = (
             f"{args.base_url}/v1/models/model:predict"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/models/model:predict"
+            else f"{_host_base}/v1/models/model:predict"
         )
-    base_url = (
-        f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
-    )
+    base_url = _host_base if args.base_url is None else args.base_url
 
     # Wait for server to be ready
     if args.ready_check_timeout_sec > 0:
@@ -1887,6 +1939,44 @@ def run_benchmark(args_: argparse.Namespace):
     )
 
 
+def _finite_positive_float(value) -> float:
+    """argparse type for a finite, strictly positive float."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite float > 0, got {value!r}"
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
+    return parsed
+
+
+def _validate_parsed_gsp_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject malformed GSP distribution/alpha combinations at parse time.
+
+    Invoked from the CLI entry point right after ``parser.parse_args()`` so
+    users see a clear argparse-style error before any server, model, or
+    tokenizer setup runs and masks the real cause with an unrelated network
+    failure.
+    """
+    distribution = getattr(args, "gsp_group_distribution", None)
+    alpha = getattr(args, "gsp_zipf_alpha", None)
+    if distribution == "zipf" and alpha is None:
+        parser.error(
+            "--gsp-group-distribution=zipf requires --gsp-zipf-alpha "
+            "(a finite float > 0)"
+        )
+    if distribution == "uniform" and alpha is not None:
+        parser.error(
+            "--gsp-zipf-alpha is only meaningful with "
+            "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
+            "or set --gsp-group-distribution=zipf"
+        )
+
+
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, [])
@@ -1928,6 +2018,7 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
+            "autobench",
             "sharegpt",
             "custom",
             "openai",
@@ -1937,11 +2028,26 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "longbench_v2",
+            "speed-bench",
         ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--speed-bench-category",
+        type=str,
+        default=None,
+        choices=["low_entropy", "mixed", "high_entropy"],
+        help="Category filter for the speed-bench dataset.",
+    )
+    parser.add_argument(
+        "--speed-bench-output-len",
+        type=int,
+        default=512,
+        help="Fixed output length for speed-bench requests (default: 512).",
     )
     parser.add_argument(
         "--model",
@@ -2108,6 +2214,18 @@ if __name__ == "__main__":
         help="Disable ignoring EOS.",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling parameter.",
+    )
+    parser.add_argument(
         "--extra-request-body",
         metavar='{"key1": "value1", "key2": "value2"}',
         type=str,
@@ -2136,8 +2254,9 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
-        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER.",
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU", "MEM"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM "
+        "(MEM dumps a torch.cuda.memory snapshot, viewable at https://pytorch.org/memory_viz).",
     )
     parser.add_argument(
         "--profile-start-step",
@@ -2306,6 +2425,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
     )
+    group.add_argument(
+        "--gsp-group-distribution",
+        type=str,
+        choices=["uniform", "zipf"],
+        default="uniform",
+        help=(
+            "Prefix-group sampling distribution for generated-shared-prefix. "
+            "'uniform' (default) assigns each group an equal number of requests. "
+            "'zipf' samples each request's group by rank with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha); rank starts at 1 "
+            "and group index 0 is the hottest. Requires --gsp-zipf-alpha "
+            "(a finite float > 0) when set to 'zipf'. Total request count is "
+            "still num_groups * prompts_per_group, identical to uniform mode; "
+            "only the per-request group assignment changes. The on-disk "
+            "dataset cache uses a distinct key per (group_distribution, "
+            "zipf_alpha), so uniform-mode caches are never mixed with "
+            "zipf-mode caches and zipf runs with different alpha use "
+            "separate files."
+        ),
+    )
+    group.add_argument(
+        "--gsp-zipf-alpha",
+        type=_finite_positive_float,
+        default=None,
+        help=(
+            "Zipf exponent alpha for --gsp-group-distribution=zipf, with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha) and rank starting "
+            "at 1. Must be a finite float strictly greater than 0; larger "
+            "values concentrate requests on lower-ranked (hotter) groups."
+        ),
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
@@ -2335,6 +2485,14 @@ if __name__ == "__main__":
         help="Underlying workload for the mooncake dataset.",
     )
     parser.add_argument(
+        "--fake-prefill",
+        action="store_true",
+        default=False,
+        help="Enable fake prefill mode for decode-only benchmarking. "
+        "Use with a decode server running --disaggregation-transfer-backend fake "
+        "to benchmark pure decode performance without a real prefill node.",
+    )
+    parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
     )
     parser.add_argument(
@@ -2345,4 +2503,5 @@ if __name__ == "__main__":
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
+    _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)

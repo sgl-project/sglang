@@ -12,10 +12,11 @@ import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
@@ -29,11 +30,16 @@ def _json_safe(obj: Any):
     """
     Recursively convert objects to JSON-serializable forms.
     - Enums -> their name
+    - Callables -> stable module-qualified name
     - Sets/Tuples -> lists
     - Dicts/Lists -> recursively processed
     """
     if isinstance(obj, Enum):
         return obj.name
+    if callable(obj):
+        module = getattr(obj, "__module__", None)
+        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
+        return f"{module}.{qualname}" if module else qualname
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
@@ -83,11 +89,14 @@ class DataType(Enum):
 class SamplingParams:
     """
     Sampling parameters for generation.
+
+    Dynamic batching compares these fields for compatibility, except fields
+    marked with `batch_sig_exclude`.
     """
 
     data_type: DataType = DataType.VIDEO
 
-    request_id: str | None = None
+    request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
 
     # All fields below are copied from ForwardBatch
 
@@ -95,13 +104,17 @@ class SamplingParams:
     image_path: str | list[str] | None = None
 
     # Text inputs
-    prompt: str | list[str] | None = None
+    prompt: str | list[str] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
     negative_prompt: str = (
         "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     )
-    prompt_path: str | None = None
-    output_path: str | None = None
-    output_file_name: str | None = None
+    prompt_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
+    output_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
+    output_file_name: str | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
     output_quality: str | None = "default"
     output_compression: int | None = None
 
@@ -122,8 +135,8 @@ class SamplingParams:
 
     # Batch info
     num_outputs_per_prompt: int = 1
-    seed: int = 42
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    seed: int | list[int] = field(default=42, metadata={"batch_sig_exclude": True})
+    generator_device: str | None = None  # None means use the pipeline/model default
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 1  # Default for image models
@@ -141,9 +154,9 @@ class SamplingParams:
     fps: int = 24
 
     # Resolution validation
-    supported_resolutions: list[tuple[int, int]] | None = (
-        None  # None means all resolutions allowed
-    )
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )  # None means all resolutions allowed
 
     # Denoising parameters
     num_inference_steps: int = None
@@ -156,30 +169,70 @@ class SamplingParams:
 
     # TeaCache parameters
     enable_teacache: bool = False
+    teacache_params: Any = (
+        None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
+    )
 
     # Profiling
-    profile: bool = False
-    num_profiled_timesteps: int = 5
-    profile_all_stages: bool = False
+    profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
+    num_profiled_timesteps: int = field(default=5, metadata={"batch_sig_exclude": True})
+    profile_all_stages: bool = field(
+        default=False, metadata={"batch_sig_exclude": True}
+    )
 
     # Debugging
-    debug: bool = False
-    perf_dump_path: str | None = None
+    debug: bool = field(default=False, metadata={"batch_sig_exclude": True})
+    perf_dump_path: str | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
 
     # Misc
     save_output: bool = True
-    return_frames: bool = False
+    return_frames: bool = field(default=False, metadata={"batch_sig_exclude": True})
+    rollout: bool = False
+    rollout_sde_type: str = "sde"
+    rollout_noise_level: float = 0.7
+    rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
+    rollout_debug_mode: bool = (
+        False  # return rollout debug tensors (intermediate states)
+    )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    rollout_return_denoising_env: bool = (
+        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    )
+    rollout_return_dit_trajectory: bool = (
+        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
+    )
+    # 0-indexed denoising-loop step filters; None = all steps.
+    rollout_sde_step_indices: list[int] | None = None
+    rollout_return_step_indices: list[int] | None = None
     # if True, disallow user params to override subclass-defined protected fields
-    no_override_protected_fields: bool = False
+    no_override_protected_fields: bool = field(
+        default=False, metadata={"batch_sig_exclude": True}
+    )
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
     # if True, suppress verbose logging for this request
-    suppress_logs: bool = False
+    suppress_logs: bool = field(default=False, metadata={"batch_sig_exclude": True})
 
+    # return output file paths directly to client
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
+    diffusers_kwargs: dict | None = None
+    max_sequence_length: int | None = None
+    flow_shift: float | None = None
+
+    # cosmos-related
+    use_duration_template: bool | None = None
+    use_resolution_template: bool | None = None
+    use_system_prompt: bool | None = None
+    use_guardrails: bool | None = None
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+    realtime_chunk_size: int | None = None
+
+    # Prompt enhancement (ErnieImage)
+    use_pe: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -245,6 +298,25 @@ class SamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
+    def build_request_extra(self) -> dict[str, Any]:
+        """Return optional request-scoped extras for downstream pipeline stages."""
+        extra = {}
+        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
+        if diffusers_kwargs:
+            extra["diffusers_kwargs"] = diffusers_kwargs
+        explicit_fields = getattr(self, "_explicit_fields", None)
+        if explicit_fields is not None:
+            extra["explicit_fields"] = sorted(explicit_fields)
+        return extra
+
+    def apply_request_extra(self, req: Any) -> None:
+        """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
+        req.extra.update(self.build_request_extra())
+        if self.condition_inputs:
+            req.condition_inputs.update(self.condition_inputs)
+        if self.realtime_chunk_size is not None:
+            req.realtime_chunk_size = self.realtime_chunk_size
+
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
@@ -268,6 +340,23 @@ class SamplingParams:
         ):
             raise ValueError(
                 f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
+            )
+
+        if isinstance(self.seed, list):
+            if not self.seed:
+                raise ValueError("seed list must not be empty")
+            for seed in self.seed:
+                if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                    raise ValueError(
+                        f"seed list must contain non-negative ints, got {self.seed!r}"
+                    )
+        elif (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, int)
+            or self.seed < 0
+        ):
+            raise ValueError(
+                "seed must be a non-negative int or list of ints, " f"got {self.seed!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -337,6 +426,8 @@ class SamplingParams:
                 raise ValueError(
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
+
+        RLRolloutArgs.validate_sampling_params(self)
 
     def check_sampling_param(self):
         # Keep backward-compatibility for old call sites.
@@ -431,9 +522,12 @@ class SamplingParams:
 
         pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
 
-        if ("wan" in pipeline_name_lower or "helios" in pipeline_name_lower) and (
-            self.enable_sequence_shard is None or self.enable_sequence_shard
-        ):
+        if (
+            "wan" in pipeline_name_lower
+            or "helios" in pipeline_name_lower
+            or "joy" in pipeline_name_lower
+            or "cosmos3" in pipeline_name_lower
+        ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")
         else:
@@ -529,18 +623,28 @@ class SamplingParams:
     def from_user_sampling_params_args(
         model_path: str, server_args: "ServerArgs", *args, **kwargs
     ):
+        pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
         try:
-            sampling_params = SamplingParams.from_pretrained(
-                model_path, backend=server_args.backend, model_id=server_args.model_id
-            )
-        except (AttributeError, ValueError) as e:
+            sampling_params = None
+            if pipeline_class_name:
+                from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+                config_classes = get_pipeline_config_classes(pipeline_class_name)
+                if config_classes is not None:
+                    _, sampling_params_cls = config_classes
+                    sampling_params = sampling_params_cls()
+
+            if sampling_params is None:
+                sampling_params = SamplingParams.from_pretrained(
+                    model_path,
+                    backend=server_args.backend,
+                    model_id=server_args.model_id,
+                )
+        except (AttributeError, ValueError):
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
             if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
                 # Determine which sampling params to use based on pipeline_class_name
-                pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
-
-                # Try to get SamplingParams from registry
                 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
                 config_classes = (
@@ -573,11 +677,13 @@ class SamplingParams:
 
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
-        user_sampling_params = SamplingParams(*args, **user_kwargs)
+
+        user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
+        sampling_params._explicit_fields = set(user_kwargs.keys())
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -593,213 +699,197 @@ class SamplingParams:
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
         """Add CLI arguments for SamplingParam fields"""
-        parser.add_argument("--data-type", type=str, nargs="+", default=DataType.VIDEO)
-        parser.add_argument(
+
+        def add_argument(*name_or_flags, **kwargs):
+            kwargs.setdefault("default", argparse.SUPPRESS)
+            return parser.add_argument(*name_or_flags, **kwargs)
+
+        add_argument("--data-type", type=str, nargs="+")
+        add_argument(
             "--num-frames-round-down",
             action="store_true",
-            default=SamplingParams.num_frames_round_down,
         )
-        parser.add_argument(
+        add_argument(
             "--enable-teacache",
             action="store_true",
-            default=SamplingParams.enable_teacache,
         )
 
         # profiling
-        parser.add_argument(
+        add_argument(
             "--profile",
             action="store_true",
-            default=SamplingParams.profile,
             help="Enable torch profiler for denoising stage",
         )
-        parser.add_argument(
+        add_argument(
             "--num-profiled-timesteps",
             type=int,
-            default=SamplingParams.num_profiled_timesteps,
             help="Number of timesteps to profile after warmup",
         )
-        parser.add_argument(
+        add_argument(
             "--profile-all-stages",
             action="store_true",
             dest="profile_all_stages",
-            default=SamplingParams.profile_all_stages,
             help="Used with --profile, profile all pipeline stages",
         )
 
-        parser.add_argument(
+        add_argument(
             "--debug",
             action="store_true",
-            default=SamplingParams.debug,
             help="",
         )
 
-        parser.add_argument(
+        add_argument(
             "--prompt",
             type=str,
             nargs="+",
-            default=SamplingParams.prompt,
             help="Text prompt(s) for generation. Use space-separated values for multiple prompts, e.g., --prompt 'prompt 1' 'prompt 2'",
         )
-        parser.add_argument(
+        add_argument(
             "--negative-prompt",
             type=str,
-            default=None,
             help="Negative text prompt for generation",
         )
-        parser.add_argument(
+        add_argument(
             "--prompt-path",
             type=str,
-            default=SamplingParams.prompt_path,
-            help="Path to a text file containing the prompt",
+            help="Path to a text file containing prompts (one per line)",
         )
-        parser.add_argument(
+        add_argument(
             "--output-file-name",
             type=str,
-            default=SamplingParams.output_file_name,
             help="Name of the output file",
         )
-        parser.add_argument(
+        add_argument(
             "--output-quality",
             type=str,
-            default=SamplingParams.output_quality,
             help="Output quality setting (default, low, medium, high, maximum)",
         )
-        parser.add_argument(
+        add_argument(
             "--output-compression",
             type=int,
-            default=SamplingParams.output_compression,
             help="Output compression level (0-100, higher means better quality but larger file size)",
         )
-        parser.add_argument(
+        add_argument(
             "--num-outputs-per-prompt",
             type=int,
-            default=SamplingParams.num_outputs_per_prompt,
             help="Number of outputs to generate per prompt",
         )
-        parser.add_argument(
+        add_argument(
             "--seed",
             type=int,
-            default=SamplingParams.seed,
+            nargs="+",
             help="Random seed for generation",
         )
-        parser.add_argument(
+        add_argument(
             "--generator-device",
             type=str,
-            default=SamplingParams.generator_device,
             choices=["cuda", "musa", "cpu"],
-            help="Device for random generator (cuda, musa or cpu). Default: cuda",
+            help="Device for random generator (cuda, musa or cpu). Default: use the model-specific setting.",
         )
-        parser.add_argument(
+        add_argument(
             "--num-frames",
             type=int,
-            default=SamplingParams.num_frames,
             help="Number of frames to generate",
         )
-        parser.add_argument(
+        add_argument(
             "--height",
             type=int,
-            default=SamplingParams.height,
             help="Height of generated output",
         )
-        parser.add_argument(
+        add_argument(
             "--width",
             type=int,
-            default=SamplingParams.width,
             help="Width of generated output",
         )
         # resolution shortcuts
-        parser.add_argument(
+        add_argument(
             "--4k",
             action="store_true",
             dest="resolution_4k",
             help="Set resolution to 4K (3840x2160)",
         )
-        parser.add_argument(
+        add_argument(
             "--2k",
             action="store_true",
             dest="resolution_2k",
             help="Set resolution to 2K (2560x1440)",
         )
-        parser.add_argument(
+        add_argument(
             "--1080p",
             action="store_true",
             dest="resolution_1080p",
             help="Set resolution to 1080p (1920x1080)",
         )
-        parser.add_argument(
+        add_argument(
             "--720p",
             action="store_true",
             dest="resolution_720p",
             help="Set resolution to 720p (1280x720)",
         )
 
-        parser.add_argument(
+        add_argument(
             "--fps",
             type=int,
-            default=SamplingParams.fps,
             help="Frames per second for saved output",
         )
-        parser.add_argument(
+        add_argument(
             "--num-inference-steps",
             type=int,
-            default=SamplingParams.num_inference_steps,
             help="Number of denoising steps",
         )
-        parser.add_argument(
+        add_argument(
             "--guidance-scale",
             type=float,
-            default=SamplingParams.guidance_scale,
             help="Classifier-free guidance scale",
         )
-        parser.add_argument(
+        add_argument(
             "--guidance-scale-2",
             type=float,
-            default=SamplingParams.guidance_scale_2,
             dest="guidance_scale_2",
             help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
         )
-        parser.add_argument(
+        add_argument(
+            "--true-cfg-scale",
+            type=float,
+            dest="true_cfg_scale",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
+        )
+        add_argument(
             "--guidance-rescale",
             type=float,
-            default=SamplingParams.guidance_rescale,
             help="Guidance rescale factor",
         )
-        parser.add_argument(
+        add_argument(
             "--cfg-normalization",
             type=float,
-            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
             dest="cfg_normalization",
-            help=("CFG renormalization factor (for Z-Image). "),
+            help="CFG renormalization factor (for Z-Image). ",
         )
-        parser.add_argument(
+        add_argument(
             "--boundary-ratio",
             type=float,
-            default=SamplingParams.boundary_ratio,
             help="Boundary timestep ratio",
         )
-        parser.add_argument(
+        add_argument(
             "--save-output",
             action="store_true",
-            default=SamplingParams.save_output,
             help="Whether to save the output to disk",
         )
-        parser.add_argument(
+        add_argument(
             "--no-save-output",
             action="store_false",
             dest="save_output",
             help="Don't save the output to disk",
         )
-        parser.add_argument(
+        add_argument(
             "--return-frames",
             action="store_true",
-            default=SamplingParams.return_frames,
             help="Whether to return the raw frames",
         )
-        parser.add_argument(
+        add_argument(
             "--image-path",
             type=str,
             nargs="+",
-            default=SamplingParams.image_path,
             help=(
                 "Path(s) to input image(s) for image-to-image / image-to-video "
                 "generation. For multiple images, pass them as space-separated "
@@ -807,106 +897,97 @@ class SamplingParams:
                 '--image-path "img1.png" "img2.png"'
             ),
         )
-        parser.add_argument(
+        add_argument(
             "--moba-config-path",
             type=str,
-            default=None,
             help="Path to a JSON file containing V-MoBA specific configurations.",
         )
-        parser.add_argument(
+        add_argument(
             "--return-trajectory-latents",
             action="store_true",
-            default=SamplingParams.return_trajectory_latents,
             help="Whether to return the trajectory",
         )
-        parser.add_argument(
+
+        # Rollout arguments
+        RLRolloutArgs.add_cli_args(parser, add_argument=add_argument)
+
+        add_argument(
             "--return-trajectory-decoded",
             action="store_true",
-            default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
         )
-        parser.add_argument(
+        add_argument(
             "--diffusers-kwargs",
             type=str,
-            default=None,
             help="JSON string of extra kwargs to pass to diffusers pipeline. "
             'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
         )
-        parser.add_argument(
+        add_argument(
             "--no-override-protected-fields",
             action="store_true",
-            default=SamplingParams.no_override_protected_fields,
             help=(
                 "If set, disallow user params to override fields defined in subclasses."
             ),
         )
-        parser.add_argument(
+        add_argument(
             "--adjust-frames",
             action=StoreBoolean,
-            default=SamplingParams.adjust_frames,
             help=(
                 "Enable/disable adjusting num_frames to evenly split latent frames across GPUs "
                 "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
-        parser.add_argument(
+        add_argument(
             "--return-file-paths-only",
             action=StoreBoolean,
-            default=SamplingParams.return_file_paths_only,
             help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
         )
-        parser.add_argument(
+        add_argument(
             "--enable-sequence-shard",
             action=StoreBoolean,
-            default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
         )
-        parser.add_argument(
+        add_argument(
             "--enable-frame-interpolation",
             action="store_true",
             help="Enable post-generation frame interpolation using RIFE 4.22.lite.",
         )
-        parser.add_argument(
+        add_argument(
             "--frame-interpolation-exp",
             type=int,
-            default=SamplingParams.frame_interpolation_exp,
             help="Frame interpolation exponent: 1=2x, 2=4x (default: 1).",
         )
-        parser.add_argument(
+        add_argument(
             "--frame-interpolation-scale",
             type=float,
-            default=SamplingParams.frame_interpolation_scale,
             help="RIFE inference scale factor (default: 1.0; use 0.5 for high-res).",
         )
-        parser.add_argument(
+        add_argument(
             "--frame-interpolation-model-path",
             type=str,
-            default=SamplingParams.frame_interpolation_model_path,
             help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
             "(default: elfgum/RIFE-4.22.lite, downloaded automatically). "
             "Only RIFE 4.22.lite architecture is supported; other RIFE versions or "
             "frame interpolation models are not compatible.",
         )
-        parser.add_argument(
+        add_argument(
             "--enable-upscaling",
             action="store_true",
             help="Enable post-generation upscaling using Real-ESRGAN.",
         )
-        parser.add_argument(
+        add_argument(
             "--upscaling-model-path",
             type=str,
-            default=SamplingParams.upscaling_model_path,
             help="Local .pth file, HuggingFace repo ID, or repo_id:filename for Real-ESRGAN weights "
             "(default: ai-forever/Real-ESRGAN with RealESRGAN_x4.pth). "
             "Only RRDBNet (e.g. RealESRGAN_x4plus) and SRVGGNetCompact (e.g. realesr-animevideov3) "
             "architectures are supported; other super-resolution models are not compatible. "
             "Use 'repo_id:filename' to specify a custom weight file from a HF repo.",
         )
-        parser.add_argument(
+        add_argument(
             "--upscaling-scale",
             type=int,
-            default=SamplingParams.upscaling_scale,
             help="Upscaling factor (default: 4).",
         )
         return parser
@@ -930,11 +1011,14 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        return {
+        cli_args = {
             attr: getattr(args, attr)
             for attr in attrs
             if hasattr(args, attr) and getattr(args, attr) is not None
         }
+        if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
+            cli_args["seed"] = cli_args["seed"][0]
+        return cli_args
 
     def output_file_path(self):
         if self.output_path is None:
@@ -964,7 +1048,14 @@ class SamplingParams:
         for field in dataclasses.fields(user_params):
             field_name = field.name
             user_value = getattr(user_params, field_name)
-            default_class_value = getattr(SamplingParams, field_name)
+            if hasattr(SamplingParams, field_name):
+                default_class_value = getattr(SamplingParams, field_name)
+            elif field.default is not dataclasses.MISSING:
+                default_class_value = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                default_class_value = field.default_factory()
+            else:
+                default_class_value = dataclasses.MISSING
 
             is_user_modified = user_value != default_class_value or (
                 explicit_fields is not None and field_name in explicit_fields

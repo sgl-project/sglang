@@ -26,6 +26,7 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrConfig,
+    GlmOcrTextConfig,
     GlmOcrVisionConfig,
 )
 
@@ -151,6 +152,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
     def __init__(
         self,
         vision_config: GlmOcrVisionConfig,
+        text_config: GlmOcrTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
@@ -203,7 +205,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
         )
         self.merger = GlmOcrVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=vision_config.out_hidden_size * vision_config.in_channels,
+            context_dim=text_config.intermediate_size,
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
@@ -273,6 +275,7 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.visual = GlmOcrVisionModel(
             vision_config=config.vision_config,
+            text_config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
@@ -430,9 +433,6 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                         self.config, name, loaded_weight
                     )
                 weight_loader(param, loaded_weight)
-
-        if not is_nextn:
-            self.visual.patch_embed.copy_conv3d_weight_to_linear()
 
 
 EntryClass = [GlmOcrForConditionalGeneration]

@@ -190,18 +190,37 @@ class EmbeddingCacheController:
     def insert_batch(
         self, image_hashes: List[str], embedding_tensors: List[torch.Tensor]
     ):
-        """Issues ONE batch PUT for all embeddings computed by this request."""
+        """Issues ONE batch PUT for all embeddings computed by this request.
+
+        Note: Even if the embedding exists locally, we still push to Mooncake
+        to ensure multi-node cache consistency. Mooncake's batch_put has
+        built-in deduplication to avoid redundant transfers.
+        """
         keys, ptrs, sizes = [], [], []
+        local_hit_count = 0
+        new_count = 0
+        skipped_count = 0
 
         with self.lock:
             for h, tensor in zip(image_hashes, embedding_tensors):
                 if h in self.hash_to_metadata:
+                    # Local cache hit: ensure Mooncake has it
+                    offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h][:4]
+
+                    # Still push to Mooncake for multi-node sharing
+                    # (Mooncake batch_put will deduplicate if already exists)
+                    keys.append(h)
+                    ptrs.append(self.cpu_pool.data_ptr() + offset)
+                    sizes.append(size_bytes)
+                    local_hit_count += 1
                     continue
 
+                # Local cache miss: allocate and copy
                 num_tokens, dim = tensor.shape[0], tensor.shape[1]
                 size_bytes = num_tokens * dim * self.element_size
                 offset = self.allocator.allocate(size_bytes)
                 if offset is None:
+                    skipped_count += 1
                     continue
 
                 # Copy to pinned pool for RDMA
@@ -216,10 +235,13 @@ class EmbeddingCacheController:
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
                 sizes.append(size_bytes)
+                new_count += 1
 
             if keys:
                 logger.info(
-                    f"Global Cache: Inserting {len(keys)} new embeddings into Mooncake cluster."
+                    f"Global Cache: Inserting {len(keys)} embeddings into Mooncake cluster "
+                    f"({new_count} new, {local_hit_count} existing for replication, "
+                    f"{skipped_count} skipped due to allocation failure)"
                 )
                 self.insert_queue.put(EmbeddingInsertOperation(keys, ptrs, sizes))
 

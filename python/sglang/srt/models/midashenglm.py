@@ -476,20 +476,12 @@ class MiDashengLMModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        if (
-            hasattr(config.text_config, "rope_scaling")
-            and config.text_config.rope_scaling
-        ):
-            if "mrope_section" in config.text_config.rope_scaling:
-
-                new_rope_scaling = {
-                    k: v
-                    for k, v in config.text_config.rope_scaling.items()
-                    if k != "mrope_section"
-                }
-                config.text_config.rope_scaling = (
-                    new_rope_scaling if new_rope_scaling else None
-                )
+        rope_scaling = config.text_config.rope_parameters
+        if rope_scaling:
+            if "mrope_section" in rope_scaling:
+                # Remove mrope_section from rope_parameters so downstream
+                # code treats this as standard rotary embedding.
+                del rope_scaling["mrope_section"]
         self.audio_encoder = DashengAudioTransformer(
             config.audio_encoder_config,
             quant_config=quant_config,

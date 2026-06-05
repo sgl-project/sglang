@@ -81,6 +81,7 @@ class AscendLoRABackend(BaseLoRABackend):
         qkv_lora_b: torch.Tensor,
         output_offset: torch.Tensor,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -89,6 +90,7 @@ class AscendLoRABackend(BaseLoRABackend):
         total_seq_len, _ = x.shape
         _, weight_intermediate_dim, _ = qkv_lora_a.shape
         _, weight_out_dim, _ = qkv_lora_b.shape
+        max_rank = weight_intermediate_dim // n_slices
 
         if base_output is None:
             output_tensor = torch.zeros(
@@ -272,4 +274,6 @@ class AscendLoRABackend(BaseLoRABackend):
             scalings_tensor, non_blocking=True
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+
+        batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info
