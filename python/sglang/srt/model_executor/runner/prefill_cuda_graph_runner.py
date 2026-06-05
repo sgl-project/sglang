@@ -89,6 +89,7 @@ _PREFILL_STATIC_FIELDS = (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -232,8 +233,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         torch.compile install) and the compile-loop pass (every shape,
         inside enable_torch_compile_warmup).
         """
-        fb = self.capture_prepare(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(fb)
+        fb, attn_backend = self.capture_prepare(num_tokens)
+        attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
 
     # -----------------------------------------------------------------
@@ -272,12 +273,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # -----------------------------------------------------------------
     # capture_prepare
     # -----------------------------------------------------------------
-    def capture_prepare(self, num_tokens: int) -> ForwardBatch:
+    def capture_prepare(
+        self, num_tokens: int
+    ) -> tuple[ForwardBatch, "AttentionBackend"]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
         backend, we swap in slices of our static buffers so captured
         segments read from stable addresses.
+
+        Returns ``(forward_batch, attn_backend)`` to mirror decode's
+        capture_prepare signature.
         """
         buffers = self.buffers
         bs = 1
@@ -368,7 +374,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
-        return forward_batch
+        return forward_batch, self.model_runner.attn_backend
 
     # -----------------------------------------------------------------
     # capture
@@ -411,8 +417,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
-        forward_batch = self.capture_prepare(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -422,7 +428,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             run_once,
             dummies=None,
             post_warmup_hook=getattr(
-                self.model_runner.attn_backend,
+                attn_backend,
                 "on_after_cuda_graph_warmup",
                 None,
             ),
