@@ -414,16 +414,18 @@ class Compressor(nn.Module):
             # to the kv pool via set_compress_*_buffer, so there's nothing
             # for forward_core_compressor to write afterwards.
             #
-            # Fused path (_forward_npu_fused) is decode-only: it reads write
-            # locations from fm.c{ratio}_loc, which _compute_compress_locs
-            # populates only in its is_decode branch. Prefill / extend keep the
-            # per-request forward_npu path. (A prefill-fused experiment was
-            # tested and REJECTED: it produced the same prefill HS as forward_npu
-            # AND crashed long decode runs — the prefill compressor was not the
-            # accuracy root cause; the MoE sqrtsoftplus gating was.)
-            if (
-                envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get()
-                and forward_batch.forward_mode.is_decode()
+            # Fused path (_forward_npu_fused) reads write locations from
+            # fm.c{ratio}_loc, populated for decode and for non-chunked prefill
+            # (start_pos=0) by _build_npu_compress_metadata_prefill. Both modes
+            # are gated by the single SGLANG_DSV4_NPU_FUSED_COMPRESSOR flag.
+            # The earlier prefill-fused crash was stale non-tail
+            # c{N}_state_page_table entries (req-slot reuse) corrupting other
+            # requests' state via the op's WriteToCacheState; fixed by zeroing
+            # non-tail page columns in the prefill metadata builder.
+            fmode = forward_batch.forward_mode
+            if envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get() and (
+                fmode.is_decode()
+                or (fmode.is_prefill() and not fmode.is_target_verify())
             ):
                 return self._forward_npu_fused(x, forward_batch.positions, forward_batch)
             return self.forward_npu(x, forward_batch.positions, forward_batch)

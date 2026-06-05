@@ -840,6 +840,53 @@ class DeepseekV4AscendAttnBackend(
         fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         fm.seqused = None
 
+        # c{ratio}_loc for the fused-op epilog write (non-chunked prefill).
+        # out_c{4,128}_loc is densely packed in batch order (one slot per
+        # compressed token), same order as positions_cmp_padding above, so the
+        # op's cmp_kv[k] -> c{ratio}_loc[k]. Equals forward_npu write_locs when
+        # prefix_lens == 0. NOT valid under chunked prefill.
+        bundle = forward_batch.out_cache_loc_dsv4
+        for ratio in (4, 128):
+            if ratio not in ratio_lists:
+                continue
+            bundle_loc = None
+            if bundle is not None:
+                bundle_loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
+            setattr(
+                fm,
+                f"c{ratio}_loc",
+                bundle_loc.to(torch.int32) if bundle_loc is not None else None,
+            )
+
+        # ROOT-CAUSE FIX: stale non-tail state-page-table entries
+        # (req_to_token_c{N}_state is NOT re-zeroed on req-slot reuse, see
+        # DSV4NPUReqToTokenPool.clear) would make the fused op's
+        # WriteToCacheState (block-0-skip) write into another request's state
+        # block. Force the page columns BEFORE each request's tail page to 0 so
+        # they hit the kernel's idInBlockTable==0 skip. Decode is unaffected
+        # (single-position write); prefill writes [0, seqlen). The tail per req
+        # starts at c_alloc_offset (same formula as forward_npu's tail-state
+        # alloc); the boundary page is left intact (its non-tail tokens write to
+        # the request's OWN tail block, harmless and never read back).
+        page_size = self.page_size
+        for ratio in (4, 128):
+            spt = getattr(fm, f"c{ratio}_state_page_table", None)
+            if spt is None:
+                continue
+            for idx in range(bs):
+                seqlen = int(cu_cpu[idx + 1] - cu_cpu[idx])
+                if seqlen == 0:
+                    continue
+                tail = seqlen % 128
+                if ratio == 4:
+                    c_alloc_len = tail + 128 if (tail <= 3 and seqlen >= 128) else tail
+                else:
+                    c_alloc_len = tail
+                c_alloc_offset = seqlen - c_alloc_len
+                first_tail_page = c_alloc_offset // page_size
+                if first_tail_page > 0:
+                    spt[idx, :first_tail_page] = 0
+
     def _compute_compress_locs(
         self,
         *,
