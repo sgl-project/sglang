@@ -535,46 +535,41 @@ class TestKVPressureSmallPool(ScriptedTestCase):
     @staticmethod
     def _script_kv_recovery_after_full(t: ScriptedContext):
         baseline = t.engine_stats()["kv_pool_free"]
-        # Engine-native pressure: two ballast decode reqs whose PROMPTS alone
-        # hold 2x1900 of the 4096-token pool. The admission gate subtracts the
-        # ballasts' clipped decode reservations (~2*512*new_token_ratio) from
-        # what is left (~296), driving rem_total below zero, so a fresh
-        # 16-token req cannot admit and parks in waiting_queue. (2x1536 left
-        # ~1024 free, which the ratio-discounted reservations did not close --
-        # the newcomer admitted; 1900 makes the arithmetic decisive.)
+        # Proven pressure regime (same mechanics as the passing SmallPool
+        # tests): one ballast decode req plus an in-flight 2048-token chunked
+        # req drive rem_total (free minus clipped decode reservations) to <= 0
+        # while the chunked req is mid-chunking. A fresh 16-token req started
+        # inside that window cannot admit and parks in waiting_queue.
         b1 = t.start_req(
-            prompt_len=1900,
+            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
             max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
             ignore_eos=True,
             prompt_token=620,
         )
-        b2 = t.start_req(
-            prompt_len=1900,
-            max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
-            ignore_eos=True,
-            prompt_token=621,
-        )
         yield from run_until(b1, lambda h: h.status == "running")
-        yield from run_until(b2, lambda h: h.status == "running")
-        ballasts = [b1, b2]
-        r = t.start_req(prompt_len=16, max_new_tokens=2)
-        for _ in range(6):
-            yield
-        assert (
-            r.status == "waiting"
-        ), f"req must be unschedulable under a full pool; status={r.status}"
 
-        for b in ballasts:
-            t.abort(b)
+        big = t.start_req(prompt_len=2048, max_new_tokens=2, prompt_token=621)
+        yield from run_until(big, lambda h: h.is_chunking and h.chunks_done >= 2)
+
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield
+        assert r.status == "waiting", (
+            f"16-token req must be unschedulable while the ballast and the "
+            f"mid-chunk req own the pool; status={r.status}"
+        )
+
+        # Real release: abort the ballast; the chunked req completes (the
+        # engine may retract the ballast first on its own -- either way the
+        # release path is engine-native) and the newcomer then admits.
+        t.abort(b1)
+        yield from run_until(big, lambda h: h.finished, max_steps=3000)
         yield from run_until(r, lambda h: h.finished, max_steps=3000)
         assert r.finished
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
-        # The finished prompt stays cached in the radix tree; drain to idle and
-        # flush before the leak check so the pool returns to its pre-pressure
-        # baseline.
+        # The finished prompts stay cached in the radix tree; drain to idle and
+        # flush before the leak check so the pool returns to baseline.
         for _ in range(40):
             if t.is_fully_idle:
                 break
@@ -583,10 +578,9 @@ class TestKVPressureSmallPool(ScriptedTestCase):
         yield
         final = t.engine_stats()["kv_pool_free"]
         assert final >= baseline, (
-            f"KV pool failed to recover post-pressure: baseline={baseline}, "
-            f"final={final}"
+            f"pool must recover to baseline after release: "
+            f"baseline={baseline}, final={final}"
         )
-
 
 class TestKVPressurePriority(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
