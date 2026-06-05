@@ -1,4 +1,4 @@
----
+﻿---
 title: "Best Practice on Ascend NPU"
 metatags:
   description: "Documentation for Best Practice on Ascend NPU"
@@ -672,7 +672,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-3_5k-1_5k-low-latency-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-3_5k-1_5k-low-latency-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
@@ -682,7 +682,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>128K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-128k-1k-low-latency-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-128k-1k-low-latency-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
   </tbody>
 </table>
@@ -721,17 +721,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-3_5k-1_5k-high-throughput-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32K+1K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-32k-1k-high-throughput-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-3_5k-1_5k-high-throughput-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
@@ -741,7 +731,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>64K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-64k-1k-high-throughput-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-64k-1k-high-throughput-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
@@ -751,7 +741,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>128K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-128k-1k-high-throughput-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-128k-1k-high-throughput-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
@@ -761,7 +751,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>64K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-64k-1k-high-throughput-on-a3-4-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-64k-1k-high-throughput-on-a3-4-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
@@ -771,7 +761,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>64K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-64k-1k-high-throughput-on-a3-16-cards-disaggregation-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-64k-1k-high-throughput-on-a3-16-cards-disaggregation-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
@@ -781,7 +771,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>128K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m25-128k-1k-high-throughput-on-a3-16-cards-disaggregation-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-128k-1k-high-throughput-on-a3-16-cards-disaggregation-mode">Optimal Configuration</a></td>
     </tr>
   </tbody>
 </table>
@@ -822,7 +812,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#kimi-k25-w4a8-3_5k-1_5k-20ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#kimi-k2-5-w4a8-3_5k-1_5k-20ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
 </tbody>
 </table>
@@ -861,9 +851,80 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#kimi-k25-w4a8-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#kimi-k2-5-w4a8-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
 </tbody>
+</table>
+
+## GLM Series Models
+
+### High Throughput
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>41ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-3_5k-1_5k-41ms-on-a3-16-cards-mixed-mode">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>23ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-16k-1k-23ms-on-a3-32-cards-disaggregation-mode">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>48</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>64K+1K+90% cache hit</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>45ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-64k-1k-90%25_cache_hit-45ms-on-a3-48-cards-disaggregation-mode">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>48</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>128K+1K+90% cache hit</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-128k-1k-90%25_cache_hit-32ms-on-a3-48-cards-disaggregation-mode">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
 </table>
 
 ## Optimal Configuration
@@ -2053,7 +2114,7 @@ do
         export GLOO_SOCKET_IFNAME=lo
         export STREAMS_PER_DEVICE=32
 
-        # P节点
+        # Prefill
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
         --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --mem-fraction-static 0.6 \
@@ -6004,4 +6065,576 @@ We tested it based on the `RANDOM` dataset.
 
 ```bash Command
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 120 --random-output-len 1500 --random-input-len 3500 --num-prompts 120
+```
+
+### GLM-5.1 3_5K-1_5K 41ms on A3 16 Cards Mixed Mode
+
+Model: [GLM-5.1](https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w4a8)
+
+<Info>The model is quantized, with MTP layers excluded from quantization.</Info>
+
+Hardware: Atlas 800I A3 16Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 41ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTHONPATH=/path/to/sglang/python:$PYTHONPATH
+
+export STREAMS_PER_DEVICE=32
+
+export HCCL_SOCKET_IFNAME=your_nic
+export GLOO_SOCKET_IFNAME=your_nic
+
+MODEL_PATH=/path/to/GLM-5.1-w4a8
+
+P_IP=('your ip1' 'your ip2')
+P_MASTER="${P_IP[0]}:4567"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export HCCL_BUFFSIZE=2500
+        python -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --attention-backend ascend \
+        --device npu \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --tp-size 32 --nnodes 2 --node-rank $i \
+        --dp-size 16 --enable-dp-attention \
+        --chunked-prefill-size 131072 --max-prefill-tokens 280000 \
+        --trust-remote-code \
+        --host 127.0.0.1 \
+        --mem-fraction-static 0.65 \
+        --port 8001 \
+        --served-model-name glm-5 \
+        --cuda-graph-max-bs 8 \
+        --max-running-requests 128 \
+        --quantization modelslim \
+        --speculative-draft-model-quantization unquant \
+        --moe-a2a-backend deepep --deepep-mode auto \
+        --load-balance-method round_robin \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+<Info>
+**Quantization Configuration:**
+
+- `--quantization modelslim` is only applicable for quantized models.
+- `--speculative-draft-model-quantization unquant` should be configured based on model specs, turned on for non-quantized MTP layers.
+</Info>
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```bash Command
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 8001 --random-range-ratio 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 320
+```
+
+### GLM-5.1 16K-1K 23ms on A3 32 Cards Disaggregation Mode
+
+Model: [GLM-5.1](https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w4a8)
+
+Hardware: Atlas 800I A3 32Card
+
+DeployMode: PD Disaggregation
+
+Dataset: random
+
+Input Output Length: 16K+1K
+
+TPOT: 23ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib/:${LD_LIBRARY_PATH}
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export PYTHONPATH=/path/to/sglang/python:$PYTHONPATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://${P_IP[0]}:24707"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+P_IP=('your prefill ip1' 'your prefill ip2')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=/path/to/GLM-5.1-w4a8
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export TASK_QUEUE_ENABLE=2
+        export ENABLE_PROFILING=0
+        export HCCL_SOCKET_IFNAME=your_nic
+        export GLOO_SOCKET_IFNAME=your_nic
+
+        export HCCL_BUFFSIZE=8
+        unset PYTORCH_NPU_ALLOC_CONF
+        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
+        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+        export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://${P_IP[0]}:24672"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 --trust-remote-code --nnodes 2 --node-rank $i \
+        --tp-size 32 --mem-fraction-static 0.75 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 64 \
+        --served-model-name glm-5 --chunked-prefill-size 524288 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
+        --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
+        --dp-size 4 --enable-dp-attention \
+        --load-balance-method round_robin \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 8 \
+        --enable-dp-lm-head --moe-dense-tp 1 \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=650
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+        export TASK_QUEUE_ENABLE=0
+        export HCCL_SOCKET_IFNAME=your_nic
+        export GLOO_SOCKET_IFNAME=your_nic
+
+        export SGLANG_NPU_USE_MULTI_STREAM=1
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8003 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --ep-size 32 \
+        --mem-fraction-static 0.87 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
+        --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
+        --cuda-graph-bs 1 2 3 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy round_robin \
+    --prefill http://your_prefill_ip1:8000 8998 \
+    --decode http://your_decode_ip1:8003 \
+    --host 127.0.0.1 \
+    --port 6688
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```bash Command
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 8003 --random-range-ratio 1 --random-output-len 1000 --random-input-len 16000 --num-prompts 192
+```
+
+### GLM-5.1 64K-1K-90%_cache_hit 45ms on A3 48 Cards Disaggregation Mode
+
+Model: [GLM-5.1](https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w4a8)
+
+Hardware: Atlas 800I A3 48Card
+
+DeployMode: PD Disaggregation
+
+Dataset: random (90% cache hit)
+
+Input Output Length: 64K+1K
+
+TPOT: 45ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib/:${LD_LIBRARY_PATH}
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export PYTHONPATH=/path/to/sglang/python:$PYTHONPATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://${P_IP[0]}:24709"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200
+
+P_IP=('your prefill ip1' 'your prefill ip2' 'your prefill ip3' 'your prefill ip4')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=/path/to/GLM-5.1-w4a8
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export TASK_QUEUE_ENABLE=2
+        export ENABLE_PROFILING=0
+        export HCCL_SOCKET_IFNAME=your_nic
+        export GLOO_SOCKET_IFNAME=your_nic
+
+        export ZBAL_HCCL_OP="send,recv"
+        export HCCL_BUFFSIZE=128
+        unset PYTORCH_NPU_ALLOC_CONF
+        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
+        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+        export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://${P_IP[$i]}:24691"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998 + i)) --trust-remote-code --nnodes 1 --node-rank 0 \
+        --tp-size 4 --mem-fraction-static 0.72 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 16 \
+        --served-model-name glm-5 --chunked-prefill-size 16384 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
+        --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
+        --speculative-draft-model-quantization unquant \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 4 \
+        --enable-dp-lm-head --moe-dense-tp 1 \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
+        --pp-size 4
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=300
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=40
+        export TASK_QUEUE_ENABLE=0
+        export HCCL_SOCKET_IFNAME=your_nic
+        export GLOO_SOCKET_IFNAME=your_nic
+
+        export SGLANG_NPU_USE_MULTI_STREAM=1
+        export SGLANG_LM_HEAD_TP=4
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8003 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --enable-dp-attention --ep-size 32 \
+        --mem-fraction-static 0.85 --max-running-requests 320 --attention-backend ascend --device npu --quantization modelslim \
+        --served-model-name glm-5 --moe-a2a-backend deepep --deepep-mode low_latency \
+        --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --disaggregation-enable-decode-radix-cache
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy round_robin \
+    --prefill http://your_prefill_ip1:8000 8998 \
+    --prefill http://your_prefill_ip2:8000 8999 \
+    --prefill http://your_prefill_ip3:8000 9000 \
+    --prefill http://your_prefill_ip4:8000 9001 \
+    --decode http://your_decode_ip1:8003 \
+    --host 127.0.0.1 \
+    --port 6688
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset (90% cache hit), this dataset is generated through [this tool](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/tree/main).
+
+```bash Command
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 8003 --random-range-ratio 1 --random-output-len 1000 --random-input-len 64000 --num-prompts 192
+```
+
+### GLM-5.1 128K-1K-90%_cache_hit 32ms on A3 48 Cards Disaggregation Mode
+
+Model: [GLM-5.1](https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w4a8)
+
+Hardware: Atlas 800I A3 48Card
+
+DeployMode: PD Disaggregation
+
+Dataset: random (90% cache hit)
+
+Input Output Length: 128K+1K
+
+TPOT: 32ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib/:${LD_LIBRARY_PATH}
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export PYTHONPATH=/path/to/sglang/python:$PYTHONPATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://${P_IP[0]}:24709"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200
+
+P_IP=('your prefill ip1' 'your prefill ip2')
+P1_IP=('your prefill ip3' 'your prefill ip4')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=/path/to/GLM-5.1-w4a8
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill group 1
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export TASK_QUEUE_ENABLE=2
+        export ENABLE_PROFILING=0
+        export HCCL_SOCKET_IFNAME=your_nic
+        export GLOO_SOCKET_IFNAME=your_nic
+
+        export ZBAL_HCCL_OP="send,recv"
+        export HCCL_BUFFSIZE=128
+        unset PYTORCH_NPU_ALLOC_CONF
+        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
+        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+        export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://${P_IP[0]}:24691"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port 8998 --trust-remote-code --nnodes 2 --node-rank $i --dist-init-addr ${P_IP[0]}:5000 \
+        --tp-size 4 --mem-fraction-static 0.72 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 32 \
+        --served-model-name glm-5 --chunked-prefill-size 16384 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
+        --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
+        --speculative-draft-model-quantization unquant \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 4 \
+        --enable-dp-lm-head --moe-dense-tp 1 \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
+        --pp-size 8
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# prefill group 2
+for i in "${!P1_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P1_IP[$i]}" || "$LOCAL_HOST2" == "${P1_IP[$i]}" ]];
+    then
+        echo "${P1_IP[$i]}"
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export TASK_QUEUE_ENABLE=2
+        export ENABLE_PROFILING=0
+        export HCCL_SOCKET_IFNAME=your_nic
+        export GLOO_SOCKET_IFNAME=your_nic
+
+        export ZBAL_HCCL_OP="send,recv"
+        export HCCL_BUFFSIZE=128
+        unset PYTORCH_NPU_ALLOC_CONF
+        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
+        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+        export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://${P1_IP[0]}:24691"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P1_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port 8999 --trust-remote-code --nnodes 2 --node-rank $i --dist-init-addr ${P1_IP[0]}:5000 \
+        --tp-size 4 --mem-fraction-static 0.72 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 32 \
+        --served-model-name glm-5 --chunked-prefill-size 16384 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
+        --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
+        --speculative-draft-model-quantization unquant \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 4 \
+        --enable-dp-lm-head --moe-dense-tp 1 \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
+        --pp-size 8
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=200
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
+        export TASK_QUEUE_ENABLE=0
+        export HCCL_SOCKET_IFNAME=your_nic
+        export GLOO_SOCKET_IFNAME=your_nic
+
+        export SGLANG_NPU_USE_MULTI_STREAM=1
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8003 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --enable-dp-attention --ep-size 32 \
+        --mem-fraction-static 0.865 --max-running-requests 96 --attention-backend ascend --device npu --quantization modelslim \
+        --served-model-name glm-5 --moe-a2a-backend deepep --deepep-mode low_latency \
+        --cuda-graph-bs 1 2 3 4 5 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000  \
+        --tokenizer-worker-num 32 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --disaggregation-decode-enable-radix-cache
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy round_robin \
+    --prefill http://your_prefill_ip1:8000 8998 \
+    --prefill http://your_prefill_ip3:8000 8999 \
+    --decode http://your_decode_ip1:8003 \
+    --host 127.0.0.1 \
+    --port 6688
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset (90% cache hit), this dataset is generated through [this tool](https://github.com/rayn-zzz/aisbench_auto_tools_prefix/tree/main).
+
+```bash Command
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 8003 --random-range-ratio 1 --random-output-len 1000 --random-input-len 131072 --num-prompts 192
 ```

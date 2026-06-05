@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
@@ -887,7 +888,9 @@ class AiterAttnBackend(AttentionBackend):
                         bs, max_kv_len, dtype=torch.int32, device=self.device
                     )
 
-                    create_flashmla_kv_indices_triton[(bs,)](
+                    create_flashmla_kv_indices_triton[
+                        (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
+                    ](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
