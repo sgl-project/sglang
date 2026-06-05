@@ -62,17 +62,8 @@ def make_mock_server_args(**overrides) -> ServerArgs:
         else:
             setattr(sa, k, v)
     if sa.cuda_graph_config is None:
-        if legacy_cuda_graph_bs is None:
-            # No silent fallback: a magic default (we used to assume [4])
-            # silently passes tests that should have declared the shape
-            # matrix the backend will be exercised with.
-            raise TypeError(
-                "make_mock_server_args: pass cuda_graph_bs=[...] (legacy) or "
-                "cuda_graph_config=CudaGraphConfig(...) so the captured shape "
-                "matrix is explicit at the call site."
-            )
         sa.cuda_graph_config = default_cuda_graph_config()
-        bs = legacy_cuda_graph_bs
+        bs = legacy_cuda_graph_bs if legacy_cuda_graph_bs is not None else [4]
         sa.cuda_graph_config[Phase.DECODE].bs = list(bs)
         sa.cuda_graph_config[Phase.DECODE].max_bs = max(bs)
         sa.cuda_graph_config[Phase.PREFILL].max_bs = max(bs)

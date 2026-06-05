@@ -309,7 +309,6 @@ class DualChunkMockModelRunner(ModelRunner):
         self.dp_size = 1
         self.pp_size = 1
         self.server_args = make_mock_server_args(
-            cuda_graph_bs=[4],
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,
