@@ -689,7 +689,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+        # Some EAGLE3 drafts (e.g. nvidia/Kimi-K2.5-Thinking-Eagle3) carry the full DeepSeek-V3
+        # config schema and explicitly set `num_nextn_predict_layers: 0`. Treat that the same as
+        # the field being absent — otherwise the draft worker takes the MTP branch below with
+        # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
+        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
+        _nnpl = self.model_config.num_nextn_predict_layers
+        model_has_mtp_layers = _nnpl is not None and _nnpl > 0
         model_num_layers = (
             self.model_config.num_nextn_predict_layers
             if self.is_draft_worker and model_has_mtp_layers
