@@ -836,11 +836,13 @@ class MoriKVManager(CommonKVManager):
         kv_item_len = self.kv_args.kv_item_lens[0]
 
         if self.is_mla_backend:
-            layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
             src_descs, dst_descs, layers_current_pp_stage = (
                 self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
             for layer_id in range(layers_current_pp_stage):
+                layer_plan = self._build_contiguous_transfer_plan(
+                    grouped_plan, self.kv_args.kv_item_lens[layer_id]
+                )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
                         src_descs[layer_id],
