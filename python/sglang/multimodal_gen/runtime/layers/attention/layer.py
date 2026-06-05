@@ -16,8 +16,8 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.acceleration_policy import (
-    attention_autotune_config,
     attention_allows_cudnn_sdp,
+    attention_autotune_config,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -370,7 +370,8 @@ class LocalAttention(nn.Module):
     ) -> bool:
         return (
             self.enable_attention_autotune
-            and self.backend in (
+            and self.backend
+            in (
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.FA2,
                 AttentionBackendEnum.TORCH_SDPA,
@@ -385,10 +386,12 @@ class LocalAttention(nn.Module):
             and q.shape[-1] <= 256
         )
 
-    def _autotune_key(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple:
-        device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    def _autotune_key(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple:
+        device_index = (
+            q.device.index
+            if q.device.index is not None
+            else torch.cuda.current_device()
+        )
         capability = torch.cuda.get_device_capability(device_index)
         return (
             capability,
@@ -445,9 +448,7 @@ class LocalAttention(nn.Module):
         }
         timings = {}
         for name, fn in candidates.items():
-            elapsed = self._time_attention_candidate(
-                fn, allow_failure=name != "native"
-            )
+            elapsed = self._time_attention_candidate(fn, allow_failure=name != "native")
             if elapsed is not None:
                 timings[name] = elapsed
 

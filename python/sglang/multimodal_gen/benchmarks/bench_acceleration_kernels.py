@@ -19,8 +19,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionMetadata,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    LocalAttention,
     _LOCAL_ATTENTION_AUTOTUNE_CACHE,
+    LocalAttention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     global_force_attn_backend_context_manager,
