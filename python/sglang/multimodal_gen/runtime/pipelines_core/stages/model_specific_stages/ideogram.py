@@ -20,7 +20,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
+    DenoisingStage,
+    DenoisingStepState,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -31,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 SEQUENCE_PADDING_INDICATOR = -1
@@ -76,6 +81,34 @@ def get_schedule_for_resolution(image_resolution, known_mean: float, std: float)
 
 def make_step_intervals(num_steps: int) -> torch.Tensor:
     return torch.linspace(0.0, 1.0, num_steps + 1, dtype=torch.float32)
+
+
+class Ideogram4Scheduler:
+    order = 1
+    init_noise_sigma = 1.0
+    num_train_timesteps = 1
+
+    def __init__(self) -> None:
+        self.timesteps = torch.empty(0, dtype=torch.float32)
+        self._begin_index = None
+
+    def set_begin_index(self, begin_index: int) -> None:
+        self._begin_index = begin_index
+
+    def set_timesteps(self, num_inference_steps: int, device=None) -> None:
+        self.timesteps = torch.arange(
+            num_inference_steps - 1,
+            -1,
+            -1,
+            dtype=torch.float32,
+            device=device or get_local_torch_device(),
+        )
+
+    def scale_model_input(self, sample: torch.Tensor, timestep=None) -> torch.Tensor:
+        return sample
+
+    def step(self, model_output, timestep, sample, return_dict=False, **kwargs):
+        raise RuntimeError("Ideogram4DenoisingStage applies its custom scheduler step")
 
 
 class Ideogram4TextEncodingStage(TextEncodingStage):
@@ -230,21 +263,83 @@ class Ideogram4DenoisingStage(DenoisingStage):
     def __init__(self, transformer, unconditional_transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
-            scheduler=None,
-            transformer_2=unconditional_transformer,
+            scheduler=Ideogram4Scheduler(),
             pipeline=pipeline,
         )
+        self.unconditional_transformer = unconditional_transformer
+        self._maybe_enable_torch_compile(self.unconditional_transformer)
 
     def _component_name_for_stage_module(self, module, default_name: str) -> str:
-        if default_name == "transformer_2":
+        if module is self.unconditional_transformer:
             return "unconditional_transformer"
         return super()._component_name_for_stage_module(module, default_name)
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="transformer",
+                phase="transformer",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            ),
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="unconditional_transformer",
+                phase="unconditional_transformer",
+                memory_intensive=True,
+            ),
+        ]
+
+    def _maybe_enable_cache_dit_and_torch_compile(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
+        self._maybe_enable_cache_dit(num_inference_steps, batch)
+        for transformer in filter(
+            None, [self.transformer, self.unconditional_transformer]
+        ):
+            self._maybe_enable_torch_compile(transformer)
+
+    def _manage_unconditional_transformer_use_site(self, batch: Req) -> None:
+        manager = self._component_residency_manager
+        if manager is None:
+            return
+        use = self._declared_component_use(
+            component_name="unconditional_transformer",
+            phase="unconditional_transformer",
+        )
+        manager.begin_use(use, module=self.unconditional_transformer)
+
+    def _manage_dit_use_site(
+        self,
+        current_model: torch.nn.Module,
+        current_phase: str,
+        batch: Req,
+    ) -> None:
+        if self._component_residency_manager is None:
+            return
+        super()._manage_dit_use_site(current_model, current_phase, batch)
+
+    def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
+        batch.did_sp_shard_latents = False
+
+    def _postprocess_sp_latents(
+        self,
+        batch: Req,
+        latents: torch.Tensor,
+        trajectory_tensor: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return latents, trajectory_tensor
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         return VerificationResult()
 
-    @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def _prepare_denoising_loop(
+        self, batch: Req, server_args: ServerArgs
+    ) -> DenoisingContext:
         preset = getattr(batch, "preset", "V4_DEFAULT_20")
         if preset not in IDEOGRAM4_PRESETS:
             raise ValueError(
@@ -252,20 +347,26 @@ class Ideogram4DenoisingStage(DenoisingStage):
             )
         preset_cfg = IDEOGRAM4_PRESETS[preset]
         num_steps = int(preset_cfg["num_steps"])
+        device = get_local_torch_device()
         schedule = get_schedule_for_resolution(
             (batch.height, batch.width),
             known_mean=float(preset_cfg["mu"]),
             std=float(preset_cfg["std"]),
         )
-        step_intervals = make_step_intervals(num_steps).to(get_local_torch_device())
-        gw_per_step = torch.as_tensor(
-            preset_cfg["guidance_schedule"],
-            dtype=torch.float32,
-            device=get_local_torch_device(),
+        step_intervals = make_step_intervals(num_steps).to(device)
+        guidance_schedule = torch.as_tensor(
+            preset_cfg["guidance_schedule"], dtype=torch.float32, device=device
         )
 
+        self.scheduler.set_timesteps(num_steps, device=device)
+        batch.scheduler = self.scheduler
+        batch.timesteps = self.scheduler.timesteps
+        batch.num_inference_steps = num_steps
+
+        ctx = super()._prepare_denoising_loop(batch, server_args)
+
         data = batch.extra["ideogram4"]
-        z = batch.latents.to(get_local_torch_device(), dtype=torch.float32)
+        z = ctx.latents.to(device, dtype=torch.float32)
         llm_features = batch.prompt_embeds[0]
         batch_size = z.shape[0]
         max_text_tokens = data["max_text_tokens"]
@@ -288,55 +389,80 @@ class Ideogram4DenoisingStage(DenoisingStage):
             dtype=llm_features.dtype,
             device=z.device,
         )
+        ctx.latents = z
+        ctx.extra.update(
+            {
+                "ideogram4_schedule": schedule,
+                "ideogram4_step_intervals": step_intervals,
+                "ideogram4_guidance_schedule": guidance_schedule,
+                "ideogram4_text_z_padding": text_z_padding,
+                "ideogram4_neg_position_ids": neg_position_ids,
+                "ideogram4_neg_segment_ids": neg_segment_ids,
+                "ideogram4_neg_indicator": neg_indicator,
+                "ideogram4_neg_llm_features": neg_llm_features,
+            }
+        )
+        return ctx
 
-        with (
-            self.use_declared_component(
-                component_name="transformer", module=self.transformer
-            ) as transformer,
-            self.use_declared_component(
-                component_name="unconditional_transformer",
-                module=self.transformer_2,
-            ) as unconditional_transformer,
-        ):
-            for i in self.progress_bar(
-                range(num_steps - 1, -1, -1),
-                total=num_steps,
-                disable=batch.suppress_logs,
+    def _run_denoising_step(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        data = batch.extra["ideogram4"]
+        z = ctx.latents.to(dtype=torch.float32)
+        llm_features = batch.prompt_embeds[0]
+        max_text_tokens = data["max_text_tokens"]
+        schedule = ctx.extra["ideogram4_schedule"]
+        step_intervals = ctx.extra["ideogram4_step_intervals"]
+        guidance_schedule = ctx.extra["ideogram4_guidance_schedule"]
+        i = step.t_int
+
+        t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
+        s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
+        t = torch.full((z.shape[0],), t_val, dtype=torch.float32, device=z.device)
+        pos_z = torch.cat([ctx.extra["ideogram4_text_z_padding"], z], dim=1)
+        use_nvtx = self.current_use_nvtx
+
+        with maybe_nvtx_range("predict_noise", use_nvtx):
+            with set_forward_context(
+                current_timestep=i,
+                attn_metadata=step.attn_metadata,
+                forward_batch=batch,
             ):
-                t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
-                s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
-                t = torch.full(
-                    (batch_size,), t_val, dtype=torch.float32, device=z.device
+                pos_out = step.current_model(
+                    llm_features=llm_features,
+                    x=pos_z,
+                    t=t,
+                    position_ids=data["position_ids"],
+                    segment_ids=data["segment_ids"],
+                    indicator=data["indicator"],
                 )
-                pos_z = torch.cat([text_z_padding, z], dim=1)
-                with set_forward_context(
-                    current_timestep=i,
-                    attn_metadata=None,
-                    forward_batch=batch,
-                ):
-                    pos_out = transformer(
-                        llm_features=llm_features,
-                        x=pos_z,
-                        t=t,
-                        position_ids=data["position_ids"],
-                        segment_ids=data["segment_ids"],
-                        indicator=data["indicator"],
-                    )
-                    pos_v = pos_out[:, max_text_tokens:]
-                    neg_v = unconditional_transformer(
-                        llm_features=neg_llm_features,
-                        x=z,
-                        t=t,
-                        position_ids=neg_position_ids,
-                        segment_ids=neg_segment_ids,
-                        indicator=neg_indicator,
-                    )
-                z = z + (gw_per_step[i] * pos_v + (1.0 - gw_per_step[i]) * neg_v) * (
-                    s_val - t_val
+                pos_v = pos_out[:, max_text_tokens:]
+
+            self._manage_unconditional_transformer_use_site(batch)
+            with set_forward_context(
+                current_timestep=i,
+                attn_metadata=step.attn_metadata,
+                forward_batch=batch,
+            ):
+                neg_v = self.unconditional_transformer(
+                    llm_features=ctx.extra["ideogram4_neg_llm_features"],
+                    x=z,
+                    t=t,
+                    position_ids=ctx.extra["ideogram4_neg_position_ids"],
+                    segment_ids=ctx.extra["ideogram4_neg_segment_ids"],
+                    indicator=ctx.extra["ideogram4_neg_indicator"],
                 )
 
-        batch.latents = z
-        return batch
+        with maybe_nvtx_range("scheduler_step", use_nvtx):
+            velocity = (
+                guidance_schedule[i] * pos_v
+                + (1.0 - guidance_schedule[i]) * neg_v
+            )
+            ctx.latents = z + velocity * (s_val - t_val)
 
 
 class Ideogram4DecodingStage(PipelineStage):

@@ -148,7 +148,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="ideogram-ai/ideogram-4-fp8",
         ),
-        DiffusionSamplingParams(
+        replace(
+            T2I_sampling_params,
             prompt=_IDEOGRAM4_JSON_PROMPT,
             output_size="1024x1024",
             output_format="png",

@@ -117,6 +117,11 @@ def _fake_server_args(cfg=None):
         enable_torch_compile=False,
         attention_backend="torch_sdpa",
         enable_layerwise_nvtx_marker=False,
+        model_loaded={"transformer": True},
+        model_paths={},
+        disable_autocast=False,
+        enable_cfg_parallel=False,
+        attention_backend_config=None,
     )
 
 
@@ -660,37 +665,33 @@ class TestIdeogram4(unittest.TestCase):
                 ),
             )
             decode_stage = Ideogram4DecodingStage(vae=FakeIdeogramVAE())
-            batch = SimpleNamespace(
-                preset="V4_TURBO_12",
-                height=256,
-                width=256,
-                latents=torch.zeros(1, 1, 128, device=device),
-                prompt_embeds=[torch.zeros(1, 2, 8, device=device)],
-                extra={
-                    "ideogram4": {
-                        "max_text_tokens": 1,
-                        "num_image_tokens": 1,
-                        "position_ids": torch.zeros(
-                            1, 2, 3, dtype=torch.long, device=device
-                        ),
-                        "segment_ids": torch.ones(
-                            1, 2, dtype=torch.long, device=device
-                        ),
-                        "indicator": torch.tensor(
-                            [[LLM_TOKEN_INDICATOR, OUTPUT_IMAGE_INDICATOR]],
-                            dtype=torch.long,
-                            device=device,
-                        ),
-                        "grid_h": 1,
-                        "grid_w": 1,
-                    }
-                },
-                suppress_logs=True,
-                trajectory_timesteps=None,
-                trajectory_latents=None,
-                rollout_trajectory_data=None,
-                metrics={},
+            batch = Req(
+                sampling_params=Ideogram4SamplingParams(
+                    prompt="11 12",
+                    height=256,
+                    width=256,
+                    preset="V4_TURBO_12",
+                    suppress_logs=True,
+                )
             )
+            batch.latents = torch.zeros(1, 1, 128, device=device)
+            batch.raw_latent_shape = batch.latents.shape
+            batch.prompt_embeds = [torch.zeros(1, 2, 8, device=device)]
+            batch.extra["ideogram4"] = {
+                "max_text_tokens": 1,
+                "num_image_tokens": 1,
+                "position_ids": torch.zeros(
+                    1, 2, 3, dtype=torch.long, device=device
+                ),
+                "segment_ids": torch.ones(1, 2, dtype=torch.long, device=device),
+                "indicator": torch.tensor(
+                    [[LLM_TOKEN_INDICATOR, OUTPUT_IMAGE_INDICATOR]],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                "grid_h": 1,
+                "grid_w": 1,
+            }
             denoised = denoise_stage.forward(batch, args)
             self.assertEqual(tuple(denoised.latents.shape), (1, 1, 128))
             decoded = decode_stage.forward(denoised, args)
