@@ -188,7 +188,13 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 .amax()
                 .to(device=weight.device, dtype=torch.float32)
             )
-            fp8_fp4_max = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
+            e4m3_max = (
+                256.0
+                if envs.FLASHINFER_NVFP4_4OVER6.get()
+                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+                else float(torch.finfo(torch.float8_e4m3fn).max)
+            )
+            fp8_fp4_max = e4m3_max * 6.0
             weight_scale_2 = torch.where(
                 weight_amax > 0,
                 weight_amax / fp8_fp4_max,
@@ -284,13 +290,15 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     @staticmethod
     def _scale_weight_name(weight_name: str) -> str:
         if "weight" in weight_name:
-            return weight_name.replace("weight", "weight_scale")
+            prefix, suffix = weight_name.rsplit("weight", 1)
+            return f"{prefix}weight_scale{suffix}"
         return f"{weight_name}.weight_scale"
 
     @staticmethod
     def _scale_2_weight_name(weight_name: str) -> str:
         if "weight" in weight_name:
-            return weight_name.replace("weight", "weight_scale_2")
+            prefix, suffix = weight_name.rsplit("weight", 1)
+            return f"{prefix}weight_scale_2{suffix}"
         return f"{weight_name}.weight_scale_2"
 
     def get_online_weight_loader(self, layer, original_weight_loader):
@@ -480,9 +488,7 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
         def process_fp8_weight_scale(
-            param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
-            weight_name: str,
             shard_id: str,
             expert_id: Optional[int],
         ) -> None:
@@ -532,9 +538,7 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 return
 
             if self._is_fp8_weight_scale_name(weight_name):
-                process_fp8_weight_scale(
-                    param, loaded_weight, weight_name, shard_id, expert_id
-                )
+                process_fp8_weight_scale(loaded_weight, shard_id, expert_id)
                 return
 
             if "weight" in weight_name:
