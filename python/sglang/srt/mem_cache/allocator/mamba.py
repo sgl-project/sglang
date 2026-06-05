@@ -22,15 +22,12 @@ free-slot bookkeeping.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import Iterator, Optional
 
 import torch
 
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import MambaPool
 
-
-class MambaTokenToKVPoolAllocator:
+class MambaSlotAllocator:
     """Manages the free-list of Mamba pool slot indices.
 
     Unlike ``BaseTokenToKVPoolAllocator`` which is designed for per-token KV
@@ -38,20 +35,11 @@ class MambaTokenToKVPoolAllocator:
     We keep the interface minimal and do NOT inherit the KV base class.
     """
 
-    def __init__(self, size: int, device: str, mamba_pool: "MambaPool"):
+    def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
-        self._mamba_pool = mamba_pool
-
-        self._is_not_in_free_group = True
-        self._free_group: list[torch.Tensor] = []
         self._alloc_iter: Optional[Iterator] = None
-
         self.clear()
-
-    @property
-    def mamba_pool(self) -> "MambaPool":
-        return self._mamba_pool
 
     def available_size(self) -> int:
         return len(self.free_slots)
@@ -89,34 +77,10 @@ class MambaTokenToKVPoolAllocator:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        if self._is_not_in_free_group:
-            self.free_slots = torch.cat((self.free_slots, free_index))
-        else:
-            self._free_group.append(free_index)
-
-    def free_group_begin(self):
-        self._is_not_in_free_group = False
-        self._free_group = []
-
-    def free_group_end(self):
-        self._is_not_in_free_group = True
-        if self._free_group:
-            self.free(torch.cat(self._free_group))
+        self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
-        self._is_not_in_free_group = True
-        self._free_group = []
-
-    def clear_slots(self, indices: torch.Tensor):
-        """Zero out mamba state at the given pool indices (delegates to pool)."""
-        self._mamba_pool.clear_slots(indices)
-
-    def backup_state(self) -> torch.Tensor:
-        return self.free_slots.clone()
-
-    def restore_state(self, state: torch.Tensor):
-        self.free_slots = state
