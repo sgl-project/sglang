@@ -462,8 +462,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
     def test_backend_replay_keeps_captured_metadata_active(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DSV4Metadata,
             DeepseekV4AttnBackend,
+            DSV4Metadata,
         )
 
         capture_metadata = DSV4Metadata(
