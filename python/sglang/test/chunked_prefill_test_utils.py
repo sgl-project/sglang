@@ -37,12 +37,16 @@ KV_CANARY_ARGS: List[str] = [
     "partial",
     "--kv-canary-sweep-interval",
     "100",
+    # canary's SingleForwardManager design requires piecewise cuda graph off
+    # (same pairing the scripted harness uses).
+    "--disable-piecewise-cuda-graph",
 ]
 
 
 @dataclass
 class ChunkedSimpleTester:
     feature_args: List[str]
+    use_kv_canary: bool
     chunked_prefill_size: int
     num_shots: int
     num_examples: int
@@ -52,14 +56,15 @@ class ChunkedSimpleTester:
     seed: int
 
     def build_prefill_side_args(self) -> List[str]:
+        canary = list(KV_CANARY_ARGS) if self.use_kv_canary else []
         return (
             ["--chunked-prefill-size", str(self.chunked_prefill_size)]
             + list(self.feature_args)
-            + list(KV_CANARY_ARGS)
+            + canary
         )
 
     def build_decode_side_args(self) -> List[str]:
-        return list(KV_CANARY_ARGS)
+        return list(KV_CANARY_ARGS) if self.use_kv_canary else []
 
     def run_eval(self, base_url: str, model: str, fixture_name: str) -> dict:
         args = SimpleNamespace(
@@ -97,6 +102,7 @@ class ChunkedSimpleTester:
 def _build_simple_tester(cls) -> ChunkedSimpleTester:
     return ChunkedSimpleTester(
         feature_args=cls.feature_args,
+        use_kv_canary=cls.use_kv_canary,
         chunked_prefill_size=cls.chunked_prefill_size,
         num_shots=cls.num_shots,
         num_examples=cls.num_examples,
@@ -110,6 +116,9 @@ def _build_simple_tester(cls) -> ChunkedSimpleTester:
 class ChunkedTestBase(CustomTestCase):
     # base class: not collectible as a test on its own
     __test__ = False
+    # canary is unsupported on some engine paths (ChunkCache, hisparse, some
+    # pools); such classes opt out, mirroring the scripted TestRadixDisabled.
+    use_kv_canary: ClassVar[bool] = True
     model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
 
@@ -151,6 +160,7 @@ class ChunkedTestBase(CustomTestCase):
 class ChunkedTestPDBase(PDDisaggregationServerBase):
     # base class: not collectible as a test on its own
     __test__ = False
+    use_kv_canary: ClassVar[bool] = True
     model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
     # Extra args for the decode server only (e.g. matching its TP to the prefill

@@ -5,13 +5,15 @@ from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 
 class TestChunkedFeatureLoRA(ChunkedTestBase):
     __test__ = True  # re-enable: the shared base sets __test__ = False
-    model = "meta-llama/Llama-2-7b-hf"
-    gsm8k_threshold = 0.50
+    model = "meta-llama/Llama-3.2-1B-Instruct"
+    gsm8k_threshold = (
+        0.20  # Llama-3.2-1B-Instruct baseline; chunking corruption collapses it to ~0
+    )
     feature_args = [
         "--enable-lora",
         "--lora-paths",
         "winddude/wizardLM-LlaMA-LoRA-7B",
-        "RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
+        "codelion/Llama-3.2-1B-Instruct-tool-calling-lora",
         "--max-loras-per-batch",
         "2",
         "--max-loaded-loras",
