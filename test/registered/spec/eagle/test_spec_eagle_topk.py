@@ -8,6 +8,7 @@ where fa3 (Hopper-only) isn't available -- functional sanity only, no perf/stres
 
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
@@ -31,6 +32,7 @@ class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogp
     acc_length_thres = 3.1
     batch_accept_len_thres = 1.75
     gsm8k_accept_len_thres = 2.4  # EAGLE3 topk16 gsm8k accept ~2.48
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagle3Topk16SpecV2(TestEagle3Topk16, SpecFeatureKit):
@@ -50,11 +52,14 @@ class TestEagleLlama2Suite(
 ):
     """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases)."""
 
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+
 
 class TestEagleLlama2Chunked4(EagleLlama2Base, SpecCorrectnessKit):
     """Correctness under tiny chunked prefill."""
 
     chunked_prefill_size = 4
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
@@ -70,6 +75,7 @@ class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
         "--speculative-token-map",
         "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
     )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 if __name__ == "__main__":
