@@ -4,11 +4,24 @@ When reviewing pull requests in this repository, read
 `.claude/rules/modify-component-must-read.md` and check whether the change
 follows it.
 
-In particular:
+Use that file as the source of truth. At the time this style guide was added,
+the required checks include:
 
-- If a pull request modifies a component listed in
+- Changes to speculative decoding code must follow the `speculative-naming`
+  guidance. This includes code under `python/sglang/srt/speculative/`, related
+  attention backends, scheduler accumulators, IPC fields, observability metrics,
+  and CLI flags.
+- Changes to `Scheduler`, `TokenizerManager`, or `ModelRunner` `__init__`
+  methods must follow the `large-class-init-style` guidance.
+- Changes that add, rename, review, or migrate `SGLANG_*` / `SGL_*`
+  environment variables, or touch `python/sglang/srt/environ.py`, must follow
+  the `env-var-conventions` guidance.
+
+When applying these checks:
+
+- If the pull request modifies a component listed in
   `.claude/rules/modify-component-must-read.md`, verify that the implementation
-  follows the corresponding required skill guidance.
+  follows the corresponding required guidance.
 - Treat violations of those component-specific requirements as review findings,
   not as optional style suggestions.
 - Prefer actionable comments that identify the changed component, the required
