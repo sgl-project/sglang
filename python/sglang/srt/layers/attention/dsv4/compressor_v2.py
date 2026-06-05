@@ -624,23 +624,6 @@ class CompressorBackendMixin:
         if kv_to_store.shape[0] == 0:
             return
 
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        if is_unified_kv_triton() and not is_indexer:
-            from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
-                store_compressed_into_unified,
-            )
-
-            store_compressed_into_unified(
-                kv_compressed=kv_to_store,
-                out_loc=out_loc_to_store,
-                unified_kv=token_to_kv_pool.get_unified_kv(layer_id),
-                swa_pages=token_to_kv_pool.unified_swa_pages,
-            )
-            return
-
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             # fused kernel: BF16 in -> FP8 quant + paged scatter in one launch
             if is_indexer:
