@@ -95,6 +95,11 @@ class _FluxDenoisingStageRouter(PipelineStage):
         self.standard_stage.set_profile_stage_name(stage_name)
         self.progressive_stage.set_profile_stage_name(stage_name)
 
+    def _active_profile_stage_name(self) -> str:
+        # Report under the canonical DenoisingStage name so existing perf baselines
+        # and tolerance logic (which checks stage == "DenoisingStage") stay correct.
+        return "DenoisingStage"
+
     def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
         return self.standard_stage.component_uses(server_args, stage_name)
 
