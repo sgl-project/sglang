@@ -125,13 +125,13 @@ class Lfm2Attention(nn.Module):
         if rope_parameters is not None and "rope_theta" in rope_parameters:
             rope_theta = rope_parameters["rope_theta"]
         else:
-            rope_theta = config.rope_parameters["rope_theta"]
+            rope_theta = getattr(config, "rope_theta", 1000000.0)
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=getattr(config, "max_position_embeddings", 8192),
-            rope_scaling=config.rope_parameters,
+            rope_scaling=rope_parameters or getattr(config, "rope_scaling", None),
             base=rope_theta,
             is_neox_style=True,
             dtype=torch.get_default_dtype(),

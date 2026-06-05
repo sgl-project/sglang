@@ -61,8 +61,8 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "64",
         ]
         with (
-            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
-            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
         ):
             cls.process = popen_launch_server(
                 cls.model,

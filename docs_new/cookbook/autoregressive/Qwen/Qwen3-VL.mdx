@@ -48,6 +48,34 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 * **Expert Parallelism** : SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
 * **Kernel Tuning** : For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
 
+**Hardware-specific notes:**
+- **H100 (FP8):** Use the `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` checkpoint for best memory efficiency.
+- **A100 / H100 (BF16):** Use standard multimodal parameters to manage throughput and GPU memory usage.
+- **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
+
+**Additional multimodal server parameters:**
+- `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid device-to-host memory copies, improving performance for high-frequency inference.
+
+**Example with full multimodal optimizations:**
+```bash Command
+SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
+SGLANG_VLM_CACHE_SIZE_MB=0 \
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-235B-A22B-Instruct \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code \
+  --tp-size 8 \
+  --enable-cache-report \
+  --log-level info \
+  --max-running-requests 64 \
+  --mem-fraction-static 0.65 \
+  --chunked-prefill-size 8192 \
+  --attention-backend fa3 \
+  --mm-attention-backend fa3 \
+  --enable-metrics
+```
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
@@ -69,7 +97,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="EMPTY",
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:30000/v1",
     timeout=3600
 )
 
@@ -129,7 +157,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="EMPTY",
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:30000/v1",
     timeout=3600
 )
 
@@ -192,7 +220,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="EMPTY",
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:30000/v1",
     timeout=3600
 )
 
@@ -247,7 +275,7 @@ python -m sglang.launch_server \
   --reasoning-parser qwen3 \
   --tp 8 \
   --host 0.0.0.0 \
-  --port 8000
+  --port 30000
 ```
 
 **Streaming with Thinking Process:**
@@ -256,7 +284,7 @@ python -m sglang.launch_server \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:30000/v1",
     api_key="EMPTY"
 )
 
@@ -325,7 +353,7 @@ python -m sglang.launch_server \
   --tool-call-parser qwen \
   --tp 8 \
   --host 0.0.0.0 \
-  --port 8000
+  --port 30000
 ```
 
 **Python Example (with Thinking Process):**
@@ -334,7 +362,7 @@ python -m sglang.launch_server \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:30000/v1",
     api_key="EMPTY"
 )
 
@@ -505,7 +533,7 @@ python -m sglang.launch_server \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --tp 8 \
   --host 0.0.0.0 \
-  --port 8000
+  --port 30000
 ```
 
 - Benchmark Command:
@@ -514,7 +542,7 @@ python -m sglang.launch_server \
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
-  --port 8000 \
+  --port 30000 \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --dataset-name image \
   --image-count 2 \
@@ -577,7 +605,7 @@ SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --tp 8 \
   --host 0.0.0.0 \
-  --port 8000
+  --port 30000
 ```
 
 - Benchmark Command:
@@ -586,7 +614,7 @@ SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
-  --port 8000 \
+  --port 30000 \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --dataset-name image \
   --image-count 2 \
@@ -649,7 +677,7 @@ python -m sglang.launch_server \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --tp 8 \
   --host 0.0.0.0 \
-  --port 8000
+  --port 30000
 ```
 
 - Benchmark Command:
@@ -658,7 +686,7 @@ python -m sglang.launch_server \
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
-  --port 8000 \
+  --port 30000 \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --dataset-name image \
   --image-count 2 \
@@ -723,7 +751,7 @@ uv pip install lmms_eval
 
 python3 -m lmms_eval \
   --model openai_compatible \
-  --model_args "model=Qwen/Qwen3-VL-235B-A22B-Instruct,api_key=EMPTY,base_url=http://127.0.0.1:8000/v1/" \
+  --model_args "model=Qwen/Qwen3-VL-235B-A22B-Instruct,api_key=EMPTY,base_url=http://127.0.0.1:30000/v1/" \
   --tasks mmmu_val \
   --batch_size 128 \
   --log_samples \

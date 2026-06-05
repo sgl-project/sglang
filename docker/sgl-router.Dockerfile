@@ -12,6 +12,12 @@
 # manifests → cargo fetch → copy src" approach caches only the fetched
 # registry; every source change still recompiles every dep.
 #
+# `Cargo.lock` is gitignored repo-wide (root .gitignore "# Rust lib"
+# block), so we generate it inside the chef stage with `cargo
+# generate-lockfile` and propagate that lockfile to the builder via
+# `COPY --from=chef`. Both stages thus build against the same lockfile,
+# preserving --locked semantics within a single Docker build.
+#
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
 # Run:
@@ -29,12 +35,13 @@ ARG DEBIAN_VERSION=bookworm
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
-COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
+COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/rust-toolchain.toml ./
-# Recipe captures the dep graph from Cargo.{toml,lock}; output is
-# cacheable per-(Cargo.lock-hash).
+# Stub a minimal src tree so cargo can resolve the workspace, generate
+# the lockfile (gitignored upstream), then prepare the chef recipe.
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
+    && cargo generate-lockfile \
     && cargo chef prepare --recipe-path recipe.json \
     && rm -rf src
 
@@ -43,6 +50,7 @@ FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
 COPY --from=chef /work/recipe.json ./recipe.json
+COPY --from=chef /work/Cargo.lock ./Cargo.lock
 COPY experimental/sgl-router/rust-toolchain.toml ./
 
 # Cook (compile + cache) the dep graph from the recipe. This layer's
@@ -50,11 +58,14 @@ COPY experimental/sgl-router/rust-toolchain.toml ./
 # invalidate it.
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Now bring in the real sources and the manifests they need.
-COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
+# Now bring in the real sources and the manifest they need.
+COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/src ./src
 
-RUN cargo build --release --locked --bin sgl-router \
+# --locked is intentionally omitted: the lockfile is generated in-container
+# (gitignored upstream) and `cargo chef cook` may have mutated it during the
+# dep-cook step, so a strict --locked check would spuriously fail.
+RUN cargo build --release --bin sgl-router \
     && strip target/release/sgl-router
 
 ######################## STAGE 3 — runtime ##############################

@@ -33,6 +33,7 @@ export const DeepSeekV4Deployment = () => {
         { id: "gb300", label: "GB300", default: false },
         { id: "h200",  label: "H200",  default: false },
         { id: "h100",  label: "H100",  default: false },
+        { id: "rtx6000", label: "RTX PRO 6000", default: false },
       ],
     },
     modelSize: {
@@ -119,12 +120,12 @@ export const DeepSeekV4Deployment = () => {
   const MARLIN_EFFHW = new Set(["h200-fp4", "h100"]);
   const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
 
-  // MegaMoE is only wired into the deepep-replacing recipes on Blackwell
-  // (balanced / max-throughput). Disabled on Hopper (H100 / H200, both FP4
-  // and FP8), on low-latency / cp recipes, and on PD-Disagg (the cookbook's
+  // MegaMoE is only wired into the max-throughput recipe on Blackwell.
+  // Disabled on Hopper (H100 / H200, both FP4 and FP8), on
+  // low-latency / balanced / cp recipes, and on PD-Disagg (the cookbook's
   // PD command builder doesn't emit the megamoe backend / env vars yet).
-  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "cp", "pd-disagg"]);
-  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200"]);
+  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "balanced", "cp", "pd-disagg"]);
+  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200", "rtx6000"]);
   const isMegamoeUnsupported = (vals) =>
     MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
     MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe);
@@ -133,7 +134,9 @@ export const DeepSeekV4Deployment = () => {
   // mooncake_store/README.md), but the cookbook generator doesn't yet emit
   // the hicache flags into buildPDDisaggCommand. Grey it out for now.
   const HICACHE_UNSUPPORTED_RECIPES = new Set(["pd-disagg"]);
+  const HICACHE_UNSUPPORTED_HARDWARE = new Set(["rtx6000"]);
   const isHicacheUnsupported = (vals) =>
+    HICACHE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
     HICACHE_UNSUPPORTED_RECIPES.has(vals.recipe);
 
   // H100 + SGLang FP8 only ships a Flash variant — Pro FP8 on H100 isn't
@@ -171,16 +174,36 @@ export const DeepSeekV4Deployment = () => {
       );
     }
     if (option.name === "hicache" && vals && isHicacheUnsupported(vals)) {
+      const reason = HICACHE_UNSUPPORTED_HARDWARE.has(vals.hardware)
+        ? "HiCache is not supported on RTX PRO 6000"
+        : "HiCache is not yet wired into the PD-Disagg cookbook command";
       return option.items.map((it) =>
         it.id === "disabled"
           ? it
-          : { ...it, disabled: true, disabledReason: "HiCache is not yet wired into the PD-Disagg cookbook command" }
+          : { ...it, disabled: true, disabledReason: reason }
       );
     }
     if (option.name === "quantization" && vals && !FP8_SUPPORTED_HARDWARE.has(vals.hardware)) {
       return option.items.map((it) =>
         it.id === "fp8"
           ? { ...it, disabled: true, disabledReason: "SGLang FP8 is only available on H100 / H200" }
+          : it
+      );
+    }
+    // RTX PRO 6000: Flash only (Pro doesn't fit in 8× 96 GB).
+    if (option.name === "modelSize" && vals && vals.hardware === "rtx6000") {
+      return option.items.map((it) =>
+        it.id === "big"
+          ? { ...it, disabled: true, disabledReason: "V4-Pro does not fit on RTX PRO 6000 (8× 96 GB)" }
+          : it
+      );
+    }
+    // RTX PRO 6000: TP-only, no EP / CP / PD-Disagg.
+    if (option.name === "recipe" && vals && vals.hardware === "rtx6000") {
+      const rtx6000Unsupported = new Set(["balanced", "max-throughput", "cp", "pd-disagg"]);
+      return option.items.map((it) =>
+        rtx6000Unsupported.has(it.id)
+          ? { ...it, disabled: true, disabledReason: "RTX PRO 6000 supports low-latency (TP-only) recipe" }
           : it
       );
     }
@@ -266,10 +289,10 @@ export const DeepSeekV4Deployment = () => {
       ) {
         next.megamoe = "disabled";
       }
-      // Switching to a recipe that doesn't support HiCache (pd-disagg) while
+      // Switching to a recipe or hardware that doesn't support HiCache while
       // L2 is selected: fall back to disabled.
       if (
-        optionName === "recipe" &&
+        (optionName === "hardware" || optionName === "recipe") &&
         next.hicache !== "disabled" &&
         isHicacheUnsupported(next)
       ) {
@@ -342,6 +365,9 @@ export const DeepSeekV4Deployment = () => {
     // the generator. TP=8 single-node uses the same sgl-project FP8 ckpt as
     // H200; the Flash/balanced/max-throughput recipes use TP=8 DP=8 + DeepEP.
     "h100-fp8|small": { slug: "sgl-project/DeepSeek-V4-Flash-FP8", tp: 8, multinode: false },
+    // RTX PRO 6000: Flash only, TP=4 single-node. Uses Marlin MoE runner
+    // with RTX PRO 6000 Triton fallback kernels. Requires lmsysorg/sglang:latest.
+    "rtx6000|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4, multinode: false },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
@@ -412,6 +438,7 @@ export const DeepSeekV4Deployment = () => {
     "h100-fp8|small|low-latency",
     "h100-fp8|small|balanced",
     "h100-fp8|small|max-throughput",
+    "rtx6000|small|low-latency",
   ]);
   // Recipes whose command is intentionally not yet provided (e.g. blocked by an
   // upstream limitation). Showing a minimal placeholder is friendlier to users
@@ -473,6 +500,29 @@ export const DeepSeekV4Deployment = () => {
 
     if (recipe === "pd-disagg") {
       return buildPDDisaggCommand(hardware, modelSize);
+    }
+
+    // RTX PRO 6000 path: Flash only, TP=4, Marlin MoE w/ RTX PRO 6000 Triton
+    // fallback. Requires Docker image lmsysorg/sglang:latest.
+    if (hardware === "rtx6000") {
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      const rtx6000Flags = [
+        "  --trust-remote-code",
+        `  --model-path ${slug}`,
+        `  --tp ${tp}`,
+        "  --moe-runner-backend marlin",
+        "  --mem-fraction-static 0.70",
+        "  --cuda-graph-max-bs 32",
+      ];
+      if (toolcall === "enabled") rtx6000Flags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") rtx6000Flags.push("  --reasoning-parser deepseek-v4");
+      rtx6000Flags.push("  --host 0.0.0.0");
+      rtx6000Flags.push("  --port 30000");
+
+      const rtx6000Cmd = `sglang serve \\\n${rtx6000Flags.join(" \\\n")}`;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? rtx6000Cmd
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(rtx6000Cmd)}`;
     }
 
     // H200 (FP4) path: dedicated branch — Hopper runs the FP4-mixed Instruct
@@ -864,12 +914,6 @@ export const DeepSeekV4Deployment = () => {
     if (megamoe !== "disabled" && recipe === "max-throughput") {
       megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320");
     }
-    // Blackwell balanced always runs with MTP (1/1/2) — when MegaMoE is layered on
-    // top, cap the per-rank dispatch buffer at 4096 to keep MoE memory in budget.
-    // (megamoe is gated to Blackwell by MEGAMOE_UNSUPPORTED_HARDWARE.)
-    if (megamoe !== "disabled" && recipe === "balanced") {
-      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096");
-    }
     if (megamoe === "w4a4") {
       megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1");
       megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1");
@@ -907,6 +951,20 @@ export const DeepSeekV4Deployment = () => {
         `#   GLOO_SOCKET_IFNAME=<your-nic>\n` +
         `#   NVSHMEM_ENABLE_NIC_PE_MAPPING=1\n` +
         `#   NVSHMEM_HCA_LIST=<your-hca-list>\n` +
+        cmd;
+    }
+    // GB200 Pro with MegaMoE disabled runs the DeepEP a2a backend, which is
+    // currently only packaged in the CUDA 12.9 image — the default `:latest`
+    // ships CUDA 13 and does not include a compatible DeepEP build.
+    if (
+      hardware === "gb200" &&
+      isBig &&
+      megamoe === "disabled" &&
+      flags.some((f) => f.includes("--moe-a2a-backend deepep"))
+    ) {
+      cmd =
+        `# NOTE: for the DeepEP backend, use the cu129 docker image\n` +
+        `# (lmsysorg/sglang:latest-cu129) instead of the default \`:latest\`.\n` +
         cmd;
     }
     const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
