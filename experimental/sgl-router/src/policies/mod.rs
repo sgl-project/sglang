@@ -11,6 +11,7 @@ pub mod registry;
 pub mod round_robin;
 
 use crate::discovery::ModelId;
+use crate::server::metrics::MetricsRegistry;
 use crate::workers::Worker;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -46,6 +47,13 @@ impl<'a> SelectionContext<'a> {
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>>;
+
+    /// Attach the process metrics registry after construction. Default is a
+    /// no-op — only policies that emit metrics (cache-aware-zmq's
+    /// `sgl_router_overlap_blocks`) override it. Mirrors
+    /// `ActiveLoadRegistry::attach_metrics`: the registry is built after the
+    /// policies, so it is injected here rather than passed to the constructor.
+    fn attach_metrics(&self, _metrics: Arc<MetricsRegistry>) {}
 }
 
 #[derive(Debug, Default)]
@@ -60,5 +68,14 @@ impl PolicyRegistry {
 
     pub fn get(&self, model: &ModelId) -> Option<Arc<dyn Policy>> {
         self.by_model.get(model).map(|p| p.clone())
+    }
+
+    /// Inject the metrics registry into every registered policy. Called once
+    /// at startup (after the registry is built) so metrics-emitting policies
+    /// can record into the shared registry.
+    pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        for entry in self.by_model.iter() {
+            entry.value().attach_metrics(Arc::clone(&metrics));
+        }
     }
 }

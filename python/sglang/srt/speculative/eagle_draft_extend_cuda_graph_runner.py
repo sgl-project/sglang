@@ -572,6 +572,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 next_token_logits=out.next_token_logits[:unpadding_bs],
                 hidden_states=out.hidden_states[:unpadding_bs],
             )
-            out.topk_p = out_copy.topk_p[:unpadding_bs]
-            out.topk_index = out_copy.topk_index[:unpadding_bs]
+            if self.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
+                out.topk_p = out_copy.topk_p[:raw_bs]
+                out.topk_index = out_copy.topk_index[:raw_bs]
         return out
