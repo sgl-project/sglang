@@ -535,49 +535,28 @@ class TestKVPressureSmallPool(ScriptedTestCase):
     @staticmethod
     def _script_kv_recovery_after_full(t: ScriptedContext):
         baseline = t.engine_stats()["kv_pool_free"]
-        # Engine-native pressure: two long-lived ballast decode reqs fill the
-        # small pool's rem_total (held tokens + clipped decode reservations), so
-        # a fresh 16-token req cannot admit and parks in waiting_queue. Aborting
-        # the ballasts is the real release path; the newcomer then completes and
-        # the pool recovers to baseline.
+        # Engine-native pressure: two ballast decode reqs whose PROMPTS alone
+        # hold 2x1900 of the 4096-token pool. The admission gate subtracts the
+        # ballasts' clipped decode reservations (~2*512*new_token_ratio) from
+        # what is left (~296), driving rem_total below zero, so a fresh
+        # 16-token req cannot admit and parks in waiting_queue. (2x1536 left
+        # ~1024 free, which the ratio-discounted reservations did not close --
+        # the newcomer admitted; 1900 makes the arithmetic decisive.)
         b1 = t.start_req(
-            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+            prompt_len=1900,
             max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
             ignore_eos=True,
             prompt_token=620,
         )
         b2 = t.start_req(
-            prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
+            prompt_len=1900,
             max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
             ignore_eos=True,
             prompt_token=621,
         )
         yield from run_until(b1, lambda h: h.status == "running")
         yield from run_until(b2, lambda h: h.status == "running")
-
-        # The decode reservations are ratio-discounted, so two big ballasts may
-        # leave admission headroom; top up with small ballasts until the free
-        # pool genuinely cannot admit a 16-token req (prompt + reservation).
         ballasts = [b1, b2]
-        for i in range(10):
-            if t.engine_stats()["kv_pool_free"] < 20:
-                break
-            extra = t.start_req(
-                prompt_len=128,
-                max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
-                ignore_eos=True,
-                prompt_token=630 + i,
-            )
-            ballasts.append(extra)
-            for _ in range(8):
-                if extra.status == "running":
-                    break
-                yield
-        assert t.engine_stats()["kv_pool_free"] < 20, (
-            f"ballasts never drove the pool below the 16-token admission "
-            f"threshold; kv_pool_free={t.engine_stats()['kv_pool_free']}"
-        )
-
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         for _ in range(6):
             yield
