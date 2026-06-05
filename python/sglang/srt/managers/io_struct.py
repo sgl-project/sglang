@@ -102,7 +102,7 @@ class BaseBatchReq(ABC):
 # The BaseBatchReq IPC class for IPC object
 class BaseBatchReqIpc(msgspec.Struct, tag=True, kw_only=True):
     rids: Optional[List[str]] = None
-    http_worker_ipcs: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[Optional[str]]] = None
 
 
 class SpeculativeDecodingMetricsMixinReq(BaseBatchReqIpc, kw_only=True):
@@ -1136,18 +1136,42 @@ class BatchTokenIDOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    input_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    output_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    output_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    input_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    input_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    output_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    output_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    input_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    input_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    output_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    output_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    input_token_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    input_token_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    output_token_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    output_token_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    input_top_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    input_top_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    output_top_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    output_top_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    input_token_ids_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    input_token_ids_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    output_token_ids_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    output_token_ids_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
@@ -1201,18 +1225,42 @@ class BatchStrOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    input_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    output_token_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    output_token_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    input_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    input_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    output_top_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    output_top_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    input_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    input_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
-    output_token_ids_logprobs_val: Optional[List[Optional[List[Optional[float]]]]]
-    output_token_ids_logprobs_idx: Optional[List[Optional[List[Optional[int]]]]]
+    input_token_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    input_token_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    output_token_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    output_token_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    input_top_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    input_top_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    output_top_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    output_top_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    input_token_ids_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    input_token_ids_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
+    output_token_ids_logprobs_val: Optional[
+        List[Optional[List[Optional[Union[float, List[Optional[float]]]]]]]
+    ]
+    output_token_ids_logprobs_idx: Optional[
+        List[Optional[List[Optional[Union[int, List[Optional[int]]]]]]]
+    ]
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states

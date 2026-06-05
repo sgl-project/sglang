@@ -14,6 +14,7 @@
 """Sampling parameters for text generation."""
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
@@ -28,6 +29,7 @@ TOP_K_ALL = 1 << 30
 logger = logging.getLogger(__name__)
 
 
+@dataclass
 class SamplingParams:
     """
     The sampling parameters.
@@ -36,6 +38,34 @@ class SamplingParams:
     https://docs.sglang.io/backend/sampling_params.html
     for the documentation.
     """
+
+    max_new_tokens: Optional[int]
+    stop_strs: Optional[Union[str, List[str]]]
+    stop_token_ids: Optional[List[int]]
+    stop_regex_strs: Optional[Union[str, List[str]]]
+    stop_str_max_len: int
+    stop_regex_max_len: int
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    frequency_penalty: float
+    presence_penalty: float
+    repetition_penalty: float
+    min_new_tokens: int
+    regex: Optional[str]
+    n: int
+    json_schema: Optional[str]
+    ebnf: Optional[str]
+    structural_tag: Optional[str]
+    ignore_eos: bool
+    skip_special_tokens: bool
+    spaces_between_special_tokens: bool
+    no_stop_trim: bool
+    custom_params: Optional[Dict[str, Any]]
+    stream_interval: Optional[int]
+    logit_bias: Optional[Dict[str, float]]
+    sampling_seed: Optional[int]
 
     def __init__(
         self,
