@@ -83,7 +83,7 @@ class LayerTransferCounter:
     def __init__(
         self,
         num_layers: int,
-        load_stream: torch.cuda.Stream,
+        load_stream: torch.Stream,
         lmc_connector: LMCacheLayerwiseConnector,
         printable: bool = False,
     ):
@@ -369,7 +369,7 @@ class LMCRadixCache(RadixCache):
                 LoadMetadata(
                     token_ids=key.token_ids,  # full page-aligned key
                     slot_mapping=slot_mapping,
-                    offset=value.numel() - prefix_pad,  # LMCache offset convention
+                    offset=value_numel - prefix_pad,  # LMCache offset convention
                 )
             )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
@@ -412,8 +412,9 @@ class LMCRadixCache(RadixCache):
         """MP non-layerwise loader: fire ``retrieve_kv`` and wait for the
         load_stream so the compute stream observes the writes.
         """
-        self.load_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.load_stream):
+        current_stream = torch.current_stream(device=self.device)
+        self.load_stream.wait_stream(current_stream)
+        with _device_stream_context(self.load_stream):
             n = self.lmcache_connector.retrieve_kv(
                 LoadMetadata(
                     token_ids=marker.key.token_ids,
@@ -423,7 +424,7 @@ class LMCRadixCache(RadixCache):
                     request_id=request_id,
                 )
             )
-        torch.cuda.current_stream().wait_stream(self.load_stream)
+        current_stream.wait_stream(self.load_stream)
         return n
 
     def _ip_load_back(
@@ -439,7 +440,7 @@ class LMCRadixCache(RadixCache):
         ``start_load_kv`` enqueues the first layer's transfer; the
         ``LayerTransferCounter`` hook drives the rest during forward.
         """
-        with torch.cuda.stream(self.load_stream):
+        with _device_stream_context(self.load_stream):
             return self.lmcache_connector.start_load_kv(
                 LoadMetadata(
                     token_ids=token_ids,
