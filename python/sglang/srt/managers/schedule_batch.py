@@ -816,6 +816,11 @@ class Req(ReqDllmMixin):
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         self.host_hit_length = 0
+        # Total cached prefix length (on-device prefix_indices + host_hit_length),
+        # capped at the max allowed prefix. Set during prefix matching at schedule
+        # time and used to estimate uncached tokens / sort by longest prefix for
+        # load reporting.
+        self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -1315,6 +1320,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_input_len = 0

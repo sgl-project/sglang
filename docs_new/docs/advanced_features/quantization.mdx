@@ -258,7 +258,7 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
     <tr>
       <td><code>auto</code></td>
       <td>SM80+</td>
-      <td>Auto-selects: <code>flashinfer_cudnn</code> on SM120; <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>flashinfer_cutlass</code> otherwise</td>
+      <td>Auto-selects: <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>flashinfer_cutlass</code> otherwise (including SM120)</td>
     </tr>
     <tr>
       <td><code>cutlass</code></td>
@@ -273,7 +273,7 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
     <tr>
       <td><code>flashinfer_cudnn</code></td>
       <td>SM100/120 (CUDA 13+, cuDNN 9.15+)</td>
-      <td>FlashInfer cuDNN backend; used on SM120 for performance</td>
+      <td>FlashInfer cuDNN backend</td>
     </tr>
     <tr>
       <td><code>flashinfer_cutedsl</code></td>

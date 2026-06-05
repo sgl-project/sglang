@@ -516,6 +516,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 + batch_result.accept_lens
                 - 1
             )
+            # NOTE: this non-graph path runs the per-step forwards without any
+            # pre-plan (see warning above). Mark the batch so the forward path
+            # keeps skipping metadata init — preserves the pre-existing
+            # behavior; the latent issue is tracked by the warning.
+            forward_batch.mark_forward_metadata_ready()
 
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
@@ -530,8 +535,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
+                # Skip relies on the unconditional mark above (pre-existing
+                # no-pre-plan behavior preserved verbatim).
                 draft_logits_output = self.draft_runner_list[step].forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 )
                 probs = torch.softmax(
                     draft_logits_output.logits_output.next_token_logits[select_index],
@@ -768,12 +775,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
+        # NOTE: metadata init is skipped here unconditionally, although
+        # prepare_for_v2_verify only plans when cuda-graph replay_prepare ran.
+        # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
+        # worker has not adopted that fix, so preserve its behavior verbatim.
+        verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
 
