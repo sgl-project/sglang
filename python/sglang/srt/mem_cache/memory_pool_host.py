@@ -118,7 +118,13 @@ class SharedMemoryHostTensorAllocator(HostTensorAllocator):
         self.group = group
         self.name_prefix = self._sanitize_name(name_prefix)
         self.is_writer = is_writer
-        self.directory = directory or tempfile.gettempdir()
+        if directory is None:
+            if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK):
+                self.directory = "/dev/shm"
+            else:
+                self.directory = tempfile.gettempdir()
+        else:
+            self.directory = directory
         self.unlink_after_attach = unlink_after_attach
         self._alloc_index = 0
         self._mmap_refs = []
