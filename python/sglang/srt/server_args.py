@@ -376,7 +376,6 @@ class ServerArgs:
     tokenizer_worker_num: int = 1
     detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
-    audio_tokenizer_path: Optional[str] = None
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -4483,15 +4482,6 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
-        )
-        parser.add_argument(
-            "--audio-tokenizer-path",
-            type=str,
-            default=ServerArgs.audio_tokenizer_path,
-            help="Path to a standalone audio tokenizer directory (containing config.json "
-            "and model weights). Currently consumed by MiMo-V2-ASR. When set, it overrides "
-            "any audio_tokenizer_path in the model config and the default `<model_path>/audio_tokenizer` "
-            "fallback, so the audio tokenizer can be relocated without editing the model's config.json.",
         )
         parser.add_argument(
             "--load-format",

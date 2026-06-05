@@ -947,7 +947,6 @@ class MiMoAudioEncoderConfig:
     projection_layers: int = 1
     add_post_norm: bool = False
     audio_segment_size: int = 6000
-    audio_tokenizer_path: Optional[str] = None
 
 
 class AudioProjection(nn.Module):
@@ -1224,25 +1223,15 @@ class AudioEncoderMixin:
         else:
             raise ValueError(f"Invalid projection layers: {config.projection_layers}")
 
-        # Precedence: --audio-tokenizer-path CLI flag > config.audio_tokenizer_path
-        # > <model_path>/audio_tokenizer fallback. The CLI flag lets users point at
-        # a relocated tokenizer dir without editing the model's config.json.
-        server_args = get_global_server_args()
-        cli_audio_tokenizer_path = getattr(server_args, "audio_tokenizer_path", None)
-        if cli_audio_tokenizer_path:
-            audio_tokenizer_path = cli_audio_tokenizer_path
-        elif config.audio_tokenizer_path:
-            audio_tokenizer_path = config.audio_tokenizer_path
-        else:
-            model_path = server_args.model_path
-            if not os.path.isdir(model_path):
-                from huggingface_hub import snapshot_download
+        model_path = get_global_server_args().model_path
+        if not os.path.isdir(model_path):
+            from huggingface_hub import snapshot_download
 
-                model_path = snapshot_download(
-                    model_path,
-                    allow_patterns=["audio_tokenizer/*"],
-                )
-            audio_tokenizer_path = os.path.join(model_path, "audio_tokenizer")
+            model_path = snapshot_download(
+                model_path,
+                allow_patterns=["audio_tokenizer/*"],
+            )
+        audio_tokenizer_path = os.path.join(model_path, "audio_tokenizer")
         dev = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.audio_tokenizer = self._load_mimo_audio_tokenizer(
             audio_tokenizer_path, dev
