@@ -26,7 +26,7 @@ class TransferKVChunk:
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
     layer_id: Optional[int] = None
-    cuda_event: object = None
+    cuda_event: Optional[object] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )

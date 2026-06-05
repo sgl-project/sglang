@@ -564,6 +564,8 @@ class TpModelWorker(BaseTpWorker):
         Returns (LogitsProcessorOutput, event) for the final group
         (when split_index reaches num_hidden_layers).
         """
+        # Route through ModelRunner.forward to preserve the common forward
+        # bookkeeping before it dispatches to forward_split_prefill.
         out = self.model_runner.forward(
             forward_batch,
             reinit_attn_backend=(forward_batch.split_index == 0),
