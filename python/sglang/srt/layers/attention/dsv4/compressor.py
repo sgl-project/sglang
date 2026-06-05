@@ -28,7 +28,14 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_tgemm = None
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
+
+    _tgemm = tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -97,6 +104,7 @@ class CompressorBackendMixin:
 
             from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
                 hip_compress_forward,
+                hip_compress_fused_norm_rope_hadamard_inplace,
                 hip_compress_fused_norm_rope_inplace,
             )
 
@@ -113,14 +121,24 @@ class CompressorBackendMixin:
             norm_eps = (
                 norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps
             )
-            hip_compress_fused_norm_rope_inplace(
-                kv_compressed,
-                norm.weight,
-                norm_eps,
-                freqs_cis_cache,
-                plan,
-            )
-            return rotate_activation(kv_compressed) if rotate else kv_compressed
+            if rotate:
+                hip_compress_fused_norm_rope_hadamard_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                    head_dim,
+                )
+            else:
+                hip_compress_fused_norm_rope_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                )
+            return kv_compressed
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -383,7 +401,12 @@ class Compressor(nn.Module):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if _tgemm is not None:
+            # linear_bf16_fp32 uses tgemm.mm + .float(); skip the .float() cast
+            # because downstream Triton kernels promote bf16→fp32 internally.
+            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
+        else:
+            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):

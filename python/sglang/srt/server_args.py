@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import socket
 import tempfile
 import uuid
 from functools import cached_property
@@ -222,6 +223,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
@@ -1034,6 +1036,9 @@ class ServerArgs:
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
 
+        # Handle crash dump environment variables (must run before CUDA init).
+        self._handle_crash_dump_env()
+
         # Handle debug utilities.
         self._handle_debug_utils()
 
@@ -1831,26 +1836,20 @@ class ServerArgs:
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-                if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
-                    envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
+                if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                     logger.warning(
-                        "Force DSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
                     )
                 else:
-                    if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
-                        logger.warning(
-                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
-                        )
-                    else:
-                        # When threshold is not manually set, set it to the index topk of model
-                        from sglang.srt.configs.model_config import get_dsa_index_topk
+                    # When threshold is not manually set, set it to the index topk of model
+                    from sglang.srt.configs.model_config import get_dsa_index_topk
 
-                        envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            get_dsa_index_topk(hf_config)
-                        )
-                        logger.warning(
-                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
-                        )
+                    envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                        get_dsa_index_topk(hf_config)
+                    )
+                    logger.warning(
+                        f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
+                    )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
@@ -2360,12 +2359,12 @@ class ServerArgs:
                     self.attention_backend = default_attention_backend
 
             prefill_backend, decode_backend = self.get_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton")
+            accepted_backends = ("trtllm_mha", "triton", "intel_xpu")
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha or triton attention backend, "
+                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 
@@ -3302,6 +3301,17 @@ class ServerArgs:
                 )
                 self.moe_runner_backend = "flashinfer_trtllm"
 
+        if (
+            self.moe_runner_backend == "auto"
+            and self.quantization == "modelopt_fp4"
+            and is_sm120_supported()
+        ):
+            self.moe_runner_backend = "flashinfer_cutlass"
+            logger.info(
+                "Use flashinfer_cutlass as MoE runner backend on SM120 for "
+                "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
+            )
+
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
@@ -3335,7 +3345,7 @@ class ServerArgs:
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        if self.moe_runner_backend == "flashinfer_trtllm":
+        if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
@@ -4388,6 +4398,34 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
+
+    def _handle_crash_dump_env(self):
+        if not self.crash_dump_folder:
+            return
+        _CUDA_COREDUMP_DEFAULTS = {
+            "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
+            "CUDA_ENABLE_USER_TRIGGERED_COREDUMP": "1",
+            "CUDA_COREDUMP_SHOW_PROGRESS": "1",
+            "CUDA_COREDUMP_GENERATION_FLAGS": (
+                "skip_nonrelocated_elf_images,skip_global_memory,"
+                "skip_shared_memory,skip_local_memory,skip_constbank_memory"
+            ),
+            "CUDA_COREDUMP_FILE": f"{self.crash_dump_folder}/%h/core.cuda.%t.%p",
+            "CUDA_COREDUMP_PIPE": "/tmp/corepipe.cuda.%h.%p",
+        }
+        for key, value in _CUDA_COREDUMP_DEFAULTS.items():
+            if key not in os.environ:
+                os.environ[key] = value
+                logger.info("Auto-set %s=%s (from --crash-dump-folder)", key, value)
+
+                if key == "CUDA_COREDUMP_FILE":
+                    # cuda curedump cannot write to a folder that does not exist,
+                    # so we have to create the folder first.
+                    hostname = socket.gethostname()
+                    os.makedirs(
+                        os.path.join(self.crash_dump_folder, hostname),
+                        exist_ok=True,
+                    )
 
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
@@ -5712,7 +5750,7 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
