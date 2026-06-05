@@ -250,6 +250,103 @@ def time_sdpa_reference(
     }
 
 
+def time_tail_replacement_variants(
+    *,
+    caches: list[CausalSelfAttentionKVCache],
+    key: torch.Tensor,
+    value: torch.Tensor,
+    tokens_per_frame: int,
+    cache_frames: int,
+    sink_frames: int,
+    prev_global_frames: int,
+    current_start_frames: int,
+    warmup: int,
+    repeats: int,
+) -> list[dict[str, float | int | str]]:
+    cache_tokens = cache_frames * tokens_per_frame
+    sink_tokens = sink_frames * tokens_per_frame
+    prev_global = prev_global_frames * tokens_per_frame
+    current_start = current_start_frames * tokens_per_frame
+    current_end = current_start + key.shape[1]
+    updated_global = current_end
+
+    def prepare() -> None:
+        for cache in caches:
+            reset_cache(cache, global_end=prev_global, local_end=cache_tokens)
+
+    def current_update() -> None:
+        for cache in caches:
+            cache.update_and_get_attention_kv(
+                key=key,
+                value=value,
+                current_chunk_start=current_start,
+                debug_name="tail_replacement_current_update",
+            )
+
+    def direct_tail_copy_with_tensor_indices() -> None:
+        for cache in caches:
+            cache.k[:, sink_tokens:cache_tokens] = key
+            cache.v[:, sink_tokens:cache_tokens] = value
+            cache.global_end_index_int = updated_global
+            cache.local_end_index_int = cache_tokens
+            cache.global_end_index.fill_(updated_global)
+            cache.local_end_index.fill_(cache_tokens)
+
+    def direct_tail_copy_int_indices_only() -> None:
+        for cache in caches:
+            cache.k[:, sink_tokens:cache_tokens] = key
+            cache.v[:, sink_tokens:cache_tokens] = value
+            cache.global_end_index_int = updated_global
+            cache.local_end_index_int = cache_tokens
+
+    def direct_tail_copy_no_indices() -> None:
+        for cache in caches:
+            cache.k[:, sink_tokens:cache_tokens] = key
+            cache.v[:, sink_tokens:cache_tokens] = value
+
+    def no_copy_int_indices_only() -> None:
+        for cache in caches:
+            cache.global_end_index_int = updated_global
+            cache.local_end_index_int = cache_tokens
+
+    variants = [
+        ("current_update", current_update),
+        ("direct_tail_copy_with_tensor_indices", direct_tail_copy_with_tensor_indices),
+        ("direct_tail_copy_int_indices_only", direct_tail_copy_int_indices_only),
+        ("direct_tail_copy_no_indices", direct_tail_copy_no_indices),
+        ("no_copy_int_indices_only", no_copy_int_indices_only),
+    ]
+    results: list[dict[str, float | int | str]] = []
+    for name, fn in variants:
+        elapsed_ms: list[float] = []
+        for idx in range(warmup + repeats):
+            prepare()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            if idx >= warmup:
+                elapsed_ms.append(start.elapsed_time(end))
+        results.append(
+            {
+                "scenario": f"tail_replacement_variant:{name}",
+                "cache_blocks": len(caches),
+                "cache_frames": cache_frames,
+                "sink_frames": sink_frames,
+                "chunk_tokens": key.shape[1],
+                "mean_ms": statistics.mean(elapsed_ms),
+                "median_ms": statistics.median(elapsed_ms),
+                "p95_ms": percentile(elapsed_ms, 95),
+                "min_ms": min(elapsed_ms),
+                "max_ms": max(elapsed_ms),
+            }
+        )
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=1)
@@ -268,6 +365,7 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--profile-row-limit", type=int, default=12)
     parser.add_argument("--skip-sdpa", action="store_true")
+    parser.add_argument("--tail-variant-bench", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -458,6 +556,35 @@ def main() -> None:
                 warmup=max(3, args.warmup // 2),
                 repeats=max(8, args.repeats // 2),
             )
+            print(json.dumps(result, indent=2))
+
+    if args.tail_variant_bench:
+        cache_tokens = 18 * tokens_per_frame
+        sink_tokens = 9 * tokens_per_frame
+        caches = [
+            make_cache(
+                batch_size=args.batch_size,
+                cache_tokens=cache_tokens,
+                heads=args.heads,
+                head_dim=args.head_dim,
+                dtype=dtype,
+                device=device,
+                sink_tokens=sink_tokens,
+            )
+            for _ in range(args.layers)
+        ]
+        for result in time_tail_replacement_variants(
+            caches=caches,
+            key=key,
+            value=value,
+            tokens_per_frame=tokens_per_frame,
+            cache_frames=18,
+            sink_frames=9,
+            prev_global_frames=18,
+            current_start_frames=18,
+            warmup=args.warmup,
+            repeats=args.repeats,
+        ):
             print(json.dumps(result, indent=2))
 
 
