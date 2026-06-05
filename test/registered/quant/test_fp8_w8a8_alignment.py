@@ -260,6 +260,62 @@ class TestChannelStrategyAlignment(CustomTestCase):
 
         self.assertEqual(output.shape, (batch, out_dim))
 
+    def test_input_k_misaligned_apply(self):
+        """Misaligned in_dim (K) exercises the input F.pad branch in
+        apply_weights, which the in_dim=2048 cases never hit."""
+        out_dim, in_dim = 1024, 1368  # K=1368 is not a multiple of 16
+        scheme = _make_scheme("CHANNEL")
+
+        weight = _make_fp8_weight(out_dim, in_dim)
+        weight_scale = torch.ones(out_dim, 1, dtype=torch.float32, device="cuda")
+        layer = _make_layer(weight, weight_scale)
+        layer.input_scale = None
+
+        scheme.process_weights_after_loading(layer)
+
+        # K must have been padded, so apply_weights pads the input.
+        self.assertGreater(layer._pad_input_k, 0)
+
+        batch = 4
+        x = torch.zeros(batch, in_dim, dtype=torch.bfloat16, device="cuda")
+        output = scheme.apply_weights(layer, x)
+        self.assertEqual(output.shape, (batch, out_dim))
+
+    def test_nonzero_numerics_allclose(self):
+        """Non-zero weight + input: the padded path must match the dequantized
+        reference, proving padded rows/cols contribute 0 and do not leak.
+
+        Both out_dim and in_dim are misaligned so the N and K pad branches are
+        active. Tolerances are loose because the input is dynamically quantized
+        to fp8.
+        """
+        out_dim, in_dim = 1368, 1368
+        scheme = _make_scheme("CHANNEL")
+
+        # Small, fp8-representable weight values so weight quantization is exact
+        # and only the input quantization contributes error.
+        torch.manual_seed(0)
+        w_ref = (
+            torch.randint(-4, 5, (out_dim, in_dim), device="cuda").to(torch.float32)
+            * 0.125
+        )
+        weight = w_ref.to(torch.float8_e4m3fn)
+        weight_scale = torch.ones(out_dim, 1, dtype=torch.float32, device="cuda")
+        layer = _make_layer(weight, weight_scale)
+        layer.input_scale = None
+        scheme.process_weights_after_loading(layer)
+
+        batch = 4
+        x = torch.randn(batch, in_dim, dtype=torch.bfloat16, device="cuda") * 0.1
+        output = scheme.apply_weights(layer, x).to(torch.float32)
+
+        # Reference: x @ (W_fp8 * weight_scale)^T computed in fp32.
+        ref = x.to(torch.float32) @ (
+            weight.to(torch.float32) * weight_scale
+        ).t()
+
+        torch.testing.assert_close(output, ref, rtol=0.05, atol=0.1)
+
 
 if __name__ == "__main__":
     unittest.main()
