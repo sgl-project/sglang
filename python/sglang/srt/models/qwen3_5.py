@@ -898,8 +898,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def _prepare_qkv_aiter_fused(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # NOTE: ForwardBatch carries no kv-pool handle on this tree; use the
-        # canonical backend accessor (same pool RadixAttention writes into).
         pool = get_token_to_kv_pool()
         k_buffer = pool.get_key_buffer(self.attn.layer_id)
         v_buffer = pool.get_value_buffer(self.attn.layer_id)
@@ -935,11 +933,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             attn_output_gate=self.attn_output_gate,
             gated_qkv_layout="interleaved",
             kv_cache_layout="NHD",
-            # FP8 KV cache: k_scale / v_scale are per-tensor dequant scales (0-dim
-            # device tensors) populated by Fp8KVCacheMethod, or None for a bf16 cache.
-            # The kernel applies (1 / scale) before the fp8 cache write, matching the
-            # token_to_kv_pool `cache_k.div_(k_scale)` convention; when None it writes
-            # the cache unscaled.
             k_scale=self.attn.k_scale,
             v_scale=self.attn.v_scale,
             eps=self.q_norm.variance_epsilon,
@@ -947,9 +940,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             q, gate, k, v = result
-            # Kernel returns gate as [T, qh, head_dim]; flatten to [T, qh*head_dim]
-            # to match the (flattened) attn_output for the elementwise gate multiply,
-            # matching the native path's gate shape.
             gate = gate.reshape(gate.shape[0], -1)
         else:
             q, k, v = result
@@ -963,13 +953,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        # ROCm fused path: split + QK-norm + RoPE + KV-cache-write in one kernel.
-        # Skip the subsequent in-attention cache write because the kernel did it.
-        # The fused kernel only does plain 1-D RoPE, so keep VL models (which use
-        # mRoPE with 2-D [3, T] positions) out of it; they use the native path.
         use_aiter_fused = (
             _aiter_fused_qkv_split_qk_norm_rope_cache is not None
-            and positions.dim() == 1
+            and positions.dim() == 1 # keep VL models out of it
+            and self.partial_rotary_factor == 1.0 # kernel supports this only
+            and forward_batch.out_cache_loc is not None
         )
 
         if use_aiter_fused:
