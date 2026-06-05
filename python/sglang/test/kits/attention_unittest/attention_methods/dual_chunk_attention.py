@@ -69,15 +69,9 @@ DUAL_CHUNK_SPARSE_SUB_WINDOW_CONFIG = {
     "sparse_attention_threshold": 0,
     "sparse_attention_last_q": 8,
     "sparse_attention_config": {
-        0: {str(head_id): ("vertical_and_slash", 8, 8, None) for head_id in range(4)}
+        0: {str(head_id): ("vertical_and_slash", 4, 4, None) for head_id in range(4)}
     },
 }
-# `vertical_size=8` (not 4): the production fallback at
-# dual_chunk_flashattention_backend.py:1110-1122 appends
-# `torch.arange(0, k_states_intra.size(0), max(1, k_states_intra.size(0)/5))`
-# when a chunk gets zero vertical indices, which can produce 5 elements
-# into a `vertical_size`-slot buffer. vertical_size >= 8 avoids that
-# overflow path. This is a known production edge case, not a test bug.
 
 # Unit tests run without distributed initialization. Sparse dual-chunk config
 # lookup should see the single-rank default.
@@ -234,6 +228,22 @@ def make_dual_chunk_sparse_threshold_gated_cases(
             page_size=16,
             prefix_lens=(0,),
             extend_lens=(16,),
+            **common,
+        ),
+    )
+
+
+def make_dual_chunk_sparse_sub_window_cases(
+    backend: str,
+) -> tuple[DualChunkAttentionCase, ...]:
+    common = dict(backend=backend, num_heads=4, num_kv_heads=4)
+    return (
+        DualChunkAttentionCase(
+            name="dual_chunk_sparse_prefill_sub_window_seq128",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(128,),
             **common,
         ),
     )
