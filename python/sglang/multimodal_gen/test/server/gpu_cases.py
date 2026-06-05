@@ -3,6 +3,7 @@ from pathlib import Path
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    IDEOGRAM4_CI_sampling_params,
     MODELOPT_FLUX1_FP8_TRANSFORMER,
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
@@ -550,6 +551,15 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
+            "ideogram4_nvfp4_t2i",
+            model_path="Comfy-Org/Ideogram-4",
+            modality="image",
+            sampling_params=IDEOGRAM4_CI_sampling_params,
+            extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
         ),
