@@ -72,6 +72,19 @@ class SchedulerLoadInquirer:
             num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
         return num_pending_tokens
 
+    def get_num_waiting_uncached_tokens(self) -> int:
+        """Get uncached input tokens waiting for prefill compute."""
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return 0
+        num_tokens = 0
+        for req in self.get_waiting_queue():
+            # if match-in-waiting-queue disabled, this metric returns seq_lens
+            num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
+        cr = self.get_chunked_req()
+        if cr is not None:
+            num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
+        return num_tokens
+
     def get_loads(self, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """
         Get comprehensive load metrics for /v1/loads endpoint.
@@ -101,6 +114,7 @@ class SchedulerLoadInquirer:
             )
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+        num_waiting_uncached_tokens = self.get_num_waiting_uncached_tokens()
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
         )
@@ -193,6 +207,7 @@ class SchedulerLoadInquirer:
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
+            num_waiting_uncached_tokens=num_waiting_uncached_tokens,
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             max_total_num_tokens=self.max_total_num_tokens,

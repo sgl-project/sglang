@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -20,6 +21,9 @@ from sglang.srt.layers.attention.fla.utils import (
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
 @triton.autotune(
@@ -32,8 +36,16 @@ CHUNK_SIZE = 64
     # because cloning the cache pool for each benchmark exceeds available memory.
     # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
     # future per-bucket configs once the kernel is refactored to write final
-    # state to a separate output buffer).
-    configs=[triton.Config({"BV": 32}, num_warps=4, num_stages=2)],
+    # state to a separate output buffer). The env knobs keep this single-config
+    # property while allowing model/hardware-local validation of the selected
+    # tile without corrupting the state pool through multi-config autotune.
+    configs=[
+        triton.Config(
+            {"BV": GDN_CHUNK_H_BV},
+            num_warps=GDN_CHUNK_H_NUM_WARPS,
+            num_stages=GDN_CHUNK_H_NUM_STAGES,
+        )
+    ],
     key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
     **autotune_cache_kwargs,
 )

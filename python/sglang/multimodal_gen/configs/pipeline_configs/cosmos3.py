@@ -56,11 +56,10 @@ class Cosmos3Config(PipelineConfig):
         # Encoder is needed for I2V; T2V/T2I never invoke it.
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
-        # WanVAE defaults use_parallel_encode/decode to True, which silently
-        # activates an SP-sharded VAE path when sp_world_size > 1 and produces
-        # garbled pixels for cosmos3's latent shape.
+        # keep WanVAE encode replicated because parallel encode changes I2V
+        # conditioning latents when sp_world_size > 1
         self.vae_config.use_parallel_encode = False
-        self.vae_config.use_parallel_decode = False
+        self.vae_config.use_parallel_decode = True
 
     def adjust_num_frames(self, num_frames: int) -> int:
         """Round ``num_frames`` so ``(n - 1) % 4 == 0`` for the VAE.

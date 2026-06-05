@@ -124,6 +124,7 @@ This section provides deployment configurations optimized for different hardware
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
+- **H100 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings.
 - **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `--attention-backend triton`. Both the full attention layers and the Gated Delta Net (linear attention) layers use Triton-based kernels on ROCm. Example: `SGLANG_USE_AITER=1 python3 -m sglang.launch_server --model-path Qwen/Qwen3.5-397B-A17B --tp 8 --attention-backend triton --trust-remote-code`. See [AMD's Day-0 support article](https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-qwen-3-5-on-amd-instinct-gpus.html) for details.
 - **Watchdog timeout:** Increase `--watchdog-timeout` to `1200` or higher for this large model, as weight loading can take significant time.
 - **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:

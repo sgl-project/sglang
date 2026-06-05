@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=False)
+register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=True)
 
 
 class TestDeepEpDeepseekV32(CustomTestCase):
@@ -53,6 +53,8 @@ class TestDeepEpDeepseekV32(CustomTestCase):
                 128,
                 "--max-total-tokens",
                 40960,
+                "--watchdog-timeout",
+                900,
             ],
             env={
                 "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -61,6 +63,7 @@ class TestDeepEpDeepseekV32(CustomTestCase):
                 "HCCL_BUFFSIZE": "2048",
                 "HCCL_OP_EXPANSION_MODE": "AIV",
                 "TASK_QUEUE_ENABLE": "0",
+                "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
             },
         )

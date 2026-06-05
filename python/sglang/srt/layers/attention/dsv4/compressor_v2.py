@@ -404,9 +404,6 @@ class CompressorBackendMixin:
         super().__init__()
         self.forward_metadata: DSV4Metadata
 
-    # NOTE: Will be overridden
-    def _maybe_upgrade_forward_metadata(self): ...
-
     def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
         return getattr(self.forward_metadata, attr_name)
@@ -430,9 +427,14 @@ class CompressorBackendMixin:
         compress_ratio: int,
         page_size: int,
         out_loc: torch.Tensor,
+        use_fp4_indexer: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
+        if use_fp4_indexer:
+            assert is_indexer
+            assert compress_ratio == 4
+            assert head_dim == 128
 
         plan = self._get_paged_compress_metadata(compress_ratio)
         is_online = _use_online_compress(compress_ratio)
@@ -465,6 +467,7 @@ class CompressorBackendMixin:
             out_loc=out_loc,
             kvcache=kv_cache,
             page_size=page_size,
+            use_fp4=use_fp4_indexer,
         )
 
     def forward_unified(
@@ -477,7 +480,6 @@ class CompressorBackendMixin:
         if forward_batch.forward_mode.is_idle():
             return
 
-        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
@@ -493,6 +495,9 @@ class CompressorBackendMixin:
             )
         else:
             out_loc = self._get_out_loc(compressor.ratio)
+            use_fp4_indexer = (
+                compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
+            )
             if compressor.is_in_indexer:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
@@ -504,7 +509,10 @@ class CompressorBackendMixin:
                 if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                     # The v2 compressor writes directly into the raw C4 KV tensor.
                     # HiSparse C4 therefore needs the physical C4 location here.
-                    out_loc = compress_kv_pool.translate_loc_to_hisparse_device(out_loc)
+                    # The compress kernel requires an int32 write location.
+                    out_loc = compress_kv_pool.translate_loc_to_hisparse_device(
+                        out_loc
+                    ).to(torch.int32)
             self._forward_compress_all_in_one(
                 kv_score_buffer=state_pool.kv_score_buffer.kv_score,
                 kv_score_input=kv_score_input,
@@ -518,6 +526,7 @@ class CompressorBackendMixin:
                 compress_ratio=compressor.ratio,
                 page_size=page_size,
                 out_loc=out_loc,
+                use_fp4_indexer=use_fp4_indexer,
             )
 
     def _forward_unified_hip(

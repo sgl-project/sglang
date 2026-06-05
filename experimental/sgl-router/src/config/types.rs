@@ -1,32 +1,35 @@
-use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// In-memory router configuration, built from CLI flags by
+/// [`crate::config::cli::Cli::into_config`] and validated by
+/// [`Config::validate`]. The router serves exactly one model.
+#[derive(Debug, Clone)]
 pub struct Config {
     pub server: ServerConfig,
-    #[serde(default)]
     pub observability: ObservabilityConfig,
-    pub models: Vec<ModelConfig>,
-    pub discovery: DiscoveryConfig,
-    #[serde(default)]
+    pub model: ModelConfig,
+    /// Selected discovery backend. Built from CLI flags by
+    /// [`crate::config::cli::Cli::into_config`]: the static-vs-k8s choice
+    /// and the k8s selector grammar are resolved there (the latter via
+    /// [`resolve_mode`]); static worker-URL validity is checked by
+    /// [`Config::validate`].
+    pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
-    #[serde(default)]
     pub active_load: ActiveLoadConfig,
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
 /// decode latency budget; e2e tests lower it so per-request failures
 /// trip the circuit breaker within the test's wall-time.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
     /// Maximum time to wait for a single upstream HTTP request to
     /// return headers + body. Default 300 s. The circuit breaker
     /// records a failure when this fires.
-    #[serde(default = "default_proxy_request_timeout_secs")]
     pub request_timeout_secs: u64,
 }
 
-fn default_proxy_request_timeout_secs() -> u64 {
+pub fn default_proxy_request_timeout_secs() -> u64 {
     300
 }
 
@@ -42,16 +45,15 @@ impl Default for ProxyConfig {
 /// sits above `proxy.request_timeout_secs` so the proxy timeout is the
 /// one users hit first for normal slow upstreams; tests lower it to
 /// let the janitor fire within their wall-time budget.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct ActiveLoadConfig {
     /// How long a request entry can live in the registry before the
     /// janitor fires its `cancel_token` and the chat handler returns
     /// 504 `stale_request_expired`. Default 600 s.
-    #[serde(default = "default_stale_request_timeout_secs")]
     pub stale_request_timeout_secs: u64,
 }
 
-fn default_stale_request_timeout_secs() -> u64 {
+pub fn default_stale_request_timeout_secs() -> u64 {
     600
 }
 
@@ -63,51 +65,52 @@ impl Default for ActiveLoadConfig {
     }
 }
 
-/// Routing policy selector — the enum form lets serde reject unknown
-/// values at deserialization time and removes the runtime string match in
-/// the policy factory.
+/// Routing policy selector — the enum form lets `clap` reject unknown
+/// values at parse time and removes the runtime string match in the
+/// policy factory.
 ///
-/// Serialised as `"round_robin"` / `"random"` / `"power_of_two"` /
-/// `"cache_aware_zmq"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
+/// `power_of_two` / `cache_aware_zmq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
+    #[value(name = "round_robin")]
     RoundRobin,
+    #[value(name = "random")]
     Random,
+    #[value(name = "power_of_two")]
     PowerOfTwo,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
+    #[value(name = "cache_aware_zmq")]
     CacheAwareZmq,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ObservabilityConfig {
-    #[serde(default = "default_log_level")]
     pub log_level: String,
-    /// Selects the tracing-subscriber output format. Serde rejects
-    /// unrecognized values at config-load (`"jsonl"` and similar
-    /// plausible typos surface as an error instead of silently
-    /// degrading to text), matching the discoverability pattern used
-    /// by `policy` and `discovery.backend`.
-    #[serde(default)]
+    /// Selects the tracing-subscriber output format. `clap` rejects
+    /// unrecognized values at parse time (`--log-format jsonl` and
+    /// similar typos surface as an error instead of silently degrading
+    /// to text).
     pub log_format: LogFormat,
 }
 
 /// `text` for human-readable dev output, `json` for one-line-per-record
 /// JSON suitable for k8s log aggregators (fluent-bit / vector / Loki).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum LogFormat {
     #[default]
+    #[value(name = "text")]
     Text,
+    #[value(name = "json")]
     Json,
 }
 
@@ -124,40 +127,37 @@ impl Default for ObservabilityConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
+    /// Tokenizer source: a local `tokenizer.json` path or a HuggingFace repo
+    /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
+    /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
-    #[serde(default)]
     pub policy: PolicyKind,
-    #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Tuning for the cache-aware ZMQ policy. Ignored unless
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
-    #[serde(default)]
     pub cache_aware: Option<CacheAwareConfig>,
 }
 
 /// Per-model cache-aware-ZMQ tuning.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct CacheAwareConfig {
     /// Lower bound on `matched_blocks / total_blocks` for the tree match
     /// to win the selection. Below this, the policy falls back to
     /// min-load. Default 0.5 — a half-cached prompt is still a strong
     /// signal but not so weak that random hash collisions could trigger
     /// affinity to an arbitrary worker.
-    #[serde(default = "default_cache_threshold")]
     pub cache_threshold: f32,
     /// Absolute load spread (`max - min`) above which the cache check is
     /// skipped in favour of min-load. Default 32 — picked to dominate
     /// over typical batch-of-8 effect.
-    #[serde(default = "default_balance_abs")]
     pub balance_abs_threshold: usize,
     /// Multiplicative load spread (`max > min * balance_rel_threshold`)
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
-    #[serde(default = "default_balance_rel")]
     pub balance_rel_threshold: f32,
 }
 
@@ -181,123 +181,20 @@ fn default_balance_rel() -> f32 {
     1.1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
-    /// Consecutive failures required before the breaker opens.  Encoded
-    /// as `NonZeroU32` so a config setting `threshold = 0` (which would
-    /// open the breaker before any failure) is rejected at deserialization
-    /// rather than silently behaving as "always open".
-    #[serde(default = "default_cb_threshold")]
+    /// Consecutive failures required before the breaker opens. Encoded
+    /// as `NonZeroU32` so `--cb-threshold 0` (which would open the
+    /// breaker before any failure) is rejected at CLI-parse time rather
+    /// than silently behaving as "always open".
     pub threshold: NonZeroU32,
-    #[serde(default = "default_cb_cool_down")]
     pub cool_down_secs: u64,
 }
 
-fn default_cb_threshold() -> NonZeroU32 {
-    NonZeroU32::new(3).unwrap()
-}
-fn default_cb_cool_down() -> u64 {
+/// Default circuit-breaker cool-down, applied when `--cb-threshold` is
+/// set without an explicit `--cb-cool-down-secs`.
+pub fn default_cb_cool_down() -> u64 {
     30
-}
-
-/// Config-level discovery section. Deserialized from:
-///
-/// TOML:
-/// ```toml
-/// [discovery]
-/// backend = "static_urls"
-/// [discovery.static_urls]
-/// urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
-/// ```
-///
-/// YAML:
-/// ```yaml
-/// discovery:
-///   backend: static_urls
-///   static_urls:
-///     urls:
-///       - http://10.0.0.1:30000
-///       - http://10.0.0.2:30000
-/// ```
-///
-/// The custom `Deserialize` impl on [`DiscoveryConfig`] converts the
-/// raw fields into the resolved `DiscoveryBackend` enum via `try_from`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveryConfigRaw {
-    pub backend: String,
-    pub static_urls: Option<StaticUrlsDiscoveryConfig>,
-    pub k8s: Option<K8sDiscoveryConfig>,
-}
-
-/// Post-validation discovery config with a resolved `DiscoveryBackend` enum.
-/// Constructed by `Config::from_path` after `validate()`.
-#[derive(Debug, Clone)]
-pub struct DiscoveryConfig {
-    pub backend: DiscoveryBackend,
-}
-
-impl<'de> Deserialize<'de> for DiscoveryConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = DiscoveryConfigRaw::deserialize(deserializer)?;
-        raw.try_into().map_err(serde::de::Error::custom)
-    }
-}
-
-impl Serialize for DiscoveryConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let raw: DiscoveryConfigRaw = self.clone().into();
-        raw.serialize(serializer)
-    }
-}
-
-impl TryFrom<DiscoveryConfigRaw> for DiscoveryConfig {
-    type Error = String;
-
-    fn try_from(raw: DiscoveryConfigRaw) -> Result<Self, Self::Error> {
-        let backend = match raw.backend.as_str() {
-            "static_urls" => {
-                let s = raw.static_urls.ok_or(
-                    "discovery.backend = \"static_urls\" requires [discovery.static_urls] section",
-                )?;
-                DiscoveryBackend::StaticUrls(s)
-            }
-            "k8s" => {
-                let k = raw
-                    .k8s
-                    .ok_or("discovery.backend = \"k8s\" requires [discovery.k8s] section")?;
-                DiscoveryBackend::K8s(k)
-            }
-            other => {
-                return Err(format!(
-                    "unknown discovery.backend = {other:?}; valid: \"static_urls\", \"k8s\""
-                ))
-            }
-        };
-        Ok(DiscoveryConfig { backend })
-    }
-}
-
-impl From<DiscoveryConfig> for DiscoveryConfigRaw {
-    fn from(cfg: DiscoveryConfig) -> Self {
-        match cfg.backend {
-            DiscoveryBackend::StaticUrls(s) => DiscoveryConfigRaw {
-                backend: "static_urls".to_string(),
-                static_urls: Some(s),
-                k8s: None,
-            },
-            DiscoveryBackend::K8s(k) => DiscoveryConfigRaw {
-                backend: "k8s".to_string(),
-                static_urls: None,
-                k8s: Some(k),
-            },
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -311,30 +208,25 @@ pub enum DiscoveryBackend {
 /// from `/server_info` (see [`crate::workers::introspect`]).
 ///
 /// No file watcher, no hot-reload: topology change requires a restart.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StaticUrlsDiscoveryConfig {
     pub urls: Vec<String>,
 }
 
 /// Configuration for the Kubernetes `EndpointSlice` discovery backend.
+/// Built from the `--service-discovery*` / `--selector` / `--prefill-selector`
+/// / `--decode-selector` flags by [`crate::config::cli::Cli::build_discovery`].
 ///
-/// Two operating modes, distinguished by which selector fields are set:
+/// Two operating modes, distinguished by which selector flags are set:
 ///
 /// 1. **Plain** — all matched workers share the same role:
-///    ```toml
-///    [discovery.k8s]
-///    namespace = "default"
-///    label_selector = "app=sglang"
-///    ```
+///    `--service-discovery-namespace default --selector app=sglang`
 ///
 /// 2. **PD disaggregation** — prefill and decode workers are separated by
 ///    different selectors:
-///    ```toml
-///    [discovery.k8s]
-///    namespace = "default"
-///    prefill_selector = "app=sglang,role=prefill"
-///    decode_selector  = "app=sglang,role=decode"
-///    ```
+///    `--service-discovery-namespace default
+///    --prefill-selector app=sglang,role=prefill
+///    --decode-selector app=sglang,role=decode`
 ///
 /// In PD mode, the selectors drive **slice-classification** (which
 /// EndpointSlices feed the prefill pool vs the decode pool). The actual
@@ -344,20 +236,19 @@ pub struct StaticUrlsDiscoveryConfig {
 /// [`crate::workers::introspect`] for the `disaggregation_mode` and
 /// `disaggregation_bootstrap_port` extraction.
 ///
-/// `mode()` validates the combination and returns the resolved
-/// [`K8sDiscoveryMode`]; any other selector combination is rejected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// [`resolve_mode`] validates the selector flags and produces the
+/// resolved [`K8sDiscoveryMode`] once, at construction in
+/// [`crate::config::cli::Cli::build_discovery`] — so an invalid selector
+/// combination is unrepresentable here.
+#[derive(Debug, Clone)]
 pub struct K8sDiscoveryConfig {
     pub namespace: String,
-    #[serde(default)]
-    pub label_selector: Option<String>,
-    #[serde(default)]
-    pub prefill_selector: Option<String>,
-    #[serde(default)]
-    pub decode_selector: Option<String>,
+    /// Resolved + validated selector mode (plain vs PD).
+    pub mode: K8sDiscoveryMode,
 }
 
-/// Resolved discovery mode derived from a [`K8sDiscoveryConfig`].
+/// Resolved discovery mode, produced by [`resolve_mode`] from the CLI
+/// selector flags and stored on [`K8sDiscoveryConfig`].
 ///
 /// The discovery backend uses this to:
 /// * pick the server-side `LIST` label selector (Plain: the single selector;
@@ -377,8 +268,8 @@ pub enum K8sDiscoveryMode {
     },
 }
 
-/// Error returned by [`K8sDiscoveryConfig::mode`] when the selector
-/// combination is invalid.
+/// Error returned by [`resolve_mode`] when the selector combination is
+/// invalid.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set")]
@@ -391,7 +282,7 @@ pub enum ConfigError {
         "discovery.k8s: {selector}_selector `{value}` uses unsupported syntax — \
          only equality terms (`key=value` or `key==value`) joined by `,` are accepted. \
          Set-based operators (`in`, `notin`), presence tests, and `!=` silently match \
-         zero endpoints at runtime and are rejected at config-load time."
+         zero endpoints at runtime and are rejected at startup."
     )]
     UnsupportedSelectorGrammar {
         selector: &'static str,
@@ -487,80 +378,79 @@ fn is_equality_selector(selector: &str) -> bool {
     true
 }
 
-impl K8sDiscoveryConfig {
-    /// Validate the selector combination and return the resolved mode.
-    pub fn mode(&self) -> Result<K8sDiscoveryMode, ConfigError> {
-        let plain = self.label_selector.as_deref();
-        let prefill = self.prefill_selector.as_deref();
-        let decode = self.decode_selector.as_deref();
-
-        match (plain, prefill, decode) {
-            (Some(label), None, None) => {
-                // Plain mode pushes `label` to the K8s API as the
-                // server-side `labelSelector` of the EndpointSlice
-                // watcher (`watcher::Config::default().labels(&label)`
-                // in `discovery::k8s::spawn`). K8s itself parses the
-                // full label-selector grammar — equality, set-based
-                // (`in` / `notin`), presence (`key` / `!key`), and
-                // `!=` — and rejects malformed selectors at
-                // watch-start time. So at config-load we don't
-                // grammar-check `label` and let the K8s API be the
-                // syntax authority (README.md:25 and the multi-model
-                // e2e in tests/e2e/k8s_integration/test_multi_model.py
-                // depend on this). PD mode, in contrast, evaluates
-                // selectors client-side via `labels_match_selector`
-                // which only understands equality — so PD selectors
-                // are still grammar-checked below.
-                Ok(K8sDiscoveryMode::Plain {
-                    label_selector: label.to_string(),
-                })
-            }
-            (None, Some(prefill), Some(decode)) => {
-                // Both selectors validated individually so the operator
-                // sees which one is malformed. WorkerMode + bootstrap_port
-                // for each prefill pod are filled in by the worker
-                // manager from each worker's `/server_info` — these
-                // selectors only drive client-side classification per
-                // EndpointSlice (see `classify_mode` in discovery/k8s.rs).
-                if !is_equality_selector(prefill) {
-                    return Err(ConfigError::UnsupportedSelectorGrammar {
-                        selector: "prefill",
-                        value: prefill.to_string(),
-                    });
-                }
-                if !is_equality_selector(decode) {
-                    return Err(ConfigError::UnsupportedSelectorGrammar {
-                        selector: "decode",
-                        value: decode.to_string(),
-                    });
-                }
-                // Empty PD selector matches every EndpointSlice at
-                // runtime; combined with classify_mode's prefill-first
-                // ordering, an empty selector would silently funnel all
-                // workers into one role. Reject up front.
-                if is_selector_empty(prefill) {
-                    return Err(ConfigError::EmptyPdSelector {
-                        selector: "prefill",
-                    });
-                }
-                if is_selector_empty(decode) {
-                    return Err(ConfigError::EmptyPdSelector { selector: "decode" });
-                }
-                // Identical selectors degrade the same way as an empty
-                // one: every slice matches both, prefill wins, decode
-                // stays empty.
-                if canonical_selector(prefill) == canonical_selector(decode) {
-                    return Err(ConfigError::IdenticalPdSelectors);
-                }
-                Ok(K8sDiscoveryMode::PdDisaggregation {
-                    prefill_selector: prefill.to_string(),
-                    decode_selector: decode.to_string(),
-                })
-            }
-            (None, None, None) => Err(ConfigError::NoSelector),
-            (None, Some(_), None) | (None, None, Some(_)) => Err(ConfigError::PartialPdSelectors),
-            (Some(_), _, _) => Err(ConfigError::MixedModes),
+/// Validate the selector combination and return the resolved
+/// [`K8sDiscoveryMode`]. Called once at construction by
+/// [`crate::config::cli::Cli::build_discovery`], so an invalid
+/// combination can never be stored on a [`K8sDiscoveryConfig`].
+pub fn resolve_mode(
+    label_selector: Option<&str>,
+    prefill_selector: Option<&str>,
+    decode_selector: Option<&str>,
+) -> Result<K8sDiscoveryMode, ConfigError> {
+    match (label_selector, prefill_selector, decode_selector) {
+        (Some(label), None, None) => {
+            // Plain mode pushes `label` to the K8s API as the
+            // server-side `labelSelector` of the EndpointSlice
+            // watcher (`watcher::Config::default().labels(&label)`
+            // in `discovery::k8s::spawn`). K8s itself parses the
+            // full label-selector grammar — equality, set-based
+            // (`in` / `notin`), presence (`key` / `!key`), and
+            // `!=` — and rejects malformed selectors at
+            // watch-start time. So we don't grammar-check `label`
+            // here and let the K8s API be the syntax authority. PD
+            // mode, in contrast, evaluates selectors client-side via
+            // `labels_match_selector` which only understands
+            // equality — so PD selectors are still grammar-checked
+            // below.
+            Ok(K8sDiscoveryMode::Plain {
+                label_selector: label.to_string(),
+            })
         }
+        (None, Some(prefill), Some(decode)) => {
+            // Both selectors validated individually so the operator
+            // sees which one is malformed. WorkerMode + bootstrap_port
+            // for each prefill pod are filled in by the worker
+            // manager from each worker's `/server_info` — these
+            // selectors only drive client-side classification per
+            // EndpointSlice (see `classify_mode` in discovery/k8s.rs).
+            if !is_equality_selector(prefill) {
+                return Err(ConfigError::UnsupportedSelectorGrammar {
+                    selector: "prefill",
+                    value: prefill.to_string(),
+                });
+            }
+            if !is_equality_selector(decode) {
+                return Err(ConfigError::UnsupportedSelectorGrammar {
+                    selector: "decode",
+                    value: decode.to_string(),
+                });
+            }
+            // Empty PD selector matches every EndpointSlice at
+            // runtime; combined with classify_mode's prefill-first
+            // ordering, an empty selector would silently funnel all
+            // workers into one role. Reject up front.
+            if is_selector_empty(prefill) {
+                return Err(ConfigError::EmptyPdSelector {
+                    selector: "prefill",
+                });
+            }
+            if is_selector_empty(decode) {
+                return Err(ConfigError::EmptyPdSelector { selector: "decode" });
+            }
+            // Identical selectors degrade the same way as an empty
+            // one: every slice matches both, prefill wins, decode
+            // stays empty.
+            if canonical_selector(prefill) == canonical_selector(decode) {
+                return Err(ConfigError::IdenticalPdSelectors);
+            }
+            Ok(K8sDiscoveryMode::PdDisaggregation {
+                prefill_selector: prefill.to_string(),
+                decode_selector: decode.to_string(),
+            })
+        }
+        (None, None, None) => Err(ConfigError::NoSelector),
+        (None, Some(_), None) | (None, None, Some(_)) => Err(ConfigError::PartialPdSelectors),
+        (Some(_), _, _) => Err(ConfigError::MixedModes),
     }
 }
 
@@ -568,23 +458,13 @@ impl K8sDiscoveryConfig {
 mod k8s_discovery_config_tests {
     use super::*;
 
-    fn cfg(plain: Option<&str>, prefill: Option<&str>, decode: Option<&str>) -> K8sDiscoveryConfig {
-        K8sDiscoveryConfig {
-            namespace: "ns".to_string(),
-            label_selector: plain.map(str::to_string),
-            prefill_selector: prefill.map(str::to_string),
-            decode_selector: decode.map(str::to_string),
-        }
-    }
-
     #[test]
     fn mode_constructs_pd_disaggregation_from_prefill_and_decode_selectors() {
         // K8s PD now works without per-pod annotations: each worker's
         // `/server_info` carries `disaggregation_bootstrap_port`, and the
         // worker manager applies it post-discovery. The K8s config layer's
         // job is just to validate the selector combination.
-        let m = cfg(None, Some("app=sglang,role=p"), Some("app=sglang,role=d"))
-            .mode()
+        let m = resolve_mode(None, Some("app=sglang,role=p"), Some("app=sglang,role=d"))
             .expect("PD mode is now valid");
         assert_eq!(
             m,
@@ -600,9 +480,8 @@ mod k8s_discovery_config_tests {
         // Both PD selectors get the same equality-only grammar check as
         // the plain label_selector. A set-based prefill selector would
         // silently match zero pods at runtime → fail-fast at load.
-        let err = cfg(None, Some("app in (sglang, vllm)"), Some("app=sglang"))
-            .mode()
-            .unwrap_err();
+        let err =
+            resolve_mode(None, Some("app in (sglang, vllm)"), Some("app=sglang")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -617,9 +496,8 @@ mod k8s_discovery_config_tests {
 
     #[test]
     fn mode_pd_rejects_set_based_decode_selector() {
-        let err = cfg(None, Some("app=sglang"), Some("app in (sglang, vllm)"))
-            .mode()
-            .unwrap_err();
+        let err =
+            resolve_mode(None, Some("app=sglang"), Some("app in (sglang, vllm)")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -634,7 +512,7 @@ mod k8s_discovery_config_tests {
 
     #[test]
     fn mode_accepts_plain_with_equality_selector() {
-        let m = cfg(Some("app=sglang"), None, None).mode().unwrap();
+        let m = resolve_mode(Some("app=sglang"), None, None).unwrap();
         assert_eq!(
             m,
             K8sDiscoveryMode::Plain {
@@ -646,15 +524,12 @@ mod k8s_discovery_config_tests {
     /// Plain mode pushes its selector to the K8s API server-side
     /// (`watcher::Config::default().labels(&selector)` in
     /// `discovery::k8s::spawn`), so the full K8s label-selector grammar
-    /// — including set-based operators — is supported. README.md:25
-    /// advertises this, and `tests/e2e/k8s_integration/test_multi_model.py`
-    /// relies on it (`label_selector = "app in (sglang,sglang-small)"`).
-    /// Rejecting set-based selectors at config-load broke the documented
-    /// multi-model k8s path.
+    /// — including set-based operators like `app in (a,b)` — is
+    /// supported and must not be grammar-checked at startup. PD mode
+    /// (checked client-side) is the opposite; see the PD tests below.
     #[test]
     fn mode_accepts_set_based_selector_in_plain_mode() {
-        let m = cfg(Some("app in (sglang,sglang-small)"), None, None)
-            .mode()
+        let m = resolve_mode(Some("app in (sglang,sglang-small)"), None, None)
             .expect("plain mode must accept set-based selectors");
         assert_eq!(
             m,
@@ -675,8 +550,7 @@ mod k8s_discovery_config_tests {
             "!deprecated",
             "tier!=canary",
         ] {
-            let m = cfg(Some(raw), None, None)
-                .mode()
+            let m = resolve_mode(Some(raw), None, None)
                 .unwrap_or_else(|e| panic!("plain mode must accept `{raw}`, got {e:?}"));
             assert_eq!(
                 m,
@@ -699,9 +573,8 @@ mod k8s_discovery_config_tests {
     /// — both must keep failing.
     #[test]
     fn mode_pd_rejects_notin_prefill_selector() {
-        let err = cfg(None, Some("app notin (vllm, trtllm)"), Some("app=sglang"))
-            .mode()
-            .unwrap_err();
+        let err =
+            resolve_mode(None, Some("app notin (vllm, trtllm)"), Some("app=sglang")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -717,9 +590,7 @@ mod k8s_discovery_config_tests {
     #[test]
     fn mode_accepts_comma_separated_equality_terms() {
         // The canonical Plain-mode selector form: `key1=v1,key2=v2`.
-        let m = cfg(Some("app=sglang,zone=us-east"), None, None)
-            .mode()
-            .unwrap();
+        let m = resolve_mode(Some("app=sglang,zone=us-east"), None, None).unwrap();
         assert_eq!(
             m,
             K8sDiscoveryMode::Plain {
@@ -730,30 +601,29 @@ mod k8s_discovery_config_tests {
 
     #[test]
     fn mode_rejects_when_no_selector_is_set() {
-        let err = cfg(None, None, None).mode().unwrap_err();
+        let err = resolve_mode(None, None, None).unwrap_err();
         assert!(matches!(err, ConfigError::NoSelector), "got {err:?}");
     }
 
     #[test]
     fn mode_rejects_mixed_plain_and_pd_selectors() {
-        let err = cfg(
+        let err = resolve_mode(
             Some("app=sglang"),
             Some("role=prefill"),
             Some("role=decode"),
         )
-        .mode()
         .unwrap_err();
         assert!(matches!(err, ConfigError::MixedModes), "got {err:?}");
     }
 
     #[test]
     fn mode_rejects_partial_pd_selectors() {
-        let err = cfg(None, Some("role=prefill"), None).mode().unwrap_err();
+        let err = resolve_mode(None, Some("role=prefill"), None).unwrap_err();
         assert!(
             matches!(err, ConfigError::PartialPdSelectors),
             "got {err:?}"
         );
-        let err = cfg(None, None, Some("role=decode")).mode().unwrap_err();
+        let err = resolve_mode(None, None, Some("role=decode")).unwrap_err();
         assert!(
             matches!(err, ConfigError::PartialPdSelectors),
             "got {err:?}"
@@ -765,7 +635,7 @@ mod k8s_discovery_config_tests {
     /// operator opts in by setting plain mode at all).
     #[test]
     fn mode_accepts_empty_plain_label_selector() {
-        let m = cfg(Some(""), None, None).mode().unwrap();
+        let m = resolve_mode(Some(""), None, None).unwrap();
         assert_eq!(
             m,
             K8sDiscoveryMode::Plain {
@@ -782,7 +652,7 @@ mod k8s_discovery_config_tests {
     /// at config load.
     #[test]
     fn mode_pd_rejects_empty_prefill_selector() {
-        let err = cfg(None, Some(""), Some("role=decode")).mode().unwrap_err();
+        let err = resolve_mode(None, Some(""), Some("role=decode")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -796,9 +666,7 @@ mod k8s_discovery_config_tests {
 
     #[test]
     fn mode_pd_rejects_empty_decode_selector() {
-        let err = cfg(None, Some("role=prefill"), Some(""))
-            .mode()
-            .unwrap_err();
+        let err = resolve_mode(None, Some("role=prefill"), Some("")).unwrap_err();
         assert!(
             matches!(err, ConfigError::EmptyPdSelector { selector: "decode" },),
             "expected EmptyPdSelector(decode), got {err:?}",
@@ -810,9 +678,7 @@ mod k8s_discovery_config_tests {
     /// failure mode as a literal empty string.
     #[test]
     fn mode_pd_rejects_whitespace_only_prefill_selector() {
-        let err = cfg(None, Some("  ,  "), Some("role=decode"))
-            .mode()
-            .unwrap_err();
+        let err = resolve_mode(None, Some("  ,  "), Some("role=decode")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -829,9 +695,7 @@ mod k8s_discovery_config_tests {
     /// so the decode pool stays empty.
     #[test]
     fn mode_pd_rejects_identical_prefill_and_decode_selectors() {
-        let err = cfg(None, Some("app=sglang"), Some("app=sglang"))
-            .mode()
-            .unwrap_err();
+        let err = resolve_mode(None, Some("app=sglang"), Some("app=sglang")).unwrap_err();
         assert!(
             matches!(err, ConfigError::IdenticalPdSelectors),
             "expected IdenticalPdSelectors, got {err:?}",
@@ -842,9 +706,7 @@ mod k8s_discovery_config_tests {
     /// identical-selector check.
     #[test]
     fn mode_pd_rejects_identical_selectors_under_whitespace_normalization() {
-        let err = cfg(None, Some("app=sglang"), Some("  app=sglang  "))
-            .mode()
-            .unwrap_err();
+        let err = resolve_mode(None, Some("app=sglang"), Some("  app=sglang  ")).unwrap_err();
         assert!(
             matches!(err, ConfigError::IdenticalPdSelectors),
             "expected IdenticalPdSelectors, got {err:?}",
@@ -861,9 +723,7 @@ mod k8s_discovery_config_tests {
     /// string level.
     #[test]
     fn mode_pd_rejects_identical_selectors_under_eq_alias() {
-        let err = cfg(None, Some("app=sglang"), Some("app==sglang"))
-            .mode()
-            .unwrap_err();
+        let err = resolve_mode(None, Some("app=sglang"), Some("app==sglang")).unwrap_err();
         assert!(
             matches!(err, ConfigError::IdenticalPdSelectors),
             "expected IdenticalPdSelectors, got {err:?}",
@@ -877,9 +737,7 @@ mod k8s_discovery_config_tests {
     /// form must agree.
     #[test]
     fn mode_pd_rejects_identical_selectors_under_inner_whitespace() {
-        let err = cfg(None, Some("app=sglang"), Some("app =  sglang"))
-            .mode()
-            .unwrap_err();
+        let err = resolve_mode(None, Some("app=sglang"), Some("app =  sglang")).unwrap_err();
         assert!(
             matches!(err, ConfigError::IdenticalPdSelectors),
             "expected IdenticalPdSelectors, got {err:?}",
@@ -893,9 +751,8 @@ mod k8s_discovery_config_tests {
     /// reintroduce the silent-failure bug.)
     #[test]
     fn mode_pd_rejects_identical_selectors_under_term_order_permutation() {
-        let err = cfg(None, Some("role=p,app=sglang"), Some("app=sglang,role=p"))
-            .mode()
-            .unwrap_err();
+        let err =
+            resolve_mode(None, Some("role=p,app=sglang"), Some("app=sglang,role=p")).unwrap_err();
         assert!(
             matches!(err, ConfigError::IdenticalPdSelectors),
             "expected IdenticalPdSelectors, got {err:?}",
@@ -907,12 +764,11 @@ mod k8s_discovery_config_tests {
     /// aggressive that it false-positives on legitimate PD configs.
     #[test]
     fn mode_pd_accepts_truly_distinct_selectors() {
-        let m = cfg(
+        let m = resolve_mode(
             None,
             Some("app=sglang,role=prefill"),
             Some("app=sglang,role=decode"),
         )
-        .mode()
         .expect("distinct selectors must validate");
         assert!(matches!(m, K8sDiscoveryMode::PdDisaggregation { .. }));
     }

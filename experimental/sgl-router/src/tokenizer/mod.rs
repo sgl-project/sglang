@@ -24,10 +24,9 @@ impl std::fmt::Debug for TokenizerRegistry {
 impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
-        for m in &cfg.models {
-            let t = adapter::load(&m.tokenizer_path)?;
-            me.inner.insert(m.id.clone(), t);
-        }
+        let m = &cfg.model;
+        let t = adapter::load(&m.tokenizer_path)?;
+        me.inner.insert(m.id.clone(), t);
         Ok(me)
     }
 
@@ -54,20 +53,18 @@ mod tests {
                 port: 0,
             },
             observability: Default::default(),
-            models: vec![crate::config::ModelConfig {
+            model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
-            }],
-            discovery: crate::config::DiscoveryConfig {
-                backend: crate::config::DiscoveryBackend::StaticUrls(
-                    crate::config::StaticUrlsDiscoveryConfig {
-                        urls: vec!["http://placeholder:0".into()],
-                    },
-                ),
             },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
             proxy: crate::config::ProxyConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
         }
@@ -192,7 +189,7 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
-        c.models[0].tokenizer_path = "/nonexistent.json".into();
+        c.model.tokenizer_path = "/nonexistent.json".into();
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
     }

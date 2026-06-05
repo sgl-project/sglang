@@ -14,17 +14,14 @@ from __future__ import annotations
 import functools
 import inspect
 import os
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_world_group,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
@@ -318,16 +315,6 @@ class MOVADenoisingStage(PipelineStage):
         result.add_check("latents", batch.latents, V.is_tensor)
         result.add_check("audio_latents", batch.audio_latents, V.is_tensor)
         return result
-
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
-        """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
+    SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -238,6 +239,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
         "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
+    ),
+    # Internal per-worker platform override used by disaggregated role launch.
+    # Empty means normal platform auto-detection.
+    "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
+        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.

@@ -114,20 +114,18 @@ mod tests {
                 port: 0,
             },
             observability: Default::default(),
-            models: vec![crate::config::ModelConfig {
+            model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
-            }],
-            discovery: crate::config::DiscoveryConfig {
-                backend: crate::config::DiscoveryBackend::StaticUrls(
-                    crate::config::StaticUrlsDiscoveryConfig {
-                        urls: vec!["http://placeholder:0".into()],
-                    },
-                ),
             },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
             proxy: crate::config::ProxyConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
         };

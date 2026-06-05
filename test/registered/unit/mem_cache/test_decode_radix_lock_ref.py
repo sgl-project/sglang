@@ -32,6 +32,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
@@ -312,7 +313,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._match_prefix_and_lock = MagicMock(
-            return_value=(torch.arange(4, dtype=torch.int64), 4)
+            return_value=DecodePrefixMatch(
+                prefix_indices=torch.arange(4, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=req.last_node,
+            )
         )
         queue._pre_alloc = MagicMock(
             side_effect=AssertionError("_pre_alloc should not run")

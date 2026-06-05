@@ -40,24 +40,16 @@ Serve `Cosmos3-Nano` directly from the Hugging Face model ID:
 
 ```bash Command
 sglang serve \
-  --model-type diffusion \
   --model-path nvidia/Cosmos3-Nano \
-  --num-gpus 1 \
-  --host 0.0.0.0 \
-  --port 30010 \
-  --output-path /tmp/sglang-cosmos3
+  --num-gpus 1
 ```
 
 For `Cosmos3-Super`, split the model across multiple GPUs:
 
 ```bash Command
 sglang serve \
-  --model-type diffusion \
   --model-path nvidia/Cosmos3-Super \
-  --num-gpus 4 \
-  --host 0.0.0.0 \
-  --port 30010 \
-  --output-path /tmp/sglang-cosmos3
+  --num-gpus 4
 ```
 
 The server also accepts the specialized `nvidia/Cosmos3-Super-Text2Image` and `nvidia/Cosmos3-Super-Image2Video` checkpoint IDs.

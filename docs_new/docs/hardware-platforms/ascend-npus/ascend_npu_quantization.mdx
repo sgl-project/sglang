@@ -315,3 +315,132 @@ python3 -m sglang.launch_server \
 > - GGUF weights are pre-dequantized to FP16/BF16 during model loading on CPU, then transferred to NPU for inference. This trades higher memory usage for faster runtime performance (no per-forward-pass dequantization overhead).
 > - MoE layers use `npu_grouped_matmul` and `npu_moe_init_routing` / `npu_moe_finalize_routing` for high-performance expert computation.
 > - TP (tensor parallelism) sharding is supported for both dense and MoE GGUF models.
+
+## Diffusion Model Quantization on Ascend NPU
+
+SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires A5; the ModelSlim W8A8/W4A4 schemes work on A2/A3.
+
+**Requirements for MXFP8:** CANN ≥ 8.0.RC3, Ascend A5
+
+<table>
+  <thead>
+    <tr>
+      <th>Quantization method</th>
+      <th><code>quant_type</code> in JSON</th>
+      <th>Scheme class</th>
+      <th>Mode</th>
+      <th>A2/A3 Supported</th>
+      <th>A5 Supported</th>
+      <th>Trigger</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>MXFP8 (W8A8)</td>
+      <td>—</td>
+      <td><code>MXFP8Config</code></td>
+      <td>Online</td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
+      <td><code>--quantization mxfp8</code></td>
+    </tr>
+    <tr>
+      <td>MXFP8 (W8A8)</td>
+      <td><code>W8A8_MXFP8</code></td>
+      <td><code>ModelSlimMXFP8Scheme</code></td>
+      <td>Offline</td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
+      <td>auto-detected from <code>quant_model_description.json</code></td>
+    </tr>
+    <tr>
+      <td>W8A8 static</td>
+      <td><code>W8A8</code></td>
+      <td><code>ModelSlimW8A8Int8</code></td>
+      <td>Offline</td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
+      <td><strong style={{color: 'orange'}}>TBD</strong></td>
+      <td>auto-detected from <code>quant_model_description.json</code></td>
+    </tr>
+    <tr>
+      <td>W8A8 dynamic</td>
+      <td><code>W8A8_DYNAMIC</code></td>
+      <td><code>ModelSlimW8A8Int8</code></td>
+      <td>Offline</td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
+      <td><strong style={{color: 'orange'}}>TBD</strong></td>
+      <td>auto-detected from <code>quant_model_description.json</code></td>
+    </tr>
+    <tr>
+      <td>W4A4 dynamic</td>
+      <td><code>W4A4_DYNAMIC</code></td>
+      <td><code>ModelSlimW4A4Int4</code></td>
+      <td>Offline</td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
+      <td><strong style={{color: 'orange'}}>TBD</strong></td>
+      <td>auto-detected from <code>quant_model_description.json</code></td>
+    </tr>
+  </tbody>
+</table>
+
+### Online MXFP8 Quantization
+
+Online quantization dynamically quantizes FP16/BF16 weights to MXFP8 at load time using `npu_dynamic_mx_quant` + `npu_quant_matmul` CANN kernels. Pass `--quantization mxfp8` to override auto-detection.
+
+```bash Command
+# Start the diffusion server with online MXFP8 quantization
+sglang serve \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --num-gpus 4
+```
+
+```bash Command
+# One-shot generation
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --prompt "a beautiful sunset over the mountains" \
+  --save-output
+```
+
+### Offline MXFP8 Quantization (ModelSlim)
+
+For offline quantization, pre-quantize the model with msModelSlim and load the resulting checkpoint. The quantization scheme is auto-detected from `quant_model_description.json`, so no extra `--quantization` flag is needed.
+
+**Step 1: Quantize with msModelSlim**
+
+```bash Command
+msmodelslim quant \
+  --model_path /path/to/wan2_2_float_weights \
+  --save_path /path/to/wan2_2_mxfp8_weights \
+  --device npu \
+  --model_type Wan2_2 \
+  --quant_type mxfp8 \
+  --trust_remote_code True
+```
+
+> Note: SGLang does not support quantized embeddings; disable embedding quantization when using msmodelslim.
+
+**Step 2: Convert to Diffusers format**
+
+msModelSlim saves quantized Wan2.2 weights in the original Wan format. Convert to Diffusers format using the provided repack script:
+
+```bash Command
+python python/sglang/multimodal_gen/tools/wan_repack.py \
+  --input-path /path/to/wan2_2_mxfp8_weights \
+  --output-path /path/to/wan2_2_mxfp8_diffusers
+```
+
+Then copy all files from the original Diffusers checkpoint (except the `transformer`/`transformer_2` folders) into the output directory.
+
+**Step 3: Run inference**
+
+```bash Command
+sglang generate \
+  --model-path /path/to/wan2_2_mxfp8_diffusers \
+  --prompt "a beautiful sunset over the mountains" \
+  --save-output
+```
+
+For pre-quantized checkpoints available on ModelScope, see [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).

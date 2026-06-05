@@ -22,7 +22,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
+    ConditionEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -66,7 +68,7 @@ def stack_tensors(name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(tensors, dim=0)
 
 
-class TextEncodingStage(PipelineStage):
+class TextEncodingStage(ConditionEncodingStage):
     """
     Stage for encoding text prompts into embeddings for diffusion models.
 

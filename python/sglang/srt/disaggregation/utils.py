@@ -50,8 +50,22 @@ class DisaggregationMode(Enum):
 # Synchronization
 #########################
 
-# env var for testing failure, convert to float explicitly
-FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
+
+def _get_failure_prob() -> float:
+    try:
+        return float(envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get())
+    except Exception:
+        # fallback to legacy env var
+        return float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", "0"))
+
+
+def _poll_with_failure_injection(pollers) -> List[int]:
+    if (failure_prob := _get_failure_prob()) > 0:
+        return [
+            int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
+            for poller in pollers
+        ]
+    return [int(poller.poll()) for poller in pollers]
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -87,13 +101,7 @@ def poll_and_all_reduce(
     server_args: Optional[ServerArgs] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
-    if FAILURE_PROB > 0:
-        polls = [
-            int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
-            for poller in pollers
-        ]
-    else:
-        polls = [int(poller.poll()) for poller in pollers]
+    polls = _poll_with_failure_injection(pollers)
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if (
@@ -141,7 +149,9 @@ def poll_and_all_reduce_with_staging(
         ):
             staging_handler.advance_scatter(decode_req)
 
-    raw_polls = [int(dr.kv_receiver.poll()) for dr in decode_reqs]
+    # allow test injection of failure probability at runtime
+    receivers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
         if raw_polls[i] == int(KVPoll.Success):
             if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
@@ -689,3 +699,11 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.logprob.input_top_logprobs_idx = []
         req.logprob.input_token_ids_logprobs_val = []
         req.logprob.input_token_ids_logprobs_idx = []
+
+
+def is_aborted(req: Req) -> bool:
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
+        req.finished_reason, FINISH_ABORT
+    )

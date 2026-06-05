@@ -6,8 +6,16 @@ from typing import Callable
 import pytest
 
 
-def multiprocess_test(file: str, nproc: int, timeout: int = 90) -> None:
-    """Launch this script as a torchrun worker and assert success."""
+def multiprocess_test(file: str, nproc: int, timeout: int = 240) -> None:
+    """Launch this script as a torchrun worker and assert success.
+
+    The default budget covers the cold-cache first invocation, where the
+    worker pays the full triton + cutlass JIT compile cost (60-180s observed
+    on H200). The previous 90s default tripped intermittently on the first
+    parametrisation of `test_tp_qknorm` (seen on `main` runs too, not only
+    on fresh-venv PRs); subsequent parametrisations finished in ~60s once
+    the JIT cache was warm.
+    """
     cmd = [
         "torchrun",
         f"--nproc_per_node={nproc}",

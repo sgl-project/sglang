@@ -23,6 +23,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
+from sglang.multimodal_gen.test.server.realtime_consistency import (
+    pop_realtime_key_frames,
+    pop_realtime_perf_stats,
+    validate_realtime_perf_stats,
+)
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -624,7 +629,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         thresholds = get_consistency_thresholds(case.id, is_video=is_video)
 
         if is_video:
-            output_frames = extract_key_frames_from_video(content)
+            output_frames = pop_realtime_key_frames(case.id)
+            if output_frames is None:
+                output_frames = extract_key_frames_from_video(content)
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
@@ -727,10 +734,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         is_video = case.server_args.modality == "video"
 
         if is_video:
-            # Extract key frames from video
-            frames = extract_key_frames_from_video(
-                content, num_frames=case.sampling_params.num_frames
-            )
+            # realtime consistency uses websocket raw frames to avoid lossy mp4 drift
+            frames = pop_realtime_key_frames(case.id)
+            if frames is None:
+                frames = extract_key_frames_from_video(
+                    content, num_frames=case.sampling_params.num_frames
+                )
 
             if len(frames) != 3:
                 logger.warning(
@@ -1201,11 +1210,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
 
         # Single generation - output is reused for both validations
+        is_realtime_case = case.sampling_params.realtime_num_chunks is not None
         perf_record, content = self.run_and_collect(
             diffusion_server,
             case.id,
             generate_fn,
-            collect_perf=not is_gt_gen_mode,
+            collect_perf=not is_gt_gen_mode and not is_realtime_case,
         )
 
         if is_gt_gen_mode:
@@ -1223,10 +1233,23 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     raise
                 failures.append((name, str(exc)))
 
-        run_case_check(
-            "performance",
-            lambda: self._validate_and_record(case, perf_record),
-        )
+        if is_realtime_case:
+            run_case_check(
+                "performance",
+                lambda: validate_realtime_perf_stats(
+                    case.id,
+                    pop_realtime_perf_stats(case.id),
+                    case.sampling_params.realtime_perf_thresholds,
+                    ignore_initial_chunks=(
+                        case.sampling_params.realtime_perf_ignore_initial_chunks
+                    ),
+                ),
+            )
+        else:
+            run_case_check(
+                "performance",
+                lambda: self._validate_and_record(case, perf_record),
+            )
 
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (

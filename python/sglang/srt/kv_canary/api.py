@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:

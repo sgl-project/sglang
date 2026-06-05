@@ -60,6 +60,8 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    reprocessed_log_input_tokens: int = 0
+    reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
 
     @classmethod
@@ -73,6 +75,8 @@ class PrefillStats:
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
+            reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
+            reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -578,9 +582,16 @@ class SchedulerMetricsReporter:
                 )
 
             priority_enabled = self.scheduler.enable_priority_scheduling
-            total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            effective_input_tokens = (
+                prefill_stats.log_input_tokens
+                - prefill_stats.reprocessed_log_input_tokens
+            )
+            effective_hit_tokens = (
+                prefill_stats.log_hit_tokens - prefill_stats.reprocessed_log_hit_tokens
+            )
+            total_tokens = effective_input_tokens + effective_hit_tokens
             cache_hit_rate = (
-                prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+                effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
 
             # Basics

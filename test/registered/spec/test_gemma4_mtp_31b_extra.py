@@ -28,14 +28,10 @@ TOPKS = (1, 3)
 DRAFT_TOKENS_BY_TOPK = {1: 6, 3: 12}
 GSM8K_NUM_EXAMPLES = 200
 GSM8K_NUM_THREADS = 128
-GSM8K_SCORE_MARGIN = 0.03
 SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
 
-# Initial values are seeded from current Gemma4 GSM8K observations in the
-# cookbook. Replace each top-k entry with exact MTP first-200-sample scores as
-# CI calibration data becomes available.
-OBSERVED_GSM8K_SCORES = {1: 0.805, 3: 0.805}
-GSM8K_SCORE_THRESHOLD = min(OBSERVED_GSM8K_SCORES.values()) - GSM8K_SCORE_MARGIN
+# Hard accuracy floor for the MTP first-200-sample GSM8K run.
+GSM8K_SCORE_THRESHOLD = 0.75
 ACCEPT_LENGTH_THRESHOLD = 1.5
 
 

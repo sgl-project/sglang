@@ -311,6 +311,9 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        return False
+
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
 
@@ -686,6 +689,9 @@ class PipelineConfig:
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 
+    def prepare_world_condition(self, batch, device, dtype):
+        return None
+
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
 
@@ -805,6 +811,18 @@ class PipelineConfig:
             type=parse_int_list,
             default=PipelineConfig.dmd_denoising_steps,
             help="Comma-separated list of denoising steps (e.g., '1000,757,522')",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-sink-size",
+            type=int,
+            default=None,
+            help="Override the number of sink frames kept by realtime causal DiT pipelines that support it.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-kv-cache-num-frames",
+            type=int,
+            default=None,
+            help="Override the total frame capacity of realtime causal DiT KV cache for pipelines that support it.",
         )
 
         # Add VAE configuration arguments

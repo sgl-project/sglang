@@ -174,7 +174,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.is_gemma4 = (
             hasattr(self.tokenizer_manager.model_config, "hf_config")
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
+            and self.tokenizer_manager.model_config.hf_config.model_type
+            in ("gemma4", "gemma4_unified")
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
@@ -470,12 +471,22 @@ class OpenAIServingChat(OpenAIServingBase):
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
 
-        """Convert OpenAI chat completion request to internal format"""
+        if request.stream:
+            if request.return_prompt_token_ids:
+                raise ValueError(
+                    "return_prompt_token_ids is not supported with streaming. "
+                    "Please set stream=false when using return_prompt_token_ids=true."
+                )
+            if request.return_meta_info:
+                raise ValueError(
+                    "return_meta_info is not supported with streaming. "
+                    "Please set stream=false when using return_meta_info=true."
+                )
+
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
-
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -483,8 +494,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
-        # Handle single vs multiple requests
-        if is_multimodal:
+        if request.input_ids is not None:
+            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        elif is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}
         else:
             if isinstance(processed_messages.prompt_ids, str):
@@ -539,6 +551,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            return_prompt_token_ids=request.return_prompt_token_ids,
         )
 
         return adapted_request, request
@@ -594,8 +607,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
-        # Use chat template
-        if self.template_manager.chat_template_name is None:
+        # When input_ids are provided, skip template tokenization entirely;
+        # only stop tokens and tool_call_constraint are needed.
+        if request.input_ids is not None:
+            result = MessageProcessingResult(
+                prompt="",
+                prompt_ids=request.input_ids,
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=request.stop or [],
+            )
+        elif self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
@@ -1244,6 +1268,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     history_tool_calls_cnt,
                 )
 
+            # Extract prompt_token_ids if requested
+            choice_prompt_token_ids = (
+                ret_item.get("prompt_token_ids")
+                if request.return_prompt_token_ids
+                else None
+            )
+
+            choice_meta_info = (
+                ret_item["meta_info"] if request.return_meta_info else None
+            )
+            # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(
                 reasoning_text, tool_calls
             )
@@ -1252,7 +1287,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if text else None,
+                    content=text if text else "",
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
@@ -1264,6 +1299,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                prompt_token_ids=choice_prompt_token_ids,
+                meta_info=choice_meta_info,
             )
             choices.append(choice_data)
 

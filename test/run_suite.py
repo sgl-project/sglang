@@ -114,6 +114,8 @@ NIGHTLY_SUITES = {
         "nightly-amd-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
+        "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",

@@ -76,17 +76,16 @@ pub fn build_registry(
     block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
-    for m in &cfg.models {
-        reg.insert(
-            ModelId(m.id.clone()),
-            build_policy(
-                m,
-                Arc::clone(&tree),
-                Arc::clone(&tokenizers),
-                Arc::clone(&block_size_oracle),
-            ),
-        );
-    }
+    let m = &cfg.model;
+    reg.insert(
+        ModelId(m.id.clone()),
+        build_policy(
+            m,
+            Arc::clone(&tree),
+            Arc::clone(&tokenizers),
+            Arc::clone(&block_size_oracle),
+        ),
+    );
     Ok(reg)
 }
 
@@ -111,34 +110,29 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ProxyConfig,
-        ServerConfig, StaticUrlsDiscoveryConfig,
+        ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig, ServerConfig,
+        StaticUrlsDiscoveryConfig,
     };
 
     use crate::config::PolicyKind;
 
-    fn cfg_with_models(policies: &[(&str, PolicyKind)]) -> Config {
+    fn cfg_with_model(id: &str, policy: PolicyKind) -> Config {
         Config {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
             },
             observability: Default::default(),
-            models: policies
-                .iter()
-                .map(|(id, p)| ModelConfig {
-                    id: (*id).into(),
-                    tokenizer_path: "/tmp/x".into(),
-                    policy: *p,
-                    circuit_breaker: None,
-                    cache_aware: None,
-                })
-                .collect(),
-            discovery: DiscoveryConfig {
-                backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-                    urls: vec!["http://placeholder:0".into()],
-                }),
+            model: ModelConfig {
+                id: id.into(),
+                tokenizer_path: "/tmp/x".into(),
+                policy,
+                circuit_breaker: None,
+                cache_aware: None,
             },
+            discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
+            }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
         }
@@ -154,22 +148,18 @@ mod tests {
     }
 
     #[test]
-    fn registry_assigns_per_model() {
-        let cfg = cfg_with_models(&[
-            ("qwen", PolicyKind::RoundRobin),
-            ("deepseek", PolicyKind::Random),
-        ]);
+    fn registry_assigns_configured_model() {
+        let cfg = cfg_with_model("qwen", PolicyKind::RoundRobin);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
         let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
-        assert!(reg.get(&ModelId("deepseek".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
     }
 
     #[test]
     fn cache_aware_zmq_builds_via_factory() {
-        let cfg = cfg_with_models(&[("modelA", PolicyKind::CacheAwareZmq)]);
+        let cfg = cfg_with_model("modelA", PolicyKind::CacheAwareZmq);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
         let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();

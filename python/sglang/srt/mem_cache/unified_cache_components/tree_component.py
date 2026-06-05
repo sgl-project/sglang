@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from enum import Enum, IntFlag
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 from numpy import float64
@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -383,7 +383,14 @@ class TreeComponent(ABC):
     # ---- HiCache Hooks ----
 
     def build_hicache_transfers(
-        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        req: Optional[Req] = None,
+        token_ids: Optional[Sequence[int]] = None,
+        prefetch_tokens: int = 0,
+        last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build transfer descriptors for this component in the given phase.
         Returns None if the component has nothing to transfer."""
@@ -394,7 +401,9 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
-        **kw,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass

@@ -2,7 +2,10 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 
-from sglang.jit_kernel.ngram_embedding import compute_n_gram_ids
+from sglang.jit_kernel.ngram_embedding import (
+    compute_n_gram_ids,
+    compute_n_gram_ids_decode,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -135,27 +138,40 @@ class NgramEmbedding(torch.nn.Module):
             or forward_batch.forward_mode.is_decode()
         ):
             ngram_embedding_info = forward_batch.ngram_embedding_info
-            torch.cumsum(
-                ngram_embedding_info.req_lens,
-                dim=0,
-                dtype=torch.int32,
-                out=self.exclusive_req_len_sums[1 : 1 + forward_batch.batch_size],
-            )
-            compute_n_gram_ids(
-                ne_n=self.over_embedding_n,
-                ne_k=self.over_embedding_k,
-                ne_weights=self.oe_weights,
-                ne_mods=self.oe_mods,
-                tokens=input_ids.to(torch.int32),
-                exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
-                exclusive_req_len_sums=self.exclusive_req_len_sums[
-                    : forward_batch.batch_size + 1
-                ],
-                ne_token_table=ngram_embedding_info.token_table,
-                row_indices=forward_batch.req_pool_indices,
-                column_starts=ngram_embedding_info.column_starts,
-                n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
-            )
+            if forward_batch.forward_mode.is_decode():
+                compute_n_gram_ids_decode(
+                    ne_n=self.over_embedding_n,
+                    ne_k=self.over_embedding_k,
+                    ne_weights=self.oe_weights,
+                    ne_mods=self.oe_mods,
+                    exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
+                    ne_token_table=ngram_embedding_info.token_table,
+                    row_indices=forward_batch.req_pool_indices,
+                    column_starts=ngram_embedding_info.column_starts,
+                    n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
+                )
+            else:
+                torch.cumsum(
+                    ngram_embedding_info.req_lens,
+                    dim=0,
+                    dtype=torch.int32,
+                    out=self.exclusive_req_len_sums[1 : 1 + forward_batch.batch_size],
+                )
+                compute_n_gram_ids(
+                    ne_n=self.over_embedding_n,
+                    ne_k=self.over_embedding_k,
+                    ne_weights=self.oe_weights,
+                    ne_mods=self.oe_mods,
+                    tokens=input_ids.to(torch.int32),
+                    exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
+                    exclusive_req_len_sums=self.exclusive_req_len_sums[
+                        : forward_batch.batch_size + 1
+                    ],
+                    ne_token_table=ngram_embedding_info.token_table,
+                    row_indices=forward_batch.req_pool_indices,
+                    column_starts=ngram_embedding_info.column_starts,
+                    n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
+                )
 
         # [13, seq_len, hidden_dim]
         all_hidden_states = torch.empty(

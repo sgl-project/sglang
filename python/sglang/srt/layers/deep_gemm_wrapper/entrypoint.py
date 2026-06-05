@@ -20,6 +20,9 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
+    if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
+        deep_gemm.set_pdl(True)
+
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 

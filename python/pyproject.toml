@@ -28,8 +28,8 @@ dependencies = [
   "distro",
   "einops",
   "fastapi",
-  "flashinfer_python[cu13]==0.6.11.post1", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.11.post1",
+  "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.12",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -38,7 +38,7 @@ dependencies = [
   "ninja",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
-  "nvidia-cutlass-dsl[cu13]==4.5.1",
+  "nvidia-cutlass-dsl[cu13]==4.5.2",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -60,7 +60,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b9",
-  "sgl-deep-gemm==0.1.0",
+  "sgl-deep-gemm==0.1.2",
   "sglang-kernel==0.4.3",
   "soundfile==0.13.1",
   "tiktoken",
@@ -82,7 +82,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.2.1",
   "smg-grpc-servicer>=0.5.0",
-  "kernels<0.15",
+  "kernels>=0.14.1,<0.15",
 ]
 
 [[tool.uv.index]]
@@ -111,6 +111,7 @@ diffusion = [
   "av==16.1.0",
   "scikit-image==0.25.2",
   "trimesh>=4.0.0",
+  "websockets",
   "xatlas",
 ]
 
@@ -177,7 +178,8 @@ killall_sglang = "sglang.cli.killall:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "jit_kernel/**/*",
+  "multimodal_gen/apps/realtime_webui/**/*"
 ]
 
 [tool.setuptools.packages.find]

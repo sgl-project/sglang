@@ -100,13 +100,23 @@ class FlashinferDispatcher(BaseDispatcher):
         # TODO: Can other moe runners use payload_in_workspace too?
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
-        # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
         # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),
         # which reserves ep_size * max_num_tokens * payload bytes, and the C++
         # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
+        #
+        # The workspace must fit both:
+        #  (a) the fattest prefill batch (bounded by chunked_prefill_size), and
+        #  (b) the largest decode batch (bounded by max_running_requests, which
+        #      _resolve_max_num_reqs caps at 4096 per DP worker).
+        # max_running_requests is not yet resolved at model-construction time,
+        # so we use 4096 as a floor to cover decode batches and _dummy_run
+        # (which warms up at batch_size = req_to_token_pool.size).
+        cps = get_global_server_args().chunked_prefill_size
+        default_max_tokens = max(cps if cps and cps > 0 else 4096, 4096)
         self.max_num_tokens = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
+            default_max_tokens,
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.

@@ -1238,6 +1238,38 @@ def biased_grouped_topk_gpu(
                 renormalize,
                 scaling,
             )
+        elif (
+            _is_xpu
+            and num_expert_group == 1
+            and topk_group == 1
+            and num_fused_shared_experts == 0
+            and num_experts <= 256
+            and topk <= 8
+        ):
+            if not apply_routed_scaling_factor_on_output:
+                scaling = 1.0
+
+            num_tokens = gating_output.shape[0]
+
+            topk_values = torch.empty(
+                (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+            )
+            topk_indices = torch.empty(
+                (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+            )
+
+            if num_tokens == 0:
+                return topk_values, topk_indices
+
+            topk_sigmoid(
+                topk_values,
+                topk_indices,
+                gating_output,
+                renormalize,
+                correction_bias,
+            )
+            return topk_values * scaling, topk_indices
+
         else:
             return biased_grouped_topk_impl(
                 hidden_states,

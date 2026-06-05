@@ -36,6 +36,16 @@ For deploying PD disaggregation at scale with load balancing and fault tolerance
 uv pip install mooncake-transfer-engine
 ```
 
+### IB Device Configuration
+
+`--disaggregation-ib-device` supports the following formats when using the Mooncake backend:
+
+1. Shared device list for all GPUs: `mlx5_0` or `mlx5_0,mlx5_1`
+2. Per-GPU JSON mapping: `{"0": "mlx5_0,mlx5_1", "1": "mlx5_2,mlx5_3"}`
+3. Path to a JSON file containing the same per-GPU mapping
+
+Each JSON value uses the same comma-separated device list format as the shared configuration.
+
 ### Usage
 
 ### Llama Single Node

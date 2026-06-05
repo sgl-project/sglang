@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,7 +33,6 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
         ),
         translate_loc_from_full_to_swa=lambda last_loc: last_loc,
         full_to_swa_index_mapping=torch.zeros(64, dtype=torch.int64),
-        _kvcache=SimpleNamespace(invalidate_loc_cache=lambda: None),
     )
 
 

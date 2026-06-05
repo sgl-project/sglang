@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -132,13 +132,6 @@ def compute_mrope_position_ids_vision(
 # -----------------------------------------------------------------------------
 
 
-def qwen3_rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Qwen3/Llama-style rotate_half: split first/second half of head_dim."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def qwen3_apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -153,8 +146,19 @@ def qwen3_apply_rotary_pos_emb(
         cos: [1, S, 1, D] or broadcastable
         sin: [1, S, 1, D] or broadcastable
     """
-    q_embed = (q * cos) + (qwen3_rotate_half(q) * sin)
-    k_embed = (k * cos) + (qwen3_rotate_half(k) * sin)
+    half = q.shape[-1] // 2
+    q1 = q[..., :half]
+    q2 = q[..., half:]
+    q_embed = torch.empty_like(q)
+    q_embed[..., :half] = q1 * cos[..., :half] - q2 * sin[..., :half]
+    q_embed[..., half:] = q2 * cos[..., half:] + q1 * sin[..., half:]
+
+    half = k.shape[-1] // 2
+    k1 = k[..., :half]
+    k2 = k[..., half:]
+    k_embed = torch.empty_like(k)
+    k_embed[..., :half] = k1 * cos[..., :half] - k2 * sin[..., :half]
+    k_embed[..., half:] = k2 * cos[..., half:] + k1 * sin[..., half:]
     return q_embed, k_embed
 
 
@@ -428,18 +432,21 @@ class Cosmos3CausalAttention(nn.Module):
         batch_size, seq_len = hidden_states.shape[:2]
 
         qkv, _ = self.to_qkv(hidden_states)
-        # split returns strided views into qkv; .contiguous() before .view()
-        # because the per-head reshape needs row-major memory.
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(
-            batch_size, seq_len, self.num_attention_heads, self.head_dim
+        qkv = qkv.view(
+            batch_size,
+            seq_len,
+            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
         )
-        k = k.contiguous().view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
-        )
-        v = v.contiguous().view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
-        )
+        q = qkv[:, :, : self.num_attention_heads, :]
+        k = qkv[
+            :,
+            :,
+            self.num_attention_heads : self.num_attention_heads
+            + self.num_key_value_heads,
+            :,
+        ]
+        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
         q = F.rms_norm(
             q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
@@ -536,32 +543,31 @@ class Cosmos3CrossAttention(nn.Module):
         batch_size, seq_len_gen = hidden_states.shape[:2]
 
         qkv, _ = self.to_qkv(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(
-            batch_size, seq_len_gen, self.num_attention_heads, self.head_dim
+        qkv = qkv.view(
+            batch_size,
+            seq_len_gen,
+            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
         )
-        k = k.contiguous().view(
-            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
-        )
-        v = v.contiguous().view(
-            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
-        )
+        q = qkv[:, :, : self.num_attention_heads, :]
+        k = qkv[
+            :,
+            :,
+            self.num_attention_heads : self.num_attention_heads
+            + self.num_key_value_heads,
+            :,
+        ]
+        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
-        q = F.rms_norm(
-            q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
-        )
-        k = F.rms_norm(
-            k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+        q, k = apply_qk_norm(
+            q.contiguous(), k.contiguous(), self.norm_q, self.norm_k, self.head_dim
         )
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
         # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
         # …) and handles the Ulysses all-to-all when SP > 1.
-        num_und = k_und.shape[1]
-        k = torch.cat([k_und, k], dim=1)
-        v = torch.cat([v_und, v], dim=1)
-        out = self.attn(q, k, v, num_replicated_kv_prefix=num_und)
+        out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
@@ -1158,24 +1164,23 @@ class Cosmos3OmniTransformer(CachableDiT):
             self.cached_kv[cache_key] = self.language_model(
                 text_ids, text_mask, freqs_und[0], freqs_und[1]
             )
-            self.cached_freqs_gen[cache_key] = freqs_gen
+            cos_gen, sin_gen = freqs_gen
+            if sequence_shard_enabled:
+                if seq_shard_pad > 0:
+                    pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                    pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                    cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
+                    sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
+                cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+                sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+                cos_gen = cos_gen[:, self.sp_rank, :, :]
+                sin_gen = sin_gen[:, self.sp_rank, :, :]
+            cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
+            sin_gen = sin_gen.unsqueeze(2)
+            self.cached_freqs_gen[cache_key] = (cos_gen, sin_gen)
 
         freqs_gen = self.cached_freqs_gen[cache_key]
         cos_gen, sin_gen = freqs_gen
-
-        if sequence_shard_enabled:
-            if seq_shard_pad > 0:
-                pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
-                sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
-            cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-            sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-            cos_gen = cos_gen[:, self.sp_rank, :, :]
-            sin_gen = sin_gen[:, self.sp_rank, :, :]
-
-        cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
-        sin_gen = sin_gen.unsqueeze(2)
 
         # Run GEN layers. `residual` is threaded so each layer's
         # input_layernorm and post_attention_layernorm can use the

@@ -37,10 +37,11 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], defau
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-# `humantime-serde` lets `WorkerConfig.request_timeout` accept human-readable
-# durations like `"60s"` / `"500ms"` / `"2m"` in YAML / TOML, rather than
-# forcing operators to write raw milliseconds.
-humantime-serde = "1"
+
+# Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
+# Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so
+# this pulls no openssl/native-tls (matching reqwest's rustls-tls above).
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 
 # Utilities
 anyhow = "1"
@@ -53,8 +54,6 @@ bytes = "1"
 rand = "0.8"
 tokio-stream = "0.1"
 dashmap = "6"
-serde_yaml = "0.9"
-toml = "0.8"
 kube = { version = "0.96", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
 tokio-util = "0.7"

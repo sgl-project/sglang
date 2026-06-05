@@ -6,8 +6,9 @@ from unittest.mock import MagicMock
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
-    _RESERVED_NAMES,
     CustomSpecAlgo,
+    _assert_custom_spec_algo_conforms,
+    _reserved_names,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -104,9 +105,20 @@ class TestRegister(_RegistryIsolated):
                 return MagicMock
 
     def test_reserved_name_raises(self):
-        for reserved in _RESERVED_NAMES:
+        for reserved in _reserved_names():
             with self.assertRaisesRegex(ValueError, "reserved"):
                 SpeculativeAlgorithm.register(reserved)
+
+    def test_reserved_names_cover_all_enum_members(self):
+        # Reserved names are derived from the enum, so every builtin (including
+        # FROZEN_KV_MTP, which a hand-maintained list had omitted) is reserved.
+        for member in SpeculativeAlgorithm:
+            self.assertIn(member.name, _reserved_names())
+        self.assertIn("NEXTN", _reserved_names())  # CLI alias
+
+    def test_reserved_name_is_case_insensitive(self):
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            SpeculativeAlgorithm.register("frozen_kv_mtp")
 
     def test_register_is_case_insensitive_on_collision(self):
         @SpeculativeAlgorithm.register("MY_FOO")
@@ -136,10 +148,19 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertFalse(self.algo.is_none())
         self.assertFalse(self.algo.is_eagle())
         self.assertFalse(self.algo.is_eagle3())
+        self.assertFalse(self.algo.is_frozen_kv_mtp())
         self.assertFalse(self.algo.is_dflash())
         self.assertFalse(self.algo.is_standalone())
         self.assertFalse(self.algo.is_ngram())
         self.assertTrue(self.algo.is_speculative())
+        # A registered plugin is never NONE -> is_some() mirrors the enum.
+        self.assertTrue(self.algo.is_some())
+
+    def test_is_some_matches_enum_semantics(self):
+        # is_some() is called on spec algos in overlap_utils.py; a CustomSpecAlgo
+        # must answer it the same way the enum does (True iff not NONE).
+        self.assertEqual(self.algo.is_some(), not self.algo.is_none())
+        self.assertEqual(SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some())
 
     def test_supports_spec_v2_follows_supports_overlap(self):
         # Plugin registered with supports_overlap=False -> not spec_v2.
@@ -214,6 +235,60 @@ class TestSubclassOverride(_RegistryIsolated):
         algo = SpeculativeAlgorithm.from_string("MY_CUSTOM")
         # Custom dispatch bypasses default overlap check
         self.assertEqual(algo.create_worker(MagicMock()), "custom-dispatched")
+
+
+class TestConformanceGuard(_RegistryIsolated):
+    """register_algorithm rejects spec classes that drift from the enum's
+    is_*() / supports_*() duck-typing interface."""
+
+    def test_base_custom_spec_algo_conforms(self):
+        # The shipped base class must satisfy its own contract.
+        _assert_custom_spec_algo_conforms(CustomSpecAlgo)
+
+    def test_conforming_subclass_passes(self):
+        class Good(CustomSpecAlgo):
+            def is_eagle(self) -> bool:
+                return True
+
+        _assert_custom_spec_algo_conforms(Good)  # does not raise
+
+    @staticmethod
+    def _spec_class_missing(method: str) -> type:
+        # Build a class exposing the full enum interface except `method`. A real
+        # subclass can't be "missing" an inherited method, so the failure mode
+        # the guard catches is the base class itself dropping one — simulated
+        # here with a standalone class.
+        interface = {
+            name
+            for name in vars(SpeculativeAlgorithm)
+            if name.startswith(("is_", "supports_"))
+        }
+        body = {m: (lambda self: False) for m in interface if m != method}
+        return type("Broken", (), body)
+
+    def test_missing_predicate_raises(self):
+        Broken = self._spec_class_missing("is_some")
+        with self.assertRaisesRegex(TypeError, "is_some"):
+            _assert_custom_spec_algo_conforms(Broken)
+
+    def test_register_rejects_nonconforming_spec_class(self):
+        Broken = self._spec_class_missing("is_some")
+        with self.assertRaisesRegex(TypeError, "missing duck-typed methods"):
+
+            @SpeculativeAlgorithm.register("MY_BROKEN", spec_class=Broken)
+            def _factory(server_args):
+                return MagicMock
+
+    def test_enum_interface_subset_of_custom_spec_algo(self):
+        # Every is_*/supports_* method on the enum exists on CustomSpecAlgo.
+        # vars() (not dir()) because EnumMeta.__dir__ hides instance methods.
+        interface = {
+            name
+            for name in vars(SpeculativeAlgorithm)
+            if name.startswith(("is_", "supports_"))
+        }
+        self.assertTrue(interface)  # guard against an empty (no-op) interface
+        self.assertEqual(interface - set(dir(CustomSpecAlgo)), set())
 
 
 class TestCrossTypeIdentity(_RegistryIsolated):
