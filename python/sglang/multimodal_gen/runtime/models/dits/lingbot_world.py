@@ -1195,8 +1195,10 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
 
     @staticmethod
     def _should_cache_cam_conditioner(forward_batch) -> bool:
-        return forward_batch is not None and getattr(
-            forward_batch, "enable_sequence_shard", False
+        return (
+            forward_batch is not None
+            and getattr(forward_batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
         )
 
     @staticmethod

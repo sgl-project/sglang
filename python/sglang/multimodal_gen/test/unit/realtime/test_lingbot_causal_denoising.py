@@ -238,6 +238,9 @@ def test_lingbot_cam_conditioner_cache_reuses_source_tensor(monkeypatch):
     block.cam_conditioner = _CamConditioner()
     forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
     monkeypatch.setattr(
+        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
         lingbot_world_module,
         "get_forward_context",
         lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=7),
@@ -283,6 +286,38 @@ def test_lingbot_cam_conditioner_cache_skips_non_sequence_shard(monkeypatch):
 
     assert first is not second
     assert first[0] is not second[0]
+    assert block.cam_conditioner.calls == 2
+    assert "lingbot_cam_conditioner" not in forward_batch.extra
+
+
+def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
+    class _CamConditioner:
+        def __init__(self):
+            self.calls = 0
+
+        def compute_scale_shift(self, c2ws_plucker_emb):
+            self.calls += 1
+            return c2ws_plucker_emb + 1, c2ws_plucker_emb + 2
+
+    block = CausalLingBotWorldTransformerBlock.__new__(
+        CausalLingBotWorldTransformerBlock
+    )
+    block.cam_conditioner = _CamConditioner()
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    monkeypatch.setattr(
+        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=7),
+    )
+
+    c2ws_plucker_emb = torch.ones(1, 2, 3)
+    first = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+    second = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+
+    assert first is not second
     assert block.cam_conditioner.calls == 2
     assert "lingbot_cam_conditioner" not in forward_batch.extra
 
@@ -337,6 +372,9 @@ def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
         SimpleNamespace(cam_conditioner=_CamConditioner(2)),
     ]
     forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    monkeypatch.setattr(
+        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
+    )
     monkeypatch.setattr(
         lingbot_world_module,
         "get_forward_context",
