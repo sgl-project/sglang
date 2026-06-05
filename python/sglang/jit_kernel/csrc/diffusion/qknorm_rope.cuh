@@ -50,19 +50,7 @@ SGL_DEVICE float load_cache_value(const float* ptr, int64_t idx) {
 #endif
 }
 
-template <typename DType>
-SGL_DEVICE float round_to_dtype(float value) {
-  return static_cast<float>(device::cast<DType>(value));
-}
-
-template <
-    int64_t kHeadDim,
-    int64_t kRopeDim,
-    bool kIsNeox,
-    bool kRoundNormBeforeRope,
-    bool kUsePDL,
-    typename DType,
-    typename IdType>
+template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kUsePDL, typename DType, typename IdType>
 __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ params) {
   using namespace device;
 
@@ -129,12 +117,6 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
       const auto [w0, w1] = cast<fp32x2_t>(weight_vec[j]);
       elems[2 * j] *= norm_factor * w0;
       elems[2 * j + 1] *= norm_factor * w1;
-      if constexpr (kRoundNormBeforeRope) {
-        const auto rounded = cast<Packed, fp32x2_t>({elems[2 * j], elems[2 * j + 1]});
-        const auto [r0, r1] = cast<fp32x2_t>(rounded);
-        elems[2 * j] = r0;
-        elems[2 * j + 1] = r1;
-      }
     }
 
     if constexpr (kIsNeox) {
@@ -154,13 +136,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
           const int half_idx = dim_idx / 2;
           const float cos = load_cache_value(cos_ptr, half_idx);
           const float sin = load_cache_value(sin_ptr, half_idx);
-          float x_cos = elems[i] * cos;
-          float y_sin = swapped * sin;
-          if constexpr (kRoundNormBeforeRope) {
-            x_cos = round_to_dtype<DType>(x_cos);
-            y_sin = round_to_dtype<DType>(y_sin);
-          }
-          elems[i] = x_cos + y_sin;
+          elems[i] = elems[i] * cos + swapped * sin;
         }
       }
     } else {
@@ -176,18 +152,8 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
           const int half_idx = static_cast<int>(lane_id * kElemsPerThread + i) / 2;
           const float cos = load_cache_value(cos_ptr, half_idx);
           const float sin = load_cache_value(sin_ptr, half_idx);
-          float x_cos = x * cos;
-          float y_sin = y * sin;
-          float y_cos = y * cos;
-          float x_sin = x * sin;
-          if constexpr (kRoundNormBeforeRope) {
-            x_cos = round_to_dtype<DType>(x_cos);
-            y_sin = round_to_dtype<DType>(y_sin);
-            y_cos = round_to_dtype<DType>(y_cos);
-            x_sin = round_to_dtype<DType>(x_sin);
-          }
-          elems[i] = x_cos - y_sin;
-          elems[i + 1] = y_cos + x_sin;
+          elems[i] = x * cos - y * sin;
+          elems[i + 1] = y * cos + x * sin;
         }
       }
     }
@@ -202,12 +168,11 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kRoundNormBeforeRope, bool kUsePDL, typename DType>
+template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kUsePDL, typename DType>
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   template <typename IdType>
-  static constexpr auto kernel =
-      fused_qknorm_rope_warp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope, kUsePDL, DType, IdType>;
+  static constexpr auto kernel = fused_qknorm_rope_warp<kHeadDim, kRopeDim, kIsNeox, kUsePDL, DType, IdType>;
 
   static void
   run(const tvm::ffi::TensorView q,
