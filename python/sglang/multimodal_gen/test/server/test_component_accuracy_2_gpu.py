@@ -15,7 +15,9 @@ from sglang.multimodal_gen.test.server.accuracy_utils import (
 )
 from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
 
-VAE_CHANNELS_LAST_3D_PARITY_CASE_IDS = {"wan2_2_i2v_a14b_2gpu"}
+VAE_CHANNELS_LAST_3D_PARITY_CASE_IDS = {
+    "wan2_2_i2v_a14b_2gpu",
+}
 VAE_CHANNELS_LAST_3D_PARITY_CASES = [
     case
     for case in ACCURACY_TWO_GPU_CASES

@@ -419,11 +419,11 @@ stabilize_flashinfer_jit_paths() {
 
 install_extra_deps() {
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.11.post1"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine==0.3.11.post1"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi

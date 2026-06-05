@@ -26,6 +26,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -73,19 +74,21 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
-)
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
-from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_TOKENIZER,
+    TokenizerMetricsCollector,
+    resolve_collector_class,
+)
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -111,6 +114,11 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+    collect_scheduler_processes,
+    pyspy_dump_schedulers,
+    trigger_cuda_user_coredump,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -197,6 +205,9 @@ class ReqState:
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+
+    # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
+    prompt_token_ids: Optional[List[int]] = None
 
 
 def _slice_streaming_output_meta_info(
@@ -293,7 +304,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # so we need to reserve the space for the draft tokens.
             self.num_reserved_tokens = max(
                 server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-                server_args.speculative_num_draft_tokens,
+                server_args.max_speculative_num_draft_tokens,
             )
         else:
             self.num_reserved_tokens = 0
@@ -373,6 +384,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            self.server_args,
+            port_args,
+            caller="TokenizerManager",
+        )
 
     def init_running_status(self):
         # Request states
@@ -488,7 +505,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     labels[label] = ""
             if self.server_args.extra_metric_labels:
                 labels.update(self.server_args.extra_metric_labels)
-            self.metrics_collector = TokenizerMetricsCollector(
+            tokenizer_collector_cls = resolve_collector_class(
+                self.server_args,
+                STAT_LOGGER_ROLE_TOKENIZER,
+                TokenizerMetricsCollector,
+            )
+            self.metrics_collector = tokenizer_collector_cls(
                 server_args=self.server_args,
                 labels=labels,
                 bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
@@ -541,7 +563,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
             if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.warning(
+                logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
             elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
@@ -549,11 +571,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
+        if self.server_args.tokenizer_worker_num > 1:
+            self._attach_multi_http_worker_info(obj)
         self._init_req_state(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
-        if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
 
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
@@ -567,6 +589,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                state = self.rid_to_state[obj.rid]
+                if obj.return_prompt_token_ids:
+                    state.prompt_token_ids = list(tokenized_obj.input_ids)
                 self._send_one_request(tokenized_obj)
                 async for response in self._wait_one_response(obj, request):
                     yield response
@@ -783,8 +808,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if (
                 not self.server_args.language_only
-                or self.server_args.encoder_transfer_backend
-                in ["zmq_to_tokenizer", "mooncake"]
+                or self.server_args.encoder_transfer_backend == "zmq_to_tokenizer"
             ):
                 if self.server_args.language_only:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
@@ -808,10 +832,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             elif (
                 self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+                and self.server_args.encoder_transfer_backend
+                in ["zmq_to_scheduler", "mooncake"]
                 and not obj.need_wait_for_mm_inputs
             ):
-                # In language_only mode with zmq_to_scheduler, if we didn't dispatch
+                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
@@ -827,6 +852,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
+            # Caller-supplied per-image hashes (external KV routers, e.g.
+            # routing-aware orchestrators that compute a content-addressed
+            # hash before dispatch). Setting MultimodalDataItem.hash here
+            # short-circuits the internal hash_feature() recompute inside
+            # set_pad_value(), making the derived pad_value deterministic
+            # from the caller's hash. That alignment lets the router's
+            # routing decision agree with sglang's prefix-cache key for
+            # the same image. On any per-item parse error or list-length
+            # mismatch we fall back to the internal recompute so a
+            # malformed mm_hashes never blocks a request.
+            caller_mm_hashes = getattr(obj, "mm_hashes", None)
+            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
+                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+                    logger.warning(
+                        "mm_hashes length (%d) != mm_items length (%d); "
+                        "ignoring caller hashes for this request.",
+                        len(caller_mm_hashes),
+                        len(mm_inputs.mm_items),
+                    )
+                else:
+                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+                        if not isinstance(item, MultimodalDataItem):
+                            continue
+                        try:
+                            item.hash = int(hex_hash, 16)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Ignoring malformed mm_hashes entry %r; "
+                                "this item will fall back to hash_feature().",
+                                hex_hash,
+                            )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1058,6 +1114,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                mm_data_mooncake=obj.mm_data_mooncake,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1427,6 +1484,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
+                    state = self.rid_to_state[tmp_obj.rid]
+                    if tmp_obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
@@ -1439,6 +1499,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        state = self.rid_to_state[tmp_obj.rid]
+                        if tmp_obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
@@ -1488,7 +1551,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
-                    tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
+                    state = self.rid_to_state[tmp_obj.rid]
+                    tokenized_obj.time_stats = state.time_stats
+                    if tmp_obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
@@ -1637,6 +1703,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
+        if obj.log_level is not None:
+            # setLevel() may raise exception if obj.log_level is illegal string.
+            # Let the exception propagate to the caller.
+            # Only legal requests will be sent to scheduler.
+            logging.getLogger().setLevel(obj.log_level.upper())
+            self.send_to_scheduler.send_pyobj(obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
@@ -1729,6 +1801,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
+            # Surface scheduler load info on each response so clients can do
+            # response-based flow control without polling /v1/loads. The
+            # scheduler already piggy-backs the per-DP-rank load on
+            # BatchStrOutput / BatchTokenIDOutput via the ``load`` field.
+            load = getattr(recv_obj, "load", None)
+            if load is not None:
+                num_running_reqs = getattr(load, "num_running_reqs", None)
+                num_waiting_reqs = getattr(load, "num_waiting_reqs", None)
+                if num_running_reqs is not None:
+                    meta_info["num_running_reqs"] = num_running_reqs
+                if num_waiting_reqs is not None:
+                    meta_info["num_waiting_reqs"] = num_waiting_reqs
+
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
@@ -1764,7 +1849,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                hidden_states = recv_obj.output_hidden_states[i]
+                if hidden_states is not None:
+                    meta_info["hidden_states"] = hidden_states
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
@@ -1831,6 +1918,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     }
                 else:
                     out_dict = None
+                if out_dict is not None and state.prompt_token_ids is not None:
+                    out_dict["prompt_token_ids"] = state.prompt_token_ids
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = (
@@ -1866,6 +1955,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     }
                 else:
                     out_dict = None
+                if out_dict is not None and state.prompt_token_ids is not None:
+                    out_dict["prompt_token_ids"] = state.prompt_token_ids
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
@@ -1936,16 +2027,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
-
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
-            and recv_obj.load is not None
-        ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
@@ -2348,7 +2429,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def dump_requests_before_crash(
         self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
     ):
-        if not self.crash_dump_folder:
+        should_dump_pyspy = envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.get()
+        should_dump_cuda_coredump = envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.get()
+        should_dump_diagnostics = should_dump_pyspy or should_dump_cuda_coredump
+        if not self.crash_dump_folder and not should_dump_diagnostics:
             return
 
         if self.crash_dump_performed:
@@ -2359,69 +2443,96 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.crash_dump_performed = True
 
-        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
+        # Dump requests info
+        if self.crash_dump_folder:
+            logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
 
-        # Add finished requests from crash_dump_request_list
-        data_to_dump = []
-        if self.crash_dump_request_list:
-            data_to_dump.extend(self.crash_dump_request_list)
+            # Add finished requests from crash_dump_request_list
+            data_to_dump = []
+            if self.crash_dump_request_list:
+                data_to_dump.extend(self.crash_dump_request_list)
 
-        # Add unfinished requests from rid_to_state
-        unfinished_requests = []
-        for rid, state in self.rid_to_state.items():
-            if not state.finished:
-                state.time_stats.set_finished_time()
-                unfinished_requests.append(
-                    (
-                        state.obj,
+            # Add unfinished requests from rid_to_state
+            unfinished_requests = []
+            for rid, state in self.rid_to_state.items():
+                if not state.finished:
+                    state.time_stats.set_finished_time()
+                    unfinished_requests.append(
                         (
-                            state.out_list[-1]
-                            if state.out_list
-                            else state.get_crash_dump_output()
-                        ),
-                        convert_time_to_realtime(state.time_stats.created_time),
-                        convert_time_to_realtime(state.time_stats.finished_time),
+                            state.obj,
+                            (
+                                state.out_list[-1]
+                                if state.out_list
+                                else state.get_crash_dump_output()
+                            ),
+                            convert_time_to_realtime(state.time_stats.created_time),
+                            convert_time_to_realtime(state.time_stats.finished_time),
+                        )
                     )
+            if unfinished_requests:
+                data_to_dump.extend(unfinished_requests)
+
+            if data_to_dump:
+                # Create a file
+                filename = os.path.join(
+                    self.crash_dump_folder,
+                    hostname,
+                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
                 )
-        if unfinished_requests:
-            data_to_dump.extend(unfinished_requests)
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
 
-        if not data_to_dump:
-            return
-
-        # Create a file
-        filename = os.path.join(
-            self.crash_dump_folder,
-            hostname,
-            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
-        )
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-
-        # Write the data to the file
-        data_to_dump_with_server_args = {
-            "server_args": self.server_args,  # Include server_args in the dump
-            "requests": data_to_dump,
-            "launch_command": " ".join(sys.argv),
-        }
-        with open(filename, "wb") as f:
-            try:
-                pickle.dump(data_to_dump_with_server_args, f)
-            except Exception as e:
-                # When the server is launched with --trust-remote-code,
-                # server_args sometimes fails to pickle. Retry without
-                # server_args so the request data still gets persisted.
+                # Write the data to the file
+                data_to_dump_with_server_args = {
+                    "server_args": self.server_args,
+                    "requests": data_to_dump,
+                    "launch_command": " ".join(sys.argv),
+                }
+                with open(filename, "wb") as f:
+                    try:
+                        pickle.dump(data_to_dump_with_server_args, f)
+                    except Exception as e:
+                        # When the server is launched with --trust-remote-code,
+                        # server_args sometimes fails to pickle. Retry without
+                        # server_args so the request data still gets persisted.
+                        logger.error(
+                            f"Failed to pickle dump with server_args: {e!r}; "
+                            "retrying without server_args"
+                        )
+                        f.seek(0)
+                        f.truncate()
+                        data_to_dump_with_server_args["server_args"] = None
+                        pickle.dump(data_to_dump_with_server_args, f)
                 logger.error(
-                    f"Failed to pickle dump with server_args: {e!r}; "
-                    "retrying without server_args"
+                    f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
                 )
-                f.seek(0)
-                f.truncate()
-                data_to_dump_with_server_args["server_args"] = None
-                pickle.dump(data_to_dump_with_server_args, f)
-        logger.error(
-            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
-        )
-        return filename
+
+        # Dump pyspy and cuda coredump
+        if should_dump_diagnostics:
+            logger.info(
+                "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
+            )
+            time.sleep(5)
+
+            scheduler_procs = collect_scheduler_processes()
+            if scheduler_procs:
+                if should_dump_pyspy:
+                    pyspy_dump_schedulers(scheduler_only=True)
+
+                if should_dump_cuda_coredump:
+                    trigger_cuda_user_coredump(scheduler_only=True)
+                    cuda_coredump_wait_secs = (
+                        envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS.get()
+                    )
+                    if cuda_coredump_wait_secs > 0:
+                        logger.info(
+                            "Waiting %.1f seconds for CUDA coredumps before exiting.",
+                            cuda_coredump_wait_secs,
+                        )
+                        time.sleep(cuda_coredump_wait_secs)
+            else:
+                logger.error(
+                    "No live scheduler processes found; skipping py-spy and CUDA coredump."
+                )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -2703,7 +2814,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This flag will be used in _tokenize_one_request to determine processing path
             if should_dispatch:
                 obj.need_wait_for_mm_inputs = True
-                if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+                if self.server_args.encoder_transfer_backend in [
+                    "zmq_to_scheduler",
+                    "mooncake",
+                ]:
                     self.mm_receiver.send_encode_request(obj)
             else:
                 obj.need_wait_for_mm_inputs = False

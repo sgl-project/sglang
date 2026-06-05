@@ -28,7 +28,6 @@ import sys
 import time
 from array import array
 from collections import defaultdict
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -48,17 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.evict_policy import (
-    EvictionStrategy,
-    FIFOStrategy,
-    FILOStrategy,
-    LFUStrategy,
-    LRUStrategy,
-    MRUStrategy,
-    PriorityStrategy,
-    SLRUStrategy,
-)
-from sglang.srt.mem_cache.utils import split_node_hash_value
+from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -225,6 +214,7 @@ class TreeNode:
         self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+        self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
@@ -258,7 +248,6 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
@@ -294,25 +283,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        if self.eviction_policy == "lru":
-            self.eviction_strategy: EvictionStrategy = LRUStrategy()
-        elif self.eviction_policy == "lfu":
-            self.eviction_strategy: EvictionStrategy = LFUStrategy()
-        elif self.eviction_policy == "fifo":
-            self.eviction_strategy: EvictionStrategy = FIFOStrategy()
-        elif self.eviction_policy == "mru":
-            self.eviction_strategy: EvictionStrategy = MRUStrategy()
-        elif self.eviction_policy == "filo":
-            self.eviction_strategy: EvictionStrategy = FILOStrategy()
-        elif self.eviction_policy == "priority":
-            self.eviction_strategy: EvictionStrategy = PriorityStrategy()
-        elif self.eviction_policy == "slru":
-            self.eviction_strategy: EvictionStrategy = SLRUStrategy()
-
-        else:
-            raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
-            )
+        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
         self.reset()

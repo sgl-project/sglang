@@ -13,6 +13,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -380,7 +381,7 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -574,13 +575,18 @@ class DeepseekMLAForwardMixin:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
-                attn_bmm_output = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_vc.shape[2],
+                B_heads, M_batch = x.shape[0], x.shape[1]
+                N_vdim = self.w_vc.shape[2]
+                # Allocate in (batch, heads, dim) so the post-GEMM
+                # transpose+flatten is a free view instead of a copy.
+                _bmm_buf = torch.empty(
+                    M_batch,
+                    B_heads,
+                    N_vdim,
                     device=x.device,
                     dtype=torch.bfloat16,
                 )
+                attn_bmm_output = _bmm_buf.transpose(0, 1)
                 batched_gemm_afp4wfp4_pre_quant(
                     x,
                     self.w_vc.transpose(-2, -1),
@@ -589,6 +595,7 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                 )
             else:
+                _bmm_buf = None
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
@@ -606,7 +613,17 @@ class DeepseekMLAForwardMixin:
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
-            if self.o_proj.weight.dtype == torch.uint8:
+            if _bmm_buf is not None:
+                # _bmm_buf is already (batch, heads, dim) contiguous
+                if self.o_proj.weight.dtype == torch.uint8:
+                    attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
+                elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                    attn_bmm_output = fused_flatten_fp8_group_quant(
+                        _bmm_buf, group_size=128, dtype_quant=torch.float8_e4m3fn
+                    )
+                else:
+                    attn_bmm_output = _bmm_buf.flatten(1, 2)
+            elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
@@ -697,7 +714,8 @@ class DeepseekMLAForwardMixin:
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
-            self.current_attention_backend in ("trtllm_mla", "tokenspeed_mla")
+            self.current_attention_backend
+            in ("trtllm_mla", "tokenspeed_mla", "cutedsl_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()

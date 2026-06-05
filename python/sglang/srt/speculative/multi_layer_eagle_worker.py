@@ -54,10 +54,10 @@ from sglang.srt.speculative.spec_utils import (
     fast_topk,
     generate_token_bitmask,
     load_token_map,
-    maybe_detect_nan,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -764,10 +764,12 @@ class MultiLayerEagleWorker(TpModelWorker):
                     self.mtp_model_runner(step).attn_backend.init_forward_metadata(
                         forward_batch
                     )
+                    # Planned pre-pad; do NOT opt into post-pad re-plan — a
+                    # DP-padded re-plan breaks DSA's indexer schedule_meta
+                    # (see #27091). Use the marked pre-pad metadata as-is.
+                    forward_batch.mark_forward_metadata_ready()
                 logits_output = (
-                    self.mtp_model_runner(step)
-                    .forward(forward_batch, skip_attn_backend_init=True)
-                    .logits_output
+                    self.mtp_model_runner(step).forward(forward_batch).logits_output
                 )
 
             maybe_detect_nan(

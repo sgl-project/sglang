@@ -62,7 +62,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_pr_test_health_check && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -171,6 +171,8 @@ jobs:
         if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
+          tracker-issue: "26340"
+          bot-token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
 
       - name: Cleanup venv
         if: always()

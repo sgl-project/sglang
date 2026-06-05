@@ -30,7 +30,11 @@ import torch.distributed
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.observability.metrics_collector import ExpertDispatchCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+    ExpertDispatchCollector,
+    resolve_collector_class,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_device, get_int_env_var
 
@@ -415,7 +419,11 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             dict(
                 layer_id=layer_idx,
                 num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist(),
+                num_tokens_per_rdma_rank=(
+                    num_tokens_per_rdma_rank.cpu().tolist()
+                    if num_tokens_per_rdma_rank is not None
+                    else None
+                ),
                 num_tokens_per_expert=num_tokens_per_expert.cpu().tolist(),
             )
         )
@@ -672,7 +680,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = [10, 100, 1000]
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
-            self._expert_dispatch_collector = ExpertDispatchCollector(
+            expert_dispatch_cls = resolve_collector_class(
+                self._server_args,
+                STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+                ExpertDispatchCollector,
+            )
+            self._expert_dispatch_collector = expert_dispatch_cls(
                 self._expert_location_metadata.ep_size
             )
             self._metric_heatmap_collection_counter = 0

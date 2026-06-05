@@ -70,11 +70,14 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
-    maybe_detect_nan,
-    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,39 +283,40 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.mark_forward_metadata_ready()
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
     ) -> None:
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.positions.numel(),
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
+            self.draft_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=True
             )
+        forward_batch.mark_forward_metadata_ready()
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
+        from types import SimpleNamespace
+
+        fb_view = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=getattr(forward_batch, "input_ids", None),
+            req_pool_indices=forward_batch.req_pool_indices[:bs],
+            seq_lens=forward_batch.seq_lens[:bs],
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=(
+                forward_batch.seq_lens_cpu[:bs]
+                if forward_batch.seq_lens_cpu is not None
+                else None
+            ),
+            encoder_lens=None,
+            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            spec_info=None,
+        )
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices[:bs],
-                forward_batch.seq_lens[:bs],
-                seq_lens_sum,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-                seq_lens_cpu=(
-                    forward_batch.seq_lens_cpu[:bs]
-                    if forward_batch.seq_lens_cpu is not None
-                    else None
-                ),
-            )
+            self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
@@ -357,7 +361,10 @@ class FrozenKVMTPWorker(TpModelWorker):
         mm_input_embeds: Optional[torch.Tensor] = None,
         draft_input: Optional[FrozenKVMTPDraftInput] = None,
     ) -> None:
-        """Run the one-token assistant seed step against frozen target KV."""
+        """Stash seed inputs on ``batch.spec_info``; the forward runs inside
+        the captured draft graph (see ``draft_forward``'s seed iter)."""
+        del seq_lens_cpu, mm_input_embeds, draft_input
+
         if batch.forward_mode.is_idle() or last_token_ids.numel() == 0:
             batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
                 device=batch.device,
@@ -368,53 +375,23 @@ class FrozenKVMTPWorker(TpModelWorker):
             )
             return
 
-        if draft_input is None:
-            draft_input = FrozenKVMTPDraftInput()
-
-        draft_input.bonus_tokens = last_token_ids.to(torch.int64)
-        draft_input.hidden_states = last_hidden_states
-        draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
-        draft_input.num_tokens_per_req = 1
-        draft_input.num_tokens_for_logprob_per_req = 1
-        draft_input.positions = self._position_for_batch(batch)
-
-        forward_mode_backup = batch.forward_mode
-        input_ids_backup = batch.input_ids
-        return_hidden_states_backup = batch.return_hidden_states
-        return_logprob_backup = batch.return_logprob
-        spec_info_backup = batch.spec_info
-
-        batch.forward_mode = ForwardMode.DECODE
-        batch.input_ids = draft_input.bonus_tokens
-        batch.return_hidden_states = False
-        batch.return_logprob = False
-        batch.spec_info = draft_input
-
-        try:
-            batch.seq_lens_cpu_cache = seq_lens_cpu
-            forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
-            forward_batch.return_logprob = False
-            if mm_input_embeds is not None:
-                forward_batch.mm_input_embeds = mm_input_embeds
-            self._set_positions(forward_batch)
-            self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
-            ):
-                logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
-            self._capture_for_decode(logits_output, draft_input)
-        finally:
-            batch.forward_mode = forward_mode_backup
-            batch.input_ids = input_ids_backup
-            batch.return_hidden_states = return_hidden_states_backup
-            batch.return_logprob = return_logprob_backup
-            # Keep the seeded draft state; only restore the old object on error paths
-            # before the assignment above could have happened.
-            if batch.spec_info is not draft_input:
-                batch.spec_info = spec_info_backup
+        stashed = FrozenKVMTPDraftInput()
+        stashed.bonus_tokens = last_token_ids.to(torch.int64)
+        stashed.hidden_states = last_hidden_states
+        # Real-shaped zeros so inherited `filter_batch`/`merge_batch` can slice
+        # them between iters; overwritten by the captured seed iter.
+        bs = last_token_ids.shape[0]
+        device = last_token_ids.device
+        stashed.topk_p = torch.zeros(
+            (bs, self.topk), device=device, dtype=torch.float32
+        )
+        stashed.topk_index = torch.zeros(
+            (bs, self.topk), device=device, dtype=torch.int64
+        )
+        stashed.capture_hidden_mode = CaptureHiddenMode.LAST
+        stashed.num_tokens_per_req = 1
+        stashed.num_tokens_for_logprob_per_req = 1
+        batch.spec_info = stashed
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -647,24 +624,61 @@ class FrozenKVMTPWorker(TpModelWorker):
             seq_lens_cpu=batch.seq_lens_cpu,
         )
 
-    def draft_forward(
-        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
-    ):
+    def draft_forward(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
-        maybe_detect_nan(topk_p, "frozen_kv_mtp_draft: initial topk_p")
 
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
-        if not skip_attn_backend_init and self.speculative_num_steps > 1:
+        # Seed + recurrent iters share the same `seq_lens - 1` rope position,
+        # so one init covers the loop. Must run even at num_steps == 1.
+        if forward_batch.needs_forward_metadata_init():
             self._init_frozen_kv_metadata(forward_batch)
+
+        # Seed iter: assistant forward on (bonus_token, target_h) to produce
+        # iter-0 `(topk_p, topk_index, hidden_states)`. For topk>1, replicate
+        # to `bs*topk` to match kernel shapes, then slice back per-req.
+        bonus_tokens = spec_info.bonus_tokens
+        target_hidden = spec_info.hidden_states
+        if self.topk > 1:
+            seed_input_ids = bonus_tokens.repeat_interleave(self.topk, dim=0)
+            seed_prev_hidden = target_hidden.repeat_interleave(self.topk, dim=0)
+        else:
+            seed_input_ids = bonus_tokens
+            seed_prev_hidden = target_hidden
+
+        forward_batch.input_ids = seed_input_ids
+        forward_batch.spec_info.hidden_states = seed_prev_hidden
+        self._set_positions(forward_batch)
+
+        with (
+            self._target_kv_pool_view(forward_batch),
+            forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+        ):
+            seed_output = self.draft_model_runner.forward(forward_batch).logits_output
+
+        maybe_detect_nan(
+            seed_output.next_token_logits, "frozen_kv_mtp_draft: seed iter"
+        )
+
+        if self.topk > 1:
+            seed_next_logits = seed_output.next_token_logits[:: self.topk]
+            seed_hidden_per_req = seed_output.hidden_states[:: self.topk]
+        else:
+            seed_next_logits = seed_output.next_token_logits
+            seed_hidden_per_req = seed_output.hidden_states
+
+        probs = torch.softmax(seed_next_logits, dim=-1)
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        maybe_detect_oob(
+            topk_index,
+            0,
+            seed_next_logits.shape[-1],
+            "frozen_kv_mtp_draft: seed topk_index OOB",
+        )
+        hidden_states = seed_hidden_per_req
 
         scores = None
         for i in range(self.speculative_num_steps):
@@ -682,14 +696,18 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 ).logits_output
 
             maybe_detect_nan(
+                logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
+            )
+            maybe_detect_inf(
                 logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
             )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -750,6 +768,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 batch.sampling_info.vocab_mask = None
 
         maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
+        maybe_detect_inf(logits_output.next_token_logits, "frozen_kv_mtp_verify")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: FrozenKVMTPVerifyOutput = spec_info.verify(

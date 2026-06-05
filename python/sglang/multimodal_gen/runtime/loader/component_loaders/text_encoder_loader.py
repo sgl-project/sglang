@@ -163,7 +163,9 @@ class TextEncoderLoader(ComponentLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+        # Sort weight files when SGLANG_SORT_WEIGHT_FILES >= 0 (default).
+        # Staggering is not applicable to text-encoder loading (no TP split).
+        if envs.SGLANG_SORT_WEIGHT_FILES.get() >= 0:
             hf_weights_files.sort()
 
         return hf_folder, hf_weights_files, use_safetensors

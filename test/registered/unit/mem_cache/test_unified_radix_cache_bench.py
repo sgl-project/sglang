@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -177,10 +178,8 @@ def create_bench_cache(
 
     # --- KV pool + allocator ---
     if has_swa:
-        from sglang.srt.mem_cache.swa_memory_pool import (
-            SWAKVPool,
-            SWATokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = SWAKVPool(
             size=kv_size,
@@ -691,9 +690,11 @@ def run_all_benchmarks(
     if benchmarks is None or "all" in benchmarks:
         benchmarks = list(ALL_BENCHMARKS.keys())
 
-    set_global_server_args_for_scheduler(
-        ServerArgs(model_path="dummy", page_size=page_size)
-    )
+    server_args = ServerArgs(model_path="dummy", page_size=page_size)
+    # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+    # loads the HF config for self.model_path — impossible for the dummy model.
+    server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, page_size)
+    set_global_server_args_for_scheduler(server_args)
 
     impl_name = (tree_cls or UnifiedRadixCache).__name__
     results = []
@@ -780,9 +781,11 @@ class _BenchSuite:
 
     @classmethod
     def setUpClass(cls):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=cls.bench_cfg["page_size"])
-        )
+        page_size = cls.bench_cfg["page_size"]
+        server_args = ServerArgs(model_path="dummy", page_size=page_size)
+        # See run_all_benchmarks for why _mamba_cache_chunk_size is preset.
+        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, page_size)
+        set_global_server_args_for_scheduler(server_args)
 
     def _run(self, bench_fn):
         cfg = self.bench_cfg

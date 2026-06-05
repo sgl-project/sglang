@@ -22,7 +22,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
+    ConditionEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -91,7 +93,7 @@ def tensor_identity_for_dedup(value: Any) -> Any:
     return value
 
 
-class TextEncodingStage(PipelineStage):
+class TextEncodingStage(ConditionEncodingStage):
     """
     Stage for encoding text prompts into embeddings for diffusion models.
 
@@ -533,7 +535,7 @@ class TextEncodingStage(PipelineStage):
         # TODO: Keep this begin-only interval until manager supports explicit
         # declared-use interval grouping. Wrapping each encoder call separately
         # can offload between positive and negative prompt encoding.
-        manager.before_use(use)
+        manager.begin_use(use, module=self.text_encoders[encoder_index])
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
         if not getattr(text_encoder, "uses_sglang_forward_context", True):

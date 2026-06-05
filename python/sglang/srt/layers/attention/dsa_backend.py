@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    TypeAlias,
+)
 
 import torch
 
@@ -19,6 +26,10 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    TopkTransformMethod,
+)
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa.transform_index import (
     transform_index_page_table_decode,
@@ -161,13 +172,6 @@ class DSAMetadata:
     token_to_batch_idx: Optional[torch.Tensor] = None
 
 
-class TopkTransformMethod(IntEnum):
-    # Transform topk indices to indices to the page table (page_size = 1)
-    PAGED = auto()
-    # Transform topk indices to indices to ragged kv (non-paged)
-    RAGGED = auto()
-
-
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return torch.cat(tensors, dim=dim)
@@ -193,6 +197,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 class DSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: DSAMetadata
     topk_transform_method: TopkTransformMethod
+    topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
 
@@ -231,17 +236,11 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         logits: torch.Tensor,
         topk: int,
         ks: Optional[torch.Tensor] = None,
-        cu_seqlens_q: torch.Tensor = None,
-        ke_offset: torch.Tensor = None,
-        batch_idx_list: List[int] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+        batch_idx_list: Optional[List[int]] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sgl_kernel import (
-            fast_topk_transform_fused,
-            fast_topk_transform_ragged_fused,
-            fast_topk_v2,
-        )
-
         if topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
@@ -259,38 +258,18 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             seq_lens_topk = ke_offset
         else:
             seq_lens_topk = self.get_seqlens_expanded()
-        if batch_idx_list is not None:
-            page_table_size_1 = self.attn_metadata.page_table_1[batch_idx_list]
-        else:
-            page_table_size_1 = self.attn_metadata.page_table_1
-
-        if not envs.SGLANG_DSA_FUSE_TOPK.get() or self.force_unfused_topk:
-            return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
-        elif self.topk_transform_method == TopkTransformMethod.PAGED:
-            # NOTE(dark): if fused, we return a transformed page table directly
-            return fast_topk_transform_fused(
-                score=logits,
-                lengths=seq_lens_topk,
-                page_table_size_1=page_table_size_1,
-                cu_seqlens_q=cu_seqlens_q_topk,
-                topk=topk,
-                row_starts=ks,
-            )
-        elif self.topk_transform_method == TopkTransformMethod.RAGGED:
-            if cu_topk_indices_offset is None:
-                raise RuntimeError(
-                    "RAGGED topk_transform requires topk_indices_offset; "
-                    "expected extend-without-speculative metadata."
-                )
-            return fast_topk_transform_ragged_fused(
-                score=logits,
-                lengths=seq_lens_topk,
-                topk_indices_offset=cu_topk_indices_offset,
-                topk=topk,
-                row_starts=ks,
-            )
-        else:
-            assert False, f"Unsupported {self.topk_transform_method = }"
+        return self.topk_backend.topk_transform(
+            logits=logits,
+            lengths=seq_lens_topk,
+            topk=topk,
+            topk_transform_method=self.topk_transform_method,
+            attn_metadata=self.attn_metadata,
+            cu_seqlens_q_topk=cu_seqlens_q_topk,
+            topk_indices_offset=cu_topk_indices_offset,
+            row_starts=ks,
+            batch_idx_list=batch_idx_list,
+            force_unfused_topk=self.force_unfused_topk,
+        )
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
@@ -343,6 +322,9 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
+            model_runner.server_args.dsa_topk_backend
+        )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -398,6 +380,16 @@ class DeepseekSparseAttnBackend(
         else:
             self.workspace_buffer = None
 
+    def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
+        if (
+            self.dsa_topk_backend.is_sgl_kernel()
+            or self.dsa_topk_backend.is_flashinfer()
+        ):
+            return topk_indices
+        raise RuntimeError(
+            f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+        )
+
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
             next_pow_of_2 = 1 << (l - 1).bit_length()
@@ -415,6 +407,25 @@ class DeepseekSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        seq_lens_cpu = (
+            forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
+        )
+        self._apply_cuda_graph_metadata(
+            bs=forward_batch.batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            forward_mode=forward_batch.forward_mode,
+            spec_info=forward_batch.spec_info,
+            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -821,19 +832,21 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        out_cache_loc: Optional[torch.Tensor] = None,
+        actual_forward_mode: Optional["ForwardMode"] = None,
     ):
+        """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
 
-        """Initialize forward metadata for capturing CUDA graph."""
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -855,11 +868,11 @@ class DeepseekSparseAttnBackend(
             )
 
             seqlens_expanded = cache_seqlens_int32
-            dsa_extend_seq_lens_list = [1] * num_tokens
+            dsa_extend_seq_lens_list = [1] * bs
             if self.dsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
-                ].slice(slice(0, num_tokens + 1))
+                ].slice(slice(0, bs + 1))
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=dsa_cache_seqlens_int32,
@@ -977,21 +990,38 @@ class DeepseekSparseAttnBackend(
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
         actual_forward_mode: Optional[ForwardMode] = None,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_metadata_out_graph`. Spec runners
+        also call this directly via _apply_cuda_graph_metadata when they
+        need to pass out_cache_loc / actual_forward_mode explicitly.
+        """
         assert seq_lens_cpu is not None
+
+        if bs not in self.decode_cuda_graph_metadata:
+            self._build_forward_metadata_cuda_graph(
+                bs,
+                None,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu,
+                forward_mode,
+                spec_info,
+                out_cache_loc,
+                actual_forward_mode,
+            )
+            return
 
         self.set_dsa_prefill_impl(forward_batch=None)
 
@@ -1431,7 +1461,7 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
         if envs.SGLANG_DSA_FUSE_TOPK.get():
-            page_table_1 = topk_indices
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = metadata.topk_indices_offset
@@ -1456,9 +1486,10 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
+            # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
-            )
+            ).to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -1619,7 +1650,7 @@ class DeepseekSparseAttnBackend(
                 layer.layer_id,
             )
         elif envs.SGLANG_DSA_FUSE_TOPK.get():
-            page_table_1 = topk_indices
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
@@ -2126,7 +2157,7 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
         if envs.SGLANG_DSA_FUSE_TOPK.get():
-            page_table_1 = topk_indices
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
                 page_table=metadata.page_table_1,
@@ -2287,6 +2318,7 @@ class DeepseekSparseAttnBackend(
             topk_transform_method=self.get_topk_transform_method(
                 forward_batch.forward_mode
             ),
+            topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             force_unfused_topk=force_unfused,
         )
@@ -2339,21 +2371,26 @@ class DeepseekSparseAttnMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        if in_capture:
+            inner_fb = build_inner_fb_view(
+                forward_batch,
+                bs=forward_batch.batch_size,
+                forward_mode=ForwardMode.DECODE,
+            )
+            for i in range(self.speculative_num_steps - 1):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    inner_fb, in_capture=True
+                )
+            return
+
+        bs = forward_batch.batch_size
         if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
@@ -2511,19 +2548,20 @@ class DeepseekSparseAttnMultiStepBackend:
                         forward_mode=ForwardMode.DECODE,
                     )
         else:
-            # Fallback: compute metadata separately for each backend
             for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                self.attn_backends[i]._apply_cuda_graph_metadata(
                     bs=bs,
                     req_pool_indices=forward_batch.req_pool_indices,
                     seq_lens=forward_batch.seq_lens,
-                    seq_lens_sum=forward_batch.seq_lens_sum,
-                    encoder_lens=None,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
                     forward_mode=ForwardMode.DECODE,
                     spec_info=forward_batch.spec_info,
-                    seq_lens_cpu=forward_batch.seq_lens_cpu,
                     out_cache_loc=None,
                 )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 
 
 # Backward-compat aliases (deprecated: use DSA class names)

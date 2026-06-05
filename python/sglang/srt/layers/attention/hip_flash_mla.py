@@ -12,13 +12,9 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
         import os
 
-        from sglang.srt.layers.attention.dsa.tilelang_kernel import (
-            dpsk_v4_fp8_attention_fwd,
-        )
-
         backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "tilelang")
     else:
-        import flash_mla
+        import sgl_kernel.flash_mla as flash_mla
 
     if backend == "comparison":
         pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
@@ -36,7 +32,18 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         return flash_mla_with_kvcache_torch(**kwargs)
 
     if backend == "tilelang":
+        from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+            dpsk_v4_fp8_attention_fwd,
+        )
+
         return dpsk_v4_fp8_attention_fwd(**kwargs)
+
+    if backend == "triton":
+        from sglang.srt.layers.attention.nsa.triton_decode import (
+            triton_fp8_attention_fwd,
+        )
+
+        return triton_fp8_attention_fwd(**kwargs)
 
     if backend == "kernel":
         return flash_mla.flash_mla_with_kvcache(**kwargs)
