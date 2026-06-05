@@ -55,7 +55,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
-    use_rank_local_fused_shared_experts as is_deepep_class_backend,
+    use_rank_local_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -202,10 +202,10 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
 
-        # DeepEP: each rank has its own shared expert slot, so total shared
-        # weight slots = num_fused_shared_experts * ep_size.
+        # Rank-local shared dispatch: each EP rank has its own shared expert
+        # slot, so total shared weight slots = num_fused_shared_experts * ep_size.
         # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
-        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+        if num_fused_shared_experts > 0 and use_rank_local_fused_shared_experts():
             num_shared_slots = num_fused_shared_experts * self.moe_ep_size
         else:
             num_shared_slots = num_fused_shared_experts
@@ -767,7 +767,7 @@ class FusedMoE(torch.nn.Module):
         if 0 <= shared_expert_id < self.num_fused_shared_experts:
             # Checkpoint shared experts start after logical routed experts, while
             # local fused MoE weights store them after physical routed experts.
-            if require_global_experts and is_deepep_class_backend():
+            if require_global_experts and use_rank_local_fused_shared_experts():
                 physical_expert_ids = [
                     rank * self.num_local_experts
                     + self._num_local_routed
