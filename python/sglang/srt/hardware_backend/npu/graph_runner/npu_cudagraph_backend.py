@@ -78,13 +78,18 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         shape_key: Any,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
+        # Two warmups so kernels are loaded and one-time setup is paid before capture.
+        # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
 
         graph = torch.npu.NPUGraph()
 
