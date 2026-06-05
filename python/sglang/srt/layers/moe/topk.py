@@ -222,6 +222,13 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
+        # ===== TO BE REFACTORED ====
+        # The experimental fused topk+pack carrier only exists under the master switch.
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            return isinstance(
+                topk_output, (StandardTopKOutput, StandardTopKOutputPacked)
+            )
+        # ===== END TO BE REFACTORED ====
         return isinstance(topk_output, StandardTopKOutput)
 
     @staticmethod
@@ -257,13 +264,29 @@ class StandardTopKOutput(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
-    # FlashInfer routed-MoE packed topk, produced fused in the gating kernel when
-    # SGLANG_OPT_LORA_FUSED_TOPK_PACK=1; None elsewhere (consumers fall back to packing).
-    packed_topk_ids: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
+
+
+# ===== TO BE REFACTORED ====
+# Experimental fused topk+pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK) carrier: the FlashInfer
+# routed-MoE packed topk produced fused in the gating kernel. Kept a SEPARATE type rather
+# than a 4th StandardTopKOutput field so the OSS `a, b, _ = topk_output` 3-tuple unpack
+# stays valid; only the gated experimental MoE dispatch reads .packed_topk_ids (getattr).
+class StandardTopKOutputPacked(NamedTuple):
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+    packed_topk_ids: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.STANDARD
+
+
+# ===== END TO BE REFACTORED ====
 
 
 class TritonKernelTopKOutput(NamedTuple):
@@ -1654,6 +1677,16 @@ def select_experts(
                     )
 
             # Qwen3MOE uses fused_topk
+            _fused_topk_kwargs = {}
+            # ===== TO BE REFACTORED ====
+            # Only the experimental fused topk+pack passes packed_out/num_token_non_padded;
+            # the default call keeps the upstream signature (fused_topk_cpu lacks these).
+            if packed_topk is not None:
+                _fused_topk_kwargs = dict(
+                    packed_out=packed_topk,
+                    num_token_non_padded=num_token_non_padded,
+                )
+            # ===== END TO BE REFACTORED ====
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1661,8 +1694,7 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
-                packed_out=packed_topk,
-                num_token_non_padded=num_token_non_padded,
+                **_fused_topk_kwargs,
             )
     else:
         assert (
@@ -1726,7 +1758,13 @@ def select_experts(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-    return StandardTopKOutput(topk_weights, topk_ids, router_logits, packed_topk)
+    # ===== TO BE REFACTORED ====
+    if packed_topk is not None:
+        return StandardTopKOutputPacked(
+            topk_weights, topk_ids, router_logits, packed_topk
+        )
+    # ===== END TO BE REFACTORED ====
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
 # Register fake implementations for torch.compile support
