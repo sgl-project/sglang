@@ -26,8 +26,21 @@ def fused_topk_npu(
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
+    # norm_type=2: native sqrtsoftplus scoring (scores = sqrt(softplus(logits))),
+    if topk_config.scoring_func == "sqrtsoftplus":
+        topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+            x=router_logits,
+            k=topk_config.top_k,
+            bias=correction_bias,
+            input_ids=None,
+            tid2eid=None,
+            routed_scaling_factor=topk_config.routed_scaling_factor,
+            norm_type=2,
+        )
+        topk_weights = topk_weights.to(torch.float32)
+
     # Fast path: simple top-k without grouped routing and bias
-    if not use_grouped_topk and correction_bias is None:
+    elif not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,
@@ -39,32 +52,6 @@ def fused_topk_npu(
                 if topk_config.num_fused_shared_experts == 0
                 else topk_weights[:, :-1]
             )
-        topk_weights = topk_weights.to(torch.float32)
-
-    # sqrtsoftplus (DSV4 noaux_tc) MUST use a torch path. npu_moe_gating_top_k only
-    # scores with sigmoid/softmax (norm_type 1/0), NOT sqrtsoftplus, so it would add
-    # the correction bias on top of the WRONG (sigmoid) scores and pick different
-    # experts than the reference -> systematic MoE routing divergence (mainbase=313
-    # vs khalil=161 on AIME idx=11). Mirror the reference (khalil) selection:
-    # scores = sqrt(softplus(logits)); top-k over (scores + correction_bias); weights
-    # from the un-biased scores; routed_scaling stays on the expert output exactly
-    # like the npu path below (renormalize=True -> scaling factor 1 in topk).
-    elif topk_config.scoring_func == "sqrtsoftplus":
-        scores = torch.nn.functional.softplus(router_logits.float()).sqrt()
-        scores_for_choice = (
-            scores + correction_bias.unsqueeze(0).float()
-            if correction_bias is not None
-            else scores
-        )
-        _, topk_ids = torch.topk(
-            scores_for_choice, k=topk_config.top_k, dim=-1, sorted=False
-        )
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = scores.gather(1, topk_ids)
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        else:
-            topk_weights = topk_weights * topk_config.routed_scaling_factor
         topk_weights = topk_weights.to(torch.float32)
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
@@ -114,5 +101,28 @@ def fused_topk_npu(
             layer_id=layer_id,
             topk_indices=topk_ids,
         )
+
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+def fused_hash_topk_npu(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    routed_scaling_factor: float,
+    expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
+) -> "TopKOutput":
+    topk = tid2eid.size(1)
+    topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+        x=router_logits,
+        k=topk,
+        bias=None,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+        routed_scaling_factor=routed_scaling_factor,
+        norm_type=2,
+    )
+    if expert_location_dispatch_info is not None:
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
