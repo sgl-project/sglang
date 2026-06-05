@@ -4,7 +4,6 @@ from typing import Optional
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    BALLAST_MAX_NEW_TOKENS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
@@ -441,27 +440,34 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_forced_admission_avoids_leak(t: ScriptedContext):
-        # A retractable decode peer holds KV the scheduler's decode-OOM retract
-        # path can actually free; raw exhaust_kv pages have no backing Req, so
-        # with leave_pages=0 the forced chunk's alloc_for_extend hard-OOMs
-        # (common.py raise RuntimeError) and crashes the scheduler.
-        r_peer = t.start_req(
-            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
-        yield from run_until(r_peer, lambda h: h.status == "running")
-
+        # Honest pressure pattern: drive the chunked req past its first chunk,
+        # then squeeze free KV to a sub-chunk sliver so the next resume sees
+        # _rem_tokens <= 0 and takes the force-re-add path. Nothing can free pages
+        # while the raw exhauster holds them, so the req stalls at its current
+        # chunk; confirm that observable stall, then release the exhauster and
+        # confirm the req completes and leaks no row. "Completes while nothing
+        # ever frees pages" is structurally impossible, so the release is part of
+        # the path under test.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
         baseline_rows = (
             t.scheduler.req_to_token_pool.size
             - t.scheduler.req_to_token_pool.available_size()
         )
-        # Squeeze free KV to a sub-chunk sliver so the chunked resume sees
-        # _rem_tokens <= 0 and takes the force-re-add path; the retractable peer
-        # supplies the pages the forced chunk needs.
         t.exhaust_kv(leave_pages=1)
-        yield from run_until_finished(r)
+        yield
+        chunks_at_stall = r.chunks_done
+        for _ in range(4):
+            yield
+        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
+            f"forced-re-add chunked req must stall under KV pressure; "
+            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
+        )
+
+        t._release_exhausted_pools()
+        yield
+        yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert (
             t.scheduler.req_to_token_pool.size
@@ -663,25 +669,31 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_add_chunked_req_non_swa_forced_admit_on_rem_zero(t: ScriptedContext):
-        # A retractable decode peer holds KV the scheduler's decode-OOM retract
-        # path can actually free; raw exhaust_kv pages have no backing Req, so
-        # with leave_pages=0 the forced chunk's alloc_for_extend hard-OOMs
-        # (common.py raise RuntimeError) and crashes the scheduler.
-        r_peer = t.start_req(
-            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
-        yield from run_until(r_peer, lambda h: h.status == "running")
-
+        # Honest pressure pattern: drive the chunked req past its first chunk, then
+        # squeeze free KV to a sub-chunk sliver so the resume sees _rem_tokens <= 0
+        # and takes the force-re-add path (schedule_policy.py:679-682). The raw
+        # exhauster holds every other page so the req stalls; confirm the stall,
+        # release the exhauster, then confirm the force-re-added req completes and
+        # releases all resources rather than leaking its held row + KV.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        # Sub-chunk sliver => _rem_tokens <= 0 => force-re-add; the peer is
-        # retractable so the forced chunk can allocate and the req finishes.
         t.exhaust_kv(leave_pages=1)
-        yield from run_until_finished(r, max_steps=800)
+        yield
+        chunks_at_stall = r.chunks_done
+        for _ in range(4):
+            yield
+        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
+            f"force-re-add chunked req must stall under KV pressure; "
+            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
+        )
+
+        t._release_exhausted_pools()
+        yield
+        yield from run_until_finished(r, max_steps=2000)
         assert r.finished, (
             "non-SWA chunked-resume must be force-admitted when "
-            "_rem_tokens == 0 (schedule_policy.py:679-682); pre-fix it "
-            "would block forever and leak its held row + KV"
+            "_rem_tokens == 0 (schedule_policy.py:679-682) and complete once the "
+            "pressure clears; it must not leak its held row + KV"
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
@@ -1071,28 +1083,31 @@ class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
         # post-squeeze chunks_done bump is NOT a reliable witness: with all KV held
         # the req may land on its final chunk and finish without advancing chunks_done
         # in the observable window, so requiring a bump is a wrong assumption.
-        # A retractable decode peer holds the KV so pressure is real but
-        # recoverable: the scheduler's decode-OOM retract path frees its pages,
-        # whereas exhaust_kv pages have no backing Req to retract -- the forced
-        # chunk's alloc_for_extend would hard-OOM and crash the scheduler.
-        r_peer = t.start_req(
-            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
-        yield from run_until(r_peer, lambda h: h.status == "running")
-
+        #
+        # Honest pressure pattern: the raw exhauster holds every page except a
+        # sub-chunk sliver, so the chunked resume sees _rem_tokens <= 0 and takes
+        # the force-to-rem_chunk_tokens re-add path while nothing can free pages,
+        # so the req stalls. Confirm that observable stall, release the exhauster,
+        # then confirm the force-re-added req completes and releases all resources.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        # Squeeze the remaining free KV down to a sub-chunk sliver so the chunked
-        # resume sees _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0
-        # and takes the force-to-rem_chunk_tokens re-add path; the decode peer can
-        # then be retracted to supply the pages the forced chunk needs.
         t.exhaust_kv(leave_pages=1)
+        yield
+        chunks_at_stall = r.chunks_done
+        for _ in range(4):
+            yield
+        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
+            f"force-re-add chunked req must stall under KV pressure; "
+            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
+        )
 
+        t._release_exhausted_pools()
+        yield
         yield from run_until_finished(r, max_steps=DEFAULT_MAX_STEPS * 2)
         assert r.finished, (
             "non-SWA chunked resume must be force-re-added when _rem_tokens <= 0 "
-            "and complete once a retractable peer frees KV; it must not leak its "
+            "and complete once the pressure clears; it must not leak its "
             f"held row + KV. status={r.status} kv_pages={r.kv_pages}"
         )
         assert r.kv_pages == 0, f"kv_pages={r.kv_pages}"

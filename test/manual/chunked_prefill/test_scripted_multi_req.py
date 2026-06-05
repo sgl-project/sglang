@@ -56,36 +56,42 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_plus_decode_in_batch(t: ScriptedContext):
+        # Every mid-chunk of a 2048/256 prompt consumes the entire 256-token chunk
+        # budget, so a second PREFILL can never co-batch with an in-flight chunked
+        # req -- by the time it ran, r1 had already finished chunking. The reachable
+        # "chunked + another req in one batch" scenario is chunked prefill MIXED
+        # WITH A DECODING req: bring r2 to a decoding state first, then start the
+        # long r1 so it chunks while r2 keeps decoding.
+        r2 = t.start_req(prompt_len=8, max_new_tokens=64, ignore_eos=True)
+        yield from run_until(
+            r2, lambda h: h.status == "running" and len(h.req.output_ids) >= 1
+        )
+
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
-
-        r2 = t.start_req(prompt_len=8, max_new_tokens=4)
-        # r1's first chunk fills the whole 256-token budget, so r2 sits in the
-        # waiting queue for a step before the scheduler co-batches it; advance
-        # until r2 actually runs (prefill or decode) while r1 still holds the
-        # single chunked slot.
-        yield from run_until(
-            r2,
-            lambda h: h.rid
-            in t.batch_composition().get("prefill", [])
-            + t.batch_composition().get("decode", []),
-        )
 
         comp = t.batch_composition()
         assert r1.rid in comp.get(
             "chunked", []
         ), f"r1 should be in chunked subset of batch; got {comp}"
-        assert r2.rid in comp.get("prefill", []) + comp.get(
+        assert r2.rid in comp.get(
             "decode", []
-        ), f"r2 should be in prefill or decode subset; got {comp}"
+        ), f"r2 should be in decode subset; got {comp}"
         chunked_set = set(comp.get("chunked", []))
         prefill_set = set(comp.get("prefill", []))
         decode_set = set(comp.get("decode", []))
         assert chunked_set.isdisjoint(prefill_set)
         assert chunked_set.isdisjoint(decode_set)
 
-        yield from run_until_all_finished([r1, r2])
-        assert r1.finished and r2.finished
+        # Abort the long-running decoder so the class teardown starts from a clean,
+        # drained pool; let r1 finish naturally.
+        t.abort(r2)
+        yield from run_until_finished(r1)
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        assert r1.finished
 
     def test_hundred_short_reqs(self):
         self.server.execute_script(self._script_hundred_short_reqs)

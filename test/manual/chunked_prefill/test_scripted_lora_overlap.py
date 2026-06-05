@@ -203,12 +203,15 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
         # Identical all-ones prompts + repeated A/B adapters under
         # max_loras_per_batch=1: adapters run one at a time, so the second A and
         # second B each run only after their twin commits the full 2048-token
-        # prefix to radix and thus prefix-hit into a single completing chunk.
-        # The first req of each adapter cannot prefix-hit and does the full
-        # multi-chunk prefill.
-        assert all(r.chunks_done >= 1 for r in reqs)
-        assert reqs[0].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
-        assert reqs[1].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        # prefix to radix. Each twin then prefix-hits all 2048 tokens and finishes
+        # its prefill in a single extend batch -- it is never held as chunked_req,
+        # so chunks_done == 0. The first req of each adapter cannot prefix-hit and
+        # processes all 2048 tokens in 256-chunks -> exactly 8 chunks.
+        expected_first_chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        assert reqs[0].chunks_done == expected_first_chunks
+        assert reqs[1].chunks_done == expected_first_chunks
+        assert reqs[2].chunks_done < expected_first_chunks
+        assert reqs[3].chunks_done < expected_first_chunks
         for r, expected_id in zip(reqs, expected_ids):
             assert lora_id_by_rid.get(r.rid) == expected_id
 

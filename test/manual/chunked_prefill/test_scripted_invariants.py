@@ -316,14 +316,18 @@ class TestInvariantsBasic(ScriptedTestCase):
     @staticmethod
     def _script_inflight_middle_chunks_caps_at_one(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        # r.req is None until the engine pulls the req into a scheduler
-        # structure on a later step; seed at 0 and sample only after yields.
+        # r.req is None before the engine pulls the req into a scheduler structure
+        # and again after it finishes and is removed from the scheduler; in both
+        # cases the req holds no in-flight chunk, so a missing req reads as 0.
+        # Sample every step from the start so the mid-chunk 1 is observed (a
+        # 2048/256 prompt has 7 mid-chunks where inflight_middle_chunks == 1).
         running_max = 0
         running_max_post_finish = 0
         post_finish_samples = 0
         for _ in range(DEFAULT_MAX_STEPS):
             yield
-            cur = r.req.inflight_middle_chunks
+            req = r.req
+            cur = req.inflight_middle_chunks if req is not None else 0
             running_max = max(running_max, cur)
             if r.finished:
                 running_max_post_finish = max(running_max_post_finish, cur)

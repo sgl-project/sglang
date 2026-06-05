@@ -72,7 +72,14 @@ class TestSpecBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.abort(r)
-        yield
+        # Aborting a chunked req mid-prefill releases its KV through the normal
+        # loop (the abort is injected via recv_requests, then the scheduler frees
+        # the row and pages over the following iterations); a single yield is not
+        # enough. Drain to a fully-idle pool before asserting the release.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
         # spec_draft_state_cleared was redundant: the eagle draft KV lives in the
         # same pool as the verified KV, so kv_pages == 0 and lock_refs == 0 after
         # abort already prove the draft state was released along with the rest.

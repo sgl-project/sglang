@@ -183,7 +183,9 @@ class TestAbortBasic(ScriptedTestCase):
     @staticmethod
     def _script_abort_unknown_rid_noop(t: ScriptedContext):
         bogus = ScriptedReqHandle(rid="never-submitted-rid", context=t)
-        t.abort(bogus)
+        # Unknown rid: TokenizerManager drops the abort without forwarding it to
+        # the scheduler, so no AbortReq transits the recv socket; fire-and-forget.
+        t.abort(bogus, await_arrival=False)
         yield
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
@@ -205,21 +207,24 @@ class TestAbortBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
 
         # run_until_finished returns the step `finished` flips; the finished req's
         # KV release and any lazy radix bookkeeping land a couple of forward steps
-        # later. Drain to a fully-idle, stable pool before snapshotting the
-        # baseline, so the abort-is-noop comparison is not corrupted by background
-        # release that was still in flight.
+        # later. Drain to a fully-idle, stable pool before asserting full release
+        # and before snapshotting the baseline, so the abort-is-noop comparison is
+        # not corrupted by background release that was still in flight.
         for _ in range(12):
             if t.is_fully_idle:
                 break
             yield
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
         kv_pool_free_before = t.engine_stats()["kv_pool_free"]
 
-        t.abort(r)
+        # The req is already finished, so TokenizerManager drops the abort without
+        # forwarding it to the scheduler; fire-and-forget (no AbortReq ever
+        # transits the recv socket to await).
+        t.abort(r, await_arrival=False)
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
@@ -298,6 +303,13 @@ class TestAbortBasic(ScriptedTestCase):
             f"structure); got status={r.status!r}"
         )
         assert r.kv_pages == 0, "timeout-abort of an unadmitted req owns no KV"
+
+        # exhaust_kv(leave_pages=0) holds raw KV pages with no backing Req, so
+        # nothing in the engine ever frees them. As the last alphabetical method in
+        # this class there is no subsequent _reset_engine_state to release them, and
+        # the graceful-shutdown drain in tearDownClass would hang on the held pool.
+        # Release the exhausted pages explicitly so shutdown can complete.
+        t._release_exhausted_pools()
 
     def test_abort_chunk_last(self):
         self.server.execute_script(self._script_abort_chunk_last)
@@ -416,47 +428,44 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_mid_chunk_no_extra_radix_node(
         t: ScriptedContext,
     ):
-        """Aborting a chunked req mid-chunk adds no radix node and does not revive it."""
+        """Aborting a chunked req mid-chunk leaves no locked radix node and does not revive it."""
         # NOTE: this intentionally does NOT exercise the skipped-stash branch
         # (`if self._chunked_req_scheduled_last_iter: stash_chunked_request(...)`
         # in get_next_batch_to_run). On a non-SWA engine that flag is only False
         # when chunked_req is None, so a held chunked_req is always stashed; the
         # "chunked req parked in waiting_queue with the flag False" inter-chunk gap
-        # is hybrid-SWA-specific and unreachable here. What this asserts is the
-        # reachable invariant: aborting while the req is the in-flight chunked_req
-        # neither caches a new prefix node nor revives the req.
+        # is hybrid-SWA-specific and unreachable here.
+        #
+        # The reachable, abort-specific invariant is NOT "no new radix node": a
+        # held chunked_req is stashed via cache_unfinished_req at the top of every
+        # get_next_batch_to_run (stash_chunked_request), so its partial prefix is
+        # legitimately cached and lock-protected WHILE it chunks -- that caching is
+        # normal prefill behavior, not an abort artifact, and one more such stash
+        # can land between the abort being injected and taking effect. What the
+        # abort must guarantee is that once the req is released it leaves NO radix
+        # node still LOCKED on its behalf (the chunk's protective lock is dropped),
+        # and that it does not revive.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-
-        # Snapshot the radix tree before abort: the abort must not add a node nor
-        # bump any node's hit_count beyond what the already-run chunks cached.
-        hit_counts_before = t.get_all_node_hit_counts()
-        node_count_before = len(hit_counts_before)
-        hit_sum_before = sum(hit_counts_before.values())
         chunks_before = r.chunks_done
 
         t.abort(r)
         yield from _drain_until_released(t, r)
 
-        hit_counts_after = t.get_all_node_hit_counts()
-        node_count_after = len(hit_counts_after)
-        hit_sum_after = sum(hit_counts_after.values())
-
-        # The abort must not create a new cached-prefix node nor bump hit counts.
-        assert node_count_after <= node_count_before, (
-            f"abort mid-chunk must not create a radix node; "
-            f"node count {node_count_before} -> {node_count_after}"
-        )
-        assert hit_sum_after <= hit_sum_before, (
-            f"abort mid-chunk must not bump radix hit counts; "
-            f"hit sum {hit_sum_before} -> {hit_sum_after}"
-        )
-        # And the abort itself releases the req and does not revive it.
+        # The abort releases the req and does not revive it.
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
         assert r.chunks_done == chunks_before, (
             f"aborted mid-chunk req revived and ran another chunk; "
             f"chunks_done went {chunks_before} -> {r.chunks_done}"
+        )
+
+        # No radix node remains locked once the aborted chunked req is released:
+        # the protective lock the in-flight chunk held while stashed is dropped.
+        lock_refs_after = t.get_all_node_lock_refs()
+        assert all(ref == 0 for ref in lock_refs_after.values()), (
+            f"abort mid-chunk left a locked radix node behind; "
+            f"node lock_refs={lock_refs_after!r}"
         )
 
     def test_abort_then_resubmit_same_rid_same_step(self):

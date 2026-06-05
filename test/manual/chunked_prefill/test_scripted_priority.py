@@ -3,6 +3,7 @@ import unittest
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    BALLAST_MAX_NEW_TOKENS,
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
@@ -39,6 +40,14 @@ class TestPriorityBasic(ScriptedTestCase):
             r.status == "waiting"
         ), f"force-retracted chunked req must be back in waiting; got {r.status}"
         assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
+
+        # Resume generation: leaving the engine paused would poison every
+        # subsequent test in the class (start_req never reaches the scheduler).
+        t.continue_generation()
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
 
     def test_retract_and_resume(self):
         self.server.execute_script(self._script_retract_and_resume)
@@ -265,23 +274,47 @@ class TestPriorityPriority(ScriptedTestCase):
         yield from run_until_all_finished([low, high])
         assert low.finished and high.finished
 
-    def test_priority_preempt_chunked(self):
-        self.server.execute_script(self._script_priority_preempt_chunked)
+
+class TestPriorityPreempt(ScriptedTestCase):
+    # Force deterministic priority preemption: max_running_requests=1 makes the
+    # running batch full after a single decode req, so admitting any further req
+    # must go through preempt_to_schedule (running_batch.batch_is_full is set in
+    # get_new_batch_prefill). The default preemption threshold (10) requires
+    # priority_diff STRICTLY greater than the threshold, so the test's 10-vs-0
+    # gap would never preempt; lower it to 0 so a 10-vs-0 gap (diff 10 > 0)
+    # preempts. This is genuine preemption of a running DECODE victim back to
+    # waiting -- not the OOM retract_decode-abort path that a raw exhaust_kv page
+    # grab triggers (which kills the only running req rather than parking it).
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_priority_scheduling=True,
+        max_running_requests=1,
+        priority_scheduling_preemption_threshold=0,
+    )
+
+    def test_priority_preempt_decode_victim_to_waiting(self):
+        self.server.execute_script(
+            self._script_priority_preempt_decode_victim_to_waiting
+        )
 
     @staticmethod
-    def _script_priority_preempt_chunked(t: ScriptedContext):
-        # Priority preemption (preempt_to_schedule) only acts on running_batch
-        # decode reqs; the in-flight chunked prefill req is held in
-        # scheduler.chunked_req and is never preempted, and exhaust_kv holds raw
-        # pages with no backing Req, so pressuring a chunked req would force-re-add
-        # and hard-OOM rather than move it to waiting. The reachable preemption is
-        # a low-priority DECODE victim yielding its real KV to a high-priority req.
-        low = t.start_req(prompt_len=8, max_new_tokens=64, priority=0, ignore_eos=True)
+    def _script_priority_preempt_decode_victim_to_waiting(t: ScriptedContext):
+        # A long-lived low-priority decode req fills the single running slot; a
+        # higher-priority req then cannot be admitted normally (batch full) and
+        # preempts the low-priority victim back to the waiting queue. Assert the
+        # victim lands in waiting with its KV released, then the high-priority req
+        # finishes. (The victim never finishes -- it is a long-lived ballast req
+        # that the per-script engine reset aborts on teardown.)
+        low = t.start_req(
+            prompt_len=8,
+            max_new_tokens=BALLAST_MAX_NEW_TOKENS,
+            priority=0,
+            ignore_eos=True,
+        )
         yield from run_until(low, lambda h: h.status == "running")
         assert low.kv_pages > 0
 
         high = t.start_req(prompt_len=8, max_new_tokens=2, priority=10)
-        t.exhaust_kv(leave_pages=1)
         yield from run_until(low, lambda h: h.status == "waiting")
 
         assert low.status == "waiting"
@@ -294,17 +327,20 @@ class TestPriorityPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_priority_preempt_release_invariant(t: ScriptedContext):
-        # Same reachable preemption as above (decode victim, not a chunked req):
-        # assert the victim releases every KV page when preempted to waiting.
+        # Same deterministic preemption (running decode victim, not a chunked
+        # req): assert the victim releases every KV page when preempted to
+        # waiting.
         r_low = t.start_req(
-            prompt_len=8, max_new_tokens=64, priority=0, ignore_eos=True
+            prompt_len=8,
+            max_new_tokens=BALLAST_MAX_NEW_TOKENS,
+            priority=0,
+            ignore_eos=True,
         )
         yield from run_until(r_low, lambda h: h.status == "running")
         pages_before = r_low.kv_pages
         assert pages_before > 0
 
         r_high = t.start_req(prompt_len=8, max_new_tokens=2, priority=10)
-        t.exhaust_kv(leave_pages=1)
         yield from run_until(r_low, lambda h: h.status == "waiting")
         assert r_low.kv_pages == 0
 

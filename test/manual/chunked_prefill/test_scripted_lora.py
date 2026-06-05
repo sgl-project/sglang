@@ -178,15 +178,19 @@ class TestLoRAAllDistinctAdapters(ScriptedTestCase):
         for r in reqs:
             assert r.kv_pages == 0
             assert r.lock_refs == 0
-            # Identical all-ones prompts + repeated A/B adapters: the first req
-            # of each adapter does a full fresh prefill, but its same-adapter
-            # twin runs only after the first commits the whole 2048-token prefix
-            # to radix (admission is effectively serialized by the LoRA pool),
-            # so the twin prefix-hits and completes in a single chunk.
-            assert r.chunks_done >= 1
-        # adapters == [A, B, A, B]; the first A and first B cannot prefix-hit.
-        assert reqs[0].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
-        assert reqs[1].chunks_done == VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        # adapters == [A, B, A, B]. The first A and first B cannot prefix-hit;
+        # with max_loras_per_batch=2 both load concurrently, but the scheduler
+        # admits one new chunked seq at a time (the prefill log shows #new-seq: 1
+        # per step, never splitting a single 256-token chunk across both), so
+        # each first-of-adapter processes all 2048 tokens in 256-chunks -> exactly
+        # 8 chunks. Their same-adapter twins run only after the first commits the
+        # whole 2048-token prefix to radix, so each twin prefix-hits the entire
+        # prompt and may chunk 0 times.
+        expected_first_chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        assert reqs[0].chunks_done == expected_first_chunks
+        assert reqs[1].chunks_done == expected_first_chunks
+        assert reqs[2].chunks_done < expected_first_chunks
+        assert reqs[3].chunks_done < expected_first_chunks
 
 
 class TestLoRAAdapterEviction(ScriptedTestCase):

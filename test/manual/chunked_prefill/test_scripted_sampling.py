@@ -184,9 +184,10 @@ class TestSamplingBasic(ScriptedTestCase):
         # logprob_start_len=0 requests an input logprob for every prompt token;
         # the default (-1) resolves to len(origin_input_ids), which starts
         # logprob computation at the end of the prompt and returns NO input
-        # logprobs (schedule_batch compute_extend_logprob, ~L1973). The
-        # one-per-token-after-the-first count below is only well-defined when
-        # logprobs begin at the prompt start, so request that explicitly.
+        # logprobs (schedule_batch compute_extend_logprob, ~L1973). With
+        # logprob_start_len=0 the engine returns one input logprob PER PROMPT
+        # TOKEN (the documented per-token contract; the LoRA logprob test
+        # likewise asserts == prompt_len), so request logprobs from the start.
         r = t.start_req(
             prompt_len=prompt_len,
             max_new_tokens=4,
@@ -200,9 +201,9 @@ class TestSamplingBasic(ScriptedTestCase):
         ), f"prompt should span multiple chunks, got chunks_done={r.chunks_done}"
         assert r.req.logprob is not None
         input_lp = r.req.logprob.input_token_logprobs_val
-        assert len(input_lp) == prompt_len - 1, (
-            f"expected {prompt_len - 1} input logprobs (one per token after "
-            f"the first), got {len(input_lp)}"
+        assert len(input_lp) == prompt_len, (
+            f"expected {prompt_len} input logprobs (one per prompt token), "
+            f"got {len(input_lp)}"
         )
 
     def test_logprob_start_len_inside_chunk_2(self):
@@ -262,6 +263,14 @@ class TestSamplingBasic(ScriptedTestCase):
         assert probe.finished
         first_token = probe.req.output_ids[0]
 
+        # flush_cache() is a no-op unless the scheduler is fully idle; drain any
+        # in-flight release first so the real request re-chunks the full prompt
+        # instead of cache-hitting the probe's prefix (which would skip prefill
+        # entirely and report chunks_done=0).
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
         t.flush_cache()
         yield
 

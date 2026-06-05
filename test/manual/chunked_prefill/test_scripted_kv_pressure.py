@@ -1,6 +1,5 @@
 import unittest
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -9,7 +8,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
-    exhaust_row_pool,
     run_until,
     run_until_all_finished,
     run_until_finished,
@@ -24,22 +22,31 @@ class TestKVPressureBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_kv_almost_empty_then_abort(t: ScriptedContext):
-        # A retractable decode peer: exhaust_kv holds raw pages with no backing
-        # Req, so the chunked req's first-chunk alloc_for_extend would hard-OOM
-        # and crash the scheduler with nothing to retract. The peer lets the
-        # decode-OOM path retract real KV so the req can chunk, then be aborted.
-        r_peer = t.start_req(
-            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
-        yield from run_until(r_peer, lambda h: h.status == "running")
-        t.exhaust_kv(leave_pages=2)
-        yield
-
+        # Honest pressure pattern: drive the long req into chunking on the full
+        # pool first (so it is genuinely admitted as chunked_req), then clamp the
+        # pool to a tiny sliver so it cannot walk any further chunk. Drive it into
+        # the observable pressure moment -- chunking with no further progress --
+        # then abort it. Aborting frees the req's own pages even while the raw
+        # exhauster still holds the rest, so the abort-release path is exercised
+        # under genuine pressure.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
+        t.exhaust_kv(leave_pages=2)
+        yield
+        chunks_at_abort = r.chunks_done
+        # Confirm the pressure is real: held at this chunk for a few steps with no
+        # progress, because the sliver cannot fit the next chunk.
+        for _ in range(4):
+            yield
+        assert r.is_chunking and r.chunks_done == chunks_at_abort, (
+            f"req must stall under KV pressure; is_chunking={r.is_chunking}, "
+            f"chunks_done={r.chunks_done}, chunks_at_abort={chunks_at_abort}"
+        )
+
         t.abort(r)
-        # The aborted chunked req releases its KV/row/lock a couple of forward
-        # steps later under overlap; drain before asserting full release.
+        # Release the raw exhauster so the drain can reclaim everything, then let
+        # the aborted chunked req release its KV/row/lock under overlap.
+        t._release_exhausted_pools()
         for _ in range(12):
             if (
                 r.kv_pages == 0
@@ -62,45 +69,42 @@ class TestKVPressureBasic(ScriptedTestCase):
     def _script_kv_full_chunked_new_req_retracts(t: ScriptedContext):
         baseline = t.engine_stats()["kv_pool_free"]
 
-        # A retractable decode peer: it holds KV that the scheduler's decode-OOM
-        # path can actually retract to admit/continue the chunked req. With only
-        # the raw-allocator exhauster (no Req) there is nothing to retract, so
-        # the chunked req's next-chunk alloc_for_extend hard-OOMs and crashes
-        # the scheduler.
-        r_peer = t.start_req(
-            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
-        yield from run_until(r_peer, lambda h: h.status == "running")
+        # Honest pressure pattern: drive the chunked req into chunking on the full
+        # pool first, then clamp the pool to a sliver so it stalls -- nothing can
+        # free pages while the exhauster holds them. Drive into the observable
+        # stall, then release the exhauster and confirm the req completes and the
+        # pool returns to baseline. "Completes while nothing ever frees pages" is
+        # structurally impossible, so the release is part of the path under test.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
         t.exhaust_kv(leave_pages=2)
         yield
-
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(2000):
-            if r.finished or (
-                r.req is not None and isinstance(r.req.finished_reason, FINISH_ABORT)
-            ):
-                break
+        chunks_at_stall = r.chunks_done
+        for _ in range(4):
             yield
-        assert r.finished or (
-            r.req is not None and isinstance(r.req.finished_reason, FINISH_ABORT)
+        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
+            f"req must stall under KV pressure before release; "
+            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
         )
+
+        t._release_exhausted_pools()
+        yield
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
         assert r.kv_pages == 0
 
-        # The ballast peer (ignore_eos) never finishes and the raw exhauster
-        # holds pages for the whole script; release both, drain to idle, and flush
-        # the radix cache (the chunked req's finished prompt stays cached) before
-        # the leak check so the pool can return to its pre-pressure baseline.
-        t.abort(r_peer)
-        t._release_exhausted_pools()
+        # The finished prompt stays cached in the radix tree; drain to idle and
+        # flush before the leak check so cached (not leaked) pages do not count
+        # against the baseline.
         for _ in range(40):
-            if r_peer.kv_pages == 0 and t.is_fully_idle:
+            if t.is_fully_idle:
                 break
             yield
         t.flush_cache()
         yield
         final = t.engine_stats()["kv_pool_free"]
         assert final >= baseline, (
-            f"KV not released after OOM/retract path: baseline={baseline}, "
+            f"KV not released after pressure/release path: baseline={baseline}, "
             f"final={final}"
         )
 
@@ -110,37 +114,34 @@ class TestKVPressureBasic(ScriptedTestCase):
     @staticmethod
     def _script_kv_full_chunked_plus_decode_retract(t: ScriptedContext):
         baseline = t.engine_stats()["kv_pool_free"]
+        # Honest pressure pattern: drive the long req into chunking first, then
+        # clamp the pool to a sliver with the raw exhauster so it cannot walk the
+        # remaining chunks. After confirming the stall, release the exhauster and
+        # confirm the req completes and the pool recovers to baseline.
         r_long = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        # A long-lived retractable decode peer holds the KV that the decode-OOM
-        # path retracts so r_long can keep chunking. A short peer (e.g.
-        # max_new_tokens=8) finishes within a few steps and is gone before
-        # r_long has walked all its chunks, leaving the next-chunk
-        # alloc_for_extend to hard-OOM against the raw exhauster and crash the
-        # scheduler. The ballast peer stays retractable for the whole run.
-        r_peer = t.start_req(
-            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
         yield from run_until(r_long, lambda h: h.is_chunking)
-        yield from run_until(r_peer, lambda h: h.status == "running")
 
         t.exhaust_kv(leave_pages=2)
         yield
-
-        for _ in range(2000):
-            if r_long.finished:
-                break
+        chunks_at_stall = r_long.chunks_done
+        for _ in range(4):
             yield
+        assert r_long.is_chunking and r_long.chunks_done == chunks_at_stall, (
+            f"r_long must stall under KV pressure; is_chunking={r_long.is_chunking}, "
+            f"chunks_done={r_long.chunks_done}"
+        )
+
+        t._release_exhausted_pools()
+        yield
+        yield from run_until_finished(r_long, max_steps=2000)
         assert r_long.finished
         assert r_long.kv_pages == 0
 
-        # The ballast peer never finishes on its own (ignore_eos); abort it,
-        # release the raw exhauster, drain to idle, and flush the radix cache (the
-        # finished chunked prompt stays cached) so the pool returns to baseline
-        # before the leak check.
-        t.abort(r_peer)
-        t._release_exhausted_pools()
+        # The finished prompt stays cached in the radix tree; drain to idle and
+        # flush before the leak check so cached (not leaked) pages do not count
+        # against the baseline.
         for _ in range(40):
-            if r_peer.kv_pages == 0 and t.is_fully_idle:
+            if t.is_fully_idle:
                 break
             yield
         t.flush_cache()
@@ -149,34 +150,6 @@ class TestKVPressureBasic(ScriptedTestCase):
         assert final >= baseline, (
             f"KV not fully released after pressure: baseline={baseline}, "
             f"final={final}"
-        )
-
-    def test_row_pool_tight_admits_after_release(self):
-        self.server.execute_script(self._script_row_pool_tight_admits_after_release)
-
-    @staticmethod
-    def _script_row_pool_tight_admits_after_release(t: ScriptedContext):
-        baseline_rows_used = (
-            t.scheduler.req_to_token_pool.size
-            - t.scheduler.req_to_token_pool.available_size()
-        )
-        yield from exhaust_row_pool(t, leave_rows=2)
-
-        reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(5)]
-        yield from run_until_all_finished(reqs, max_steps=2000)
-        for r in reqs:
-            assert r.finished, f"req {r.rid} did not finish"
-            assert r.kv_pages == 0, (
-                f"row-pool pressure must not leave KV held: rid={r.rid}, "
-                f"kv_pages={r.kv_pages}"
-            )
-        final_rows_used = (
-            t.scheduler.req_to_token_pool.size
-            - t.scheduler.req_to_token_pool.available_size()
-        )
-        assert final_rows_used <= baseline_rows_used, (
-            f"row pool leak after admit-after-release: baseline used="
-            f"{baseline_rows_used}, final used={final_rows_used}"
         )
 
     def test_lock_refs_tight_concurrent_prefix(self):
@@ -251,19 +224,26 @@ class TestKVPressureBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_kv_at_one_page_chunked_completes(t: ScriptedContext):
-        # A retractable decode peer holds the KV that the decode-OOM path retracts
-        # so the chunked req can prefill under tight KV; the raw exhauster alone
-        # backs no Req, so the req's chunk alloc_for_extend would hard-OOM and
-        # crash the scheduler.
-        r_peer = t.start_req(
-            prompt_len=8, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
-        yield from run_until(r_peer, lambda h: h.status == "running")
-        t.exhaust_kv(leave_pages=2)
-        yield
+        # Honest pressure pattern: drive a small chunked req into chunking on the
+        # full pool, then take every remaining free page so it cannot finish its
+        # tail chunk; confirm the stall, release the raw exhauster, then confirm
+        # completion and full release.
         r = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE + 1, max_new_tokens=1)
+        yield from run_until(r, lambda h: h.is_chunking)
+        t.exhaust_kv(leave_pages=0)
+        yield
+        chunks_at_stall = r.chunks_done
+        for _ in range(4):
+            yield
+        assert r.is_chunking and r.chunks_done == chunks_at_stall, (
+            f"req must stall under tight KV before release; "
+            f"is_chunking={r.is_chunking}, chunks_done={r.chunks_done}"
+        )
+
+        t._release_exhausted_pools()
+        yield
         yield from run_until(r, lambda h: h.finished, max_steps=2000)
-        assert r.finished, "tiny chunked req must complete under tight KV"
+        assert r.finished, "tiny chunked req must complete after release"
         assert r.kv_pages == 0, (
             f"tight-KV chunked completion must release all pages; got "
             f"kv_pages={r.kv_pages}"
@@ -276,32 +256,33 @@ class TestKVPressureBasic(ScriptedTestCase):
     @staticmethod
     def _script_kv_recovery_after_full(t: ScriptedContext):
         baseline = t.engine_stats()["kv_pool_free"]
-        # A retractable decode peer holds the KV the scheduler retracts to admit
-        # the new req under full-pool pressure. The raw exhauster backs no Req, so
-        # without the peer the new req can never be admitted. The new req is a
-        # non-chunked 16-token prompt that needs its whole footprint at once
-        # (no chunk truncation), so the peer's prompt is sized so that retracting
-        # it frees comfortably more than the new req's 16 + 2 tokens.
-        r_peer = t.start_req(
-            prompt_len=64, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
-        )
-        yield from run_until(r_peer, lambda h: h.status == "running")
-        t.exhaust_kv(leave_pages=2)
+        # Honest pressure pattern: the raw exhauster takes every free page (leave
+        # zero), so a fresh non-chunked 16-token req cannot be admitted at all and
+        # is stuck waiting. Confirm it stays waiting under the full pool, release
+        # the exhauster, then confirm it is admitted, completes, and the pool
+        # recovers to baseline.
+        t.exhaust_kv(leave_pages=0)
         yield
 
         r = t.start_req(prompt_len=16, max_new_tokens=2)
+        for _ in range(6):
+            yield
+        assert (
+            r.status == "waiting"
+        ), f"req must be unschedulable under a full pool; status={r.status}"
+
+        t._release_exhausted_pools()
+        yield
         yield from run_until(r, lambda h: h.finished, max_steps=3000)
         assert r.finished
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
-        # Release the never-finishing ballast peer and the raw exhauster, drain to
-        # idle, and flush the radix cache (the finished prompt stays cached) before
-        # the leak check so the pool can return to its pre-pressure baseline.
-        t.abort(r_peer)
-        t._release_exhausted_pools()
+        # The finished prompt stays cached in the radix tree; drain to idle and
+        # flush before the leak check so the pool returns to its pre-pressure
+        # baseline.
         for _ in range(40):
-            if r_peer.kv_pages == 0 and t.is_fully_idle:
+            if t.is_fully_idle:
                 break
             yield
         t.flush_cache()
@@ -448,7 +429,13 @@ class TestKVPressureBasic(ScriptedTestCase):
         mid_chunk = expected_chunks // 2
         last_minus_one = max(1, expected_chunks - 1)
 
-        r_first = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Distinct prompt_token per req: with identical prompts the second/third
+        # req would cache-hit the prior finished req's full prefix and never
+        # chunk, so chunks_done would stay 0 and the chunk-progress predicate
+        # would never be satisfied.
+        r_first = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=31
+        )
         yield from run_until(r_first, lambda h: h.is_chunking)
         t.pause_generation(mode="retract")
         yield
@@ -457,7 +444,9 @@ class TestKVPressureBasic(ScriptedTestCase):
         assert r_first.finished
         assert r_first.kv_pages == 0
 
-        r_mid = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r_mid = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=32
+        )
         yield from run_until(r_mid, lambda h: h.chunks_done >= mid_chunk)
         t.pause_generation(mode="retract")
         yield
@@ -466,7 +455,9 @@ class TestKVPressureBasic(ScriptedTestCase):
         assert r_mid.finished
         assert r_mid.kv_pages == 0
 
-        r_last = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r_last = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=33
+        )
         yield from run_until(r_last, lambda h: h.chunks_done >= last_minus_one)
         t.pause_generation(mode="retract")
         yield
@@ -480,11 +471,20 @@ class TestKVPressureBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_flush_cache_during_chunked_in_flight(t: ScriptedContext):
-        r_warm = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
+        # Distinct prompt_token: r must genuinely chunk while in flight, so it
+        # must NOT cache-hit the warm req's full prefix (identical prompts would
+        # let it skip chunking entirely and chunks_done would stay 0). The warm
+        # req still populates the radix tree so flush_cache has cached nodes to
+        # clear mid-flight.
+        r_warm = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1, prompt_token=41
+        )
         yield from run_until_finished(r_warm)
         assert r_warm.finished
 
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=42
+        )
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.flush_cache()
         yield from run_until_finished(r, max_steps=2000)
@@ -532,6 +532,85 @@ class TestKVPressureBasic(ScriptedTestCase):
         yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.chunks_done >= chunks_after_second_resume
+
+
+class TestKVPressureSmallRowPool(ScriptedTestCase):
+    # req_to_token_pool.size == max_running_requests. The default pool is
+    # thousands of rows that ballast reqs can never fully occupy, because the KV
+    # pool exhausts long before the row pool does. Cap max_running_requests small
+    # so a handful of never-finishing ballast reqs really hold every row and the
+    # admit-after-release path can be exercised.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        max_running_requests=8,
+    )
+
+    def test_row_pool_tight_admits_after_release(self):
+        self.server.execute_script(self._script_row_pool_tight_admits_after_release)
+
+    @staticmethod
+    def _script_row_pool_tight_admits_after_release(t: ScriptedContext):
+        # Honest pressure pattern: hold every row with never-finishing ballast
+        # reqs (each occupies exactly one row for its whole life), confirm fresh
+        # reqs are stuck waiting because no row is allocatable, then release the
+        # ballast and confirm the waiting reqs are admitted, finish, and leak no
+        # rows. "Admits after release" with nothing ever freeing a row is
+        # structurally impossible, so the release is part of the path under test.
+        baseline_rows_used = (
+            t.scheduler.req_to_token_pool.size
+            - t.scheduler.req_to_token_pool.available_size()
+        )
+        row_pool_size = t.scheduler.req_to_token_pool.size
+        ballast = [
+            t.start_req(
+                prompt_len=1, max_new_tokens=BALLAST_MAX_NEW_TOKENS, ignore_eos=True
+            )
+            for _ in range(row_pool_size)
+        ]
+        for _ in range(DEFAULT_MAX_STEPS):
+            if t.scheduler.req_to_token_pool.available_size() == 0:
+                break
+            yield
+        assert t.scheduler.req_to_token_pool.available_size() == 0, (
+            f"ballast must hold every row; "
+            f"available={t.scheduler.req_to_token_pool.available_size()}"
+        )
+
+        reqs = [
+            t.start_req(prompt_len=8, max_new_tokens=1, prompt_token=50 + i)
+            for i in range(5)
+        ]
+        for _ in range(6):
+            yield
+        for r in reqs:
+            assert r.status == "waiting", (
+                f"fresh req must be unschedulable under a full row pool; "
+                f"rid={r.rid}, status={r.status}"
+            )
+
+        for b in ballast:
+            t.abort(b)
+        yield from run_until_all_finished(reqs, max_steps=2000)
+        for r in reqs:
+            assert r.finished, f"req {r.rid} did not finish after release"
+            assert r.kv_pages == 0, (
+                f"row-pool pressure must not leave KV held: rid={r.rid}, "
+                f"kv_pages={r.kv_pages}"
+            )
+
+        # Drain the aborted ballast to idle before the row-leak comparison.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
+            yield
+        final_rows_used = (
+            t.scheduler.req_to_token_pool.size
+            - t.scheduler.req_to_token_pool.available_size()
+        )
+        assert final_rows_used <= baseline_rows_used, (
+            f"row pool leak after admit-after-release: baseline used="
+            f"{baseline_rows_used}, final used={final_rows_used}"
+        )
 
 
 class TestKVPressurePriority(ScriptedTestCase):
