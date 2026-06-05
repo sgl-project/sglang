@@ -6,6 +6,10 @@ from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MOD
 
 class TestChunkedFeatureSpec(ChunkedTestBase):
     __test__ = True  # re-enable: the shared base sets __test__ = False
+    # kv-canary cannot instrument the eagle draft decode's topk expansion
+    # (positions are bs*topk vs the canary's bs-sized plan); same opt-out as
+    # the scripted TestSpecBasic.
+    use_kv_canary = False
     model = DEFAULT_TARGET_MODEL_EAGLE
     gsm8k_threshold = 0.50
     feature_args = [
