@@ -38,11 +38,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg \
         build-essential \
         python3 python3-dev python3-pip python-is-python3 \
-        python3.12-venv \
         wget git \
         ca-certificates \
         libstdc++-12-dev \
     && rm -rf /var/lib/apt/lists/*
+# ---- python 3.14 ----
+RUN apt update \
+    && apt install -y --no-install-recommends software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt update \
+    && apt install -y python3.14 python3.14-venv python3.14-dev \
+    && rm /usr/bin/python3 && ln -s /usr/bin/python3.14 /usr/bin/python3
 ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
@@ -69,7 +75,7 @@ RUN ROCM_SPEC="${ROCM_SDK_VERSION:+==${ROCM_SDK_VERSION}}" \
 
 # Initialize ROCm SDK
 RUN rocm-sdk init && rocm-sdk targets
-ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.14/site-packages/_rocm_sdk_devel
 ENV CPATH=$ROCM_HOME/include
 ENV LIBRARY_PATH=$ROCM_HOME/lib
 ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
@@ -268,7 +274,7 @@ RUN apt update && apt install -y ninja-build patchelf cmake \
     && git clone https://github.com/ROCm/FlyDSL.git --branch v0.1.8
 RUN cd FlyDSL \
     && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
-    && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
+    && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.14/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
     && bash -lc 'source /opt/venv/bin/activate \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
       && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
