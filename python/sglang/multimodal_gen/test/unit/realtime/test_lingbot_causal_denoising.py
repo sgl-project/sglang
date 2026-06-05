@@ -7,8 +7,13 @@ import torch
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CrossAttentionKVCache,
 )
+from sglang.multimodal_gen.runtime.models.dits import (
+    lingbot_world as lingbot_world_module,
+)
 from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
     CausalLingBotWorldTransformer3DModel,
+    CausalLingBotWorldTransformerBlock,
+    LingBotWorldCamConditioner,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
@@ -196,7 +201,204 @@ def test_lingbot_i2v_model_input_writer_reuses_buffer():
     assert torch.equal(second[:, 16:], condition)
 
 
-def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready():
+def test_lingbot_cam_conditioner_scale_shift_matches_forward():
+    hidden_states = torch.randn(2, 3, 4)
+    c2ws_plucker_emb = torch.randn(2, 3, 4)
+    conditioner = SimpleNamespace(
+        compute_scale_shift=lambda c2ws: (c2ws * 0.25, c2ws - 0.5)
+    )
+
+    expected = LingBotWorldCamConditioner.forward(
+        conditioner,
+        hidden_states,
+        c2ws_plucker_emb,
+    )
+    actual = LingBotWorldCamConditioner.forward(
+        conditioner,
+        hidden_states,
+        c2ws_plucker_emb,
+        conditioner.compute_scale_shift(c2ws_plucker_emb),
+    )
+
+    assert torch.allclose(actual, expected)
+
+
+def test_lingbot_cam_conditioner_cache_reuses_source_tensor(monkeypatch):
+    class _CamConditioner:
+        def __init__(self):
+            self.calls = 0
+
+        def compute_scale_shift(self, c2ws_plucker_emb):
+            self.calls += 1
+            return c2ws_plucker_emb + 1, c2ws_plucker_emb + 2
+
+    block = CausalLingBotWorldTransformerBlock.__new__(
+        CausalLingBotWorldTransformerBlock
+    )
+    block.cam_conditioner = _CamConditioner()
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    monkeypatch.setattr(
+        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=7),
+    )
+
+    c2ws_plucker_emb = torch.ones(1, 2, 3)
+    first = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+    second = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+    next_source = c2ws_plucker_emb.clone()
+    third = block._cam_conditioner_scale_shift(next_source)
+
+    assert first is second
+    assert third is not first
+    assert block.cam_conditioner.calls == 2
+    cache = forward_batch.extra["lingbot_cam_conditioner"]
+    assert cache["source_key"][0] == next_source.data_ptr()
+    assert len(cache["entries"]) == 1
+
+
+def test_lingbot_cam_conditioner_cache_skips_non_sequence_shard(monkeypatch):
+    class _CamConditioner:
+        def __init__(self):
+            self.calls = 0
+
+        def compute_scale_shift(self, c2ws_plucker_emb):
+            self.calls += 1
+            return c2ws_plucker_emb + 1, c2ws_plucker_emb + 2
+
+    block = CausalLingBotWorldTransformerBlock.__new__(
+        CausalLingBotWorldTransformerBlock
+    )
+    block.cam_conditioner = _CamConditioner()
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=False)
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=7),
+    )
+
+    c2ws_plucker_emb = torch.ones(1, 2, 3)
+    first = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+    second = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+
+    assert first is not second
+    assert first[0] is not second[0]
+    assert block.cam_conditioner.calls == 2
+    assert "lingbot_cam_conditioner" not in forward_batch.extra
+
+
+def test_lingbot_cam_conditioner_cache_skips_single_ulysses_world(monkeypatch):
+    class _CamConditioner:
+        def __init__(self):
+            self.calls = 0
+
+        def compute_scale_shift(self, c2ws_plucker_emb):
+            self.calls += 1
+            return c2ws_plucker_emb + 1, c2ws_plucker_emb + 2
+
+    block = CausalLingBotWorldTransformerBlock.__new__(
+        CausalLingBotWorldTransformerBlock
+    )
+    block.cam_conditioner = _CamConditioner()
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    monkeypatch.setattr(
+        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=7),
+    )
+
+    c2ws_plucker_emb = torch.ones(1, 2, 3)
+    first = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+    second = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+
+    assert first is not second
+    assert block.cam_conditioner.calls == 2
+    assert "lingbot_cam_conditioner" not in forward_batch.extra
+
+
+def test_lingbot_cam_conditioner_cache_skips_context_update(monkeypatch):
+    class _CamConditioner:
+        def __init__(self):
+            self.calls = 0
+
+        def compute_scale_shift(self, c2ws_plucker_emb):
+            self.calls += 1
+            return c2ws_plucker_emb + 1, c2ws_plucker_emb + 2
+
+    block = CausalLingBotWorldTransformerBlock.__new__(
+        CausalLingBotWorldTransformerBlock
+    )
+    block.cam_conditioner = _CamConditioner()
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=-1),
+    )
+
+    c2ws_plucker_emb = torch.ones(1, 2, 3)
+    first = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+    second = block._cam_conditioner_scale_shift(c2ws_plucker_emb)
+
+    assert first is not second
+    assert block.cam_conditioner.calls == 2
+    assert "lingbot_cam_conditioner" not in forward_batch.extra
+
+
+def test_lingbot_model_prepares_cam_conditioner_scale_shifts(monkeypatch):
+    class _CamConditioner:
+        def __init__(self, offset):
+            self.offset = offset
+            self.calls = 0
+
+        def compute_scale_shift(self, c2ws_plucker_emb):
+            self.calls += 1
+            return (
+                c2ws_plucker_emb + self.offset,
+                c2ws_plucker_emb + self.offset + 10,
+            )
+
+    model = CausalLingBotWorldTransformer3DModel.__new__(
+        CausalLingBotWorldTransformer3DModel
+    )
+    model.blocks = [
+        SimpleNamespace(cam_conditioner=_CamConditioner(1)),
+        SimpleNamespace(cam_conditioner=_CamConditioner(2)),
+    ]
+    forward_batch = SimpleNamespace(extra={}, enable_sequence_shard=True)
+    monkeypatch.setattr(
+        lingbot_world_module, "get_ulysses_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=forward_batch, current_timestep=7),
+    )
+
+    c2ws_plucker_emb = torch.ones(1, 2, 3)
+    first = model._prepare_cam_conditioner_scale_shifts(c2ws_plucker_emb, forward_batch)
+    second = model._prepare_cam_conditioner_scale_shifts(
+        c2ws_plucker_emb, forward_batch
+    )
+    next_source = c2ws_plucker_emb.clone()
+    third = model._prepare_cam_conditioner_scale_shifts(next_source, forward_batch)
+
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    assert first[0] is second[0]
+    assert first[1] is second[1]
+    assert third[0] is not first[0]
+    assert [block.cam_conditioner.calls for block in model.blocks] == [2, 2]
+
+
+def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready(monkeypatch):
     class _ConditionEmbedder:
         def __init__(self):
             self.full_calls = 0
@@ -219,6 +421,14 @@ def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready():
         CausalLingBotWorldTransformer3DModel
     )
     model.condition_embedder = _ConditionEmbedder()
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            forward_batch=SimpleNamespace(extra={}),
+            current_timestep=7,
+        ),
+    )
     crossattn_cache = [
         CrossAttentionKVCache(
             k=torch.empty(1, 1, 1, 1),

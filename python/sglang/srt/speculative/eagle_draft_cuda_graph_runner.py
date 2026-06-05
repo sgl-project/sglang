@@ -401,6 +401,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
+            # The capture batch is planned here (out-of-forward), so the
+            # per-step forwards inside draft_forward must not re-plan.
+            forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
             shape_key = self._make_graph_key(num_seqs)
             self.backend.capture_one(

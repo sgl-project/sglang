@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
     mla_quantize_and_rope_for_fp8,
 )
@@ -390,7 +391,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        create_flashmla_kv_indices_triton[(batch_size,)](
+        create_flashmla_kv_indices_triton[
+            (
+                batch_size,
+                get_num_kv_index_blocks_flashmla(max_blocks, self.page_size),
+            )
+        ](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -536,7 +542,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
 
         # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[(bs,)](
+        create_flashmla_kv_indices_triton[
+            (
+                bs,
+                get_num_kv_index_blocks_flashmla(
+                    metadata.block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
             self.req_to_token,
             req_pool_indices[:bs],
             seq_lens,
@@ -958,9 +971,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_decode_metadata
         )
 
-        # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-        # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-        # and padding logic in prepare_mlp_sync_batch to avoid this
+        # Backstop: metadata was built pre-pad (marked) and DP padding then
+        # grew the batch. The marker path deliberately does not re-plan
+        # post-pad (DSA can't rebuild on a padded batch, see #27091), so this
+        # local re-plan catches the size mismatch.
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
@@ -1060,9 +1074,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or self.forward_decode_metadata
             )
 
-            # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-            # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-            # and padding logic in prepare_mlp_sync_batch to avoid this
+            # Backstop: metadata was built pre-pad (marked) and DP padding
+            # then grew the batch. The marker path deliberately does not
+            # re-plan post-pad (DSA can't rebuild on a padded batch, see
+            # #27091), so this local re-plan catches the size mismatch.
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
                 self.init_forward_metadata(forward_batch)

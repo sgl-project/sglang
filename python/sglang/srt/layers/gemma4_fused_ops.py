@@ -215,7 +215,7 @@ def gemma_qkv_rmsnorm(
 
     If k and v are both None (KV-shared layer), only Q is normalized.
     """
-    assert q.is_cuda
+    assert q.is_cuda or q.is_xpu
     assert q.stride(-1) == 1, "Q's last dim must be contiguous"
     assert q_weight.shape[-1] == head_dim
     M = q.shape[0] if q.dim() >= 2 else 1
@@ -223,7 +223,7 @@ def gemma_qkv_rmsnorm(
 
     has_kv = k is not None and v is not None
     if has_kv:
-        assert k.is_cuda and v.is_cuda
+        assert (k.is_cuda and v.is_cuda) or (k.is_xpu and v.is_xpu)
         assert k.stride(-1) == 1 and v.stride(-1) == 1
         assert k_weight is not None and k_weight.shape[-1] == head_dim
 
@@ -243,6 +243,75 @@ def gemma_qkv_rmsnorm(
         HAS_KV=has_kv,
         BLOCK=BLOCK,
     )
+
+
+@triton.jit
+def _gemma_routing_post_topk_kernel(
+    Logits_ptr,
+    Ids_ptr,
+    Scale_ptr,
+    Out_weights_ptr,
+    Out_ids_ptr,
+    stride_l,
+    stride_ow,
+    stride_oi,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Fused: softmax(topk_logits) * per_expert_scale[topk_ids] → float32 weights, int32 ids.
+
+    One program per token. K is the number of top-k experts (e.g. 8).
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_K)
+    mask = cols < K
+
+    logits = tl.load(
+        Logits_ptr + row * stride_l + cols, mask=mask, other=float("-inf")
+    ).to(tl.float32)
+    ids_i64 = tl.load(Ids_ptr + row * stride_l + cols, mask=mask, other=0)
+
+    # Stable softmax
+    max_val = tl.max(logits, axis=0)
+    exp_val = tl.exp(logits - max_val)
+    sum_exp = tl.sum(exp_val, axis=0)
+    weights = exp_val / sum_exp
+
+    # Gather per_expert_scale and multiply
+    scale = tl.load(Scale_ptr + ids_i64, mask=mask, other=1.0).to(tl.float32)
+    weights = weights * scale
+
+    tl.store(Out_weights_ptr + row * stride_ow + cols, weights, mask=mask)
+    tl.store(Out_ids_ptr + row * stride_oi + cols, ids_i64.to(tl.int32), mask=mask)
+
+
+def gemma_routing_post_topk(
+    topk_logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused softmax + scale-gather + casts for Gemma4 routing.
+
+    Replaces: softmax(topk_logits) * per_expert_scale[topk_ids] → (f32, i32).
+    """
+    B, K = topk_logits.shape
+    BLOCK_K = triton.next_power_of_2(K)
+    out_weights = torch.empty((B, K), dtype=torch.float32, device=topk_logits.device)
+    out_ids = torch.empty((B, K), dtype=torch.int32, device=topk_logits.device)
+
+    _gemma_routing_post_topk_kernel[(B,)](
+        topk_logits,
+        topk_ids,
+        per_expert_scale,
+        out_weights,
+        out_ids,
+        topk_logits.stride(0),
+        out_weights.stride(0),
+        out_ids.stride(0),
+        K=K,
+        BLOCK_K=BLOCK_K,
+    )
+    return out_weights, out_ids
 
 
 def gemma_dual_rmsnorm_residual_scalar(
