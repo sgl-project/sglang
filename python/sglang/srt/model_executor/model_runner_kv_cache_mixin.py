@@ -883,7 +883,7 @@ class ModelRunnerKVCacheMixin:
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
+            max_num_reqs = min(max_num_reqs // self.dp_size, token_capacity // 2)
         else:
             max_num_reqs = min(estimated, token_capacity // 2)
 
