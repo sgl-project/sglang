@@ -976,7 +976,6 @@ class ServerArgs:
         self._handle_xpu_backends()
 
         # Allow OOT platform plugins to apply server args defaults.
-
         current_platform.apply_server_args_defaults(self)
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
@@ -2887,7 +2886,6 @@ class ServerArgs:
             2.3 Otherwise, we will use triton backend.
         """
         # OOT platforms provide their own default attention backend.
-
         if current_platform.is_out_of_tree():
             return current_platform.get_default_attention_backend()
 
