@@ -1,0 +1,221 @@
+name: Nightly Benchmark (AMD ROCm 7.2)
+
+# Runs SemiAnalysis serving-benchmark recipes against the sglang build *under
+# test* on AMD GPUs, so throughput / TTFT / TPOT / E2EL stay apples-to-apples
+# with the published dashboard.
+#
+# Mirrors the AMD CI container flow used by nightly-test-amd-rocm720.yml
+# (k8s runner + scripts/ci/amd helpers), NOT the GB200 srt-slurm path. The
+# under-test sglang is editable-installed into the container by
+# amd_ci_install_dependency.sh; the benchmark repo is checked out at a pinned
+# ref and each recipe is invoked verbatim by scripts/ci/amd/run_benchmark.sh.
+#
+# Models are config-driven: edit scripts/ci/amd/benchmark-configs.yaml to add a
+# model. Do NOT edit this workflow for routine config changes.
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # nightly, offset from other AMD nightly runs
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'sglang git ref to test (leave empty for the triggering sha).'
+        required: false
+        type: string
+        default: ''
+      configs:
+        description: 'Comma-separated config names to run (empty = all in benchmark-configs.yaml).'
+        required: false
+        type: string
+        default: ''
+      variants:
+        description: 'Comma-separated variants to keep, e.g. base,mtp (empty = each config default).'
+        required: false
+        type: string
+        default: ''
+      isl:
+        description: 'Override input sequence length for all rows (empty = per-config).'
+        required: false
+        type: string
+        default: ''
+      osl:
+        description: 'Override output sequence length for all rows (empty = per-config).'
+        required: false
+        type: string
+        default: ''
+      dp_attention:
+        description: 'Override DP-attention for all rows (empty = per-config).'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'false'
+          - 'true'
+      conc_list:
+        description: 'Override concurrencies for all rows (each value relaunches the server).'
+        required: false
+        type: string
+        default: ''
+      model_path:
+        description: 'Override model id/path for all rows (a path starting with / skips download).'
+        required: false
+        type: string
+        default: ''
+      benchmark_repo:
+        description: 'Benchmark recipe repo (owner/name).'
+        required: false
+        type: string
+        default: 'SemiAnalysisAI/InferenceX'
+      benchmark_ref:
+        description: 'Benchmark recipe repo ref (SHA recommended for reproducibility).'
+        required: false
+        type: string
+        default: 'c1383387104b0bb3dea03577a0fcfca5e5bb016a'
+      continue_on_error:
+        description: 'Do not fail the workflow on benchmark errors.'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  group: nightly-benchmark-amd-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Expand scripts/ci/amd/benchmark-configs.yaml into a {config x variant}
+  # matrix. To add/remove benchmarks, edit that YAML only.
+  # ---------------------------------------------------------------------------
+  setup:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Generate benchmark matrix
+        id: gen
+        env:
+          CONFIGS_FILTER: ${{ inputs.configs }}
+          VARIANTS_FILTER: ${{ inputs.variants }}
+          OVERRIDE_ISL: ${{ inputs.isl }}
+          OVERRIDE_OSL: ${{ inputs.osl }}
+          OVERRIDE_DP_ATTN: ${{ inputs.dp_attention }}
+          OVERRIDE_CONC_LIST: ${{ inputs.conc_list }}
+          OVERRIDE_MODEL: ${{ inputs.model_path }}
+        run: |
+          pip install pyyaml -q
+          MATRIX=$(python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Matrix:"
+          echo "$MATRIX" | python3 -m json.tool
+
+  benchmark:
+    needs: setup
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.config.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout sglang (under test)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Checkout benchmark recipes (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.benchmark_repo || 'SemiAnalysisAI/InferenceX' }}
+          ref: ${{ inputs.benchmark_ref || 'c1383387104b0bb3dea03577a0fcfca5e5bb016a' }}
+          path: benchmark-recipes
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          # --skip-test-time-deps: throughput + GSM8K don't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Run benchmark (${{ matrix.config.name }} / ${{ matrix.config.variant }})
+        timeout-minutes: 600
+        run: |
+          > github_summary.md
+          set +e
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e BENCHMARK_DIR="/sglang-checkout/benchmark-recipes" \
+            -e MODEL_PREFIX="${{ matrix.config.model_prefix }}" \
+            -e PRECISION="${{ matrix.config.precision }}" \
+            -e RUNNER="${{ matrix.config.runner }}" \
+            -e FRAMEWORK="${{ matrix.config.framework }}" \
+            -e VARIANT="${{ matrix.config.variant }}" \
+            -e BENCH_MODEL="${{ matrix.config.model }}" \
+            -e TP="${{ matrix.config.tp }}" \
+            -e EP_SIZE="${{ matrix.config.ep }}" \
+            -e ISL="${{ matrix.config.isl }}" \
+            -e OSL="${{ matrix.config.osl }}" \
+            -e DP_ATTENTION="${{ matrix.config.dp_attn }}" \
+            -e CONC_LIST="${{ matrix.config.conc_list }}" \
+            -e RESULT_OUT_DIR="/sglang-checkout/benchmark_results" \
+            bash scripts/ci/amd/run_benchmark.sh
+          RC=$?
+          set -e
+          echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
+          if [ "${{ (github.event_name == 'schedule' || inputs.continue_on_error) && 'true' || 'false' }}" = "true" ]; then
+            echo "continue-on-error: not failing the job (rc=$RC)"
+            exit 0
+          fi
+          exit $RC
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.config.name }}-${{ matrix.config.variant }}-${{ github.run_id }}
+          path: benchmark_results/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean up container
+        if: always()
+        continue-on-error: true
+        run: docker rm -f ci_sglang 2>/dev/null || true
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
+    needs:
+      - benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more benchmark jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more benchmark jobs were cancelled"
+            exit 1
+          fi
+          echo "All benchmark jobs passed"

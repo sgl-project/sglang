@@ -1,0 +1,80 @@
+# AMD nightly serving-benchmark configurations.
+#
+# Each entry maps to a SemiAnalysis benchmark recipe script under the benchmark
+# repo (default SemiAnalysisAI/InferenceX), at:
+#
+#   benchmarks/single_node/[fixed_seq_len/]<model-prefix>_<precision>_<runner>_<framework>[_mtp].sh
+#
+# The workflow (.github/workflows/nightly-benchmark-amd-rocm720.yml) expands
+# this into one job per (config x variant) and runs each recipe verbatim against
+# the sglang build under test, so the numbers stay apples-to-apples with the
+# published dashboard.
+#
+# To add a model: add an entry below (and make sure the recipe script exists in
+# the benchmark repo). Do NOT edit the workflow YAML for routine config changes.
+#
+# Fields:
+#   name          unique id (used in artifact / result-file names)
+#   model-prefix  recipe prefix, e.g. dsv4
+#   precision     fp4 | fp8 | ...
+#   runner        mi355x | mi325x | ...   (must match the recipe filename)
+#   framework     sglang
+#   model         HF id, or a local /path (a path starting with / skips download)
+#   runs-on       GitHub Actions runner label for this config
+#   variants      list of: base (STP) | mtp (EAGLE speculative decoding)
+#   tp            tensor-parallel size            (default 8)
+#   ep            expert-parallel size            (default 1)
+#   dp-attn       enable DP-attention path        (default false; true for high conc)
+#   isl, osl      sequence lengths                (default 1024 / 1024)
+#   conc-list     space/comma separated concurrencies; NOTE each value relaunches
+#                 the server, so keep it short for large models (default "32")
+
+configs:
+  - name: dsv4-fp4-mi355x-sglang
+    model-prefix: dsv4
+    precision: fp4
+    runner: mi355x
+    framework: sglang
+    model: deepseek-ai/DeepSeek-V4-Pro
+    runs-on: linux-mi35x-gpu-8
+    variants: [base, mtp]
+    tp: 8
+    ep: 1
+    dp-attn: false
+    isl: 1024
+    osl: 1024
+    conc-list: "32"
+
+  # --- examples: copy an entry above and adjust to add coverage ---------------
+  #
+  # High-concurrency DP-attention sweep for the same model (mirrors the dsv4
+  # search space in InferenceX amd-master.yaml). Enable by uncommenting:
+  #
+  # - name: dsv4-fp4-mi355x-sglang-dp
+  #   model-prefix: dsv4
+  #   precision: fp4
+  #   runner: mi355x
+  #   framework: sglang
+  #   model: deepseek-ai/DeepSeek-V4-Pro
+  #   runs-on: linux-mi35x-gpu-8
+  #   variants: [base, mtp]
+  #   tp: 8
+  #   ep: 1
+  #   dp-attn: true
+  #   isl: 1024
+  #   osl: 1024
+  #   conc-list: "256"
+  #
+  # Another model (the recipe script must exist in the benchmark repo, e.g.
+  # benchmarks/single_node/fixed_seq_len/dsr1_fp4_mi355x_sglang.sh):
+  #
+  # - name: dsr1-fp4-mi355x-sglang
+  #   model-prefix: dsr1
+  #   precision: fp4
+  #   runner: mi355x
+  #   framework: sglang
+  #   model: deepseek-ai/DeepSeek-R1-0528
+  #   runs-on: linux-mi35x-gpu-8
+  #   variants: [base]
+  #   tp: 8
+  #   conc-list: "16 32"
