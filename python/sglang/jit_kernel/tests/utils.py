@@ -12,7 +12,7 @@ def multigpu_pytest_main(
     num_gpus: Sequence[int],
     *,
     pre_launch_fn: Optional[Callable[[List[int]], None]] = None,
-    timeout: Optional[int] = 240,
+    timeout: Optional[int] = 600,
 ) -> None:
     """cudalib-style multi-GPU pytest entry point.
 
@@ -31,11 +31,12 @@ def multigpu_pytest_main(
     instead of compiling kernels on first call.
 
     ``timeout`` (kw-only, seconds) bounds each per-world-size torchrun
-    invocation. The default budget covers the cold-cache first invocation,
-    where the worker pays the full triton + cutlass JIT compile cost (60-180s
-    observed on H200); subsequent parametrisations finish in ~60s once the JIT
-    cache is warm. A worker that exceeds the budget is killed and the run
-    fails. Pass ``None`` to wait indefinitely.
+    invocation. The default budget covers the cold-cache first invocation
+    (the worker pays the full triton + cutlass JIT compile cost, 60-180s
+    observed on H200) plus the nightly full sweep, which runs every size x
+    dtype x algo x graph-mode parametrisation rather than the reduced in-CI
+    range. A worker that exceeds the budget is killed and the run fails. Pass
+    ``None`` to wait indefinitely.
     """
 
     def inner() -> int:
