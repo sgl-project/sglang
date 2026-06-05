@@ -120,8 +120,10 @@ configs:
   # MiniMax-M2.5 TP4 on rocm700. InferenceX has no sglang minimax recipe yet, so
   # the launch spec is lifted from the nightly TP4 test
   # (test/registered/amd/accuracy/mi35x/test_minimax_m25_tp4_eval_mi35x.py;
-  # TP4 + unified attention + FP8 KV cache). base-only (no MTP variant).
-  - name: minimaxm25-fp8-mi355x-sglang
+  # TP4 + unified attention + FP8 KV cache). base-only (no MTP variant). The
+  # 1k1k and 8k1k entries share one launch spec via YAML anchors -- tune env /
+  # server-args in one place.
+  - name: minimaxm25-fp8-mi355x-sglang-1k1k
     model-prefix: minimaxm25
     precision: fp8
     runner: mi355x
@@ -135,11 +137,11 @@ configs:
     dp-attn: false
     isl: 1024
     osl: 1024
-    conc-list: "1 4 16 32"
-    env:
+    conc-list: "4 8 16 32 64 128"
+    env: &minimax_m25_env
       SGLANG_USE_AITER: "1"
       SGLANG_USE_AITER_UNIFIED_ATTN: "1"
-    server-args: >-
+    server-args: &minimax_m25_server_args >-
       --dtype bfloat16
       --trust-remote-code
       --attention-backend aiter
@@ -148,6 +150,25 @@ configs:
       --kv-cache-dtype fp8_e4m3
       --page-size 16
       --watchdog-timeout 1200
+    bench-backend: vllm
+
+  - name: minimaxm25-fp8-mi355x-sglang-8k1k
+    model-prefix: minimaxm25
+    precision: fp8
+    runner: mi355x
+    framework: sglang
+    model: MiniMaxAI/MiniMax-M2.5
+    runs-on: linux-mi35x-gpu-8
+    rocm-version: rocm700
+    variants: [base]
+    tp: 4
+    ep: 1
+    dp-attn: false
+    isl: 8192
+    osl: 1024
+    conc-list: "4 8 16 32 64 128"
+    env: *minimax_m25_env
+    server-args: *minimax_m25_server_args
     bench-backend: vllm
 
   # --- examples: copy an entry above and adjust to add coverage ---------------
