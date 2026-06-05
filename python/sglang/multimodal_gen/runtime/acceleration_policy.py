@@ -135,7 +135,7 @@ def attention_allows_cudnn_sdp(extra_impl_args: Mapping[str, Any]) -> bool:
 
 def attention_autotune_config(
     extra_impl_args: Mapping[str, Any],
-) -> tuple[bool, int, int, float]:
+) -> tuple[bool, int, int, float, bool]:
     attention_cfg: Mapping[str, Any] = addict.Dict()
     acceleration_cfg: Mapping[str, Any] = addict.Dict()
     if "attention_autotune" in extra_impl_args:
@@ -199,4 +199,21 @@ def attention_autotune_config(
             ),
         )
     )
-    return enabled, warmup, iters, min_speedup
+    live_miss_policy = extra_impl_args.get(
+        "attention_autotune_live_miss",
+        attention_cfg.get(
+            "attention_autotune_live_miss",
+            acceleration_cfg.get(
+                "attention_autotune_live_miss",
+                _get_nested(acceleration_cfg, "attention", "autotune_live_miss"),
+            ),
+        ),
+    )
+    live_miss = _normalize_policy(live_miss_policy) in {
+        "auto",
+        "on",
+        "true",
+        "1",
+        "force",
+    }
+    return enabled, warmup, iters, min_speedup, live_miss

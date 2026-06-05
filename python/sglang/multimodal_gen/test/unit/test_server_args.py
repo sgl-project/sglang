@@ -179,26 +179,32 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
-                "acceleration_config": "attention_autotune=true,attention_autotune_iters=20,attention_autotune_min_speedup=1.03",
+                "acceleration_config": "attention_autotune=true,attention_autotune_iters=20,attention_autotune_min_speedup=1.03,attention_autotune_live_miss=true",
             }
         )
 
         self.assertTrue(args.acceleration_config.attention_autotune)
         self.assertEqual(args.acceleration_config.attention_autotune_iters, 20)
         self.assertEqual(args.acceleration_config.attention_autotune_min_speedup, 1.03)
+        self.assertTrue(args.acceleration_config.attention_autotune_live_miss)
 
     def test_attention_acceleration_defaults_to_auto(self):
         self.assertTrue(attention_allows_cudnn_sdp({}))
-        enabled, warmup, iters, min_speedup = attention_autotune_config({})
+        enabled, warmup, iters, min_speedup, live_miss = attention_autotune_config({})
         self.assertTrue(enabled)
         self.assertEqual(warmup, 5)
         self.assertEqual(iters, 20)
         self.assertEqual(min_speedup, 1.10)
+        self.assertFalse(live_miss)
 
     def test_attention_acceleration_can_be_disabled(self):
         self.assertFalse(attention_allows_cudnn_sdp({"allow_cudnn_sdp": False}))
-        enabled, _, _, _ = attention_autotune_config({"attention_autotune": False})
+        enabled, _, _, _, _ = attention_autotune_config({"attention_autotune": False})
         self.assertFalse(enabled)
+        _, _, _, _, live_miss = attention_autotune_config(
+            {"attention_autotune_live_miss": "false"}
+        )
+        self.assertFalse(live_miss)
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):

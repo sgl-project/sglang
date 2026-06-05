@@ -312,6 +312,7 @@ class LocalAttention(nn.Module):
             self.attention_autotune_warmup,
             self.attention_autotune_iters,
             self.attention_autotune_min_speedup,
+            self.attention_autotune_live_miss,
         ) = attention_autotune_config(extra_impl_args)
         self.attn_impl = impl_cls(
             num_heads=num_heads,
@@ -518,7 +519,18 @@ class LocalAttention(nn.Module):
                 ).transpose(1, 2)
 
         if self._can_autotune_attention(q, k, v):
-            selected = self._select_attention_backend(q, k, v, ctx_attn_metadata)
+            key = self._autotune_key(q, k, v)
+            selected = _LOCAL_ATTENTION_AUTOTUNE_CACHE.get(key)
+            if selected is None:
+                forward_batch = forward_context.forward_batch
+                if self.attention_autotune_live_miss or getattr(
+                    forward_batch, "is_warmup", False
+                ):
+                    selected = self._select_attention_backend(
+                        q, k, v, ctx_attn_metadata
+                    )
+                else:
+                    selected = "native"
             if selected == "sdpa_cudnn":
                 return self._sdpa_forward(q, k, v, True)
             if selected == "sdpa_no_cudnn":

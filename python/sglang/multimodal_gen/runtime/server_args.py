@@ -1120,8 +1120,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "kernel_compile_policy=off|auto|force_torch_compile|force_fused "
                 "with kernel_compile_ops=op1,op2, allow_cudnn_sdp=false to disable "
                 "default cuDNN SDPA auto mode, attention_autotune=false to disable "
-                "default dense LocalAttention autotune, and "
-                "attention_autotune_min_speedup=1.10."
+                "default warmup-time dense LocalAttention autotune, "
+                "attention_autotune_live_miss=true to autotune cache misses on "
+                "real requests, and attention_autotune_min_speedup=1.10."
             ),
         )
 
