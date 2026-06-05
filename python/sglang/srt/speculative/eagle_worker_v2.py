@@ -427,6 +427,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
+                    forward_batch.mark_forward_metadata_ready()
                 parent_list, top_scores_index, draft_tokens = self.draft_forward(
                     forward_batch
                 )
@@ -559,9 +560,7 @@ class EagleDraftWorker(BaseDraftWorker):
             with forward_context(
                 ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
             ), canary_index_ctx:
-                logits_output = self.draft_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
+                logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.topk == 1 and not _is_hip:
@@ -750,7 +749,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 ).logits_output
 
         maybe_detect_nan(
@@ -1181,13 +1180,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute).
-        # Only skip metadata init when cuda-graph already ran replay_prepare;
-        # the non-cuda-graph path needs forward_extend's init (post-pad).
+        # Metadata init is skipped iff cuda-graph already ran replay_prepare —
+        # prepare_for_v2_verify marked the batch in exactly that case; the
+        # non-cuda-graph path stays unmarked and gets forward_extend's init
+        # (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=can_run_cuda_graph,
         )
         logits_output = forward_batch_output.logits_output
 
