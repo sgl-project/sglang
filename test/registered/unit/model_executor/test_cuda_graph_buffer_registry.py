@@ -842,6 +842,52 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                 name,
             )
 
+    def test_num_token_non_padded_gathered_dp_branch(self):
+        import unittest.mock as mock
+
+        from sglang.srt.model_executor import forward_batch_info as fbi
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        ntnp = torch.zeros(1, dtype=torch.int32)
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            num_token_non_padded=ntnp,
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+        )
+        # Gathered (DP) path: post_fill overwrites the FB copy with the local
+        # count. Pin attn-TP (size=2, rank=0) so the result is deterministic.
+        with mock.patch.object(
+            fbi, "get_attention_tp_size", return_value=2
+        ), mock.patch.object(fbi, "get_attention_tp_rank", return_value=0):
+            reg = build_decode_registry(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=8,
+                seq_len_fill_value=5,
+                cache_loc_dtype=torch.int64,
+                enable_num_token_non_padded=True,
+                require_gathered_buffer=True,
+                source=src,
+            )
+            fb = _MiniForwardBatch(
+                num_token_non_padded=torch.tensor([100], dtype=torch.int32),
+            )
+            reg.fill_from(
+                fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+            )
+        # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
+        # local = clamp(100 - rank*4, 0, 4) = 4  (NOT the raw FB copy of 100).
+        self.assertEqual(int(src.num_token_non_padded.item()), 4)
+
     def test_source_with_ngram_registers_structured_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
@@ -1104,6 +1150,43 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         )
         reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=3, padded_num_tokens=8)
         self.assertTrue(torch.equal(idx, torch.tensor([3, 4], dtype=torch.int64)))
+
+    def test_source_none_owns_allocated_buffers(self):
+        # source=None -> the registry allocates (owns) every slot.
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=True,
+            hidden_size=4,
+            embed_dtype=torch.float32,
+            enable_mamba_track=True,
+            share_pool=False,
+            source=None,
+        )
+        self.assertEqual(tuple(reg.get_slot("input_ids").buffer.shape), (16,))
+        self.assertEqual(tuple(reg.get_slot("positions").buffer.shape), (16,))
+        self.assertEqual(tuple(reg.get_slot("out_cache_loc").buffer.shape), (16,))
+        self.assertEqual(tuple(reg.get_slot("mrope_positions").buffer.shape), (3, 16))
+        self.assertEqual(tuple(reg.get_slot("input_embeds").buffer.shape), (16, 4))
+        self.assertEqual(tuple(reg.get_slot("mamba_track_indices").buffer.shape), (2,))
+        # Fills + ZERO-tails the pad with no backing source.
+        fb = _MiniForwardBatch(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
+            positions=torch.tensor([4, 5, 6], dtype=torch.int64),
+            out_cache_loc=torch.tensor([7, 8, 9], dtype=torch.int64),
+        )
+        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
+        ids = reg.get_slot("input_ids").buffer
+        self.assertTrue(
+            torch.equal(ids[:3], torch.tensor([1, 2, 3], dtype=torch.int64))
+        )
+        self.assertTrue(torch.all(ids[3:8] == 0))
 
 
 class TestFillOncePolicy(unittest.TestCase):

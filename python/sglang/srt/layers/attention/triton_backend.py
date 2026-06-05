@@ -1519,12 +1519,9 @@ def update_sliding_window_buffer(
     )
     if hasattr(token_to_kv_pool, "translate_loc_from_full_to_swa"):
         kv_last_index = window_kv_indptr[-1]
-        # Flush before+after: window_kv_indices is a different tensor than out_cache_loc.
-        token_to_kv_pool.invalidate_loc_cache()
         window_kv_indices[:kv_last_index] = (
             token_to_kv_pool.translate_loc_from_full_to_swa(
                 window_kv_indices[:kv_last_index]
             )
         )
-        token_to_kv_pool.invalidate_loc_cache()
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
