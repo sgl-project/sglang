@@ -1,6 +1,7 @@
 """Unit tests for Qwen25Detector — no server, no model loading."""
 
 import json
+import pytest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
@@ -204,6 +205,17 @@ class TestQwen25DetectorStreaming(CustomTestCase):
         names = [c.name for c in named]
         self.assertIn("get_weather", names)
         self.assertIn("search", names)
+
+        # Reconstruct and verify parameters for each tool call by tool_index
+        params_by_index = {}
+        for c in all_calls:
+            if c.parameters:
+                params_by_index[c.tool_index] = (
+                    params_by_index.get(c.tool_index, "") + c.parameters
+                )
+
+        self.assertEqual(json.loads(params_by_index[0]), {"city": "Beijing"})
+        self.assertEqual(json.loads(params_by_index[1]), {"query": "food"})
 
 
 if __name__ == "__main__":

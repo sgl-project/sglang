@@ -165,19 +165,29 @@ class TestDeepSeekV3DetectorStreaming(CustomTestCase):
 
     def test_streaming_single_tool_call(self):
         detector = DeepSeekV3Detector()
-        full_call = (
-            f"{_CALLS_BEGIN}{_make_call('get_weather', '{\"city\": \"Beijing\"}')}{_CALLS_END}"
-        )
-        # Split at midpoint to simulate streaming
-        mid = len(full_call) // 2
+        inner = _make_call("get_weather", '{"city": "Beijing"}')
+        full_call = f"{_CALLS_BEGIN}{inner}{_CALLS_END}"
+
+        # Split into 3 chunks so the streaming parser can emit the name on the
+        # first match and then the argument diff on the second match:
+        #   chunk 1 — header + inner call up to (not including) _CALL_END → name sent
+        #   chunk 2 — _CALL_END                                            → args sent
+        #   chunk 3 — _CALLS_END                                           → cleanup
+        split = full_call.index(_CALL_END)
+        chunks = [full_call[:split], _CALL_END, _CALLS_END]
+
         all_calls = []
-        for chunk in [full_call[:mid], full_call[mid:]]:
+        for chunk in chunks:
             result = detector.parse_streaming_increment(chunk, self.tools)
             all_calls.extend(result.calls)
 
         named = [c for c in all_calls if c.name]
         self.assertEqual(len(named), 1)
         self.assertEqual(named[0].name, "get_weather")
+
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Beijing")
 
     def test_streaming_accumulates_arguments(self):
         detector = DeepSeekV3Detector()
@@ -197,6 +207,10 @@ class TestDeepSeekV3DetectorStreaming(CustomTestCase):
         named = [c for c in all_calls if c.name]
         self.assertGreater(len(named), 0)
         self.assertEqual(named[0].name, "get_weather")
+
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Shanghai")
 
 
 if __name__ == "__main__":
