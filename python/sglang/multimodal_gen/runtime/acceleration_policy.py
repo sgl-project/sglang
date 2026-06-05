@@ -168,7 +168,7 @@ def attention_autotune_config(
                 acceleration_cfg.get(
                     "attention_autotune_warmup",
                     _get_nested(acceleration_cfg, "attention", "autotune_warmup")
-                    or 3,
+                    or 5,
                 ),
             ),
         )
@@ -181,7 +181,7 @@ def attention_autotune_config(
                 acceleration_cfg.get(
                     "attention_autotune_iters",
                     _get_nested(acceleration_cfg, "attention", "autotune_iters")
-                    or 10,
+                    or 20,
                 ),
             ),
         )
@@ -194,7 +194,7 @@ def attention_autotune_config(
                 acceleration_cfg.get(
                     "attention_autotune_min_speedup",
                     _get_nested(acceleration_cfg, "attention", "autotune_min_speedup")
-                    or 1.02,
+                    or 1.10,
                 ),
             ),
         )

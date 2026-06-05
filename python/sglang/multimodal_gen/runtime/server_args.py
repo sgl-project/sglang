@@ -1121,7 +1121,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "with kernel_compile_ops=op1,op2, allow_cudnn_sdp=false to disable "
                 "default cuDNN SDPA auto mode, attention_autotune=false to disable "
                 "default dense LocalAttention autotune, and "
-                "attention_autotune_min_speedup=1.02."
+                "attention_autotune_min_speedup=1.10."
             ),
         )
 

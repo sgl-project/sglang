@@ -290,9 +290,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="bf16")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--autotune-warmup", type=int, default=3)
-    parser.add_argument("--autotune-iters", type=int, default=10)
-    parser.add_argument("--autotune-min-speedup", type=float, default=1.02)
+    parser.add_argument("--autotune-warmup", type=int, default=5)
+    parser.add_argument("--autotune-iters", type=int, default=20)
+    parser.add_argument("--autotune-min-speedup", type=float, default=1.10)
     parser.add_argument(
         "--attention-autotune-mode",
         choices=["default", "explicit", "disabled"],

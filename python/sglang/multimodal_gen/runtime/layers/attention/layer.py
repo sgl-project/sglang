@@ -380,6 +380,7 @@ class LocalAttention(nn.Module):
             and q.dim() == 4
             and k.dim() == 4
             and v.dim() == 4
+            and max(q.shape[1], k.shape[1]) > 256
             and q.shape[-1] <= 256
         )
 

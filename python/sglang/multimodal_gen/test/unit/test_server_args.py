@@ -191,9 +191,9 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertTrue(attention_allows_cudnn_sdp({}))
         enabled, warmup, iters, min_speedup = attention_autotune_config({})
         self.assertTrue(enabled)
-        self.assertEqual(warmup, 3)
-        self.assertEqual(iters, 10)
-        self.assertEqual(min_speedup, 1.02)
+        self.assertEqual(warmup, 5)
+        self.assertEqual(iters, 20)
+        self.assertEqual(min_speedup, 1.10)
 
     def test_attention_acceleration_can_be_disabled(self):
         self.assertFalse(attention_allows_cudnn_sdp({"allow_cudnn_sdp": False}))
