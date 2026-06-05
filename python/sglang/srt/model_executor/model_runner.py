@@ -838,6 +838,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or not server_args.enable_hierarchical_cache
             or self.device != "cuda"
             or self.is_draft_worker
+            or not self._supports_hicache_host_prealloc()
         ):
             return
 
@@ -860,8 +861,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             self.prealloc_host_kv_pool.start_kv_buffer_allocation()
             logger.info(
-                "Started async HiCache host KV pool preallocation "
-                "for %s before graph capture.",
+                "Started async HiCache host KV pool allocation for %s.",
                 type(self.prealloc_host_kv_pool).__name__,
             )
         except Exception as e:  # noqa: BLE001
@@ -872,6 +872,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 e,
             )
             self.prealloc_host_kv_pool = None
+
+    def _supports_hicache_host_prealloc(self):
+        spec = self.linear_attn_model_spec
+        registry_uses_mamba = spec.uses_mamba_radix_cache if spec is not None else False
+        return not (
+            self.is_hybrid_swa
+            or self.hybrid_gdn_config is not None
+            or self.mamba2_config is not None
+            or registry_uses_mamba
+            or self.kimi_linear_config is not None
+            or self.hybrid_lightning_config is not None
+        )
 
     def take_prealloc_host_kv_pool(self):
         pool = self.prealloc_host_kv_pool

@@ -116,24 +116,13 @@ def build_kv_only_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
-    prealloc_host_kv_pool = params.prealloc_host_kv_pool
-    expected_host_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
-    if isinstance(prealloc_host_kv_pool, expected_host_cls):
-        kv_host_pool = prealloc_host_kv_pool
-        kv_host_pool.wait_kv_buffer_ready()
-    else:
-        if prealloc_host_kv_pool is not None:
-            raise ValueError(
-                f"Mismatched HiCache prealloc host pool "
-                f"{type(prealloc_host_kv_pool).__name__} for unified KV-only path."
-            )
-        kv_host_pool = build_kv_host_pool(
-            kv_pool=kv_pool,
-            page_size=page_size,
-            server_args=server_args,
-            use_mla=use_mla,
-            override_kv_cache_dim=override_kv_cache_dim,
-        )
+    kv_host_pool = build_kv_host_pool(
+        kv_pool=kv_pool,
+        page_size=page_size,
+        server_args=server_args,
+        use_mla=use_mla,
+        override_kv_cache_dim=override_kv_cache_dim,
+    )
     entries = [
         build_pool_entry(
             name=PoolName.KV,

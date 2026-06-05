@@ -5,7 +5,6 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -69,28 +68,7 @@ logger = logging.getLogger(__name__)
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
-
-_host_register_tls = threading.local()
 PRETOUCH_CHUNK_BYTES = 256 * 1024 * 1024
-
-
-@contextmanager
-def defer_cuda_host_register(stop_event: Optional[threading.Event] = None):
-    """Allocate host tensors without registering them from this thread."""
-
-    old_value = getattr(_host_register_tls, "defer", False)
-    old_stop_event = getattr(_host_register_tls, "stop_event", None)
-    _host_register_tls.defer = True
-    _host_register_tls.stop_event = stop_event
-    try:
-        yield
-    finally:
-        _host_register_tls.defer = old_value
-        _host_register_tls.stop_event = old_stop_event
-
-
-def is_cuda_host_register_deferred() -> bool:
-    return bool(getattr(_host_register_tls, "defer", False))
 
 
 def cuda_host_register_tensor(buffer: torch.Tensor, tag: str = "") -> None:
@@ -106,11 +84,14 @@ def cuda_host_register_tensor(buffer: torch.Tensor, tag: str = "") -> None:
     )
 
 
-def bounded_pretouch_host_tensor(buffer: torch.Tensor, tag: str = "") -> None:
+def bounded_pretouch_host_tensor(
+    buffer: torch.Tensor,
+    stop_event: threading.Event,
+    tag: str = "",
+) -> None:
     """Fault in host pages until the caller asks the background thread to stop."""
 
-    stop_event = getattr(_host_register_tls, "stop_event", None)
-    if stop_event is None or buffer.device.type != "cpu" or buffer.numel() == 0:
+    if buffer.device.type != "cpu" or buffer.numel() == 0:
         return
 
     total_bytes = buffer.numel() * buffer.element_size()
@@ -255,10 +236,7 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        if is_cuda_host_register_deferred():
-            bounded_pretouch_host_tensor(buffer)
-        else:
-            cuda_host_register_tensor(buffer)
+        cuda_host_register_tensor(buffer)
     return buffer
 
 
@@ -348,8 +326,8 @@ class HostKVCache(abc.ABC):
         self._alloc_thread: Optional[threading.Thread] = None
         self._alloc_error: Optional[BaseException] = None
         self._buffer_ready = False
-        self._cuda_host_register_deferred = False
-        self._alloc_stop_event: Optional[threading.Event] = None
+        self._register_kv_buffer_on_wait = False
+        self._pretouch_stop_event: Optional[threading.Event] = None
         self.clear()
 
         if not defer_alloc:
@@ -361,42 +339,32 @@ class HostKVCache(abc.ABC):
         with self.lock:
             if self._buffer_ready or self._alloc_thread is not None:
                 return
-            self._alloc_cuda_device: Optional[int] = None
-            try:
-                if self.device_pool.device == "cuda" and torch.cuda.is_available():
-                    self._alloc_cuda_device = torch.cuda.current_device()
-            except Exception:  # noqa: BLE001
-                self._alloc_cuda_device = None
 
-            self._alloc_started_at = time.perf_counter()
-            self._alloc_finished_at: Optional[float] = None
-            self._alloc_stop_event = threading.Event()
+            self._register_kv_buffer_on_wait = (
+                self.pin_memory and self.device_pool.device == "cuda"
+            )
+            if self._register_kv_buffer_on_wait:
+                self._pretouch_stop_event = threading.Event()
             self._alloc_thread = threading.Thread(
-                target=self._run_allocation,
+                target=self._allocate_buffers,
                 name=f"hicache-host-alloc-{type(self).__name__}",
                 daemon=True,
             )
             self._alloc_thread.start()
 
-    def _run_allocation(self) -> None:
-        self._cuda_host_register_deferred = (
-            self.pin_memory and self.device_pool.device == "cuda"
-        )
-        ctx = (
-            defer_cuda_host_register(self._alloc_stop_event)
-            if self._cuda_host_register_deferred
-            else nullcontext()
-        )
-        try:
-            with ctx:
-                self._allocate_buffers()
-        finally:
-            self._alloc_finished_at = time.perf_counter()
-
     def _allocate_buffers(self) -> None:
+        old_pin_memory = self.pin_memory
         try:
             t0 = time.perf_counter()
+            if self._register_kv_buffer_on_wait:
+                self.pin_memory = False
             self.kv_buffer = self.init_kv_buffer()
+            if self._register_kv_buffer_on_wait:
+                bounded_pretouch_host_tensor(
+                    self.kv_buffer,
+                    self._pretouch_stop_event,
+                    tag=type(self).__name__,
+                )
             log_prefix = (
                 "[hicache-prealloc-thread]"
                 if self._alloc_thread is not None
@@ -408,6 +376,8 @@ class HostKVCache(abc.ABC):
             )
         except BaseException as e:  # noqa: BLE001
             self._alloc_error = e
+        finally:
+            self.pin_memory = old_pin_memory
 
     @synchronized
     def wait_kv_buffer_ready(self) -> None:
@@ -416,68 +386,35 @@ class HostKVCache(abc.ABC):
         if self._buffer_ready:
             return
 
-        wait_t0 = time.perf_counter()
         spawned_async = self._alloc_thread is not None
         if spawned_async:
-            if self._alloc_stop_event is not None:
-                self._alloc_stop_event.set()
+            if self._pretouch_stop_event is not None:
+                self._pretouch_stop_event.set()
             self._alloc_thread.join()
             self._alloc_thread = None
-            self._alloc_stop_event = None
+            self._pretouch_stop_event = None
         else:
             self._allocate_buffers()
 
-        wait_elapsed = time.perf_counter() - wait_t0
         if spawned_async:
-            started_at = getattr(self, "_alloc_started_at", None)
-            finished_at = getattr(self, "_alloc_finished_at", None)
-            if started_at is not None and finished_at is not None:
-                logger.info(
-                    f"[hicache-prealloc] wait_kv_buffer_ready: blocked main "
-                    f"thread for {wait_elapsed:.2f}s; alloc total inflight "
-                    f"{finished_at - started_at:.2f}s; overlap window "
-                    f"{wait_t0 - started_at:.2f}s ({type(self).__name__})"
-                )
-            else:
-                logger.info(
-                    f"[hicache-prealloc] wait_kv_buffer_ready: blocked main "
-                    f"thread for {wait_elapsed:.2f}s ({type(self).__name__})"
-                )
+            logger.info(
+                "[hicache-prealloc] host KV allocation finished "
+                f"({type(self).__name__})"
+            )
         else:
             logger.info(
-                f"[hicache-alloc] wait_kv_buffer_ready: ran inline, "
-                f"took {wait_elapsed:.2f}s ({type(self).__name__})"
+                f"[hicache-alloc] host KV allocation finished ({type(self).__name__})"
             )
 
         if self._alloc_error is not None:
             raise self._alloc_error
 
-        self._register_deferred_cuda_host_buffers()
+        if self._register_kv_buffer_on_wait:
+            cuda_host_register_tensor(self.kv_buffer)
+            self._register_kv_buffer_on_wait = False
+
         self._post_alloc_setup()
         self._buffer_ready = True
-
-    def _register_deferred_cuda_host_buffers(self) -> None:
-        if not self._cuda_host_register_deferred:
-            return
-        captured_device = getattr(self, "_alloc_cuda_device", None)
-        t0 = time.perf_counter()
-        ctx = (
-            torch.cuda.device(captured_device)
-            if captured_device is not None
-            else nullcontext()
-        )
-        with ctx:
-            for tag, buffer in self._iter_cuda_host_register_buffers():
-                cuda_host_register_tensor(buffer, tag=tag)
-        logger.info(
-            f"[hicache-register] deferred CUDA host registration finished in "
-            f"{time.perf_counter() - t0:.2f}s ({type(self).__name__})"
-        )
-        self._cuda_host_register_deferred = False
-
-    def _iter_cuda_host_register_buffers(self):
-        if self.kv_buffer is not None:
-            yield "kv_buffer", self.kv_buffer
 
     def _post_alloc_setup(self) -> None:
         return
