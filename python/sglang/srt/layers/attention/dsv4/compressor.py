@@ -382,19 +382,23 @@ class Compressor(nn.Module):
 
         self.ape_converted = False
 
-    def load_ape_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        assert param is self.ape
-        if self.overlap:
-            loaded_weight = torch.chunk(loaded_weight, 2, dim=-1)
-            loaded_weight = torch.cat([loaded_weight[0], loaded_weight[1]], dim=0)
-            loaded_weight = loaded_weight.view(self.ratio, -1)
-        assert loaded_weight.shape == param.shape
-        param.data.copy_(loaded_weight)
+    def _apply_ape_hotfix(self):
         self.ape_converted = True
+
+        if self.overlap:
+            ape = torch.chunk(self.ape.data, 2, dim=-1)
+            ape = torch.cat([ape[0], ape[1]], dim=0)
+            self.ape.data.copy_(ape.view(self.ratio, -1))
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
-        self.load_ape_weight(self.ape, self.ape.data)
+        self._apply_ape_hotfix()
+
+    def load_ape_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        assert param is self.ape
+        assert loaded_weight.shape == param.shape
+        param.data.copy_(loaded_weight)
+        self._apply_ape_hotfix()
 
     def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
