@@ -68,7 +68,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         *,
         draft_extend_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
-        init_max_bs: Optional[int] = None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -113,8 +112,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         # num_steps + 1, or topk > 1 draft-extend overflows them.
         self.num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
         self.max_bs = max(self.capture_bs)
-        if init_max_bs is not None and init_max_bs > self.max_bs:
-            self.max_bs = init_max_bs
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         self.draft_extend_attn_backend.init_cuda_graph_state(

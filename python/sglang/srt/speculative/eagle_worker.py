@@ -291,7 +291,6 @@ class EAGLEWorker(TpModelWorker):
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
-        init_max_bs = getattr(self, "_adaptive_init_max_bs", None)
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -302,7 +301,7 @@ class EAGLEWorker(TpModelWorker):
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                 self.target_worker.device
-            ](self, init_max_bs=init_max_bs)
+            ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -318,7 +317,7 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self, init_max_bs=init_max_bs
+                self
             )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
@@ -364,7 +363,6 @@ class EAGLEWorker(TpModelWorker):
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
         cuda_graph_bs: list[int] | None = None,
-        init_max_bs: int | None = None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
@@ -374,7 +372,6 @@ class EAGLEWorker(TpModelWorker):
             speculative_num_steps,
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
-            init_max_bs=init_max_bs,
         ):
             # Reuse existing init methods for draft attention backend and cuda graphs
             self.init_attention_backend()
@@ -430,7 +427,6 @@ class EAGLEWorker(TpModelWorker):
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
         cuda_graph_bs: list[int] | None = None,
-        init_max_bs: int | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -459,8 +455,6 @@ class EAGLEWorker(TpModelWorker):
             # are not affected.
             if not cuda_graph_bs:
                 sa.disable_cuda_graph = True
-        # Expose init_max_bs for init_cuda_graphs() → EAGLEDraftCudaGraphRunner.
-        self._adaptive_init_max_bs = init_max_bs
         try:
             yield
         finally:
@@ -477,7 +471,6 @@ class EAGLEWorker(TpModelWorker):
                 sa.cuda_graph_bs,
                 sa.disable_cuda_graph,
             ) = backup
-            self._adaptive_init_max_bs = None
 
     @property
     def draft_model_runner(self):

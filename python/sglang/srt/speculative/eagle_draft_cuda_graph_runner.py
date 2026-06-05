@@ -66,7 +66,6 @@ class EAGLEDraftCudaGraphRunner:
         *,
         draft_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
-        init_max_bs: Optional[int] = None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -103,12 +102,7 @@ class EAGLEDraftCudaGraphRunner:
 
         # Attention backend
         self.num_tokens_per_bs = self.topk
-        # init_max_bs ensures every step's draft backend is initialised with the
-        # same max_bs, keeping FA3 scheduler-metadata tensor shapes consistent
-        # across steps so all steps produce identical results at the same BS.
         self.max_bs = max(self.capture_bs)
-        if init_max_bs is not None and init_max_bs > self.max_bs:
-            self.max_bs = init_max_bs
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)

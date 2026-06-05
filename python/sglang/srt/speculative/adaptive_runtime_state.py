@@ -53,7 +53,6 @@ class AdaptiveSpecWorker(Protocol):
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
         cuda_graph_bs: list[int] | None = None,
-        init_max_bs: int | None = None,
     ) -> SpecRuntimeState: ...
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None: ...
@@ -95,7 +94,6 @@ class AdaptiveController:
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps."""
         self.params.set_cuda_graph_bs(cuda_graph_bs)
-        init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
 
         for steps in self.candidate_steps:
             if steps in self._states:
@@ -106,7 +104,6 @@ class AdaptiveController:
                 speculative_num_steps=steps,
                 speculative_num_draft_tokens=steps + 1,
                 cuda_graph_bs=pruned_bs,
-                init_max_bs=init_max_bs,
             )
             self._states[steps] = state
 

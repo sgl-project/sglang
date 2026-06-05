@@ -333,7 +333,6 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
-        init_max_bs = getattr(self, "_adaptive_init_max_bs", None)
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -344,7 +343,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                 self.target_worker.device
-            ](self, init_max_bs=init_max_bs)
+            ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -391,7 +390,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
                 self.target_worker.device
-            ](self, init_max_bs=init_max_bs)
+            ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -1010,7 +1009,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
         cuda_graph_bs=None,
-        init_max_bs=None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
@@ -1020,7 +1018,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_steps,
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
-            init_max_bs=init_max_bs,
         ):
             self._draft_worker.init_attention_backend()
             self._draft_worker.init_cuda_graphs()
@@ -1110,7 +1107,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
         cuda_graph_bs: list[int] | None = None,
-        init_max_bs: int | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -1145,8 +1141,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # are not affected.
             if not cuda_graph_bs:
                 sa.disable_cuda_graph = True
-        dw._adaptive_init_max_bs = init_max_bs
-
         dw._rebuild_topk1_chain_buffers()
 
         try:
@@ -1167,7 +1161,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 sa.cuda_graph_bs,
                 sa.disable_cuda_graph,
             ) = backup
-            dw._adaptive_init_max_bs = None
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):

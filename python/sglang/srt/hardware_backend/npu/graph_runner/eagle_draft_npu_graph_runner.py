@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Dict, Optional, Union
+from typing import TYPE_CHECKING, Dict, Union
 
 import numpy as np
 import torch
@@ -45,12 +45,8 @@ if is_npu():
 
 
 class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
-    def __init__(
-        self,
-        eagle_worker: EAGLEWorker,
-        init_max_bs: Optional[int] = None,
-    ):
-        super().__init__(eagle_worker, init_max_bs=init_max_bs)
+    def __init__(self, eagle_worker: EAGLEWorker):
+        super().__init__(eagle_worker)
         self.update_attr_name = None
         self.update_attr_type = None
         self._init_arch_map()

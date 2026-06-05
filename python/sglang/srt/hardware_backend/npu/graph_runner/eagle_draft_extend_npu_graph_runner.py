@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -31,12 +31,8 @@ if TYPE_CHECKING:
 
 
 class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
-    def __init__(
-        self,
-        eagle_worker: EAGLEWorker,
-        init_max_bs: Optional[int] = None,
-    ):
-        super().__init__(eagle_worker, init_max_bs=init_max_bs)
+    def __init__(self, eagle_worker: EAGLEWorker):
+        super().__init__(eagle_worker)
 
     def _create_graph(self):
         return torch.npu.NPUGraph()
