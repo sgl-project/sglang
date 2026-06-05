@@ -78,7 +78,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -134,6 +133,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -274,6 +274,35 @@ class DeepseekV2MLP(nn.Module):
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
+
+        if (
+            getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
+            and self.swiglu_limit is None
+            and not isinstance(x, tuple)
+        ):
+            from flashinfer import fp4_quantize
+
+            from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+                nvfp4_gemm_swiglu_nvfp4_quant,
+            )
+
+            x_fp4, x_scale = fp4_quantize(
+                x, self.gate_up_proj.input_scale_inv, enable_pdl=True
+            )
+            out_fp4, out_scale = nvfp4_gemm_swiglu_nvfp4_quant(
+                x_fp4,
+                x_scale,
+                self.gate_up_proj.weight_swiglu_interleaved,
+                self.gate_up_proj.weight_scale_swiglu_interleaved,
+                self.gate_up_proj.alpha,
+                self.down_proj.input_scale_inv,
+                enable_pdl=True,
+            )
+            out, _ = self.down_proj(
+                (out_fp4, out_scale),
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            )
+            return out
 
         if (
             gemm_output_zero_allocator is not None
@@ -673,6 +702,32 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
+            # Flags must be set before weight load so
+            # process_weights_after_loading sees them and builds the
+            # [Up, Gate]-interleaved weight + scale.
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptFp4LinearMethod,
+            )
+            from sglang.srt.utils.common import is_sm100_supported
+
+            fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
+            if (
+                envs.SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION.get()
+                and is_sm100_supported()
+                and isinstance(
+                    self.shared_experts.gate_up_proj.quant_method,
+                    ModelOptFp4LinearMethod,
+                )
+                and isinstance(
+                    self.shared_experts.down_proj.quant_method,
+                    ModelOptFp4LinearMethod,
+                )
+                and fc1_n % 128 == 0
+                and get_global_server_args().disable_piecewise_cuda_graph
+            ):
+                self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
+                self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
+                self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
@@ -2114,19 +2169,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        if not (
-            enable_moe_dense_fully_dp()
-            and (not self.is_layer_sparse)
-            and hidden_states.shape[0] == 0
-        ):
-            state.hidden_states_mlp_output = self.mlp(
-                hidden_states, state.forward_batch
-            )
-        else:
-            state.hidden_states_mlp_output = hidden_states
-
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             state.pop("hidden_states_mlp_output"),
@@ -2181,7 +2223,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                **get_embedding_tp_kwargs(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -2462,8 +2504,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # Quant configs like Quark may rely on the model to provide fused-module
         # mappings so exclusion checks can unfuse derived names back to the
         # checkpoint's source layer names.
-        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
-            quant_config.packed_modules_mapping = self.packed_modules_mapping
+        if quant_config is not None:
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
 
         self.pp_group = get_pp_group()
         self.config = config

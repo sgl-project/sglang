@@ -754,15 +754,19 @@ class TboForwardBatchPreparer:
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
                 # For logits and logprobs post processing, thus we do not care
-                temp_scaled_logprobs=False,
                 temperature=None,
-                top_p_normalized_logprobs=False,
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
+                # TBO children start unplanned — planned by the TBO-aware init
+                # flow; a stale parent "ready" would wrongly skip that.
+                forward_metadata_ready=False,
+                forward_metadata_planned_bs=None,
+                forward_metadata_planned_num_tokens=None,
+                forward_metadata_replan_equivalent=False,
             )
         )
 
