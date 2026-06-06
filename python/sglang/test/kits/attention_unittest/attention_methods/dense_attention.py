@@ -16,10 +16,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
-from ..mock_server_args import (
-    cuda_graph_config_from_legacy_flags,
-    make_mock_server_args,
-)
+from ..mock_server_args import make_mock_server_args
 
 # Unit tests run without distributed initialization. Backends that size buffers by
 # attention tensor-parallel degree should see the single-rank default.
@@ -304,8 +301,6 @@ class MockModelRunner(ModelRunner):
         device: str,
         max_context_len: int,
         head_dim: int,
-        disable_cuda_graph: bool = True,
-        disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
@@ -328,10 +323,6 @@ class MockModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            cuda_graph_config=cuda_graph_config_from_legacy_flags(
-                disable_cuda_graph=disable_cuda_graph,
-                disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
-            ),
             disable_radix_cache=False,
             dllm_algorithm=None,
             dllm_algorithm_config=None,
@@ -928,8 +919,6 @@ def build_dense_attention_fixture(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
-    disable_cuda_graph: bool = True,
-    disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
 ) -> DenseAttentionFixture:
@@ -952,8 +941,6 @@ def build_dense_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         head_dim=head_dim,
-        disable_cuda_graph=disable_cuda_graph,
-        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
     )
     try:

@@ -275,7 +275,6 @@ def _run_split_op_extend_case(
         testcase,
         case,
         **build_kwargs,
-        disable_piecewise_cuda_graph=False,
     )
     split_inputs = adapter.fixture_inputs(split_fixture)
     split_initial_state = adapter.clone_state(split_fixture)

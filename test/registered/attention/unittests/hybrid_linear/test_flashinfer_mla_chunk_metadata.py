@@ -79,8 +79,6 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
         max_context_len=DEFAULT_MAX_CONTEXT_LEN,
         kv_lora_rank=_KV_LORA_RANK,
         qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
-        disable_cuda_graph=True,
-        disable_piecewise_cuda_graph=True,
         runner_batch_size=None,
         fp8_kv_cache=False,
     )

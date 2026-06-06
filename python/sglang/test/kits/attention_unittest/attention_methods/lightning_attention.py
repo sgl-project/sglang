@@ -25,10 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
 
-from ..mock_server_args import (
-    cuda_graph_config_from_legacy_flags,
-    make_mock_server_args,
-)
+from ..mock_server_args import make_mock_server_args
 
 _dp_attention.get_attention_tp_size = lambda: 1
 _dp_attention.get_attention_tp_rank = lambda: 0
@@ -214,8 +211,6 @@ class MockLightningModelRunner(ModelRunner):
         device: str,
         max_context_len: int,
         head_dim: int,
-        disable_cuda_graph: bool = True,
-        disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
@@ -235,10 +230,6 @@ class MockLightningModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            cuda_graph_config=cuda_graph_config_from_legacy_flags(
-                disable_cuda_graph=disable_cuda_graph,
-                disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
-            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -522,8 +513,6 @@ def build_lightning_attention_fixture(
     num_hidden_layers: int = 1,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
-    disable_cuda_graph: bool = True,
-    disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
 ) -> LightningAttentionFixture:
@@ -544,8 +533,6 @@ def build_lightning_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         head_dim=head_dim,
-        disable_cuda_graph=disable_cuda_graph,
-        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
     )
     try:
