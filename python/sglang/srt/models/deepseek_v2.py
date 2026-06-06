@@ -796,8 +796,14 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
+        # EPLB only rebalances physical routed experts. Fused shared expert
+        # slots live after each rank's routed slots and must stay stable.
+        num_local_experts_for_eplb = (
+            self.experts.num_local_experts - self.num_fused_shared_experts
+        )
+
         return [
-            x.data
+            x.data[:num_local_experts_for_eplb]
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
             and filter_moe_weight_param_global_expert(

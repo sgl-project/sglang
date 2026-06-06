@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -381,9 +382,6 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
-
-        # Out-of-tree platform plugin system — used by elif below
-        from sglang.srt.platforms import current_platform
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform

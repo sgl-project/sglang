@@ -49,6 +49,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -223,6 +224,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
+    "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
@@ -943,8 +945,6 @@ class ServerArgs:
         self._handle_xpu_backends()
 
         # Allow OOT platform plugins to apply server args defaults.
-        from sglang.srt.platforms import current_platform
-
         current_platform.apply_server_args_defaults(self)
 
         # Handle piecewise CUDA graph.
@@ -1358,8 +1358,6 @@ class ServerArgs:
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 5b. OOT platforms that don't support piecewise cuda graph
-        from sglang.srt.platforms import current_platform
-
         if current_platform.is_out_of_tree():
             if not current_platform.support_piecewise_cuda_graph():
                 self.disable_piecewise_cuda_graph = True
@@ -2177,13 +2175,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
-                    # The AITER MXFP4 fused-MoE path for GPT-OSS expects the
-                    # SEPARATED gate/up tile layout (matches the
-                    # `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
-                    # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
-                    # callers default to INTERLEAVE; opt this path out
-                    # unless the user explicitly overrode it.
-                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
+                    ## The AITER MXFP4 fused-MoE path for GPT-OSS expects the
+                    ## SEPARATED gate/up tile layout (matches the
+                    ## `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+                    ## Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
+                    ## callers default to INTERLEAVE; opt this path out
+                    ## unless the user explicitly overrode it.
+                    # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
@@ -2743,8 +2741,6 @@ class ServerArgs:
             2.3 Otherwise, we will use triton backend.
         """
         # OOT platforms provide their own default attention backend.
-        from sglang.srt.platforms import current_platform
-
         if current_platform.is_out_of_tree():
             return current_platform.get_default_attention_backend()
 
@@ -3344,7 +3340,7 @@ class ServerArgs:
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        if self.moe_runner_backend == "flashinfer_trtllm":
+        if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
@@ -5955,7 +5951,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-adaptive-config",
             type=str,
-            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs.",
             default=ServerArgs.speculative_adaptive_config,
         )
         parser.add_argument(
@@ -7309,7 +7305,6 @@ class ServerArgs:
         )
 
         candidate_steps = resolve_candidate_steps_from_config(
-            initial_steps=self.speculative_num_steps,
             cfg_path=self.speculative_adaptive_config,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
