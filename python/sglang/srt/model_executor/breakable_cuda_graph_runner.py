@@ -172,30 +172,9 @@ class BreakableCudaGraphRunner:
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
-        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
-            PrefillInputBuffers,
-        )
         from sglang.srt.utils import is_npu
 
-        with torch.device(self.device):
-            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,),
-                dtype=torch.int64 if not is_npu() else torch.int32,
-            )
-            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            if self.is_multimodal:
-                input_embeds = torch.zeros(
-                    (self.max_num_tokens, model_runner.model_config.hidden_size),
-                    dtype=model_runner.dtype,
-                )
-                mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
-            else:
-                input_embeds = None
-                mrope_positions = None
-
+        cache_loc_dtype = torch.int64 if not is_npu() else torch.int32
         if model_runner.is_draft_worker:
             from sglang.srt.speculative.eagle_utils import get_draft_hidden_dim
 
@@ -206,31 +185,18 @@ class BreakableCudaGraphRunner:
                 device=self.device,
             )
 
-        self.buffers = PrefillInputBuffers(
-            input_ids=input_ids,
-            out_cache_loc=out_cache_loc,
-            mamba_track_indices=None,
-            mamba_track_mask=None,
-            mamba_track_seqlens=None,
-            positions=positions,
-            input_embeds=input_embeds,
-            mrope_positions=mrope_positions,
-        )
-        self.buffers.share_buffers()
-
-        # Token-axis FB-shared slot registry adopting the PrefillInputBuffers
-        # storage. Breakable has no mamba track and bs is not padded here, so
-        # there are no bs-axis slots (max_bs is unused).
+        # Registry owns (allocates + pools) the token-axis input buffers.
         self.buffer_registry = build_prefill_registry(
             device=self.device,
             max_bs=1,
             max_num_token=self.max_num_tokens,
-            cache_loc_dtype=torch.int64 if not is_npu() else torch.int32,
+            cache_loc_dtype=cache_loc_dtype,
             is_multimodal=self.is_multimodal,
             hidden_size=model_runner.model_config.hidden_size,
             embed_dtype=model_runner.dtype,
             enable_mamba_track=False,
-            source=self.buffers,
+            share_pool=not is_npu(),
+            source=None,
         )
 
     @torch.no_grad()

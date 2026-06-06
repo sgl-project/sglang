@@ -108,6 +108,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
 
@@ -215,6 +217,13 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
+        # ===== TO BE REFACTORED ====
+        # The experimental fused topk+pack carrier only exists under the master switch.
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            return isinstance(
+                topk_output, (StandardTopKOutput, StandardTopKOutputPacked)
+            )
+        # ===== END TO BE REFACTORED ====
         return isinstance(topk_output, StandardTopKOutput)
 
     @staticmethod
@@ -254,6 +263,25 @@ class StandardTopKOutput(NamedTuple):
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
+
+
+# ===== TO BE REFACTORED ====
+# Experimental fused topk+pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK) carrier: the FlashInfer
+# routed-MoE packed topk produced fused in the gating kernel. Kept a SEPARATE type rather
+# than a 4th StandardTopKOutput field so the OSS `a, b, _ = topk_output` 3-tuple unpack
+# stays valid; only the gated experimental MoE dispatch reads .packed_topk_ids (getattr).
+class StandardTopKOutputPacked(NamedTuple):
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+    packed_topk_ids: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.STANDARD
+
+
+# ===== END TO BE REFACTORED ====
 
 
 class TritonKernelTopKOutput(NamedTuple):
@@ -431,6 +459,20 @@ class TopK(MultiPlatformOp):
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
+        # ===== TO BE REFACTORED ====
+        elif get_moe_runner_backend().is_experimental_sgl_trtllm():
+            try:
+                from sglang.srt.server_args import get_global_server_args
+
+                use_standard_for_lora = bool(get_global_server_args().enable_lora)
+            except ValueError:
+                use_standard_for_lora = False
+            output_format = (
+                TopKOutputFormat.STANDARD
+                if use_standard_for_lora
+                else TopKOutputFormat.BYPASSED
+            )
+        # ===== END TO BE REFACTORED ====
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
             get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
@@ -681,6 +723,8 @@ def fused_topk(
     renormalize: bool,
     correction_bias: Optional[torch.Tensor] = None,
     scoring_func: str = "softmax",
+    packed_out: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -703,6 +747,23 @@ def fused_topk(
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
             )
+        # ===== TO BE REFACTORED ====
+        elif packed_out is not None:
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
+            # writes topk_weights/topk_ids AND the FlashInfer packed topk in one launch.
+            from sglang.jit_kernel.trtllm_lora_temp.topk_softmax_pack import (
+                topk_softmax_pack,
+            )
+
+            topk_softmax_pack(
+                topk_weights,
+                topk_ids,
+                packed_out,
+                gating_output,
+                renormalize,
+                num_token_non_padded=num_token_non_padded,
+            )
+        # ===== END TO BE REFACTORED ====
         else:
             topk_softmax(
                 topk_weights,
@@ -1215,6 +1276,30 @@ def biased_grouped_topk_gpu(
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
+            # ===== TO BE REFACTORED ====
+            _use_jit_bf16_gate = False
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+                _use_jit_bf16_gate = (
+                    lora_envs.SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE.get()
+                    and lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
+                )
+            if _use_jit_bf16_gate:
+                from sglang.jit_kernel.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
+                    kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
+                )
+
+                # bf16 pass-through: skip the two host-side fp32 upcast kernels.
+                return _kimi_k2_moe_fused_gate(
+                    gating_output,
+                    correction_bias,
+                    topk=topk,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
+            # ===== END TO BE REFACTORED ====
             return kimi_k2_moe_fused_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,
@@ -1388,7 +1473,7 @@ def _post_process_topk_ids(
     layer_id: int,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
@@ -1398,6 +1483,7 @@ def _post_process_topk_ids(
             layer_id=layer_id,
             topk_indices=topk_ids,
         )
+    recorder_topk_ids = None
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
@@ -1410,10 +1496,17 @@ def _post_process_topk_ids(
                 routed_cols, expert_location_dispatch_info, num_token_non_padded
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+            # ExpertDistributionRecorder tracks EPLB physical routed experts.
+            # DeepEP dispatch later inserts per-rank shared slots into topk_ids,
+            # so keep the routed physical ids separately for statistics.
+            recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
+
+    if recorder_topk_ids is None:
+        recorder_topk_ids = topk_ids
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
@@ -1452,7 +1545,7 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    return topk_ids, topk_weights
+    return topk_ids, topk_weights, recorder_topk_ids
 
 
 def select_experts(
@@ -1479,6 +1572,9 @@ def select_experts(
     )
 
     scoring_func = topk_config.scoring_func
+
+    # Set by the fused-gating+pack branch below; None everywhere else.
+    packed_topk = None
 
     (
         router_logits,
@@ -1571,7 +1667,43 @@ def select_experts(
                 renormalize=renormalize,
             )
         else:
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): only on the plain
+            # CUDA softmax path with no EPLB remap / shared experts / bias / routing overrides.
+            _fused_topk_pack = False
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+                _fused_topk_pack = lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get()
+            if (
+                _fused_topk_pack
+                and _is_cuda
+                and not _use_aiter
+                and scoring_func == "softmax"
+                and correction_bias is None
+                and expert_location_dispatch_info is None
+                and num_fused_shared_experts == 0
+                and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+                and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            ):
+                num_experts = router_logits.shape[-1]
+                if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
+                    packed_topk = torch.empty(
+                        (hidden_states.shape[0], top_k),
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+
             # Qwen3MOE uses fused_topk
+            _fused_topk_kwargs = {}
+            # ===== TO BE REFACTORED ====
+            # Only the experimental fused topk+pack passes packed_out/num_token_non_padded;
+            # the default call keeps the upstream signature (fused_topk_cpu lacks these).
+            if packed_topk is not None:
+                _fused_topk_kwargs = dict(
+                    packed_out=packed_topk,
+                    num_token_non_padded=num_token_non_padded,
+                )
+            # ===== END TO BE REFACTORED ====
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1579,6 +1711,7 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
+                **_fused_topk_kwargs,
             )
     else:
         assert (
@@ -1630,7 +1763,7 @@ def select_experts(
         if k > 0:
             topk_weights = torch.full_like(topk_weights, 1.0 / k)
 
-    topk_ids, topk_weights = _post_process_topk_ids(
+    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         topk_config=topk_config,
@@ -1640,8 +1773,16 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(
+        topk_ids=recorder_topk_ids
+    )
 
+    # ===== TO BE REFACTORED ====
+    if packed_topk is not None:
+        return StandardTopKOutputPacked(
+            topk_weights, topk_ids, router_logits, packed_topk
+        )
+    # ===== END TO BE REFACTORED ====
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 

@@ -6,6 +6,7 @@ use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware_zmq::CacheAwareZmqPolicy,
     kv_events::{BlockSizeOracle, HashTree},
+    load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
@@ -32,6 +33,7 @@ pub fn build_policy(
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.unwrap_or_default();
             Arc::new(CacheAwareZmqPolicy::new(
@@ -54,6 +56,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             // Provide an empty tree + empty tokenizer registry + fresh
             // oracle so the test policy is constructible. Production
@@ -76,17 +79,16 @@ pub fn build_registry(
     block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
-    for m in &cfg.models {
-        reg.insert(
-            ModelId(m.id.clone()),
-            build_policy(
-                m,
-                Arc::clone(&tree),
-                Arc::clone(&tokenizers),
-                Arc::clone(&block_size_oracle),
-            ),
-        );
-    }
+    let m = &cfg.model;
+    reg.insert(
+        ModelId(m.id.clone()),
+        build_policy(
+            m,
+            Arc::clone(&tree),
+            Arc::clone(&tokenizers),
+            Arc::clone(&block_size_oracle),
+        ),
+    );
     Ok(reg)
 }
 
@@ -111,34 +113,29 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ProxyConfig,
-        ServerConfig, StaticUrlsDiscoveryConfig,
+        ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig, ServerConfig,
+        StaticUrlsDiscoveryConfig,
     };
 
     use crate::config::PolicyKind;
 
-    fn cfg_with_models(policies: &[(&str, PolicyKind)]) -> Config {
+    fn cfg_with_model(id: &str, policy: PolicyKind) -> Config {
         Config {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
             },
             observability: Default::default(),
-            models: policies
-                .iter()
-                .map(|(id, p)| ModelConfig {
-                    id: (*id).into(),
-                    tokenizer_path: "/tmp/x".into(),
-                    policy: *p,
-                    circuit_breaker: None,
-                    cache_aware: None,
-                })
-                .collect(),
-            discovery: DiscoveryConfig {
-                backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-                    urls: vec!["http://placeholder:0".into()],
-                }),
+            model: ModelConfig {
+                id: id.into(),
+                tokenizer_path: "/tmp/x".into(),
+                policy,
+                circuit_breaker: None,
+                cache_aware: None,
             },
+            discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
+            }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
         }
@@ -150,26 +147,23 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::RoundRobin);
         let _ = build_policy_kind_only(PolicyKind::Random);
         let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
+        let _ = build_policy_kind_only(PolicyKind::LoadBased);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
     }
 
     #[test]
-    fn registry_assigns_per_model() {
-        let cfg = cfg_with_models(&[
-            ("qwen", PolicyKind::RoundRobin),
-            ("deepseek", PolicyKind::Random),
-        ]);
+    fn registry_assigns_configured_model() {
+        let cfg = cfg_with_model("qwen", PolicyKind::RoundRobin);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
         let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
-        assert!(reg.get(&ModelId("deepseek".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
     }
 
     #[test]
     fn cache_aware_zmq_builds_via_factory() {
-        let cfg = cfg_with_models(&[("modelA", PolicyKind::CacheAwareZmq)]);
+        let cfg = cfg_with_model("modelA", PolicyKind::CacheAwareZmq);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
         let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
@@ -181,6 +175,20 @@ mod tests {
         assert!(
             dbg.contains("CacheAwareZmqPolicy"),
             "expected CacheAwareZmqPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn load_based_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("LoadBasedPolicy"),
+            "expected LoadBasedPolicy debug repr, got: {dbg}",
         );
     }
 }

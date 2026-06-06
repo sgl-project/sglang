@@ -105,9 +105,23 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
+_gdn_use_alt_stream = (
+    get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
+)
+_qknorm_use_alt_stream = (
+    get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
+)
 _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
+
+
+def _disable_shared_experts_fusion() -> bool:
+    # Resolved lazily: the global server args is not set at module import time
+    # (e.g. when this module is imported by unit tests).
+    return get_global_server_args().disable_shared_experts_fusion
+
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
@@ -446,6 +460,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and get_is_capture_mode()
             and not torch.compiler.is_compiling()
             and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
+            and _gdn_use_alt_stream
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -567,10 +582,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=alt_stream,
+                alt_stream=(alt_stream if _disable_shared_experts_fusion() else None),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=True,
+                support_shared_expert_fusion=not _disable_shared_experts_fusion(),
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -779,10 +794,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=alt_stream,
+                alt_stream=(alt_stream if _disable_shared_experts_fusion() else None),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=True,
+                support_shared_expert_fusion=not _disable_shared_experts_fusion(),
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -824,6 +839,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.alt_stream is not None
             and get_is_capture_mode()
             and not torch.compiler.is_compiling()
+            and _qknorm_use_alt_stream
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1068,7 +1084,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
         if self.pp_group.is_first_rank:
@@ -1668,7 +1684,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_fused_shared_experts = 0
-        if _use_aiter:
+        if _use_aiter and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0

@@ -2102,6 +2102,20 @@ class FlashAttentionBackend(AttentionBackend):
                     # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
                     cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
                     if self.page_size > 1:
+                        # Only the draft tokens produced up to this step are live;
+                        # cache_loc arrives num_steps-wide. Slice so the scatter fills at
+                        # most decode_length of the (decode_length + 1) expand page_table
+                        # columns -- without this the extra distinct pages overflow the row.
+                        cache_loc = cache_loc[:, :decode_length]
+                        assert (
+                            cache_loc.shape[1] <= metadata_expand.page_table.shape[1]
+                        ), (
+                            f"draft expand page_table too narrow: cache_loc width "
+                            f"{cache_loc.shape[1]} > "
+                            f"{metadata_expand.page_table.shape[1]} columns "
+                            f"(decode_length + 1); page_size={self.page_size}, "
+                            f"topk={self.topk}, num_steps={self.speculative_num_steps}"
+                        )
                         draft_decode_set_expand_metadata(
                             cache_seqlens_int32=metadata_expand.cache_seqlens_int32,
                             page_table=metadata_expand.page_table,
@@ -2731,6 +2745,8 @@ def draft_decode_set_expand_metadata(
     cache_loc = (cache_loc // page_size).to(torch.int32)
     if cache_loc.dim() == 1:
         cache_loc = cache_loc.unsqueeze(0)
+    # cache_loc is pre-sliced to decode_length by the caller, so the scatter fills at
+    # most decode_length of the (decode_length + 1) page_table columns.
     # Vectorized torch.unique_consecutive: track value change points then scatter
     mask = torch.ones_like(cache_loc, dtype=torch.bool)
     mask[:, 1:] = cache_loc[:, 1:] != cache_loc[:, :-1]
