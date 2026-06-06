@@ -16,7 +16,10 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -417,24 +420,62 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
 
 def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
     """
-    Allgather KV cache from all CP ranks and write the full result
-    into each rank's local memory pool.
+    Make this layer's local K/V pool ready for the upcoming attention
+    forward by allgathering across the CP group.
+
+    Two stages run in this order:
+
+    1. **Prefix range** (CP KV-resharding only, ``[0, prefix_len)``):
+       per request, allgather each peer rank's already-stored owned
+       prefix K/V from this layer's ``k_buffer`` / ``v_buffer`` and
+       scatter peer ranks' K/V into the transient pool rows
+       pre-allocated by ``cp_alloc_extend_transient``. Skipped when no
+       transient prefix rows were allocated (e.g. fresh prefill with
+       no radix-cache reuse, or CP-resharding off).
+    2. **Extend range** (always under CP, ``[prefix_len,
+       prefix_len + extend_len)``): one batched allgather over the
+       current-step ``k`` / ``v`` tensors and a single
+       ``set_kv_buffer`` into the union ``cp_transient.full_out_cache_loc``
+       (CP-resharded) or ``out_cache_loc`` (legacy).
     """
-    cache_loc = (
-        forward_batch.out_cache_loc
-        if not layer.is_cross_attention
-        else forward_batch.encoder_out_cache_loc
-    )
+    _cp_fill_remote_prefix_pool_rows(forward_batch, layer, cp_size)
+
+    cp_state = getattr(forward_batch, "cp_transient", None)
+    if (
+        not layer.is_cross_attention
+        and cp_state is not None
+        and cp_state.full_out_cache_loc is not None
+    ):
+        cache_loc = cp_state.full_out_cache_loc
+    else:
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
 
     k = k.contiguous()
     v = v.contiguous()
 
-    key_cache_full = cp_all_gather_rerange_kv_cache(
-        k, cp_size, forward_batch, torch.cuda.current_stream()
-    )
-    value_cache_full = cp_all_gather_rerange_kv_cache(
-        v, cp_size, forward_batch, torch.cuda.current_stream()
-    )
+    if forward_batch.attn_cp_metadata is not None:
+        # CP zigzag split active: each rank computed K, V for its zigzag
+        # slice; allgather across CP ranks to produce canonical-order
+        # full K, V for the current step.
+        key_cache_full = cp_all_gather_rerange_kv_cache(
+            k, cp_size, forward_batch, torch.cuda.current_stream()
+        )
+        value_cache_full = cp_all_gather_rerange_kv_cache(
+            v, cp_size, forward_batch, torch.cuda.current_stream()
+        )
+    else:
+        # No CP zigzag split (short prompt that failed ``can_cp_split``).
+        # Each rank already has the full local K, V for the new tokens
+        # (because no CP split happened upstream), so write them directly
+        # to ``full_out_cache_loc``. The transient rows for non-owned
+        # positions also receive the correct K, V, so attention reads
+        # the right data through the unchanged ``req_to_token``.
+        key_cache_full = k
+        value_cache_full = v
 
     get_token_to_kv_pool().set_kv_buffer(
         layer,
@@ -444,6 +485,125 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         layer.k_scale,
         layer.v_scale,
     )
+
+
+# Lightweight counter for observability of the remote prefix gather path.
+# Inspected by tests; consumed by ``CpTransientManager`` indirectly.
+_CP_PREFIX_GATHER_STATS = {"call_ct": 0, "active_ct": 0, "row_ct": 0}
+
+
+def _cp_fill_remote_prefix_pool_rows(forward_batch, layer, cp_size: int) -> None:
+    """Prefix-range stage of :func:`cp_allgather_and_save_kv_cache`. Kept
+    as a private helper so the public hook stays a single function.
+
+    No-op when CP KV-resharding is not active for this batch, when no
+    CP-admitted request has a non-empty prefix, or when the layer is
+    cross-attention.
+
+    NOTE on symmetry: do not early-exit just because ``state.prefix_rows``
+    is None on *this* rank. A request can have all its prefix pages owned
+    by the local rank (so nothing for this rank to receive) while peer
+    ranks still need this rank's K, V via NCCL allgather. Exiting here
+    would deadlock peers in the collective. The exit on
+    ``not any(prefix_lens_cpu)`` is symmetric across CP ranks because
+    ``extend_prefix_lens_cpu`` is batch-level metadata.
+    """
+    _CP_PREFIX_GATHER_STATS["call_ct"] += 1
+    if layer.is_cross_attention:
+        return
+    state = getattr(forward_batch, "cp_transient", None)
+    if state is None or not state.owner_per_pages:
+        return
+    prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+    if not prefix_lens_cpu or not any(p > 0 for p in prefix_lens_cpu):
+        return
+
+    _CP_PREFIX_GATHER_STATS["active_ct"] += 1
+    if state.prefix_rows is not None:
+        _CP_PREFIX_GATHER_STATS["row_ct"] += int(state.prefix_rows.numel())
+
+    attn_cp_rank = get_attention_cp_rank()
+    _kv_pool = get_token_to_kv_pool()
+    page_size = _kv_pool.page_size
+    req_pool_indices_cpu = forward_batch.req_pool_indices.tolist()
+    req_to_token = get_req_to_token_pool().req_to_token
+    k_buffer, v_buffer = _kv_pool.get_kv_buffer(layer.layer_id)
+    cp_group = get_attention_cp_group()
+    stream = torch.cuda.current_stream()
+    device = req_to_token.device
+
+    for s, owner in enumerate(state.owner_per_pages):
+        if owner is None:
+            continue
+        prefix_len = int(prefix_lens_cpu[s])
+        if prefix_len == 0:
+            continue
+        req_pool_idx = int(req_pool_indices_cpu[s])
+
+        positions = torch.arange(prefix_len, dtype=torch.int64, device=device)
+        page_ids = positions // page_size
+        owners_per_pos = owner.to(device=device, dtype=torch.int64)[page_ids]
+
+        per_rank_positions: List[torch.Tensor] = []
+        per_rank_count: List[int] = []
+        for r in range(cp_size):
+            pos_r = positions[owners_per_pos == r]
+            per_rank_positions.append(pos_r)
+            per_rank_count.append(int(pos_r.numel()))
+        max_count = max(per_rank_count)
+        if max_count == 0:
+            continue
+
+        self_positions = per_rank_positions[attn_cp_rank]
+        if self_positions.numel() > 0:
+            self_slots = req_to_token[req_pool_idx, self_positions]
+            k_local = k_buffer[self_slots]
+            v_local = v_buffer[self_slots]
+        else:
+            k_local = torch.empty(
+                (0, *k_buffer.shape[1:]),
+                dtype=k_buffer.dtype,
+                device=k_buffer.device,
+            )
+            v_local = torch.empty(
+                (0, *v_buffer.shape[1:]),
+                dtype=v_buffer.dtype,
+                device=v_buffer.device,
+            )
+
+        if k_local.shape[0] < max_count:
+            pad = max_count - k_local.shape[0]
+            k_pad_spec = [0, 0] * (k_local.ndim - 1) + [0, pad]
+            v_pad_spec = [0, 0] * (v_local.ndim - 1) + [0, pad]
+            k_local = F.pad(k_local, k_pad_spec, mode="constant", value=0)
+            v_local = F.pad(v_local, v_pad_spec, mode="constant", value=0)
+
+        with use_symmetric_memory(cp_group, disabled=not is_allocation_symmetric()):
+            k_full = torch.empty(
+                max_count * cp_size,
+                *k_local.shape[1:],
+                dtype=k_local.dtype,
+                device=k_local.device,
+            )
+            v_full = torch.empty(
+                max_count * cp_size,
+                *v_local.shape[1:],
+                dtype=v_local.dtype,
+                device=v_local.device,
+            )
+        cp_group.cp_all_gather_into_tensor_async(k_full, k_local, stream)
+        cp_group.cp_all_gather_into_tensor_async(v_full, v_local, stream)
+
+        k_view = k_full.view(cp_size, max_count, *k_local.shape[1:])
+        v_view = v_full.view(cp_size, max_count, *v_local.shape[1:])
+
+        for r in range(cp_size):
+            if r == attn_cp_rank or per_rank_count[r] == 0:
+                continue
+            positions_r = per_rank_positions[r]
+            transient_slots = req_to_token[req_pool_idx, positions_r]
+            k_buffer[transient_slots] = k_view[r, : per_rank_count[r]]
+            v_buffer[transient_slots] = v_view[r, : per_rank_count[r]]
 
 
 def cp_attn_forward_extend(
@@ -692,3 +852,56 @@ def prepare_context_parallel_metadata(
         total_seq_lens=total_seq_lens,
         bs=bs,
     )
+
+
+def owner_for_page(global_page_idx: int, total_pages: int, cp_size: int) -> int:
+    """Return the CP rank that owns ``global_page_idx`` under contiguous
+    partitioning.
+
+    Inverse of ``page_indices_to_cp_rank_page_indices``
+    (``sglang/srt/disaggregation/utils.py:page_indices_to_cp_rank_page_indices``).
+    With ``rem = total_pages % cp_size``, the first ``rem`` ranks each own
+    ``base + 1`` pages and the rest own ``base`` pages. Per-request imbalance
+    is at most one page; aggregate skew across many requests is bounded by
+    ``cp_size - 1`` pages per rank, which is well within tolerance for v1.
+
+    Identical on every CP rank because both inputs and the rule are
+    deterministic - this is the SPMD-safe source of truth for ``cp_owner``.
+    """
+    if cp_size <= 0:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if not (0 <= global_page_idx < total_pages):
+        raise IndexError(
+            f"global_page_idx={global_page_idx} out of range for total_pages={total_pages}"
+        )
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+    if rem == 0:
+        return global_page_idx // base
+    boundary = rem * (base + 1)
+    if global_page_idx < boundary:
+        return global_page_idx // (base + 1)
+    return rem + (global_page_idx - boundary) // base
+
+
+def compute_cp_owner_per_page(
+    total_tokens: int, page_size: int, cp_size: int
+) -> torch.Tensor:
+    """Build the per-page CP-owner tensor for a request of ``total_tokens``.
+
+    Returns an int8 tensor of length ``total_tokens // page_size`` where entry
+    ``i`` is the CP rank that owns the i-th page. Mirrored across CP ranks -
+    every rank computes the same result given the same inputs.
+
+    The trailing partial page (``total_tokens % page_size``) is not included
+    because the radix tree only caches page-aligned tokens.
+    """
+    if cp_size <= 0:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    total_pages = total_tokens // page_size
+    if total_pages == 0:
+        return torch.empty((0,), dtype=torch.int8)
+    owners = [owner_for_page(i, total_pages, cp_size) for i in range(total_pages)]
+    return torch.tensor(owners, dtype=torch.int8)

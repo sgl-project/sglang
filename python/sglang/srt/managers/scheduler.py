@@ -456,6 +456,26 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        # Activate the CP KV-reshard radix path (per-page owner population,
+        # slot-0 sentinel values for non-owned pages, rank-0 eviction
+        # consensus). Without this call ``cp_attn_group`` stays None, so
+        # ``cp_owner_per_page`` is never populated and reshard silently
+        # degenerates to full-KV CP (every rank stores the full KV, no
+        # per-rank saving). See RadixCache.enable_cp_consensus.
+        if (
+            getattr(self.server_args, "enable_cp_kv_reshard", False)
+            and self.server_args.attn_cp_size > 1
+            and not self.disable_radix_cache
+            and hasattr(self.tree_cache, "enable_cp_consensus")
+        ):
+            from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+            self.tree_cache.enable_cp_consensus(
+                get_attention_cp_group(),
+                self.ps.attn_cp_rank,
+                self.server_args.attn_cp_size,
+            )
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
@@ -895,6 +915,69 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
+
+    def _get_draft_kv_pool(self):
+        """Return (draft_token_to_kv_pool, draft_model_config) for the current
+        draft worker, or (None, None) when no draft KV pool is available."""
+        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+            return None, None
+
+        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+            return draft_runner.token_to_kv_pool, draft_runner.model_config
+
+        return (
+            self.draft_worker.model_runner.token_to_kv_pool,
+            self.draft_worker.model_config,
+        )
+
+    def _maybe_register_hicache_draft(self) -> None:
+        """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
+        if not self.enable_hierarchical_cache:
+            return
+
+        draft_kv_pool, _ = self._get_draft_kv_pool()
+        if draft_kv_pool is None:
+            return
+
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.memory_pool_host import (
+            MHATokenToKVPoolHost,
+            MLATokenToKVPoolHost,
+        )
+
+        pool = draft_kv_pool
+        if isinstance(pool, HybridLinearKVPool):
+            pool = pool.full_kv_pool
+
+        # Create host pool for draft with the same slot count as the target host pool,
+        # so that host indices stay 1-to-1 between target and draft KV caches.
+        primary = self.tree_cache.cache_controller.mem_pool_host
+        kw = dict(
+            host_to_device_ratio=primary.size / pool.size,
+            host_size=0,
+            page_size=self.page_size,
+            layout=self.server_args.hicache_mem_layout,
+        )
+        if isinstance(pool, MHATokenToKVPool):
+            draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        elif isinstance(pool, MLATokenToKVPool):
+            draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
+        else:
+            logger.warning(
+                "Draft pool type %s not supported for HiCache, skipping.",
+                type(pool).__name__,
+            )
+            return
+
+        self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -1691,6 +1774,9 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_disagg_prefill_inflight_queue=lambda: getattr(
+                self, "disagg_prefill_inflight_queue", None
+            ),
         )
 
     def init_kv_events_publisher(self) -> None:

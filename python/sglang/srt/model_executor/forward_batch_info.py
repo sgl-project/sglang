@@ -67,6 +67,7 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.utils.cp_transient import CpTransientState
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -457,6 +458,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
+    # CP KV-resharding (v1, prefill-only, DESIGN_kv_reshard.md §6). Single
+    # container for the per-request owner arrays, the union of transient pool
+    # rows allocated this forward, the prefix-range subset (consumed by the
+    # per-layer prefix-fill stage), and the canonical-order extend-write
+    # destination. ``None`` outside CP-resharding or when no request in the
+    # batch is CP-admitted. See ``CpTransientState`` for field semantics.
+    cp_transient: Optional["CpTransientState"] = None
+
+
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
@@ -665,6 +675,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
         )
+        # CP KV-resharding (DESIGN_kv_reshard.md §6): build the consolidated
+        # CpTransientState. Owners are mirrored from Req.cp_owner_per_page
+        # (None entries indicate non-CP-admitted requests); the transient
+        # bookkeeping comes from the scheduler-side allocation. Only create
+        # the state when at least one request is CP-admitted or an
+        # allocation exists — keeps non-CP forwards allocation-free.
+        owner_per_pages = [
+            getattr(req, "cp_owner_per_page", None) for req in batch.reqs
+        ]
+        if batch.cp_transient_allocation is not None or any(
+            o is not None for o in owner_per_pages
+        ):
+            from sglang.srt.layers.utils.cp_transient import CpTransientState
+
+            state = CpTransientState(owner_per_pages=owner_per_pages)
+            if batch.cp_transient_allocation is not None:
+                state.attach_allocation(batch.cp_transient_allocation)
+            ret.cp_transient = state
 
         ret._maybe_init_non_generation_fields(batch)
 

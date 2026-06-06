@@ -54,6 +54,11 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    # CP KV-reshard deferred-release: callable returning the current
+    # disagg_prefill_inflight_queue so the leak detector can account for
+    # transient rows still pinned by in-flight reqs. Returns [] or None
+    # when not applicable (decode side, non-disagg runs).
+    get_disagg_prefill_inflight_queue: Optional[Callable] = None
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -262,12 +267,46 @@ class SchedulerInvariantChecker:
             msg,
         )
 
+    def _count_in_flight_cp_transient_rows(self) -> int:
+        """Sum of CP-reshard transient rows still pinned by reqs in the
+        disagg-prefill inflight queue.
+
+        Used to add an ``uncached`` term to the pool invariant so the
+        leak detector doesn't fire between ``ModelRunner.forward()`` (which
+        skips its synchronous free under ``--enable-cp-kv-reshard`` on a
+        prefill node) and the per-req release that runs when
+        ``KVPoll.Success``/``Failed`` fires in
+        ``process_disagg_prefill_inflight_queue``.
+
+        Returns 0 when no inflight queue exists (decode side, non-disagg
+        runs, or reshard disabled).
+        """
+        if self.get_disagg_prefill_inflight_queue is None:
+            return 0
+        queue = self.get_disagg_prefill_inflight_queue()
+        if not queue:
+            return 0
+        total = 0
+        for req in queue:
+            state = getattr(req, "cp_transient_state", None)
+            if state is None or not state.has_transient_rows():
+                continue
+            mask = state.req_indices == req.req_pool_idx
+            total += int(mask.sum())
+        return total
+
     def _check_all_pools(
         self, ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, List[str]]:
         """Check memory invariant across all pools. Returns (has_leak, messages)."""
         has_leak = False
         messages = []
+
+        # CP KV-reshard deferred-release accounting: rows pinned by reqs
+        # currently in the disagg-prefill inflight queue are allocated but
+        # not yet returned to the pool — count them as ``uncached`` so the
+        # invariant balances.
+        uncached = uncached + self._count_in_flight_cp_transient_rows()
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
         has_leak |= full_leak

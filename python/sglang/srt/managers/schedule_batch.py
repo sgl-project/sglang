@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.utils.cp_transient import CpTransientState
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
@@ -830,6 +831,12 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
+        # CP KV-resharding (v4): per-page owner array. Populated at admission
+        # when --enable-cp-kv-reshard is set; None otherwise. Covers the
+        # page-aligned input length and is locked at admission so the same
+        # logical page maps to the same CP rank across chunked-prefill chunks.
+        self.cp_owner_per_page: Optional[torch.Tensor] = None
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -948,6 +955,12 @@ class Req(ReqDllmMixin):
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        # CP KV-resharding deferred-release: shared reference to the batch's
+        # CpTransientState carrying this req's non-owned transient rows. Set
+        # by process_disagg_prefill before the req enters the inflight queue;
+        # consumed by cp_transient_mgr.free_for_request when the KV transfer
+        # reaches Success/Failed. ``None`` outside CP-reshard mode.
+        self.cp_transient_state: Optional["CpTransientState"] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -1119,6 +1132,25 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+
+            # CP KV-resharding (DESIGN_kv_reshard.md §4): populate the per-page
+            # owner array on the Req so the scheduler's transient allocation
+            # and the per-layer remote prefix gather can find it. Owners are
+            # inherited from the matched cache-hit prefix (via
+            # ``match_result.cp_owner_per_page``) and extended with freshly
+            # computed owners for the new-tail pages. Skipped when the tree
+            # has no CP consensus (i.e., --enable-cp-kv-reshard is off).
+            if getattr(tree_cache, "cp_attn_group", None) is not None:
+                from sglang.srt.managers.schedule_policy import (
+                    _populate_req_cp_owner_per_page,
+                )
+
+                _populate_req_cp_owner_per_page(
+                    tree_cache,
+                    self,
+                    total_tokens=input_len,
+                    matched_owners=getattr(match_result, "cp_owner_per_page", None),
+                )
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1655,6 +1687,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     capture_hidden_mode: Optional[CaptureHiddenMode] = None
     return_hidden_states_before_norm: bool = False
 
+    # CP KV-resharding: transient pool-row bookkeeping for the current extend
+    # forward (DESIGN_kv_reshard.md §6). Populated by ``alloc_for_extend`` and
+    # propagated to ``ForwardBatch`` via ``ModelWorkerBatch``. ``None`` outside
+    # CP-resharding or when no request in the batch is CP-admitted.
+    cp_transient_allocation: Optional["CpTransientState"] = None
+
     @classmethod
     def init_new(
         cls,
@@ -1859,6 +1897,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
+
+        # CP KV-reshard: alloc_for_extend may have populated the batch-level
+        # transient-row bookkeeping. The disagg-prefill transfer-completion
+        # path frees this request's remote rows via req.cp_transient_state, but
+        # under overlap scheduling the batch object seen by
+        # process_batch_result no longer carries cp_transient_allocation.
+        # Attach the shared reference to each req now (a Req is long-lived and
+        # survives the handoff) so the deferred free actually fires.
+        if getattr(self, "cp_transient_allocation", None) is not None:
+            for _req in self.reqs:
+                _req.cp_transient_state = self.cp_transient_allocation
 
         # Set fields
         input_embeds = []

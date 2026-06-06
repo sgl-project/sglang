@@ -123,7 +123,66 @@ def match_prefix_for_req(
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
+
+    # CP KV-resharding (DESIGN_kv_reshard.md §4): ownership is fixed by the
+    # creator of each radix-tree node. The new request inherits the owners of
+    # its cache-hit prefix (so it reads cached bytes from the rank that
+    # actually holds them) and computes fresh owners only for its new tail.
+    # ``match_result.cp_owner_per_page`` is populated by
+    # ``RadixCache.match_prefix`` during the descent, so we avoid a second
+    # traversal here. The tree's ``cp_attn_group`` is non-None iff
+    # --enable-cp-kv-reshard is set and the scheduler called
+    # ``RadixCache.enable_cp_consensus``.
+    if getattr(tree_cache, "cp_attn_group", None) is not None:
+        _populate_req_cp_owner_per_page(
+            tree_cache,
+            req,
+            total_tokens=len(token_ids),
+            matched_owners=match_result.cp_owner_per_page,
+        )
+
     return match_result
+
+
+def _populate_req_cp_owner_per_page(
+    tree_cache,
+    req: Req,
+    total_tokens: int,
+    matched_owners: Optional[torch.Tensor],
+) -> None:
+    """Set ``req.cp_owner_per_page`` from the matched-prefix owners (as
+    returned by ``match_prefix``) plus freshly-computed owners for the
+    new tail (DESIGN_kv_reshard.md §4).
+
+    ``matched_owners`` is the concatenated ``cp_owner_per_page`` along the
+    matched chain; ``None`` or empty means the whole request is new.
+    """
+    from sglang.srt.layers.utils.cp_utils import compute_cp_owner_per_page
+
+    page_size = tree_cache.page_size
+    cp_size = tree_cache.cp_size
+    total_pages = total_tokens // page_size
+    if total_pages == 0:
+        req.cp_owner_per_page = None
+        return
+
+    if matched_owners is None:
+        matched_owners = torch.empty((0,), dtype=torch.int8)
+
+    matched_pages = matched_owners.numel()
+    if matched_pages >= total_pages:
+        # Full prefix hit (rare but possible after chunked-prefill restart).
+        req.cp_owner_per_page = matched_owners[:total_pages].clone()
+        return
+
+    # Compute owners for the tail [matched_pages, total_pages) using this
+    # request's own total_pages; this is what gets stored on the new
+    # TreeNodes when this request later inserts its tail.
+    full_for_this_req = compute_cp_owner_per_page(
+        total_tokens=total_tokens, page_size=page_size, cp_size=cp_size
+    )
+    tail = full_for_this_req[matched_pages:total_pages].clone()
+    req.cp_owner_per_page = torch.cat([matched_owners, tail])
 
 
 class CacheAwarePolicy(Enum):

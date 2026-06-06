@@ -80,6 +80,21 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+class _PadSender:
+    """Sentinel sender for CP-aware ``pop_bootstrapped`` queue padding.
+
+    When CP ranks have differently-sized bootstrap queues (which can
+    happen briefly between iterations even under the same broadcast),
+    the empty-queue rank pads its poll list to ``max_len`` with this
+    placeholder so ``poll_and_all_reduce_attn_cp_tp_group`` sees matching
+    tensor shapes across the collective. Returns ``KVPoll.Bootstrapping``
+    (the min enum) so MIN-reduction does not advance padded positions.
+    """
+
+    def poll(self):
+        return KVPoll.Bootstrapping
+
+
 def maybe_release_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
@@ -320,17 +335,48 @@ class PrefillBootstrapQueue:
         failed_reqs = []
         indices_to_remove = set()
 
-        if len(self.queue) == 0:
+        # Coordinate queue length across attn-cp + attn-tp ranks BEFORE
+        # the early-return so we don't deadlock the downstream all_reduce.
+        # Under CP, ranks can momentarily disagree on queue length (e.g.,
+        # CP0 still holds a req in Bootstrapping while CP1 already popped
+        # it). Without this barrier, an empty-queue rank returns early
+        # and skips the all_reduce in poll_and_all_reduce_attn_cp_tp_group,
+        # leaving the non-empty rank blocked on the attn_cp collective.
+        local_len = len(self.queue)
+        len_tensor = torch.tensor([local_len], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            len_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.scheduler.attn_tp_cpu_group,
+        )
+        torch.distributed.all_reduce(
+            len_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.scheduler.attn_cp_cpu_group,
+        )
+        max_len = int(len_tensor.item())
+        if max_len == 0:
             if return_failed_reqs is False:
                 return []
             else:
                 return [], []
 
+        # Build a poll list padded to max_len so the all_reduce sees
+        # matching tensor shapes across ranks. Padding entries carry a
+        # KVPoll.Bootstrapping (min enum) so MIN-reduction yields
+        # Bootstrapping for any position not all ranks agree on, leaving
+        # the req in the queue for the next iteration.
+        senders = [req.disagg_kv_sender for req in self.queue]
+        if len(senders) < max_len:
+            senders = senders + [_PadSender()] * (max_len - len(senders))
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.queue],
+            senders,
             self.scheduler.attn_cp_cpu_group,
             self.scheduler.attn_tp_cpu_group,
         )
+        # Restrict polls to local queue length; padded positions are not
+        # processed by this rank.
+        polls = polls[:local_len]
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if (
@@ -451,6 +497,15 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
+            # Top-of-iteration barrier on tp_cpu_group: when ranks branch
+            # differently inside the iteration (e.g. one has batch=None and
+            # skips run_batch's NCCL forward, the other doesn't), the
+            # surviving collectives in pop_bootstrapped /
+            # process_disagg_prefill_inflight_queue can fire on mismatched
+            # iterations and deadlock. The barrier guarantees lockstep
+            # entry into each iteration. Cost: ~50 µs idle.
+            torch.distributed.barrier(group=self.tp_cpu_group)
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -564,6 +619,13 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
+        # CP KV-resharding: capture the batch-level transient state once so
+        # each req entering the inflight queue holds a shared reference. The
+        # state stays alive until the LAST req with deferred rows drains.
+        # Outside reshard mode, batch.cp_transient_allocation is None and the
+        # shared reference is a no-op marker.
+        cp_transient_state = getattr(batch, "cp_transient_allocation", None)
+
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -580,6 +642,15 @@ class SchedulerDisaggregationPrefillMixin:
 
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
+                # Attach the shared cp_transient state before enqueueing so
+                # the inflight handler can free this req's slice on
+                # Success/Failed (see model_runner.py:3181 deferred-free).
+                # Only set from the batch when present: under overlap
+                # scheduling this batch object may have lost
+                # cp_transient_allocation, but the req already carries the
+                # shared reference attached in ScheduleBatch.prepare_for_extend.
+                if cp_transient_state is not None:
+                    req.cp_transient_state = cp_transient_state
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -674,16 +745,36 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
-        if len(self.disagg_prefill_inflight_queue) == 0:
+        # Same CP-coordination barrier as pop_bootstrapped: agree on a
+        # common queue length so all ranks either enter the all_reduce
+        # together or all return early.
+        local_len = len(self.disagg_prefill_inflight_queue)
+        len_tensor = torch.tensor([local_len], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            len_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.attn_tp_cpu_group,
+        )
+        torch.distributed.all_reduce(
+            len_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.attn_cp_cpu_group,
+        )
+        max_len = int(len_tensor.item())
+        if max_len == 0:
             return []
 
         done_reqs = []
 
+        senders = [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue]
+        if len(senders) < max_len:
+            senders = senders + [_PadSender()] * (max_len - len(senders))
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            senders,
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
+        polls = polls[:local_len]
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
@@ -712,6 +803,9 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                # CP KV-reshard: release this req's deferred transient
+                # rows now that the KV transfer has finished reading them.
+                self._release_cp_transient_for_req(req)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
@@ -727,6 +821,9 @@ class SchedulerDisaggregationPrefillMixin:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+                # Release deferred transient rows on the failure path too —
+                # the transfer is not going to read them anymore.
+                self._release_cp_transient_for_req(req)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -778,6 +875,28 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs
+
+    def _release_cp_transient_for_req(self: Scheduler, req: Req) -> None:
+        """Free this req's deferred CP-reshard transient rows.
+
+        Counterpart to the skipped ``cp_transient_mgr.free()`` in
+        ``model_runner.py``: with ``--enable-cp-kv-reshard`` on a disagg
+        prefill node, transient rows live past the forward so the KV
+        transfer can read them. We release them once the transfer hits a
+        terminal state. Safe to call when ``cp_transient_state`` is None
+        (no-op) and idempotent for double-fire on the same req.
+        """
+        state = getattr(req, "cp_transient_state", None)
+        if state is None:
+            return
+        try:
+            mgr = self.tp_worker.model_runner.cp_transient_mgr
+            allocator = self.token_to_kv_pool_allocator
+            req_to_token = self.req_to_token_pool.req_to_token
+        except AttributeError:
+            return
+        mgr.free_for_request(state, req.req_pool_idx, allocator, req_to_token)
+        req.cp_transient_state = None
 
     def get_transferred_rids(self: Scheduler) -> List[str]:
         """

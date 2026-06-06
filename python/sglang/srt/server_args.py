@@ -548,6 +548,10 @@ class ServerArgs:
     attn_cp_size: int = 1
     moe_dp_size: int = 1
 
+    # CP KV-resharding: shard KV bytes across CP ranks (DESIGN_kv_reshard.md).
+    # Disaggregated prefill nodes only; bans listed in _handle_cp_kv_reshard().
+    enable_cp_kv_reshard: bool = False
+
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -1016,6 +1020,11 @@ class ServerArgs:
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
+
+        # Validate --enable-cp-kv-reshard after both CP and speculative
+        # resolution have run, so banned combinations are caught against
+        # the final values rather than raw CLI input.
+        self._handle_cp_kv_reshard()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -3275,6 +3284,74 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+    def _handle_cp_kv_reshard(self):
+        """Validate --enable-cp-kv-reshard against DESIGN_kv_reshard.md §2.
+
+        Bans enforceable at server_args time (model-dependent bans like
+        SWA-hybrid + cp_size>1 and cross-attention layers are checked
+        later when the model config is known).
+        """
+        if not self.enable_cp_kv_reshard:
+            return
+
+        if self.attn_cp_size <= 1:
+            raise ValueError(
+                "--enable-cp-kv-reshard requires --attn-cp-size > 1; "
+                f"got attn_cp_size={self.attn_cp_size}."
+            )
+        import os as _os
+
+        if self.disaggregation_mode != "prefill" and not _os.environ.get(
+            "SGLANG_TEST_CP_KV_RESHARD_ALLOW_NULL"
+        ):
+            raise ValueError(
+                "--enable-cp-kv-reshard is supported on disaggregated prefill "
+                f"nodes only; got disaggregation_mode={self.disaggregation_mode!r}. "
+                "Set SGLANG_TEST_CP_KV_RESHARD_ALLOW_NULL=1 to bypass for "
+                "single-server accuracy testing."
+            )
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-cp-kv-reshard is incompatible with "
+                "--enable-hierarchical-cache (host-side store is not sharded)."
+            )
+        if self.enable_hisparse:
+            raise ValueError(
+                "--enable-cp-kv-reshard is incompatible with --enable-hisparse "
+                "(separate retract path not yet ported to the sharded layout)."
+            )
+        if self.enable_lmcache:
+            raise ValueError(
+                "--enable-cp-kv-reshard is incompatible with --enable-lmcache."
+            )
+        if self.disable_radix_cache:
+            raise ValueError(
+                "--enable-cp-kv-reshard requires the radix cache path "
+                "(eviction consensus is implemented on RadixCache)."
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--enable-cp-kv-reshard is incompatible with speculative "
+                f"decoding in v1; got speculative_algorithm="
+                f"{self.speculative_algorithm!r}."
+            )
+
+        # Multi-writer reshard (each CP rank sends its slice separately)
+        # needs the decode-side staging buffer to aggregate ``cp_size``
+        # chunks per region before scatter. Only auto-enable when the user
+        # explicitly opted into multi-writer via
+        # ``SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1``; the default
+        # single-writer (rank-0-only) reshard path sends one stream and
+        # does not need the aggregator. Only valid for nixl/mooncake.
+        if (
+            self.disaggregation_transfer_backend in ("nixl", "mooncake")
+            and envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+        ):
+            import os as _os
+
+            if not envs.SGLANG_DISAGG_STAGING_BUFFER.is_set():
+                _os.environ["SGLANG_DISAGG_STAGING_BUFFER"] = "1"
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -6854,6 +6931,16 @@ class ServerArgs:
             "--enable-prefill-context-parallel",
             action="store_true",
             help="Enable context parallelism used in the prefill phase",
+        )
+        parser.add_argument(
+            "--enable-cp-kv-reshard",
+            action="store_true",
+            help=(
+                "Shard the KV cache bytes across CP ranks (each rank stores "
+                "only its slice) while keeping a mirrored global KV cache tree. "
+                "Disaggregated prefill nodes only; requires --attn-cp-size > 1. "
+                "See DESIGN_kv_reshard.md."
+            ),
         )
         parser.add_argument(
             "--prefill-cp-mode",

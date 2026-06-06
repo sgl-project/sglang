@@ -345,7 +345,63 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    _maybe_alloc_cp_transient_for_extend(batch, req_pool_indices)
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
+def _maybe_alloc_cp_transient_for_extend(
+    batch: ScheduleBatch, req_pool_indices: list[int]
+) -> None:
+    """CP KV-resharding (DESIGN_kv_reshard.md §6): allocate transient pool
+    rows for every non-owned position in this extend batch and stash the
+    bookkeeping on ``batch`` so it flows through to ``ForwardBatch`` via
+    ``ModelWorkerBatch``. The transient rows live next to the regular
+    extend allocation in ``req_to_token``, so paged FA can read both
+    through the standard page table.
+
+    Skipped when ``--enable-cp-kv-reshard`` is off or no request in the
+    batch was admitted under CP-resharding (i.e. every ``cp_owner_per_page``
+    is ``None``)."""
+    server_args = get_global_server_args()
+    if not getattr(server_args, "enable_cp_kv_reshard", False):
+        return
+
+    owners = [getattr(req, "cp_owner_per_page", None) for req in batch.reqs]
+    if all(o is None for o in owners):
+        return
+
+    from sglang.srt.layers.dp_attention import get_attention_cp_rank
+    from sglang.srt.layers.utils.cp_transient import (
+        cp_alloc_extend_transient,
+        cp_build_full_out_cache_loc_for_extend,
+    )
+
+    allocator = batch.token_to_kv_pool_allocator
+    page_size = allocator.page_size
+    allocation, dropped = cp_alloc_extend_transient(
+        req_to_token=batch.req_to_token_pool.req_to_token,
+        allocator=allocator,
+        cp_owner_per_pages=owners,
+        prefix_lens=batch.prefix_lens,
+        extend_lens=batch.extend_lens,
+        req_pool_indices=req_pool_indices,
+        cp_rank=get_attention_cp_rank(),
+        page_size=page_size,
+        tree_cache=batch.tree_cache,
+    )
+    if dropped:
+        raise RuntimeError(
+            f"cp_alloc_extend_transient dropped requests {dropped} in "
+            "CP-resharded extend; transient_reserve may be undersized"
+        )
+    allocation.full_out_cache_loc = cp_build_full_out_cache_loc_for_extend(
+        req_to_token=batch.req_to_token_pool.req_to_token,
+        prefix_lens=batch.prefix_lens,
+        extend_lens=batch.extend_lens,
+        req_pool_indices=req_pool_indices,
+    )
+    batch.cp_transient_allocation = allocation
 
 
 def alloc_paged_token_slots_decode(

@@ -399,6 +399,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+        from sglang.srt.layers.utils.cp_transient import CpTransientManager
+
+        self.cp_transient_mgr = CpTransientManager()
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = getattr(
             model_config, "is_hybrid_swa_compress", False
@@ -3190,6 +3194,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
                 **kwargs,
             )
+
+        # Disagg-prefill with CP-KV-reshard reads transient rows after the
+        # forward returns (in the KV-transfer step). Freeing them here
+        # would race with the transfer and trip the pool leak detector
+        # (see DESIGN_kv_reshard.md §6 lifecycle). In that mode we defer:
+        # the cp_transient state stays attached to forward_batch (and to
+        # the underlying ScheduleBatch.cp_transient_allocation), and the
+        # disagg-prefill inflight queue handler frees per request once
+        # KVPoll.Success/Failed fires.
+        if not (
+            self.server_args.disaggregation_mode == "prefill"
+            and self.server_args.enable_cp_kv_reshard
+        ):
+            self.cp_transient_mgr.free(forward_batch, self.token_to_kv_pool_allocator)
+
         return (ret, can_run_graph)
 
     def forward_idle(

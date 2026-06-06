@@ -544,13 +544,93 @@ def page_indices_to_cp_rank_page_indices(
 
 
 def filter_kv_indices_for_cp_rank(
-    kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
+    kv_mgr: CommonKVManager,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    total_request_pages: Optional[int] = None,
 ) -> Tuple[np.ndarray, slice]:
-    """Filters kv_indices and index_slice for the current CP rank."""
-    total_pages = len(kv_indices)
+    """Filters kv_indices and index_slice for the current CP rank.
+
+    Two modes:
+
+    * **Legacy / non-reshard (the default).** Every CP rank holds the *full*
+      KV cache (`cp_allgather_and_save_kv_cache` writes the gathered KV into
+      every rank's pool). The request's pool rows form a contiguous global
+      range, so partitioning by pool-row-id range is equivalent to
+      partitioning by position. We keep the existing value-based filter for
+      backward compatibility.
+
+    * **CP KV-reshard (``--enable-cp-kv-reshard``).** Each rank holds only
+      its owned-positions' KV in permanent pool rows; non-owned positions
+      point to *transient* pool rows that hold peers' KV. ``kv_indices`` is
+      therefore a per-rank interleave of permanent (owned) and transient
+      (non-owned) row IDs, and the value-based filter mis-identifies the
+      slice — it can pick the transient rows, or drop the rank's owned
+      slice entirely, producing garbage on the decode side
+      (`DEBUG_kv_reshard_progress.md` / `HANDOFF_kv_reshard_session.md`).
+      Under reshard, partition by *position* using the same
+      ``base + (1 if r<rem else 0)`` rule as ``page_indices_to_cp_rank_page_indices``,
+      applied to the request's total page count. ``kv_indices[local_start:local_end]``
+      then returns exactly this rank's permanent (owned) rows for the
+      chunk.
+    """
     cp_rank = kv_mgr.attn_cp_rank
     cp_size = kv_mgr.attn_cp_size
 
+    if cp_size <= 1 or len(kv_indices) == 0:
+        return kv_indices, index_slice
+
+    if getattr(kv_mgr.server_args, "enable_cp_kv_reshard", False):
+        # Two reshard transfer modes (see ``common/conn.py`` for the full
+        # rationale):
+        #
+        #   - Single-writer (default, ``enable_all_cp_ranks_for_transfer``
+        #     is False). Rank 0's pool holds the FULL KV between forward
+        #     and the post-transfer free (owned permanent rows + transient
+        #     peer slices kept alive by the deferred-free path), so rank 0
+        #     sends the entire chunk unchanged. Other CP ranks are dummies
+        #     and never reach this filter; if they do (defensive), they
+        #     return an empty slice.
+        #
+        #   - Multi-writer (opt-in,
+        #     ``enable_all_cp_ranks_for_transfer=True``). Each CP rank
+        #     sends only its position-partitioned slice in parallel and
+        #     decode aggregates via the staging buffer.
+        if not getattr(kv_mgr, "enable_all_cp_ranks_for_transfer", False):
+            if cp_rank == 0:
+                return kv_indices, index_slice
+            return kv_indices[:0], slice(index_slice.start, index_slice.start)
+
+        # Multi-writer: position-based partition.
+        # ``total_request_pages`` is the partition basis; fall back to chunk
+        # size if not provided so single-chunk requests still behave correctly.
+        N = total_request_pages if total_request_pages is not None else len(kv_indices)
+        base = N // cp_size
+        rem = N % cp_size
+        if cp_rank < rem:
+            rank_start = cp_rank * (base + 1)
+            rank_end = rank_start + base + 1
+        else:
+            rank_start = rem * (base + 1) + (cp_rank - rem) * base
+            rank_end = rank_start + base
+
+        chunk_start = index_slice.start
+        chunk_end = chunk_start + len(kv_indices)
+        sel_start = max(rank_start, chunk_start)
+        sel_end = min(rank_end, chunk_end)
+
+        if sel_start >= sel_end:
+            return kv_indices[:0], slice(index_slice.start, index_slice.start)
+
+        rel_start = sel_start - chunk_start
+        rel_end = sel_end - chunk_start
+        return (
+            kv_indices[rel_start:rel_end],
+            slice(sel_start, sel_end),
+        )
+
+    # Legacy non-reshard path (value-based filter, full KV on every rank).
+    total_pages = len(kv_indices)
     rank_page_indices = page_indices_to_cp_rank_page_indices(
         page_indices=kv_indices,
         total_pages=total_pages,

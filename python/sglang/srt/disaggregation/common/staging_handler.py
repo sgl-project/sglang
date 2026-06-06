@@ -525,11 +525,23 @@ class PrefillStagingStrategy:
         """
         from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
-        chunk_idx = (
+        # With multi-CP-rank transfer (kv-reshard or
+        # ``SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER``), each CP rank sends
+        # its own seq-dim slice of the request. For short prompts that fit in
+        # one chunk, every CP rank computes
+        # ``kv_chunk_index_start // full_chunk_pages == 0`` and the writes
+        # collide on a single staging region. Interleave cp_rank into
+        # chunk_idx so each CP rank lands in a distinct region. Falls back to
+        # the original numbering when ``cp_size == 1`` (preserves the existing
+        # non-CP semantics).
+        cp_size = max(1, int(getattr(self.kv_manager, "attn_cp_size", 1)))
+        cp_rank = int(getattr(self.kv_manager, "attn_cp_rank", 0))
+        base_chunk_idx = (
             kv_chunk_index_start // self.full_chunk_pages
             if self.full_chunk_pages > 0
             else 0
         )
+        chunk_idx = base_chunk_idx * cp_size + cp_rank
 
         stg = req.staging
         if stg is None or chunk_idx >= len(stg.offsets):
@@ -782,11 +794,20 @@ def prefetch_staging_reqs(
     chunked_prefill_size: int,
     staging_requested: set,
     prefetch_sockets: dict,
+    cp_rank: int = 0,
+    cp_size: int = 1,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
     allocates staging during the GPU forward pass.
+
+    ``cp_rank`` / ``cp_size`` encode the calling rank's CP position into the
+    chunk_idx so that multi-CP-rank transfer (``--enable-cp-kv-reshard`` or
+    ``SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER``) does not collide multiple
+    CP ranks' chunks onto a single staging region when the prompt fits in a
+    single ``chunked_prefill_size`` chunk. Matches the encoding in
+    ``PrefillStagingStrategy.check_ready``.
     """
     import zmq
 
@@ -810,13 +831,14 @@ def prefetch_staging_reqs(
             continue
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
 
-        for chunk_idx in range(num_chunks):
+        for base_chunk_idx in range(num_chunks):
+            chunk_idx = base_chunk_idx * max(1, cp_size) + int(cp_rank)
             stg_key = (room, chunk_idx, session_id)
             if stg_key in staging_requested:
                 continue
             staging_requested.add(stg_key)
 
-            remaining = total_pages - chunk_idx * full_chunk_pages
+            remaining = total_pages - base_chunk_idx * full_chunk_pages
             chunk_pages = min(full_chunk_pages, remaining)
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)

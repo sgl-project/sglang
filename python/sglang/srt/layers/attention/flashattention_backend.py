@@ -139,6 +139,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
+        self.enable_cp_kv_reshard = (
+            model_runner.server_args.enable_cp_kv_reshard and self.attn_cp_size > 1
+        )
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -777,6 +780,32 @@ class FlashAttentionBackend(AttentionBackend):
         if k is not None:
             assert v is not None
 
+            is_cp_mode = (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            )
+
+            # Under CP KV-resharding, the K, V write must go through
+            # ``cp_allgather_and_save_kv_cache`` (which writes to
+            # ``full_out_cache_loc``) whenever transient rows were
+            # allocated for this batch -- otherwise non-owned transient
+            # rows would be left un-filled, and attention reads via
+            # ``req_to_token`` would hit those rows with stale data.
+            # This catches the CP-ineligible-prompt case (e.g., a short
+            # prompt where ``can_cp_split`` returned False) and any other
+            # path where ``attn_cp_metadata`` is None but the scheduler
+            # allocated transient rows.
+            use_reshard_write = (
+                not layer.is_cross_attention
+                and not self.use_mla
+                and getattr(forward_batch, "cp_transient", None) is not None
+                and forward_batch.cp_transient.full_out_cache_loc is not None
+                and self.attn_cp_size > 1
+                and save_kv_cache
+                and not self.fa_skip_kv_cache
+            )
+
             if save_kv_cache and not self.fa_skip_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
@@ -795,9 +824,12 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
-                elif is_cp_mode:
-                    # Dense-MHA CP: k, v are still rank-local; backend
-                    # all-gathers and writes to the per-rank pool.
+                elif is_cp_mode or use_reshard_write:
+                    # Dense-MHA CP (regular OR with KV-reshard transient
+                    # rows): k, v are rank-local; backend all-gathers and
+                    # writes to the per-rank pool. The reshard path
+                    # additionally fills transient rows via
+                    # ``forward_batch.cp_transient.full_out_cache_loc``.
                     cp_allgather_and_save_kv_cache(
                         forward_batch, layer, k, v, self.attn_cp_size
                     )

@@ -96,6 +96,16 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+class _PadReceiver:
+    """Sentinel receiver used by ``pop_transferred`` to pad poll lists
+    when TP queues have different lengths. Returns ``KVPoll.Bootstrapping``
+    so MIN-reduction does not advance padded positions.
+    """
+
+    def poll(self):
+        return KVPoll.Bootstrapping
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -1578,7 +1588,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-        if not self.queue:
+        # Coordinate queue length across TP ranks BEFORE the early-return,
+        # else a TP rank with an empty queue skips ``poll_and_all_reduce``
+        # while a non-empty TP rank blocks in the collective. Pad poll
+        # lists so the all_reduce sees matching tensor shapes.
+        local_len = len(self.queue)
+        len_tensor = torch.tensor([local_len], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            len_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.gloo_group,
+        )
+        max_len = int(len_tensor.item())
+        if max_len == 0:
             return []
 
         if self.scheduler.enable_decode_hicache:
@@ -1593,7 +1615,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging:
             polls = self._poll_with_staging()
         else:
-            polls = self._poll_with_metadata_gate()
+            # Under CP KV-reshard, TP ranks can momentarily see different
+            # queue lengths. Pad the poll list with sentinel ``_PadReceiver``
+            # entries so ``all_reduce`` sees matching tensor shapes; trim
+            # the result back to ``local_len`` afterwards. The padded
+            # receivers do not have associated ``decode_reqs`` /
+            # ``metadata_buffers``, so we skip the metadata gate when
+            # padding is active.
+            if local_len < max_len:
+                receivers = [dr.kv_receiver for dr in self.queue]
+                receivers = receivers + [_PadReceiver()] * (max_len - local_len)
+                polls = poll_and_all_reduce(receivers, self.gloo_group)
+                polls = polls[:local_len]
+            else:
+                polls = self._poll_with_metadata_gate()
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -1722,6 +1757,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
+            # See prefill.py: top-of-iteration barrier prevents iteration
+            # drift when ranks take different branches inside the loop.
+            torch.distributed.barrier(group=self.tp_cpu_group)
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
