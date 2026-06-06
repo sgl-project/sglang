@@ -830,9 +830,7 @@ class TestIdeogram4(unittest.TestCase):
         sharded = _maybe_shard_bitsandbytes_4bit_quant_state(param, quant_state)
 
         self.assertEqual(sharded.shape, torch.Size((2, 8)))
-        torch.testing.assert_close(
-            sharded.absmax, torch.tensor([4.0, 5.0, 6.0, 7.0])
-        )
+        torch.testing.assert_close(sharded.absmax, torch.tensor([4.0, 5.0, 6.0, 7.0]))
 
     def test_assign_load_preserves_bitsandbytes_tp_attrs(self):
         class TinyModule(torch.nn.Module):
@@ -973,6 +971,59 @@ class TestIdeogram4(unittest.TestCase):
         self.assertFalse(
             any(isinstance(module, torch.nn.Linear) for module in encoder.modules())
         )
+
+    def test_ideogram_text_encoder_tp_fp8_uses_column_parallel_linears(self):
+        config = Ideogram4TextEncoderConfig()
+        config.post_diffusers_config_update()
+        config.arch_config.text_config = Qwen3VLTextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=4,
+            max_position_embeddings=64,
+            pad_token_id=0,
+        )
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.models.encoders.qwen3vl.model_parallel_is_initialized",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.encoders.qwen3vl.get_tp_world_size",
+                    return_value=2,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+            ):
+                with torch.device("meta"):
+                    encoder = IdeogramQwen3VLTextEncoder(config)
+        finally:
+            set_global_server_args(prev_args)
+
+        layer = encoder.language_model.layers[0]
+        self.assertEqual(layer.self_attn.num_heads, 2)
+        self.assertEqual(layer.self_attn.num_key_value_heads, 2)
+        self.assertIsInstance(
+            layer.self_attn.q_proj, WeightOnlyFP8ColumnParallelLinear
+        )
+        self.assertFalse(layer.self_attn.q_proj.gather_output)
+        self.assertTrue(layer.self_attn.o_proj.gather_output)
+        self.assertIsInstance(layer.mlp.gate_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertFalse(layer.mlp.gate_proj.gather_output)
+        self.assertTrue(layer.mlp.down_proj.gather_output)
 
     def test_denoise_and_decode_shape_smoke(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module

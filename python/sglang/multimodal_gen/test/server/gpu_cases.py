@@ -14,6 +14,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_WAN22_FP8_MODEL,
     MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_NVFP4_MODEL,
+    IDEOGRAM4_CI_sampling_params,
     T2V_PROMPT,
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -564,8 +565,6 @@ TWO_GPU_CASES = [
             extras=[
                 "--attention-backend",
                 "fa",
-                "--component-attention-backends",
-                "text_encoder=torch_sdpa,transformer=fa",
             ],
         ),
         IDEOGRAM4_CI_sampling_params,
