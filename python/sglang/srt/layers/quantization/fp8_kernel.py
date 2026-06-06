@@ -73,6 +73,9 @@ if _is_cuda or _is_musa:
     from sglang.jit_kernel.per_token_group_quant_8bit import (
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
     )
+    from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+        per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
+    )
 
 if _is_hip:
     _has_vllm = False
@@ -532,7 +535,10 @@ def sglang_per_token_group_quant_fp8(
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
             if enable_v2:
-                sgl_per_token_group_quant_8bit(
+                # JIT v2 (bit-exact with and same perf as the AOT
+                # sgl_per_token_group_quant_8bit_v2, which stays available as a
+                # fallback). Routed here by default.
+                sgl_per_token_group_quant_8bit_jit_v2(
                     x,
                     x_q,
                     x_s,
@@ -540,10 +546,9 @@ def sglang_per_token_group_quant_fp8(
                     eps,
                     fp8_min,
                     fp8_max,
-                    scale_ue8m0,
-                    fuse_silu_and_mul,
-                    masked_m,
-                    enable_v2=True,
+                    scale_ue8m0=scale_ue8m0,
+                    fuse_silu_and_mul=fuse_silu_and_mul,
+                    masked_m=masked_m,
                 )
             else:
                 sgl_per_token_group_quant_8bit_jit(
