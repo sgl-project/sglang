@@ -114,17 +114,17 @@ class SpeculativeDecodingMetricsMixinReq(BaseBatchReqIpc, kw_only=True):
     """
 
     # Verify count: number of verification forward passes
-    spec_verify_ct: List[int]
+    spec_verify_ct: Optional[List[int]]
 
     # Accepted drafts: Number of accepted draft tokens during speculative decoding
     # (strict drafts-only count, excludes the bonus token).
-    spec_num_correct_drafts: List[int]
+    spec_num_correct_drafts: Optional[List[int]]
 
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
     # Empty list [] when speculative decoding is disabled.
-    spec_correct_drafts_histogram: List[List[int]]
+    spec_correct_drafts_histogram: Optional[List[List[int]]]
 
 
 # Parameters for a session
@@ -751,7 +751,7 @@ class GenerateReqInput(BaseReq):
 
 class TokenizedGenerateReqInput(BaseReqIpc, kw_only=True):
     # The input text
-    input_text: Optional[str]  # str
+    input_text: Optional[Union[str, List[Union[str, List[str]]]]]  # str
     # The input token ids
     input_ids: Optional[array]  # Optional[array[int]]
     # The multimodal inputs
@@ -1071,7 +1071,7 @@ class EmbeddingReqInput(BaseReq):
 
 class TokenizedEmbeddingReqInput(BaseReqIpc, kw_only=True):
     # The input text
-    input_text: Optional[str]  # str
+    input_text: Optional[Union[str, List[Union[str, List[str]]]]]  # str
     # The input token ids
     input_ids: Optional[array]  # array[int]
     # The image inputs
@@ -1303,7 +1303,7 @@ class BatchEmbeddingOutput(BaseBatchReqIpc, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[Dict[str, Any]]]  # List[BaseFinishReason]
     # The output embedding
-    embeddings: List[Union[List[float], Dict[int, float]]]
+    embeddings: List[Union[List[float], Dict[int, float], float]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
