@@ -102,12 +102,24 @@ patches:
 """
 
 
+_PR_REVERT_YAML_27460 = """
+patches:
+  - target: sglang.srt.layers.attention.flashinfer_mla_backend.FlashInferMLAMultiStepDraftBackend.init_cuda_graph_state
+    edits:
+      - match: |
+          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+        replacement: |
+          (self.speculative_num_steps, max_bs * self.max_context_len),
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
     26329: _PR_REVERT_YAML_26329,
     27338: _PR_REVERT_YAML_27338,
     27360: _PR_REVERT_YAML_27360,
     26972: _PR_REVERT_YAML_26972,
+    27460: _PR_REVERT_YAML_27460,
 }
 
 
