@@ -268,7 +268,6 @@ def create_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
-    online_state_slot_offset: int = 0,
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
@@ -391,11 +390,7 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    def get_state_pool(
-        self,
-        attn_backend: AttentionBackend,
-        forward_batch: Optional[ForwardBatch] = None,
-    ) -> CompressStatePool:
+    def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
@@ -437,10 +432,8 @@ class Compressor(nn.Module):
 
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4AttnBackend)
-        kv_score_buffer = self.get_state_pool(
-            attn_backend, forward_batch
-        ).kv_score_buffer.kv_score
-        kv_compressed = attn_backend.forward_compress(
+        kv_score_buffer = self.get_state_pool(attn_backend).kv_score_buffer.kv_score
+        return attn_backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score,
             ape=self.ape.view(-1, self.head_dim),
@@ -452,17 +445,6 @@ class Compressor(nn.Module):
             forward_batch=forward_batch,
             is_paged=True,
         )
-        online_c128_mtp = getattr(attn_backend, "online_c128_mtp", None)
-        if online_c128_mtp is not None:
-            online_c128_mtp.write_prefix_states(
-                layer_id=self.layer_id,
-                compressor=self,
-                kv_score_input=kv_score,
-                logical_forward_mode=getattr(
-                    forward_batch, "_original_forward_mode", forward_batch.forward_mode
-                ),
-            )
-        return kv_compressed
 
 
 if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
