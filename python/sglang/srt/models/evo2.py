@@ -949,8 +949,10 @@ class Evo2ForCausalLM(nn.Module):
             if name.endswith("._extra_state"):
                 continue
 
-            # Skip FP8 extra states (handled by Transformer Engine)
+            # Skip FP8 extra states and non-weight buffers
             if "fp8" in name.lower() or "_extra_state" in name:
+                continue
+            if any(x in name for x in (".inv_freq", "filter.t")):
                 continue
 
             # Remap Vortex weight name → sglang name (before stacking logic)
@@ -1054,6 +1056,8 @@ class Evo2ForCausalLM(nn.Module):
                 return f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
             if rest == "inner_mha_cls.out_proj.weight":
                 return f"model.layers.{layer_idx}.self_attn.out_proj.weight"
+            if rest == "inner_mha_cls.out_proj.bias":
+                return f"model.layers.{layer_idx}.self_attn.out_proj.bias"
 
             # MLP — l1/l2 are stacked into gate_up_proj; l3 is direct
             if rest == "mlp.l1.weight":
@@ -1084,6 +1088,8 @@ class Evo2ForCausalLM(nn.Module):
             # Hyena output projection
             if rest == "out_filter_dense.weight":
                 return f"model.layers.{layer_idx}.out_filter_dense.weight"
+            if rest == "out_filter_dense.bias":
+                return f"model.layers.{layer_idx}.out_filter_dense.bias"
 
         return name
 
