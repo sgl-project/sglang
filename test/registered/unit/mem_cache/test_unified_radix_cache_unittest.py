@@ -546,6 +546,15 @@ class UnifiedRadixCacheSuite:
         req_to_token_pool.alloc([req])
         return req
 
+    def _apply_match_to_req(self, req, match):
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        req.last_host_node = match.last_host_node
+        req.best_match_node = match.best_match_node
+        req.host_hit_length = match.host_hit_length
+        req.swa_host_hit_length = match.swa_host_hit_length
+        req.mamba_host_hit_length = match.mamba_host_hit_length
+
     def _make_seq(self, start: int, num_pages: int) -> list[int]:
         """Page-aligned token sequence of num_pages pages."""
         page_size = self.cfg.page_size
@@ -2845,7 +2854,24 @@ class UnifiedRadixCacheSuite:
         self.assertIs(result.best_match_node, leaf)
         self.assertIs(result.last_device_node, parent)
         self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
-        # host_hit_length is Full-KV only; SWA host hit lands in swa_host_hit_length.
+        self.assertEqual(result.host_hit_length, len(leaf.key))
+        self.assertEqual(result.swa_host_hit_length, len(leaf.key))
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        parent = chain[-2]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._set_aux_host_tombstone(tree, leaf, ComponentType.SWA)
+
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
@@ -2901,10 +2927,7 @@ class UnifiedRadixCacheSuite:
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -2945,10 +2968,7 @@ class UnifiedRadixCacheSuite:
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -2986,10 +3006,7 @@ class UnifiedRadixCacheSuite:
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
