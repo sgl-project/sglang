@@ -167,6 +167,69 @@
             "expected_median_denoise_ms": 190.02,
             "estimated_full_test_time_s": 133.2
         },
+        "ideogram4_fp8_t2i": {
+            "stages_ms": {
+                "InputValidationStage": 0.06,
+                "Ideogram4TextEncodingStage": 68.96,
+                "LatentPreparationStage": 0.17,
+                "Ideogram4DenoisingStage": 20813.98,
+                "Ideogram4DecodingStage": 95.09
+            },
+            "denoise_step_ms": {
+                "0": 347.26,
+                "1": 432.22,
+                "2": 436.95,
+                "3": 433.16,
+                "4": 435.54,
+                "5": 436.19,
+                "6": 434.96,
+                "7": 438.49,
+                "8": 434.57,
+                "9": 432.22,
+                "10": 433.62,
+                "11": 432.95,
+                "12": 434.85,
+                "13": 436.07,
+                "14": 435.5,
+                "15": 433.8,
+                "16": 435.74,
+                "17": 436.2,
+                "18": 435.16,
+                "19": 435.39,
+                "20": 433.49,
+                "21": 434.57,
+                "22": 434.71,
+                "23": 434.96,
+                "24": 436.35,
+                "25": 435.63,
+                "26": 435.37,
+                "27": 434.56,
+                "28": 434.36,
+                "29": 436.84,
+                "30": 437.8,
+                "31": 436.89,
+                "32": 434.56,
+                "33": 434.34,
+                "34": 436.35,
+                "35": 433.87,
+                "36": 435.89,
+                "37": 436.25,
+                "38": 435.15,
+                "39": 436.16,
+                "40": 436.25,
+                "41": 437.04,
+                "42": 435.25,
+                "43": 437.14,
+                "44": 434.85,
+                "45": 436.19,
+                "46": 436.2,
+                "47": 433.98
+            },
+            "expected_e2e_ms": 20982.91,
+            "expected_avg_denoise_ms": 433.46,
+            "expected_median_denoise_ms": 435.31,
+            "estimated_full_test_time_s": 120.0
+        },
         "flux_image_t2i": {
             "stages_ms": {
                 "TimestepPreparationStage": 32.58,
@@ -751,7 +814,8 @@
             },
             "expected_e2e_ms": 961.86,
             "expected_avg_denoise_ms": 57.95,
-            "expected_median_denoise_ms": 64.35
+            "expected_median_denoise_ms": 64.35,
+            "estimated_full_test_time_s": 59.9
         },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
@@ -874,7 +938,8 @@
             },
             "expected_e2e_ms": 28350.2,
             "expected_avg_denoise_ms": 672.19,
-            "expected_median_denoise_ms": 679.16
+            "expected_median_denoise_ms": 679.16,
+            "estimated_full_test_time_s": 117.6
         },
         "qwen_image_t2i_cache_dit_enabled": {
             "stages_ms": {
@@ -1454,7 +1519,8 @@
             },
             "expected_e2e_ms": 11816.27,
             "expected_avg_denoise_ms": 982.57,
-            "expected_median_denoise_ms": 1118.83
+            "expected_median_denoise_ms": 1118.83,
+            "estimated_full_test_time_s": 77.0
         },
         "wan2_2_i2v_a14b_2gpu": {
             "stages_ms": {
@@ -2605,6 +2671,14 @@
             "expected_median_denoise_ms": 246.85,
             "estimated_full_test_time_s": 170.0
         },
+        "lingbot_world_realtime_plastic_beach": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 126.0
+        },
         "ltx_2_3_hq_pipeline": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
@@ -2613,39 +2687,239 @@
                 "LTX2HalveResolutionStage": 0.06,
                 "LTX2LoRASwitchStage": 0.01,
                 "LTX2SigmaPreparationStage": 0.27,
-                "TimestepPreparationStage": 22.21,
+                "TimestepPreparationStage": 60.49,
                 "LTX2AVLatentPreparationStage": 0.18,
-                "LTX2ImageEncodingStage": 0.02,
-                "LTX2AVDenoisingStage": 16162.58,
-                "LTX2UpsampleStage": 3.23,
-                "LTX2RefinementStage": 1593.51,
-                "LTX2AVDecodingStage": 650.0,
+                "LTX2ImageEncodingStage": 1185.13,
+                "LTX2AVDenoisingStage": 22802.53,
+                "LTX2UpsampleStage": 37.42,
+                "LTX2RefinementStage": 3123.85,
+                "LTX2AVDecodingStage": 3266.55,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 1565.09,
-                "1": 1034.27,
-                "2": 989.12,
-                "3": 1048.34,
-                "4": 938.4,
-                "5": 952.6,
-                "6": 992.87,
-                "7": 843.37,
-                "8": 808.52,
-                "9": 715.13,
-                "10": 1100.0,
-                "11": 717.4,
-                "12": 790.42,
-                "13": 761.88,
-                "14": 375.63,
-                "15": 453.87,
-                "16": 448.42,
-                "17": 451.66
+                "0": 1942.27,
+                "1": 1736.24,
+                "2": 1740.39,
+                "3": 1816.87,
+                "4": 1576.27,
+                "5": 1611.1,
+                "6": 1586.7,
+                "7": 1559.69,
+                "8": 1456.36,
+                "9": 1591.21,
+                "10": 1534.93,
+                "11": 852.43,
+                "12": 836.03,
+                "13": 855.98,
+                "14": 443.03,
+                "15": 957.19,
+                "16": 876.98,
+                "17": 878.4
             },
-            "expected_e2e_ms": 22500.0,
-            "expected_avg_denoise_ms": 900.0,
-            "expected_median_denoise_ms": 980.0,
+            "expected_e2e_ms": 30068.97,
+            "expected_avg_denoise_ms": 1325.11,
+            "expected_median_denoise_ms": 1547.31,
             "estimated_full_test_time_s": 363.2
+        },
+        "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 98.3
+        },
+        "cosmos3_nano_t2i": {
+            "stages_ms": {
+                "Cosmos3ImagePreprocessStage": 0.01,
+                "Cosmos3TokenizationStage": 155.89,
+                "Cosmos3LatentPreparationStage": 0.15,
+                "Cosmos3TimestepPreparationStage": 0.64,
+                "Cosmos3DenoisingStage": 846.85,
+                "Cosmos3DecodingStage": 12.14
+            },
+            "denoise_step_ms": {
+                "0": 58.61,
+                "1": 21.71,
+                "2": 44.31,
+                "3": 22.05,
+                "4": 21.79,
+                "5": 21.78,
+                "6": 21.79,
+                "7": 22.25,
+                "8": 22.59,
+                "9": 22.73,
+                "10": 22.75,
+                "11": 22.71,
+                "12": 24.63,
+                "13": 22.43,
+                "14": 21.97,
+                "15": 22.74,
+                "16": 22.93,
+                "17": 22.74,
+                "18": 22.68,
+                "19": 22.55,
+                "20": 22.52,
+                "21": 22.37,
+                "22": 22.29,
+                "23": 22.45,
+                "24": 22.63,
+                "25": 22.64,
+                "26": 22.53,
+                "27": 22.48,
+                "28": 22.41,
+                "29": 22.18,
+                "30": 22.19,
+                "31": 22.48,
+                "32": 22.68,
+                "33": 22.65,
+                "34": 22.37
+            },
+            "expected_e2e_ms": 1019.02,
+            "expected_avg_denoise_ms": 24.13,
+            "expected_median_denoise_ms": 22.52,
+            "estimated_full_test_time_s": 65.0
+        },
+        "cosmos3_nano_t2v": {
+            "stages_ms": {
+                "Cosmos3ImagePreprocessStage": 0.01,
+                "Cosmos3TokenizationStage": 152.97,
+                "Cosmos3LatentPreparationStage": 0.17,
+                "Cosmos3TimestepPreparationStage": 0.64,
+                "Cosmos3DenoisingStage": 294.92,
+                "Cosmos3DecodingStage": 47.82,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 89.22,
+                "1": 61.52,
+                "2": 85.06,
+                "3": 58.08
+            },
+            "expected_e2e_ms": 499.70,
+            "expected_avg_denoise_ms": 73.47,
+            "expected_median_denoise_ms": 73.29,
+            "estimated_full_test_time_s": 65.0
+        },
+        "flux_2_t2i_customized_vae_path": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 574.4
+        },
+        "wan2_2_t2v_a14b_teacache_2gpu": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 253.9
+        },
+        "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 55.4
+        },
+        "mova_360p_tp2": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 160.2
+        },
+        "mova_360p_ring1_uly2": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 236.8
+        },
+        "zimage_image_t2i_2_gpus_non_square": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 67.9
+        },
+        "flux1_modelopt_fp8_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 50.3
+        },
+        "flux2_modelopt_fp8_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 498.1
+        },
+        "wan22_modelopt_fp8_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 89.5
+        },
+        "hunyuanvideo_modelopt_fp8_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 64.3
+        },
+        "qwen_image_modelopt_fp8_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 65.5
+        },
+        "qwen_image_edit_modelopt_fp8_ti2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 73.7
+        },
+        "flux1_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 71.2
+        },
+        "flux2_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 592.3
+        },
+        "wan22_modelopt_nvfp4_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 181.8
         }
     }
 }
