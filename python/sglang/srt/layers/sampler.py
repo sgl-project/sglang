@@ -46,6 +46,13 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 
+# The aiter greedy_sample kernel can return an out-of-range token id (== vocab_size,
+# e.g. 151666 for MiniCPM-V) for all-NaN / all -inf logit rows on ROCm, which decodes
+# to an empty string and breaks downstream consumers. Set this to 1 to fall back to
+# torch.argmax (which always returns a valid index). Default off so behavior is
+# unchanged elsewhere.
+_disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE")
+
 if is_npu():
     import torch_npu
 
@@ -110,7 +117,7 @@ class Sampler(nn.Module):
         logits = self._preprocess_logits(logits, sampling_info)
 
         if sampling_info.is_all_greedy:
-            if _use_aiter:
+            if _use_aiter and not _disable_aiter_greedy_sample:
                 batch_next_token_ids = torch.empty(
                     logits.shape[0], device=logits.device, dtype=torch.int32
                 )
