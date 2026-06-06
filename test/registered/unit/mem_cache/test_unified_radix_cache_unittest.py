@@ -3227,6 +3227,69 @@ class UnifiedRadixCacheSuite:
             n_swa,
         )
 
+    def test_hicache_swa_load_back_host_lock_protects_pending_nodes(self):
+        """SWA LOAD_BACK must keep selected host chunks alive until commit.
+
+        PoolTransfer records nodes_to_load before the H2D transfer commits. If a
+        selected host-only SWA node stays evictable in that window, host eviction
+        can clear its host_value and LOAD_BACK commit later hits len(None).
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, allocator, _, chain, window_pages = self._swa_finalize_setup()
+        loaded_nodes = chain[-window_pages:]
+        for n in loaded_nodes:
+            self._set_aux_host_tombstone(tree, n, ComponentType.SWA)
+
+        swa_comp = tree.components[ComponentType.SWA]
+        transfers = swa_comp.build_hicache_transfers(
+            chain[-1], CacheTransferPhase.LOAD_BACK
+        )
+        self.assertIsNotNone(transfers)
+        xfer = transfers[0]
+        self.assertEqual(xfer.nodes_to_load, loaded_nodes)
+        n_swa = int(xfer.host_indices.numel())
+
+        host_lock = tree.inc_host_lock_ref(chain[-1])
+        released = False
+        try:
+            for n in loaded_nodes:
+                cd = n.component_data[ComponentType.SWA]
+                self.assertGreater(cd.host_lock_ref, 0)
+                self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(n))
+
+            tree.evict_host(n_swa * 2, ComponentType.SWA)
+            for n in loaded_nodes:
+                self.assertIsNotNone(n.component_data[ComponentType.SWA].host_value)
+
+            new_swa = allocator.swa_attn_allocator.alloc(n_swa)
+            self.assertIsNotNone(new_swa)
+            xfer.device_indices = new_swa
+            swa_comp.commit_hicache_transfer(
+                chain[-1], CacheTransferPhase.LOAD_BACK, transfers=transfers
+            )
+            tree.dec_host_lock_ref(chain[-1], host_lock.to_dec_params())
+            released = True
+
+            offset = 0
+            for n in loaded_nodes:
+                cd = n.component_data[ComponentType.SWA]
+                self.assertIsNotNone(cd.value)
+                self.assertEqual(cd.host_lock_ref, 0)
+                chunk_len = int(cd.value.numel())
+                self.assertEqual(
+                    cd.value.tolist(),
+                    new_swa[offset : offset + chunk_len].tolist(),
+                )
+                offset += chunk_len
+            self.assertEqual(offset, n_swa)
+        finally:
+            if not released:
+                tree.dec_host_lock_ref(chain[-1], host_lock.to_dec_params())
+
     def _swa_anchor_chain_tokens(self, num_pages: int) -> list[int]:
         """Reproduce the token sequence used by _build_chain_pages."""
         tokens: list[int] = []
