@@ -69,7 +69,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.mhc import mhc_fused_post_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1693,16 +1692,31 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
+        server_args = get_global_server_args()
+        if server_args.disable_shared_experts_fusion:
             return
 
         disable_reason = None
-        if get_global_server_args().enforce_shared_experts_fusion:
+        if server_args.enable_deepep_waterfill:
+            if self.config.n_shared_experts != 1:
+                raise ValueError(
+                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
+                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
+                )
+        elif (
+            get_moe_a2a_backend().is_megamoe()
+            and server_args.enforce_shared_experts_fusion
+        ):
             pass
-        elif uses_per_rank_fused_shared_slots():
+        elif get_moe_a2a_backend().is_megamoe():
             disable_reason = (
-                "DeepSeek V4 per-rank shared-slot backend: fusion off by default "
+                "DeepSeek V4 MegaMOE backend: fusion off by default "
                 "(use --enforce-shared-experts-fusion to enable)."
+            )
+        elif server_args.enforce_shared_experts_fusion:
+            disable_reason = (
+                "DeepSeek V4 only supports enforced shared-experts fusion with "
+                "MegaMOE or DeepEP Waterfill."
             )
         else:
             disable_reason = (
