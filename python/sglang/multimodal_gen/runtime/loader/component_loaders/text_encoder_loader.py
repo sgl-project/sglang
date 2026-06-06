@@ -306,6 +306,18 @@ class TextEncoderLoader(ComponentLoader):
             fsdp_cpu_offload = False
             should_offload = False
 
+        if (
+            getattr(
+                model_config.arch_config, "requires_gpu_resident_text_encoder", False
+            )
+            and should_offload
+        ):
+            logger.warning(
+                "Keeping bitsandbytes 4-bit text encoder GPU-resident; CUDA "
+                "weights and quant states are required for this checkpoint."
+            )
+            should_offload = False
+
         if should_offload and not current_platform.is_mps():
             model_device = torch.device("cpu")
         else:

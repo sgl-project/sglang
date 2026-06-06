@@ -221,7 +221,9 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
-    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
+    # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
+    # else /tmp); see debug_utils/cuda_coredump.py.
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -336,6 +338,11 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
+
+    SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
+    SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
