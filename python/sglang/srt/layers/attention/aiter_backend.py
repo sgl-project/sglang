@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
@@ -906,7 +907,9 @@ class AiterAttnBackend(AttentionBackend):
                         bs, max_kv_len, dtype=torch.int32, device=self.device
                     )
 
-                    create_flashmla_kv_indices_triton[(bs,)](
+                    create_flashmla_kv_indices_triton[
+                        (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
+                    ](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -918,10 +921,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     if self.use_sliding_window_kv_pool:
+                        # AITER attention kernels require int32 page indices;
+                        # full_to_swa_index_mapping is stored as int64.
                         swa_page_table = (
                             self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 kv_indices
-                            )
+                            ).to(torch.int32)
                         )
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
@@ -1397,10 +1402,13 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if self.use_sliding_window_kv_pool:
+                    # AITER attention kernels (e.g. mha_batch_prefill_func)
+                    # require int32 page indices; full_to_swa_index_mapping is
+                    # stored as int64.
                     swa_page_table = (
                         self.token_to_kv_pool.translate_loc_from_full_to_swa(
                             self.indices_updater_prefill.kv_indices
-                        )
+                        ).to(torch.int32)
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -1596,10 +1604,12 @@ class AiterAttnBackend(AttentionBackend):
                         ]
 
                         if self.use_sliding_window_kv_pool:
+                            # AITER attention kernels require int32 page indices;
+                            # full_to_swa_index_mapping is stored as int64.
                             swa_page_indices = (
                                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                     page_indices
-                                )
+                                ).to(torch.int32)
                             )
 
                             page_indices = self._transform_table_1_to_real(page_indices)
