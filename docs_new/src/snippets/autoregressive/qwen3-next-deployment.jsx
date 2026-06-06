@@ -78,7 +78,7 @@ export const Qwen3NextDeployment = () => {
       mi300x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 2, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: false }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     }
   };
 
