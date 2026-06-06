@@ -31,7 +31,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
-from ..mock_server_args import make_mock_server_args
+from ..mock_server_args import (
+    cuda_graph_config_from_legacy_flags,
+    make_mock_server_args,
+)
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _dp_attention.get_attention_tp_size = lambda: 1
@@ -329,8 +332,10 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=cuda_graph_config_from_legacy_flags(
+                disable_cuda_graph=disable_cuda_graph,
+                disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            ),
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,

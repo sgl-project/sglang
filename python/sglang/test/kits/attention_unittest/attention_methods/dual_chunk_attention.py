@@ -15,7 +15,10 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
-from ..mock_server_args import make_mock_server_args
+from ..mock_server_args import (
+    cuda_graph_config_from_legacy_flags,
+    make_mock_server_args,
+)
 from .dense_attention import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
@@ -311,8 +314,10 @@ class DualChunkMockModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=cuda_graph_config_from_legacy_flags(
+                disable_cuda_graph=disable_cuda_graph,
+                disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            ),
             disable_radix_cache=False,
             dp_size=1,
             enable_dp_attention=False,

@@ -21,8 +21,34 @@ validation it performs is irrelevant for module-level attention tests.
 
 import dataclasses
 
-from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+    default_cuda_graph_config,
+)
 from sglang.srt.server_args import ServerArgs
+
+
+def cuda_graph_config_from_legacy_flags(
+    *,
+    disable_cuda_graph: bool = False,
+    disable_piecewise_cuda_graph: bool = False,
+) -> CudaGraphConfig:
+    # Fixture bypasses __post_init__, so the production
+    # _parse_cuda_graph_config translation of the legacy disable_* flags
+    # never runs. Build the equivalent CudaGraphConfig here so fixture
+    # callers get the same behavior they'd get via Engine(...).
+    decode_backend = Backend.DISABLED if disable_cuda_graph else Backend.FULL
+    prefill_backend = (
+        Backend.DISABLED
+        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+        else Backend.TC_PIECEWISE
+    )
+    return CudaGraphConfig(
+        decode=PhaseConfig(backend=decode_backend),
+        prefill=PhaseConfig(backend=prefill_backend),
+    )
 
 
 def make_mock_server_args(**overrides) -> ServerArgs:
