@@ -3114,7 +3114,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
             max_bs=new_bs,
             max_num_token=new_tokens,
-            seq_len_fill_value=self.attn_backend.get_cuda_graph_seq_len_fill_value(),
+            # Eager applies no padding (raw == padded), so the seq_lens
+            # FILL_SENTINEL only initializes the [raw:padded] tail, which is
+            # empty and never read here. Use 0 rather than the backend's
+            # cuda-graph fill value, which non-cuda-graph backends
+            # (torch_native / torch_flex / intel_amx / ...) do not implement.
+            seq_len_fill_value=0,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
                 self.server_args.enable_mamba_extra_buffer()
