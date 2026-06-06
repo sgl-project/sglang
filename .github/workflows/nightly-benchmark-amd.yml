@@ -4,12 +4,10 @@ name: Nightly Benchmark (AMD)
 # AMD GPUs, so throughput / TTFT / TPOT / ITL / E2EL stay apples-to-apples with
 # the published dashboard.
 #
-# Mirrors the AMD CI container flow used by nightly-test-amd-rocm720.yml
-# (k8s runner + scripts/ci/amd helpers), NOT the GB200 srt-slurm path. The
-# under-test sglang is editable-installed into the container by
-# amd_ci_install_dependency.sh; the server is launched by
-# scripts/ci/amd/run_benchmark.sh with config-driven flags and the load is
-# driven by the benchmark repo's client.
+# Two levels for a readable Actions UI: this parent fans out one nested job per
+# model group (model-prefix), each calling the reusable _benchmark-amd.yml,
+# which in turn runs that model's configs (1k1k / 8k1k / base / mtp ...). Expand
+# a model entry in the run to see its per-config jobs.
 #
 # Models -- and the ROCm image each one uses -- are config-driven: edit
 # scripts/ci/amd/benchmark-configs.yaml to add a model. Do NOT edit this
@@ -28,6 +26,7 @@ on:
       - amd_benchmark
     paths:
       - '.github/workflows/nightly-benchmark-amd.yml'
+      - '.github/workflows/_benchmark-amd.yml'
       - 'scripts/ci/amd/benchmark-configs.yaml'
       - 'scripts/ci/amd/generate_benchmark_matrix.py'
       - 'scripts/ci/amd/run_benchmark.sh'
@@ -68,7 +67,7 @@ on:
           - 'false'
           - 'true'
       conc_list:
-        description: 'Override concurrencies for all rows (each value relaunches the server).'
+        description: 'Override concurrencies for all rows (one launch sweeps all of them).'
         required: false
         type: string
         default: ''
@@ -93,145 +92,77 @@ on:
         type: boolean
         default: true
 
-env:
-  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
 concurrency:
   group: nightly-benchmark-amd-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' }}
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Expand scripts/ci/amd/benchmark-configs.yaml into a {config x variant}
-  # matrix. To add/remove benchmarks, edit that YAML only.
+  # Discover the distinct model groups (model-prefix) from benchmark-configs.yaml
+  # so the parent can fan out one nested job per model. To add/remove benchmarks,
+  # edit that YAML only.
   # ---------------------------------------------------------------------------
-  setup:
+  setup-groups:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
+      groups: ${{ steps.gen.outputs.groups }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Generate benchmark matrix
+      - name: List model groups
         id: gen
         env:
           CONFIGS_FILTER: ${{ inputs.configs }}
-          VARIANTS_FILTER: ${{ inputs.variants }}
-          OVERRIDE_ISL: ${{ inputs.isl }}
-          OVERRIDE_OSL: ${{ inputs.osl }}
-          OVERRIDE_DP_ATTN: ${{ inputs.dp_attention }}
-          OVERRIDE_CONC_LIST: ${{ inputs.conc_list }}
-          OVERRIDE_MODEL: ${{ inputs.model_path }}
         run: |
           pip install pyyaml -q
-          MATRIX=$(python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml)
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "Matrix:"
-          echo "$MATRIX" | python3 -m json.tool
+          GROUPS=$(python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml --list-groups)
+          echo "groups=$GROUPS" >> "$GITHUB_OUTPUT"
+          echo "Model groups: $GROUPS"
 
-  benchmark:
-    needs: setup
+  # One nested (reusable-workflow) job per model group -> the Actions UI shows an
+  # expandable per-model entry whose children are the per-config benchmark jobs.
+  model:
+    needs: setup-groups
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ matrix.config.runs_on }}
     strategy:
       fail-fast: false
       matrix:
-        config: ${{ fromJson(needs.setup.outputs.matrix) }}
-    steps:
-      - name: Checkout sglang (under test)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Checkout benchmark recipes (pinned)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.benchmark_repo || 'SemiAnalysisAI/InferenceX' }}
-          ref: ${{ inputs.benchmark_ref || 'c1383387104b0bb3dea03577a0fcfca5e5bb016a' }}
-          path: benchmark-recipes
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Setup docker (${{ matrix.config.rocm_version }})
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.config.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
-      - name: Install dependencies
-        run: |
-          # --skip-test-time-deps: throughput + GSM8K don't need lmms-eval / human-eval.
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-
-      - name: Run benchmark (${{ matrix.config.name }} / ${{ matrix.config.variant }})
-        timeout-minutes: 600
-        run: |
-          > github_summary.md
-          set +e
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            -e BENCHMARK_DIR="/sglang-checkout/benchmark-recipes" \
-            -e MODEL_PREFIX="${{ matrix.config.model_prefix }}" \
-            -e PRECISION="${{ matrix.config.precision }}" \
-            -e RUNNER="${{ matrix.config.runner }}" \
-            -e FRAMEWORK="${{ matrix.config.framework }}" \
-            -e VARIANT="${{ matrix.config.variant }}" \
-            -e BENCH_MODEL="${{ matrix.config.model }}" \
-            -e TP="${{ matrix.config.tp }}" \
-            -e EP_SIZE="${{ matrix.config.ep }}" \
-            -e ISL="${{ matrix.config.isl }}" \
-            -e OSL="${{ matrix.config.osl }}" \
-            -e DP_ATTENTION="${{ matrix.config.dp_attn }}" \
-            -e CONC_LIST="${{ matrix.config.conc_list }}" \
-            -e LAUNCH_SPEC_B64="${{ matrix.config.launch_spec_b64 }}" \
-            -e RESULT_OUT_DIR="/sglang-checkout/benchmark_results" \
-            bash scripts/ci/amd/run_benchmark.sh
-          RC=$?
-          set -e
-          echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
-          if [ "${{ (github.event_name == 'schedule' || inputs.continue_on_error) && 'true' || 'false' }}" = "true" ]; then
-            echo "continue-on-error: not failing the job (rc=$RC)"
-            exit 0
-          fi
-          exit $RC
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-${{ matrix.config.name }}-${{ matrix.config.variant }}-${{ github.run_id }}
-          path: benchmark_results/**
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Clean up container
-        if: always()
-        continue-on-error: true
-        run: docker rm -f ci_sglang 2>/dev/null || true
+        group: ${{ fromJson(needs.setup-groups.outputs.groups) }}
+    uses: ./.github/workflows/_benchmark-amd.yml
+    with:
+      group: ${{ matrix.group }}
+      ref: ${{ inputs.ref }}
+      configs: ${{ inputs.configs }}
+      variants: ${{ inputs.variants }}
+      isl: ${{ inputs.isl }}
+      osl: ${{ inputs.osl }}
+      dp_attention: ${{ inputs.dp_attention }}
+      conc_list: ${{ inputs.conc_list }}
+      model_path: ${{ inputs.model_path }}
+      benchmark_repo: ${{ inputs.benchmark_repo }}
+      benchmark_ref: ${{ inputs.benchmark_ref }}
+      # schedule / push always continue-on-error; dispatch honors the input.
+      continue_on_error: ${{ github.event_name != 'workflow_dispatch' || inputs.continue_on_error }}
+    secrets: inherit
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
     needs:
-      - benchmark
+      - model
     runs-on: ubuntu-latest
     steps:
-      - name: Check if any job failed
+      - name: Check if any model group failed
         run: |
           if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more benchmark jobs failed"
+            echo "One or more benchmark model groups failed"
             exit 1
           fi
           if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more benchmark jobs were cancelled"
+            echo "One or more benchmark model groups were cancelled"
             exit 1
           fi
-          echo "All benchmark jobs passed"
+          echo "All benchmark model groups passed"

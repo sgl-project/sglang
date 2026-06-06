@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Generate the AMD nightly serving-benchmark job matrix.
+"""Generate the AMD nightly serving-benchmark job matrix (or model groups).
 
-Reads ``scripts/ci/amd/benchmark-configs.yaml`` and prints a JSON array (one
-entry per ``config x variant``) suitable for a GitHub Actions
-``strategy.matrix``. Each row carries the override-able per-run knobs plus a
-base64-encoded ``launch_spec`` (env + server/client args) that
+Reads ``scripts/ci/amd/benchmark-configs.yaml``.
+
+Default mode prints a JSON array (one entry per ``config x variant``) for a
+GitHub Actions ``strategy.matrix``. Each row carries the override-able per-run
+knobs plus a base64-encoded ``launch_spec`` (env + server/client args) that
 ``scripts/ci/amd/run_benchmark.sh`` decodes to launch the sglang server itself.
 
-The base/​mtp launch spec is merged here (so the launcher stays variant-agnostic)
+With ``--list-groups`` it instead prints a JSON array of the unique model
+groups (``model-prefix`` values). The parent workflow uses this to fan out one
+nested (reusable-workflow) job per model, and each calls back here with
+``GROUP_FILTER`` set to expand only that model's configs.
+
+The base/mtp launch spec is merged here (so the launcher stays variant-agnostic)
 and base64-encoded so it survives ``-e`` / ``docker exec`` without quoting issues.
 
 Filtering / overrides come from environment variables so the workflow can pass
-optional ``workflow_dispatch`` inputs without fragile shell quoting:
+optional inputs without fragile shell quoting:
 
-  CONFIGS_FILTER      comma list of config names to keep   (empty = all)
-  VARIANTS_FILTER     comma list of variants to keep        (empty = per-config)
-  OVERRIDE_ISL        override isl for every row            (empty = per-config)
+  GROUP_FILTER        comma list of model-prefixes to keep (empty = all)
+  CONFIGS_FILTER      comma list of config names to keep    (empty = all)
+  VARIANTS_FILTER     comma list of variants to keep         (empty = per-config)
+  OVERRIDE_ISL        override isl for every row             (empty = per-config)
   OVERRIDE_OSL        override osl for every row
   OVERRIDE_DP_ATTN    override dp-attn for every row (true|false)
   OVERRIDE_CONC_LIST  override conc-list for every row
@@ -64,14 +71,20 @@ def _launch_spec_b64(cfg, variant):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("usage: generate_benchmark_matrix.py <configs.yaml>", file=sys.stderr)
+    argv = [a for a in sys.argv[1:] if a != "--list-groups"]
+    list_groups = "--list-groups" in sys.argv[1:]
+    if not argv:
+        print(
+            "usage: generate_benchmark_matrix.py <configs.yaml> [--list-groups]",
+            file=sys.stderr,
+        )
         return 2
 
-    with open(sys.argv[1]) as f:
+    with open(argv[0]) as f:
         doc = yaml.safe_load(f) or {}
     configs = doc.get("configs", []) or []
 
+    group_filter = set(_csv(os.environ.get("GROUP_FILTER")))
     name_filter = set(_csv(os.environ.get("CONFIGS_FILTER")))
     variant_filter = set(_csv(os.environ.get("VARIANTS_FILTER")))
     ov_isl = os.environ.get("OVERRIDE_ISL", "").strip()
@@ -80,17 +93,34 @@ def main():
     ov_conc = os.environ.get("OVERRIDE_CONC_LIST", "").strip()
     ov_model = os.environ.get("OVERRIDE_MODEL", "").strip()
 
+    def keep(cfg):
+        if group_filter and cfg["model-prefix"] not in group_filter:
+            return False
+        if name_filter and cfg["name"] not in name_filter:
+            return False
+        return True
+
+    if list_groups:
+        groups = []
+        for cfg in configs:
+            if keep(cfg) and cfg["model-prefix"] not in groups:
+                groups.append(cfg["model-prefix"])
+        if not groups:
+            print("ERROR: no benchmark configs matched the filters", file=sys.stderr)
+            return 1
+        print(json.dumps(groups))
+        return 0
+
     rows = []
     for cfg in configs:
-        name = cfg["name"]
-        if name_filter and name not in name_filter:
+        if not keep(cfg):
             continue
         for variant in cfg.get("variants", ["base"]):
             if variant_filter and variant not in variant_filter:
                 continue
             rows.append(
                 {
-                    "name": name,
+                    "name": cfg["name"],
                     "model_prefix": cfg["model-prefix"],
                     "precision": cfg["precision"],
                     "runner": cfg["runner"],
