@@ -1426,20 +1426,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             and _enable_moe_post_reduce_scatter
             and self.moe_post_communicator.should_use_reduce_scatter(forward_batch)
         )
-        if (
-            os.environ.get("DSV4_MOE_RS_DEBUG_DECISION", "0").lower()
-            in ("1", "true", "yes", "on")
-            and _use_tp_moe_gather
-            and _enable_moe_post_reduce_scatter
-            and not use_reduce_scatter
-        ):
-            logger.warning(
-                "DSV4_MOE_RS_DECISION rank=%s mode=%s padding=%s sizes=%s",
-                get_attention_dp_rank(),
-                forward_batch.forward_mode,
-                forward_batch.dp_padding_mode,
-                forward_batch.global_num_tokens_cpu,
-            )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
@@ -1478,22 +1464,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             with torch.profiler.record_function("DSV4_MOE_RS_TO_NEXT_ATTN.postprocess"):
-                if os.environ.get("DSV4_MOE_RS_DEBUG", "0").lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                ):
-                    logger.warning(
-                        "DSV4_MOE_RS_TO_NEXT_ATTN rank=%s mode=%s padding=%s "
-                        "sizes=%s input_shape=%s use_reduce_scatter=%s",
-                        get_attention_dp_rank(),
-                        forward_batch.forward_mode,
-                        forward_batch.dp_padding_mode,
-                        forward_batch.global_num_tokens_cpu,
-                        tuple(hidden_states.shape),
-                        use_reduce_scatter,
-                    )
                 old_allow_reduce_scatter = (
                     self.moe_post_communicator.allow_reduce_scatter
                 )
