@@ -25,6 +25,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
@@ -898,6 +899,12 @@ class KVCache(abc.ABC):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError()
 
+    def kivi_roundtrip_on_indices(
+        self, layer: RadixAttention, kv_indices: torch.Tensor, kv_indices_len: int
+    ) -> None:
+        # Optional KIVI hook. Pools that support it can override.
+        return
+
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
 
@@ -1164,6 +1171,66 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def _kivi_roundtrip(
+        self, layer: RadixAttention, cache_k: torch.Tensor, cache_v: torch.Tensor
+    ):
+        from sglang.srt.layers.quantization.kivi_utils import kivi_roundtrip_kv_chunk
+
+        k_group_size = getattr(layer, "kivi_k_group_size", 32)
+        allow_flattened_groups = os.getenv(
+            "SGLANG_KIVI_ALLOW_FLATTENED_GROUPS", ""
+        ).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if k_group_size > 1 and not allow_flattened_groups:
+            if not getattr(self, "_kivi_flattened_group_warning_logged", False):
+                logger.warning(
+                    "Skipping KIVI roundtrip for k_group_size=%s because the current "
+                    "KV write path is flattened across requests. Set "
+                    "SGLANG_KIVI_ALLOW_FLATTENED_GROUPS=1 only for single-request "
+                    "experiments.",
+                    k_group_size,
+                )
+                self._kivi_flattened_group_warning_logged = True
+            return cache_k, cache_v
+
+        v_group_size = getattr(layer, "kivi_v_group_size", 32)
+        if cache_v.shape[-1] % v_group_size != 0:
+            v_group_size = 1
+        return kivi_roundtrip_kv_chunk(
+            cache_k,
+            cache_v,
+            k_bits=getattr(layer, "kivi_k_bits", 2),
+            v_bits=getattr(layer, "kivi_v_bits", 2),
+            k_group_size=k_group_size,
+            v_group_size=v_group_size,
+            residual_length=getattr(layer, "kivi_residual_length", 128),
+        )
+
+    def kivi_roundtrip_on_indices(
+        self, layer: RadixAttention, kv_indices: torch.Tensor, kv_indices_len: int
+    ) -> None:
+        disable_roundtrip = os.getenv("SGLANG_KIVI_DISABLE_ROUNDTRIP", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if disable_roundtrip:
+            return
+        if not getattr(layer, "kivi_runtime_enabled", False) or kv_indices_len <= 0:
+            return
+        layer_id = layer.layer_id
+        indices = kv_indices[:kv_indices_len].to(torch.int64)
+        k = self._get_key_buffer(layer_id)[indices]
+        v = self._get_value_buffer(layer_id)[indices]
+        k, v = self._kivi_roundtrip(layer, k, v)
+        self._get_key_buffer(layer_id)[indices] = k
+        self._get_value_buffer(layer_id)[indices] = v
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1185,6 +1252,25 @@ class MHATokenToKVPool(KVCache):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
+
+        if layer is not None and getattr(layer, "kivi_runtime_enabled", False):
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+            disable_roundtrip = os.getenv(
+                "SGLANG_KIVI_DISABLE_ROUNDTRIP", ""
+            ).lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            min_chunk_tokens = int(os.getenv("SGLANG_KIVI_MIN_CHUNK_TOKENS", "8"))
+            if (
+                (not disable_roundtrip)
+                and (not get_is_capture_mode())
+                and cache_k.shape[0] >= min_chunk_tokens
+            ):
+                cache_k, cache_v = self._kivi_roundtrip(layer, cache_k, cache_v)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -1699,6 +1785,14 @@ class HybridLinearKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+
+    def kivi_roundtrip_on_indices(
+        self, layer: RadixAttention, kv_indices: torch.Tensor, kv_indices_len: int
+    ) -> None:
+        with self._transfer_id_context(layer):
+            self.full_kv_pool.kivi_roundtrip_on_indices(
+                layer, kv_indices, kv_indices_len
+            )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)

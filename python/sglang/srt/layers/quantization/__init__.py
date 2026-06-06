@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQMarlinConfig,
 )
 from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
+from sglang.srt.layers.quantization.kivi import KIVIConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -92,6 +93,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "quark": QuarkConfig,
     "quark_mxfp4": QuarkConfig,
     "auto-round": AutoRoundConfig,
+    "kivi": KIVIConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
 }

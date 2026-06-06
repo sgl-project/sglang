@@ -153,6 +153,7 @@ QUANTIZATION_CHOICES = [
     "mxfp4",  # MOE-only.
     "auto-round",
     "compressed-tensors",  # for Ktransformers
+    "kivi",
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
