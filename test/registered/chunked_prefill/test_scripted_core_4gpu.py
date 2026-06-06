@@ -42,10 +42,6 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
                         args=(num_chunks, num_conc_reqs),
                     )
 
-    def test_pp_flush_cache_during_inflight_chunk_results(self):
-        """flush_cache landing after the last chunk dispatch but before its batch result is processed must not corrupt the radix tree."""
-        self.server.execute_script(self._script_flush_during_inflight_chunk_results)
-
     @staticmethod
     def _script_pp_one_combo(t: ScriptedContext, num_chunks: int, num_conc_reqs: int):
         prompt_len = num_chunks * _CHUNK_SIZE - 3
@@ -59,6 +55,10 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
                 f"combo num_chunks={num_chunks}, num_conc_reqs={num_conc_reqs}: "
                 f"req {r.rid!r} did not finish"
             )
+
+    def test_pp_flush_cache_during_inflight_chunk_results(self):
+        """flush_cache landing after the last chunk dispatch but before its batch result is processed must not corrupt the radix tree."""
+        self.server.execute_script(self._script_flush_during_inflight_chunk_results)
 
     @staticmethod
     def _script_flush_during_inflight_chunk_results(t: ScriptedContext):
