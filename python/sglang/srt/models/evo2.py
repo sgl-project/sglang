@@ -19,7 +19,7 @@ Tokenizer:
 import json
 import logging
 import os
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +55,7 @@ _is_cuda = is_cuda()
 # Tokenizer: auto-generate Vortex-compatible CharLevelTokenizer files
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def generate_evo2_tokenizer_files(model_path: str, vocab_size: int = 512) -> None:
     """Generate tokenizer.json and tokenizer_config.json for Evo 2.
 
@@ -85,10 +86,24 @@ def generate_evo2_tokenizer_files(model_path: str, vocab_size: int = 512) -> Non
     tokenizer_json = {
         "version": "1.0",
         "added_tokens": [
-            {"id": 0, "content": "<eod>", "single_word": False, "lstrip": False,
-             "rstrip": False, "normalized": False, "special": True},
-            {"id": 1, "content": "<pad>", "single_word": False, "lstrip": False,
-             "rstrip": False, "normalized": False, "special": True},
+            {
+                "id": 0,
+                "content": "<eod>",
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            },
+            {
+                "id": 1,
+                "content": "<pad>",
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            },
         ],
         "pre_tokenizer": {
             "type": "ByteLevel",
@@ -157,9 +172,10 @@ def generate_evo2_tokenizer_files(model_path: str, vocab_size: int = 512) -> Non
 # Helper: interleave channels (Evo2 uses Hyena's channel mixing pattern)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _interleave(x: torch.Tensor) -> torch.Tensor:
     """Interleave first half with second half along last dim.
-    
+
     For input shape (B, L, 2D), returns (B, L, 2D) where channels are
     interleaved: [d0, d1, d2, ..., d_{D-1}, d_D, ..., d_{2D-1}]
     becomes    [d0, d_D, d1, d_{D+1}, ...]
@@ -167,16 +183,18 @@ def _interleave(x: torch.Tensor) -> torch.Tensor:
     D = x.shape[-1] // 2
     a, b = x[..., :D], x[..., D:]
     stacked = torch.stack([a, b], dim=-1)  # (..., D, 2)
-    return stacked.flatten(start_dim=-2)   # (..., 2D)
+    return stacked.flatten(start_dim=-2)  # (..., 2D)
 
 
-def _column_split(x: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _column_split(
+    x: torch.Tensor, num_heads: int, head_dim: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split into (x1, x2, v) using column-wise split pattern.
-    
+
     The input x of shape (B, L, 3*H*head_dim) is split into 3 chunks
     of (H*head_dim) each, reshaped to (B, L, H, head_dim), and split
     across the head dimension into x2, x1, v (one head_dim each).
-    
+
     Returns:
         (x2, x1, v): each of shape (B, L, hidden_size)
     """
@@ -190,9 +208,10 @@ def _column_split(x: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch
 # Evo2MLP – Gated MLP with optional Evo2-style (identity for layer > 0)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class Evo2MLP(nn.Module):
     """Gated MLP used in both Attention and Hyena blocks.
-    
+
     Evo2 uses GELU activation (not SiLU) and optionally uses identity
     activation for layers > 0 when evo2_style_activations=True.
     """
@@ -239,7 +258,7 @@ class Evo2MLP(nn.Module):
 
     def forward(self, x, forward_batch=None, use_reduce_scatter: bool = False):
         gate_up, _ = self.gate_up_proj(x)
-        
+
         # Split gate and up
         intermediate = gate_up.shape[-1] // 2
         gate = gate_up[..., :intermediate]
@@ -259,6 +278,7 @@ class Evo2MLP(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 # Evo2Attention – MHA with RoPE + KV cache
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class Evo2Attention(nn.Module):
     """Multi-head self-attention with RoPE for Evo2 attention layers."""
@@ -288,7 +308,7 @@ class Evo2Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -344,6 +364,7 @@ class Evo2Attention(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 # Evo2AttentionLayer – Full attention block (MHA + MLP with pre-norm residual)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class Evo2AttentionLayer(nn.Module):
     """Attention decoder layer: PreNorm → MHA → Residual → PostNorm → MLP → Residual."""
@@ -410,9 +431,10 @@ class Evo2AttentionLayer(nn.Module):
 # Evo2HyenaFilter – Short FIR + Long filter (IIR or FIR)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class Evo2HyenaFilter(nn.Module):
     """Hyena cascade filter: short depthwise FIR → interleave → long filter.
-    
+
     Handles all three Hyena variants:
     - HCL: IIR long filter with log_poles + residues (state_size poles)
     - HCM: FIR long filter with learned impulse response (128 tokens)
@@ -436,7 +458,11 @@ class Evo2HyenaFilter(nn.Module):
         self.state_size = config.state_size
         self.short_filter_length = config.short_filter_length
         self.fir_inner_filter_length = fir_inner_filter_length
-        self.hyena_filter_groups = hyena_filter_groups if hyena_filter_groups is not None else config.hidden_size
+        self.hyena_filter_groups = (
+            hyena_filter_groups
+            if hyena_filter_groups is not None
+            else config.hidden_size
+        )
         self.interleave = config.interleave
         self.column_split_hyena = config.column_split_hyena
 
@@ -465,10 +491,14 @@ class Evo2HyenaFilter(nn.Module):
         else:
             # IIR-based: HCL with log_poles + residues
             self.log_poles = nn.Parameter(
-                torch.randn(self.hyena_filter_groups, self.state_size, 1, dtype=torch.float32)
+                torch.randn(
+                    self.hyena_filter_groups, self.state_size, 1, dtype=torch.float32
+                )
             )
             self.residues = nn.Parameter(
-                torch.randn(self.hyena_filter_groups, self.state_size, dtype=torch.float32)
+                torch.randn(
+                    self.hyena_filter_groups, self.state_size, dtype=torch.float32
+                )
             )
             self.D = nn.Parameter(torch.zeros(self.hidden_size))
             self.h = None
@@ -484,18 +514,19 @@ class Evo2HyenaFilter(nn.Module):
     def _compute_iir_filter(self, L: int, device: torch.device) -> torch.Tensor:
         """Compute IIR impulse response h[t] = sum_k residues_k * exp(log_poles_k * t)."""
         self._update_time(L, device)
-        residues = self.residues.to(torch.float32)       # (G, S)
-        log_poles = self.log_poles.to(torch.float32)      # (G, S, 1)
-        t = self.t[:, :, :L]                              # (1, 1, L)
+        residues = self.residues.to(torch.float32)  # (G, S)
+        log_poles = self.log_poles.to(torch.float32)  # (G, S, 1)
+        t = self.t[:, :, :L]  # (1, 1, L)
         # h shape: (1, G, L) then squeeze to (G, L)
         h = (residues[..., None] * (log_poles * t).exp()).sum(dim=1)  # (G, L)
         return h.unsqueeze(1)  # (G, 1, L)
 
     def _apply_short_filter(
-        self, u: torch.Tensor,
+        self,
+        u: torch.Tensor,
     ) -> torch.Tensor:
         """Apply short depthwise FIR filter.
-        
+
         Args:
             u: (B, L, 3*hidden_size)
         Returns:
@@ -507,7 +538,7 @@ class Evo2HyenaFilter(nn.Module):
             squeeze_back = True
         else:
             squeeze_back = False
-            
+
         u_t = u.transpose(1, 2)  # (B, 3*hidden_size, L)
         # Pad for causal conv
         pad = self.short_filter_length - 1
@@ -524,10 +555,11 @@ class Evo2HyenaFilter(nn.Module):
         return u_filt
 
     def _apply_long_filter(
-        self, z: torch.Tensor,
+        self,
+        z: torch.Tensor,
     ) -> torch.Tensor:
         """Apply the long (IIR or FIR) filter.
-        
+
         Args:
             z: (B, L, 3*hidden_size) – already short-filtered
         Returns:
@@ -539,7 +571,7 @@ class Evo2HyenaFilter(nn.Module):
             squeeze_back = True
         else:
             squeeze_back = False
-            
+
         B, L, _ = z.shape
 
         # Split into x1, x2, v based on column_split mode
@@ -584,15 +616,17 @@ class Evo2HyenaFilter(nn.Module):
             # Apply IIR filter via FFT convolution
             # y = x1 * (v * h) + D * (x1 * v), then gate with x2
             gate = x1 * v  # (B, L, D)
-            
+
             # FFT convolution: treat as (B, D, L)
             gate_t = gate.transpose(1, 2).float()  # (B, D, L)
             fft_len = 2 * L
             k_f = torch.fft.rfft(h.float(), n=fft_len) / fft_len  # (D, F)
             u_f = torch.fft.rfft(gate_t, n=fft_len)  # (B, D, F)
-            y = torch.fft.irfft(u_f * k_f, n=fft_len, norm='forward')[..., :L]  # (B, D, L)
+            y = torch.fft.irfft(u_f * k_f, n=fft_len, norm="forward")[
+                ..., :L
+            ]  # (B, D, L)
             y = y.transpose(1, 2).to(z.dtype)  # (B, L, D)
-            
+
             if self.D is not None:
                 y = y + self.D[None, None, :] * gate
             y = y * x2
@@ -603,7 +637,7 @@ class Evo2HyenaFilter(nn.Module):
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
         """Forward pass for prefill (batch processing).
-        
+
         Args:
             u: (B, L, 3*hidden_size) – output of input projection
         Returns:
@@ -615,7 +649,7 @@ class Evo2HyenaFilter(nn.Module):
             squeeze_back = True
         else:
             squeeze_back = False
-            
+
         L = u.shape[1]
 
         # 1. Short FIR filter
@@ -637,9 +671,10 @@ class Evo2HyenaFilter(nn.Module):
 # Evo2HyenaConvLayer – Full Hyena convolution block
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class Evo2HyenaConvLayer(nn.Module):
     """Hyena convolution decoder layer.
-    
+
     Flow: PreNorm → InputProj(→3×hidden) → HyenaFilter → OutProj + Residual
           → PostNorm → MLP + Residual
     """
@@ -658,7 +693,11 @@ class Evo2HyenaConvLayer(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.fir_inner_filter_length = fir_inner_filter_length
-        self.hyena_filter_groups = hyena_filter_groups if hyena_filter_groups is not None else config.hidden_size
+        self.hyena_filter_groups = (
+            hyena_filter_groups
+            if hyena_filter_groups is not None
+            else config.hidden_size
+        )
 
         self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -733,6 +772,7 @@ class Evo2HyenaConvLayer(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 # Evo2Model – The full StripedHyena 2 model
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class Evo2Model(nn.Module):
     """Evo2 (StripedHyena 2) model with interleaved attention and Hyena layers."""
@@ -837,6 +877,7 @@ class Evo2Model(nn.Module):
 # Evo2ForCausalLM – Model with LM head and weight loading
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class Evo2ForCausalLM(nn.Module):
     """Evo2 model with causal LM head, compatible with Vortex checkpoints.
 
@@ -865,9 +906,7 @@ class Evo2ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size
-            )
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -925,7 +964,6 @@ class Evo2ForCausalLM(nn.Module):
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in sglang_name:
                     continue
-                # Replace shard name with stacked param name
                 stacked_name = sglang_name.replace(shard_name, param_name)
                 if stacked_name not in params_dict:
                     continue

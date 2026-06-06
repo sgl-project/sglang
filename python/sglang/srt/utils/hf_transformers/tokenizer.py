@@ -70,6 +70,7 @@ def _ensure_evo2_tokenizer_files(tokenizer_name: str) -> None:
         if cfg.get("tokenizer_type") == "CharLevelTokenizer":
             vocab_size = cfg.get("vocab_size", 512)
             from sglang.srt.models.evo2 import generate_evo2_tokenizer_files
+
             generate_evo2_tokenizer_files(model_dir, vocab_size)
     except Exception:
         pass  # Don't block model loading for tokenizer generation failures
