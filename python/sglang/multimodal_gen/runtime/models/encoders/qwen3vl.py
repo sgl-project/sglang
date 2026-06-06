@@ -162,9 +162,7 @@ class Qwen3VLTextAttention(nn.Module):
             assert self.total_num_key_value_heads % self.tp_size == 0
         self.num_heads = self.total_num_heads // self.tp_size
         self.num_key_value_heads = self.total_num_key_value_heads // self.tp_size
-        self.num_key_value_groups = (
-            self.num_heads // self.num_key_value_heads
-        )
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
@@ -330,7 +328,9 @@ class Qwen3VLTextMLP(nn.Module):
 
     def forward(self, x):
         hidden_states = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-        hidden_states = _gather_tensor_parallel_activation(hidden_states, self.gate_proj)
+        hidden_states = _gather_tensor_parallel_activation(
+            hidden_states, self.gate_proj
+        )
         down_proj = self.down_proj(hidden_states)
         return down_proj
 

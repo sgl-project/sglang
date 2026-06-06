@@ -187,9 +187,11 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
                 ),
                 "bnb_output_shard_start": getattr(layer, "tp_rank", 0)
                 * output_size_per_partition,
-                "bnb_input_shard_start": 0
-                if input_size_per_partition == input_size
-                else getattr(layer, "tp_rank", 0) * input_size_per_partition,
+                "bnb_input_shard_start": (
+                    0
+                    if input_size_per_partition == input_size
+                    else getattr(layer, "tp_rank", 0) * input_size_per_partition
+                ),
             },
         )
         layer.register_parameter("weight", qweight)
@@ -398,9 +400,7 @@ def _maybe_shard_bitsandbytes_4bit_quant_state(
     param: torch.nn.Parameter,
     quant_state: Any,
 ) -> Any:
-    full_shape = tuple(
-        getattr(param, "bnb_full_shape", tuple(quant_state.shape or ()))
-    )
+    full_shape = tuple(getattr(param, "bnb_full_shape", tuple(quant_state.shape or ())))
     local_shape = tuple(getattr(param, "bnb_local_shape", full_shape))
     if not full_shape or local_shape == full_shape:
         return quant_state

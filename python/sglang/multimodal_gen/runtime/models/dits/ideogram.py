@@ -8,13 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
-from sglang.multimodal_gen.runtime.layers.attention import (
-    USPAttention,
-    build_varlen_mask_meta,
-)
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.layers.attention import (
+    USPAttention,
+    build_varlen_mask_meta,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,

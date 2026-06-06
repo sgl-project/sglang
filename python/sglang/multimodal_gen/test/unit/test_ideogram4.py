@@ -1016,9 +1016,7 @@ class TestIdeogram4(unittest.TestCase):
         layer = encoder.language_model.layers[0]
         self.assertEqual(layer.self_attn.num_heads, 2)
         self.assertEqual(layer.self_attn.num_key_value_heads, 2)
-        self.assertIsInstance(
-            layer.self_attn.q_proj, WeightOnlyFP8ColumnParallelLinear
-        )
+        self.assertIsInstance(layer.self_attn.q_proj, WeightOnlyFP8ColumnParallelLinear)
         self.assertFalse(layer.self_attn.q_proj.gather_output)
         self.assertTrue(layer.self_attn.o_proj.gather_output)
         self.assertIsInstance(layer.mlp.gate_proj, WeightOnlyFP8ColumnParallelLinear)
