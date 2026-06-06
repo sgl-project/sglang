@@ -184,10 +184,8 @@ def format_fit_window(model: dict) -> str:
     """Render the model's fit window as `[start, end)` for the step summary.
 
     Surfacing the whole span keeps the lower-bound date from reading as a
-    staleness marker (it trails today by fit_window_days). Falls back to the
-    legacy `data_as_of` key for pre-rename sglang-ci-stats snapshots (drop
-    once the `fit_window_start` rename is deployed)."""
-    start = model.get("fit_window_start") or model.get("data_as_of")
+    staleness marker (it trails today by fit_window_days)."""
+    start = model.get("fit_window_start")
     days = model.get("fit_window_days")
     if not start or not isinstance(days, int):
         return f"fit_window_start={start}"
