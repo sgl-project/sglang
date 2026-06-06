@@ -16,10 +16,10 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     set_mamba_track_indices_from_reqs,
 )
-from sglang.srt.managers.utils import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    get_alloc_reserve_per_decode,
     get_last_loc,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
