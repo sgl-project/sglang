@@ -1145,6 +1145,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 activation_type=activation,
             )[0]
 
+            if (
+                not layer.should_fuse_routed_scaling_factor_in_topk
+                and self.moe_runner_config.routed_scaling_factor is not None
+            ):
+                output.mul_(self.moe_runner_config.routed_scaling_factor)
+
             return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(
