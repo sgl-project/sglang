@@ -19,6 +19,12 @@
             "psnr_threshold": 28.0,
             "mean_abs_diff_threshold": 8.0
         },
+        "ideogram4_fp8_t2i": {
+            "clip_threshold": 0.97,
+            "ssim_threshold": 0.78,
+            "psnr_threshold": 18.0,
+            "mean_abs_diff_threshold": 18.0
+        },
         "flux_2_klein_image_t2i": {
             "clip_threshold": 0.94,
             "ssim_threshold": 0.78,
