@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar, List, Optional
 
@@ -43,78 +42,8 @@ KV_CANARY_ARGS: List[str] = [
 ]
 
 
-@dataclass
-class ChunkedSimpleTester:
-    feature_args: List[str]
-    use_kv_canary: bool
-    chunked_prefill_size: int
-    num_shots: int
-    num_examples: int
-    num_threads: int
-    max_tokens: int
-    gsm8k_threshold: float
-    seed: int
-
-    def build_prefill_side_args(self) -> List[str]:
-        canary = list(KV_CANARY_ARGS) if self.use_kv_canary else []
-        return (
-            ["--chunked-prefill-size", str(self.chunked_prefill_size)]
-            + list(self.feature_args)
-            + canary
-        )
-
-    def build_decode_side_args(self) -> List[str]:
-        return list(KV_CANARY_ARGS) if self.use_kv_canary else []
-
-    def run_eval(self, base_url: str, model: str, fixture_name: str) -> dict:
-        args = SimpleNamespace(
-            base_url=base_url,
-            model=model,
-            eval_name="mixed_prefix_gsm8k",
-            api="chat_completion",
-            max_tokens=self.max_tokens,
-            num_examples=self.num_examples,
-            num_threads=self.num_threads,
-            num_shots=self.num_shots,
-            mixed_prefix_gsm8k_secondary_pool_size=15,
-            mixed_prefix_gsm8k_seed=self.seed,
-            gsm8k_data_path=None,
-            temperature=0.0,
-        )
-        tic = time.perf_counter()
-        metrics = run_eval(args)
-        metrics["elapsed_sec"] = time.perf_counter() - tic
-        print(f"[{fixture_name}] {metrics}")
-        return metrics
-
-    def assert_score(self, testcase, metrics: dict, fixture_name: str) -> None:
-        score = metrics.get("score")
-        testcase.assertIsNotNone(score, "run_eval returned no score")
-        passed = score >= self.gsm8k_threshold
-        status = "PASS" if passed else "FAIL"
-        print(
-            f"[{fixture_name}] gsm8k score={score:.4f} "
-            f"threshold={self.gsm8k_threshold:.4f} -> {status}"
-        )
-        testcase.assertGreaterEqual(score, self.gsm8k_threshold)
-
-
-def _build_simple_tester(cls) -> ChunkedSimpleTester:
-    return ChunkedSimpleTester(
-        feature_args=cls.feature_args,
-        use_kv_canary=cls.use_kv_canary,
-        chunked_prefill_size=cls.chunked_prefill_size,
-        num_shots=cls.num_shots,
-        num_examples=cls.num_examples,
-        num_threads=cls.num_threads,
-        max_tokens=cls.max_tokens,
-        gsm8k_threshold=cls.gsm8k_threshold,
-        seed=cls.seed,
-    )
-
-
-class ChunkedTestBase(CustomTestCase):
-    # base class: not collectible as a test on its own
+class ChunkedGsm8kMixin:
+    # mixin: not collectible as a test on its own
     __test__ = False
     # canary is unsupported on some engine paths (ChunkCache, hisparse, some
     # pools); such classes opt out, mirroring the scripted TestRadixDisabled.
@@ -128,22 +57,58 @@ class ChunkedTestBase(CustomTestCase):
     num_threads: ClassVar[int] = DEFAULT_NUM_THREADS
     max_tokens: ClassVar[int] = DEFAULT_MAX_TOKENS
     gsm8k_threshold: ClassVar[float]
-    seed: ClassVar[int] = DEFAULT_SEED
+
+    def build_prefill_side_args(self) -> List[str]:
+        canary = list(KV_CANARY_ARGS) if self.use_kv_canary else []
+        return (
+            ["--chunked-prefill-size", str(self.chunked_prefill_size)]
+            + list(self.feature_args)
+            + canary
+        )
+
+    def test_mixed_prefix_gsm8k_chunked(self):
+        fixture_name = type(self).__name__
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mixed_prefix_gsm8k",
+            api="chat_completion",
+            max_tokens=self.max_tokens,
+            num_examples=self.num_examples,
+            num_threads=self.num_threads,
+            num_shots=self.num_shots,
+            mixed_prefix_gsm8k_secondary_pool_size=15,
+            mixed_prefix_gsm8k_seed=DEFAULT_SEED,
+            gsm8k_data_path=None,
+            temperature=0.0,
+        )
+        tic = time.perf_counter()
+        metrics = run_eval(args)
+        metrics["elapsed_sec"] = time.perf_counter() - tic
+        print(f"[{fixture_name}] {metrics} threshold={self.gsm8k_threshold:.4f}")
+
+        score = metrics.get("score")
+        self.assertIsNotNone(score, "run_eval returned no score")
+        self.assertGreaterEqual(score, self.gsm8k_threshold)
+
+
+class ChunkedTestBase(ChunkedGsm8kMixin, CustomTestCase):
+    # base class: not collectible as a test on its own
+    __test__ = False
 
     base_url: ClassVar[str] = DEFAULT_URL_FOR_TEST
     launch_timeout: ClassVar[int] = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
     process: ClassVar[Optional[object]] = None
-    _simple_tester: ClassVar[Optional[ChunkedSimpleTester]] = None
 
     @classmethod
     def setUpClass(cls):
-        cls._simple_tester = _build_simple_tester(cls)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=cls.launch_timeout,
-            other_args=cls._simple_tester.build_prefill_side_args(),
+            other_args=cls("test_mixed_prefix_gsm8k_chunked").build_prefill_side_args(),
         )
 
     @classmethod
@@ -151,39 +116,21 @@ class ChunkedTestBase(CustomTestCase):
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
-    def test_mixed_prefix_gsm8k_chunked(self):
-        fixture_name = type(self).__name__
-        metrics = self._simple_tester.run_eval(self.base_url, self.model, fixture_name)
-        self._simple_tester.assert_score(self, metrics, fixture_name)
 
-
-class ChunkedTestPDBase(PDDisaggregationServerBase):
+class ChunkedTestPDBase(ChunkedGsm8kMixin, PDDisaggregationServerBase):
     # base class: not collectible as a test on its own
     __test__ = False
-    use_kv_canary: ClassVar[bool] = True
-    model: ClassVar[str] = DEFAULT_MODEL
-    feature_args: ClassVar[List[str]] = []
     # Extra args for the decode server only (e.g. matching its TP to the prefill
     # side so the transferred KV layout lines up).
     decode_feature_args: ClassVar[List[str]] = []
 
-    chunked_prefill_size: ClassVar[int] = DEFAULT_CHUNKED_PREFILL_SIZE
-    num_shots: ClassVar[int] = DEFAULT_NUM_SHOTS
-    num_examples: ClassVar[int] = DEFAULT_NUM_EXAMPLES
-    num_threads: ClassVar[int] = DEFAULT_NUM_THREADS
-    max_tokens: ClassVar[int] = DEFAULT_MAX_TOKENS
-    gsm8k_threshold: ClassVar[float]
-    seed: ClassVar[int] = DEFAULT_SEED
-
-    _simple_tester: ClassVar[Optional[ChunkedSimpleTester]] = None
-
     @classmethod
     def setUpClass(cls):
-        cls._simple_tester = _build_simple_tester(cls)
-        cls.extra_prefill_args = cls._simple_tester.build_prefill_side_args()
-        cls.extra_decode_args = cls._simple_tester.build_decode_side_args() + list(
-            cls.decode_feature_args
-        )
+        cls.extra_prefill_args = cls(
+            "test_mixed_prefix_gsm8k_chunked"
+        ).build_prefill_side_args()
+        canary = list(KV_CANARY_ARGS) if cls.use_kv_canary else []
+        cls.extra_decode_args = canary + list(cls.decode_feature_args)
         PDDisaggregationServerBase.setUpClass()
         cls.model = try_cached_model(cls.model)
         cls.launch_all()
@@ -191,8 +138,3 @@ class ChunkedTestPDBase(PDDisaggregationServerBase):
     @classmethod
     def tearDownClass(cls):
         PDDisaggregationServerBase.tearDownClass()
-
-    def test_mixed_prefix_gsm8k_chunked(self):
-        fixture_name = type(self).__name__
-        metrics = self._simple_tester.run_eval(self.base_url, self.model, fixture_name)
-        self._simple_tester.assert_score(self, metrics, fixture_name)
