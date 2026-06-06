@@ -87,12 +87,7 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
-        if get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
+        if get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0"):
             # MoE fixed reduce-scatter needs graph capture/replay to use equal
             # per-rank token chunks. This now goes through the same
             # LayerCommunicator postprocess path as DeepSeek-V2.

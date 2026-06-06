@@ -95,8 +95,7 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 def should_use_dsv4_dp_moe_reduce_scatterv() -> bool:
     return (
-        get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower()
-        in ("1", "true", "yes", "on")
+        get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0")
         and is_dp_attention_enabled()
         and get_attention_dp_size() > 1
         and get_moe_a2a_backend().is_none()

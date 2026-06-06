@@ -1103,8 +1103,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch, global_num_tokens
         )
         if (
-            get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower()
-            in ("1", "true", "yes", "on")
+            get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0")
             and not self.is_extend_in_batch
             and not self.forward_mode.is_target_verify()
             and not self.forward_mode.is_draft_extend(include_v2=True)
