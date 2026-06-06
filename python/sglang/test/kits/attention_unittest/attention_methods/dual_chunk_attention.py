@@ -1041,8 +1041,7 @@ def _dual_chunk_sparse_selection_reference(
             slash_topk = slash_topk_buffer[head_i, : current_slash_size[head_i]]
 
             intra_vertical_indices = (
-                vertical_topk[vertical_topk >= prev_chunk_end_pos]
-                - prev_chunk_end_pos
+                vertical_topk[vertical_topk >= prev_chunk_end_pos] - prev_chunk_end_pos
             )
             if intra_vertical_indices.nelement() == 0:
                 intra_vertical_indices = _dual_chunk_sparse_fallback_indices_reference(
@@ -1078,12 +1077,10 @@ def _dual_chunk_sparse_selection_reference(
                     & (slash_topk < (prev_chunk_end_pos + chunk_q_len))
                 ]
                 if succ_slash_indices.nelement() == 0:
-                    succ_slash_indices = (
-                        _dual_chunk_sparse_fallback_indices_reference(
-                            stage_kv_lens["succ"],
-                            current_slash_size[head_i],
-                            q.device,
-                        )
+                    succ_slash_indices = _dual_chunk_sparse_fallback_indices_reference(
+                        stage_kv_lens["succ"],
+                        current_slash_size[head_i],
+                        q.device,
                     )
                 stage_vertical_indices["succ"].append(succ_vertical_indices)
                 stage_slash_indices["succ"].append(succ_slash_indices)
@@ -1106,12 +1103,10 @@ def _dual_chunk_sparse_selection_reference(
                     slash_topk < (prev_chunk_end_pos - chunk_len + chunk_q_len)
                 ]
                 if inter_slash_indices.nelement() == 0:
-                    inter_slash_indices = (
-                        _dual_chunk_sparse_fallback_indices_reference(
-                            stage_kv_lens["inter"],
-                            current_slash_size[head_i],
-                            q.device,
-                        )
+                    inter_slash_indices = _dual_chunk_sparse_fallback_indices_reference(
+                        stage_kv_lens["inter"],
+                        current_slash_size[head_i],
+                        q.device,
                     )
                 stage_vertical_indices["inter"].append(inter_vertical_indices)
                 stage_slash_indices["inter"].append(inter_slash_indices)
