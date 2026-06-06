@@ -10,7 +10,10 @@ from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_p
 ROW_LINEAR_INV_BLOCK_K = 128
 
 
-def _get_global_server_args() -> Any:
+def _get_global_server_args(server_args: Optional[Any] = None) -> Any:
+    if server_args is not None:
+        return server_args
+
     from sglang.srt.server_args import get_global_server_args
 
     return get_global_server_args()
@@ -20,8 +23,8 @@ def get_rl_on_policy_target() -> Optional[str]:
     return getattr(_get_global_server_args(), "rl_on_policy_target", None)
 
 
-def is_true_on_policy_enabled() -> bool:
-    return resolve_true_on_policy_runtime_policy(_get_global_server_args()).enabled
+def is_true_on_policy_enabled(server_args: Optional[Any] = None) -> bool:
+    return resolve_true_on_policy_runtime_policy(_get_global_server_args(server_args)).enabled
 
 
 def is_tp_invariant_target() -> bool:
