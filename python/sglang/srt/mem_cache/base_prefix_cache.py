@@ -168,7 +168,7 @@ class MatchResult(NamedTuple):
                             that don't run multi-component validation, set this
                             equal to `last_host_node`.
         host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
-                            loaded back to device. Pure-KV cache semantics; 
+                            loaded back to device. Pure-KV cache semantics;
         swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
                             window) and will be load-back into the SWA device pool.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
