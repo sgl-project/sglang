@@ -246,9 +246,14 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if page_size == 1 or spec_topk == 1:
         return max(spec_steps * spec_topk, spec_tokens)
     else:
-        raise NotImplementedError(
-            "get_alloc_len_per_decode not implemented for page_size > 1 and spec_topk > 1"
-        )
+        # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree
+        # footprint. Per topk branch needs ceil((last_page_len + num_steps) / page)
+        # pages; the partial tail page can be up to page_size - 1, and each branch
+        # gets its own (duplicated) copy -- so reserve for all topk branches.
+        num_new_pages_per_topk = (
+            (page_size - 1) + spec_steps + page_size - 1
+        ) // page_size
+        return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
 
 
 @dataclass

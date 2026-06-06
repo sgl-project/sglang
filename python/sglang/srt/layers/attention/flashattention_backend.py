@@ -398,6 +398,20 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table = self.req_to_token_pool.req_to_token[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
+                elif self.speculative_num_steps == 0:
+                    # Draft-extend's idle batch (padded for DP MLP-sync) has no
+                    # tree; build plain metadata (padded output is discarded).
+                    metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.cu_seqlens_q = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device=device
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                    metadata.page_table = self.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
@@ -679,10 +693,11 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
         if self.use_sliding_window_kv_pool:
+            # FA3 requires an int32 page_table.
             metadata.swa_page_table = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     metadata.page_table
-                )
+                ).to(torch.int32)
             )
 
         # Convert the page table to a strided format which is needed by FA3 API
@@ -872,7 +887,7 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                         metadata.page_table
-                    )
+                    ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1351,7 +1366,7 @@ class FlashAttentionBackend(AttentionBackend):
                         page_table = (
                             self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 metadata.page_table
-                            )
+                            ).to(torch.int32)
                         )
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
@@ -2087,6 +2102,20 @@ class FlashAttentionBackend(AttentionBackend):
                     # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
                     cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
                     if self.page_size > 1:
+                        # Only the draft tokens produced up to this step are live;
+                        # cache_loc arrives num_steps-wide. Slice so the scatter fills at
+                        # most decode_length of the (decode_length + 1) expand page_table
+                        # columns -- without this the extra distinct pages overflow the row.
+                        cache_loc = cache_loc[:, :decode_length]
+                        assert (
+                            cache_loc.shape[1] <= metadata_expand.page_table.shape[1]
+                        ), (
+                            f"draft expand page_table too narrow: cache_loc width "
+                            f"{cache_loc.shape[1]} > "
+                            f"{metadata_expand.page_table.shape[1]} columns "
+                            f"(decode_length + 1); page_size={self.page_size}, "
+                            f"topk={self.topk}, num_steps={self.speculative_num_steps}"
+                        )
                         draft_decode_set_expand_metadata(
                             cache_seqlens_int32=metadata_expand.cache_seqlens_int32,
                             page_table=metadata_expand.page_table,
@@ -2410,7 +2439,7 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 metadata.page_table
-            )
+            ).to(torch.int32)
         else:
             page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
@@ -2537,7 +2566,7 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             sliced_page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 metadata.page_table[:bs, :max_seq_len]
-            )
+            ).to(torch.int32)
         else:
             sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
@@ -2614,10 +2643,10 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 page_table_a
-            )
+            ).to(torch.int32)
             page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 page_table_b
-            )
+            ).to(torch.int32)
 
         prepare_swa_spec_page_table_triton(
             page_table,
@@ -2716,6 +2745,8 @@ def draft_decode_set_expand_metadata(
     cache_loc = (cache_loc // page_size).to(torch.int32)
     if cache_loc.dim() == 1:
         cache_loc = cache_loc.unsqueeze(0)
+    # cache_loc is pre-sliced to decode_length by the caller, so the scatter fills at
+    # most decode_length of the (decode_length + 1) page_table columns.
     # Vectorized torch.unique_consecutive: track value change points then scatter
     mask = torch.ones_like(cache_loc, dtype=torch.bool)
     mask[:, 1:] = cache_loc[:, 1:] != cache_loc[:, :-1]

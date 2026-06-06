@@ -196,7 +196,14 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
-    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
+    # Controls weight-file ordering for load-time I/O optimization.
+    #   -1 : no sorting, no staggering; preserves original file order.
+    #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
+    #   k>0: sort files and stagger per-rank order with factor k.
+    #        Files are processed in groups of (tp_size * k), and rank r starts each
+    #        group at offset (r * k), improving multi-rank I/O concurrency while
+    #        keeping access relatively ordered.
+    SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
@@ -214,7 +221,9 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
-    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
+    # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
+    # else /tmp); see debug_utils/cuda_coredump.py.
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -256,6 +265,10 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
+    # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
+    SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
+    # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
+    SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
@@ -326,6 +339,11 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
 
+    SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
+    SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
+
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
@@ -382,6 +400,7 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_AG = EnvBool(True)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
@@ -409,6 +428,9 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
+    # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
+    SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -434,6 +456,9 @@ class Envs:
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Enable per-token NVFP4 activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
+    FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
+    FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
@@ -471,6 +496,7 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # DeepSeek MHA Optimization
@@ -618,6 +644,11 @@ class Envs:
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
 
+    # Crash diagnostics
+    SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
+    SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
+    SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
+
     # Encoder gRPC
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
     # Encoder receiver selection: http|grpc (used by EPD paths).
@@ -687,9 +718,9 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 
     # SWA radix cache
-    SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
@@ -735,6 +766,13 @@ class Envs:
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
+    # Replicate the input embedding across TP ranks instead of sharding it
+    # along the vocab dimension (saves an all-reduce/all-gather in the embed
+    # lookup at the cost of replicated embedding weights). Drives both the
+    # target and every draft that shares its embedding (see
+    # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
+    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
+    SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
@@ -755,6 +793,7 @@ class Envs:
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
