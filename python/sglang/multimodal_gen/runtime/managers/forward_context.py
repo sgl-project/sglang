@@ -53,11 +53,24 @@ _forward_context: Optional["ForwardContext"] = None
 
 
 def get_forward_context() -> "ForwardContext":
-    """Get the current forward context."""
+    """Get the current forward context.
+
+    Raises ``AssertionError`` if called outside of a ``set_forward_context`` block.
+    """
     assert _forward_context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
     )
+    return _forward_context
+
+
+def get_forward_context_or_none() -> "Optional[ForwardContext]":
+    """Return the active forward context, or ``None`` if no context is set.
+
+    Prefer this over ``get_forward_context()`` whenever an absent context is a
+    valid, expected situation (e.g. during initialisation or test code that
+    runs outside of the denoising loop).
+    """
     return _forward_context
 
 

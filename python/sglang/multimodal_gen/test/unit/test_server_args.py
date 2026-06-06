@@ -1672,6 +1672,8 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             "true",
             "--dit-config.use-triton-kernels",
             "true",
+            "--dit-config.allow-triton-fallback",
+            "true",
         ]
 
         with patch.object(sys, "argv", ["sglang"] + argv):
@@ -1682,6 +1684,7 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
         self.assertTrue(arch.use_chunked_softmax_attention)
         self.assertTrue(arch.pad_attention_head_dim_to_flash)
         self.assertTrue(arch.use_triton_kernels)
+        self.assertTrue(arch.allow_triton_fallback)
 
     def test_resolution_flag_overrides_qwen_image_layered_pipeline_config(self):
         parser = FlexibleArgumentParser()

@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import sys
 import tempfile
@@ -37,9 +38,13 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     SanaWMTransformer3DModel,
     T2IFinalLayer,
     TimestepEmbedder,
+    _build_ucpe_apply_fns,
     _make_sana_wm_local_attention,
+    _record_sana_wm_triton_import_error,
     _sana_wm_chunk_index_from_chunk_size,
     _sana_wm_chunked_attention,
+    _sana_wm_triton_import_error,
+    _invert_SE3,
     _sana_wm_normalize_chunk_index,
     _sana_wm_padded_attention_head_size,
     _sana_wm_sequence_shard_enabled,
@@ -59,6 +64,7 @@ from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     VanillaD2HStrategy,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -66,8 +72,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
+    SanaWMDecodingStage,
     SanaWMDenoisingStage,
     SanaWMTextEncodingStage,
     _align_sana_wm_cfg_text_conditions,
@@ -76,10 +86,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     configure_sana_wm_ltx2_vae_for_long_video,
 )
 from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
+    SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV,
     coerce_sana_wm_intrinsics_vec4,
+    default_sana_wm_intrinsics_vec4,
     latent_frame_sana_wm_camera_conditions,
     parse_sana_wm_action_string,
     sana_wm_action_to_camera_to_world,
+    scale_sana_wm_intrinsics_to_latent,
 )
 from sglang.multimodal_gen.runtime.utils.sana_wm_runtime_cache import (
     SANA_WM_REQUEST_RUNTIME_CACHE_KEY,
@@ -164,8 +177,10 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sana_wm_two_stage_residency"):
             SanaWMPipelineConfig(sana_wm_two_stage_residency="bad-residency")
 
-    def test_adjust_num_frames_rounds_to_temporal_stride(self) -> None:
+    def test_adjust_num_frames_snaps_to_nearest_temporal_stride(self) -> None:
         self.assertEqual(self.config.adjust_num_frames(50), 49)
+        self.assertEqual(self.config.adjust_num_frames(53), 57)
+        self.assertEqual(self.config.adjust_num_frames(55), 57)
         self.assertEqual(self.config.adjust_num_frames(49), 49)
 
     def test_prepare_latent_shape_returns_5d(self) -> None:
@@ -251,16 +266,22 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
             use_chunked_softmax_attention=True,
             pad_attention_head_dim_to_flash=True,
             use_triton_kernels=True,
+            allow_triton_fallback=True,
         )
 
         self.assertTrue(dit_config.arch_config.use_chunked_softmax_attention)
         self.assertTrue(dit_config.arch_config.pad_attention_head_dim_to_flash)
         self.assertTrue(dit_config.arch_config.use_triton_kernels)
+        self.assertTrue(dit_config.arch_config.allow_triton_fallback)
 
     def test_dit_triton_kernels_default_enabled(self) -> None:
         self.assertTrue(SanaWMConfig().arch_config.use_triton_kernels)
+        self.assertFalse(SanaWMConfig().arch_config.allow_triton_fallback)
         self.assertFalse(
             SanaWMConfig(use_triton_kernels=False).arch_config.use_triton_kernels
+        )
+        self.assertTrue(
+            SanaWMConfig(allow_triton_fallback=True).arch_config.allow_triton_fallback
         )
 
     def test_pipeline_config_dict_can_enable_dit_attention_flags(self) -> None:
@@ -270,6 +291,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
                     "use_chunked_softmax_attention": True,
                     "pad_attention_head_dim_to_flash": True,
                     "use_triton_kernels": True,
+                    "allow_triton_fallback": True,
                 }
             }
         )
@@ -278,6 +300,61 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertTrue(arch.use_chunked_softmax_attention)
         self.assertTrue(arch.pad_attention_head_dim_to_flash)
         self.assertTrue(arch.use_triton_kernels)
+        self.assertTrue(arch.allow_triton_fallback)
+
+    def test_sana_wm_triton_fallback_defaults_to_fail_fast(self) -> None:
+        attn = BidirectionalGDNUCPESinglePathLiteLA(
+            in_dim=16,
+            heads=4,
+            head_dim=4,
+            conv_kernel_size=0,
+            softmax_main=False,
+            use_triton_kernels=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "refuses to silently fall back"):
+            attn._handle_triton_fallback(
+                kernel_name="Triton test kernel",
+                reason="is unavailable",
+                warning_attr="_triton_main_gdn_warning_logged",
+            )
+
+    def test_sana_wm_triton_fallback_can_be_explicitly_allowed(self) -> None:
+        attn = BidirectionalGDNUCPESinglePathLiteLA(
+            in_dim=16,
+            heads=4,
+            head_dim=4,
+            conv_kernel_size=0,
+            softmax_main=False,
+            use_triton_kernels=True,
+            allow_triton_fallback=True,
+        )
+
+        attn._handle_triton_fallback(
+            kernel_name="Triton test kernel",
+            reason="failed",
+            warning_attr="_triton_main_gdn_warning_logged",
+            error=RuntimeError("boom"),
+            disable_fast_path=True,
+        )
+
+        self.assertFalse(attn.use_triton_kernels)
+        self.assertTrue(attn._triton_main_gdn_warning_logged)
+
+    def test_sana_wm_triton_import_errors_are_keyed_by_kernel_family(self) -> None:
+        qkv_error = RuntimeError("qkv missing")
+        scan_error = RuntimeError("scan missing")
+
+        with patch(
+            "sglang.multimodal_gen.runtime.models.dits.sana_wm."
+            "_SANA_WM_TRITON_KERNELS_IMPORT_ERRORS",
+            {},
+        ):
+            _record_sana_wm_triton_import_error("qkv_preprocess", qkv_error)
+            _record_sana_wm_triton_import_error("cam_scan", scan_error)
+
+            self.assertIs(_sana_wm_triton_import_error("qkv_preprocess"), qkv_error)
+            self.assertIs(_sana_wm_triton_import_error("cam_scan"), scan_error)
 
     def test_dit_arch_text_norm_defaults_match_upstream(self) -> None:
         arch = SanaWMConfig().arch_config
@@ -587,6 +664,85 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         )
 
 
+class TestSanaWMTritonIdentityCache(unittest.TestCase):
+    @staticmethod
+    def _load_kernel_module():
+        try:
+            from sglang.jit_kernel.diffusion.sana_wm import fused_gdn_chunkwise
+        except ModuleNotFoundError as exc:
+            if exc.name == "triton":
+                raise unittest.SkipTest("triton is not installed") from exc
+            raise
+        return fused_gdn_chunkwise
+
+    def test_cam_identity_cache_evicts_lru_entry(self) -> None:
+        module = self._load_kernel_module()
+        env = {
+            module._CAM_IDENTITY_CACHE_MAX_ENTRIES_ENV: "2",
+            module._CAM_IDENTITY_CACHE_MAX_BYTES_ENV: "-1",
+        }
+        device = torch.device("cpu")
+
+        with patch.dict(os.environ, env):
+            module._clear_cam_identity_cache()
+            try:
+                first = module._cam_identity_tables(B=1, N=2, H=1, D=2, device=device)
+                module._cam_identity_tables(B=1, N=3, H=1, D=2, device=device)
+                self.assertIs(
+                    module._cam_identity_tables(B=1, N=2, H=1, D=2, device=device),
+                    first,
+                )
+                module._cam_identity_tables(B=1, N=4, H=1, D=2, device=device)
+
+                keys = list(module._CAM_IDENTITY_CACHE.keys())
+                self.assertEqual(len(keys), 2)
+                self.assertIn(("cpu", None, 1, 2, 2, 2), keys)
+                self.assertNotIn(("cpu", None, 1, 3, 2, 2), keys)
+                self.assertIn(("cpu", None, 1, 4, 2, 2), keys)
+            finally:
+                module._clear_cam_identity_cache()
+
+    def test_cam_identity_cache_can_be_disabled(self) -> None:
+        module = self._load_kernel_module()
+        env = {
+            module._CAM_IDENTITY_CACHE_MAX_ENTRIES_ENV: "8",
+            module._CAM_IDENTITY_CACHE_MAX_BYTES_ENV: "0",
+        }
+        device = torch.device("cpu")
+
+        with patch.dict(os.environ, env):
+            module._clear_cam_identity_cache()
+            try:
+                first = module._cam_identity_tables(B=1, N=2, H=1, D=2, device=device)
+                second = module._cam_identity_tables(B=1, N=2, H=1, D=2, device=device)
+
+                self.assertEqual(len(module._CAM_IDENTITY_CACHE), 0)
+                self.assertIsNot(first, second)
+                self.assertIsNot(first[0], second[0])
+            finally:
+                module._clear_cam_identity_cache()
+
+    def test_phase_b_dtile_tuning_cache_is_device_specific(self) -> None:
+        module = self._load_kernel_module()
+        module._PHASE_B_DTILE_ARCH_CACHE.clear()
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            module.torch.cuda, "is_available", return_value=True
+        ), patch.object(
+            module.torch.cuda, "current_device", side_effect=[0, 1]
+        ), patch.object(
+            module.torch.cuda,
+            "get_device_capability",
+            side_effect=lambda dev: (8, 0) if dev == 0 else (12, 1),
+        ):
+            self.assertEqual(module._pick_phase_b_d_splits(112, 0), (4, 8, 2, False))
+            self.assertEqual(
+                module._pick_phase_b_d_splits(112, 0), (1, None, None, None)
+            )
+
+        module._PHASE_B_DTILE_ARCH_CACHE.clear()
+
+
 class TestSanaWMSamplingParams(unittest.TestCase):
     @staticmethod
     def _server_args():
@@ -615,6 +771,19 @@ class TestSanaWMSamplingParams(unittest.TestCase):
         self.assertIs(params.condition_inputs["camera_to_world"], cam)
         self.assertIs(params.condition_inputs["intrinsics"], intr)
 
+    def test_adjust_includes_prepacked_camera_condition_inputs_when_set(self) -> None:
+        camera_conditions = torch.zeros(49, 20)
+        chunk_plucker = torch.zeros(48, 6, 22, 40)
+        params = SanaWMSamplingParams(
+            camera_conditions=camera_conditions,
+            chunk_plucker=chunk_plucker,
+        )
+
+        params._adjust(self._server_args())
+
+        self.assertIs(params.condition_inputs["camera_conditions"], camera_conditions)
+        self.assertIs(params.condition_inputs["chunk_plucker"], chunk_plucker)
+
     def test_adjust_includes_action_condition_inputs_when_set(self) -> None:
         params = SanaWMSamplingParams(
             action="w-8,jw-8",
@@ -630,11 +799,28 @@ class TestSanaWMSamplingParams(unittest.TestCase):
         self.assertEqual(params.condition_inputs["rotation_speed_deg"], 2.0)
         self.assertEqual(params.condition_inputs["pitch_limit_deg"], 70.0)
 
+    def test_build_request_extra_includes_refiner_controls_when_set(self) -> None:
+        params = SanaWMSamplingParams(
+            skip_refiner=True,
+            refiner_prompt="refine this world state",
+        )
+
+        extra = params.build_request_extra()
+
+        self.assertTrue(extra["skip_refiner"])
+        self.assertEqual(extra["refiner_prompt"], "refine this world state")
+
     def test_adjust_rejects_action_with_direct_camera(self) -> None:
         cam = torch.eye(4).unsqueeze(0).expand(49, 4, 4)
         params = SanaWMSamplingParams(action="w-8", camera_to_world=cam)
 
         with self.assertRaisesRegex(ValueError, "either action or camera_to_world"):
+            params._adjust(self._server_args())
+
+    def test_adjust_rejects_invalid_action_motion_params(self) -> None:
+        params = SanaWMSamplingParams(action="w-8", translation_speed=0)
+
+        with self.assertRaisesRegex(ValueError, "translation_speed"):
             params._adjust(self._server_args())
 
     def test_cli_args_accept_upstream_action_aliases(self) -> None:
@@ -656,6 +842,53 @@ class TestSanaWMSamplingParams(unittest.TestCase):
         self.assertEqual(cli_args["action"], "w-8,jw-8")
         self.assertEqual(cli_args["translation_speed"], 0.06)
         self.assertEqual(cli_args["rotation_speed_deg"], 2.0)
+
+    def test_video_api_sampling_params_exposes_sana_wm_controls(self) -> None:
+        from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+            VideoGenerationsRequest,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
+            _build_video_sampling_params,
+        )
+
+        prev_global = server_args_module._global_server_args
+        server_args = SimpleNamespace(
+            backend="sglang",
+            comfyui_mode=False,
+            model_id=None,
+            model_path=DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST,
+            num_gpus=1,
+            output_path=None,
+            pipeline_class_name=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        set_global_server_args(server_args)
+        try:
+            self.assertNotIn("action", VideoGenerationsRequest.model_fields)
+            self.assertNotIn("skip_refiner", VideoGenerationsRequest.model_fields)
+            request = VideoGenerationsRequest(
+                prompt="drive forward",
+                input_reference="/tmp/sana-wm-first-frame.png",
+                action="w-8,jw-8",
+                condition_inputs={"intrinsics": [50.0, 50.0, 32.0, 32.0]},
+                skip_refiner=True,
+                refiner_prompt="cinematic refiner prompt",
+                true_cfg_scale=4.5,
+            )
+
+            params = _build_video_sampling_params("api-rid", request)
+        finally:
+            server_args_module._global_server_args = prev_global
+
+        self.assertIsInstance(params, SanaWMSamplingParams)
+        self.assertEqual(params.condition_inputs["action"], "w-8,jw-8")
+        self.assertEqual(
+            params.condition_inputs["intrinsics"], [50.0, 50.0, 32.0, 32.0]
+        )
+        self.assertEqual(params.true_cfg_scale, 4.5)
+        extra = params.build_request_extra()
+        self.assertTrue(extra["skip_refiner"])
+        self.assertEqual(extra["refiner_prompt"], "cinematic refiner prompt")
 
 
 class TestSanaWMRegistry(unittest.TestCase):
@@ -684,6 +917,16 @@ class TestSanaWMRegistry(unittest.TestCase):
             get_non_diffusers_pipeline_name("/models/sana_wm_bidirectional"),
             "SanaWMTwoStagePipeline",
         )
+
+    def test_realtime_registry_does_not_register_sana_wm(self) -> None:
+        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+            get_realtime_model_adapter,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Realtime video is not supported"):
+            get_realtime_model_adapter(
+                SimpleNamespace(pipeline_config=SanaWMPipelineConfig())
+            )
 
     def test_overlay_resolver_matches_hf_cache_snapshot_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1131,6 +1374,18 @@ class TestSanaWMPipeline(unittest.TestCase):
                 )
             )
 
+    def test_validate_parallelism_rejects_cfg_parallel_degree_below_two(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly two branches"):
+            SanaWMPipeline._validate_parallelism_args(
+                SimpleNamespace(
+                    tp_size=1,
+                    sp_degree=1,
+                    enable_cfg_parallel=True,
+                    cfg_parallel_degree=1,
+                    pipeline_config=SanaWMPipelineConfig(),
+                )
+            )
+
     def test_two_stage_validate_parallelism_allows_native_refiner_common_tp(
         self,
     ) -> None:
@@ -1233,8 +1488,145 @@ class TestSanaWMPipeline(unittest.TestCase):
                 SimpleNamespace(tp_size=1, sp_degree=2)
             )
 
+    def test_create_pipeline_stages_uses_standard_sana_wm_stages(self) -> None:
+        pipeline = object.__new__(SanaWMPipeline)
+        pipeline.modules = {
+            "text_encoder": object(),
+            "tokenizer": object(),
+            "vae": object(),
+            "transformer": object(),
+            "scheduler": object(),
+        }
+        pipeline._stages = []
+        pipeline._stage_name_mapping = {}
+        pipeline._disagg_role = RoleType.MONOLITHIC
+
+        pipeline.create_pipeline_stages(
+            SimpleNamespace(
+                tp_size=1,
+                sp_degree=1,
+                enable_cfg_parallel=False,
+                pipeline_config=SanaWMPipelineConfig(),
+            )
+        )
+
+        self.assertIsInstance(pipeline._stages[0], InputValidationStage)
+        self.assertIsInstance(pipeline._stages[1], SanaWMTextEncodingStage)
+        self.assertEqual(
+            pipeline._stage_name_mapping["prompt_encoding_stage"],
+            pipeline._stages[1],
+        )
+
 
 class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
+    @staticmethod
+    def _make_verify_batch(**overrides) -> Req:
+        kwargs = {
+            "prompt": "drive forward",
+            "negative_prompt": "",
+            "guidance_scale": 4.5,
+            "height": 704,
+            "width": 1280,
+            "num_frames": 49,
+            "num_inference_steps": 4,
+            "condition_image": torch.zeros(3, 8, 8),
+            "prompt_embeds": [torch.zeros(1, 4, 8)],
+            "negative_prompt_embeds": [torch.zeros(1, 4, 8)],
+            "condition_inputs": {},
+        }
+        kwargs.update(overrides)
+        return Req(**kwargs)
+
+    def test_verify_input_accepts_prepared_sana_wm_request(self) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+
+        result = stage.verify_input(
+            self._make_verify_batch(),
+            SimpleNamespace(pipeline_config=pipeline_config),
+        )
+
+        self.assertTrue(result.is_valid(), result.get_failure_summary())
+
+    def test_verify_input_requires_condition_image(self) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+
+        result = stage.verify_input(
+            self._make_verify_batch(condition_image=None),
+            SimpleNamespace(pipeline_config=pipeline_config),
+        )
+
+        self.assertIn("condition_image", result.get_failed_fields())
+
+    def test_verify_input_rejects_stride_misaligned_size(self) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+
+        result = stage.verify_input(
+            self._make_verify_batch(height=705),
+            SimpleNamespace(pipeline_config=pipeline_config),
+        )
+
+        self.assertIn("height", result.get_failed_fields())
+
+    def test_verify_input_rejects_action_camera_conflict(self) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+
+        result = stage.verify_input(
+            self._make_verify_batch(
+                condition_inputs={
+                    "action": "w-8",
+                    "camera_to_world": torch.eye(4).unsqueeze(0),
+                }
+            ),
+            SimpleNamespace(pipeline_config=pipeline_config),
+        )
+
+        self.assertIn("condition_inputs", result.get_failed_fields())
+
+    def test_verify_input_rejects_invalid_action_motion_params(self) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+
+        result = stage.verify_input(
+            self._make_verify_batch(
+                condition_inputs={
+                    "action": "w-8",
+                    "translation_speed": -0.1,
+                }
+            ),
+            SimpleNamespace(pipeline_config=pipeline_config),
+        )
+
+        self.assertIn("condition_inputs", result.get_failed_fields())
+
     def test_action_string_rolls_out_camera_to_world(self) -> None:
         self.assertEqual(
             parse_sana_wm_action_string(" w-2，d-1, none-1 "),
@@ -1256,6 +1648,24 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             parse_sana_wm_action_string("x-1")
         with self.assertRaisesRegex(ValueError, "non-positive"):
             parse_sana_wm_action_string("w-0")
+
+    def test_ucpe_apply_fns_expose_reusable_projection_matrices(self) -> None:
+        raymats = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 3, 1, 1)
+
+        prope_fns = _build_ucpe_apply_fns(
+            head_dim=112,
+            raymats=raymats,
+            rotary_emb=None,
+        )
+
+        self.assertEqual(len(prope_fns), 6)
+        P, P_T, P_inv = prope_fns[3:]
+        self.assertTrue(P.is_contiguous())
+        self.assertTrue(P_T.is_contiguous())
+        self.assertTrue(P_inv.is_contiguous())
+        self.assertTrue(torch.equal(P, raymats))
+        self.assertTrue(torch.equal(P_T, raymats.transpose(-1, -2).contiguous()))
+        self.assertTrue(torch.equal(P_inv, _invert_SE3(raymats)))
 
     def test_vae_encode_image_extracts_latent_dist_and_normalizes_ltx2(self) -> None:
         class DummyLatentDist:
@@ -1369,6 +1779,24 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(transformer.latent_shape, (2, 128, 3, 4, 5))
         self.assertIn("precomputed_prope_fns", out)
         self.assertIn("precomputed_plucker_emb", out)
+
+    def test_static_conditioning_precompute_without_hook_falls_back(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=object(),
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+
+        out = stage._prepare_transformer_static_conditioning(
+            camera_conditions=torch.zeros(1, 3, 20),
+            chunk_plucker=torch.zeros(1, 48, 3, 4, 5),
+            latent_shape=(1, 128, 3, 4, 5),
+            do_cfg=False,
+            cfg_parallel=False,
+        )
+
+        self.assertEqual(out, {})
 
     def test_prepare_noise_latents_accepts_per_sample_generators(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
@@ -1513,6 +1941,54 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             torch.equal(out[1, :, :1], torch.full((128, 1, 22, 40), 2.0))
         )
 
+    def test_default_intrinsics_use_horizontal_fov_strategy(self) -> None:
+        with patch.dict(os.environ, {SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV: "70.0"}):
+            intrinsics = default_sana_wm_intrinsics_vec4(
+                batch_size=2,
+                num_frames=3,
+                pixel_h=384,
+                pixel_w=640,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+        expected_focal = 640.0 / (2.0 * math.tan(math.radians(70.0) / 2.0))
+        self.assertEqual(tuple(intrinsics.shape), (2, 3, 4))
+        torch.testing.assert_close(
+            intrinsics[0, 0],
+            torch.tensor([expected_focal, expected_focal, 320.0, 192.0]),
+        )
+        torch.testing.assert_close(intrinsics[0], intrinsics[1])
+
+    def test_default_intrinsics_env_override_changes_horizontal_fov(self) -> None:
+        with patch.dict(os.environ, {SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV: "60.0"}):
+            intrinsics = default_sana_wm_intrinsics_vec4(
+                batch_size=1,
+                num_frames=1,
+                pixel_h=384,
+                pixel_w=640,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+        expected_focal = 640.0 / (2.0 * math.tan(math.radians(60.0) / 2.0))
+        torch.testing.assert_close(
+            intrinsics[0, 0],
+            torch.tensor([expected_focal, expected_focal, 320.0, 192.0]),
+        )
+
+    def test_default_intrinsics_rejects_out_of_range_fov(self) -> None:
+        with patch.dict(os.environ, {SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV: "10.0"}):
+            with self.assertRaisesRegex(ValueError, "horizontal FOV"):
+                default_sana_wm_intrinsics_vec4(
+                    batch_size=1,
+                    num_frames=1,
+                    pixel_h=384,
+                    pixel_w=640,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                )
+
     def test_default_static_camera_builds_latent_raymap_and_chunk_plucker(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -1522,14 +1998,15 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         )
         batch = SimpleNamespace(extra={}, height=384, width=640)
 
-        camera_conditions, chunk_plucker, source = stage._build_camera_conditioning(
-            batch,
-            batch_size=1,
-            num_frames=17,
-            latent_shape=(1, 128, 3, 12, 20),
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        )
+        with patch.dict(os.environ, {SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV: "70.0"}):
+            camera_conditions, chunk_plucker, source = stage._build_camera_conditioning(
+                batch,
+                batch_size=1,
+                num_frames=17,
+                latent_shape=(1, 128, 3, 12, 20),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
 
         self.assertEqual(source, "default_static")
         self.assertEqual(camera_conditions.shape, (1, 3, 20))
@@ -1537,11 +2014,25 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertTrue(
             torch.equal(camera_conditions[0, 0, :16], torch.eye(4).reshape(-1))
         )
-        self.assertTrue(
-            torch.allclose(
-                camera_conditions[0, 0, 16:],
-                torch.tensor([16.0, 16.0, 10.0, 6.0]),
-            )
+        expected_pixel_intrinsics = default_sana_wm_intrinsics_vec4(
+            batch_size=1,
+            num_frames=17,
+            pixel_h=384,
+            pixel_w=640,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            horizontal_fov_deg=70.0,
+        )
+        expected_latent_intrinsics = scale_sana_wm_intrinsics_to_latent(
+            expected_pixel_intrinsics,
+            pixel_h=384,
+            pixel_w=640,
+            latent_h=12,
+            latent_w=20,
+        )
+        torch.testing.assert_close(
+            camera_conditions[0, 0, 16:],
+            expected_latent_intrinsics[0, 0],
         )
 
     def test_request_intrinsics_are_transformed_for_condition_image_crop(self) -> None:
@@ -1794,6 +2285,17 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             17,
         )
 
+    def test_action_length_does_not_cap_requested_num_frames(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        batch = SimpleNamespace(num_frames=49, condition_inputs={"action": "w-8"})
+
+        self.assertEqual(stage._adjust_num_frames_for_request(batch), 49)
+
     def test_intrinsics_3x3_sequence_can_exceed_requested_frame_count(self) -> None:
         intrinsics = torch.eye(3).unsqueeze(0).repeat(321, 1, 1)
 
@@ -2016,6 +2518,17 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertTrue(_sana_wm_should_do_cfg(batch))
         self.assertEqual(_sana_wm_effective_guidance_scale(batch), 4.5)
 
+    def test_cfg_treats_empty_negative_prompt_as_unconditional_condition(self) -> None:
+        batch = SimpleNamespace(
+            do_classifier_free_guidance=False,
+            negative_prompt="",
+            negative_prompt_embeds=None,
+            guidance_scale=4.5,
+            true_cfg_scale=None,
+        )
+
+        self.assertTrue(_sana_wm_should_do_cfg(batch))
+
     def test_cfg_accepts_preencoded_negative_prompt_embeds(self) -> None:
         batch = Req(
             prompt="drive forward",
@@ -2053,8 +2566,65 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(scheduler.shift, 9.8)
         self.assertTrue(torch.equal(batch.timesteps, torch.arange(3)))
 
+    def test_prepare_timesteps_uses_request_flow_shift_override(self) -> None:
+        class FakeScheduler:
+            def __init__(self):
+                self.shift = None
+                self.timesteps = None
+                self.sigmas = None
+
+            def set_timesteps(self, num_inference_steps, device, shift=None):
+                self.shift = shift
+                self.timesteps = torch.arange(num_inference_steps, device=device)
+                self.sigmas = torch.tensor([float(shift), 0.0], device=device)
+
+        scheduler = FakeScheduler()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=scheduler,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        batch = SimpleNamespace(
+            num_inference_steps=3,
+            scheduler=None,
+            flow_shift=7.25,
+        )
+
+        stage._prepare_timesteps(batch, SimpleNamespace(), torch.device("cpu"))
+
+        self.assertEqual(scheduler.shift, 7.25)
+
 
 class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
+    def test_verify_input_allows_preencoded_negative_tensor(self) -> None:
+        stage = SanaWMTextEncodingStage(text_encoders=[object()], tokenizers=[object()])
+        batch = Req(
+            prompt="drive forward",
+            negative_prompt=None,
+            negative_prompt_embeds=torch.zeros(1, 4, 8),
+            guidance_scale=4.5,
+        )
+
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertTrue(result.is_valid(), result.get_failure_summary())
+
+    def test_verify_input_requires_single_sana_wm_text_encoder(self) -> None:
+        stage = SanaWMTextEncodingStage(text_encoders=[], tokenizers=[])
+        batch = Req(prompt="drive forward", guidance_scale=1.0)
+
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertIn("text_encoders", result.get_failed_fields())
+        self.assertIn("tokenizers", result.get_failed_fields())
+
     def test_official_prompt_window_keeps_bos_and_tail(self) -> None:
         tensor = torch.arange(5).reshape(1, 5, 1)
 
@@ -2144,15 +2714,15 @@ class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
 
         with (
             patch(
-                f"{_SANA_WM_STAGE_MODULE}._sana_wm_stage_tp_world_size",
+                f"{_SANA_WM_STAGE_MODULE}.sana_wm_stage_tp_world_size",
                 return_value=2,
             ),
             patch(
-                f"{_SANA_WM_STAGE_MODULE}._sana_wm_is_tp_rank0",
+                f"{_SANA_WM_STAGE_MODULE}.sana_wm_is_tp_rank0",
                 return_value=False,
             ),
             patch(
-                f"{_SANA_WM_STAGE_MODULE}._sana_wm_broadcast_tensor_dict_from_tp_rank0",
+                f"{_SANA_WM_STAGE_MODULE}.sana_wm_broadcast_tensor_dict_from_tp_rank0",
                 return_value=payload,
             ),
             patch.object(
@@ -2169,6 +2739,59 @@ class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
 
 
 class TestSanaWMDenoisingStage(unittest.TestCase):
+    @staticmethod
+    def _make_verify_batch(**overrides) -> Req:
+        kwargs = {
+            "prompt": "drive forward",
+            "guidance_scale": 1.0,
+            "latents": torch.zeros(1, 128, 3, 2, 2),
+            "timesteps": torch.arange(2),
+            "num_inference_steps": 2,
+            "prompt_embeds": [torch.zeros(1, 4, 8)],
+            "generator": torch.Generator(device="cpu").manual_seed(0),
+            "extra": {
+                "camera_conditions": torch.zeros(1, 3, 20),
+                "chunk_plucker": torch.zeros(1, 48, 3, 2, 2),
+            },
+        }
+        kwargs.update(overrides)
+        return Req(**kwargs)
+
+    def test_verify_input_accepts_prepared_denoising_request(self) -> None:
+        stage = object.__new__(SanaWMDenoisingStage)
+
+        result = stage.verify_input(
+            self._make_verify_batch(),
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertTrue(result.is_valid(), result.get_failure_summary())
+
+    def test_verify_input_requires_5d_latents(self) -> None:
+        stage = object.__new__(SanaWMDenoisingStage)
+
+        result = stage.verify_input(
+            self._make_verify_batch(latents=torch.zeros(1, 128, 2, 2)),
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertIn("latents", result.get_failed_fields())
+
+    def test_verify_input_rejects_bad_camera_condition_shapes(self) -> None:
+        stage = object.__new__(SanaWMDenoisingStage)
+
+        result = stage.verify_input(
+            self._make_verify_batch(
+                extra={
+                    "camera_conditions": torch.zeros(1, 3, 19),
+                    "chunk_plucker": torch.zeros(1, 48, 3, 2, 2),
+                }
+            ),
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertIn("camera_conditions", result.get_failed_fields())
+
     def test_reuses_shared_denoising_forward(self) -> None:
         self.assertIs(SanaWMDenoisingStage.forward, DenoisingStage.forward)
 
@@ -2220,20 +2843,105 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         self.assertTrue(torch.allclose(combined_from_pos_rank, serial))
         self.assertTrue(torch.allclose(combined_from_neg_rank, serial))
 
-    def test_cfg_parallel_idle_rank_contributes_zero(self) -> None:
+    def test_cfg_parallel_rejects_invalid_rank(self) -> None:
         local_noise = torch.tensor([7.0])
 
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.cfg_model_parallel_all_reduce",
-            side_effect=lambda partial: partial,
-        ) as all_reduce:
-            combined = SanaWMDenoisingStage._combine_cfg_parallel_noise(
+        with self.assertRaisesRegex(ValueError, "cfg_rank 0 or 1"):
+            SanaWMDenoisingStage._combine_cfg_parallel_noise(
                 local_noise, guidance_scale=4.5, cfg_rank=2
             )
 
-        expected = torch.zeros_like(local_noise)
-        self.assertTrue(torch.equal(combined, expected))
-        self.assertTrue(torch.equal(all_reduce.call_args.args[0], expected))
+    def test_serial_cfg_latent_model_input_reuses_buffer(self) -> None:
+        latents = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+        buffer = torch.empty(4, 3, 2)
+
+        out = SanaWMDenoisingStage._write_serial_cfg_latent_model_input(
+            buffer,
+            latents,
+        )
+
+        self.assertIs(out, buffer)
+        torch.testing.assert_close(out[:2], latents)
+        torch.testing.assert_close(out[2:], latents)
+
+        updated = latents + 100
+        out_again = SanaWMDenoisingStage._write_serial_cfg_latent_model_input(
+            buffer,
+            updated,
+        )
+
+        self.assertIs(out_again, buffer)
+        torch.testing.assert_close(out_again[:2], updated)
+        torch.testing.assert_close(out_again[2:], updated)
+
+    def test_serial_cfg_noise_combine_reuses_text_branch_storage(self) -> None:
+        noise_uncond = torch.tensor([[[1.0, 2.0]]])
+        noise_text = torch.tensor([[[3.0, 5.0]]])
+        noise_pred = torch.cat([noise_uncond, noise_text], dim=0)
+
+        combined = SanaWMDenoisingStage._combine_serial_cfg_noise_in_place(
+            noise_pred,
+            guidance_scale=2.0,
+        )
+
+        expected = noise_uncond + 2.0 * (noise_text - noise_uncond)
+        self.assertEqual(combined.data_ptr(), noise_pred[1:].data_ptr())
+        torch.testing.assert_close(combined, expected)
+
+    def test_serial_cfg_step_timestep_avoids_spatial_cfg_duplication(self) -> None:
+        condition_mask = torch.zeros(2, 1, 3, 4, 5)
+        condition_mask[:, :, :1] = 1
+        frame_limit = (1.0 - condition_mask[:, :, :, 0, 0].float()) * 1000.0
+        token_limit = (1.0 - condition_mask.flatten(2).squeeze(1).float()) * 1000.0
+
+        model_timestep, per_token_timesteps = (
+            SanaWMDenoisingStage._prepare_step_timesteps(
+                torch.tensor(800),
+                frame_limit,
+                token_limit,
+                do_cfg=True,
+                cfg_parallel=False,
+            )
+        )
+
+        self.assertEqual(tuple(model_timestep.shape), (4, 1, 3))
+        self.assertEqual(tuple(per_token_timesteps.shape), (2, 60))
+        self.assertTrue(torch.equal(model_timestep[:2], model_timestep[2:]))
+        self.assertTrue(torch.equal(model_timestep[:, :, 0], torch.zeros(4, 1)))
+        self.assertTrue(
+            torch.equal(
+                model_timestep[:, :, 1:],
+                torch.full((4, 1, 2), 800.0),
+            )
+        )
+        self.assertTrue(torch.equal(per_token_timesteps[:, :20], torch.zeros(2, 20)))
+        self.assertTrue(
+            torch.equal(per_token_timesteps[:, 20:], torch.full((2, 40), 800.0))
+        )
+
+
+class TestSanaWMDecodingStage(unittest.TestCase):
+    def test_verify_input_requires_5d_latents(self) -> None:
+        stage = SanaWMDecodingStage(vae=None)
+        batch = Req(
+            prompt="drive forward",
+            latents=torch.zeros(1, 128, 3, 2, 2),
+        )
+
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertTrue(result.is_valid(), result.get_failure_summary())
+
+        batch.latents = torch.zeros(1, 128, 2, 2)
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertIn("latents", result.get_failed_fields())
 
 
 class TestSanaWMOptionalAttentionPadding(unittest.TestCase):
@@ -2522,6 +3230,78 @@ class TestSanaWMNativeDiTChunking(unittest.TestCase):
 
 
 class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
+    @staticmethod
+    def _make_refiner_stage() -> SanaWMLTX2RefinerStage:
+        return SanaWMLTX2RefinerStage(
+            transformer=torch.nn.Identity(),
+            connectors=torch.nn.Identity(),
+            text_encoder=torch.nn.Identity(),
+            tokenizer=SimpleNamespace(pad_token="<pad>", eos_token="<eos>"),
+            dtype=torch.float32,
+        )
+
+    def test_verify_input_accepts_prepared_refiner_request(self) -> None:
+        stage = self._make_refiner_stage()
+        batch = Req(
+            prompt=["left", "right"],
+            latents=torch.zeros(2, 128, 3, 2, 2),
+            seeds=[11, 23],
+            extra={},
+        )
+
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertTrue(result.is_valid(), result.get_failure_summary())
+
+    def test_verify_input_rejects_bad_refiner_prompt_batch(self) -> None:
+        stage = self._make_refiner_stage()
+        batch = Req(
+            prompt=["left", "right", "forward"],
+            latents=torch.zeros(2, 128, 3, 2, 2),
+            extra={},
+        )
+
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertIn("refiner_prompt", result.get_failed_fields())
+
+    def test_verify_input_rejects_bad_refiner_seed_batch(self) -> None:
+        stage = self._make_refiner_stage()
+        batch = Req(
+            prompt=["left", "right"],
+            latents=torch.zeros(2, 128, 3, 2, 2),
+            seeds=[1, 2, 3],
+            extra={},
+        )
+
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertIn("seeds", result.get_failed_fields())
+
+    def test_verify_input_requires_refiner_5d_latents(self) -> None:
+        stage = self._make_refiner_stage()
+        batch = Req(
+            prompt="drive forward",
+            latents=torch.zeros(1, 128, 2, 2),
+            extra={},
+        )
+
+        result = stage.verify_input(
+            batch,
+            SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
+        )
+
+        self.assertIn("latents", result.get_failed_fields())
+
     def test_diffusers_refiner_detection_uses_official_class_name(self) -> None:
         class LTX2VideoTransformer3DModel(torch.nn.Module):
             pass
@@ -2632,7 +3412,7 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
                 return_value=1,
             ),
             patch(
-                f"{_SANA_WM_REFINER_STAGE_MODULE}._sana_wm_is_tp_rank0",
+                f"{_SANA_WM_REFINER_STAGE_MODULE}.sana_wm_is_tp_rank0",
                 return_value=False,
             ),
         ):
@@ -2925,16 +3705,16 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
 
         with (
             patch(
-                f"{_SANA_WM_REFINER_STAGE_MODULE}._sana_wm_stage_tp_world_size",
+                f"{_SANA_WM_REFINER_STAGE_MODULE}.sana_wm_stage_tp_world_size",
                 return_value=2,
             ),
             patch(
-                f"{_SANA_WM_REFINER_STAGE_MODULE}._sana_wm_is_tp_rank0",
+                f"{_SANA_WM_REFINER_STAGE_MODULE}.sana_wm_is_tp_rank0",
                 return_value=False,
             ),
             patch(
                 f"{_SANA_WM_REFINER_STAGE_MODULE}."
-                "_sana_wm_broadcast_tensor_dict_from_tp_rank0",
+                "sana_wm_broadcast_tensor_dict_from_tp_rank0",
                 return_value={
                     "prompt_embeds": prompt_embeds,
                     "attention_mask": attention_mask,

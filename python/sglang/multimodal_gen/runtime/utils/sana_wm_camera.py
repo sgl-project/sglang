@@ -12,7 +12,48 @@ import torch
 SANA_WM_DEFAULT_TRANSLATION_SPEED = 0.05
 SANA_WM_DEFAULT_ROTATION_SPEED_DEG = 1.2
 SANA_WM_DEFAULT_PITCH_LIMIT_DEG = 85.0
+SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG = 70.0
+SANA_WM_MIN_DEFAULT_FOV_DEG = 25.0
+SANA_WM_MAX_DEFAULT_FOV_DEG = 120.0
+SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV = "SGLANG_SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG"
 SANA_WM_ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
+
+
+def validate_sana_wm_motion_params(
+    *,
+    translation_speed: Any = SANA_WM_DEFAULT_TRANSLATION_SPEED,
+    rotation_speed_deg: Any = SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
+    pitch_limit_deg: Any = SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
+) -> tuple[float, float, float]:
+    """Validate and normalize SANA-WM action rollout speed controls."""
+    try:
+        translation_speed = float(translation_speed)
+        rotation_speed_deg = float(rotation_speed_deg)
+        pitch_limit_deg = float(pitch_limit_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "SANA-WM motion parameters must be numeric: "
+            f"translation_speed={translation_speed!r}, "
+            f"rotation_speed_deg={rotation_speed_deg!r}, "
+            f"pitch_limit_deg={pitch_limit_deg!r}."
+        ) from exc
+
+    if not math.isfinite(translation_speed) or translation_speed <= 0:
+        raise ValueError(
+            "translation_speed must be a finite positive value, "
+            f"got {translation_speed}."
+        )
+    if not math.isfinite(rotation_speed_deg) or not (0 < rotation_speed_deg < 180):
+        raise ValueError(
+            "rotation_speed_deg must be finite and in (0, 180) degrees, "
+            f"got {rotation_speed_deg}."
+        )
+    if not math.isfinite(pitch_limit_deg) or not (0 < pitch_limit_deg <= 90):
+        raise ValueError(
+            "pitch_limit_deg must be finite and in (0, 90] degrees, "
+            f"got {pitch_limit_deg}."
+        )
+    return translation_speed, rotation_speed_deg, pitch_limit_deg
 
 
 def _sana_wm_rot_x(angle_rad: float) -> torch.Tensor:
@@ -74,9 +115,16 @@ def sana_wm_action_to_camera_to_world(
     rotation_speed_deg: float = SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
     pitch_limit_deg: float = SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
 ) -> torch.Tensor:
+    translation_speed, rotation_speed_deg, pitch_limit_deg = (
+        validate_sana_wm_motion_params(
+            translation_speed=translation_speed,
+            rotation_speed_deg=rotation_speed_deg,
+            pitch_limit_deg=pitch_limit_deg,
+        )
+    )
     per_frame = parse_sana_wm_action_string(action)
-    rotate_rad = math.radians(float(rotation_speed_deg))
-    pitch_limit_rad = math.radians(float(pitch_limit_deg))
+    rotate_rad = math.radians(rotation_speed_deg)
+    pitch_limit_rad = math.radians(pitch_limit_deg)
     current = torch.eye(4, dtype=torch.float64)
     poses = [current.clone()]
     current_pitch = 0.0
@@ -115,13 +163,13 @@ def sana_wm_action_to_camera_to_world(
 
         move = torch.zeros(3, dtype=torch.float64)
         if "w" in held:
-            move += forward * float(translation_speed)
+            move += forward * translation_speed
         if "s" in held:
-            move -= forward * float(translation_speed)
+            move -= forward * translation_speed
         if "d" in held:
-            move += right * float(translation_speed)
+            move += right * translation_speed
         if "a" in held:
-            move -= right * float(translation_speed)
+            move -= right * translation_speed
 
         current = torch.eye(4, dtype=torch.float64)
         current[:3, :3] = rotation_new
@@ -285,15 +333,33 @@ def coerce_sana_wm_intrinsics_vec4(
         intrinsics = intrinsics.unsqueeze(0)
     elif intrinsics.dim() == 3 and intrinsics.shape[-2:] == (3, 3):
         vec4 = sana_wm_intrinsics_matrix_to_vec4(intrinsics)
-        if intrinsics.shape[0] >= num_frames:
-            intrinsics = vec4.unsqueeze(0)
-        elif intrinsics.shape[0] == batch_size:
-            intrinsics = vec4.unsqueeze(1)
+        N = intrinsics.shape[0]
+        if N == 1:
+            # Single matrix: broadcast over both batch and frame axes.
+            intrinsics = vec4.unsqueeze(0)  # (1, 1, 4)
+        elif N == batch_size and N < num_frames:
+            # Unambiguous: one matrix per batch item, same for all frames.
+            intrinsics = vec4.unsqueeze(1)  # (B, 1, 4)
+        elif N >= num_frames and N != batch_size:
+            # Unambiguous: one matrix per frame (or more, trimmed later), broadcast batch.
+            intrinsics = vec4.unsqueeze(0)  # (1, F, 4)
+        elif N == batch_size == num_frames:
+            # Ambiguous: N matches both batch_size and num_frames.
+            # Treat as per-frame (broadcast batch) — the more common case
+            # (camera intrinsics rarely differ per video in a batch).
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "intrinsics shape (N=%d, 3, 3) is ambiguous: N equals both "
+                "batch_size and num_frames. Treating as per-frame intrinsics "
+                "(broadcasting over batch). Pass shape (B, F, 3, 3) to be explicit.",
+                N,
+            )
+            intrinsics = vec4.unsqueeze(0)  # (1, F, 4)
         else:
             raise ValueError(
-                "intrinsics with shape (N,3,3) must use N>=num_frames "
-                f"or N=batch_size, got N={intrinsics.shape[0]}, "
-                f"num_frames={num_frames}, batch_size={batch_size}"
+                "intrinsics with shape (N, 3, 3) requires N == 1, "
+                f"N == batch_size ({batch_size}), or N >= num_frames ({num_frames}); "
+                f"got N={N}."
             )
     elif intrinsics.dim() == 3 and intrinsics.shape[-1] == 4:
         pass
@@ -378,6 +444,68 @@ def latent_frame_sana_wm_camera_conditions(
     return camera_conditions.index_select(1, time_indices)
 
 
+def sana_wm_default_horizontal_fov_deg() -> float:
+    value = os.getenv(SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV)
+    if value is None or value.strip() == "":
+        fov_deg = SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG
+    else:
+        try:
+            fov_deg = float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV} must be a float in "
+                f"({SANA_WM_MIN_DEFAULT_FOV_DEG}, "
+                f"{SANA_WM_MAX_DEFAULT_FOV_DEG}) degrees, got {value!r}."
+            ) from exc
+
+    if not (SANA_WM_MIN_DEFAULT_FOV_DEG < fov_deg < SANA_WM_MAX_DEFAULT_FOV_DEG):
+        raise ValueError(
+            f"SANA-WM default horizontal FOV must be in "
+            f"({SANA_WM_MIN_DEFAULT_FOV_DEG}, "
+            f"{SANA_WM_MAX_DEFAULT_FOV_DEG}) degrees, got {fov_deg}."
+        )
+    return fov_deg
+
+
+def default_sana_wm_intrinsics_vec4(
+    *,
+    batch_size: int,
+    num_frames: int,
+    pixel_h: int,
+    pixel_w: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    horizontal_fov_deg: float | None = None,
+) -> torch.Tensor:
+    if pixel_h <= 0 or pixel_w <= 0:
+        raise ValueError(
+            "SANA-WM default intrinsics require positive pixel size, "
+            f"got height={pixel_h}, width={pixel_w}."
+        )
+    if horizontal_fov_deg is None:
+        horizontal_fov_deg = sana_wm_default_horizontal_fov_deg()
+    if not (
+        SANA_WM_MIN_DEFAULT_FOV_DEG
+        < float(horizontal_fov_deg)
+        < SANA_WM_MAX_DEFAULT_FOV_DEG
+    ):
+        raise ValueError(
+            f"SANA-WM default horizontal FOV must be in "
+            f"({SANA_WM_MIN_DEFAULT_FOV_DEG}, "
+            f"{SANA_WM_MAX_DEFAULT_FOV_DEG}) degrees, got "
+            f"{horizontal_fov_deg}."
+        )
+
+    fov_rad = math.radians(float(horizontal_fov_deg))
+    focal = float(pixel_w) / (2.0 * math.tan(fov_rad / 2.0))
+    intrinsics = torch.tensor(
+        [focal, focal, pixel_w / 2.0, pixel_h / 2.0],
+        device=device,
+        dtype=dtype,
+    ).view(1, 1, 4)
+    return intrinsics.repeat(batch_size, num_frames, 1)
+
+
 def default_sana_wm_static_camera(
     *,
     batch_size: int,
@@ -389,11 +517,12 @@ def default_sana_wm_static_camera(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     camera_to_world = torch.eye(4, device=device, dtype=dtype).view(1, 1, 4, 4)
     camera_to_world = camera_to_world.repeat(batch_size, num_frames, 1, 1)
-    focal = 0.8 * float(max(pixel_h, pixel_w))
-    intrinsics = torch.tensor(
-        [focal, focal, pixel_w / 2.0, pixel_h / 2.0],
+    intrinsics = default_sana_wm_intrinsics_vec4(
+        batch_size=batch_size,
+        num_frames=num_frames,
+        pixel_h=pixel_h,
+        pixel_w=pixel_w,
         device=device,
         dtype=dtype,
-    ).view(1, 1, 4)
-    intrinsics = intrinsics.repeat(batch_size, num_frames, 1)
+    )
     return camera_to_world, intrinsics

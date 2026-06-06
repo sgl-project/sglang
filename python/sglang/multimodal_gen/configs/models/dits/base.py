@@ -84,21 +84,41 @@ class DiTConfig(ModelConfig):
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.use_chunked_softmax_attention",
             default=None,
-            help="Enable SANA-WM chunked softmax attention. Ignored by models that do not expose this DiT option.",
+            help=(
+                "Enable SANA-WM chunked softmax attention. Ignored by "
+                "models that do not expose this DiT option."
+            ),
         )
         parser.add_argument(
             f"--{prefix}.pad-attention-head-dim-to-flash",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.pad_attention_head_dim_to_flash",
             default=None,
-            help="Enable SANA-WM opt-in head-dim padding for FlashAttention. Ignored by models that do not expose this DiT option.",
+            help=(
+                "Enable SANA-WM opt-in head-dim padding for FlashAttention. "
+                "Ignored by models that do not expose this DiT option."
+            ),
         )
         parser.add_argument(
             f"--{prefix}.use-triton-kernels",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.use_triton_kernels",
             default=None,
-            help="Enable or disable SANA-WM Triton kernels. Ignored by models that do not expose this DiT option.",
+            help=(
+                "Enable or disable SANA-WM Triton kernels. Ignored by "
+                "models that do not expose this DiT option."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}.allow-triton-fallback",
+            action=StoreBoolean,
+            dest=f"{prefix.replace('-', '_')}.allow_triton_fallback",
+            default=None,
+            help=(
+                "Allow SANA-WM CUDA inference to fall back to the slower torch "
+                "path when a Triton fast path is unavailable. Ignored by "
+                "models that do not expose this DiT option."
+            ),
         )
 
         return parser

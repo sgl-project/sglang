@@ -43,12 +43,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
-    SANA_WM_DEFAULT_PITCH_LIMIT_DEG as _SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
-    SANA_WM_DEFAULT_ROTATION_SPEED_DEG as _SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
-    SANA_WM_DEFAULT_TRANSLATION_SPEED as _SANA_WM_DEFAULT_TRANSLATION_SPEED,
+    SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
+    SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
+    SANA_WM_DEFAULT_TRANSLATION_SPEED,
     coerce_sana_wm_action_camera_to_world,
     coerce_sana_wm_camera_to_world,
     coerce_sana_wm_intrinsics_vec4,
@@ -58,7 +62,9 @@ from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
     pad_or_trim_sana_wm_frames,
     relative_sana_wm_camera_poses,
     sana_wm_action_num_frames,
+    sana_wm_default_horizontal_fov_deg,
     scale_sana_wm_intrinsics_to_latent,
+    validate_sana_wm_motion_params,
 )
 from sglang.multimodal_gen.runtime.utils.sana_wm_runtime_cache import (
     clear_sana_wm_request_runtime_cache,
@@ -81,6 +87,14 @@ _SANA_WM_PRECOMPUTED_PROPE_FNS_KEY = "precomputed_prope_fns"
 _SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY = "precomputed_plucker_emb"
 
 
+def _clear_sana_wm_precomputed_static_conditioning(batch: Req) -> None:
+    extra = getattr(batch, "extra", None)
+    if extra is None:
+        return
+    extra.pop(_SANA_WM_PRECOMPUTED_PROPE_FNS_KEY, None)
+    extra.pop(_SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY, None)
+
+
 def _sana_wm_effective_guidance_scale(batch: Req) -> float:
     cfg_scale = getattr(batch, "true_cfg_scale", None)
     if cfg_scale is None:
@@ -91,7 +105,15 @@ def _sana_wm_effective_guidance_scale(batch: Req) -> float:
 
 
 def _sana_wm_has_negative_condition(batch: Req) -> bool:
-    if getattr(batch, "negative_prompt", None) is not None:
+    """Return True if a negative/unconditional CFG condition is present.
+
+    Upstream SANA-WM uses an empty negative prompt as the unconditional branch,
+    so ``negative_prompt=""`` is still a valid CFG condition for this model.
+    """
+    neg_prompt = getattr(batch, "negative_prompt", None)
+    if neg_prompt is not None:
+        if isinstance(neg_prompt, (list, tuple)):
+            return len(neg_prompt) > 0
         return True
 
     neg_embeds = getattr(batch, "negative_prompt_embeds", None)
@@ -112,7 +134,7 @@ def _sana_wm_should_do_cfg(batch: Req) -> bool:
     )
 
 
-def _sana_wm_stage_tp_world_size() -> int:
+def sana_wm_stage_tp_world_size() -> int:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return 1
     try:
@@ -121,8 +143,8 @@ def _sana_wm_stage_tp_world_size() -> int:
         return 1
 
 
-def _sana_wm_stage_tp_rank() -> int:
-    if _sana_wm_stage_tp_world_size() <= 1:
+def sana_wm_stage_tp_rank() -> int:
+    if sana_wm_stage_tp_world_size() <= 1:
         return 0
     try:
         return get_tp_rank()
@@ -130,14 +152,14 @@ def _sana_wm_stage_tp_rank() -> int:
         return 0
 
 
-def _sana_wm_is_tp_rank0() -> bool:
-    return _sana_wm_stage_tp_rank() == 0
+def sana_wm_is_tp_rank0() -> bool:
+    return sana_wm_stage_tp_rank() == 0
 
 
-def _sana_wm_broadcast_tensor_dict_from_tp_rank0(
+def sana_wm_broadcast_tensor_dict_from_tp_rank0(
     tensor_dict: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if _sana_wm_stage_tp_world_size() <= 1:
+    if sana_wm_stage_tp_world_size() <= 1:
         if tensor_dict is None:
             raise RuntimeError("SANA-WM TP broadcast payload is missing on rank 0.")
         return tensor_dict
@@ -340,6 +362,12 @@ def configure_sana_wm_ltx2_vae_for_long_video(
 
 
 class SanaWMDecodingStage(DecodingStage):
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify SANA-WM decoding stage inputs."""
+        result = super().verify_input(batch, server_args)
+        result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
+        return result
+
     @torch.no_grad()
     def decode(
         self,
@@ -362,6 +390,97 @@ def _first_tensor(value: Any) -> torch.Tensor | None:
     if isinstance(value, (list, tuple)):
         return value[0] if value else None
     return value if isinstance(value, torch.Tensor) else None
+
+
+def _sana_wm_tensor_or_tensor_list(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return V.is_tensor(value)
+    return V.list_of_tensors(value)
+
+
+def _sana_wm_optional_tensor_or_tensor_list_allow_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, torch.Tensor):
+        return V.is_tensor(value)
+    if isinstance(value, (list, tuple)):
+        return all(
+            isinstance(item, torch.Tensor) and V.is_tensor(item) for item in value
+        )
+    return False
+
+
+def _sana_wm_none_or_positive_int(value: Any) -> bool:
+    return value is None or V.positive_int(value)
+
+
+def _sana_wm_condition_inputs_dict(value: Any) -> bool:
+    return value is None or isinstance(value, dict)
+
+
+def _sana_wm_condition_inputs_mutually_compatible(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    if value.get("action") is None:
+        return True
+    return (
+        value.get("camera_to_world") is None
+        and value.get("camera_conditions") is None
+        and value.get("chunk_plucker") is None
+    )
+
+
+def _sana_wm_condition_inputs_motion_params_valid(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    motion_keys = ("translation_speed", "rotation_speed_deg", "pitch_limit_deg")
+    if not any(key in value for key in motion_keys):
+        return True
+    try:
+        validate_sana_wm_motion_params(
+            translation_speed=value.get(
+                "translation_speed", SANA_WM_DEFAULT_TRANSLATION_SPEED
+            ),
+            rotation_speed_deg=value.get(
+                "rotation_speed_deg", SANA_WM_DEFAULT_ROTATION_SPEED_DEG
+            ),
+            pitch_limit_deg=value.get(
+                "pitch_limit_deg", SANA_WM_DEFAULT_PITCH_LIMIT_DEG
+            ),
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _sana_wm_condition_image_not_empty(value: Any) -> bool:
+    return not isinstance(value, list) or len(value) > 0
+
+
+def _sana_wm_camera_conditions_ready(value: Any) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, torch.Tensor)
+        and V.is_tensor(value)
+        and value.dim() == 3
+        and value.shape[-1] == 20
+    )
+
+
+def _sana_wm_chunk_plucker_ready(value: Any) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, torch.Tensor)
+        and V.is_tensor(value)
+        and value.dim() == 5
+        and value.shape[1] == 48
+    )
 
 
 def _to_device_dtype(
@@ -454,9 +573,37 @@ class SanaWMTextEncodingStage(TextEncodingStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        if _sana_wm_stage_tp_world_size() > 1 and not _sana_wm_is_tp_rank0():
+        if sana_wm_stage_tp_world_size() > 1 and not sana_wm_is_tp_rank0():
             return []
         return super().component_uses(server_args, stage_name)
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify SANA-WM text encoding stage inputs."""
+        result = VerificationResult()
+        result.add_check("prompt", batch.prompt, V.string_or_list_strings)
+        result.add_check("text_encoders", self.text_encoders, lambda x: len(x) == 1)
+        result.add_check("tokenizers", self.tokenizers, lambda x: len(x) == 1)
+        result.add_check(
+            "do_classifier_free_guidance",
+            batch.do_classifier_free_guidance,
+            V.bool_value,
+        )
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.is_list)
+        result.add_check(
+            "negative_prompt_embeds",
+            batch.negative_prompt_embeds,
+            _sana_wm_optional_tensor_or_tensor_list_allow_empty,
+        )
+        result.add_check(
+            "negative_prompt",
+            batch.negative_prompt,
+            lambda x: (
+                not batch.do_classifier_free_guidance
+                or _first_tensor(batch.negative_prompt_embeds) is not None
+                or V.string_or_list_strings(x)
+            ),
+        )
+        return result
 
     @staticmethod
     def _text_encoder_max_length(server_args: ServerArgs) -> int:
@@ -517,13 +664,13 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         list[torch.Tensor],
         list[list[int]],
     ]:
-        if _sana_wm_stage_tp_world_size() <= 1:
+        if sana_wm_stage_tp_world_size() <= 1:
             return self.encode_text(*args, **kwargs)
 
         payload = None
-        if _sana_wm_is_tp_rank0():
+        if sana_wm_is_tp_rank0():
             payload = _pack_sana_wm_text_outputs(self.encode_text(*args, **kwargs))
-        payload = _sana_wm_broadcast_tensor_dict_from_tp_rank0(payload)
+        payload = sana_wm_broadcast_tensor_dict_from_tp_rank0(payload)
         return _unpack_sana_wm_text_outputs(payload)
 
     @torch.no_grad()
@@ -582,6 +729,13 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         has_preencoded_negative = (
             _first_tensor(getattr(batch, "negative_prompt_embeds", None)) is not None
         )
+        # Pre-initialise so references below are always bound regardless of which branch runs.
+        neg_embeds_list: list[torch.Tensor] = []
+        neg_masks_list: list[torch.Tensor] = []
+        neg_pooler_embeds_list: list[torch.Tensor] = []
+        neg_embeds_masks_list: list[torch.Tensor] = []
+        neg_seq_lens_list: list[torch.Tensor] = []
+
         if batch.do_classifier_free_guidance and not has_preencoded_negative:
             negative_prompt = batch.negative_prompt
             if not isinstance(negative_prompt, (str, list)) or (
@@ -658,18 +812,148 @@ class SanaWMDenoisingStage(DenoisingStage):
             return StageParallelismType.CFG_PARALLEL
         return StageParallelismType.REPLICATED
 
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        """Run the SANA-WM denoising loop.
+
+        Wraps the base-class ``forward`` with a try/finally so that the
+        pre-computed static conditioning tensors (Plücker emb, prope_fns) that
+        were persisted in ``batch.extra`` by ``SanaWMBeforeDenoisingStage``
+        are always freed — even when a denoising step raises an exception.
+        Without this guard those tensors would remain allocated in GPU memory
+        until the batch object itself is garbage-collected.
+        """
+        try:
+            return super().forward(batch, server_args)
+        except BaseException:
+            # Ensure large pre-computed tensors are released on the error path.
+            # _finalize_denoising_loop (happy path) handles this for successful runs.
+            _clear_sana_wm_precomputed_static_conditioning(batch)
+            clear_sana_wm_request_runtime_cache(batch)
+            raise
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify SANA-WM denoising stage inputs."""
+        result = VerificationResult()
+        result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
+        result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
+        result.add_check(
+            "prompt_embeds",
+            batch.prompt_embeds,
+            _sana_wm_tensor_or_tensor_list,
+        )
+        result.add_check("image_embeds", batch.image_embeds, V.is_list)
+        result.add_check(
+            "num_inference_steps", batch.num_inference_steps, V.positive_int
+        )
+        result.add_check(
+            "guidance_scale",
+            _sana_wm_effective_guidance_scale(batch),
+            V.non_negative_float,
+        )
+        result.add_check("eta", batch.eta, V.non_negative_float)
+        result.add_check("generator", batch.generator, V.generator_or_list_generators)
+        result.add_check(
+            "do_classifier_free_guidance",
+            batch.do_classifier_free_guidance,
+            V.bool_value,
+        )
+        result.add_check(
+            "negative_prompt_embeds",
+            batch.negative_prompt_embeds,
+            (
+                _sana_wm_tensor_or_tensor_list
+                if _sana_wm_should_do_cfg(batch)
+                else _sana_wm_optional_tensor_or_tensor_list_allow_empty
+            ),
+        )
+        extra = getattr(batch, "extra", None)
+        result.add_check("extra", extra, lambda x: x is None or isinstance(x, dict))
+        extra = extra or {}
+        result.add_check(
+            "camera_conditions",
+            extra.get("camera_conditions"),
+            _sana_wm_camera_conditions_ready,
+        )
+        result.add_check(
+            "chunk_plucker",
+            extra.get("chunk_plucker"),
+            _sana_wm_chunk_plucker_ready,
+        )
+        return result
+
+    @staticmethod
+    def _write_serial_cfg_latent_model_input(
+        buffer: torch.Tensor,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = latents.shape[0]
+        expected_shape = (batch_size * 2, *latents.shape[1:])
+        if tuple(buffer.shape) != expected_shape:
+            raise ValueError(
+                "SANA-WM serial CFG latent buffer shape mismatch: expected "
+                f"{expected_shape}, got {tuple(buffer.shape)}."
+            )
+        buffer[:batch_size].copy_(latents)
+        buffer[batch_size:].copy_(latents)
+        return buffer
+
+    @staticmethod
+    def _prepare_step_timesteps(
+        step_timestep: torch.Tensor,
+        frame_condition_limit: torch.Tensor,
+        token_condition_limit: torch.Tensor,
+        *,
+        do_cfg: bool,
+        cfg_parallel: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        timestep = step_timestep.float()
+        model_timestep = torch.minimum(
+            timestep.expand(frame_condition_limit.shape),
+            frame_condition_limit,
+        )
+        if do_cfg and not cfg_parallel:
+            model_timestep = torch.cat([model_timestep, model_timestep], dim=0)
+        per_token_timesteps = torch.minimum(
+            timestep.expand(token_condition_limit.shape),
+            token_condition_limit,
+        )
+        return model_timestep, per_token_timesteps
+
+    @staticmethod
+    def _combine_serial_cfg_noise_in_place(
+        noise_pred: torch.Tensor,
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        return noise_pred_text.sub_(noise_pred_uncond).mul_(guidance_scale).add_(
+            noise_pred_uncond
+        )
+
     @staticmethod
     def _combine_cfg_parallel_noise(
         noise_pred: torch.Tensor,
         guidance_scale: float,
         cfg_rank: int,
     ) -> torch.Tensor:
+        """Combine CFG branches across exactly 2 CFG-parallel ranks.
+
+        Rank 0 holds the positive-branch prediction, rank 1 holds the
+        negative-branch prediction.  The all-reduce sums the two scaled
+        contributions so every rank ends up with the full CFG output.
+
+        ``cfg_world_size != 2`` is rejected at the start of the denoising loop,
+        so ``cfg_rank`` is always 0 or 1 here.
+        """
+        if cfg_rank not in (0, 1):
+            raise ValueError(
+                "SANA-WM CFG parallel combine expects cfg_rank 0 or 1, "
+                f"got cfg_rank={cfg_rank}."
+            )
         if cfg_rank == 0:
             partial = guidance_scale * noise_pred
-        elif cfg_rank == 1:
-            partial = (1.0 - guidance_scale) * noise_pred
         else:
-            partial = torch.zeros_like(noise_pred)
+            partial = (1.0 - guidance_scale) * noise_pred
         return cfg_model_parallel_all_reduce(partial)
 
     def _prepare_denoising_loop(
@@ -769,11 +1053,15 @@ class SanaWMDenoisingStage(DenoisingStage):
 
         cfg_parallel = bool(server_args.enable_cfg_parallel and do_cfg)
         cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel else 0
-        if cfg_parallel and get_classifier_free_guidance_world_size() > 2:
-            logger.warning_once(
-                "SANA-WM CFG parallel uses two guidance branches; extra CFG ranks "
-                "skip transformer forwards and contribute zeros."
-            )
+        if cfg_parallel:
+            cfg_world_size = get_classifier_free_guidance_world_size()
+            if cfg_world_size != 2:
+                raise ValueError(
+                    f"SANA-WM CFG parallel requires exactly 2 CFG ranks (one for "
+                    f"the positive branch, one for the negative branch), but "
+                    f"cfg_world_size={cfg_world_size}. "
+                    "Set --cfg-parallel-size 2 (or disable with --no-cfg-parallel)."
+                )
 
         if cfg_parallel:
             if cfg_rank == 1:
@@ -831,12 +1119,21 @@ class SanaWMDenoisingStage(DenoisingStage):
             model_kwargs,
         )
 
-        condition_mask_input = (
-            condition_mask
-            if cfg_parallel or not do_cfg
-            else torch.cat([condition_mask, condition_mask], dim=0)
+        serial_cfg_latent_model_input = (
+            torch.empty(
+                (latents.shape[0] * 2, *latents.shape[1:]),
+                device=latents.device,
+                dtype=latents.dtype,
+            )
+            if do_cfg and not cfg_parallel
+            else None
         )
-        timestep_condition_limit = (1.0 - condition_mask_input.float()) * 1000.0
+        timestep_frame_condition_limit = (
+            1.0 - condition_mask[:, :, :, 0, 0].float()
+        ) * 1000.0
+        timestep_token_condition_limit = (
+            1.0 - condition_mask.flatten(2).squeeze(1).float()
+        ) * 1000.0
 
         self.log_info(
             "SANA-WM flow_euler_ltx denoising: latent=%s, steps=%d, cfg=%s, "
@@ -876,13 +1173,14 @@ class SanaWMDenoisingStage(DenoisingStage):
                 "cfg_parallel": cfg_parallel,
                 "cfg_rank": cfg_rank,
                 "condition_mask": condition_mask,
-                "condition_mask_input": condition_mask_input,
                 "do_cfg": do_cfg,
                 "guidance_scale": guidance_scale,
                 "init_condition_latents": init_condition_latents,
                 "model_kwargs": model_kwargs,
+                "serial_cfg_latent_model_input": serial_cfg_latent_model_input,
                 "start_time": time.perf_counter(),
-                "timestep_condition_limit": timestep_condition_limit,
+                "timestep_frame_condition_limit": timestep_frame_condition_limit,
+                "timestep_token_condition_limit": timestep_token_condition_limit,
             },
         )
 
@@ -907,37 +1205,37 @@ class SanaWMDenoisingStage(DenoisingStage):
         cfg_parallel = bool(ctx.extra["cfg_parallel"])
         cfg_rank = int(ctx.extra["cfg_rank"])
         condition_mask = ctx.extra["condition_mask"]
-        condition_mask_input = ctx.extra["condition_mask_input"]
         do_cfg = bool(ctx.extra["do_cfg"])
         model_kwargs = ctx.extra["model_kwargs"]
-        timestep_condition_limit = ctx.extra["timestep_condition_limit"]
 
         if cfg_parallel:
             latent_model_input = ctx.latents
-        else:
-            latent_model_input = (
-                torch.cat([ctx.latents, ctx.latents], dim=0)
-                if do_cfg
-                else ctx.latents
+        elif do_cfg:
+            latent_model_input = self._write_serial_cfg_latent_model_input(
+                ctx.extra["serial_cfg_latent_model_input"],
+                ctx.latents,
             )
-
-        timestep = step.t_device.expand(condition_mask_input.shape).float()
-        timestep = torch.minimum(timestep, timestep_condition_limit)
-        model_timestep = timestep[:, :1, :, 0, 0]
-
-        if cfg_parallel and cfg_rank > 1:
-            noise_pred = torch.zeros_like(ctx.latents, dtype=ctx.target_dtype)
         else:
-            with set_forward_context(
-                current_timestep=step.step_index,
-                attn_metadata=None,
-                forward_batch=batch,
-            ):
-                noise_pred = step.current_model(
-                    hidden_states=latent_model_input.to(ctx.target_dtype),
-                    timestep=model_timestep,
-                    **model_kwargs,
-                )
+            latent_model_input = ctx.latents
+
+        model_timestep, per_token_timesteps = self._prepare_step_timesteps(
+            step.t_device,
+            ctx.extra["timestep_frame_condition_limit"],
+            ctx.extra["timestep_token_condition_limit"],
+            do_cfg=do_cfg,
+            cfg_parallel=cfg_parallel,
+        )
+
+        with set_forward_context(
+            current_timestep=step.step_index,
+            attn_metadata=None,
+            forward_batch=batch,
+        ):
+            noise_pred = step.current_model(
+                hidden_states=latent_model_input.to(ctx.target_dtype),
+                timestep=model_timestep,
+                **model_kwargs,
+            )
 
         if do_cfg:
             guidance_scale = float(ctx.extra["guidance_scale"])
@@ -946,11 +1244,10 @@ class SanaWMDenoisingStage(DenoisingStage):
                     noise_pred, guidance_scale, cfg_rank
                 )
             else:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
+                noise_pred = self._combine_serial_cfg_noise_in_place(
+                    noise_pred,
+                    guidance_scale,
                 )
-                timestep = timestep.chunk(2)[0]
 
         latents_dtype = ctx.latents.dtype
         latents_shape = ctx.latents.shape
@@ -959,7 +1256,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             -noise_pred.reshape(batch_size, channels, -1).transpose(1, 2),
             step.t_device,
             ctx.latents.reshape(batch_size, channels, -1).transpose(1, 2),
-            per_token_timesteps=timestep.reshape(batch_size, 1, -1)[:, 0],
+            per_token_timesteps=per_token_timesteps,
             return_dict=False,
         )[0]
         denoised_latents = scheduler_output.transpose(1, 2).reshape(latents_shape)
@@ -985,9 +1282,7 @@ class SanaWMDenoisingStage(DenoisingStage):
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         clear_sana_wm_request_runtime_cache(batch)
-        if getattr(batch, "extra", None) is not None:
-            batch.extra.pop(_SANA_WM_PRECOMPUTED_PROPE_FNS_KEY, None)
-            batch.extra.pop(_SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY, None)
+        _clear_sana_wm_precomputed_static_conditioning(batch)
 
         log_sana_wm_tensor_stats("denoise.output_latents", ctx.latents)
         unchanged = (
@@ -1044,6 +1339,69 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             )
         return uses
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify SANA-WM before-denoising stage inputs."""
+        result = VerificationResult()
+        pipeline_config = getattr(server_args, "pipeline_config", self.pipeline_config)
+        vae_stride = getattr(pipeline_config, "vae_stride", (8, 32, 32))
+        height_stride = int(vae_stride[1])
+        width_stride = int(vae_stride[2] if len(vae_stride) > 2 else height_stride)
+
+        result.add_check(
+            "condition_image",
+            getattr(batch, "condition_image", None),
+            [V.not_none, _sana_wm_condition_image_not_empty],
+        )
+        result.add_check(
+            "height",
+            batch.height,
+            [V.positive_int, V.divisible(height_stride)],
+        )
+        result.add_check(
+            "width",
+            batch.width,
+            [V.positive_int, V.divisible(width_stride)],
+        )
+        result.add_check(
+            "num_frames",
+            getattr(batch, "num_frames", None),
+            _sana_wm_none_or_positive_int,
+        )
+        result.add_check(
+            "num_inference_steps",
+            batch.num_inference_steps,
+            V.positive_int,
+        )
+        result.add_check(
+            "prompt_embeds",
+            batch.prompt_embeds,
+            _sana_wm_tensor_or_tensor_list,
+        )
+        result.add_check(
+            "guidance_scale",
+            _sana_wm_effective_guidance_scale(batch),
+            V.non_negative_float,
+        )
+        result.add_check(
+            "negative_prompt_embeds",
+            batch.negative_prompt_embeds,
+            (
+                _sana_wm_tensor_or_tensor_list
+                if _sana_wm_should_do_cfg(batch)
+                else _sana_wm_optional_tensor_or_tensor_list_allow_empty
+            ),
+        )
+        result.add_check(
+            "condition_inputs",
+            getattr(batch, "condition_inputs", None),
+            [
+                _sana_wm_condition_inputs_dict,
+                _sana_wm_condition_inputs_mutually_compatible,
+                _sana_wm_condition_inputs_motion_params_valid,
+            ],
+        )
+        return result
+
     @torch.no_grad()
     def _vae_encode_image(
         self,
@@ -1054,17 +1412,16 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         """Encode a single image frame through the VAE encoder."""
         vae = self.vae
         configure_sana_wm_ltx2_vae_for_long_video(vae, self.pipeline_config)
-        vae_dtype_map = {
-            "bf16": torch.bfloat16,
-            "fp16": torch.float16,
-            "fp32": torch.float32,
-        }
-        vae_dtype = vae_dtype_map.get(
+        vae_dtype = PRECISION_TO_TYPE.get(
             self.pipeline_config.vae_precision, torch.bfloat16
         )
 
-        # Normalize image to [-1, 1] range expected by the VAE
-        if image.max() > 1.01:
+        # Normalize to [0, 1] then shift to [-1, 1] as expected by the VAE.
+        # uint8 tensors are always in [0, 255]; for float tensors the caller
+        # should supply [0, 1] values — we accept both for robustness.
+        if not image.is_floating_point():
+            image = image.float() / 255.0
+        elif image.max() > 1.5:
             image = image / 255.0
         image = (image * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
 
@@ -1118,23 +1475,34 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
     @staticmethod
     def _extract_vae_latents(encoded: Any) -> torch.Tensor:
-        """Return deterministic VAE latents from common Diffusers outputs."""
-        latent_dist = getattr(encoded, "latent_dist", None)
-        if latent_dist is not None:
-            if hasattr(latent_dist, "mode"):
-                return latent_dist.mode()
-            mean = getattr(latent_dist, "mean", None)
-            if isinstance(mean, torch.Tensor):
-                return mean
-            if callable(mean):
-                return mean()
-            if hasattr(latent_dist, "sample"):
-                return latent_dist.sample()
+        """Return deterministic VAE latents from common Diffusers encode() outputs.
 
-        if isinstance(encoded, tuple) and encoded:
-            return SanaWMBeforeDenoisingStage._extract_vae_latents(encoded[0])
-        if isinstance(encoded, torch.Tensor):
-            return encoded
+        Handles DiagonalGaussianDistribution (latent_dist attribute), plain
+        tensors, and tuple wrappers — up to 8 nesting levels to guard against
+        infinite loops from unexpected encoder return types.
+        """
+        for _ in range(8):
+            if isinstance(encoded, torch.Tensor):
+                return encoded
+
+            latent_dist = getattr(encoded, "latent_dist", None)
+            if latent_dist is not None:
+                if hasattr(latent_dist, "mode"):
+                    return latent_dist.mode()
+                mean = getattr(latent_dist, "mean", None)
+                if isinstance(mean, torch.Tensor):
+                    return mean
+                if callable(mean):
+                    return mean()
+                if hasattr(latent_dist, "sample"):
+                    return latent_dist.sample()
+
+            if isinstance(encoded, tuple) and encoded:
+                encoded = encoded[0]
+                continue
+
+            break
+
         raise TypeError(
             "Unsupported VAE encode output for SANA-WM first-frame conditioning: "
             f"{type(encoded).__name__}"
@@ -1220,25 +1588,47 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
     @staticmethod
     def _canonical_condition_image_tensor(image: torch.Tensor) -> torch.Tensor:
-        """Return image as NCHW RGB float tensor without changing its value range."""
+        """Return image as NCHW RGB float tensor without changing its value range.
+
+        Accepted input layouts:
+          - NCHW  (N, 1|3|4, H, W)
+          - NHWC  (N, H, W, 1|3|4)
+          - CHW   (1|3|4, H, W) — only when the channel dim is unambiguous
+          - HWC   (H, W, 1|3|4) — only when the channel dim is unambiguous
+          - NCFHW singleton-video (N, C, 1, H, W) → squeezed to NCHW
+
+        Raises ``ValueError`` when the layout is ambiguous (both leading and
+        trailing dimension fall in the channel-count set {1, 3, 4}) so callers
+        get an explicit error instead of a silently wrong layout.
+        """
+        _CHANNEL_COUNTS = {1, 3, 4}
         image = image.float()
         if image.dim() == 5 and image.shape[2] == 1:
             image = image.squeeze(2)
         if image.dim() == 3:
-            if image.shape[0] in (1, 3, 4):
-                image = image.unsqueeze(0)
-            elif image.shape[-1] in (1, 3, 4):
-                image = image.permute(2, 0, 1).unsqueeze(0)
+            c_first, c_last = image.shape[0], image.shape[-1]
+            is_channel_first = c_first in _CHANNEL_COUNTS
+            is_channel_last = c_last in _CHANNEL_COUNTS
+            if is_channel_first and not is_channel_last:
+                image = image.unsqueeze(0)  # CHW → NCHW
+            elif is_channel_last and not is_channel_first:
+                image = image.permute(2, 0, 1).unsqueeze(0)  # HWC → NCHW
+            elif is_channel_first and is_channel_last:
+                raise ValueError(
+                    f"Ambiguous condition_image tensor shape {tuple(image.shape)}: "
+                    f"both leading dim ({c_first}) and trailing dim ({c_last}) look "
+                    "like channel counts (1, 3, or 4). Pass an explicit NCHW tensor."
+                )
             else:
                 raise ValueError(
-                    "condition_image tensor must be CHW or HWC with 1, 3, "
-                    f"or 4 channels; got {tuple(image.shape)}."
+                    "condition_image tensor must be CHW or HWC with 1, 3, or 4 "
+                    f"channels; got shape {tuple(image.shape)}."
                 )
         elif image.dim() == 4:
-            if image.shape[1] in (1, 3, 4):
-                pass
-            elif image.shape[-1] in (1, 3, 4):
-                image = image.permute(0, 3, 1, 2)
+            if image.shape[1] in _CHANNEL_COUNTS:
+                pass  # already NCHW
+            elif image.shape[-1] in _CHANNEL_COUNTS:
+                image = image.permute(0, 3, 1, 2)  # NHWC → NCHW
             else:
                 raise ValueError(
                     "condition_image tensor must be NCHW or NHWC with 1, 3, "
@@ -1388,7 +1778,38 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         out[..., 1] *= sy
         out[..., 3] = out[..., 3] * sy - top
         return out
-    
+
+    @staticmethod
+    def _set_condition_image_preprocess_info(
+        batch: Req | None,
+        preprocess_info: Any,
+    ) -> None:
+        if batch is None:
+            return
+        if not hasattr(batch, "extra") or batch.extra is None:
+            batch.extra = {}
+        batch.extra[_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY] = preprocess_info
+
+    @staticmethod
+    def _splice_first_frame_latent(
+        latents: torch.Tensor,
+        first_frame_z: torch.Tensor,
+    ) -> torch.Tensor:
+        B = latents.shape[0]
+        first_frame_z = first_frame_z.to(device=latents.device, dtype=latents.dtype)
+        if first_frame_z.shape[0] == 1 and B > 1:
+            first_frame_z = first_frame_z.expand(B, -1, -1, -1, -1)
+        elif first_frame_z.shape[0] != B:
+            raise ValueError(
+                "SANA-WM first-frame latent batch does not match noise batch: "
+                f"{first_frame_z.shape[0]} vs {B}."
+            )
+
+        latents = latents.clone()
+        latents[:, :, 0:1] = first_frame_z
+        log_sana_wm_tensor_stats("latents.after_first_frame_splice", latents)
+        return latents
+
 
     @torch.no_grad()
     def _splice_first_frame(
@@ -1417,14 +1838,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 self._vae_encode_image(img_tensor, dtype, device)
             )
 
-        if batch is not None:
-            if not hasattr(batch, "extra") or batch.extra is None:
-                batch.extra = {}
-            batch.extra[_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY] = (
-                preprocess_infos[0]
-                if len(preprocess_infos) == 1
-                else preprocess_infos
-            )
+        preprocess_info_for_batch = (
+            preprocess_infos[0] if len(preprocess_infos) == 1 else preprocess_infos
+        )
+        self._set_condition_image_preprocess_info(batch, preprocess_info_for_batch)
         self.log_info(
             "First-frame condition image preprocessed: source=%s, resized=%s, "
             "crop_offset=%s, target=%s.",
@@ -1439,19 +1856,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             )
 
         first_frame_z = torch.cat(first_frame_latents, dim=0)
-        if first_frame_z.shape[0] == 1 and B > 1:
-            first_frame_z = first_frame_z.expand(B, -1, -1, -1, -1)
-        elif first_frame_z.shape[0] != B:
-            raise ValueError(
-                "SANA-WM first-frame latent batch does not match noise batch: "
-                f"{first_frame_z.shape[0]} vs {B}."
-            )
-
-        # Splice: replace the first temporal latent frame
-        latents = latents.clone()
-        latents[:, :, 0:1] = first_frame_z
-        log_sana_wm_tensor_stats("latents.after_first_frame_splice", latents)
-        return latents
+        return self._splice_first_frame_latent(latents, first_frame_z)
 
     @staticmethod
     def _condition_images_for_batch(condition_image: Any, batch_size: int) -> list[Any]:
@@ -1616,19 +2021,20 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 source = (
                     "action" if intrinsics is not None else "action_default_intrinsics"
                 )
-                translation_speed = float(
-                    condition_inputs.get(
-                        "translation_speed", _SANA_WM_DEFAULT_TRANSLATION_SPEED
-                    )
-                )
-                rotation_speed_deg = float(
-                    condition_inputs.get(
-                        "rotation_speed_deg", _SANA_WM_DEFAULT_ROTATION_SPEED_DEG
-                    )
-                )
-                pitch_limit_deg = float(
-                    condition_inputs.get(
-                        "pitch_limit_deg", _SANA_WM_DEFAULT_PITCH_LIMIT_DEG
+                translation_speed, rotation_speed_deg, pitch_limit_deg = (
+                    validate_sana_wm_motion_params(
+                        translation_speed=condition_inputs.get(
+                            "translation_speed",
+                            SANA_WM_DEFAULT_TRANSLATION_SPEED,
+                        ),
+                        rotation_speed_deg=condition_inputs.get(
+                            "rotation_speed_deg",
+                            SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
+                        ),
+                        pitch_limit_deg=condition_inputs.get(
+                            "pitch_limit_deg",
+                            SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
+                        ),
                     )
                 )
                 camera_to_world = coerce_sana_wm_action_camera_to_world(
@@ -1660,8 +2066,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                         dtype=camera_compute_dtype,
                     )
                     self.log_info(
-                        "No intrinsics provided; using heuristic centered "
-                        "intrinsics for the action trajectory."
+                        "No intrinsics provided; using centered pinhole "
+                        "intrinsics with default horizontal FOV %.2f deg for "
+                        "the action trajectory. Pass request intrinsics for "
+                        "camera-accurate geometry.",
+                        sana_wm_default_horizontal_fov_deg(),
                     )
                 else:
                     intrinsics_vec4 = coerce_sana_wm_intrinsics_vec4(
@@ -1698,8 +2107,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                         dtype=camera_compute_dtype,
                     )
                     self.log_info(
-                        "No intrinsics provided; using heuristic centered "
-                        "intrinsics for the request camera trajectory."
+                        "No intrinsics provided; using centered pinhole "
+                        "intrinsics with default horizontal FOV %.2f deg for "
+                        "the request camera trajectory. Pass request "
+                        "intrinsics for camera-accurate geometry.",
+                        sana_wm_default_horizontal_fov_deg(),
                     )
                 else:
                     intrinsics_vec4 = coerce_sana_wm_intrinsics_vec4(
@@ -1742,8 +2154,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 source = "default_static"
                 self.log_info(
                     "No camera trajectory provided; using a static identity "
-                    "camera with heuristic centered intrinsics. Pass "
-                    "camera_to_world/intrinsics for camera-controlled output."
+                    "camera with centered pinhole intrinsics at default "
+                    "horizontal FOV %.2f deg. Pass camera_to_world/intrinsics "
+                    "for camera-controlled output.",
+                    sana_wm_default_horizontal_fov_deg(),
                 )
                 camera_to_world, intrinsics_vec4 = default_sana_wm_static_camera(
                     batch_size=batch_size,
@@ -1855,8 +2269,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 else self.transformer
             )
             prepare_static = getattr(
-                transformer, "prepare_sana_wm_static_conditioning"
+                transformer, "prepare_sana_wm_static_conditioning", None
             )
+            if prepare_static is None:
+                return {}
             static_kwargs = prepare_static(
                 camera_conditions=model_camera_conditions,
                 chunk_plucker=model_chunk_plucker,
@@ -1864,9 +2280,15 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             )
 
         if static_kwargs:
+            plucker_bytes = 0
+            plucker_emb = static_kwargs.get(_SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY)
+            if isinstance(plucker_emb, torch.Tensor):
+                plucker_bytes = plucker_emb.numel() * plucker_emb.element_size()
             self.log_info(
-                "SANA-WM transformer static conditioning prepared: %s",
+                "SANA-WM transformer static conditioning prepared: %s "
+                "(plucker_emb_mb=%.2f)",
                 sorted(static_kwargs.keys()),
+                plucker_bytes / (1024 * 1024),
             )
         return static_kwargs
 
@@ -1880,13 +2302,16 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         num_inference_steps = batch.num_inference_steps
 
-        flow_shift = getattr(
-            self.pipeline_config,
-            "inference_flow_shift",
-            None,
-        )
+        flow_shift = getattr(batch, "flow_shift", None)
+        if flow_shift is None:
+            flow_shift = getattr(
+                self.pipeline_config,
+                "inference_flow_shift",
+                None,
+            )
         if flow_shift is None:
             flow_shift = getattr(self.pipeline_config, "flow_shift", 9.95)
+        flow_shift = float(flow_shift)
         kwargs = {}
 
         # diffusers FlowMatchEulerDiscreteScheduler supports mu/shift
@@ -1919,6 +2344,17 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         batch.scheduler = scheduler
         return batch
 
+    def _adjust_num_frames_for_request(self, batch: Req) -> int:
+        requested_num_frames = batch.num_frames or 49
+        action_num_frames = self._action_num_frames_for_request(batch)
+        if action_num_frames is not None and action_num_frames != requested_num_frames:
+            self.log_info(
+                "SANA-WM action trajectory has %d frames; keeping requested "
+                "num_frames=%d and padding/trimming the action trajectory.",
+                action_num_frames,
+                requested_num_frames,
+            )
+        return self.pipeline_config.adjust_num_frames(requested_num_frames)
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -1934,20 +2370,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         )
         if not hasattr(batch, "extra") or batch.extra is None:
             batch.extra = {}
+        _clear_sana_wm_precomputed_static_conditioning(batch)
 
         # --- 0. Adjust num_frames to be compatible with VAE temporal stride ---
-        requested_num_frames = batch.num_frames or 49
-        action_num_frames = self._action_num_frames_for_request(batch)
-        if action_num_frames is not None and action_num_frames < requested_num_frames:
-            self.log_info(
-                "SANA-WM action trajectory has %d frames; capping requested "
-                "num_frames=%d before VAE stride adjustment.",
-                action_num_frames,
-                requested_num_frames,
-            )
-            requested_num_frames = action_num_frames
-        num_frames = requested_num_frames
-        num_frames = self.pipeline_config.adjust_num_frames(num_frames)
+        num_frames = self._adjust_num_frames_for_request(batch)
         batch.num_frames = num_frames
         self.log_info(
             "SANA-WM prepare: seed=%s, size=%dx%d, frames=%d, "

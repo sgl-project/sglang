@@ -147,7 +147,10 @@ def _configured_sana_wm_cfg_parallel_degree(server_args: ServerArgs) -> int:
     if not getattr(server_args, "enable_cfg_parallel", False):
         return 1
     try:
-        return max(int(getattr(server_args, "cfg_parallel_degree", 2) or 2), 1)
+        value = getattr(server_args, "cfg_parallel_degree", 2)
+        if value is None:
+            return 2
+        return max(int(value), 1)
     except (TypeError, ValueError):
         return 2
 
@@ -190,11 +193,11 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
 
         if getattr(server_args, "enable_cfg_parallel", False):
             cfg_parallel_degree = _configured_sana_wm_cfg_parallel_degree(server_args)
-            if cfg_parallel_degree > 2:
+            if cfg_parallel_degree != 2:
                 raise ValueError(
-                    "SANA-WM CFG parallelism only has two useful branches "
+                    "SANA-WM CFG parallelism requires exactly two branches "
                     "(positive and negative prompt). "
-                    f"Expected cfg_parallel_degree <= 2, got {cfg_parallel_degree}."
+                    f"Expected cfg_parallel_degree == 2, got {cfg_parallel_degree}."
                 )
 
         sp_degree = getattr(server_args, "sp_degree", 1) or 1

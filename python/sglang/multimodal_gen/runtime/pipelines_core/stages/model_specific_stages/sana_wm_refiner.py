@@ -31,11 +31,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMDecodingStage,
-    _sana_wm_broadcast_tensor_dict_from_tp_rank0,
-    _sana_wm_is_tp_rank0,
-    _sana_wm_stage_tp_world_size,
+    sana_wm_broadcast_tensor_dict_from_tp_rank0,
+    sana_wm_is_tp_rank0,
+    sana_wm_stage_tp_world_size,
     log_sana_wm_tensor_stats,
     sana_wm_diagnostics_enabled,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+    VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -119,6 +123,44 @@ def sana_wm_skip_refiner_enabled(
 def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
     precision = getattr(server_args.pipeline_config, "dit_precision", "bf16")
     return PRECISION_TO_TYPE.get(precision, torch.bfloat16)
+
+
+def _refiner_prompt_value(batch: Req) -> Any:
+    extra = getattr(batch, "extra", None) or {}
+    prompt = extra.get("refiner_prompt")
+    return getattr(batch, "prompt", None) if prompt is None else prompt
+
+
+def _refiner_prompt_matches_batch(batch_size: int | None):
+    def validator(value: Any) -> bool:
+        if batch_size is None:
+            return False
+        if isinstance(value, str):
+            return True
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return len(value) in (1, batch_size)
+        return False
+
+    return validator
+
+
+def _refiner_seeds_match_batch(batch_size: int | None):
+    def validator(value: Any) -> bool:
+        if value is None:
+            return True
+        if batch_size is None:
+            return False
+        if not isinstance(value, (list, tuple)):
+            return False
+        if not all(isinstance(item, int) for item in value):
+            return False
+        return len(value) in (1, batch_size)
+
+    return validator
+
+
+def _refiner_fps_valid(value: Any) -> bool:
+    return value is None or (isinstance(value, (int, float)) and value > 0)
 
 
 def _is_current_cfg_main_rank() -> bool:
@@ -476,7 +518,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         stage_name = self._component_stage_name(stage_name)
         if (
             _uses_native_refiner_tp_group(self.transformer, server_args)
-            and not _sana_wm_is_tp_rank0()
+            and not sana_wm_is_tp_rank0()
         ):
             return [
                 ComponentUse(
@@ -508,6 +550,43 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             ),
         ]
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify SANA-WM LTX-2 refiner stage inputs."""
+        result = VerificationResult()
+        result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
+        result.add_check(
+            "extra",
+            getattr(batch, "extra", None),
+            lambda x: x is None or isinstance(x, dict),
+        )
+
+        latents = batch.latents if isinstance(batch.latents, torch.Tensor) else None
+        batch_size = (
+            int(latents.shape[0])
+            if latents is not None and latents.dim() == 5
+            else None
+        )
+        if not sana_wm_skip_refiner_enabled(
+            batch,
+            pipeline_config=getattr(server_args, "pipeline_config", None),
+        ):
+            result.add_check(
+                "refiner_prompt",
+                _refiner_prompt_value(batch),
+                _refiner_prompt_matches_batch(batch_size),
+            )
+            result.add_check(
+                "fps",
+                getattr(batch, "fps", 16),
+                _refiner_fps_valid,
+            )
+            result.add_check(
+                "seeds",
+                getattr(batch, "seeds", None),
+                _refiner_seeds_match_batch(batch_size),
+            )
+        return result
+
     @staticmethod
     def _prompts_for_batch(batch: Req, batch_size: int) -> list[str]:
         prompt = batch.extra.get("refiner_prompt") if batch.extra else None
@@ -532,7 +611,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._should_broadcast_prompt_encoding_over_tp():
             payload = None
-            if _sana_wm_is_tp_rank0():
+            if sana_wm_is_tp_rank0():
                 prompt_embeds, attention_mask = self._encode_prompts_local(
                     prompts, device
                 )
@@ -540,19 +619,20 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                     "prompt_embeds": prompt_embeds,
                     "attention_mask": attention_mask,
                 }
-            payload = _sana_wm_broadcast_tensor_dict_from_tp_rank0(payload)
-            return (
+            payload = sana_wm_broadcast_tensor_dict_from_tp_rank0(payload)
+            outputs = (
                 payload["prompt_embeds"].to(device=device, dtype=self.dtype),
                 payload["attention_mask"].to(device=device),
             )
-
-        return self._encode_prompts_local(prompts, device)
+        else:
+            return self._encode_prompts_local(prompts, device)
+        return outputs
 
     def _should_broadcast_prompt_encoding_over_tp(self) -> bool:
         server_args = getattr(self, "server_args", None)
         return (
             _uses_native_refiner_tp_group(self.transformer, server_args)
-            and _sana_wm_stage_tp_world_size() > 1
+            and sana_wm_stage_tp_world_size() > 1
         )
 
     @torch.inference_mode()
@@ -862,7 +942,12 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         else:
             seeds = [int(getattr(batch, "seed", 0) or 0)] * batch_size
 
-        refined = self._refine_batch(batch.latents, prompts, fps=fps, seeds=seeds)
+        refined = self._refine_batch(
+            batch.latents,
+            prompts,
+            fps=fps,
+            seeds=seeds,
+        )
         batch.latents = refined.to(
             device=batch.latents.device, dtype=batch.latents.dtype
         )

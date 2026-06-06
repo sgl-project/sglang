@@ -16,7 +16,7 @@ class SanaWMArchConfig(DiTArchConfig):
     out_channels: int = 128
     num_layers: int = 20
 
-    # Patch embedder uses (1, patch_size, patch_size) — temporal patch is always 1.
+    # Patch embedder uses (1, patch_size, patch_size); temporal patch is always 1.
     patch_size_t: int = 1
 
     num_attention_heads: int = 20
@@ -59,7 +59,7 @@ class SanaWMArchConfig(DiTArchConfig):
     init_cam_from_base: bool = True
     use_chunk_plucker_post_attn: bool = True
     use_chunk_plucker_input: bool = False
-    chunk_plucker_channels: int = 48  # 8 orig frames × 6D Plücker
+    chunk_plucker_channels: int = 48  # 8 orig frames x 6D Plucker
     chunk_plucker_post_attn_blocks: int = 20
 
     chunk_split_strategy: str = "first_chunk_plus_one"
@@ -75,6 +75,9 @@ class SanaWMArchConfig(DiTArchConfig):
     # SGLang-owned Triton kernels for SANA-WM hot-path tensor preprocessing.
     # Enabled by default; users can explicitly disable them for parity checks.
     use_triton_kernels: bool = True
+    # Keep CUDA inference honest by default: if a requested Triton fast path is
+    # missing or fails, raise instead of silently running the slow torch scan.
+    allow_triton_fallback: bool = False
 
     # --- Temporal FFN (GLUMBConvTemp) ---
     ffn_type: str = "GLUMBConvTemp"
@@ -95,7 +98,7 @@ class SanaWMArchConfig(DiTArchConfig):
     # The released checkpoint stores raw upstream parameter names (no leading
     # "transformer." prefix).  The bidirectional checkpoint also contains a
     # legacy `pos_embed` tensor (absolute position embedding) that is no longer
-    # part of the architecture — SANA-WM uses RoPE instead.  Map it to "" so
+    # part of the architecture; SANA-WM uses RoPE instead. Map it to "" so
     # the weight loader skips it rather than raising on the unknown key.
     param_names_mapping: dict = field(
         default_factory=lambda: {
@@ -116,6 +119,7 @@ class SanaWMConfig(DiTConfig):
     use_chunked_softmax_attention: bool | None = None
     pad_attention_head_dim_to_flash: bool | None = None
     use_triton_kernels: bool | None = None
+    allow_triton_fallback: bool | None = None
 
     def apply_user_flags_to_arch_config(self) -> None:
         if self.use_chunked_softmax_attention is not None:
@@ -128,6 +132,8 @@ class SanaWMConfig(DiTConfig):
             )
         if self.use_triton_kernels is not None:
             self.arch_config.use_triton_kernels = self.use_triton_kernels
+        if self.allow_triton_fallback is not None:
+            self.arch_config.allow_triton_fallback = self.allow_triton_fallback
 
     def __post_init__(self):
         self.apply_user_flags_to_arch_config()

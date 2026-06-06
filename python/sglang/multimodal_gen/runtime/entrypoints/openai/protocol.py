@@ -125,6 +125,7 @@ class VideoGenerationsRequest(BaseModel):
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    condition_inputs: Optional[Dict[str, Any]] = None
     # Performance profiling
     perf_dump_path: Optional[str] = None
 

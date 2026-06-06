@@ -261,13 +261,19 @@ class SanaWMPipelineConfig(PipelineConfig):
         return (batch_size, z_dim, T_latent, H_sp, W_sp)
 
     def adjust_num_frames(self, num_frames: int) -> int:
-        """Ensure (num_frames - 1) is divisible by VAE temporal stride."""
+        """Snap to the nearest frame count supported by the VAE temporal stride."""
         t_stride = self.vae_stride[0]
         if (num_frames - 1) % t_stride != 0:
-            adjusted = ((num_frames - 1) // t_stride) * t_stride + 1
+            lower = ((num_frames - 1) // t_stride) * t_stride + 1
+            upper = lower + t_stride
+            adjusted = (
+                lower
+                if num_frames - lower < upper - num_frames
+                else upper
+            )
             logger.warning(
                 f"num_frames - 1 must be divisible by temporal stride {t_stride}. "
-                f"Rounding {num_frames} → {adjusted}."
+                f"Snapping {num_frames} → {adjusted}."
             )
             return adjusted
         return num_frames

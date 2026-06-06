@@ -36,16 +36,39 @@ BiGDN inference path: QK_NORM=1, USE_PRECOMPUTED_RMS=1, SAVE_STATE=0.
 
 from __future__ import annotations
 
+import functools
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
+from threading import Lock
 
 import torch
 import triton
 import triton.language as tl
 
-_CAM_IDENTITY_CACHE: dict[
-    tuple[str, int | None, int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-] = {}
+_CAM_IDENTITY_CACHE_DEFAULT_MAX_BYTES = 128 * 1024 * 1024
+_CAM_IDENTITY_CACHE_DEFAULT_MAX_ENTRIES = 8
+
+# Preallocated 1-element placeholder tensors keyed by (device_str, dtype).
+# Avoids repeated tiny CUDA mallocs in the SKIP_Z fast path.
+_DUMMY_TENSOR_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _get_dummy(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return a cached 1-element placeholder tensor for the given device/dtype."""
+    key = (str(device), dtype)
+    dummy = _DUMMY_TENSOR_CACHE.get(key)
+    if dummy is None:
+        dummy = torch.empty(1, device=device, dtype=dtype)
+        _DUMMY_TENSOR_CACHE[key] = dummy
+    return dummy
+_CAM_IDENTITY_CACHE_MAX_BYTES_ENV = "SGLANG_SANA_WM_CAM_IDENTITY_CACHE_MAX_BYTES"
+_CAM_IDENTITY_CACHE_MAX_ENTRIES_ENV = "SGLANG_SANA_WM_CAM_IDENTITY_CACHE_MAX_ENTRIES"
+_CamIdentityCacheKey = tuple[str, int | None, int, int, int, int]
+_CamIdentityTables = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+_CAM_IDENTITY_CACHE: OrderedDict[_CamIdentityCacheKey, _CamIdentityTables] = OrderedDict()
+_CAM_IDENTITY_CACHE_LOCK = Lock()
 
 # ════════════════════════════════════════════════════════════════
 #  Per-architecture launch config (auto-selected via compute capability)
@@ -594,9 +617,9 @@ def phase_a(
 
     if skip_z:
         # NUM_ONLY callers (camera branch) do not consume the Z scan. Return
-        # placeholders and let Phase B skip all Z loads/stores as well.
-        I_P_z = torch.empty(1, device=qkv.device, dtype=bridge_dtype)
-        B_z = torch.empty(1, device=qkv.device, dtype=torch.float32)
+        # cached 1-element dummies so Phase B can skip all Z loads/stores.
+        I_P_z = _get_dummy(qkv.device, bridge_dtype)
+        B_z = _get_dummy(qkv.device, torch.float32)
         return I_P_kv, A, I_P_z, B_z
 
     I_P_z = torch.empty(BH, F, BLOCK_D, BLOCK_D, device=qkv.device, dtype=bridge_dtype)
@@ -844,7 +867,7 @@ def phase_b_triton(
     decay_flat = decay.reshape(BH, F).contiguous().float()
 
     load_init = init_state_kv is not None
-    dummy = torch.empty(1, device=device, dtype=fdtype)
+    dummy = _get_dummy(device, fdtype)
     full_M = lambda: torch.empty(BH, F, BLOCK_D, BLOCK_D, device=device, dtype=fdtype)
     full_z = lambda: torch.empty(BH, F, BLOCK_D, device=device, dtype=fdtype)
     M_fwd = dummy if direction == 2 else full_M()
@@ -1076,7 +1099,8 @@ def _phase_b_dtile_kernel(
                     tl.store(z_rev_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d_full, z)
 
 
-_PHASE_B_DTILE_ARCH_CACHE: dict = {}  # (dev, dot_prec) -> (d_splits, nw, ns, acc)
+_PHASE_B_DTILE_ARCH_CACHE: dict = {}
+# (dev, major, minor, BLOCK_D, dot_prec) -> (d_splits, nw, ns, acc)
 
 
 # Per-arch D-tile optimum from 2026-04-29 sweep (T=11 B=1 P0 IEEE):
@@ -1091,9 +1115,10 @@ def _pick_phase_b_d_splits(BLOCK_D: int, dot_precision: int = 0):
     `d_splits>1` → use `_phase_b_dtile_kernel` with overrides for nw/ns/acc.
     Override via env: PHASE_B_D_SPLITS, PHASE_B_DTILE_NW, PHASE_B_DTILE_NS,
     PHASE_B_DTILE_ACC (1=True / 0=False).
-    """
-    import os
 
+    Results are cached per CUDA device/capability, ``BLOCK_D``, and precision so
+    heterogeneous devices in the same process do not reuse another GPU's tuning.
+    """
     env_d = os.environ.get("PHASE_B_D_SPLITS", None)
     if env_d is not None:
         d = int(env_d)
@@ -1105,15 +1130,13 @@ def _pick_phase_b_d_splits(BLOCK_D: int, dot_precision: int = 0):
         acc = bool(int(acc_env)) if acc_env is not None else None
         return (d, nw, ns, acc)
     try:
-        import torch
-
         if not torch.cuda.is_available():
             return (1, None, None, None)
         dev = torch.cuda.current_device()
-        cache_key = (dev, dot_precision)
+        cap = torch.cuda.get_device_capability(dev)
+        major, minor = cap[0], cap[1]
+        cache_key = (dev, major, minor, BLOCK_D, dot_precision)
         if cache_key not in _PHASE_B_DTILE_ARCH_CACHE:
-            cap = torch.cuda.get_device_capability(dev)
-            major, minor = cap[0], cap[1]
             if dot_precision == 2:
                 # IEEE fp32: D-tile dominates baseline on every arch (96-config sweep).
                 if major == 8 and minor == 0:
@@ -1154,6 +1177,8 @@ def _pick_phase_b_d_splits(BLOCK_D: int, dot_precision: int = 0):
                     cfg = (1, None, None, None)  # GB10 — baseline wins
                 else:
                     cfg = (1, None, None, None)  # Ada, unknown
+            if cfg[0] < 1 or BLOCK_D % cfg[0] != 0:
+                cfg = (1, None, None, None)
             _PHASE_B_DTILE_ARCH_CACHE[cache_key] = cfg
         return _PHASE_B_DTILE_ARCH_CACHE[cache_key]
     except Exception:
@@ -1874,6 +1899,114 @@ def fused_bigdn_stateful_chunkwise(
 #    2. No Z denominator scan; output is num-only (out = Q @ M, no /Z).
 #       skip_z=True elides Phase A Z; num_only=True elides Phase C den compute.
 # ─────────────────────────────────────────────────────────────────────────────
+def _cam_identity_cache_int_env(env_name: str, default: int) -> int:
+    value = os.getenv(env_name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+@functools.lru_cache(maxsize=1)
+def _cam_identity_cache_max_bytes() -> int:
+    """Return the byte budget for _CAM_IDENTITY_CACHE."""
+    return _cam_identity_cache_int_env(
+        _CAM_IDENTITY_CACHE_MAX_BYTES_ENV,
+        _CAM_IDENTITY_CACHE_DEFAULT_MAX_BYTES,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _cam_identity_cache_max_entries() -> int:
+    """Return the entry limit for _CAM_IDENTITY_CACHE."""
+    return _cam_identity_cache_int_env(
+        _CAM_IDENTITY_CACHE_MAX_ENTRIES_ENV,
+        _CAM_IDENTITY_CACHE_DEFAULT_MAX_ENTRIES,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _cam_identity_cache_disabled() -> bool:
+    """Return True when the cam identity cache is fully disabled."""
+    return (
+        _cam_identity_cache_max_entries() == 0
+        or _cam_identity_cache_max_bytes() == 0
+    )
+
+
+def _cam_identity_cache_device_key(device: torch.device) -> tuple[str, int | None]:
+    if device.type == "cuda":
+        if device.index is not None:
+            return device.type, int(device.index)
+        if torch.cuda.is_available():
+            return device.type, int(torch.cuda.current_device())
+    return device.type, device.index
+
+
+def _cam_identity_tables_nbytes(tables: _CamIdentityTables) -> int:
+    return sum(t.numel() * t.element_size() for t in tables)
+
+
+def _clear_cam_identity_cache() -> None:
+    _cam_identity_cache_max_bytes.cache_clear()
+    _cam_identity_cache_max_entries.cache_clear()
+    _cam_identity_cache_disabled.cache_clear()
+    with _CAM_IDENTITY_CACHE_LOCK:
+        _CAM_IDENTITY_CACHE.clear()
+
+
+def _trim_cam_identity_cache_locked() -> None:
+    max_entries = _cam_identity_cache_max_entries()
+    max_bytes = _cam_identity_cache_max_bytes()
+    if max_entries == 0 or max_bytes == 0:
+        _CAM_IDENTITY_CACHE.clear()
+        return
+
+    while max_entries >= 0 and len(_CAM_IDENTITY_CACHE) > max_entries:
+        _CAM_IDENTITY_CACHE.popitem(last=False)
+
+    if max_bytes < 0:
+        return
+
+    total_bytes = sum(
+        _cam_identity_tables_nbytes(tables)
+        for tables in _CAM_IDENTITY_CACHE.values()
+    )
+    while total_bytes > max_bytes and _CAM_IDENTITY_CACHE:
+        _, tables = _CAM_IDENTITY_CACHE.popitem(last=False)
+        total_bytes -= _cam_identity_tables_nbytes(tables)
+
+
+def _maybe_cache_cam_identity_tables(
+    key: _CamIdentityCacheKey,
+    tables: _CamIdentityTables,
+) -> _CamIdentityTables:
+    if _cam_identity_cache_disabled():
+        return tables
+
+    max_bytes = _cam_identity_cache_max_bytes()
+    table_bytes = _cam_identity_tables_nbytes(tables)
+    if max_bytes >= 0 and table_bytes > max_bytes:
+        return tables
+
+    with _CAM_IDENTITY_CACHE_LOCK:
+        if _cam_identity_cache_disabled():
+            _CAM_IDENTITY_CACHE.clear()
+            return tables
+
+        cached = _CAM_IDENTITY_CACHE.get(key)
+        if cached is not None:
+            _CAM_IDENTITY_CACHE.move_to_end(key)
+            return cached
+
+        _CAM_IDENTITY_CACHE[key] = tables
+        _CAM_IDENTITY_CACHE.move_to_end(key)
+        _trim_cam_identity_cache_locked()
+    return tables
+
+
 def _cam_identity_tables(
     *,
     B: int,
@@ -1881,21 +2014,25 @@ def _cam_identity_tables(
     H: int,
     D: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> _CamIdentityTables:
     """Cached identity RMS/RoPE tables used by ``cam_scan_chunkwise``."""
-    device_index = device.index if device.type == "cuda" else None
-    key = (device.type, device_index, B, N, H * D, D)
-    cached = _CAM_IDENTITY_CACHE.get(key)
-    if cached is not None:
-        return cached
+    device_type, device_index = _cam_identity_cache_device_key(device)
+    key = (device_type, device_index, B, N, H * D, D)
+    if _cam_identity_cache_disabled():
+        _clear_cam_identity_cache()
+    else:
+        with _CAM_IDENTITY_CACHE_LOCK:
+            cached = _CAM_IDENTITY_CACHE.get(key)
+            if cached is not None:
+                _CAM_IDENTITY_CACHE.move_to_end(key)
+                return cached
 
     ones_inv_rms = torch.ones(B, N, device=device, dtype=torch.float32)
     ones_nw = torch.ones(H * D, device=device, dtype=torch.float32)
     ones_cos = torch.ones(N, D, device=device, dtype=torch.float32)
     zeros_sin = torch.zeros(N, D, device=device, dtype=torch.float32)
     cached = (ones_inv_rms, ones_nw, ones_cos, zeros_sin)
-    _CAM_IDENTITY_CACHE[key] = cached
-    return cached
+    return _maybe_cache_cam_identity_tables(key, cached)
 
 
 def cam_scan_chunkwise(
