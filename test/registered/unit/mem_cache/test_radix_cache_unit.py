@@ -142,6 +142,19 @@ class TestRadixKey(unittest.TestCase):
         repr_str = repr(key)
         self.assertIn("...", repr_str)  # Should be truncated
 
+    def test_hash_page_includes_extra_key(self):
+        """Test that hash_page is namespaced by extra_key."""
+        tokens = [1, 2, 3, 4]
+
+        hash_none = RadixKey(tokens, None).hash_page(0, len(tokens))
+        hash_empty = RadixKey(tokens, "").hash_page(0, len(tokens))
+        hash_key1 = RadixKey(tokens, "key1").hash_page(0, len(tokens))
+        hash_key2 = RadixKey(tokens, "key2").hash_page(0, len(tokens))
+
+        self.assertNotEqual(hash_none, hash_empty)
+        self.assertNotEqual(hash_key1, hash_key2)
+        self.assertNotEqual(hash_none, hash_key1)
+
 
 class TestTreeNode(unittest.TestCase):
     """Test cases for TreeNode class."""
@@ -797,6 +810,36 @@ class TestRadixCache(unittest.TestCase):
             self.assertIsNotNone(node.hash_value)
             # Should have 1 page (split at page_size=2)
             self.assertEqual(len(node.hash_value), 1)
+
+    def test_block_hashes_are_isolated_by_extra_key(self):
+        """Test that KV event block hashes differ across extra_key namespaces."""
+        cache = RadixCache.create_simulated(
+            page_size=4,
+            enable_kv_cache_events=True,
+        )
+        tokens = [1, 2, 3, 4]
+
+        cache.insert(InsertParams(key=RadixKey(tokens, "key1"), value=None))
+        events_key1 = [
+            event for event in cache.take_events() if isinstance(event, BlockStored)
+        ]
+
+        match_other_namespace = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens, "key2"))
+        )
+        self.assertEqual(match_other_namespace.prefix_len, 0)
+
+        cache.insert(InsertParams(key=RadixKey(tokens, "key2"), value=None))
+        events_key2 = [
+            event for event in cache.take_events() if isinstance(event, BlockStored)
+        ]
+
+        self.assertEqual(len(events_key1), 1)
+        self.assertEqual(len(events_key2), 1)
+        self.assertNotEqual(
+            events_key1[0].block_hashes[0],
+            events_key2[0].block_hashes[0],
+        )
 
     def test_memory_allocated(self):
         keys, values = [], []

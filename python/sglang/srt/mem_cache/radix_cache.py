@@ -182,6 +182,10 @@ class RadixKey:
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
         """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
         hasher = hashlib.sha256()
+        if self.extra_key is not None:
+            encoded_extra_key = self.extra_key.encode("utf-8")
+            hasher.update(len(encoded_extra_key).to_bytes(4, byteorder="little"))
+            hasher.update(encoded_extra_key)
         if prior_hash:
             hasher.update(bytes.fromhex(prior_hash))
         t = self.token_ids
