@@ -80,7 +80,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--max-running-requests",
                 str(cls.max_running_requests),
                 "--max-total-tokens",
-                "12000",
+                "14000",
                 "--disable-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',

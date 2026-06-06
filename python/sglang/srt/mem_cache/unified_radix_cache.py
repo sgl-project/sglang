@@ -510,7 +510,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 256
+        self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         if storage_backend is not None:
