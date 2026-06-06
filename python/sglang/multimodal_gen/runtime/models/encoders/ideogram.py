@@ -10,6 +10,12 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    attach_bitsandbytes_4bit_quant_states,
+    build_bitsandbytes_4bit_quant_states,
+    is_bitsandbytes_4bit_state_name,
+    swap_linears_to_bitsandbytes_4bit,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     swap_linears_to_weight_only_fp8,
 )
@@ -31,7 +37,12 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
         if isinstance(text_config, dict):
             text_config = Qwen3VLTextConfig(**text_config)
         self.language_model = Qwen3VLTextModel(text_config)
-        if getattr(arch_config, "ideogram_fp8_weight_only", False):
+        self._uses_bitsandbytes_4bit = getattr(
+            arch_config, "ideogram_bnb_4bit_weight_only", False
+        )
+        if self._uses_bitsandbytes_4bit:
+            swap_linears_to_bitsandbytes_4bit(self.language_model)
+        elif getattr(arch_config, "ideogram_fp8_weight_only", False):
             swap_linears_to_weight_only_fp8(self.language_model)
 
     @torch.no_grad()
@@ -100,6 +111,9 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
         return features
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if self._uses_bitsandbytes_4bit:
+            return self._load_bitsandbytes_4bit_weights(weights)
+
         loaded_params: set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
@@ -115,6 +129,52 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight.to(param.dtype))
             loaded_params.add(name)
+        return loaded_params
+
+    def _load_bitsandbytes_4bit_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ):
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        raw_quant_state: dict[str, torch.Tensor] = {}
+        normal_weight_names: list[str] = []
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            if is_bitsandbytes_4bit_state_name(name):
+                if "quant_state.bitsandbytes" in name:
+                    loaded_weight = loaded_weight.cpu().data
+                raw_quant_state[name] = loaded_weight
+                continue
+            if name.startswith("visual."):
+                continue
+            if "rotary_emb.inv_freq" in name:
+                continue
+            param = params_dict.get(name)
+            if param is None:
+                raise KeyError(
+                    f"Unexpected weight name while loading Ideogram text encoder: {name}"
+                )
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight.to(param.dtype))
+            normal_weight_names.append(name)
+            loaded_params.add(name)
+
+        quant_states = build_bitsandbytes_4bit_quant_states(
+            normal_weight_names,
+            raw_quant_state,
+            next(self.parameters()).device,
+        )
+        attach_bitsandbytes_4bit_quant_states(params_dict, quant_states)
+        quantized_params_missing_state = [
+            name
+            for name, param in params_dict.items()
+            if getattr(param, "use_bitsandbytes_4bit", False)
+            and name not in quant_states
+        ]
+        if quantized_params_missing_state:
+            raise ValueError(
+                "Missing bitsandbytes quant_state for Ideogram text encoder weights: "
+                f"{quantized_params_missing_state[:8]}"
+            )
         return loaded_params
 
 
