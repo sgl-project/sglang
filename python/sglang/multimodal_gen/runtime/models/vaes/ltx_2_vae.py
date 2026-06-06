@@ -12,6 +12,26 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.parallel.ltx2_dist_utils import (
+    DistLTX2VideoCausalConv3d,
+)
+from sglang.multimodal_gen.runtime.models.vaes.parallel.parallel_utils import (
+    gather_tensor,
+    get_vae_parallel_world_size,
+    split_tensor,
+)
+
+_LTX2_VAE_PARALLEL_ENABLED = False
+
+
+def _maybe_enable_ltx2_vae_parallel() -> None:
+    global _LTX2_VAE_PARALLEL_ENABLED, LTX2VideoCausalConv3d
+    if _LTX2_VAE_PARALLEL_ENABLED:
+        return
+    if get_vae_parallel_world_size() <= 1:
+        return
+    LTX2VideoCausalConv3d = DistLTX2VideoCausalConv3d
+    _LTX2_VAE_PARALLEL_ENABLED = True
 
 
 class PerChannelRMSNorm(nn.Module):
@@ -108,6 +128,9 @@ class LTX2VideoCausalConv3d(nn.Module):
 
         hidden_states = self.conv(hidden_states)
         return hidden_states
+
+
+LocalLTX2VideoCausalConv3d = LTX2VideoCausalConv3d
 
 
 # Like LTXVideoResnetBlock3d, but uses new causal Conv3d, normal Conv3d for the conv_shortcut, and the spatial padding
@@ -272,6 +295,9 @@ class LTXVideoDownsampler3d(nn.Module):
     ) -> None:
         super().__init__()
 
+        _maybe_enable_ltx2_vae_parallel()
+        self._use_parallel = get_vae_parallel_world_size() > 1
+
         self.stride = stride if isinstance(stride, tuple) else (stride, stride, stride)
         self.group_size = (
             in_channels * stride[0] * stride[1] * stride[2]
@@ -281,7 +307,8 @@ class LTXVideoDownsampler3d(nn.Module):
             self.stride[0] * self.stride[1] * self.stride[2]
         )
 
-        self.conv = LTX2VideoCausalConv3d(
+        # Downsampler gathers full height before this conv, so it must stay local.
+        self.conv = LocalLTX2VideoCausalConv3d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=3,
@@ -290,6 +317,9 @@ class LTXVideoDownsampler3d(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
+        if self._use_parallel:
+            hidden_states = gather_tensor(hidden_states, dim=3)
+
         hidden_states = torch.cat(
             [hidden_states[:, :, : self.stride[0] - 1], hidden_states], dim=2
         )
@@ -312,6 +342,9 @@ class LTXVideoDownsampler3d(nn.Module):
         hidden_states = hidden_states.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(1, 4)
         hidden_states = hidden_states + residual
 
+        if self._use_parallel:
+            hidden_states = split_tensor(hidden_states, dim=3)
+
         return hidden_states
 
 
@@ -326,6 +359,9 @@ class LTXVideoUpsampler3d(nn.Module):
         spatial_padding_mode: str = "zeros",
     ) -> None:
         super().__init__()
+
+        _maybe_enable_ltx2_vae_parallel()
+        self._use_parallel = get_vae_parallel_world_size() > 1
 
         self.stride = stride if isinstance(stride, tuple) else (stride, stride, stride)
         self.residual = residual
@@ -871,6 +907,9 @@ class LTX2VideoEncoder3d(nn.Module):
     ):
         super().__init__()
 
+        _maybe_enable_ltx2_vae_parallel()
+        self._use_parallel = get_vae_parallel_world_size() > 1
+
         self.patch_size = patch_size
         self.patch_size_t = patch_size_t
         self.in_channels = in_channels * patch_size**2
@@ -955,6 +994,8 @@ class LTX2VideoEncoder3d(nn.Module):
         )
         # Thanks for driving me insane with the weird patching order :(
         hidden_states = hidden_states.permute(0, 1, 3, 7, 5, 2, 4, 6).flatten(1, 4)
+        if self._use_parallel:
+            hidden_states = split_tensor(hidden_states, dim=3)
         hidden_states = self.conv_in(hidden_states, causal=causal)
 
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -979,6 +1020,9 @@ class LTX2VideoEncoder3d(nn.Module):
         last_channel = hidden_states[:, -1:]
         last_channel = last_channel.repeat(1, hidden_states.size(1) - 2, 1, 1, 1)
         hidden_states = torch.cat([hidden_states, last_channel], dim=1)
+
+        if self._use_parallel:
+            hidden_states = gather_tensor(hidden_states, dim=3)
 
         return hidden_states
 
@@ -1030,6 +1074,9 @@ class LTX2VideoDecoder3d(nn.Module):
         spatial_padding_mode: str = "reflect",
     ) -> None:
         super().__init__()
+
+        _maybe_enable_ltx2_vae_parallel()
+        self._use_parallel = get_vae_parallel_world_size() > 1
 
         self.patch_size = patch_size
         self.patch_size_t = patch_size_t
@@ -1119,6 +1166,9 @@ class LTX2VideoDecoder3d(nn.Module):
     ) -> torch.Tensor:
         causal = causal or self.is_causal
 
+        if self._use_parallel:
+            hidden_states = split_tensor(hidden_states, dim=3)
+
         hidden_states = self.conv_in(hidden_states, causal=causal)
 
         if self.timestep_scale_multiplier is not None:
@@ -1156,6 +1206,9 @@ class LTX2VideoDecoder3d(nn.Module):
 
         hidden_states = self.conv_act(hidden_states)
         hidden_states = self.conv_out(hidden_states, causal=causal)
+
+        if self._use_parallel:
+            hidden_states = gather_tensor(hidden_states, dim=3)
 
         p = self.patch_size
         p_t = self.patch_size_t
@@ -1249,6 +1302,9 @@ class LTX23VideoDecoder3d(nn.Module):
     ) -> None:
         super().__init__()
 
+        _maybe_enable_ltx2_vae_parallel()
+        self._use_parallel = get_vae_parallel_world_size() > 1
+
         self.patch_size = patch_size
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels * patch_size**2
@@ -1314,6 +1370,8 @@ class LTX23VideoDecoder3d(nn.Module):
         causal = self.is_causal if causal is None else causal
 
         hidden_states = self.per_channel_statistics.un_normalize(hidden_states)
+        if self._use_parallel:
+            hidden_states = split_tensor(hidden_states, dim=3)
         hidden_states = self.conv_in(hidden_states, causal=causal)
 
         if self.timestep_scale_multiplier is not None and temb is not None:
@@ -1345,6 +1403,9 @@ class LTX23VideoDecoder3d(nn.Module):
         hidden_states = self.conv_act(hidden_states)
         hidden_states = self.conv_out(hidden_states, causal=causal)
 
+        if self._use_parallel:
+            hidden_states = gather_tensor(hidden_states, dim=3)
+
         p = self.patch_size
         p_t = self.patch_size_t
         batch_size, _, num_frames, height, width = hidden_states.shape
@@ -1372,6 +1433,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
     def __init__(self, config: LTXVideoVAEConfig):
         super().__init__(config=config)
+        _maybe_enable_ltx2_vae_parallel()
         in_channels = config.arch_config.in_channels
         latent_channels = config.arch_config.latent_channels
         out_channels = config.arch_config.out_channels
@@ -1544,6 +1606,10 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 The stride between two consecutive horizontal tiles. This is to ensure that there are no tiling
                 artifacts produced across the width dimension.
         """
+        # TODO: need a better way to determine if tiling is supported
+        if get_vae_parallel_world_size() >= 8:
+            self.use_tiling = False
+            return
         self.use_tiling = True
         self.tile_sample_min_height = (
             tile_sample_min_height or self.tile_sample_min_height

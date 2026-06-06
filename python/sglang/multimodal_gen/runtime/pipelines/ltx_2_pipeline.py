@@ -264,6 +264,29 @@ def _add_ltx2_decoding_stage(pipeline: ComposedPipelineBase):
 class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
     """Override ``_time_shift_exponential`` to use torch f32 instead of numpy f64."""
 
+    def stretch_shift_to_terminal(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Guard against degenerate warmup schedules (e.g., num_inference_steps=1)
+        that can make scale_factor=0 and trigger divide-by-zero warnings.
+        """
+        one_minus_z = 1 - t
+        denom = 1 - self.config.shift_terminal
+        if denom == 0:
+            return t
+        scale_factor = one_minus_z[-1] / denom
+        if torch.is_tensor(scale_factor):
+            is_finite = torch.isfinite(scale_factor).item()
+            is_zero = scale_factor.item() == 0
+        else:
+            sf = float(scale_factor)
+            is_finite = math.isfinite(sf)
+            is_zero = sf == 0
+        # If scale_factor is 0 or non-finite, fall back to the original schedule.
+        if (not is_finite) or is_zero:
+            return t
+        stretched_t = 1 - (one_minus_z / scale_factor)
+        return stretched_t
+
     def set_timesteps(
         self,
         num_inference_steps=None,
