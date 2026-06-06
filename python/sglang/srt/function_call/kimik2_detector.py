@@ -219,10 +219,7 @@ class KimiK2Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
-            if self.eot_token in new_text:
-                self._reset_streaming_state()
-            else:
-                self._buffer = ""
+            self._reset_streaming_state()
             normal_text = _strip_special_tokens(new_text)
             return StreamingParseResult(normal_text=normal_text)
 
@@ -272,9 +269,7 @@ class KimiK2Detector(BaseFormatDetector):
                         "name": function_name,
                         "arguments": {},
                     }
-                    # Re-enter the loop so this call's arguments are parsed from
-                    # the buffer in the same increment when already present.
-                    continue
+                    # Fall through to parse this call's arguments in the same iteration.
 
                 argument_diff = (
                     function_args[len(self._last_arguments) :]
