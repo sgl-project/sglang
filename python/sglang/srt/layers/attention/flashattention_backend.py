@@ -7,7 +7,6 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.metadata import (
     normal_decode_set_metadata,
@@ -23,10 +22,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
-
-# Opt-in (SGLANG_ENABLE_ASYNC_ASSERT=1) guard for the draft-decode expand scatter OOB
-# below. Read at import so the @torch.compile helper doesn't graph-break on the env lookup.
-_ASSERT_DRAFT_EXPAND_OOB = envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -2107,6 +2102,20 @@ class FlashAttentionBackend(AttentionBackend):
                     # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
                     cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
                     if self.page_size > 1:
+                        # Only the draft tokens produced up to this step are live;
+                        # cache_loc arrives num_steps-wide. Slice so the scatter fills at
+                        # most decode_length of the (decode_length + 1) expand page_table
+                        # columns -- without this the extra distinct pages overflow the row.
+                        cache_loc = cache_loc[:, :decode_length]
+                        assert (
+                            cache_loc.shape[1] <= metadata_expand.page_table.shape[1]
+                        ), (
+                            f"draft expand page_table too narrow: cache_loc width "
+                            f"{cache_loc.shape[1]} > "
+                            f"{metadata_expand.page_table.shape[1]} columns "
+                            f"(decode_length + 1); page_size={self.page_size}, "
+                            f"topk={self.topk}, num_steps={self.speculative_num_steps}"
+                        )
                         draft_decode_set_expand_metadata(
                             cache_seqlens_int32=metadata_expand.cache_seqlens_int32,
                             page_table=metadata_expand.page_table,
@@ -2736,24 +2745,13 @@ def draft_decode_set_expand_metadata(
     cache_loc = (cache_loc // page_size).to(torch.int32)
     if cache_loc.dim() == 1:
         cache_loc = cache_loc.unsqueeze(0)
-    # cache_loc is num_steps-wide (out_cache_loc.view(-1, num_steps)); only decode_length
-    # tokens are live this step. Slice to match the page_size==1 path -- else the extra
-    # distinct pages overflow the step-tight (decode_length + 1) page_table on scatter_.
-    cache_loc = cache_loc[:, :decode_length]
+    # cache_loc is pre-sliced to decode_length by the caller, so the scatter fills at
+    # most decode_length of the (decode_length + 1) page_table columns.
     # Vectorized torch.unique_consecutive: track value change points then scatter
     mask = torch.ones_like(cache_loc, dtype=torch.bool)
     mask[:, 1:] = cache_loc[:, 1:] != cache_loc[:, :-1]
     positions = mask.cumsum(dim=1) - 1
     num_seqs = cache_loc.shape[0]
-    if _ASSERT_DRAFT_EXPAND_OOB:
-        # Pad a -1 sentinel so .max() is safe on an empty batch (num_seqs == 0) and
-        # stays graph-break-free under torch.compile; -1 never trips the bound.
-        safe_positions = torch.nn.functional.pad(positions.flatten(), (0, 1), value=-1)
-        torch._assert_async(
-            safe_positions.max() < page_table.shape[1],
-            "draft expand page_table scatter OOB: per-branch draft slots span more "
-            "distinct pages than the (decode_length + 1) columns allocated",
-        )
     page_table[:num_seqs, :].scatter_(1, positions, cache_loc)
 
 
