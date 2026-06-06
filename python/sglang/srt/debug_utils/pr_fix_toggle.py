@@ -89,20 +89,15 @@ patches:
 
 _PR_REVERT_YAML_26972 = """
 patches:
-  - target: sglang.srt.model_executor.model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin._init_pools
+  - target: sglang.srt.mem_cache.common.get_req_to_token_extra_context_len
     edits:
       - match: |
           if (
-              self.server_args.speculative_algorithm is not None
-              and self.server_args.page_size > 1
-              and (self.server_args.speculative_eagle_topk or 1) > 1
+              server_args.speculative_algorithm is not None
+              and server_args.page_size > 1
+              and (server_args.speculative_eagle_topk or 1) > 1
           ):
-              from sglang.srt.managers.utils import get_alloc_len_per_decode
-
-              extra_max_context_len = max(
-                  extra_max_context_len,
-                  2 * get_alloc_len_per_decode(self.server_args),
-              )
+              extra = max(extra, get_alloc_reserve_per_decode(server_args))
         replacement: ""
 """
 
