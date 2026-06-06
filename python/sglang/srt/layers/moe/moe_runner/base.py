@@ -66,6 +66,8 @@ class MoeRunnerConfig:
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
 
+    enable_pad_token_mask: bool = False
+
 
 @dataclass
 class RunnerInput(ABC):

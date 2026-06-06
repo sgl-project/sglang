@@ -1122,7 +1122,8 @@ def _mask_topk_ids_padded_region(
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        mask = (indices >= num_token_non_padded).unsqueeze(-1)
+        topk_ids.masked_fill_(mask, -1)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

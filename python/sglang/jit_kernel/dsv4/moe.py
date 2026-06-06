@@ -9,6 +9,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -102,8 +103,9 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
     )
 
 
-def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
-    return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+@register_custom_op(mutates_args=["topk_ids"])
+def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) -> None:
+    _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
 
 
 def hash_topk(
