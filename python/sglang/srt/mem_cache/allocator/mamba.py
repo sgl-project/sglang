@@ -38,6 +38,10 @@ class MambaSlotAllocator:
     def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
+        # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
+        # When non-None, `alloc(1)` consumes the next slot from this iterator
+        # instead of calling `_do_alloc(1)` per request. Reset to None outside
+        # a group window so `alloc` falls through to the per-call path.
         self._alloc_iter: Optional[Iterator] = None
         self.clear()
 
