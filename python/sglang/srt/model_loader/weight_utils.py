@@ -13,7 +13,6 @@ import itertools
 import json
 import logging
 import os
-import pickle
 import re
 import struct
 import tempfile
@@ -1119,12 +1118,11 @@ def _load_pt_file(bin_file: str) -> dict:
     """
     try:
         return torch.load(bin_file, map_location="cpu", weights_only=True)
-    except (RuntimeError, pickle.UnpicklingError) as e:
-        if isinstance(e, pickle.UnpicklingError) or "legacy .tar format" in str(e):
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
             logger.warning(
-                "Loading %s with weights_only=False (%s)",
+                "Loading %s with weights_only=False (legacy tar format)",
                 os.path.basename(bin_file),
-                "unsupported global" if isinstance(e, pickle.UnpicklingError) else "legacy tar format",
             )
             return torch.load(bin_file, map_location="cpu", weights_only=False)
         raise
