@@ -109,12 +109,44 @@ class TextEncoderLoader(ComponentLoader):
             1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
-        return AutoModel.from_pretrained(
+        model_class = self._resolve_transformers_text_encoder_class(
+            component_model_path, server_args
+        )
+        return model_class.from_pretrained(
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             torch_dtype=PRECISION_TO_TYPE[encoder_dtype],
         )
+
+    @staticmethod
+    def _resolve_transformers_text_encoder_class(component_model_path, server_args):
+        """Resolve the concrete transformers class for a text encoder.
+
+        AutoModel maps encoder-decoder model types (e.g. T5/UMT5) to their
+        full seq2seq class (T5Model/UMT5Model), whose forward expects
+        decoder inputs and raises when the module is used purely as a text
+        encoder. For such checkpoints, prefer the encoder-only class recorded in
+        the config architectures (e.g. UMT5EncoderModel). Encoders that
+        are not encoder-decoder keep using AutoModel unchanged.
+        """
+        import transformers
+        from transformers import AutoConfig, AutoModel
+
+        try:
+            config = AutoConfig.from_pretrained(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        except Exception:
+            return AutoModel
+        if getattr(config, "is_encoder_decoder", False):
+            for arch in getattr(config, "architectures", None) or []:
+                model_class = getattr(transformers, arch, None)
+                if isinstance(model_class, type):
+                    return model_class
+        return AutoModel
 
     def _prepare_weights(
         self,
