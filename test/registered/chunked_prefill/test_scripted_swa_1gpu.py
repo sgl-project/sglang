@@ -10,41 +10,15 @@ register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
 _SWA_MODEL = "openai/gpt-oss-20b"
 
-# Regression for issue #24252 / PR #24318: a chunked req that is deferred by
-# add_chunked_req's hybrid-SWA early-return must not be stash-cached, otherwise
-# its already-freed req_pool_idx is double-freed and prefix_indices corrupted,
-# producing an empty/garbage micro-batch that crashes the extend path.
-#
-# This reproduces the production trigger directly, with no internal-state pokes.
-# With the overlap scheduler (the production default), decode iterations are
-# pipelined alongside an in-flight chunked prefill, so decode -- and therefore
-# the retraction it can trigger -- runs while a req is mid-chunk. We saturate a
-# small hybrid-SWA pool (swa_full_tokens_ratio=0.1, as in the issue) with a pool
-# of ignore_eos decoders. They drive repeated real "KV cache pool is full.
-# Retract requests." retractions; while a chunked req is mid-prefill, the SWA
-# pool exhausts (and the retract's new_token_ratio jump inflates the running
-# batch's reserved-decode offset), so the chunked req's next add_chunked_req
-# early-returns -- parking it (the scheduler keeps it as chunked_req but does not
-# run it in the batch). We detect the park purely from observed batch composition
-# (t.chunked_parks: an iteration whose chunked_rid is this req yet the req is
-# absent from the batch that ran), so the test does not depend on any internal
-# scheduler scheduling flag. Which candidate gets parked depends on the exact
-# churn, so we feed chunked candidates until one is observed parked, then assert
-# the stash gate left no radix lock refs after the engine drains. On the un-gated
-# (buggy) code the spurious stash double-frees and crashes the scheduler
-# (KV-canary).
 _MAX_TOTAL_TOKENS = 4096
 _SWA_FULL_TOKENS_RATIO = 0.1
 _CHUNK_SIZE = 64
 
-# Decoders that fill the small SWA pool and drive the retraction churn.
 _N_DECODERS = 6
 _DECODER_PROMPT = 64
 _DECODER_MAX_NEW = 512
 _DECODER_WARMUP_RUNNING = 3
 
-# Chunked candidate: long enough to span several chunks (so it is mid-prefill
-# when a retraction fires), short enough to be admitted under memory pressure.
 _CHUNKED_PROMPT = 384
 _CHUNKED_MAX_NEW = 2
 _N_CANDIDATES = 24
@@ -72,8 +46,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
     def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedContext):
         s = t.scheduler
 
-        # Sustained memory pressure: ignore_eos decoders that keep the small SWA
-        # pool saturated and trigger repeated real retractions.
         for i in range(_N_DECODERS):
             t.start_req(
                 prompt_len=_DECODER_PROMPT,
@@ -86,11 +58,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
                 break
             yield
 
-        # Feed chunked candidates until any one is parked by the add_chunked_req
-        # hybrid-SWA early-return. Which candidate gets parked depends on the exact
-        # churn, and a park can land on an earlier candidate after we have moved on
-        # to feeding the next one -- the batch log is not cleared mid-script -- so
-        # check chunked_parks across every candidate fed so far, not just the latest.
         candidates = []
         parked = False
         for _ in range(_N_CANDIDATES):
@@ -117,9 +84,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
             "early-return; the test never exercised the stash gate"
         )
 
-        # Drain. On the buggy (un-gated) code the spurious stash of the deferred
-        # chunked req has already double-freed/corrupted state (KV-canary crash)
-        # before we get here; on fixed code the drain must leave no locked nodes.
         t.abort_all()
         for _ in range(_DRAIN_STEPS):
             if (

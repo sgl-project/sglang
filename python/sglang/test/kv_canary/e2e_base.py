@@ -129,12 +129,6 @@ class CanaryE2EBase(CapturedServerE2EBase):
         ignore_eos: Optional[bool] = None,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
-        # SWA-divergence assertions only fire once a request decodes past the SWA sliding
-        # window, so the window evicts and writes the 0-sentinel that
-        # swa_out_of_window_tokens counts. Greedy decode length is not deterministic across
-        # PP/eager/cuda-graph numerics — PP can emit EOS hundreds of tokens before the
-        # window slides — so force full-length decode for SWA fixtures rather than relying
-        # on the model generating past the window on its own.
         if ignore_eos is None:
             ignore_eos = self.model_mode == "swa"
         results = post_parallel_generate(

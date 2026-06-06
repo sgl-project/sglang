@@ -76,17 +76,13 @@ class TestScriptedCore(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        # The overlap scheduler completes the one forward already in flight when
-        # pause is requested, so output_ids advances by one before generation
-        # halts. At last_decode that final token reaches max_new_tokens and the req
-        # finishes cleanly instead of parking -- the correct outcome there. At every
-        # other stage the req has tokens left, so the retract parks it and the
-        # paused engine must not advance it afterwards.
+        # At the last_decode stage the final decode can complete during the
+        # retract; a finished req may already be removed from the scheduler, so
+        # its output_ids are unobservable (r.req is None) and clean completion is
+        # covered by the run_until_finished tail below. When the req is not
+        # finished, pause(retract) must park it back in the waiting_queue and the
+        # paused engine must not advance it.
         if r.finished:
-            # A finished req may already be removed from the scheduler during the
-            # retract (r.req is None), leaving output_ids unobservable; clean
-            # completion is then covered by the run_until_finished tail below. When
-            # still observable, the final token must have reached max_new_tokens.
             req = r.req
             assert req is None or len(req.output_ids) == _LIFECYCLE_MAX_NEW_TOKENS, (
                 f"stage={stage}: finished req has wrong output length "

@@ -223,13 +223,6 @@ def _spawn_server_process(
     engine_kwargs: Dict[str, Any],
 ) -> Tuple[mp.process.BaseProcess, int]:
     mp_ctx = mp.get_context("spawn")
-    # The scripted runtime MUST run with the overlap scheduler -- it is the
-    # production default and the behaviour the harness exists to exercise (decode
-    # pipelined alongside in-flight prefill is exactly what the hybrid-SWA
-    # chunked-req regression and others depend on). Never set
-    # disable_overlap_schedule=True here or in any test's ENGINE_KWARGS; scripts
-    # must instead account for the one-step pipeline (e.g. drain the in-flight
-    # forward with an extra yield before asserting frozen per-step state).
     launch_kwargs: Dict[str, Any] = dict(
         host=SERVER_HOST,
         port=get_free_port(),

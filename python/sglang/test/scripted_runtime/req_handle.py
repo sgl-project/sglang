@@ -39,10 +39,6 @@ class ScriptedReqHandle:
 
     @property
     def kv_pages(self) -> int:
-        # KV pages this req currently holds in the token pool. A finished, aborted,
-        # or retracted req has released its row (req_pool_idx is None) and owns no
-        # exclusive KV -- its kv_allocated_len attribute is left stale and must not
-        # be read. Only a req that still owns a row holds KV pages.
         req = self.req
         if req is None or req.req_pool_idx is None:
             return 0
@@ -51,10 +47,7 @@ class ScriptedReqHandle:
 
     @property
     def lock_refs(self) -> int:
-        # A finished/aborted req has dropped its node reference; report 0 rather
-        # than dereferencing None. SWA radix nodes split the lock ref into
-        # full-attention and sliding-window counts; a plain node exposes a single
-        # lock_ref.
+        # SWA radix nodes split the lock ref into full + swa counts.
         from sglang.srt.mem_cache.swa_radix_cache import TreeNode as SWATreeNode
 
         req = self.req

@@ -6,13 +6,8 @@ DEFAULT_CHUNK_SIZE: int = 256
 
 DEFAULT_MAX_STEPS: int = 400
 
-# Long enough to span 8 chunks at the default chunk size, which comfortably
-# exceeds every chunks_done lower bound (<= 4) asserted in the manual suite.
 VERY_LONG_PROMPT_LEN: int = 8 * DEFAULT_CHUNK_SIZE
 
-# Qwen3-0.6B ties its word embeddings and already handles the tie correctly
-# under pipeline parallelism (qwen3.py), so the PP scripted-runtime tests can
-# use it without patching the model code.
 SMALL_MODEL: str = "Qwen/Qwen3-0.6B"
 
 
@@ -46,10 +41,8 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
-    # Probe EVERY handle EVERY step (no short-circuit): a handle is only
-    # registered in the context's _seen_rids by probing it (finished/status/req),
-    # and a req that finishes and recycles before its first probe would report
-    # not-finished forever. Latch each handle's finished state per step.
+    # Probe every handle every step: an unprobed handle is never registered
+    # for post-recycle finished-tracking and would report not-finished forever.
     done = [False] * len(handles)
     for _ in range(max_steps):
         for i, h in enumerate(handles):
@@ -64,9 +57,6 @@ def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_S
 
 
 def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_STEPS):
-    # Populate the radix cache with a prefix by running a real request to
-    # completion, so a later request hits the cached prefix. Uniform prompts
-    # only (every manual call site passes [v] * n).
     assert prompt_tokens, "warmup_radix needs a non-empty prompt"
     token = prompt_tokens[0]
     assert all(
@@ -78,39 +68,22 @@ def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_ST
     yield from run_until_finished(handle, max_steps=max_steps)
 
 
-# Long enough that ballast requests never finish for the duration of any test
-# (>> every max_steps below), yet 1 + this stays within the smallest test model's
-# context window (Qwen3-0.6B is 40960); a larger max_new_tokens is rejected at
-# admission ("exceeds the model's maximum context length") and never holds a row.
-# Use only with a FULL-SIZE KV pool (row-pool pressure), where the KV cost of the
-# huge decode reservation is irrelevant because the row pool exhausts first.
+# Never finishes within any test's step budget, yet stays within the test
+# model's context window so admission does not reject it.
 BALLAST_MAX_NEW_TOKENS: int = 30000
 
-# KV pool cap (in tokens) for the small-KV-pool pressure classes. Small enough
-# that a long-lived ballast decode req plus a chunked prefill req together run the
-# pool out and trip the engine's decode-OOM retract path, large enough that both
-# reqs are admitted in the first place (page_size == 1 on the small test model).
+# Small-KV-pool pressure classes: ballast + a chunked req run the capped pool
+# out so the engine's own decode-OOM retract path resolves the pressure.
 SMALL_KV_POOL_MAX_TOTAL_TOKENS: int = 4096
 
-# Decode budget for the small-KV-pool ballast. Unlike BALLAST_MAX_NEW_TOKENS this
-# must keep the ballast ADMISSIBLE into the capped pool: add_one_req gates on
-# extend_input_len + min(max_new_tokens, CLIP_MAX_NEW_TOKENS) + page_size <
-# rem_total_tokens, so with prompt_len 1536 and a 4096-token pool the clipped
-# max_new must stay well under ~2500. 512 leaves ample admission headroom while
-# still reserving enough decode space that, once a 2048-token chunked req is also
-# in flight, the combined reservation drives rem_total_tokens <= 0 and trips the
-# add_chunked_req force-re-add branch -- which the engine then resolves by
-# retracting the ballast (decode-OOM path), not by crashing on raw exhaustion.
+# Must keep the ballast ADMISSIBLE into the capped pool (its clipped decode
+# reservation counts against rem_total_tokens at admission).
 SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS: int = 512
 
 SMALL_KV_POOL_BALLAST_PROMPT_LEN: int = 1536
 
 
 def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):
-    # Pressure req_to_token_pool with REAL ballast requests instead of slicing
-    # the pool's internal free_slots: a request occupies exactly one row for its
-    # whole lifetime, so M never-finishing ballast reqs hold exactly M rows. The
-    # engine's abort_all() drain on reset frees them, so no custom restore needed.
     target: int = t.scheduler.req_to_token_pool.available_size() - leave_rows
     if target <= 0:
         return

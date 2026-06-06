@@ -50,10 +50,7 @@ class ScriptedBatchRecord:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
-    # A prior script may have left the engine paused (e.g. pause_generation with
-    # no matching continue_generation). While paused the event loop short-circuits
-    # before get_next_batch_to_run, so neither the drain below nor the next
-    # script's requests can make progress -- resume first so the reset can settle.
+    # A paused event loop cannot drain; resume before resetting.
     if scheduler._engine_paused:
         ctx.continue_generation()
 
@@ -68,9 +65,6 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
         ):
             break
 
-    # Pipeline parallelism keeps micro-batches in flight after the running batch
-    # already looks empty; let them finish (and release their radix nodes) before
-    # flushing the cache they still reference.
     server_args = scheduler.server_args
     for _ in range(2 * (server_args.pp_size + server_args.pp_async_batch_depth)):
         yield

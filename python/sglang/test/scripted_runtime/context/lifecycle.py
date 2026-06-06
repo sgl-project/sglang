@@ -60,8 +60,6 @@ def abort_all(ctx: "ScriptedContext") -> None:
 
 def abort(ctx: "ScriptedContext", *, rid: str, await_arrival: bool = True) -> None:
     if not await_arrival:
-        # An abort of an unknown or already-finished rid never reaches the
-        # scheduler (TokenizerManager drops it), so there is no AbortReq to await.
         _http_post_fire_and_forget(
             ctx,
             path="/abort_request",

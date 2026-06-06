@@ -43,12 +43,8 @@ def _http_post_fire_and_forget(
     path: str,
     json: Optional[Dict[str, Any]],
 ) -> None:
-    # Fire the control POST without awaiting any echo on the recv_from_tokenizer
-    # socket. TokenizerManager.abort_request drops an abort whose rid is unknown
-    # or already finished (rid not in rid_to_state) WITHOUT forwarding an AbortReq
-    # to the scheduler, so no object ever transits the socket -- awaiting one would
-    # always time out. The caller verifies the (no-op) consequence by driving the
-    # loop itself after this returns.
+    # No recv echo to await: TokenizerManager drops an unknown/finished-rid
+    # abort without forwarding anything to the scheduler.
     server_args = ctx.scheduler.server_args
     url = f"http://{server_args.host}:{server_args.port}{path}"
 
