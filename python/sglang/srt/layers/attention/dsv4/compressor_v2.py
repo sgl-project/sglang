@@ -558,15 +558,28 @@ class CompressorBackendMixin:
         kv_score_buffer = state_pool.kv_score_buffer.kv_score
         kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
-        kv_compressed = compress_forward(
-            kv_score_buffer=kv_score_buffer,
-            kv_score_input=kv_score_input,
-            ape=compressor.ape.view(-1, head_dim),
-            plan=plan,
-            compress_ratio=compress_ratio,
-            head_dim=head_dim,
-            is_online=False,
-        )
+        if compress_ratio == 128:
+            # The generic JIT c128_v2 kernel on HIP expects bf16 state-buffer
+            # inputs, while this ROCm fallback path keeps the score buffer in
+            # fp32 for precision parity. Use the local Triton C128 path instead
+            # of the generic JIT to avoid dtype mismatches during graph capture.
+            kv_compressed = _compress_forward_c128_triton(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=compressor.ape.view(-1, head_dim),
+                plan=plan,
+                head_dim=head_dim,
+            )
+        else:
+            kv_compressed = compress_forward(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=compressor.ape.view(-1, head_dim),
+                plan=plan,
+                compress_ratio=compress_ratio,
+                head_dim=head_dim,
+                is_online=False,
+            )
 
         if kv_compressed.shape[0] == 0:
             return

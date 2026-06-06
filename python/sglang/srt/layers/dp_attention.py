@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -87,6 +88,16 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
+        if os.environ.get("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            # MoE fixed reduce-scatter needs graph capture/replay to use equal
+            # per-rank token chunks. This now goes through the same
+            # LayerCommunicator postprocess path as DeepSeek-V2.
+            return cls.MAX_LEN
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
         if _USE_ROCM700A_WA:

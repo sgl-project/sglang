@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -91,6 +92,17 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def should_use_dsv4_dp_moe_reduce_scatterv() -> bool:
+    return (
+        os.environ.get("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower()
+        in ("1", "true", "yes", "on")
+        and is_dp_attention_enabled()
+        and get_attention_dp_size() > 1
+        and get_moe_a2a_backend().is_none()
+    )
+
 
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
@@ -711,7 +723,7 @@ class LayerCommunicator:
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         ):
-            if should_use_dp_reduce_scatterv():
+            if should_use_dp_reduce_scatterv() or should_use_dsv4_dp_moe_reduce_scatterv():
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
@@ -1269,7 +1281,7 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(group),
             hidden_states,
         )
-        if should_use_dp_reduce_scatterv():
+        if should_use_dp_reduce_scatterv() or should_use_dsv4_dp_moe_reduce_scatterv():
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
