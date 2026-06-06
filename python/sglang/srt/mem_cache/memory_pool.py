@@ -2425,6 +2425,11 @@ class MHATokenToKOnlyPool(KVCache):
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
+    def register_layer_transfer_counter(
+        self, layer_transfer_counter: "LayerDoneCounter"
+    ) -> None:
+        self.layer_transfer_counter = layer_transfer_counter
+
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -2562,16 +2567,35 @@ class MiniMaxSparseKVPool(KVCache):
         if self.index_k_pool is not None:
             self.mem_usage += self.index_k_pool.mem_usage
 
+        # HiCacheController reads these from the top-level KV pool wrapper.
+        self.layer_num = self.main_pool.layer_num
+        self.start_layer = self.main_pool.start_layer
+        self.end_layer = self.main_pool.end_layer
+        self.layer_transfer_counter = None
+
+    def register_layer_transfer_counter(
+        self, layer_transfer_counter: "LayerDoneCounter"
+    ) -> None:
+        self.layer_transfer_counter = layer_transfer_counter
+
+    def _wait_for_layer(self, layer_id: int) -> None:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
         return self.main_pool.get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
         return self.main_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
         return self.main_pool.get_kv_buffer(layer_id)
 
     def get_index_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
         mapped_id = self.index_kv_layer_id_mapping.get(layer_id)
         if mapped_id is None:
             raise ValueError(
@@ -2582,6 +2606,7 @@ class MiniMaxSparseKVPool(KVCache):
         return self.index_kv_pool.get_kv_buffer(mapped_id)
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
         # First try the K-only pool; fall back to the index_kv pool's K side
         # so callers that just need K work for both sparse subgroups.
         mapped_id = self.index_k_layer_id_mapping.get(layer_id)
