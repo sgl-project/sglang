@@ -69,6 +69,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.mhc import mhc_fused_post_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1696,20 +1697,32 @@ class DeepseekV4ForCausalLM(nn.Module):
         if server_args.disable_shared_experts_fusion:
             return
 
-        # Waterfill and MegaMoE need shared-experts fusion so the shared expert
-        # is represented as an MoE slot instead of a separate MLP.
-        if server_args.enable_deepep_waterfill or get_moe_a2a_backend().is_megamoe():
+        fusion_reason = None
+        if server_args.enable_deepep_waterfill:
+            fusion_reason = "--enable-deepep-waterfill set"
+        elif uses_per_rank_fused_shared_slots():
+            if server_args.enforce_shared_experts_fusion:
+                fusion_reason = (
+                    f"{get_moe_a2a_backend().value} backend enabled with "
+                    "--enforce-shared-experts-fusion"
+                )
+            else:
+                server_args.disable_shared_experts_fusion = True
+                log_info_on_rank0(
+                    logger,
+                    "DeepSeek V4 per-rank shared-slot backend: fusion off by "
+                    "default (use --enforce-shared-experts-fusion to enable). "
+                    "Shared experts fusion optimization is disabled.",
+                )
+                return
+
+        if fusion_reason is not None:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "
                     f"expert, but got n_shared_experts={self.config.n_shared_experts}."
                 )
             self.num_fused_shared_experts = self.config.n_shared_experts
-            fusion_reason = (
-                "--enable-deepep-waterfill set"
-                if server_args.enable_deepep_waterfill
-                else "MegaMoE backend enabled"
-            )
             log_info_on_rank0(
                 logger,
                 f"DeepSeek V4: {fusion_reason}; KEEP shared-experts fusion enabled.",
