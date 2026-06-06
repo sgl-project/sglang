@@ -3325,6 +3325,12 @@ class Scheduler(
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.ps.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+            # In-flight PP microbatches (e.g. dispatched prefill chunks whose
+            # batch results are not processed yet) are not in running_mbs.
+            and (
+                self.ps.pp_size == 1
+                or all(mb is None or mb.is_empty() for mb in self.mbs)
+            )
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
