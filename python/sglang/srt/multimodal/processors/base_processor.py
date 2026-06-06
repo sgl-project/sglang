@@ -549,8 +549,11 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
+        except ValueError as e:
+            # Bad input (e.g. invalid base64) -> 400, not 500.
+            raise ValueError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            raise RuntimeError(f"Error while loading data {data}: {e}") from e
 
     @staticmethod
     def _get_preprocessed_input_format(data):
