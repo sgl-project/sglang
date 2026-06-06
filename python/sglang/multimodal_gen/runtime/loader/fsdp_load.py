@@ -583,10 +583,15 @@ def load_model_from_full_model_state_dict(
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
 
-        requires_grad = False
-        sharded_sd[target_param_name] = nn.Parameter(
-            sharded_tensor, requires_grad=requires_grad
-        )
+        actual_param = param_dict.get(target_param_name)
+        if actual_param is not None:
+            sharded_sd[target_param_name] = _make_param_like(
+                actual_param, sharded_tensor
+            )
+        else:
+            sharded_sd[target_param_name] = nn.Parameter(
+                sharded_tensor, requires_grad=False
+            )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
 

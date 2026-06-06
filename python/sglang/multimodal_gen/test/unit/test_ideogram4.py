@@ -834,6 +834,33 @@ class TestIdeogram4(unittest.TestCase):
             sharded.absmax, torch.tensor([4.0, 5.0, 6.0, 7.0])
         )
 
+    def test_assign_load_preserves_bitsandbytes_tp_attrs(self):
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.empty(8, 1, dtype=torch.uint8), requires_grad=False
+                )
+                self.weight.bnb_full_shape = (4, 8)
+                self.weight.bnb_local_shape = (2, 8)
+                self.weight.bnb_output_shard_start = 2
+                self.weight.bnb_input_shard_start = 0
+
+        model = TinyModule()
+        load_model_from_full_model_state_dict(
+            model,
+            iter([("weight", torch.ones(8, 1, dtype=torch.uint8))]),
+            torch.device("cpu"),
+            param_dtype=None,
+            strict=True,
+            param_names_mapping=lambda name: (name, None, None),
+        )
+
+        self.assertEqual(model.weight.bnb_full_shape, (4, 8))
+        self.assertEqual(model.weight.bnb_local_shape, (2, 8))
+        self.assertEqual(model.weight.bnb_output_shard_start, 2)
+        self.assertEqual(model.weight.bnb_input_shard_start, 0)
+
     def test_missing_weight_only_fp8_scale_is_fatal(self):
         with torch.device("meta"):
             model = WeightOnlyFP8Linear(3, 2, bias=False)
