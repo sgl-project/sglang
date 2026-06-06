@@ -261,6 +261,73 @@ def test_helper_preserves_input_dtype_bf16_cuda():
     assert out_k.dtype == dtype
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="fused QK-Norm+RoPE kernel requires CUDA",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_kernel_matches_eager_reference_cuda(dtype):
+    # Numerical parity on the actual fused fast path. The fp32 parity tests
+    # above only exercise the eager fallback because the fused kernel gates
+    # on ``q.dtype in (fp16, bf16)``; this test runs at the production dtype
+    # and uses a spy to confirm the fused branch fires (not silently falling
+    # back to eager+flashinfer-rope and passing for the wrong reason).
+    import sglang.multimodal_gen.runtime.layers.layernorm as ln_mod
+
+    device = torch.device("cuda")
+    head_dim = 64
+    num_tokens = 256
+    num_heads = 4
+    batch = 1
+    q_norm, k_norm = _make_qk_norms(head_dim, dtype)
+    q_norm = q_norm.to(device=device, dtype=dtype)
+    k_norm = k_norm.to(device=device, dtype=dtype)
+
+    torch.manual_seed(7)
+    q = torch.randn(batch, num_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(batch, num_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    cos, sin, cos_sin_cache = _make_cos_sin(num_tokens, head_dim)
+    cos = cos.to(device)
+    sin = sin.to(device)
+    cos_sin_cache = cos_sin_cache.to(device)
+
+    # Eager reference: 2x RMSNorm + 2x rotary on the SAME inputs, in dtype.
+    ref_q = q_norm(q.contiguous()).to(dtype)
+    ref_k = k_norm(k.contiguous()).to(dtype)
+    ref_q = _apply_rotary_emb(ref_q, cos, sin, is_neox_style=False)
+    ref_k = _apply_rotary_emb(ref_k, cos, sin, is_neox_style=False)
+
+    # Fused path. allow_inplace=True so we clone inputs to avoid mutating
+    # the (already-consumed) eager-reference tensors.
+    with patch.object(
+        ln_mod,
+        "fused_inplace_qknorm_rope",
+        wraps=ln_mod.fused_inplace_qknorm_rope,
+    ) as spy:
+        out_q, out_k = apply_qk_norm_with_optional_rope(
+            q=q.clone().contiguous(),
+            k=k.clone().contiguous(),
+            q_norm=q_norm,
+            k_norm=k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=False,
+            allow_inplace=True,
+        )
+    assert spy.call_count >= 1, (
+        "expected fused_inplace_qknorm_rope to fire on bf16/fp16 CUDA inputs; "
+        "helper silently fell back to eager (likely a dtype-gate regression)"
+    )
+
+    # Tolerances chosen for fused vs eager at the head_dim reductions used in
+    # HunyuanVideo. bf16 has ~7 mantissa bits so ULP near 1.0 is ~7e-3; the
+    # fused kernel does its reduction in fp32 internally then casts back, so
+    # 2e-2 atol/rtol is the loosest credible parity bar. fp16 keeps ~5e-3.
+    tol = {torch.bfloat16: 2e-2, torch.float16: 5e-3}[dtype]
+    torch.testing.assert_close(out_q, ref_q, atol=tol, rtol=tol)
+    torch.testing.assert_close(out_k, ref_k, atol=tol, rtol=tol)
+
+
 # Block-level tests --------------------------------------------------------
 
 
