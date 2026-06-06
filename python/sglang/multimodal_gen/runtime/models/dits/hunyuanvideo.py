@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -46,29 +46,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-
-
-def _build_qknorm_rope_cos_sin_cache(
-    freqs_cis: Optional[tuple[torch.Tensor, torch.Tensor]],
-) -> Optional[torch.Tensor]:
-    """Pack ``(cos, sin)`` into the ``[num_tokens, head_dim]`` fp32 layout that
-    ``apply_qk_norm_with_optional_rope`` expects.
-
-    Built once per ``HunyuanVideoTransformer3DModel.forward`` (where
-    ``freqs_cis`` is produced) and threaded through every block, avoiding the
-    ``num_blocks * num_steps`` redundant cats the previous per-block build
-    paid on every denoise step.
-    """
-    if freqs_cis is None:
-        return None
-    cos, sin = freqs_cis
-    return torch.cat(
-        [
-            cos.to(dtype=torch.float32).contiguous(),
-            sin.to(dtype=torch.float32).contiguous(),
-        ],
-        dim=-1,
-    )
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -210,7 +187,6 @@ class MMDoubleStreamBlock(nn.Module):
         txt: torch.Tensor,
         vec: torch.Tensor,
         freqs_cis: tuple,
-        cos_sin_cache: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Process modulation vectors
         img_mod_outputs = self.img_mod(vec)
@@ -255,13 +231,14 @@ class MMDoubleStreamBlock(nn.Module):
         # img_q here (both from the same qkv split), so the `.to(...)` was a
         # no-op. Dropped intentionally; dtype preservation is covered by
         # ``test_helper_preserves_input_dtype_*`` in the unit tests.
-        #
-        # ``cos_sin_cache`` is built once per
-        # ``HunyuanVideoTransformer3DModel.forward`` and threaded in; the
-        # ``None`` branch is a back-compat fallback for any external caller
-        # that still passes only ``freqs_cis``.
-        if cos_sin_cache is None:
-            cos_sin_cache = _build_qknorm_rope_cos_sin_cache(freqs_cis)
+        cos, sin = freqs_cis
+        cos_sin_cache = torch.cat(
+            [
+                cos.to(dtype=torch.float32).contiguous(),
+                sin.to(dtype=torch.float32).contiguous(),
+            ],
+            dim=-1,
+        )
         head_dim = img_q.shape[-1]
         img_q, img_k = apply_qk_norm_with_optional_rope(
             q=img_q.contiguous(),
@@ -420,7 +397,6 @@ class MMSingleStreamBlock(nn.Module):
         vec: torch.Tensor,
         txt_len: int,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-        cos_sin_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Process modulation
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
@@ -460,12 +436,14 @@ class MMSingleStreamBlock(nn.Module):
         txt_k = qkv[:, img_len:, 1].contiguous()
         txt_v = qkv[:, img_len:, 2]
 
-        # ``cos_sin_cache`` is built once per
-        # ``HunyuanVideoTransformer3DModel.forward`` and threaded in; the
-        # ``None`` branch is a back-compat fallback for any external caller
-        # that still passes only ``freqs_cis``.
-        if cos_sin_cache is None:
-            cos_sin_cache = _build_qknorm_rope_cos_sin_cache(freqs_cis)
+        cos, sin = freqs_cis
+        cos_sin_cache = torch.cat(
+            [
+                cos.to(dtype=torch.float32).contiguous(),
+                sin.to(dtype=torch.float32).contiguous(),
+            ],
+            dim=-1,
+        )
         head_dim = img_q.shape[-1]
 
         # Image stream: fused QK-Norm + RoPE.
@@ -739,13 +717,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        # Build the [num_tokens, head_dim] fp32 cos_sin_cache once here and
-        # thread it through every block, so the apply_qk_norm_with_optional_rope
-        # call sites in MMDoubleStreamBlock / MMSingleStreamBlock don't pay a
-        # fresh torch.cat per block per denoise step (was N_blocks * N_steps
-        # redundant allocations).
-        cos_sin_cache = _build_qknorm_rope_cos_sin_cache(freqs_cis)
-
         should_skip_forward = self.should_skip_forward_for_cached_states(
             img=img, vec=vec
         )
@@ -758,7 +729,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
             # Process through double stream blocks
             for index, block in enumerate(self.double_blocks):
-                double_block_args = [img, txt, vec, freqs_cis, cos_sin_cache]
+                double_block_args = [img, txt, vec, freqs_cis]
                 img, txt = block(*double_block_args)
             # Merge txt and img to pass through single stream blocks
             x = torch.cat((img, txt), 1)
@@ -771,7 +742,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                         vec,
                         txt_seq_len,
                         freqs_cis,
-                        cos_sin_cache,
                     ]
                     x = block(*single_block_args)
 
