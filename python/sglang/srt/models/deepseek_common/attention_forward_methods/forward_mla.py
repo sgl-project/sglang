@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -55,6 +56,8 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.utils import BumpAllocator
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -65,6 +68,7 @@ class MlaBmmFusionPlan:
     q_nope_out_buf: torch.Tensor
     q_nope_out_view: torch.Tensor
     attn_output_buf: torch.Tensor
+
 
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
@@ -239,9 +243,7 @@ class DeepseekMLAForwardMixin:
         q: torch.Tensor,
         latent_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_nope, q_pe = q.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
         return q_nope, q_pe, k_pe
 
@@ -387,7 +389,15 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if not self.skip_topk or prev_topk_indices is None:
+                # skip_topk (shared) layers carry no indexer weights in the
+                # checkpoint, so they must reuse the carried topk and never run
+                # the indexer. Do NOT widen this to `or prev_topk_indices is
+                # None` (the upstream gate): that recomputes with an
+                # uninitialized indexer whenever cross-layer propagation is
+                # unavailable (e.g. the TBO op path drops topk_indices),
+                # reintroducing the >index_topk garbling. The is_nextn clause is
+                # the sole intentional fallback (layer 78 has its own weights).
+                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -413,7 +423,12 @@ class DeepseekMLAForwardMixin:
                     fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
 
                 if q_lora is not None:
-                    if not self.skip_topk or prev_topk_indices is None:
+                    # See the skip_topk note above: shared layers have no
+                    # indexer weights, so this gate must not fall back to
+                    # computing when prev_topk_indices is None.
+                    if not self.skip_topk or (
+                        self.is_nextn and prev_topk_indices is None
+                    ):
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
@@ -436,91 +451,119 @@ class DeepseekMLAForwardMixin:
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        _kvb_q = None
         if fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
             # this transposed alias directly.
             q_nope_out = fusion_plan.q_nope_out_view
-        elif self.use_deep_gemm_bmm:
-            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            )
-            q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
-            )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (q_nope_val, q_nope_scale),
-                (self.w_kc, self.w_scale_k),
-                q_nope_out,
-                masked_m,
-                expected_m,
-            )
-            q_nope_out = q_nope_out[:, :expected_m, :]
-        elif _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
-                x = q_nope.transpose(0, 1)
-                q_nope_out = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_kc.shape[2],
-                    device=x.device,
-                    dtype=torch.bfloat16,
+        else:
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_prepare,
                 )
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_kc.transpose(-2, -1),
-                    self.w_scale_k.transpose(-2, -1),
-                    torch.bfloat16,
+
+                _kvb_q = kv_b_lora_q_prepare(self, q_nope)
+
+            if self.use_deep_gemm_bmm:
+                (
+                    q_nope_val,
+                    q_nope_scale,
+                    masked_m,
+                    expected_m,
+                    aligned_m,
+                ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                    q_nope.transpose(0, 1)
+                )
+                q_nope_out = q_nope.new_empty(
+                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                )
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (q_nope_val, q_nope_scale),
+                    (self.w_kc, self.w_scale_k),
                     q_nope_out,
+                    masked_m,
+                    expected_m,
                 )
-            else:
-                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
-                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
-                ):
-                    # fp8 Triton kernel: always on gfx950,
-                    # cudagraph-only on gfx942 (hides launch overhead)
-                    q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=q_nope,
-                        WQ=self.w_kc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=None,  # allocate (B, M, N)
-                        transpose_bm=False,  # (B, M, N)
-                        transpose_bm_in=True,  # (M, B, K)
+                q_nope_out = q_nope_out[:, :expected_m, :]
+            elif _is_hip:
+                # TODO(haishaw): add bmm_fp8 to ROCm
+                if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
+                    x = q_nope.transpose(0, 1)
+                    q_nope_out = torch.empty(
+                        x.shape[0],
+                        x.shape[1],
+                        self.w_kc.shape[2],
+                        device=x.device,
                         dtype=torch.bfloat16,
                     )
-
+                    batched_gemm_afp4wfp4_pre_quant(
+                        x,
+                        self.w_kc.transpose(-2, -1),
+                        self.w_scale_k.transpose(-2, -1),
+                        torch.bfloat16,
+                        q_nope_out,
+                    )
                 else:
+                    if (
+                        _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn
+                    ) or (
+                        get_is_capture_mode()
+                        and self.w_kc.dtype == torch.float8_e4m3fnuz
+                    ):
+                        # fp8 Triton kernel: always on gfx950,
+                        # cudagraph-only on gfx942 (hides launch overhead)
+                        q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                            X=q_nope,
+                            WQ=self.w_kc.transpose(-1, -2),
+                            w_scale=self.w_scale,
+                            group_size=128,
+                            YQ=None,  # allocate (B, M, N)
+                            transpose_bm=False,  # (B, M, N)
+                            transpose_bm_in=True,  # (M, B, K)
+                            dtype=torch.bfloat16,
+                        )
+
+                    else:
+                        q_nope_out = torch.bmm(
+                            q_nope.to(torch.bfloat16).transpose(0, 1),
+                            self.w_kc.to(torch.bfloat16) * self.w_scale,
+                        )
+
+            elif self.w_kc.dtype == torch.float8_e4m3fn:
+                if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
                     )
-
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
-            if _is_cpu:
-                q_nope_out = torch.bmm(
-                    q_nope.to(torch.bfloat16).transpose(0, 1),
-                    self.w_kc.to(torch.bfloat16) * self.w_scale,
-                )
+                else:
+                    # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+                    q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                        q_nope.transpose(0, 1),
+                        (
+                            torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                            if _is_cublas_ge_129
+                            else zero_allocator.allocate(1)
+                        ),
+                    )
+                    q_nope_out = bmm_fp8(
+                        q_nope_val,
+                        self.w_kc,
+                        q_nope_scale,
+                        self.w_scale,
+                        torch.bfloat16,
+                    )
             else:
-                # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
-                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                    q_nope.transpose(0, 1),
-                    (
-                        torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
-                        if _is_cublas_ge_129
-                        else zero_allocator.allocate(1)
-                    ),
-                )
-                q_nope_out = bmm_fp8(
-                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-                )
-        else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        if fusion_plan is None:
             q_nope_out = q_nope_out.transpose(0, 1)
-            if is_kv_b_lora_active(self):
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_apply,
+                )
+
+                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+            elif is_kv_b_lora_active(self):
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
@@ -724,6 +767,15 @@ class DeepseekMLAForwardMixin:
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
+        _kvb_v = None
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
+            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                kv_b_lora_v_prepare,
+            )
+
+            _kvb_v = kv_b_lora_v_prepare(self, attn_output)
+
         if self.use_deep_gemm_bmm:
             (
                 attn_output_val,
@@ -862,7 +914,15 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        if is_kv_b_lora_active(self):
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                kv_b_lora_v_apply,
+            )
+
+            attn_bmm_output = kv_b_lora_v_apply(
+                self, attn_output, attn_bmm_output, _kvb_v
+            )
+        elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )

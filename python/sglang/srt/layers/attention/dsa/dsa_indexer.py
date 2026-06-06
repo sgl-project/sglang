@@ -765,11 +765,31 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
-        # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
-        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
-        # that layout here.
-        if seqlens_32.dim() == 2:
+
+        assert len(q_fp8.shape) == 3
+        # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
+        # hidden states; q_offset is the real (unpadded) q length.
+        q_offset = sum(metadata.get_dsa_extend_len_cpu())
+
+        # DG-native q=[B,next_n,H,D] is faster than expanded q=[B*next_n,1,H,D]
+        # for target_verify with next_n>=2 (bigger MMA tile, fewer atoms). The
+        # precomputed ctx_lens_2d's shape is the single source of truth — if
+        # dsa_backend chose the per-token layout (e.g. non-SM100), fall through
+        # to the expanded path.
+        B = metadata.get_seqlens_int32().shape[0]
+        next_n = q_offset // B if B > 0 else 0
+        ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        use_dg_native = (
+            _is_cuda
+            and forward_batch.forward_mode.is_target_verify()
+            and next_n >= 2
+            and ctx_2d is not None
+            and ctx_2d.shape == (B, next_n)
+        )
+
+        if use_dg_native:
+            seqlens_32_2d = ctx_2d
+        elif seqlens_32.dim() == 2:
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
@@ -779,8 +799,6 @@ class Indexer(MultiPlatformOp):
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
-        assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
         block_kv = page_size
         num_heads_kv = 1
@@ -791,12 +809,10 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
-        # and it is necessary to extract the actual q length.
-        q_offset = sum(metadata.get_dsa_extend_len_cpu())
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
+            q_fp8 = q_fp8.unsqueeze(1)
             batch_size, next_n, heads, _ = q_fp8.shape
             logits = torch.empty(
                 (batch_size * next_n, max_seq_len),
@@ -814,7 +830,21 @@ class Indexer(MultiPlatformOp):
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
             )
+        elif use_dg_native:
+            # block_tables[::next_n] de-expands dsa_backend's repeat_interleave
+            # without a copy (DG only checks `stride(1) == 1`).
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2]),
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables[::next_n],
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
         else:
+            q_fp8 = q_fp8.unsqueeze(1)
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,
@@ -1462,7 +1492,9 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        in_piecewise_or_breakable_cuda_graph = _is_in_piecewise_or_breakable_cuda_graph()
+        in_piecewise_or_breakable_cuda_graph = (
+            _is_in_piecewise_or_breakable_cuda_graph()
+        )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside
         # custom ops via get_forward_context() to prevent Dynamo from guarding
@@ -1710,9 +1742,7 @@ class Indexer(MultiPlatformOp):
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
                     return maybe_capture_indexer_topk(layer_id, topk_result)
                 elif in_piecewise_or_breakable_cuda_graph:
-                    assert (
-                        not enable_dual_stream
-                    ), (
+                    assert not enable_dual_stream, (
                         "Internal error: piecewise/breakable CUDA graph should not "
                         "be enabled with dual stream"
                     )
