@@ -97,7 +97,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" || "${{ inputs.runs_on }}" == "4-gpu-gb300" ]]; then
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
           python3 scripts/ci/utils/update_rerun_test_status.py \
@@ -113,7 +113,7 @@ jobs:
         env:
           GRACE_BLACKWELL: ${{ inputs.grace_blackwell }}
         run: |
-          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" || "${{ inputs.runs_on }}" == "4-gpu-gb300" ]]; then
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
           bash ${{ inputs.install_script }}
@@ -121,7 +121,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" || "${{ inputs.runs_on }}" == "4-gpu-gb300" ]]; then
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
           cmds=()
