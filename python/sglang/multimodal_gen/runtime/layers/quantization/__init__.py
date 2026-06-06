@@ -2,11 +2,11 @@
 
 from typing import Literal, get_args
 
-from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
-    BitsAndBytesConfig,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
