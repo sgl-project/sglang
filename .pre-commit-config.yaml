@@ -99,6 +99,11 @@ repos:
         files: ^test/registered/.*\.py$
         exclude: ^test/registered/.*/utils\.py$
         pass_filenames: false
+      - id: check-bench-style
+        name: enforce unified marker benchmark style
+        entry: python3 scripts/ci/check_bench_style.py
+        language: system
+        files: ^python/sglang/jit_kernel/benchmark/.*bench_.*\.py$
       - id: check-no-docs-changes
         name: reject changes under legacy docs/
         entry: python3 scripts/ci/check_no_docs_changes.py
