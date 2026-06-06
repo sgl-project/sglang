@@ -63,24 +63,18 @@ def _ensure_evo2_tokenizer_files(tokenizer_name: str) -> None:
     """
     try:
         # Resolve config.json path — works for local dirs and HF Hub names
-        config_path = _resolve_local_or_cached_file(
-            tokenizer_name, "config.json"
-        )
+        config_path = _resolve_local_or_cached_file(tokenizer_name, "config.json")
     except FileNotFoundError:
         return
     except (OSError, json.JSONDecodeError, ValueError) as e:
-        logger.debug(
-            "Failed to read config.json for %s: %s", tokenizer_name, e
-        )
+        logger.debug("Failed to read config.json for %s: %s", tokenizer_name, e)
         return
 
     try:
         with open(config_path) as f:
             cfg = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        logger.debug(
-            "Failed to parse config.json for %s: %s", tokenizer_name, e
-        )
+        logger.debug("Failed to parse config.json for %s: %s", tokenizer_name, e)
         return
 
     if cfg.get("tokenizer_type") != "CharLevelTokenizer":
