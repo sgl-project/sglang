@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _UpstreamMlp,
     BidirectionalGDNUCPESinglePathLiteLA,
     GLUMBConvTemp,
+    MultiHeadCrossAttention,
     PatchEmbedMS3D,
     _RMSNorm,
     _SanaWMPaddedLocalAttention,
@@ -58,6 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     VanillaD2HStrategy,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
@@ -78,6 +80,9 @@ from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
     latent_frame_sana_wm_camera_conditions,
     parse_sana_wm_action_string,
     sana_wm_action_to_camera_to_world,
+)
+from sglang.multimodal_gen.runtime.utils.sana_wm_runtime_cache import (
+    SANA_WM_REQUEST_RUNTIME_CACHE_KEY,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
     OfficialDiffusersLTX2RefinerModule,
@@ -1300,6 +1305,71 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual([use.component_name for use in uses], ["vae"])
         self.assertEqual(uses[0].target_dtype, torch.bfloat16)
 
+    def test_before_denoising_declares_transformer_static_conditioning_use(
+        self,
+    ) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=object(),
+            transformer=object(),
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+
+        uses = stage.component_uses(
+            SimpleNamespace(pipeline_config=pipeline_config),
+            stage_name="sana_wm_before_denoising",
+        )
+
+        self.assertEqual([use.component_name for use in uses], ["vae", "transformer"])
+        transformer_use = uses[1]
+        self.assertEqual(transformer_use.phase, "transformer")
+        self.assertTrue(transformer_use.memory_intensive)
+        self.assertTrue(transformer_use.preferred_ready_after_request)
+
+    def test_static_conditioning_precompute_expands_cfg_batch(self) -> None:
+        class FakeTransformer:
+            def __init__(self):
+                self.camera_shape = None
+                self.chunk_shape = None
+
+            def prepare_sana_wm_static_conditioning(
+                self,
+                *,
+                camera_conditions,
+                chunk_plucker,
+                latent_shape,
+            ):
+                self.camera_shape = tuple(camera_conditions.shape)
+                self.chunk_shape = tuple(chunk_plucker.shape)
+                self.latent_shape = tuple(latent_shape)
+                return {
+                    "precomputed_prope_fns": ("prepared",),
+                    "precomputed_plucker_emb": torch.ones(4, 60, 8),
+                }
+
+        transformer = FakeTransformer()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=transformer,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+
+        out = stage._prepare_transformer_static_conditioning(
+            camera_conditions=torch.zeros(2, 3, 20),
+            chunk_plucker=torch.zeros(2, 48, 3, 4, 5),
+            latent_shape=(2, 128, 3, 4, 5),
+            do_cfg=True,
+            cfg_parallel=False,
+        )
+
+        self.assertEqual(transformer.camera_shape, (4, 3, 20))
+        self.assertEqual(transformer.chunk_shape, (4, 48, 3, 4, 5))
+        self.assertEqual(transformer.latent_shape, (2, 128, 3, 4, 5))
+        self.assertIn("precomputed_prope_fns", out)
+        self.assertIn("precomputed_plucker_emb", out)
+
     def test_prepare_noise_latents_accepts_per_sample_generators(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -1789,6 +1859,150 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
 
         self.assertEqual(key[0], (2, 3))
         self.assertEqual(key[-1], 0)
+
+    def test_camera_qkv_projection_fuses_params_for_inference(self) -> None:
+        attn = BidirectionalGDNUCPESinglePathLiteLA(
+            in_dim=8,
+            heads=2,
+            head_dim=4,
+        )
+        attn.eval()
+        x = torch.randn(2, 3, 8)
+
+        with torch.no_grad():
+            q_ref = attn.q_proj_cam(x)
+            k_ref = attn.k_proj_cam(x)
+            v_ref = attn.v_proj_cam(x)
+
+            self.assertTrue(attn.fuse_cam_qkv_projection())
+            fused_weight = attn._fused_cam_qkv_weight
+            q, k, v = attn._cam_qkv(x)
+
+            self.assertIs(attn._fused_cam_qkv_weight, fused_weight)
+            self.assertFalse(attn._fused_cam_qkv_weight.requires_grad)
+            self.assertFalse(attn._fused_cam_qkv_bias.requires_grad)
+            torch.testing.assert_close(q, q_ref)
+            torch.testing.assert_close(k, k_ref)
+            torch.testing.assert_close(v, v_ref)
+
+    def test_cross_attention_kv_request_cache_reuses_static_condition(self) -> None:
+        attn = MultiHeadCrossAttention(d_model=8, num_heads=2, qk_norm=True)
+        attn.request_cache_name = "cross_attn_kv_0"
+        attn.eval()
+        x = torch.randn(1, 3, 8)
+        cond = torch.randn(1, 4, 8)
+        batch = Req(prompt="drive forward")
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_SANA_WM_REQUEST_RUNTIME_CACHE": "1",
+                "SGLANG_SANA_WM_CROSS_ATTN_KV_CACHE_MAX_BYTES": "-1",
+            },
+        ), torch.no_grad(), set_forward_context(
+            current_timestep=0, attn_metadata=None, forward_batch=batch
+        ), patch.object(
+            attn.kv_linear,
+            "forward",
+            wraps=attn.kv_linear.forward,
+        ) as kv_forward:
+            out = attn(x, cond)
+            cached_out = attn(x, cond)
+
+            self.assertEqual(kv_forward.call_count, 1)
+            request_cache = batch.extra[SANA_WM_REQUEST_RUNTIME_CACHE_KEY]
+            self.assertIn("cross_attn_kv_0", request_cache)
+            self.assertIn("entry", request_cache["cross_attn_kv_0"])
+            torch.testing.assert_close(cached_out, out)
+
+            cond.add_(0.25)
+            attn(x, cond)
+
+            self.assertEqual(kv_forward.call_count, 2)
+
+    def test_cross_attention_kv_request_cache_respects_max_bytes(self) -> None:
+        attn = MultiHeadCrossAttention(d_model=8, num_heads=2, qk_norm=True)
+        attn.request_cache_name = "cross_attn_kv_0"
+        attn.eval()
+        x = torch.randn(1, 3, 8)
+        cond = torch.randn(1, 4, 8)
+        batch = Req(prompt="drive forward")
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_SANA_WM_REQUEST_RUNTIME_CACHE": "1",
+                "SGLANG_SANA_WM_CROSS_ATTN_KV_CACHE_MAX_BYTES": "1",
+            },
+        ), torch.no_grad(), set_forward_context(
+            current_timestep=0, attn_metadata=None, forward_batch=batch
+        ), patch.object(
+            attn.kv_linear,
+            "forward",
+            wraps=attn.kv_linear.forward,
+        ) as kv_forward:
+            out = attn(x, cond)
+            uncached_out = attn(x, cond)
+
+            self.assertEqual(kv_forward.call_count, 2)
+            request_cache = batch.extra[SANA_WM_REQUEST_RUNTIME_CACHE_KEY]
+            self.assertEqual(request_cache["cross_attn_kv_0"], {})
+            torch.testing.assert_close(uncached_out, out)
+
+    def test_y_projection_request_cache_reuses_static_encoder_states(self) -> None:
+        model = SanaWMTransformer3DModel.__new__(SanaWMTransformer3DModel)
+        torch.nn.Module.__init__(model)
+        model.y_embedder = torch.nn.Linear(4, 8)
+        model.y_norm = True
+        model.attention_y_norm = _RMSNorm(8)
+        model.blocks = torch.nn.ModuleList()
+        encoder_hidden_states = torch.randn(1, 5, 4)
+        batch = Req(prompt="drive forward")
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_REQUEST_RUNTIME_CACHE": "1"},
+        ), torch.no_grad(), set_forward_context(
+            current_timestep=0, attn_metadata=None, forward_batch=batch
+        ), patch.object(
+            model.y_embedder,
+            "forward",
+            wraps=model.y_embedder.forward,
+        ) as y_forward:
+            y = model._get_projected_y(encoder_hidden_states, batch_size=2)
+            cached_y = model._get_projected_y(encoder_hidden_states, batch_size=2)
+
+            self.assertEqual(y_forward.call_count, 1)
+            self.assertEqual(tuple(cached_y.shape), (2, 5, 8))
+            request_cache = batch.extra[SANA_WM_REQUEST_RUNTIME_CACHE_KEY]
+            self.assertIn("y_projection", request_cache)
+            self.assertIn("entry", request_cache["y_projection"])
+            torch.testing.assert_close(cached_y, y)
+
+    def test_request_runtime_cache_can_be_disabled(self) -> None:
+        model = SanaWMTransformer3DModel.__new__(SanaWMTransformer3DModel)
+        torch.nn.Module.__init__(model)
+        model.y_embedder = torch.nn.Linear(4, 8)
+        model.y_norm = False
+        model.blocks = torch.nn.ModuleList()
+        encoder_hidden_states = torch.randn(1, 5, 4)
+        batch = Req(prompt="drive forward")
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_REQUEST_RUNTIME_CACHE": "0"},
+        ), torch.no_grad(), set_forward_context(
+            current_timestep=0, attn_metadata=None, forward_batch=batch
+        ), patch.object(
+            model.y_embedder,
+            "forward",
+            wraps=model.y_embedder.forward,
+        ) as y_forward:
+            model._get_projected_y(encoder_hidden_states, batch_size=1)
+            model._get_projected_y(encoder_hidden_states, batch_size=1)
+
+            self.assertEqual(y_forward.call_count, 2)
+            self.assertNotIn(SANA_WM_REQUEST_RUNTIME_CACHE_KEY, batch.extra)
 
     def test_cfg_uses_true_cfg_scale_when_present(self) -> None:
         batch = Req(

@@ -60,6 +60,9 @@ from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
     sana_wm_action_num_frames,
     scale_sana_wm_intrinsics_to_latent,
 )
+from sglang.multimodal_gen.runtime.utils.sana_wm_runtime_cache import (
+    clear_sana_wm_request_runtime_cache,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -74,6 +77,8 @@ _SANA_WM_DIAGNOSTIC_MAX_SAMPLE_ELEMENTS = 65_536
 _SANA_WM_DEFAULT_VAE_TILE_MIN_FRAMES = 96
 _SANA_WM_DEFAULT_VAE_TILE_STRIDE_FRAMES = 64
 _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY = "sana_wm_condition_image_preprocess"
+_SANA_WM_PRECOMPUTED_PROPE_FNS_KEY = "precomputed_prope_fns"
+_SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY = "precomputed_plucker_emb"
 
 
 def _sana_wm_effective_guidance_scale(batch: Req) -> float:
@@ -692,6 +697,7 @@ class SanaWMDenoisingStage(DenoisingStage):
 
         num_inference_steps = batch.num_inference_steps
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
+        clear_sana_wm_request_runtime_cache(batch)
         self._maybe_enable_cache_dit_and_torch_compile(num_inference_steps, batch)
 
         latents = batch.latents.to(device=device, dtype=target_dtype)
@@ -754,6 +760,12 @@ class SanaWMDenoisingStage(DenoisingStage):
         chunk_plucker = _to_device_dtype(
             extra.get("chunk_plucker"), device=device, dtype=target_dtype
         )
+        precomputed_prope_fns = extra.get(_SANA_WM_PRECOMPUTED_PROPE_FNS_KEY)
+        precomputed_plucker_emb = _to_device_dtype(
+            extra.get(_SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY),
+            device=device,
+            dtype=target_dtype,
+        )
 
         cfg_parallel = bool(server_args.enable_cfg_parallel and do_cfg)
         cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel else 0
@@ -773,8 +785,14 @@ class SanaWMDenoisingStage(DenoisingStage):
             model_kwargs = {
                 "encoder_hidden_states": branch_embeds,
                 "encoder_attention_mask": branch_mask,
-                "camera_conditions": camera_conditions,
-                "chunk_plucker": chunk_plucker,
+                "camera_conditions": (
+                    None if precomputed_prope_fns is not None else camera_conditions
+                ),
+                "chunk_plucker": (
+                    None if precomputed_plucker_emb is not None else chunk_plucker
+                ),
+                _SANA_WM_PRECOMPUTED_PROPE_FNS_KEY: precomputed_prope_fns,
+                _SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY: precomputed_plucker_emb,
             }
         else:
             model_kwargs = {
@@ -787,15 +805,25 @@ class SanaWMDenoisingStage(DenoisingStage):
                     _cat_optional_tensors(neg_mask, pos_mask) if do_cfg else pos_mask
                 ),
                 "camera_conditions": (
-                    torch.cat([camera_conditions, camera_conditions], dim=0)
-                    if do_cfg and camera_conditions is not None
-                    else camera_conditions
+                    None
+                    if precomputed_prope_fns is not None
+                    else (
+                        torch.cat([camera_conditions, camera_conditions], dim=0)
+                        if do_cfg and camera_conditions is not None
+                        else camera_conditions
+                    )
                 ),
                 "chunk_plucker": (
-                    torch.cat([chunk_plucker, chunk_plucker], dim=0)
-                    if do_cfg and chunk_plucker is not None
-                    else chunk_plucker
+                    None
+                    if precomputed_plucker_emb is not None
+                    else (
+                        torch.cat([chunk_plucker, chunk_plucker], dim=0)
+                        if do_cfg and chunk_plucker is not None
+                        else chunk_plucker
+                    )
                 ),
+                _SANA_WM_PRECOMPUTED_PROPE_FNS_KEY: precomputed_prope_fns,
+                _SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY: precomputed_plucker_emb,
             }
         model_kwargs.update(chunk_kwargs)
         model_kwargs = self.prepare_extra_func_kwargs(
@@ -956,11 +984,10 @@ class SanaWMDenoisingStage(DenoisingStage):
     def _finalize_denoising_loop(
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
-        clear_inference_caches = getattr(
-            self.transformer, "clear_sana_wm_inference_caches", None
-        )
-        if clear_inference_caches is not None:
-            clear_inference_caches()
+        clear_sana_wm_request_runtime_cache(batch)
+        if getattr(batch, "extra", None) is not None:
+            batch.extra.pop(_SANA_WM_PRECOMPUTED_PROPE_FNS_KEY, None)
+            batch.extra.pop(_SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY, None)
 
         log_sana_wm_tensor_stats("denoise.output_latents", ctx.latents)
         unchanged = (
@@ -993,18 +1020,29 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        if self.vae is None:
-            return []
         stage_name = self._component_stage_name(stage_name)
+        uses: list[ComponentUse] = []
         pipeline_config = getattr(server_args, "pipeline_config", self.pipeline_config)
-        vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-        return [
-            ComponentUse(
-                stage_name=stage_name,
-                component_name="vae",
-                target_dtype=vae_dtype,
+        if self.vae is not None:
+            vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="vae",
+                    target_dtype=vae_dtype,
+                )
             )
-        ]
+        if self.transformer is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="transformer",
+                    phase="transformer",
+                    preferred_ready_after_request=True,
+                    memory_intensive=True,
+                )
+            )
+        return uses
 
     @torch.no_grad()
     def _vae_encode_image(
@@ -1778,6 +1816,60 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         return camera_conditions, chunk_plucker, source
 
+    @staticmethod
+    def _duplicate_condition_for_cfg(value: torch.Tensor | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        return torch.cat([value, value], dim=0)
+
+    def _prepare_transformer_static_conditioning(
+        self,
+        *,
+        camera_conditions: torch.Tensor | None,
+        chunk_plucker: torch.Tensor | None,
+        latent_shape: tuple,
+        do_cfg: bool,
+        cfg_parallel: bool,
+    ) -> dict[str, Any]:
+        if self.transformer is None:
+            return {}
+        if camera_conditions is None and chunk_plucker is None:
+            return {}
+
+        model_camera_conditions = camera_conditions
+        model_chunk_plucker = chunk_plucker
+        if do_cfg and not cfg_parallel:
+            model_camera_conditions = self._duplicate_condition_for_cfg(
+                camera_conditions
+            )
+            model_chunk_plucker = self._duplicate_condition_for_cfg(chunk_plucker)
+
+        with self.use_declared_component(
+            component_name="transformer",
+            module=self.transformer,
+            phase="transformer",
+        ) as active_transformer:
+            transformer = (
+                active_transformer
+                if active_transformer is not None
+                else self.transformer
+            )
+            prepare_static = getattr(
+                transformer, "prepare_sana_wm_static_conditioning"
+            )
+            static_kwargs = prepare_static(
+                camera_conditions=model_camera_conditions,
+                chunk_plucker=model_chunk_plucker,
+                latent_shape=latent_shape,
+            )
+
+        if static_kwargs:
+            self.log_info(
+                "SANA-WM transformer static conditioning prepared: %s",
+                sorted(static_kwargs.keys()),
+            )
+        return static_kwargs
+
     def _prepare_timesteps(
         self,
         batch: Req,
@@ -1945,10 +2037,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             None if chunk_plucker is None else tuple(chunk_plucker.shape),
         )
 
-        # --- 5. Prepare timesteps and sigmas ---
-        batch = self._prepare_timesteps(batch, server_args, device)
-
-        # --- 6. Ensure prompt_embeds is a list (DenoisingStage expects list[Tensor]) ---
+        # --- 5. Ensure prompt_embeds is a list (DenoisingStage expects list[Tensor]) ---
         if isinstance(batch.prompt_embeds, torch.Tensor):
             batch.prompt_embeds = [batch.prompt_embeds]
         if batch.negative_prompt_embeds is not None and isinstance(
@@ -1956,8 +2045,26 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         ):
             batch.negative_prompt_embeds = [batch.negative_prompt_embeds]
 
-        # --- 7. CFG setup ---
+        # --- 6. CFG setup ---
         batch.do_classifier_free_guidance = _sana_wm_should_do_cfg(batch)
+        cfg_parallel = bool(
+            getattr(server_args, "enable_cfg_parallel", False)
+            and batch.do_classifier_free_guidance
+        )
+
+        # --- 7. Precompute request-static transformer camera conditioning ---
+        batch.extra.update(
+            self._prepare_transformer_static_conditioning(
+                camera_conditions=camera_conditions,
+                chunk_plucker=chunk_plucker,
+                latent_shape=latent_shape,
+                do_cfg=batch.do_classifier_free_guidance,
+                cfg_parallel=cfg_parallel,
+            )
+        )
+
+        # --- 8. Prepare timesteps and sigmas ---
+        batch = self._prepare_timesteps(batch, server_args, device)
 
         self.log_info(
             "BeforeDenoisingStage done: latent=%s, T_lat=%d, H_sp=%d, W_sp=%d, "
