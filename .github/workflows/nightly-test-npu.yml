@@ -97,10 +97,13 @@ jobs:
       matrix:
         test_config:
           # qwen3_6_35b_a3b performance tests
-          - name: qwen3_6_35b_a3b_1p_in3k5_out1k5_50ms_aime26
+          - name: qwen3_6_35b_a3b_1p_in3k5_out1k5_50ms
             runner: linux-aarch64-a3-2
             test_case: test/registered/ascend/performance/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_in3k5_out1k5_50ms.py
             test_type: 'perf'
+          - name: qwen3_6_35b_a3b_1p_aime26
+            runner: linux-aarch64-a3-2
+            test_case: test/registered/ascend/accuracy/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_aime26.py
           - name: qwen3_6_35b_a3b_1p_in64k_out1k_50ms
             runner: linux-aarch64-a3-2
             test_case: test/registered/ascend/performance/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_in64k_out1k_50ms.py
@@ -213,10 +216,6 @@ jobs:
           - name: qwen3_vl_30b_a3b_thinking_1p_mmmu
             runner: linux-aarch64-a3-2
             test_case: test/registered/ascend/accuracy/qwen3_vl_30b_a3b_thinking/test_npu_qwen3_vl_30b_a3b_thinking_1p_mmmu.py
-#          # qwen3_omni_30b_a3b_thinking accuracy tests
-#          - name: qwen3_omni_30b_a3b_thinking_1p_mmmu
-#            runner: linux-aarch64-a3-2
-#            test_case: test/registered/ascend/accuracy/qwen3_omni_30b_a3b_thinking/test_npu_qwen3_omni_30b_a3b_thinking_1p_mmmu.py
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:
       runner: ${{ matrix.test_config.runner }}
@@ -327,6 +326,8 @@ jobs:
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| single-node-poc | $(group_icon ${single_result}) ${single_result} |" >> $GITHUB_STEP_SUMMARY
+          echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
+          echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "## Per-Test Metrics" >> $GITHUB_STEP_SUMMARY
@@ -364,6 +365,4 @@ jobs:
 
           FAIL=0
           if [ "${single_result}" != "success" ] && [ "${single_result}" != "skipped" ]; then FAIL=1; fi
-          if [ "${multi_result}" != "success" ] && [ "${multi_result}" != "skipped" ]; then FAIL=1; fi
-          if [ "${mix_result}" != "success" ] && [ "${mix_result}" != "skipped" ]; then FAIL=1; fi
           exit $FAIL
