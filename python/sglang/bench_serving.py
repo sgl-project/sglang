@@ -92,6 +92,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    audio_data: Optional[List[str]] = None
 
 
 @dataclass
@@ -273,6 +274,9 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
+        if request_func_input.audio_data:
+            payload.update({"audio_data": request_func_input.audio_data})
+
         headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
@@ -387,6 +391,22 @@ async def async_request_openai_chat_completions(
                 "image_url": {"url": img_url},
             }
             for img_url in request_func_input.image_data
+        ]
+        content_items.append({"type": "text", "text": request_func_input.prompt})
+        messages = [
+            {
+                "role": "user",
+                "content": content_items,
+            },
+        ]
+    elif request_func_input.audio_data:
+        # Build multi-audio content: a list of audio_url entries followed by the text
+        content_items = [
+            {
+                "type": "audio_url",
+                "audio_url": {"url": audio_url},
+            }
+            for audio_url in request_func_input.audio_data
         ]
         content_items.append({"type": "text", "text": request_func_input.prompt})
         messages = [
@@ -641,6 +661,10 @@ async def async_request_sglang_generate(
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
+
+        # Add audio data if available (list of audio urls/base64)
+        if request_func_input.audio_data:
+            payload["audio_data"] = request_func_input.audio_data
 
         headers = get_request_headers()
         if request_func_input.routing_key:
@@ -1295,6 +1319,7 @@ async def benchmark(
         output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
         image_data=test_request.image_data,
+        audio_data=test_request.audio_data,
         extra_request_body=extra_request_body,
     )
 
@@ -1406,6 +1431,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            audio_data=request.audio_data,
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
@@ -1647,6 +1673,12 @@ async def benchmark(
                 f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
                 f"{args.random_output_len}_{args.image_count}imgs_"
                 f"{args.image_resolution}.jsonl"
+            )
+        elif args.dataset_name == "audio":
+            output_file_name = (
+                f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
+                f"{args.random_output_len}_{args.audio_count}auds_"
+                f"{args.audio_length}s.jsonl"
             )
         elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
@@ -2133,6 +2165,39 @@ if __name__ == "__main__":
         type=str,
         default="random",
         help=("Content for images for image dataset. " "Supports random and blank."),
+    )
+    # audio dataset args
+    parser.add_argument(
+        "--audio-count",
+        type=int,
+        default=1,
+        help="Number of audio clips per request (only available with the audio dataset)",
+    )
+    parser.add_argument(
+        "--audio-length",
+        type=float,
+        default=5.0,
+        help="Length in seconds of each synthetic audio clip for the audio dataset.",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=16000,
+        help="Sample rate (Hz) of synthetic audio clips for the audio dataset.",
+    )
+    parser.add_argument(
+        "--random-audio-count",
+        action="store_true",
+        help="Enable random audio clip count per request for the audio dataset.",
+    )
+    parser.add_argument(
+        "--audio-content",
+        type=str,
+        default="random",
+        help=(
+            "Content for clips in the audio dataset. "
+            "Supports random (sine tone + noise) and silence."
+        ),
     )
     parser.add_argument(
         "--request-rate",

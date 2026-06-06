@@ -1,5 +1,6 @@
 from typing import Dict, Type
 
+from sglang.benchmark.datasets.audio import AudioDataset
 from sglang.benchmark.datasets.autobench import AutoBenchmarkDataset
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 from sglang.benchmark.datasets.custom import CustomDataset
@@ -27,6 +28,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "generated-shared-prefix": GeneratedSharedPrefixDataset,
     "mmmu": MMMUDataset,
     "image": ImageDataset,
+    "audio": AudioDataset,
     "mooncake": MooncakeDataset,
     "longbench_v2": LongBenchV2Dataset,
     "speed-bench": SpeedBenchDataset,
