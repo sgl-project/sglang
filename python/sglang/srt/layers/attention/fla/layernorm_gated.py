@@ -20,7 +20,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
