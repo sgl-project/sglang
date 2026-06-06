@@ -72,7 +72,7 @@ jobs:
   stage-a-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: intel-bmg
+    runs-on: b70
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -82,25 +82,53 @@ jobs:
 
       - name: Build Docker image
         run: |
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
+          # For PR events, use PR head repo/branch; for push events, use current repo/branch
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            REPO="${{ github.event.pull_request.head.repo.clone_url }}"
+            BRANCH="${{ github.head_ref }}"
+          else
+            REPO="https://github.com/${{ github.repository }}.git"
+            BRANCH="${{ github.ref_name }}"
+          fi
+          echo "Building with REPO=$REPO, BRANCH=$BRANCH"
+          TAG="bmg${RUNNER_SLOT:+-s$RUNNER_SLOT}"
           docker build \
-            ${PR_REPO:+--build-arg SG_LANG_REPO=$PR_REPO} \
-            ${PR_HEAD_REF:+--build-arg SG_LANG_BRANCH=$PR_HEAD_REF} \
-            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_main:bmg .
+            --build-arg SG_LANG_REPO=$REPO \
+            --build-arg SG_LANG_BRANCH=$BRANCH \
+            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_main:${TAG} .
 
       - name: Run container
         id: start_container
         run: |
+          TAG="bmg${RUNNER_SLOT:+-s$RUNNER_SLOT}"
+          # Build --device args from GPU_RENDER_DEVICES / GPU_CARD_DEVICES (set via runner .env).
+          # On single-runner hosts where these are empty, fall back to mounting all of /dev/dri.
+          DEVICE_ARGS=""
+          if [[ -n "${GPU_RENDER_DEVICES}${GPU_CARD_DEVICES}" ]]; then
+            for d in ${GPU_RENDER_DEVICES//,/ } ${GPU_CARD_DEVICES//,/ }; do
+              DEVICE_ARGS="$DEVICE_ARGS --device $d"
+            done
+          else
+            DEVICE_ARGS="--device /dev/dri"
+          fi
+          # CPU / memory pinning (empty -> no pinning on single-runner hosts)
+          CPUSET_ARGS=""
+          [[ -n "$CPU_CORES" ]] && CPUSET_ARGS="$CPUSET_ARGS --cpuset-cpus=$CPU_CORES"
+          [[ -n "$NUMA_NODE" ]] && CPUSET_ARGS="$CPUSET_ARGS --cpuset-mems=$NUMA_NODE"
+
           container_id=$(docker run -dt \
+            --name ci_sglang_xpu${RUNNER_SLOT:+_s$RUNNER_SLOT} \
+            $CPUSET_ARGS \
             --group-add 992 \
             --group-add $(getent group video | cut -d: -f3) \
             --group-add $(getent group render | cut -d: -f3) \
             -v $HOME/.cache/huggingface:/root/.cache/huggingface \
             --device /dev/dri \
             -v /dev/dri/by-path:/dev/dri/by-path \
+            $DEVICE_ARGS \
+            -e ZE_AFFINITY_MASK=0,1,2,3 \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
-            xpu_sglang_main:bmg)
+            xpu_sglang_main:${TAG})
           echo "Started container: $container_id"
           echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
 
