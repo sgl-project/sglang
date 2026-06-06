@@ -877,7 +877,11 @@ export const Playground = ({ config }) => {
         if (opt.flags?.length) {
           flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
         }
-        env = h.stripEnvByPrefix(env, fc.stripEnv || []);
+        const ownedEnvKeys = [...(fc.stripEnv || [])];
+        for (const o of (fc.options || [])) {
+          for (const e of (o.env || [])) ownedEnvKeys.push(e.split("=")[0]);
+        }
+        env = h.stripEnvByPrefix(env, ownedEnvKeys);
         if (opt.env?.length) env = [...env, ...opt.env];
         return { flags, env };
       },
