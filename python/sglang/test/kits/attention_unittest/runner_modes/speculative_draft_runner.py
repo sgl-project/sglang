@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -280,6 +281,12 @@ def _configure_runner_for_eagle_draft(
     server_args = runner.server_args
     updates = {
         "attention_backend": case.backend,
+        "cuda_graph_config": CudaGraphConfig(
+            decode=PhaseConfig(
+                bs=[settings.capture_batch_size],
+                max_bs=settings.capture_batch_size,
+            ),
+        ),
         "debug_cuda_graph": False,
         "decode_attention_backend": case.backend,
         "disable_cuda_graph_padding": False,
@@ -304,10 +311,6 @@ def _configure_runner_for_eagle_draft(
     }
     for key, value in updates.items():
         setattr(server_args, key, value)
-    # Direct write because cuda_graph_config is a nested dataclass; setattr
-    # on the flat key "cuda_graph_bs" would shadow rather than reach it.
-    server_args.cuda_graph_config.decode.bs = [settings.capture_batch_size]
-    server_args.cuda_graph_config.decode.max_bs = settings.capture_batch_size
 
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
