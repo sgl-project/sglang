@@ -1468,7 +1468,10 @@ def set_mamba_track_indices_from_reqs(batch):
     # Default to 0 (first ping-pong slot) to avoid TypeError.
     idx = (
         torch.tensor(
-            [req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0 for req in batch.reqs],
+            [
+                req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
+                for req in batch.reqs
+            ],
             dtype=torch.int64,
             pin_memory=True,
         )
