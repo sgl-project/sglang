@@ -390,6 +390,7 @@ def _run_eagle_draft_eager(
         init_eager_metadata(worker, batch, settings)
     else:
         worker.draft_attn_backend.init_forward_metadata(batch)
+    batch.mark_forward_metadata_ready()  # mirror production: pre-plan marks
     return worker.draft_forward(batch)
 
 
@@ -397,7 +398,7 @@ def _run_frozen_kv_mtp_eager(
     worker: _FrozenKVMTPWorkerHarness,
     batch: ForwardBatch,
 ):
-    return worker.draft_forward(batch, skip_attn_backend_init=False)
+    return worker.draft_forward(batch)
 
 
 def _capture_eagle_draft_graph_runner(
@@ -588,8 +589,10 @@ class _DenseEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -625,8 +628,10 @@ class _FrozenKVMTPDenseDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -713,10 +718,20 @@ def _make_dense_frozen_kv_mtp_draft_inputs(
     settings: EagleDraftRunnerSettings,
 ) -> dict[str, torch.Tensor]:
     draft_inputs = _make_dense_draft_inputs(case, settings)
+    # `draft_forward` now runs the assistant seed iter in-graph: it consumes the
+    # per-req bonus token + target hidden and derives iter-0 topk_p/topk_index
+    # itself, so the fixture supplies `bonus_tokens` rather than topk_p/index.
+    with _seeded_rng(4090 + len(case.name) + settings.topk, device=settings.device):
+        bonus_tokens = torch.randint(
+            0,
+            settings.vocab_size,
+            (case.batch_size,),
+            dtype=torch.int64,
+            device=settings.device,
+        )
     return {
         "hidden_states": draft_inputs["hidden_states"],
-        "topk_p": draft_inputs["topk_p"],
-        "topk_index": draft_inputs["topk_index"],
+        "bonus_tokens": bonus_tokens,
     }
 
 
@@ -849,9 +864,8 @@ def _make_dense_frozen_kv_mtp_forward_batch(
     settings: EagleDraftRunnerSettings,
 ) -> ForwardBatch:
     spec_info = FrozenKVMTPDraftInput(
-        topk_p=draft_inputs["topk_p"].clone(),
-        topk_index=draft_inputs["topk_index"].clone(),
         hidden_states=draft_inputs["hidden_states"].clone(),
+        bonus_tokens=draft_inputs["bonus_tokens"].clone(),
         capture_hidden_mode=CaptureHiddenMode.LAST,
         num_tokens_per_req=settings.topk,
         num_tokens_for_logprob_per_req=settings.topk,
@@ -1003,8 +1017,10 @@ class _MLAEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1259,8 +1275,10 @@ class _DSV4EagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1559,8 +1577,10 @@ class _DSAEagleDraftForward:
             torch.full_like(indices, -1),
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
