@@ -319,6 +319,10 @@ def patch_evo2_config_json(model: str) -> None:
     Some Evo2 repos ship with config.yml instead of config.json.
     This handles both, detects the Evo2 variant, and writes a complete
     config.json with all fields from the Vortex YAML configs.
+
+    original configs can be found here:
+    https://github.com/ArcInstitute/evo2/tree/main/evo2/configs
+    
     """
     import json
     import os
