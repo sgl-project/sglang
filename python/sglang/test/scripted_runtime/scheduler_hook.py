@@ -55,13 +55,13 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
     """Run the engine until the server warmup request has been received and
     fully processed, so scripts never observe foreign warmup traffic."""
     scheduler = ctx.scheduler
-    if scheduler.server_args.skip_server_warmup:
+    server_args = scheduler.server_args
+    if server_args.skip_server_warmup:
         return
 
     # is_fully_idle() can transiently report idle while a PP microbatch result
     # is still in flight, so require it to hold for two full microbatch
     # rotations after the warmup request was observed on the recv socket.
-    server_args = scheduler.server_args
     quiesce_iters = 2 * (server_args.pp_size + server_args.pp_async_batch_depth)
     proxy = ctx._tokenizer_recv_proxy
     deadline = time.monotonic() + WARMUP_DRIVE_TIMEOUT_S
