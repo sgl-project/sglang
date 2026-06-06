@@ -98,6 +98,103 @@ def _validate_conv_args(
             raise ValueError("padding='same' is not supported for strided convolutions")
 
 
+class Conv1dLayer(MultiPlatformOp):
+    """Drop-in replacement for nn.Conv1d"""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int]],
+        stride: Union[int, Tuple[int]] = 1,
+        padding: Union[int, Tuple[int]] = 0,
+        dilation: Union[int, Tuple[int]] = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = _tuplify(kernel_size, 1)
+        self.stride = _tuplify(stride, 1)
+        self.dilation = _tuplify(dilation, 1)
+        self.padding = _tuplify(padding, 1)
+        self.groups = groups
+        self.padding_mode = padding_mode
+
+        _validate_conv_args(
+            in_channels, out_channels, groups, padding, padding_mode, self.stride
+        )
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels // groups, *self.kernel_size)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+        if _is_cpu and _is_cpu_amx_available:
+            self.quant_method = PackWeightMethod(
+                weight_names=["weight"], is_conv_weight=True
+            )
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = nn.init._calculate_correct_fan(self.weight, "fan_in")
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv1d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if use_intel_amx_backend(self):
+            # conv1d_cpu returns [N, L_out, OC]
+            out = torch.ops.sgl_kernel.conv1d_cpu(
+                x,
+                self.weight,
+                self.bias,
+                self.stride[0],
+                self.padding[0],
+                True,
+            )
+            # transpose to [N, OC, L_out] for standard Conv1d API compatibility
+            return out.permute(0, 2, 1).contiguous()
+        return self.forward_native(x)
+
+    def forward_cpu_nhwc(self, x: torch.Tensor) -> torch.Tensor:
+        """CPU path returning [N, L_out, OC] layout directly (no transpose copy).
+
+        Use this when the caller needs [N, L_out, OC] anyway.
+        Input x must still be [N, IC, L].
+        """
+        if use_intel_amx_backend(self):
+            return torch.ops.sgl_kernel.conv1d_cpu(
+                x,
+                self.weight,
+                self.bias,
+                self.stride[0],
+                self.padding[0],
+                True,
+            )
+        return self.forward_native(x).permute(0, 2, 1).contiguous()
+
+
 class Conv2dLayer(MultiPlatformOp):
     """Drop-in replacement for nn.Conv2d. Linear optimization disabled by default."""
 
@@ -259,7 +356,9 @@ class Conv3dLayer(MultiPlatformOp):
             self.register_parameter("bias", None)
 
         if _is_cpu and _is_cpu_amx_available and self.bias is not None:
-            self.quant_method = PackWeightMethod(weight_names=["weight"])
+            self.quant_method = PackWeightMethod(
+                weight_names=["weight"], is_conv_weight=True
+            )
         self._reset_parameters()
 
     def _reset_parameters(self):

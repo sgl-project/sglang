@@ -29,6 +29,7 @@ import tqdm
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -38,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import (
+    empty_context,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -121,8 +123,6 @@ def register_fake_ops():
         "decode_attention_cpu",
         "extend_attention_cpu",
         "gemma_fused_add_rmsnorm_cpu",
-        "layernorm_cpu",
-        "fused_add_layernorm_cpu",
     ]
     for op in none_return_ops:
 
@@ -141,6 +141,8 @@ def register_fake_ops():
         "gemma_rmsnorm_cpu",
         "gemma3_rmsnorm_cpu",
         "gemma4_rmsnorm_cpu",
+        "layernorm_cpu",
+        "fused_add_layernorm_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -530,10 +532,7 @@ class CPUGraphRunner:
         assert (
             model_runner.spec_algorithm.is_none()
         ), "CPUGraphRunner does not support speculative inference yet."
-        # TODO add compile support for encoder-decoder models
-        assert (
-            not self.is_encoder_decoder
-        ), "CPUGraphRunner does not support encoder-decoder models yet."
+
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
@@ -548,6 +547,7 @@ class CPUGraphRunner:
             self.max_bs, self.max_num_token
         )
 
+        self.encoder_len_fill_value = 0
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
         )
@@ -575,10 +575,26 @@ class CPUGraphRunner:
                 dtype=torch.bool,
                 device=self.device,
             )
+            if self.is_encoder_decoder:
+                self.encoder_lens = torch.full(
+                    (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int64
+                )
+                self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64)
+            else:
+                self.encoder_lens = None
+                self.encoder_out_cache_loc = None
 
         # Capture
         try:
-            self.capture()
+            # use model_capture_mode for encoder-decoder models to
+            # set skip_cross_attention to avoid
+            # "Graph Break Reason: Data-dependent branching" caused by
+            # skip_cross_attention = forward_batch.encoder_lens.max() == 0
+            capture_context = (
+                model_capture_mode if self.is_encoder_decoder else empty_context
+            )
+            with capture_context():
+                self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture CPU graph failed: {e}\n{CPU_GRAPH_CAPTURE_FAILED_MSG}"
@@ -589,6 +605,10 @@ class CPUGraphRunner:
             forward_batch.batch_size in self.graphs
             if self.disable_padding
             else forward_batch.batch_size <= self.max_bs
+        )
+
+        is_encoder_lens_supported = (
+            forward_batch.encoder_lens.max() > 0 if self.is_encoder_decoder else True
         )
 
         requested_capture_hidden_mode = max(
@@ -605,7 +625,11 @@ class CPUGraphRunner:
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
 
-        return is_bs_supported and capture_hidden_mode_matches
+        return (
+            is_bs_supported
+            and capture_hidden_mode_matches
+            and is_encoder_lens_supported
+        )
 
     def capture(self) -> None:
         capture_range = (
@@ -667,6 +691,10 @@ class CPUGraphRunner:
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
         self.num_token_non_padded[...] = num_tokens
+        if self.is_encoder_decoder:
+            encoder_lens = self.encoder_lens[:bs]
+        else:
+            encoder_lens = None
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -682,6 +710,9 @@ class CPUGraphRunner:
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
+            encoder_lens_cpu=encoder_lens,
+            encoder_out_cache_loc=self.encoder_out_cache_loc,
             return_logprob=False,
             positions=positions,
             mrope_positions=mrope_positions,
@@ -821,25 +852,28 @@ class CPUGraphRunner:
         assert (
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
-
-        prepared_forward_batch = self.prepare_replay(forward_batch)
-        output = self.graphs[prepared_forward_batch.batch_size](
-            prepared_forward_batch.input_ids,
-            prepared_forward_batch.positions,
-            prepared_forward_batch,
+        replay_context = (
+            model_capture_mode if self.is_encoder_decoder else empty_context
         )
-        if forward_batch.batch_size in self.graphs:
-            return output
+        with replay_context():
+            prepared_forward_batch = self.prepare_replay(forward_batch)
+            output = self.graphs[prepared_forward_batch.batch_size](
+                prepared_forward_batch.input_ids,
+                prepared_forward_batch.positions,
+                prepared_forward_batch,
+            )
+            if forward_batch.batch_size in self.graphs:
+                return output
 
-        assert isinstance(output, LogitsProcessorOutput)
-        return LogitsProcessorOutput(
-            next_token_logits=output.next_token_logits[: self.raw_num_token],
-            hidden_states=(
-                output.hidden_states[: self.raw_num_token]
-                if output.hidden_states is not None
-                else None
-            ),
-        )
+            assert isinstance(output, LogitsProcessorOutput)
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.hidden_states[: self.raw_num_token]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

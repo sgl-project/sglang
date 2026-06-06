@@ -77,6 +77,10 @@ namespace {
         using packed_t = uint8_t;                                \
         return __VA_ARGS__();                                    \
       }                                                          \
+      case at::ScalarType::Float: {                              \
+        using packed_t = float;                                  \
+        return __VA_ARGS__();                                    \
+      }                                                          \
       default:                                                   \
         TORCH_CHECK(false, "Unsupported floating data type.\n"); \
     }                                                            \
@@ -142,6 +146,27 @@ namespace {
     default:                                                         \
       TORCH_CHECK(false, "Unsupported reduced floating data type."); \
   }
+
+// dispatch: float, bfloat16, float16
+#define CPU_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)                      \
+  [&] {                                                                   \
+    switch (TYPE) {                                                       \
+      case at::ScalarType::Float: {                                       \
+        using scalar_t = float;                                           \
+        return __VA_ARGS__();                                             \
+      }                                                                   \
+      case at::ScalarType::BFloat16: {                                    \
+        using scalar_t = at::BFloat16;                                    \
+        return __VA_ARGS__();                                             \
+      }                                                                   \
+      case at::ScalarType::Half: {                                        \
+        using scalar_t = at::Half;                                        \
+        return __VA_ARGS__();                                             \
+      }                                                                   \
+      default:                                                            \
+        TORCH_CHECK(false, NAME, ": unsupported dtype ", toString(TYPE)); \
+    }                                                                     \
+  }()
 
 // dispatch with mixed dtypes (TYPE1, TYPE2):
 //   TYPE1: the primary dtype (input, output, weight);

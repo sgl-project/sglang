@@ -542,40 +542,51 @@ class LayerNorm(MultiPlatformOp):
     def forward_cuda(
         self,
         x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if (
             _flashinfer_layernorm_available
             and x.dtype == torch.bfloat16
             and self.dtype == torch.float32
+            and residual is None
         ):
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         else:
-            return self.forward_native(x)
+            return self.forward_native(x, residual)
 
     def forward_native(
         self,
         x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if residual is not None:
+            x = x + residual
+            residual = x
         weight = self.weight if self.elementwise_affine else None
         bias = self.bias if self.use_bias else None
         orig_dtype = x.dtype
         x = x.to(self.dtype)
-        return F.layer_norm(
+        x = F.layer_norm(
             x,
             (self.hidden_size,),
             weight=weight,
             bias=bias,
             eps=self.variance_epsilon,
         ).to(orig_dtype)
+        if residual is None:
+            return x
+        return x, residual
 
     def forward_hip(
         self,
         x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if (
             _has_aiter_layer_norm
             and x.dtype in (torch.bfloat16, torch.float16)
             and x.dtype == self.dtype
+            and residual is None
         ):
             orig_shape = x.shape
             x = x.reshape(-1, self.hidden_size)
@@ -583,25 +594,32 @@ class LayerNorm(MultiPlatformOp):
                 orig_shape
             )
         else:
-            return self.forward_native(x)
+            return self.forward_native(x, residual)
 
     def forward_npu(
         self,
         x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        return self.forward_native(x, residual)
 
     def forward_cpu(
         self,
         x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if _is_cpu_amx_available:
             bias_data = self.bias.data if self.use_bias else None
+            if residual is not None:
+                output = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+                    x, residual, self.weight.data, bias_data, self.variance_epsilon
+                )
+                return output, residual
             return torch.ops.sgl_kernel.layernorm_cpu(
                 x, self.weight.data, bias_data, self.variance_epsilon
             )
         else:
-            return self.forward_native(x)
+            return self.forward_native(x, residual)
 
 
 class GemmaRMSNorm(MultiPlatformOp):

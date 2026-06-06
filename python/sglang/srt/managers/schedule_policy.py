@@ -984,6 +984,18 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                # For encoder-decoder models, the encoder portion must not be
+                # split across chunks. Ensure the chunk covers all encoder
+                # tokens when the encoder is not yet cached.
+                if (
+                    req.multimodal_inputs is not None
+                    and req.multimodal_inputs.num_image_tokens is not None
+                ):
+                    encoder_len = req.multimodal_inputs.num_image_tokens
+                    if len(req.prefix_indices) < encoder_len:
+                        if trunc_len < encoder_len:
+                            return AddReqResult.OTHER
+
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]

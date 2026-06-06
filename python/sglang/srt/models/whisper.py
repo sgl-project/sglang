@@ -8,6 +8,8 @@ from transformers import WhisperConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.conv import Conv1dLayer
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -20,6 +22,10 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
+
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
 
 
 class WhisperAttention(torch.nn.Module):
@@ -27,6 +33,7 @@ class WhisperAttention(torch.nn.Module):
 
     def __init__(
         self,
+        orig_embed_dim: int,
         embed_dim: int,
         num_heads: int,
         bias: bool = True,
@@ -58,10 +65,10 @@ class WhisperAttention(torch.nn.Module):
 
         if is_cross_attention:
             self.q_proj = ColumnParallelLinear(
-                embed_dim, embed_dim, quant_config=quant_config
+                orig_embed_dim, embed_dim, quant_config=quant_config
             )
             self.kv_proj = QKVParallelLinear(
-                hidden_size=embed_dim,
+                hidden_size=orig_embed_dim,
                 head_size=head_dim,
                 total_num_heads=0,
                 total_num_kv_heads=num_heads,
@@ -70,15 +77,15 @@ class WhisperAttention(torch.nn.Module):
             )
         else:
             self.qkv_proj = QKVParallelLinear(
-                embed_dim, head_dim, num_heads, quant_config=quant_config
+                orig_embed_dim, head_dim, num_heads, quant_config=quant_config
             )
         self.out_proj = RowParallelLinear(
-            embed_dim, embed_dim, bias=bias, quant_config=quant_config
+            embed_dim, orig_embed_dim, bias=bias, quant_config=quant_config
         )
         self.attn = RadixAttention(
             self.num_heads,
             head_dim,
-            scaling=1.0,
+            scaling=self.scaling,
             num_kv_heads=self.num_heads,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -99,7 +106,6 @@ class WhisperAttention(torch.nn.Module):
         if self.is_cross_attention:
             # Cross-attention: KV cached during prefill, read from pool during decode.
             q, _ = self.q_proj(hidden_states)
-            q = q * self.scaling
             if cross_hidden_states is not None:
                 kv, _ = self.kv_proj(cross_hidden_states)
                 k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
@@ -110,23 +116,55 @@ class WhisperAttention(torch.nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.chunk(chunks=3, dim=-1)
-            q = q * self.scaling
 
             if self.is_encoder:
                 num_heads = self.attn.tp_q_head_num
                 head_dim = self.attn.head_dim
                 batch_size, seq_len, _ = hidden_states.shape
+                if _is_cpu and _is_amx_available:
+                    # reshape to [total_tokens, num_heads, head_dim] for flash_attn_varlen_func
+                    q = q.reshape(batch_size * seq_len, num_heads, head_dim)
+                    k = k.reshape(batch_size * seq_len, num_heads, head_dim)
+                    v = v.reshape(batch_size * seq_len, num_heads, head_dim)
 
-                q = q.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-                k = k.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-                v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+                    seqlens = torch.arange(
+                        0,
+                        (batch_size + 1) * seq_len,
+                        step=seq_len,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                    attn_output = torch.ops.sgl_kernel.flash_attn_varlen_func(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q=seqlens,
+                        cu_seqlens_k=seqlens,
+                        max_seqlen_q=seq_len,
+                        max_seqlen_k=seq_len,
+                        causal=False,
+                    )
+                    # reshape back to [batch_size, seq_len, num_heads * head_dim]
+                    attn_output = attn_output.reshape(
+                        batch_size, seq_len, num_heads * head_dim
+                    )
+                else:
+                    q = q.view(batch_size, seq_len, num_heads, head_dim).permute(
+                        0, 2, 1, 3
+                    )
+                    k = k.view(batch_size, seq_len, num_heads, head_dim).permute(
+                        0, 2, 1, 3
+                    )
+                    v = v.view(batch_size, seq_len, num_heads, head_dim).permute(
+                        0, 2, 1, 3
+                    )
 
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, scale=1.0
-                )
-                attn_output = attn_output.permute(0, 2, 1, 3).reshape(
-                    batch_size, seq_len, num_heads * head_dim
-                )
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, scale=self.scaling
+                    )
+                    attn_output = attn_output.permute(0, 2, 1, 3).reshape(
+                        batch_size, seq_len, num_heads * head_dim
+                    )
             else:
                 attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=True)
 
@@ -143,24 +181,29 @@ class WhisperEncoderLayer(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.embed_dim = config.d_model
+        orig_embed_dim = config.d_model
+        self.embed_dim = orig_embed_dim
+        if _is_cpu and _is_amx_available:
+            head_dim = orig_embed_dim // config.original_num_attention_heads
+            self.embed_dim = head_dim * config.encoder_attention_heads
 
         self.self_attn = WhisperAttention(
+            orig_embed_dim=orig_embed_dim,
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             layer_id=layer_id,
             quant_config=quant_config,
             is_encoder=True,
         )
-        self.self_attn_layer_norm = torch.nn.LayerNorm(self.embed_dim)
+        self.self_attn_layer_norm = LayerNorm(orig_embed_dim)
 
         self.activation_fn = get_act_fn(
             config.activation_function, quant_config=quant_config
         )
 
-        self.fc1 = ColumnParallelLinear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = RowParallelLinear(config.encoder_ffn_dim, self.embed_dim)
-        self.final_layer_norm = torch.nn.LayerNorm(self.embed_dim)
+        self.fc1 = ColumnParallelLinear(orig_embed_dim, config.encoder_ffn_dim)
+        self.fc2 = RowParallelLinear(config.encoder_ffn_dim, orig_embed_dim)
+        self.final_layer_norm = LayerNorm(orig_embed_dim)
 
     def forward(
         self,
@@ -172,10 +215,7 @@ class WhisperEncoderLayer(torch.nn.Module):
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states, forward_batch)
 
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states, residual = self.final_layer_norm(hidden_states, residual)
         hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
@@ -199,7 +239,11 @@ class WhisperDecoderLayer(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.embed_dim = config.d_model
+        orig_embed_dim = config.d_model
+        self.embed_dim = orig_embed_dim
+        if _is_cpu and _is_amx_available:
+            head_dim = orig_embed_dim // config.original_num_attention_heads
+            self.embed_dim = head_dim * config.decoder_attention_heads
 
         # Offset decoder layer IDs to avoid overlap with encoder layers
         decoder_self_attn_layer_id = config.encoder_layers + layer_id
@@ -208,6 +252,7 @@ class WhisperDecoderLayer(torch.nn.Module):
         )
 
         self.self_attn = WhisperAttention(
+            orig_embed_dim=orig_embed_dim,
             embed_dim=self.embed_dim,
             num_heads=config.decoder_attention_heads,
             layer_id=decoder_self_attn_layer_id,
@@ -217,19 +262,19 @@ class WhisperDecoderLayer(torch.nn.Module):
         self.activation_fn = get_act_fn(
             config.activation_function, quant_config=quant_config
         )
-
-        self.self_attn_layer_norm = torch.nn.LayerNorm(self.embed_dim)
+        self.self_attn_layer_norm = LayerNorm(orig_embed_dim)
         self.encoder_attn = WhisperAttention(
+            orig_embed_dim=orig_embed_dim,
             embed_dim=self.embed_dim,
             num_heads=config.decoder_attention_heads,
             layer_id=decoder_cross_attn_layer_id,
             quant_config=quant_config,
             is_cross_attention=True,
         )
-        self.encoder_attn_layer_norm = torch.nn.LayerNorm(self.embed_dim)
-        self.fc1 = ColumnParallelLinear(self.embed_dim, config.decoder_ffn_dim)
-        self.fc2 = RowParallelLinear(config.decoder_ffn_dim, self.embed_dim)
-        self.final_layer_norm = torch.nn.LayerNorm(self.embed_dim)
+        self.encoder_attn_layer_norm = LayerNorm(orig_embed_dim)
+        self.fc1 = ColumnParallelLinear(orig_embed_dim, config.decoder_ffn_dim)
+        self.fc2 = RowParallelLinear(config.decoder_ffn_dim, orig_embed_dim)
+        self.final_layer_norm = LayerNorm(orig_embed_dim)
 
     def forward(
         self,
@@ -241,17 +286,15 @@ class WhisperDecoderLayer(torch.nn.Module):
         residual = decoder_hidden_states
         decoder_hidden_states = self.self_attn_layer_norm(decoder_hidden_states)
         decoder_hidden_states = self.self_attn(decoder_hidden_states, forward_batch)
-        decoder_hidden_states = residual + decoder_hidden_states
-
-        residual = decoder_hidden_states
-        decoder_hidden_states = self.encoder_attn_layer_norm(decoder_hidden_states)
+        decoder_hidden_states, residual = self.encoder_attn_layer_norm(
+            decoder_hidden_states, residual
+        )
         decoder_hidden_states = self.encoder_attn(
             decoder_hidden_states, forward_batch, encoder_hidden_states
         )
-        decoder_hidden_states = residual + decoder_hidden_states
-
-        residual = decoder_hidden_states
-        decoder_hidden_states = self.final_layer_norm(decoder_hidden_states)
+        decoder_hidden_states, residual = self.final_layer_norm(
+            decoder_hidden_states, residual
+        )
         decoder_hidden_states, _ = self.fc1(decoder_hidden_states)
         decoder_hidden_states = self.activation_fn(decoder_hidden_states)
         decoder_hidden_states, _ = self.fc2(decoder_hidden_states)
@@ -271,10 +314,10 @@ class WhisperEncoder(torch.nn.Module):
         embed_dim = config.d_model
         self.embed_scale = embed_dim**-0.5 if config.scale_embedding else 1.0
 
-        self.conv1 = torch.nn.Conv1d(
+        self.conv1 = Conv1dLayer(
             config.num_mel_bins, embed_dim, kernel_size=3, padding=1
         )
-        self.conv2 = torch.nn.Conv1d(
+        self.conv2 = Conv1dLayer(
             embed_dim, embed_dim, kernel_size=3, stride=2, padding=1
         )
         self.embed_positions = torch.nn.Embedding(
@@ -287,7 +330,7 @@ class WhisperEncoder(torch.nn.Module):
                 for id in range(config.encoder_layers)
             ]
         )
-        self.layer_norm = torch.nn.LayerNorm(config.d_model)
+        self.layer_norm = LayerNorm(config.d_model)
 
     def forward(
         self,
@@ -300,10 +343,14 @@ class WhisperEncoder(torch.nn.Module):
         position_ids = position_ids.to(device=device)
 
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
-        inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
-
-        inputs_embeds = inputs_embeds.mT
-
+        if _is_cpu and _is_amx_available:
+            # CPU AMX path: conv2 returns [N, L_out, OC] directly, skip transpose
+            inputs_embeds = torch.nn.functional.gelu(
+                self.conv2.forward_cpu_nhwc(inputs_embeds)
+            )
+        else:
+            inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
+            inputs_embeds = inputs_embeds.mT.contiguous()
         hidden_states = inputs_embeds + self.embed_positions(position_ids)
 
         for encoder_layer in self.layers:
@@ -336,8 +383,7 @@ class WhisperDecoder(torch.nn.Module):
                 for layer_idx in range(config.decoder_layers)
             ]
         )
-
-        self.layer_norm = torch.nn.LayerNorm(config.d_model)
+        self.layer_norm = LayerNorm(config.d_model)
 
     def forward(
         self,
@@ -462,7 +508,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
 
             if features_to_encode:
                 # Batch all features and run encoder once instead of sequentially
-                features_batch = torch.cat(features_to_encode, dim=0)
+                features_batch = torch.cat(features_to_encode, dim=0).contiguous()
                 encoder_len = features_batch.shape[-1] // 2
                 encoder_position_ids = torch.arange(
                     encoder_len, device=features_batch.device
