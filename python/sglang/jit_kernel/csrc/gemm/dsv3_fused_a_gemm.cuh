@@ -591,7 +591,12 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   constexpr int tile_m = 16;
   constexpr int tile_n = kTileN;                        // 8 or 16
   constexpr int tile_k = std::max(256, 1024 / tile_n);  // 256
-  constexpr int max_stage_cnt = 1024 * 192 / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
+#if defined(SGL_CUDA_ARCH) && SGL_CUDA_ARCH >= 1200
+  constexpr int smem_stage_budget = 96 * 1024;
+#else
+  constexpr int smem_stage_budget = 192 * 1024;
+#endif
+  constexpr int max_stage_cnt = smem_stage_budget / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
   constexpr int k_iter_cnt = gemm_k / tile_k;
   constexpr int stage_cnt =
       k_iter_cnt > max_stage_cnt ? max_stage_cnt : k_iter_cnt;  // possible tunable for smallK > 1 wave n. // 22
