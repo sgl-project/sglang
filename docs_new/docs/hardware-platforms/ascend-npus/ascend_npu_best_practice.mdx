@@ -3214,8 +3214,8 @@ sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
 export SGLANG_SET_CPU_AFFINITY=1
+export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
 
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
@@ -3223,25 +3223,44 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_ALGO="level0:NA;level1:ring"
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=20
-export HCCL_BUFFSIZE=2000
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_WARMUP_TIMEOUT=3600
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
 
-python -m sglang.launch_server \
-        --model-path /path/to/Qwen3-Next-80B-A3B-Instruct-W8A8-3 \
-        --host 127.0.0.1 \
-        --port 6699 \
-        --tp-size 4 \
-        --device npu \
-        --attention-backend ascend \
-        --mem-fraction-static 0.685 \
-        --max-running-requests 80 \
-        --watchdog-timeout 3600 \
-        --disable-radix-cache \
-        --cuda-graph-bs 80 \
-        --max-prefill-tokens 28672  --max-total-tokens 450560 \
-        --moe-a2a-backend deepep --deepep-mode auto \
-        --quantization modelslim \
-        --chunked-prefill-size -1
+ZBAL_HCCL_OP="allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base"
+export HCCL_BUFFSIZE=64
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBAL_ENABLE_GRAPH=1
+MODEL_PATH=/home/weights/Qwen3-Next-80B-A3B-Instruct-W8A8
+
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
+    --page-size 128 \
+    --tp-size 4 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6699 \
+    --mem-fraction-static 0.75 \
+    --disable-radix-cache --max-prefill-tokens 14080 --context-length 26384 \
+    --chunked-prefill-size -1 --max-running-requests 300 \
+    --mamba-ssm-dtype bfloat16 \
+    --quantization modelslim \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  --speculative-draft-model-quantization  unquant \
+    --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
+    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
 ```
 
 #### Benchmark
@@ -3249,7 +3268,7 @@ python -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```shell Command
-python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 80 --random-output-len 1536 --random-input-len 3584 --num-prompts 160 --random-range-ratio 1
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 300 --random-output-len 1536 --random-input-len 3584 --num-prompts 300 --random-range-ratio 1
 ```
 
 ### Qwen3-32B 6K-1_5K 18ms on A2 8 Cards Mixed Mode
