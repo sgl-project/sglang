@@ -1217,10 +1217,9 @@ class Req(ReqDllmMixin):
         if self.sampling_params.ignore_eos:
             return False
 
-        # Check stop token ids
-        matched_eos = False
-
         for i, token_id in enumerate(new_accepted_tokens):
+            matched_eos = False
+            matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
             if self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
@@ -1230,14 +1229,18 @@ class Req(ReqDllmMixin):
                 if self.tokenizer.additional_stop_token_ids:
                     matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
+                if matched_pos + 1 < self.sampling_params.min_new_tokens:
+                    continue
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
-                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
                 self.finished_len = matched_pos + 1
                 return True
 
         return False
 
     def _check_str_based_finish(self):
+        if len(self.output_ids) < self.sampling_params.min_new_tokens:
+            return False
+
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0

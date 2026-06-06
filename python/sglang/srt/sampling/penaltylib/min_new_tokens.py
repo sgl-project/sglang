@@ -3,6 +3,28 @@ import torch
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 
 
+def _get_token_based_stop_ids(req):
+    stop_ids = set(req.sampling_params.stop_token_ids or ())
+
+    tokenizer = getattr(req, "tokenizer", None)
+    if tokenizer is not None:
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            stop_ids.add(eos_token_id)
+
+        additional_stop_token_ids = getattr(
+            tokenizer, "additional_stop_token_ids", None
+        )
+        if additional_stop_token_ids:
+            stop_ids.update(additional_stop_token_ids)
+
+    eos_token_ids = getattr(req, "eos_token_ids", None)
+    if eos_token_ids:
+        stop_ids.update(eos_token_ids)
+
+    return list(stop_ids)
+
+
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     """
     Min new tokens penalizer penalizes tokens based on the length of the output.
@@ -25,13 +47,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
             sequences=[
                 torch.tensor(
-                    data=(
-                        list(
-                            (req.sampling_params.stop_token_ids or set())
-                            | (req.tokenizer.additional_stop_token_ids or set())
-                            | {req.tokenizer.eos_token_id}
-                        )
-                    ),
+                    data=_get_token_based_stop_ids(req),
                     dtype=torch.int64,
                     device=self.orchestrator.device,
                 )
