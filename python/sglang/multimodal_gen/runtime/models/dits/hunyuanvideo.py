@@ -709,7 +709,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             teacache_params, TeaCacheParams
         ), "teacache_params is not a TeaCacheParams"
         num_inference_steps = forward_batch.num_inference_steps
-        teache_thresh = teacache_params.teacache_thresh
+        teache_thresh = teacache_params.rel_l1_thresh
 
         coefficients = teacache_params.coefficients
 

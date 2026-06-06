@@ -169,9 +169,7 @@ class SamplingParams:
 
     # TeaCache parameters
     enable_teacache: bool = False
-    teacache_params: Any = (
-        None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
-    )
+    teacache_params: Any | None = None
 
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})

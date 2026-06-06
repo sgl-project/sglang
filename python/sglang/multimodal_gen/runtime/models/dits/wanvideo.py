@@ -947,8 +947,6 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         # For type checking
-
-        self.cnt = 0
         self.__post_init__()
 
         # misc
@@ -1002,16 +1000,19 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance=None,
         **kwargs,
     ) -> torch.Tensor:
-        forward_batch = get_forward_context().forward_batch
+
+        # if caching is enabled, we might initialize or reset the cache state
+        self.maybe_init_cache()
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+
         if forward_batch is not None:
             sequence_shard_enabled = (
                 forward_batch.enable_sequence_shard and self.sp_size > 1
             )
         else:
             sequence_shard_enabled = False
-        self.enable_teacache = (
-            forward_batch is not None and forward_batch.enable_teacache
-        )
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -1146,25 +1147,27 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # 4. Transformer blocks
         # if caching is enabled, we might be able to skip the forward pass
-        should_skip_forward = self.should_skip_forward_for_cached_states(
-            timestep_proj=timestep_proj, temb=temb
-        )
+        should_skip_forward = False
+        if self.cache:
+            use_ret_steps = forward_batch.sampling_params.teacache_params.use_ret_steps
+            modulated_input = timestep_proj if use_ret_steps else temb
+            should_skip_forward = self.cache.step(modulated_input)
 
         if should_skip_forward:
-            hidden_states = self.retrieve_cached_states(hidden_states)
+            # compute hidden_states by reading from the cached state
+            hidden_states = self.cache.read(hidden_states)
         else:
-            # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
+            if self.cache:
                 original_hidden_states = hidden_states.clone()
 
             for block in self.blocks:
                 hidden_states = block(
                     hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
                 )
-            # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
-                self.maybe_cache_states(hidden_states, original_hidden_states)
-        self.cnt += 1
+
+            if self.cache:
+                # update the cache with the new hidden states
+                self.cache.write(hidden_states, original_hidden_states)
 
         if sequence_shard_enabled:
             hidden_states = hidden_states.contiguous()
@@ -1201,56 +1204,6 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
         return output
-
-    def maybe_cache_states(
-        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
-    ) -> None:
-        """Cache residual with CFG positive/negative separation."""
-        residual = hidden_states.squeeze(0) - original_hidden_states
-        if not self.is_cfg_negative:
-            self.previous_residual = residual
-        else:
-            self.previous_residual_negative = residual
-
-    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-        if not self.enable_teacache:
-            return False
-        ctx = self._get_teacache_context()
-        if ctx is None:
-            return False
-
-        # Initialize Wan-specific parameters
-        teacache_params = ctx.teacache_params
-        use_ret_steps = teacache_params.use_ret_steps
-        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
-            ctx.num_inference_steps, ctx.do_cfg
-        )
-
-        # Determine boundary step
-        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
-
-        timestep_proj = kwargs["timestep_proj"]
-        temb = kwargs["temb"]
-        modulated_inp = timestep_proj if use_ret_steps else temb
-
-        self.is_cfg_negative = ctx.is_cfg_negative
-
-        # Use shared helper to compute cache decision
-        should_calc = self._compute_teacache_decision(
-            modulated_inp=modulated_inp,
-            is_boundary_step=is_boundary_step,
-            coefficients=ctx.coefficients,
-            teacache_thresh=ctx.teacache_thresh,
-        )
-
-        return not should_calc
-
-    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Retrieve cached residual with CFG positive/negative separation."""
-        if not self.is_cfg_negative:
-            return hidden_states + self.previous_residual
-        else:
-            return hidden_states + self.previous_residual_negative
 
 
 EntryClass = WanTransformer3DModel
