@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 import tempfile
@@ -24,7 +25,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.cuda_ipc_transport_utils import SimpleCudaIpcProxy
+
+logger = logging.getLogger(__name__)
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -554,41 +557,22 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if SGL_USE_CUDA_IPC:
                 for item in mm_items:
                     if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                                item.feature
-                            )
-                        )
-                        if isinstance(available_slice, torch.Tensor):
-                            available_slice.copy_(
-                                item.feature.reshape(-1).view(torch.int8),
-                                non_blocking=True,
-                            )
-                            item.feature = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.feature,
-                                sync_buffer_meta=sync_flag,
-                            )
+                        try:
+                            item.feature = SimpleCudaIpcProxy.from_tensor(item.feature)
+                        except Exception as e:
+                            logger.warning("Failed to create CUDA IPC proxy: %s", e)
                     elif (
                         isinstance(item.precomputed_embeddings, torch.Tensor)
                         and item.precomputed_embeddings.is_cuda
                     ):
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                                item.precomputed_embeddings
+                        try:
+                            item.precomputed_embeddings = (
+                                SimpleCudaIpcProxy.from_tensor(
+                                    item.precomputed_embeddings
+                                )
                             )
-                        )
-                        if isinstance(available_slice, torch.Tensor):
-                            flattened = item.precomputed_embeddings.reshape(-1)
-                            available_slice.copy_(
-                                flattened.view(torch.int8),
-                                non_blocking=True,
-                            )
-                            item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.precomputed_embeddings,
-                                sync_buffer_meta=sync_flag,
-                            )
+                        except Exception as e:
+                            logger.warning("Failed to create CUDA IPC proxy: %s", e)
 
             return MultimodalProcessorOutput(
                 input_ids=input_ids.tolist(),

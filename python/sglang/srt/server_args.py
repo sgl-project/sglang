@@ -786,7 +786,7 @@ class ServerArgs:
     enforce_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
-    keep_mm_feature_on_device: bool = False
+
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
     enable_return_indexer_topk: bool = False
@@ -6768,11 +6768,7 @@ class ServerArgs:
             action="store_true",
             help="Adopt base image processor instead of fast image processor.",
         )
-        parser.add_argument(
-            "--keep-mm-feature-on-device",
-            action="store_true",
-            help="Keep multimodal feature tensors on device after processing to save D2H copy.",
-        )
+
         parser.add_argument(
             "--enable-return-hidden-states",
             action="store_true",

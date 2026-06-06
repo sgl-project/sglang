@@ -113,7 +113,6 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = True
 
         mock_processor = MagicMock()
         mock_processor.__class__.__name__ = "TestProcessor"
@@ -210,7 +209,6 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = False
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"

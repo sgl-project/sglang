@@ -30,12 +30,7 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-)
+from sglang.srt.utils.cuda_ipc_transport_utils import SimpleCudaIpcProxy
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -259,25 +254,9 @@ class BaseMultimodalProcessor(ABC):
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
-            # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
-            # tokenizer workers. Each worker gets an equal share so that adding
-            # workers doesn't multiply the GPU-side footprint.
-            worker_num = self.server_args.tokenizer_worker_num
-            per_worker_pool_size = max(
-                MM_FEATURE_CACHE_SIZE // worker_num,
-                128 * 1024 * 1024,
-            )
-            logger.info(
-                "MmItemMemoryPool size per tokenizer worker: %.0f MiB "
-                "(budget %.0f MiB / %d worker(s))",
-                per_worker_pool_size / (1024 * 1024),
-                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
-                worker_num,
-            )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                per_worker_pool_size,
-                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-            )
+            # SimpleCudaIpcProxy uses per-tensor CUDA IPC handles instead of a
+            # pre-allocated memory pool.  No pool allocation is needed.
+            logger.info("CUDA IPC transport enabled (per-tensor mode, no memory pool)")
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -469,16 +448,13 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.server_args.keep_mm_feature_on_device:
-            # move feature tensors to cpu
+        if not SGL_USE_CUDA_IPC:
+            # Move feature tensors to CPU for cross-process pickle transport.
             for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
-                    pass
-                else:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -1212,30 +1188,15 @@ class BaseMultimodalProcessor(ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
-        """helper function to turn a tensor into a cuda-ipc tensor"""
+        """helper function to turn a tensor into a cuda-ipc proxy"""
         if not tensor.is_cuda:
             return tensor
 
-        sync_flag, available_slice, byte_offset = (
-            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
-        )
-        if isinstance(available_slice, torch.Tensor):
-            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
-            return CudaIpcTensorTransportProxy(
-                data=available_slice,
-                info_data=tensor,
-                sync_buffer_meta=sync_flag,
-                pool_ipc_handle=(
-                    self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if _IPC_POOL_HANDLE_CACHE
-                    else None
-                ),
-                pool_byte_offset=byte_offset,
-                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-            )
-        if self.server_args.keep_mm_feature_on_device:
-            return tensor
-        return tensor.cpu()
+        try:
+            return SimpleCudaIpcProxy.from_tensor(tensor)
+        except Exception as e:
+            logger.warning("Failed to create CUDA IPC proxy: %s", e)
+            return tensor.cpu()
 
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.

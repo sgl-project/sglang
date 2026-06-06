@@ -509,3 +509,88 @@ class CudaIpcTensorTransportProxy:
 
         self.reconstruct_tensor = reconstructed_tensor
         return self.reconstruct_tensor
+
+
+class SimpleCudaIpcProxy:
+    """Per-tensor CUDA IPC proxy. No pool, no sync flag, no polling thread.
+
+    Producer: wraps a CUDA tensor's IPC handle for pickle transport.
+    Consumer: opens handle -> zero-copy view into producer's GPU memory.
+    Lifecycle: producer storage is prevented from GC by holding a reference;
+               consumer views are freed when the proxy is GC'd.
+    """
+
+    def __init__(
+        self,
+        handle,
+        shape,
+        dtype,
+        stride,
+        device_index,
+        storage_offset,
+        storage_ref=None,
+    ):
+        self.ipc_state = {
+            "handle": handle,
+            "shape": shape,
+            "dtype": dtype,
+            "stride": stride,
+            "device_index": device_index,
+            "storage_offset": storage_offset,
+        }
+        # Hold a reference to the producer's storage so that the underlying
+        # GPU memory stays alive until this proxy (and all its consumer views)
+        # are garbage-collected.  _share_cuda_() also pins the storage
+        # internally (CudaIPCSentDataLimbo), but we keep an explicit ref
+        # as a safety net.
+        self._storage_ref = storage_ref
+        self._reconstructed = None
+
+    def __getstate__(self):
+        # Exclude _storage_ref from pickle: it's only needed on the producer
+        # to prevent GC.  The consumer reconstructs via the IPC handle.
+        state = self.__dict__.copy()
+        state["_storage_ref"] = None
+        state["_reconstructed"] = None
+        return state
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor):
+        """Producer side: get IPC handle from tensor (no copy)."""
+        storage = tensor.untyped_storage()
+        handle = storage._share_cuda_()
+        return cls(
+            handle=handle,
+            shape=tensor.shape,
+            dtype=tensor.dtype,
+            stride=tensor.stride(),
+            device_index=tensor.device.index,
+            storage_offset=tensor.storage_offset(),
+            storage_ref=storage,
+        )
+
+    def reconstruct_on_target_device(self, rebuild_device_idx):
+        """Consumer side: open IPC handle -> zero-copy view."""
+        if (
+            self._reconstructed is not None
+            and self._reconstructed.device.index == rebuild_device_idx
+        ):
+            return self._reconstructed
+
+        handle = self.ipc_state["handle"]
+        target_device = torch.device(f"cuda:{rebuild_device_idx}")
+        redirected_handle = (rebuild_device_idx,) + tuple(handle)[1:]
+
+        with torch.cuda.device(target_device):
+            storage = torch.UntypedStorage._new_shared_cuda(*redirected_handle)
+            shape = self.ipc_state["shape"]
+            dtype = self.ipc_state["dtype"]
+            stride = self.ipc_state["stride"]
+            s_offset = self.ipc_state["storage_offset"]
+
+            # Zero-copy view into producer's memory
+            self._reconstructed = torch.empty(
+                0, dtype=dtype, device=target_device
+            ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
+
+        return self._reconstructed
