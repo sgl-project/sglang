@@ -35,6 +35,8 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
     "joy-echo": "JoyEchoPipeline",
+    "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
 }
 
 

@@ -902,10 +902,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     if self.use_sliding_window_kv_pool:
+                        # AITER attention kernels require int32 page indices;
+                        # full_to_swa_index_mapping is stored as int64.
                         swa_page_table = (
                             self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 kv_indices
-                            )
+                            ).to(torch.int32)
                         )
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
@@ -1381,10 +1383,13 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if self.use_sliding_window_kv_pool:
+                    # AITER attention kernels (e.g. mha_batch_prefill_func)
+                    # require int32 page indices; full_to_swa_index_mapping is
+                    # stored as int64.
                     swa_page_table = (
                         self.token_to_kv_pool.translate_loc_from_full_to_swa(
                             self.indices_updater_prefill.kv_indices
-                        )
+                        ).to(torch.int32)
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -1580,10 +1585,12 @@ class AiterAttnBackend(AttentionBackend):
                         ]
 
                         if self.use_sliding_window_kv_pool:
+                            # AITER attention kernels require int32 page indices;
+                            # full_to_swa_index_mapping is stored as int64.
                             swa_page_indices = (
                                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                     page_indices
-                                )
+                                ).to(torch.int32)
                             )
 
                             page_indices = self._transform_table_1_to_real(page_indices)
