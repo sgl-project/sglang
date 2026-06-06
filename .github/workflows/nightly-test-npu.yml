@@ -287,8 +287,6 @@ jobs:
     if: ${{ !cancelled() }}
     needs:
       - nightly-poc-single-node-tests
-      - nightly-poc-multi-node-tests
-      - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
     steps:
       - name: Download all metrics
@@ -309,8 +307,6 @@ jobs:
           }
 
           single_result="${{ needs.nightly-poc-single-node-tests.result }}"
-          multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
-          mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
           group_icon() {
             case "$1" in
@@ -327,8 +323,6 @@ jobs:
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| single-node-poc | $(group_icon ${single_result}) ${single_result} |" >> $GITHUB_STEP_SUMMARY
-          echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
-          echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "## Per-Test Metrics" >> $GITHUB_STEP_SUMMARY
