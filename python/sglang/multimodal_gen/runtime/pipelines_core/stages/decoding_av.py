@@ -16,6 +16,16 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
+# Fallback LTX-2 compression ratios used only if the VAE does not expose them.
+_DEFAULT_SPATIAL_COMPRESSION = 32
+_DEFAULT_TEMPORAL_COMPRESSION = 8
+# Safety factors for the untiled-decode free-memory estimate. The decoder's
+# transient activation workspace dwarfs the final frame buffer, so the
+# decoded-frame byte estimate is scaled up before comparing against free memory.
+_UNTILED_DECODE_WORKSPACE_FACTOR = 8  # peak transient activations vs. output frames
+_UNTILED_DECODE_SAFETY_MARGIN = 1.3  # extra headroom on top of the estimate
+_UNTILED_DECODE_MIN_FREE_FRACTION = 0.3  # require >30% of total memory still free
+
 
 class LTX2AVDecodingStage(DecodingStage):
     """
@@ -57,15 +67,33 @@ class LTX2AVDecodingStage(DecodingStage):
             return "force"
         return "auto"
 
-    @staticmethod
-    def _untiled_decode_fits(latents: torch.Tensor) -> bool:
+    def _untiled_decode_fits(self, latents: torch.Tensor) -> bool:
         try:
             free, total = torch.cuda.mem_get_info()
+            spatial = int(
+                getattr(
+                    self.vae,
+                    "spatial_compression_ratio",
+                    _DEFAULT_SPATIAL_COMPRESSION,
+                )
+            )
+            temporal = int(
+                getattr(
+                    self.vae,
+                    "temporal_compression_ratio",
+                    _DEFAULT_TEMPORAL_COMPRESSION,
+                )
+            )
             channels = int(latents.shape[1]) if latents.dim() >= 2 else 1
+            # latent positions -> decoded RGB pixels.
             decoded_numel = latents.numel() / max(channels, 1) * 3
-            decoded_numel *= 32 * 32 * 8  # LTX spatial/temporal expansion.
-            peak_bytes = decoded_numel * 2 * 8  # bf16 plus decoder workspace.
-            return free > peak_bytes * 1.3 and (free / max(total, 1)) > 0.3
+            decoded_numel *= spatial * spatial * temporal
+            # bf16 output frames scaled by the transient-activation workspace.
+            peak_bytes = decoded_numel * 2 * _UNTILED_DECODE_WORKSPACE_FACTOR
+            return (
+                free > peak_bytes * _UNTILED_DECODE_SAFETY_MARGIN
+                and (free / max(total, 1)) > _UNTILED_DECODE_MIN_FREE_FRACTION
+            )
         except Exception:
             return False
 
@@ -95,11 +123,12 @@ class LTX2AVDecodingStage(DecodingStage):
                     "Untiled eager VAE decode hit OOM; falling back to tiled "
                     "eager decode for the rest of this run."
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Untiled eager VAE decode failed (%s); falling back to "
-                    "tiled eager decode.",
-                    type(exc).__name__,
+            except Exception:  # noqa: BLE001
+                # Log the full traceback so a genuine decode bug (shape/dtype/
+                # NaN) is not silently masked by the tiled-decode fallback.
+                logger.exception(
+                    "Untiled eager VAE decode failed; falling back to tiled "
+                    "eager decode for the rest of this run."
                 )
             self._vae_decode_untiled_failed = True
             try:
@@ -140,7 +169,17 @@ class LTX2AVDecodingStage(DecodingStage):
 
     @staticmethod
     def _postprocess_video_to_uint8_np(video: torch.Tensor):
-        """Convert decoded [B, C, T, H, W] video to final uint8 frames."""
+        """Convert decoded [B, C, T, H, W] video to final uint8 [B, T, H, W, C] frames.
+
+        This replaces ``VideoProcessor.postprocess_video(output_type="np")`` (which
+        returned float32 [0, 1]) and does the denormalize + uint8 cast on-GPU so only
+        uint8 (not float32) is copied to the host. It is numerically identical to the
+        previous pipeline end-to-end: ``save_outputs`` already cast the float output
+        to uint8 via ``(np.clip(x, 0, 1) * 255).astype(np.uint8)`` (truncation), which
+        matches ``.to(torch.uint8)`` here. NOTE: the stage output is now uint8 [0, 255]
+        rather than float [0, 1]; ``save_outputs`` handles both, but any consumer that
+        reads ``OutputBatch.output`` directly as float must account for this.
+        """
         if not isinstance(video, torch.Tensor) or video.dim() != 5:
             raise TypeError(
                 "Expected decoded video tensor with shape [B, C, T, H, W], "
