@@ -99,16 +99,13 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
-        if (
-            scheduler.chunked_req is None
-            and len(scheduler.waiting_queue) == 0
-            and scheduler.running_batch.is_empty()
-        ):
+        if scheduler.is_fully_idle():
             break
-
-    server_args = scheduler.server_args
-    for _ in range(2 * (server_args.pp_size + server_args.pp_async_batch_depth)):
-        yield
+    else:
+        raise RuntimeError(
+            "scripted_runtime reset: scheduler did not become fully idle "
+            f"within {RESET_DRAIN_MAX_STEPS} steps"
+        )
 
     ctx.flush_cache()
     yield

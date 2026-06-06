@@ -12,10 +12,18 @@ def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
     if s.chunked_req is not None:
         yield s.chunked_req
     yield from s.waiting_queue
-    if s.running_batch is not None:
-        yield from s.running_batch.reqs
-    if s.last_batch is not None:
-        yield from s.last_batch.reqs
+    if s.ps.pp_size > 1:
+        # Under PP, running_batch / last_batch only alias the current
+        # microbatch slot; scan every slot so requests in other slots
+        # (e.g. in-flight dispatched chunks) stay visible.
+        for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
+            if mb is not None:
+                yield from mb.reqs
+    else:
+        if s.running_batch is not None:
+            yield from s.running_batch.reqs
+        if s.last_batch is not None:
+            yield from s.last_batch.reqs
 
 
 def list_active_reqs(ctx: "ScriptedContext") -> List["Req"]:
