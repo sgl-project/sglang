@@ -238,9 +238,7 @@ class UnifiedLRUList:
             return None
         return x
 
-    def get_prev_no_host_lock(
-        self, node: UnifiedTreeNode, check_id: bool = True
-    ):
+    def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
         if check_id:
             assert node.id in self.cache
@@ -1608,9 +1606,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return False
 
-        host_anchor_params = self.inc_host_lock_ref(
-            best_match_node
-        ).to_dec_params()
+        host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
 
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
@@ -2328,9 +2324,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(
-                    ack_id
-                )
+                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
             finish_count -= 1
