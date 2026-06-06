@@ -16,7 +16,6 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -258,6 +257,21 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
         )
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        # seq_lens_cpu is unused by _replay_metadata for the non-target-verify
+        # case but kept in the contract for compatibility.
+        self.forward_metadata = self._replay_metadata(
+            forward_batch.batch_size,
+            forward_batch.req_pool_indices,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+            forward_batch.seq_lens_cpu if not in_capture else None,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
         self.forward_metadata = self._forward_metadata(forward_batch)
@@ -391,42 +405,6 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst.to(self.device, non_blocking=True),
             track_ssm_final_src.to(self.device, non_blocking=True),
             track_ssm_final_dst.to(self.device, non_blocking=True),
-        )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=None,
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        self.forward_metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
 
     def init_forward_metadata_capture_cpu_graph(
@@ -698,6 +676,27 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
             ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        metadata = self._replay_metadata(
+            forward_batch.batch_size,
+            forward_batch.req_pool_indices,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+            forward_batch.seq_lens_cpu if not in_capture else None,
+        )
+        spec_info = forward_batch.spec_info
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        self.forward_metadata = Mamba2Metadata.prepare_decode(
+            metadata,
+            forward_batch.seq_lens,
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
         metadata = self._forward_metadata(forward_batch)
@@ -707,54 +706,11 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch,
         )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=None,
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
-        )
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
-        self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata,
-            seq_lens,
-            is_target_verify=forward_mode.is_target_verify(),
-            draft_token_num=draft_token_num,
-        )
-
     def forward(
         self,
         mixer: MambaMixer2,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         layer_id: int,
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
@@ -762,7 +718,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        intermediate_states = mixer.forward(
+        mixer_out, intermediate_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
             layer_cache=layer_cache,
@@ -796,6 +752,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     num_decodes,
                 )
 
+        return mixer_out
+
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(
             "Mamba2AttnBackend's forward is called directly instead of through HybridLinearAttnBackend, as it supports mixed prefill and decode"
@@ -827,25 +785,20 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
-        # Explicit linear-attention subclass → strong linear signal (KDA, GDN,
-        # Qwen3-Next, Qwen3.5 main linear layers).
-        if isinstance(layer, RadixLinearAttention):
-            return False
-        # Some hybrid models (Ling-2.5/2.6) wrap their linear layers in plain
-        # `RadixAttention` rather than `RadixLinearAttention`. Those wrappers
-        # set `_is_linear_attention=True` on the attn module so we can
-        # distinguish them from full-attention RadixAttention instances —
-        # including MTP/NEXTN draft layers, which are full and must default to
-        # the full-attn path.
-        if layer is not None and getattr(layer, "_is_linear_attention", False):
-            return False
-        if isinstance(layer, RadixAttention):
-            return True
-
         if layer is not None:
             layer_id = layer.layer_id
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
@@ -856,6 +809,16 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
+        # Hybrid MLA models (Ring/Ling, Kimi-Linear) resolve this via
+        # get_attn_backend(), which returns this wrapper; delegate to the
+        # full-attn backend so its chunked/one-shot prefill metadata is planned.
+        init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
+        if init is not None:
+            init(forward_batch, disable_flashinfer_ragged)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
@@ -863,27 +826,6 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cpu_graph_state(max_bs, max_num_tokens)
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
 
     def init_forward_metadata_capture_cpu_graph(
         self,
@@ -904,29 +846,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 encoder_lens,
                 forward_mode,
                 spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):

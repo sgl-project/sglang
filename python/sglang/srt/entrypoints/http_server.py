@@ -164,6 +164,7 @@ from sglang.srt.utils import (
     add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
+    is_mps,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -305,7 +306,11 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
         elif server_args.disaggregation_mode == "decode":
@@ -1299,15 +1304,21 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.post("/weights_checker")
+@app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message, ranks = await _global_state.tokenizer_manager.check_weights(
-        obj, request
+async def check_weights(
+    obj: Optional[CheckWeightsReqInput] = None, request: Request = None
+):
+    if obj is None:
+        obj = CheckWeightsReqInput()
+    success, message, ranks, per_engine_checksum = (
+        await _global_state.tokenizer_manager.check_weights(obj, request)
     )
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
+    if per_engine_checksum is not None:
+        body["per_engine_checksum"] = per_engine_checksum
     return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
@@ -1452,13 +1463,24 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
 
     # 2) Call the non-stream parsing method (non-stream)
-    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+    if getattr(obj, "return_blocks", False):
+        blocks = parser.parse_non_stream_blocks(obj.text)
+        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
+        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
+        reasoning_text = "".join(reasoning_blocks)
+        normal_text = "".join(text_blocks)
+    else:
+        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
         "reasoning_text": reasoning_text,
         "text": normal_text,
     }
+    if getattr(obj, "return_blocks", False):
+        response_data["reasoning_blocks"] = reasoning_blocks
+        response_data["text_blocks"] = text_blocks
+        response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
 
@@ -1903,8 +1925,8 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     model_info = res.json()
 
-    # Construct a warmup request
-    is_vlm = bool(model_info.get("has_image_understanding", False))
+    # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"

@@ -221,16 +221,8 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
+def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
-
-    Args:
-        layer: The FusedMoE layer module.
-        num_tokens: Current token count entering the MoE layer.  Used as
-            the buffer size for the non-a2a (allgather) path, where the
-            autotune dummy run passes req_to_token_pool.size * dp_size —
-            the worst-case post-allgather batch.  For the a2a path this
-            is ignored in favour of the dispatcher's workspace limit.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
     it depends on final weight shapes and EP configuration.  The wrapper's
@@ -259,20 +251,18 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
     )
 
     server_args = get_global_server_args()
-    use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
+    use_cuda_graph = not server_args.disable_cuda_graph
 
-    # Buffer size must cover the worst-case token count the MoE layer can see.
-    # - A2A path: dispatch returns tensors flattened from
-    #   [ep_size, max_tokens_per_rank, ...].
-    # - Standard allgather path: dp_size * max local tokens per rank.
+    # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
+    # single forward can route through this layer.
     dispatcher = getattr(layer, "dispatcher", None)
     if hasattr(dispatcher, "max_num_tokens"):
+        # A2A path: bounded by the dispatcher's own workspace limit.
         max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
     else:
-        # Standard allgather path: num_tokens from the first forward is
-        # req_to_token_pool.size * dp_size (the autotune dummy run's batch),
-        # which is the worst-case post-allgather token count.
-        max_num_tokens = max(num_tokens, 1)
+        # Standard allgather path: the MoE sees up to dp_size local forwards
+        # gathered together, so scale the per-rank forward bound by dp_size.
+        max_num_tokens = server_args.dp_size * server_args.cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside

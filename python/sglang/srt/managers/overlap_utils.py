@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -46,7 +46,7 @@ _is_npu = is_npu()
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
-_DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
+_DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -78,34 +78,42 @@ def _gather_spec_extras(
     return topk_p, topk_index, bonus_tokens, hidden_states
 
 
-def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
-    input_ids[:] = torch.where(
-        input_ids < 0,
-        future_token_ids_map[torch.clamp(-input_ids, min=0)],
-        input_ids,
-    )
+def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+    """Materialize input_ids at forward entry. Two sources:
 
+    - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
+    - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
+    """
+    if batch.prefill_input_ids_cpu is not None:
+        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        if batch.mix_running_indices is not None:
+            decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    decode_gpu,
+                    future_map.output_tokens_buf,
+                    batch.mix_running_indices,
+                )
+            batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+        else:
+            batch.input_ids = prefill_gpu
+        batch.prefill_input_ids_cpu = None
+        batch.mix_running_indices = None
+    elif batch.input_ids is None and future_map.spec_algo.is_none():
+        batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(
+                batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
+            )
 
-if _is_cuda or _is_hip:
-    from sglang.jit_kernel.resolve_future_token_ids import (
-        resolve_future_token_ids_cuda,
-    )
-
-    _resolve_future_token_ids = resolve_future_token_ids_cuda
-else:
-    _resolve_future_token_ids = _resolve_future_token_ids_native
+    # spec_v1 (non-overlap spec) doesn't relay extras; only spec_v2 does.
+    if batch.is_spec_v2:
+        future_map._resolve_spec_extras(batch)
 
 
 class FutureMap:
-    """Cross-iter relay buffer for values the next iter's schedule cannot
-    compute locally (e.g. spec_v2 seq_lens after accept_lens, sampled tokens).
-
-    Forward stream publishes into a buf; next iter's schedule pulls lazily.
-    Schedule-deterministic values (e.g. non-spec seq_lens via +1) stay
-    maintained by SB directly and do not need the relay.
-
-    SB.seq_lens GPU is always a faithful seq_lens_cpu mirror; forward path
-    treats it as read-only, spec mutations land on forward_batch.seq_lens.
+    """Always-on pool-indexed relay for cross-iter values. Forward writes via
+    publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
     """
 
     def __init__(
@@ -174,19 +182,6 @@ class FutureMap:
                 device=self.device,
             )
 
-    def resolve_future(self, batch: ScheduleBatch):
-        # seq_lens is already real on entry (SB +1 for non-spec;
-        # resolve_seq_lens_cpu pulled from buf for spec_v2). Only resolve
-        # input_ids tokens / spec extras here.
-        if self.spec_algo.is_none():
-            _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
-            if _DEBUG_ASSERT:
-                _assert_nonneg_and_invalidate(
-                    batch.input_ids, self.output_tokens_buf, batch.req_pool_indices
-                )
-        else:
-            self._resolve_spec_extras(batch)
-
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
@@ -217,14 +212,6 @@ class FutureMap:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
-
-    def set_input_ids_sentinel(
-        self, batch: ScheduleBatch, future_indices: torch.Tensor
-    ) -> None:
-        # Sentinel for the decode portion so mixed batches can cat extend
-        # (positive real tokens) + decode (negative sentinels) into one
-        # input_ids; resolve_future translates negatives via output_tokens_buf.
-        batch.input_ids = -future_indices
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # seq_lens_cpu may be needed on the host for kernel-launch prep (some backends).
@@ -285,7 +272,11 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        if self.spec_algo.is_none():
+        # Dispatch by payload type, not spec_algo: spec_v1 (non-overlap spec)
+        # also passes a token Tensor here.
+        # FIXME(lsyin): unify this relay path with a dataclass instead of the
+        # Tensor / EagleDraftInput type switch.
+        if isinstance(payload, torch.Tensor):
             self.output_tokens_buf[indices] = payload.to(torch.int64)
             return
 
