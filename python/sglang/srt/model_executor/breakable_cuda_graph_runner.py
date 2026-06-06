@@ -319,7 +319,9 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        # Match capture/replay dispatch without starting CUDA graph capture.
+        # GLM-5 DSA can select MHA_ONE_SHOT in eager warmup after the dense
+        # prefill threshold changed from 0 to index_topk, then fail the dense
+        # head assertion. Use BCG dispatch here to match capture/replay.
         with (
             forward_context(ForwardContext(attn_backend=self.model_runner.attn_backend)),
             enable_breakable_cuda_graph(),
