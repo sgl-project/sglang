@@ -182,10 +182,8 @@ def _column_split(x: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch
     """
     # x shape: (B, L, 3 * num_heads * head_dim)
     x = x.view(*x.shape[:-1], 3, num_heads, head_dim)
-    x2 = x[:, :, 0].flatten(start_dim=-2)  # (B, L, hidden_size)
-    x1 = x[:, :, 1].flatten(start_dim=-2)
-    v = x[:, :, 2].flatten(start_dim=-2)
-    return x2, x1, v
+    x2, x1, v = x.unbind(dim=-3)
+    return x2.flatten(start_dim=-2), x1.flatten(start_dim=-2), v.flatten(start_dim=-2)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
