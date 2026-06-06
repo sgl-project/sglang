@@ -310,8 +310,8 @@ class TextEncoderLoader(ComponentLoader):
             model_config.arch_config, "requires_gpu_resident_text_encoder", False
         ) and should_offload:
             logger.warning(
-                "Keeping text encoder GPU-resident; CPU offload is not supported "
-                "for this checkpoint."
+                "Keeping bitsandbytes 4-bit text encoder GPU-resident; CUDA "
+                "weights and quant states are required for this checkpoint."
             )
             should_offload = False
 
