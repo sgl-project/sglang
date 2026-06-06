@@ -119,6 +119,8 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
+        env:
+          GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '0' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 

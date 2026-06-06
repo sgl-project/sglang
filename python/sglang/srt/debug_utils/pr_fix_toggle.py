@@ -66,9 +66,32 @@ patches:
 """
 
 
+_PR_REVERT_YAML_27338 = """
+patches:
+  - target: sglang.srt.layers.attention.flashinfer_backend.FlashInferMultiStepDraftBackend.init_cuda_graph_state
+    edits:
+      - match: |
+          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+        replacement: |
+          (self.speculative_num_steps, max_bs * self.max_context_len),
+"""
+
+
+_PR_REVERT_YAML_27360 = """
+patches:
+  - target: sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend._apply_cuda_graph_metadata
+    edits:
+      - match: |
+          cache_loc = cache_loc[:, :decode_length]
+        replacement: ""
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
     26329: _PR_REVERT_YAML_26329,
+    27338: _PR_REVERT_YAML_27338,
+    27360: _PR_REVERT_YAML_27360,
 }
 
 

@@ -16,18 +16,17 @@ use tokio::task::JoinHandle;
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
-/// Workers may serve multiple models; we use the config of the **first** model
-/// that has an explicit CB config, falling back to `None` (default config).
+/// The router serves a single configured model; apply its circuit-breaker
+/// config when this worker advertises that model id. Falls back to `None`
+/// (default config) otherwise.
 fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerConfig> {
-    for model_id in &spec.model_ids {
-        if let Some(mc) = cfg.models.iter().find(|m| m.id == model_id.0) {
-            if let Some(cbc) = &mc.circuit_breaker {
-                return Some(CircuitBreakerConfig {
-                    threshold: cbc.threshold,
-                    cool_down: Duration::from_secs(cbc.cool_down_secs),
-                });
-            }
-        }
+    let model = &cfg.model;
+    let cbc = model.circuit_breaker.as_ref()?;
+    if spec.model_ids.iter().any(|id| id.0 == model.id) {
+        return Some(CircuitBreakerConfig {
+            threshold: cbc.threshold,
+            cool_down: Duration::from_secs(cbc.cool_down_secs),
+        });
     }
     None
 }
@@ -279,8 +278,8 @@ async fn register_one(
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, DiscoveryConfig,
-        ModelConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+        ActiveLoadConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, ModelConfig,
+        PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
     };
     use crate::discovery::{WorkerId, WorkerMode};
     use axum::{routing::get, Json, Router};
@@ -296,7 +295,7 @@ mod tests {
                 port: 0,
             },
             observability: Default::default(),
-            models: vec![ModelConfig {
+            model: ModelConfig {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy: PolicyKind::RoundRobin,
@@ -305,12 +304,10 @@ mod tests {
                     cool_down_secs,
                 }),
                 cache_aware: None,
-            }],
-            discovery: DiscoveryConfig {
-                backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-                    urls: vec!["http://test:30000".into()],
-                }),
             },
+            discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://test:30000".into()],
+            }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
         }
