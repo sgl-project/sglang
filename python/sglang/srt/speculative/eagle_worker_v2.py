@@ -1271,9 +1271,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
-            self._mamba_verify_update(
-                batch, verify_input, accept_lens, accept_index, bs
-            )
+            self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -1323,7 +1321,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _mamba_verify_update(
         self,
         batch: ScheduleBatch,
-        verify_input: EagleVerifyInput,
         accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
@@ -1331,9 +1328,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Update mamba state for hybrid GDN models after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-            if verify_input.topk != 1:
-                raise ValueError("Spec v2 currently only supports topk = 1.")
-
             accepted_indices_offset = torch.arange(
                 0,
                 bs * self.speculative_num_draft_tokens,
@@ -1341,7 +1335,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=accept_lens.dtype,
                 device=accept_lens.device,
             )
-            last_correct_step_indices = accept_lens - 1
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            # `accept_index` is [bs, spec_steps + 1] of global draft-tree node
+            # indices; the last accepted slot per req sits at column
+            # `accept_lens - 1`. Subtracting the per-req tree base offset recovers
+            # the draft-tree step that holds the correct mamba state. For topk == 1
+            # the accepted path is the front chain, so this reduces to
+            # `accept_lens - 1`; for topk > 1 it follows the accepted branch through
+            # the tree (mirrors spec v1 `eagle_worker.py` `_mamba_verify_update`).
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accepted_indices_offset
+            )
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1359,11 +1364,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 to_track_ith = torch.clamp(
                     tracking_point - seq_lens_pre_verify - 1, min=0
                 ).to(torch.int64)
-                req_idx = torch.arange(
-                    bs,
-                    dtype=torch.int64,
-                    device=accept_lens.device,
-                )
                 candidate_track_steps = (
                     accept_index[req_idx, to_track_ith] - accepted_indices_offset
                 )
