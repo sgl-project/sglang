@@ -219,7 +219,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.common import ceil_align, require_mlp_sync
+from sglang.srt.utils.common import ceil_align, next_power_of_2, require_mlp_sync
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -343,6 +343,14 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
+@dataclass
+class _EagerBufferRegistry:
+    # Lazily-built eager input-buffer registry plus the capacity it was sized to.
+    registry: Optional["CudaGraphBufferRegistry"] = None
+    max_bs: int = 0
+    max_num_tokens: int = 0
+
+
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
@@ -419,6 +427,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self.init_new_workspace = False
+        self._eager_decode_registry = _EagerBufferRegistry()
+        self._eager_prefill_registry = _EagerBufferRegistry()
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
 
@@ -3084,108 +3094,97 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def _ensure_eager_registry(
+        self,
+        cache: _EagerBufferRegistry,
+        raw_bs: int,
+        raw_num_tokens: int,
+        build: Callable[[int, int], "CudaGraphBufferRegistry"],
+    ) -> "CudaGraphBufferRegistry":
+        # Built on first use and grown (next power of two) when a batch exceeds
+        # the current capacity.
+        if (
+            cache.registry is not None
+            and raw_bs <= cache.max_bs
+            and raw_num_tokens <= cache.max_num_tokens
+        ):
+            return cache.registry
+        cache.max_bs = next_power_of_2(max(raw_bs, cache.max_bs))
+        cache.max_num_tokens = next_power_of_2(
+            max(raw_num_tokens, cache.max_num_tokens)
+        )
+        cache.registry = build(cache.max_bs, cache.max_num_tokens)
+        return cache.registry
+
     def _ensure_eager_decode_registry(
         self, raw_bs: int, raw_num_tokens: int
     ) -> "CudaGraphBufferRegistry":
-        reg = getattr(self, "_eager_decode_registry", None)
-        cap_bs, cap_tokens = getattr(self, "_eager_decode_registry_capacity", (0, 0))
-        if reg is not None and raw_bs <= cap_bs and raw_num_tokens <= cap_tokens:
-            return reg
-
-        def _next_pow2(n: int) -> int:
-            return 1 << max(0, n - 1).bit_length() if n > 0 else 1
-
-        new_bs = _next_pow2(max(raw_bs, cap_bs))
-        new_tokens = _next_pow2(max(raw_num_tokens, cap_tokens))
         is_encoder_decoder = self.model_config.is_encoder_decoder
-        reg = build_decode_registry(
-            device=self.device,
-            max_bs=new_bs,
-            max_num_token=new_tokens,
-            # Eager has no padding so this sentinel is never read; 0 avoids the
-            # cuda-graph-only fill-value method that some backends lack.
-            seq_len_fill_value=0,
-            cache_loc_dtype=torch.int64,
-            enable_mamba_track=(
-                self.server_args.enable_mamba_extra_buffer()
-                and self.spec_algorithm.is_none()
+        return self._ensure_eager_registry(
+            self._eager_decode_registry,
+            raw_bs,
+            raw_num_tokens,
+            lambda bs, num_tokens: build_decode_registry(
+                device=self.device,
+                max_bs=bs,
+                max_num_token=num_tokens,
+                # Eager has no padding so this sentinel is never read; 0 avoids the
+                # cuda-graph-only fill-value method that some backends lack.
+                seq_len_fill_value=0,
+                cache_loc_dtype=torch.int64,
+                enable_mamba_track=(
+                    self.server_args.enable_mamba_extra_buffer()
+                    and self.spec_algorithm.is_none()
+                ),
+                is_encoder_decoder=is_encoder_decoder,
+                encoder_len_fill_value=(
+                    getattr(self.model_config.hf_config, "max_source_positions", 0)
+                    if is_encoder_decoder
+                    else 0
+                ),
+                enable_num_token_non_padded=False,
+                register_global_num_tokens=False,
+                require_gathered_buffer=False,
+                require_mlp_tp_gather=False,
+                dp_size=self.server_args.dp_size,
+                share_pool=False,
+                source=None,
             ),
-            is_encoder_decoder=is_encoder_decoder,
-            encoder_len_fill_value=(
-                getattr(self.model_config.hf_config, "max_source_positions", 0)
-                if is_encoder_decoder
-                else 0
-            ),
-            enable_num_token_non_padded=False,
-            register_global_num_tokens=False,
-            require_gathered_buffer=False,
-            require_mlp_tp_gather=False,
-            dp_size=self.server_args.dp_size,
-            share_pool=False,
-            source=None,
-        )
-        self._eager_decode_registry = reg
-        self._eager_decode_registry_capacity = (new_bs, new_tokens)
-        return reg
-
-    def _eager_decode_fb_view(
-        self, forward_batch: ForwardBatch, pp_proxy_tensors=None
-    ) -> ForwardBatch:
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
-            return replace(forward_batch)
-        raw_bs = forward_batch.batch_size
-        raw_num_tokens = forward_batch.input_ids.shape[0]
-        registry = self._ensure_eager_decode_registry(raw_bs, raw_num_tokens)
-        registry.fill_from(
-            forward_batch,
-            raw_bs=raw_bs,
-            padded_bs=raw_bs,
-            raw_num_tokens=raw_num_tokens,
-            padded_num_tokens=raw_num_tokens,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-        return registry.extract_buffer(
-            padded_bs=raw_bs,
-            padded_num_tokens=raw_num_tokens,
-            forward_batch_template=forward_batch,
         )
 
     def _ensure_eager_prefill_registry(
         self, raw_bs: int, raw_num_tokens: int
     ) -> "CudaGraphBufferRegistry":
-        reg = getattr(self, "_eager_prefill_registry", None)
-        cap_bs, cap_tokens = getattr(self, "_eager_prefill_registry_capacity", (0, 0))
-        if reg is not None and raw_bs <= cap_bs and raw_num_tokens <= cap_tokens:
-            return reg
-
-        def _next_pow2(n: int) -> int:
-            return 1 << max(0, n - 1).bit_length() if n > 0 else 1
-
-        new_bs = _next_pow2(max(raw_bs, cap_bs))
-        new_tokens = _next_pow2(max(raw_num_tokens, cap_tokens))
-        reg = build_prefill_registry(
-            device=self.device,
-            max_bs=new_bs,
-            max_num_token=new_tokens,
-            cache_loc_dtype=torch.int64,
-            is_multimodal=self.is_multimodal,
-            enable_mamba_track=False,
-            register_input_embeds=False,
-            share_pool=False,
-            source=None,
+        return self._ensure_eager_registry(
+            self._eager_prefill_registry,
+            raw_bs,
+            raw_num_tokens,
+            lambda bs, num_tokens: build_prefill_registry(
+                device=self.device,
+                max_bs=bs,
+                max_num_token=num_tokens,
+                cache_loc_dtype=torch.int64,
+                is_multimodal=self.is_multimodal,
+                enable_mamba_track=False,
+                register_input_embeds=False,
+                share_pool=False,
+                source=None,
+            ),
         )
-        self._eager_prefill_registry = reg
-        self._eager_prefill_registry_capacity = (new_bs, new_tokens)
-        return reg
 
-    def _eager_extend_fb_view(
+    def _eager_fb_view(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> ForwardBatch:
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         raw_num_tokens = forward_batch.input_ids.shape[0]
-        registry = self._ensure_eager_prefill_registry(raw_bs, raw_num_tokens)
+        ensure = (
+            self._ensure_eager_prefill_registry
+            if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            else self._ensure_eager_decode_registry
+        )
+        registry = ensure(raw_bs, raw_num_tokens)
         registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
@@ -3206,7 +3205,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if not self.server_args.enable_pdmux:
-            forward_batch = self._eager_decode_fb_view(forward_batch, pp_proxy_tensors)
+            forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
         pdmux_override = False
         if forward_batch.needs_forward_metadata_init():
@@ -3296,7 +3295,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return (ret, can_run_graph)
 
         if not self.server_args.enable_pdmux:
-            forward_batch = self._eager_extend_fb_view(forward_batch, pp_proxy_tensors)
+            forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
 
         # Launch model forward
         if forward_batch.needs_forward_metadata_init():
@@ -3332,9 +3331,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
             if not self.server_args.enable_pdmux:
-                forward_batch = self._eager_decode_fb_view(
-                    forward_batch, pp_proxy_tensors
-                )
+                forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
             self.attn_backend.init_forward_metadata(forward_batch)
         else:
             self.attn_backend.forward_metadata = None
