@@ -2,7 +2,7 @@ name: Release Docker Runtime Images
 #
 # Builds and publishes runtime Docker images (production-optimized, ~50% smaller):
 #   - lmsysorg/sglang:v{version}-runtime, lmsysorg/sglang:latest-runtime
-#   - lmsysorg/sglang:v{version}-cu126-runtime, lmsysorg/sglang:latest-cu126-runtime
+#   - lmsysorg/sglang:v{version}-cu129-runtime, lmsysorg/sglang:latest-cu129-runtime
 #
 on:
   push:
@@ -50,6 +50,6 @@ jobs:
       tag_config: |
         [
           {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}-runtime", "latest-runtime", "v${{ needs.resolve-version.outputs.version }}-cu130-runtime", "latest-cu130-runtime"]},
-          {"cuda": "cu126", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu126-runtime", "latest-cu126-runtime"]}
+          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu129-runtime", "latest-cu129-runtime"]}
         ]
     secrets: inherit

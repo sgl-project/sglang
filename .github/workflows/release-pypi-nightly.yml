@@ -110,7 +110,7 @@ jobs:
     strategy:
       fail-fast: false
       # The wheel is CUDA-agnostic and built once — we just register the same
-      # artifact under cu126/sglang/ and cu130/sglang/ wheel indexes so users
+      # artifact under cu129/sglang/ and cu130/sglang/ wheel indexes so users
       # can install via either --extra-index-url. Serialize because both matrix
       # runs clone and push to the same sgl-whl branch.
       max-parallel: 1

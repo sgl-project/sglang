@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_tag:
-        description: "Existing image tag (e.g., v0.4.7-cu126-amd64)"
+        description: "Existing image tag (e.g., v0.4.7-cu129-amd64)"
         required: true
       target_tag:
         description: "New tag to apply (e.g., latest)"

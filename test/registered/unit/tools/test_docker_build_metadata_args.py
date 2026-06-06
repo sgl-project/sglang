@@ -76,9 +76,9 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
 
     def test_release_metadata_prefers_versioned_tag(self):
         args = self.run_helper(
-            cuda="cu126",
+            cuda="cu129",
             tag_config=[
-                {"cuda": "cu126", "tags": ["v{version}", "latest"]},
+                {"cuda": "cu129", "tags": ["v{version}", "latest"]},
                 {"cuda": "cu130", "tags": ["v{version}-cu130", "latest-cu130"]},
             ],
         )
@@ -99,7 +99,7 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
             cuda="cu130",
             image_repo="lmsysorg/sglang-staging",
             tag_config=[
-                {"cuda": "cu126", "tags": ["v{version}-runtime", "latest-runtime"]},
+                {"cuda": "cu129", "tags": ["v{version}-runtime", "latest-runtime"]},
                 {
                     "cuda": "cu130",
                     "tags": ["v{version}-cu130-runtime", "latest-cu130-runtime"],
@@ -114,11 +114,11 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
 
     def test_dev_nightly_metadata_prefers_unique_tag_from_checked_out_commit(self):
         args = self.run_helper(
-            cuda="cu126",
+            cuda="cu129",
             version="",
             build_commit="1234567890abcdef",
             tag_config=[
-                {"cuda": "cu126", "tags": ["dev", "nightly-dev-{date}-{short_sha}"]},
+                {"cuda": "cu129", "tags": ["dev", "nightly-dev-{date}-{short_sha}"]},
                 {
                     "cuda": "cu130",
                     "tags": ["dev-cu13", "nightly-dev-cu13-{date}-{short_sha}"],
@@ -140,7 +140,7 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
             cuda="cu130",
             version="",
             tag_config=[
-                {"cuda": "cu126", "tags": ["dev-my-test"]},
+                {"cuda": "cu129", "tags": ["dev-my-test"]},
                 {"cuda": "cu130", "tags": ["dev-cu13-my-test"]},
             ],
         )
@@ -153,7 +153,7 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
     def test_missing_cuda_entry_fails(self):
         with self.assertRaisesRegex(ValueError, "cu130"):
             self.helper.select_tag(
-                json.dumps([{"cuda": "cu126", "tags": ["v{version}"]}]),
+                json.dumps([{"cuda": "cu129", "tags": ["v{version}"]}]),
                 "cu130",
                 "0.6.0",
                 "20260429",

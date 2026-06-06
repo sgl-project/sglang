@@ -80,7 +80,7 @@ RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
       13.0) TORCH_VER=2.12.0; CU_TAG=cu130 ;; \
-      12.6) TORCH_VER=2.12.0; CU_TAG=cu126 ;; \
+      12.9) TORCH_VER=2.12.0; CU_TAG=cu129 ;; \
       *)    echo "Unsupported CUDA_VERSION for torch ${TORCH_VER:-2.12.0}: ${CUDA_VERSION}" >&2; exit 1 ;; \
     esac; \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
