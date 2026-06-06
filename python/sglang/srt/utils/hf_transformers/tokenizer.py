@@ -15,6 +15,7 @@
 
 import json
 import logging
+import os
 import warnings
 from pathlib import Path
 from typing import Optional, Union
@@ -47,6 +48,31 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 # Class name used by transformers v5 when no tokenizer mapping exists for a model_type.
 _TOKENIZERS_BACKEND = "TokenizersBackend"
+
+
+def _ensure_evo2_tokenizer_files(tokenizer_name: str) -> None:
+    """Auto-generate tokenizer files for Evo2 models using Vortex CharLevelTokenizer.
+
+    Evo2 models use a character-level tokenizer where each byte maps to its
+    UTF-8 value (A=65, C=67, G=71, T=84). If the model directory contains a
+    config.json with tokenizer_type='CharLevelTokenizer' but no tokenizer.json,
+    this function generates the required files automatically.
+    """
+    try:
+        model_dir = tokenizer_name
+        if not os.path.isdir(model_dir):
+            return
+        config_path = os.path.join(model_dir, "config.json")
+        if not os.path.isfile(config_path):
+            return
+        with open(config_path) as f:
+            cfg = json.load(f)
+        if cfg.get("tokenizer_type") == "CharLevelTokenizer":
+            vocab_size = cfg.get("vocab_size", 512)
+            from sglang.srt.models.evo2 import generate_evo2_tokenizer_files
+            generate_evo2_tokenizer_files(model_dir, vocab_size)
+    except Exception:
+        pass  # Don't block model loading for tokenizer generation failures
 
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
@@ -466,6 +492,9 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    # Auto-generate tokenizer files for Evo2 models that use Vortex CharLevelTokenizer
+    _ensure_evo2_tokenizer_files(tokenizer_name)
+
     # Tiktoken format has its own backend — no fastokens patching needed.
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer

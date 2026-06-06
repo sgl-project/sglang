@@ -9,9 +9,16 @@ Evo2 is a hybrid DNA foundation model that interleaves:
 - HCS layers: Hyena-SE (Short) using 7-token FIR filters
 
 Reference: https://github.com/Zymrael/vortex
+
+Tokenizer:
+  Evo2 uses a CharLevelTokenizer from Vortex: each DNA base is encoded as its
+  UTF-8 byte value (A=65, C=67, G=71, T=84). The tokenizer is auto-generated
+  on first use if tokenizer.json is not found in the model directory.
 """
 
+import json
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -44,6 +51,90 @@ from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tokenizer: auto-generate Vortex-compatible CharLevelTokenizer files
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_evo2_tokenizer_files(model_path: str, vocab_size: int = 512) -> None:
+    """Generate tokenizer.json and tokenizer_config.json for Evo 2.
+
+    Evo 2 uses the Vortex CharLevelTokenizer which encodes each character as its
+    raw UTF-8 byte value. DNA bases map to: A=65, C=67, G=71, T=84.
+    Special tokens: <eod>=0 (BOS/EOS), <pad>=1.
+
+    This function is idempotent — it only creates files if they don't exist.
+    """
+    tok_path = os.path.join(model_path, "tokenizer.json")
+    cfg_path = os.path.join(model_path, "tokenizer_config.json")
+
+    if os.path.exists(tok_path) and os.path.exists(cfg_path):
+        return
+
+    # Build vocabulary: each byte index maps to its character representation
+    # In Vortex CharLevelTokenizer: decode_token(n) = chr(max(32, min(n, vocab_size)))
+    vocab_dict = {}
+    for i in range(vocab_size):
+        if i == 0:
+            vocab_dict["<eod>"] = i
+        elif i == 1:
+            vocab_dict["<pad>"] = i
+        else:
+            char_code = max(32, min(i, vocab_size))
+            vocab_dict[chr(char_code)] = i
+
+    tokenizer_json = {
+        "version": "1.0",
+        "added_tokens": [
+            {"id": 0, "content": "<eod>", "single_word": False, "lstrip": False,
+             "rstrip": False, "normalized": False, "special": True},
+            {"id": 1, "content": "<pad>", "single_word": False, "lstrip": False,
+             "rstrip": False, "normalized": False, "special": True},
+        ],
+        "pre_tokenizer": {
+            "type": "ByteLevel",
+            "add_prefix_space": False,
+            "trim_offsets": True,
+            "use_regex": False,
+        },
+        "decoder": {
+            "type": "ByteLevel",
+            "add_prefix_space": False,
+            "trim_offsets": True,
+            "use_regex": False,
+        },
+        "model": {
+            "type": "BPE",
+            "unk_token": "<eod>",
+            "continuing_subword_prefix": "",
+            "end_of_word_suffix": "",
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "vocab": vocab_dict,
+            "merges": [],
+        },
+    }
+
+    tokenizer_config = {
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "model_max_length": 8192,
+        "bos_token": "<eod>",
+        "eos_token": "<eod>",
+        "pad_token": "<pad>",
+        "unk_token": "<eod>",
+        "pad_token_id": 1,
+        "clean_up_tokenization_spaces": False,
+        "extra_special_tokens": {},
+    }
+
+    os.makedirs(model_path, exist_ok=True)
+    with open(tok_path, "w") as f:
+        json.dump(tokenizer_json, f, indent=2)
+    with open(cfg_path, "w") as f:
+        json.dump(tokenizer_config, f, indent=2)
+
+    logger.info(f"Generated Evo 2 tokenizer files in {model_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -396,9 +487,13 @@ class Evo2HyenaFilter(nn.Module):
         Returns:
             u_filt: (B, L, 3*hidden_size)
         """
-        # For depthwise conv1d: treat each channel independently
-        # weight: (3*hidden_size, 1, 3)
-        # For depthwise, we use groups=3*hidden_size
+        # Handle 2D input during CUDA graph capture (no batch dim)
+        if u.dim() == 2:
+            u = u.unsqueeze(0)
+            squeeze_back = True
+        else:
+            squeeze_back = False
+            
         u_t = u.transpose(1, 2)  # (B, 3*hidden_size, L)
         # Pad for causal conv
         pad = self.short_filter_length - 1
@@ -410,6 +505,8 @@ class Evo2HyenaFilter(nn.Module):
             groups=3 * self.hidden_size,
         )
         u_filt = u_filt.transpose(1, 2)  # (B, L, 3*hidden_size)
+        if squeeze_back:
+            u_filt = u_filt.squeeze(0)
         return u_filt
 
     def _apply_long_filter(
@@ -422,6 +519,13 @@ class Evo2HyenaFilter(nn.Module):
         Returns:
             y: (B, L, hidden_size)
         """
+        # Handle 2D input during CUDA graph capture
+        if z.dim() == 2:
+            z = z.unsqueeze(0)
+            squeeze_back = True
+        else:
+            squeeze_back = False
+            
         B, L, _ = z.shape
 
         # Split into x1, x2, v based on column_split mode
@@ -449,7 +553,7 @@ class Evo2HyenaFilter(nn.Module):
                 h_flipped = h.flip(-1)
             else:
                 h_flipped = h
-            y = F.conv1d(gate_padded, h_flipped, groups=self.hyena_filter_groups)
+            y = F.conv1d(gate_padded, h_flipped, groups=gate_padded.shape[1])
             if self.D is not None:
                 y = y + self.D[None, :, None] * gate_t
             y = y.transpose(1, 2)  # (B, L, D)
@@ -461,24 +565,26 @@ class Evo2HyenaFilter(nn.Module):
                 h_raw = h_raw.repeat_interleave(
                     self.hidden_size // self.hyena_filter_groups, dim=0
                 )
-            h = h_raw.to(z.dtype)
+            h = h_raw.to(z.dtype).squeeze(1)  # (D, L)
 
             # Apply IIR filter via FFT convolution
             # y = x1 * (v * h) + D * (x1 * v), then gate with x2
             gate = x1 * v  # (B, L, D)
             
-            # FFT convolution of gate with h
-            D_total = self.hidden_size
+            # FFT convolution: treat as (B, D, L)
+            gate_t = gate.transpose(1, 2).float()  # (B, D, L)
             fft_len = 2 * L
-            gate_fft = torch.fft.rfft(gate.float(), n=fft_len, dim=1)
-            h_fft = torch.fft.rfft(h.float().expand(B, -1, -1).transpose(1, 2), n=fft_len, dim=1)
-            y = torch.fft.irfft(gate_fft * h_fft, n=fft_len, dim=1)[:, :L, :]
+            k_f = torch.fft.rfft(h.float(), n=fft_len) / fft_len  # (D, F)
+            u_f = torch.fft.rfft(gate_t, n=fft_len)  # (B, D, F)
+            y = torch.fft.irfft(u_f * k_f, n=fft_len, norm='forward')[..., :L]  # (B, D, L)
+            y = y.transpose(1, 2).to(z.dtype)  # (B, L, D)
             
             if self.D is not None:
                 y = y + self.D[None, None, :] * gate
             y = y * x2
-            y = y.to(z.dtype)
 
+        if squeeze_back:
+            y = y.squeeze(0)
         return y
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
@@ -489,6 +595,13 @@ class Evo2HyenaFilter(nn.Module):
         Returns:
             y: (B, L, hidden_size)
         """
+        # Handle 2D input during CUDA graph capture
+        if u.dim() == 2:
+            u = u.unsqueeze(0)
+            squeeze_back = True
+        else:
+            squeeze_back = False
+            
         L = u.shape[1]
 
         # 1. Short FIR filter
@@ -501,6 +614,8 @@ class Evo2HyenaFilter(nn.Module):
         # 3. Long filter (IIR or FIR)
         y = self._apply_long_filter(z)  # (B, L, hidden_size)
 
+        if squeeze_back:
+            y = y.squeeze(0)
         return y
 
 
@@ -791,6 +906,18 @@ class Evo2ForCausalLM(nn.Module):
 
             param = params_dict[sglang_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            
+            # Handle shape mismatches by reshaping loaded weight to match param
+            if param.size() != loaded_weight.size():
+                try:
+                    loaded_weight = loaded_weight.reshape(param.size())
+                except RuntimeError:
+                    logger.warning(
+                        f"Shape mismatch for {sglang_name}: "
+                        f"param={list(param.shape)}, loaded={list(loaded_weight.shape)}. Skipping."
+                    )
+                    continue
+            
             weight_loader(param, loaded_weight)
             loaded_params.add(sglang_name)
 

@@ -136,3 +136,13 @@ register_completion_template(
         fim_position=FimPosition.END,
     )
 )
+
+register_completion_template(
+    CompletionTemplate(
+        name="evo2",
+        fim_begin_token="A",
+        fim_middle_token="[MASK]",
+        fim_end_token="[PAD]",
+        fim_position=FimPosition.MIDDLE,
+    )
+)
