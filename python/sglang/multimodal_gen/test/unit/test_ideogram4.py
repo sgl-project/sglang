@@ -24,6 +24,11 @@ from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType, get_module_role
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     FP8_WEIGHT_DTYPE,
     WeightOnlyFP8Linear,
@@ -46,6 +51,9 @@ from sglang.multimodal_gen.runtime.models.dits.ideogram import (
 )
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
     IdeogramQwen3VLTextEncoder,
+)
+from sglang.multimodal_gen.runtime.pipelines.ideogram import (
+    _resolve_ideogram4_unconditional_transformer_weights_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -149,6 +157,33 @@ class TestIdeogram4(unittest.TestCase):
             ):
                 os.mkdir(f"{tmpdir}/{subdir}")
             info = get_model_info(tmpdir, backend="sglang")
+        self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Pipeline")
+        self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
+        self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
+
+    def test_registry_resolves_comfy_nvfp4_repo_to_native_pipeline(self):
+        get_model_info.cache_clear()
+        _get_config_info.cache_clear()
+
+        info = get_model_info("Comfy-Org/Ideogram-4", backend="sglang")
+
+        self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Nvfp4Pipeline")
+        self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
+        self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
+
+    def test_registry_resolves_official_nf4_repo_to_native_pipeline(self):
+        get_model_info.cache_clear()
+        _get_config_info.cache_clear()
+
+        with patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={
+                "_class_name": "Ideogram4Pipeline",
+                "_diffusers_version": "0.0.0",
+            },
+        ):
+            info = get_model_info("ideogram-ai/ideogram-4-nf4", backend="sglang")
+
         self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Pipeline")
         self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
         self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
@@ -305,6 +340,7 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
+            component_transformer_weights_paths={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -312,6 +348,45 @@ class TestIdeogram4(unittest.TestCase):
         self.assertIsNot(component_args, server_args)
         self.assertIsNone(component_args.transformer_weights_path)
         self.assertIsNone(component_args.nunchaku_config)
+
+    def test_transformer_component_uses_per_component_weights_override(self):
+        server_args = SimpleNamespace(
+            transformer_weights_path=(
+                "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
+            ),
+            nunchaku_config={"enabled": True},
+            component_transformer_weights_paths={
+                "unconditional_transformer": (
+                    "/ckpt/diffusion_models/"
+                    "ideogram4_unconditional_nvfp4_mixed.safetensors"
+                )
+            },
+        )
+
+        component_args = _server_args_for_transformer_component(
+            server_args,
+            "unconditional_transformer",
+        )
+
+        self.assertIsNot(component_args, server_args)
+        self.assertEqual(
+            component_args.transformer_weights_path,
+            "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
+        )
+        self.assertIsNone(component_args.nunchaku_config)
+
+    def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
+        self.assertEqual(
+            _resolve_ideogram4_unconditional_transformer_weights_path(
+                "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
+            ),
+            "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
+        )
+        self.assertIsNone(
+            _resolve_ideogram4_unconditional_transformer_weights_path(
+                "/ckpt/custom_transformer.safetensors"
+            )
+        )
 
     def test_ideogram_denoiser_does_not_request_dtype_cast(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
@@ -554,6 +629,69 @@ class TestIdeogram4(unittest.TestCase):
         )
         self.assertEqual(state["layers.0.attention.qkv.weight"].dtype, FP8_WEIGHT_DTYPE)
 
+    def test_ideogram_dit_nvfp4_quant_config_uses_native_fp4_linears(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=[
+                "input_proj",
+                "llm_cond_proj",
+                "t_embedding.*",
+                "adaln_proj",
+                "layers.*.adaln_modulation",
+                "final_layer.*",
+            ],
+        )
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+            )
+            with patch(
+                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                return_value=1,
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(
+                        Ideogram4DiTConfig(),
+                        {},
+                        quant_config=quant_config,
+                    )
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertEqual(model.layers[0].attention.qkv.prefix, "layers.0.attention.qkv")
+        self.assertIsInstance(
+            model.layers[0].attention.qkv.quant_method,
+            ModelOptFp4LinearMethod,
+        )
+        self.assertIsInstance(model.input_proj.quant_method, UnquantizedLinearMethod)
+
+        state = model.state_dict()
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.weight"].shape),
+            (13824, 2304),
+        )
+        self.assertEqual(state["layers.0.attention.qkv.weight"].dtype, torch.uint8)
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.weight_scale"].shape),
+            (13824, 288),
+        )
+        self.assertEqual(
+            state["layers.0.attention.qkv.weight_scale"].dtype,
+            FP8_WEIGHT_DTYPE,
+        )
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.weight_scale_2"].shape),
+            (1,),
+        )
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.input_scale"].shape),
+            (1,),
+        )
+
     def test_missing_weight_only_fp8_scale_is_fatal(self):
         with torch.device("meta"):
             model = WeightOnlyFP8Linear(3, 2, bias=False)
@@ -613,6 +751,27 @@ class TestIdeogram4(unittest.TestCase):
             config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
         )
         self.assertTrue(config.arch_config.ideogram_fp8_weight_only)
+        self.assertFalse(config.arch_config.ideogram_bnb_4bit_weight_only)
+        self.assertFalse(config.arch_config.requires_gpu_resident_text_encoder)
+
+    def test_ideogram_text_encoder_post_config_hook_uses_bnb_for_nf4(self):
+        config = Ideogram4TextEncoderConfig()
+        config.update_model_arch(
+            {
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                }
+            }
+        )
+
+        self.assertEqual(
+            config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
+        )
+        self.assertTrue(config.arch_config.ideogram_bnb_4bit_weight_only)
+        self.assertFalse(config.arch_config.ideogram_fp8_weight_only)
+        self.assertTrue(config.arch_config.requires_gpu_resident_text_encoder)
 
     def test_ideogram_text_encoder_swaps_linears_to_weight_only_fp8(self):
         config = Ideogram4TextEncoderConfig()
