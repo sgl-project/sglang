@@ -586,6 +586,11 @@ def run_one_case(
         else:
             json_schema = None
 
+        # At large batch sizes, per-token SSE streaming events add enough
+        # client-side overhead to skew the measured timing. Raise the effective
+        # stream_interval so the server emits far fewer events; TTFT is then
+        # recovered from the server-reported throughput below instead of from
+        # per-event timestamps.
         reduce_sse = batch_size > 256
         effective_stream_interval = (
             max(stream_interval, output_len) if reduce_sse else stream_interval
@@ -727,6 +732,10 @@ def run_one_case(
         acc_length = internal_state[0].get("avg_spec_accept_length", None) or -1
 
     if reduce_sse and last_gen_throughput > 0:
+        # With SSE suppressed, the per-token last_ttft measured above is
+        # unreliable, so estimate it from total decode time. last_gen_throughput
+        # is per-DP-rank, so scale by dp_size to get aggregate throughput across
+        # all ranks.
         dp_size = server_info.get("dp_size", 1)
         decode_time = batch_size * output_len / (last_gen_throughput * dp_size)
         last_ttft = latency - decode_time
