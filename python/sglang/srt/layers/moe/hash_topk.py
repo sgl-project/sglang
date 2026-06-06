@@ -19,8 +19,8 @@ from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _mask_topk_ids_padded_region,
     _remap_topk_for_per_rank_shared_slots,
-    _uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -179,7 +179,7 @@ class HashTopK(nn.Module):
 
         if (
             self.num_fused_shared_experts > 0
-            and _uses_per_rank_fused_shared_slots()
+            and uses_per_rank_fused_shared_slots()
         ):
             shared_cols = topk_ids[:, -self.num_fused_shared_experts :]
             routed_cols = topk_ids[:, : -self.num_fused_shared_experts]
