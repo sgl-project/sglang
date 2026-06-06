@@ -26,7 +26,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
 
-from ..mock_server_args import make_mock_server_args
+from ..mock_server_args import (
+    cuda_graph_config_from_legacy_flags,
+    make_mock_server_args,
+)
 
 _dp_attention.get_attention_tp_size = lambda: 1
 
@@ -202,6 +205,8 @@ class MockKDAModelRunner(ModelRunner):
         head_dim: int,
         head_k_dim: int,
         head_v_dim: int,
+        disable_cuda_graph: bool = True,
+        disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
@@ -221,6 +226,10 @@ class MockKDAModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
+            cuda_graph_config=cuda_graph_config_from_legacy_flags(
+                disable_cuda_graph=disable_cuda_graph,
+                disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -541,6 +550,8 @@ def build_kda_attention_fixture(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
+    disable_cuda_graph: bool = True,
+    disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
 ) -> KDAAttentionFixture:
@@ -562,6 +573,8 @@ def build_kda_attention_fixture(
         head_dim=head_k_dim,
         head_k_dim=head_k_dim,
         head_v_dim=head_v_dim,
+        disable_cuda_graph=disable_cuda_graph,
+        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
     )
     try:

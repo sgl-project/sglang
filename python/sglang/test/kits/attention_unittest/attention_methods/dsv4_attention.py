@@ -31,7 +31,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
-from ..mock_server_args import make_mock_server_args
+from ..mock_server_args import (
+    cuda_graph_config_from_legacy_flags,
+    make_mock_server_args,
+)
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _dp_attention.get_attention_tp_size = lambda: 1
@@ -296,6 +299,8 @@ class MockDSV4ModelRunner:
         device: str,
         max_context_len: int,
         swa_size: int,
+        disable_cuda_graph: bool = True,
+        disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
         compression_ratios: list[int] = None,
     ):
@@ -327,6 +332,10 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
+            cuda_graph_config=cuda_graph_config_from_legacy_flags(
+                disable_cuda_graph=disable_cuda_graph,
+                disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            ),
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,
@@ -648,6 +657,8 @@ def build_dsv4_attention_fixture(
     max_context_len: int = 256,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    disable_cuda_graph: bool = True,
+    disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     compression_ratios: list[int] = None,
 ) -> DSV4AttentionFixture:
@@ -683,6 +694,8 @@ def build_dsv4_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         swa_size=swa_size,
+        disable_cuda_graph=disable_cuda_graph,
+        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
         compression_ratios=compression_ratios,
     )

@@ -155,6 +155,7 @@ def run_speculative_cuda_graph_case(
         testcase,
         case,
         **build_kwargs,
+        disable_cuda_graph=False,
         runner_batch_size=capture_batch_size,
     )
     backend = graph_fixture.backend

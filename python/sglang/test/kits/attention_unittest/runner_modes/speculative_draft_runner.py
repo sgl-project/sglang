@@ -336,6 +336,7 @@ def _build_eagle_draft_fixture(
         testcase,
         case,
         **build_kwargs,
+        disable_cuda_graph=False,
         runner_batch_size=settings.capture_batch_size,
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
@@ -367,6 +368,7 @@ def _build_frozen_kv_mtp_fixture(
         testcase,
         case,
         **build_kwargs,
+        disable_cuda_graph=False,
         runner_batch_size=settings.capture_batch_size,
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)

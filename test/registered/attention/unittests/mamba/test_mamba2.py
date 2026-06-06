@@ -224,6 +224,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         fixture = build_mamba2_attention_fixture(
             self,
             case,
+            disable_cuda_graph=False,
             runner_batch_size=case.batch_size,
         )
         backend = fixture.backend
