@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 
 
 class EvictionStrategy(ABC):
-    """淘汰策略的抽象基类。
+    """淘汰策略的抽象基类:主要作用是定义规范（契约），告诉所有继承它的子类：
+    你们必须实现 get_priority 这个方法，并且它的输入和输出格式应该符合我的规定。
 
     所有淘汰策略都要实现 get_priority 方法。
     返回值小的节点会优先被淘汰。

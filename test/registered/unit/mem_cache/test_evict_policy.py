@@ -34,13 +34,18 @@ from sglang.srt.mem_cache.evict_policy import (
 )
 
 
+# 在python中，函数名前加下划线通常表示这是一个私有辅助函数，只在当前测试文件内部使用。
+# **kwargs：表示接收任意数量的关键字参数。这些参数会被自动打包成一个字典（Dictionary）。
+# 例如调用：_make_node(last_access_time=100.0, hit_count=5)
+# 此时 kwargs 内部就是：{"last_access_time": 100.0, "hit_count": 5}
 def _make_node(**kwargs):
     """快速构造一个模拟 TreeNode，只设置策略需要的属性。
 
     用 MagicMock 而非真实 TreeNode，避免依赖整个 radix_cache 模块。
     这保证了单元测试的隔离性——即使 radix_cache.py 改了，测试也不受影响。
     """
-    node = MagicMock()
+    node = MagicMock() # 万能替身，任何属性都可以临时创建
+    # 初始化evict_Priority.py中策略需要的属性，默认值为0或0.0
     node.last_access_time = kwargs.get("last_access_time", 0.0)
     node.hit_count = kwargs.get("hit_count", 0)
     node.creation_time = kwargs.get("creation_time", 0.0)
