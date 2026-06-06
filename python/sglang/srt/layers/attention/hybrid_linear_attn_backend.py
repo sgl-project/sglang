@@ -16,7 +16,6 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -711,7 +710,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         self,
         mixer: MambaMixer2,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         layer_id: int,
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
@@ -719,7 +718,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        intermediate_states = mixer.forward(
+        mixer_out, intermediate_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
             layer_cache=layer_cache,
@@ -753,6 +752,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     num_decodes,
                 )
 
+        return mixer_out
+
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(
             "Mamba2AttnBackend's forward is called directly instead of through HybridLinearAttnBackend, as it supports mixed prefill and decode"
@@ -782,18 +783,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
 
     def _is_full_attn(
-        self,
-        layer: Optional[Union[RadixAttention, RadixLinearAttention]],
-        layer_id: Optional[int] = None,
+        self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
-        # RadixLinearAttention is unambiguously a linear-attention layer.
-        # Everything else (including plain RadixAttention) must be classified by
-        # layer id: models like Bailing/Ring use a plain RadixAttention for their
-        # linear layers, so an `isinstance(layer, RadixAttention) -> full` shortcut
-        # would misroute those linear layers to the full-attention backend.
-        if isinstance(layer, RadixLinearAttention):
-            return False
-
         if layer is not None:
             layer_id = layer.layer_id
         assert layer_id is not None, "either layer or layer_id must be provided"
@@ -817,6 +808,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
+
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
+        # Hybrid MLA models (Ring/Ling, Kimi-Linear) resolve this via
+        # get_attn_backend(), which returns this wrapper; delegate to the
+        # full-attn backend so its chunked/one-shot prefill metadata is planned.
+        init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
+        if init is not None:
+            init(forward_batch, disable_flashinfer_ragged)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
