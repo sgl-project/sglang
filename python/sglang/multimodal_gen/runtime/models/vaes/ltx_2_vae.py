@@ -87,24 +87,55 @@ class LTX2VideoCausalConv3d(nn.Module):
             padding_mode=spatial_padding_mode,
         )
 
+    def _weight_is_channels_last_3d(self) -> bool:
+        w = self.conv.weight
+        return (
+            w.dim() == 5
+            and hasattr(torch, "channels_last_3d")
+            and w.is_contiguous(memory_format=torch.channels_last_3d)
+        )
+
+    def _causal_temporal_pad_channels_last(
+        self, x: torch.Tensor, left: int, right: int
+    ) -> torch.Tensor:
+        # Build the temporally-padded tensor directly in channels_last_3d so the
+        # cuDNN NDHWC conv path is preserved. The single allocate-and-copy_ does
+        # double duty (replication pad + layout fix) and avoids the expensive
+        # contiguous->channels_last reconversion that repeat()+concatenate()
+        # would otherwise force on the decode hot path. Numerically identical to
+        # the repeat/concatenate path (replicate-edge == repeat-edge frame).
+        b, c, t, h, w = x.shape
+        out = torch.empty(
+            (b, c, t + left + right, h, w),
+            dtype=x.dtype,
+            device=x.device,
+            memory_format=torch.channels_last_3d,
+        )
+        out[:, :, left : left + t].copy_(x)
+        if left:
+            out[:, :, :left].copy_(x[:, :, :1])
+        if right:
+            out[:, :, left + t :].copy_(x[:, :, -1:])
+        return out
+
     def forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
         time_kernel_size = self.kernel_size[0]
 
         if causal:
-            pad_left = hidden_states[:, :, :1, :, :].repeat(
-                (1, 1, time_kernel_size - 1, 1, 1)
-            )
-            hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
+            left, right = time_kernel_size - 1, 0
         else:
-            pad_left = hidden_states[:, :, :1, :, :].repeat(
-                (1, 1, (time_kernel_size - 1) // 2, 1, 1)
+            left = right = (time_kernel_size - 1) // 2
+
+        if hidden_states.dim() == 5 and self._weight_is_channels_last_3d():
+            hidden_states = self._causal_temporal_pad_channels_last(
+                hidden_states, left, right
             )
-            pad_right = hidden_states[:, :, -1:, :, :].repeat(
-                (1, 1, (time_kernel_size - 1) // 2, 1, 1)
-            )
-            hidden_states = torch.concatenate(
-                [pad_left, hidden_states, pad_right], dim=2
-            )
+        else:
+            pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, left, 1, 1))
+            parts = [pad_left, hidden_states]
+            if right:
+                parts.append(hidden_states[:, :, -1:, :, :].repeat((1, 1, right, 1, 1)))
+            hidden_states = torch.concatenate(parts, dim=2)
 
         hidden_states = self.conv(hidden_states)
         return hidden_states

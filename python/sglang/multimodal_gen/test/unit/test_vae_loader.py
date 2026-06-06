@@ -109,7 +109,16 @@ class TestVAELoader(unittest.TestCase):
             server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
             self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
 
-    def test_channels_last_3d_defaults_false_for_ltx_on_cuda(self):
+    def test_channels_last_3d_defaults_true_for_single_gpu_ltx_on_cuda(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
+            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+        ):
+            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=1)
+            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
+
+    def test_channels_last_3d_defaults_false_for_multi_gpu_ltx_on_cuda(self):
         with (
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
