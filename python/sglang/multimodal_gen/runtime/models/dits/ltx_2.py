@@ -1633,6 +1633,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         disable_a2v_cross_attn: bool = False,
         disable_v2a_cross_attn: bool = False,
         audio_replicated_for_sp: bool = False,
+        late_layer_ratio: float = 1.0,
+        late_audio_self_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
 
@@ -1856,6 +1858,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     audio_hidden_states,
                 )
             )
+        late_layer_start = int(len(self.transformer_blocks) * float(late_layer_ratio))
         for block in self.transformer_blocks:
             block_idx = getattr(block, "idx", -1)
             video_self_attn_perturbation_mask = None
@@ -1866,6 +1869,14 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             skip_audio_self_attn = block_idx in skip_audio_self_attn_blocks
             skip_a2v_cross_attn = disable_a2v_cross_attn
             skip_v2a_cross_attn = disable_v2a_cross_attn
+            block_audio_self_attention_mask = audio_self_attention_mask
+            if (
+                block_idx >= late_layer_start
+                and late_audio_self_attention_mask is not None
+            ):
+                block_audio_self_attention_mask = late_audio_self_attention_mask
+            elif block_idx >= late_layer_start and late_layer_ratio < 1.0:
+                block_audio_self_attention_mask = None
             if perturbation_configs is not None:
                 if not skip_video_self_attn:
                     assert video_self_attn_perturbation_states is not None
@@ -1906,7 +1917,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 encoder_attention_mask=encoder_attention_mask,
                 audio_encoder_attention_mask=audio_encoder_attention_mask,
                 video_self_attention_mask=video_self_attention_mask,
-                audio_self_attention_mask=audio_self_attention_mask,
+                audio_self_attention_mask=block_audio_self_attention_mask,
                 a2v_cross_attention_mask=a2v_cross_attention_mask,
                 v2a_cross_attention_mask=v2a_cross_attention_mask,
                 skip_video_self_attn=skip_video_self_attn,
