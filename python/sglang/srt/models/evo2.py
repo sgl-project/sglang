@@ -937,7 +937,6 @@ class Evo2ForCausalLM(nn.Module):
         """
         # (param_name, shard_name, shard_id) — used for stacked parameters
         stacked_params_mapping = [
-            (".qkv_proj", ".Wqkv", 0),
             (".gate_up_proj", ".l1", 0),
             (".gate_up_proj", ".l2", 1),
         ]
@@ -971,7 +970,7 @@ class Evo2ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", None)
                 if weight_loader is None:
                     weight_loader = default_weight_loader
-                weight_loader(param, loaded_weight, shard_id=shard_id)
+                weight_loader(param, loaded_weight, loaded_shard_id=shard_id)
                 loaded_params.add(stacked_name)
                 matched = True
                 break
@@ -1050,9 +1049,9 @@ class Evo2ForCausalLM(nn.Module):
             if rest == "post_norm.scale":
                 return f"model.layers.{layer_idx}.post_norm.weight"
 
-            # MHA — Wqkv is stacked (q,k,v); loaded via stacked_params_mapping
+            # MHA — Wqkv is a single combined QKV tensor (not stacked)
             if rest == "inner_mha_cls.Wqkv.weight":
-                return f"model.layers.{layer_idx}.self_attn.Wqkv.weight"
+                return f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
             if rest == "inner_mha_cls.out_proj.weight":
                 return f"model.layers.{layer_idx}.self_attn.out_proj.weight"
 
