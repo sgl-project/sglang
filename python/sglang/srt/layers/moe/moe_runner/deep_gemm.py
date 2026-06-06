@@ -394,8 +394,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
         if use_mxfp8:
-            recipe_a = tuple(quant_info.block_shape)
             recipe_b = tuple(quant_info.block_shape)
+            # gran_k depends on the dispatch path that quantised the gateup acts,
+            # not on tensor shapes: standard dispatch uses block_shape[1] (=32),
+            # DeepEP LL a fixed 128. Inferring it from K // (act_sf_last * 4) is
+            # wrong -- e.g. K=640/act_sf_last=2: true gran_k=128, formula gives 80,
+            # and deep_gemm's ceil_div(K, gran_k*4)==act_sf_last check still passes
+            # (640/512==2), silently mis-reading the scale. Each pre_permute records
+            # the true gran_k in running_state.
+            gran_k_act = running_state.get(
+                "mxfp8_act_gran_k", quant_info.block_shape[1]
+            )
+            # mirror deep_gemm's sf.size(-1)==ceil_div(K,gran_k*4) assert so a wrong
+            # gran_k fails loudly here, not inside the kernel.
+            _, _, k_for_recipe = hidden_states.shape
+            act_sf_last = hidden_states_scale.shape[-1]
+            assert ceil_div(k_for_recipe, gran_k_act * 4) == act_sf_last, (
+                f"MXFP8 gateup scale mismatch: gran_k={gran_k_act}, K={k_for_recipe}, "
+                f"act_sf_last={act_sf_last}, expected "
+                f"{ceil_div(k_for_recipe, gran_k_act * 4)}"
+            )
+            recipe_a = (quant_info.block_shape[0], gran_k_act)
         elif quant_info.is_fp4_experts:
             recipe_a, recipe_b = (1, 128), (1, 32)
         else:
@@ -472,6 +491,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         del gateup_output
 
+        # The down activation is quantised locally by _varlen_deep_gemm_silu_mul_quant
+        # at scale_block_size (never DeepEP-LL), so its gran_k is scale_block_size
+        # regardless of the gateup path -- don't reuse the gateup recipe_a.
+        recipe_a_down = recipe_a
+        if use_mxfp8:
+            recipe_a_down = (quant_info.block_shape[0], scale_block_size)
+
         # GroupGemm-1
         n = w2_weight.shape[1]
 
@@ -511,7 +537,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
-            recipe_a=recipe_a,
+            recipe_a=recipe_a_down,
             recipe_b=recipe_b,
             **gemm_overlap_args_dict,
         )
@@ -642,6 +668,12 @@ def pre_permute_standard_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
+    # moe_ep_deepgemm_preprocess quantises activations at block_shape[1] (=32 for
+    # mxfp8); _run_masked_gemm needs this to build recipe_a (see its comment).
+    # block_shape is None on the non-mxfp8/bf16 path, where gran_k is unused.
+    running_state["mxfp8_act_gran_k"] = (
+        quant_info.block_shape[1] if quant_info.block_shape else 128
+    )
 
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
@@ -709,6 +741,9 @@ def pre_permute_deepep_ll_to_deep_gemm(
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
+    # DeepEP LL FP8 dispatch quantises activations at a fixed 128 block, not the
+    # checkpoint block_shape; _run_masked_gemm reads this to build recipe_a.
+    running_state["mxfp8_act_gran_k"] = 128
 
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,

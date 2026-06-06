@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -273,6 +274,10 @@ class MiniMaxM3MoE(nn.Module):
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.intermediate_size * self.n_shared_experts
+            # Under DeepEP the layer output is all-gathered, not all-reduced, so a
+            # TP-sharded shared MLP (reduce_results=False) would leave an unreduced
+            # partial. Replicate it (tp_size=1) for a complete output, like GLM4 / DSV2.
+            shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 layer_id=layer_id,
@@ -280,6 +285,7 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
                 intermediate_size=intermediate_size,
+                **(dict(tp_rank=0, tp_size=1) if shared_experts_tp1 else {}),
             )
         else:
             self.shared_experts = None
@@ -344,7 +350,30 @@ class MiniMaxM3MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        raise NotImplementedError("DeepEP is not yet implemented in MiniMax M3.")
+        shared_output = None
+        if hidden_states.shape[0] > 0:
+            shared_output = self._forward_shared_experts(hidden_states)
+            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        # DeepEPMoE returns the complete per-token routed result (no TP all-reduce
+        # here, unlike forward_normal), and the shared experts are replicated
+        # (tp_size=1, see __init__), so both are complete per token and add directly.
+        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
+        return final_hidden_states
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):

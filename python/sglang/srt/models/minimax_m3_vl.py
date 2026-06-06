@@ -32,6 +32,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
+    MiniMaxM3SparseForCausalLM,
     get_spec_layer_idx_from_weight_name,
 )
 from sglang.srt.models.minimax_vl_common import (
@@ -166,6 +167,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             self.num_fused_shared_experts == 1
         ), "Only 1 fused shared expert is supported"
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        # EP looks up this hook on the top-level arch class to build expert-location
+        # metadata (else ExpertLocationDispatchInfo.init_new asserts). The VL config
+        # nests the LM config under text_config, so delegate there; fall back to
+        # config itself when text_config is absent (LM config passed directly).
+        text_config = getattr(config, "text_config", None) or config
+        return MiniMaxM3SparseForCausalLM.get_model_config_for_expert_location(
+            text_config
+        )
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
