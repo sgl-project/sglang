@@ -2359,8 +2359,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
-        # TODO (csy): for preempted requests, we may want to insert into the tree
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        is_insert = (
+            server_args.enable_hierarchical_cache
+            and server_args.disaggregation_mode != "decode"
+        )
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
