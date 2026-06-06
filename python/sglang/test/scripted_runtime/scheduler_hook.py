@@ -67,7 +67,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
     deadline = time.monotonic() + WARMUP_DRIVE_TIMEOUT_S
 
     idle_streak = 0
-    while proxy.work_reqs_seen == 0 or idle_streak < quiesce_iters:
+    while idle_streak < quiesce_iters:
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "scripted_runtime: server warmup did not complete within "
@@ -76,9 +76,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
                 f"idle_streak={idle_streak})"
             )
         yield
-        if proxy.work_reqs_seen == 0:
-            idle_streak = 0
-        elif scheduler.is_fully_idle():
+        if proxy.work_reqs_seen > 0 and scheduler.is_fully_idle():
             idle_streak += 1
         else:
             idle_streak = 0
