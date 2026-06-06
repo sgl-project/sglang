@@ -118,14 +118,17 @@ jobs:
         env:
           CONFIGS_FILTER: ${{ inputs.configs }}
         run: |
-          # pyyaml is preinstalled on ubuntu-latest; only (re)install if missing,
-          # and never let pip's PEP668 exit code abort this `bash -e` step.
+          set -x
+          # Ensure pyyaml (usually preinstalled). PEP668-safe; fail loudly if it
+          # genuinely can't be installed (no masking).
           python3 -c 'import yaml' 2>/dev/null \
-            || python3 -m pip install -q pyyaml --break-system-packages 2>/dev/null \
-            || python3 -m pip install -q pyyaml 2>/dev/null || true
-          GROUPS=$(python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml --list-groups)
-          echo "groups=$GROUPS" >> "$GITHUB_OUTPUT"
-          echo "Model groups: $GROUPS"
+            || python3 -m pip install -q --break-system-packages pyyaml \
+            || python3 -m pip install -q pyyaml
+          # Redirect (not pipe) so a generator failure aborts the step; cat so
+          # the group list is visible in the log.
+          python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml --list-groups > /tmp/groups.json
+          cat /tmp/groups.json
+          echo "groups=$(cat /tmp/groups.json)" >> "$GITHUB_OUTPUT"
 
   # One nested (reusable-workflow) job per model group -> the Actions UI shows an
   # expandable per-model entry whose children are the per-config benchmark jobs.
