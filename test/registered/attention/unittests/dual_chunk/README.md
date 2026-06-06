@@ -19,7 +19,7 @@ Columns are runner modes; rows are kernel-path modes of the single
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Non-sparse | ✓ first-window, successor-chunk, inter-chunk extend/decode layouts + GQA decode | deferred: graph metadata for dual-chunk not scoped | deferred | deferred | blocked: `init_forward_metadata` asserts `is_prefill() or is_decode()` (`dual_chunk_flashattention_backend.py:179`); `TARGET_VERIFY` falls under `is_prefill()` but the wrapper hasn't been wired through | deferred | deferred | deferred | blocked: `DRAFT_EXTEND_V2` excluded from `is_prefill()` alias (see Production-Unsupported below) | deferred | deferred | — |
 | Sparse all-column (`vertical_size`/`slash_size` chosen so every key in the first chunk is selected) | ✓ single-request first-chunk, multi-request first-chunk, page-boundary first-chunk | — | — | — | blocked: same `is_prefill` assertion | — | — | — | blocked: same | — | — | — |
-| Sparse sub-window (`vertical_size=4`, `slash_size=4`, `seq_len=128`) | ✓ smoke: finite output, expected shape, differs from dense | — | — | — | — | — | — | — | — | — | — | — |
+| Sparse sub-window (`vertical_size=4`, `slash_size=4`, `seq_len=128`) | ✓ independent DCA top-k/split/fallback reference + torch sparse-kernel reference | — | — | — | — | — | — | — | — | — | — | — |
 | Threshold-gated sparse (`sparse_attention_threshold=100`, seq_len=16 → gate disables sparse, falls back to dense) | ✓ verifies `current_orig_seq_len > threshold` gate semantics | — | — | — | — | — | — | — | — | — | — | — |
 
 ## Input And Config Coverage
@@ -35,8 +35,10 @@ Columns are runner modes; rows are kernel-path modes of the single
 - Multi-request sparse and page-boundary sparse variants exercise per-request
   `cu_seqlens_*` slicing inside `_dual_chunk_flash_attn_prefill_func`.
 - Sub-window sparse prefill uses `vertical_size=4`, `slash_size=4`, and
-  `seq_len=128` to verify a genuinely pruning sparse path runs without
-  crashing or silently falling back to dense.
+  `seq_len=128` to verify the DCA-specific content-aware top-k split and
+  empty-stage fallback against an independent reference, then verifies the
+  sparse output against a torch sparse-kernel reference that consumes the
+  production block/column metadata.
 - Threshold-gated sparse uses `sparse_attention_threshold=100` so a 16-token
   prompt bypasses the sparse kernel and falls through to the dense chunk
   flash path, exercising the gate semantics in the wrapper.
@@ -81,48 +83,8 @@ See `KNOWN_FAILURES.md` §1 for the full root cause + fix.
 
 - Populate CUDA graph and PCG/BCG runner metadata after eager non-sparse
   coverage is stable across more chunk layouts.
-- **Sub-context-window sparse pruning reference (genuine follow-up)** —
-  The current "all-column" sparse cases match the dense reference exactly
-  because the chosen `vertical_size=16` + `slash_size=16` + `last_q=16`
-  configuration covers every column in the first chunk for `seq_len <= 16`.
-  The sub-window smoke case verifies that a truly pruning path runs, but a
-  strict correctness reference still needs to apply the same mask the kernel
-  applies.
-
-  The blocker is that the production sparse-attention config
-  `("vertical_and_slash", v_size, s_size, threshold)` is **content-aware**:
-  per-head `v_idx` and `s_idx` are picked by top-k attention scores over
-  the last `last_q` queries, not from a fixed schedule
-  (`dual_chunk_flashattention_backend.py:_dual_chunk_flash_attn_prefill`).
-  An independent reference therefore has three paths:
-
-  1. **Mock the sparse-config lookup** — patch
-     `get_sparse_attention_config` or the per-layer top-k selection so the
-     fixture supplies known `v_idx` / `s_idx` tensors. Then write a
-     token-level reference that masks `attn_scores[q, k] = -inf` unless
-     `k in v_idx` or `(q - k) in s_idx` (with causal `k <= q`). This is the
-     cleanest path but needs a hook in `_dual_chunk_flash_attn_prefill_func`
-     that doesn't exist today.
-  2. **Replicate `convert_vertical_slash_indexes`** at block granularity in
-     pure-PyTorch, then iterate `(block_count, block_offset, column_count,
-     column_index)` to build a per-(query_block, key_block) mask matching
-     the kernel's selection. Faithful but tedious — the block math (M=64,
-     N=64) needs to be mirrored exactly.
-  3. **Statistical recovery check** — compute dense attention scores
-     `softmax(Q @ K^T)` per head, identify the top-k columns by score, and
-     verify the sparse kernel output approximates the dense output modulo
-     the dropped probability mass. Not strict `assert_close`; rejects only
-     gross divergences.
-
-  Option 1 is recommended. It requires either: (a) a new
-  `sparse_attention_config_override` kwarg threaded through
-  `DualChunkFlashAttentionBackend.__init__` that bypasses the content-aware
-  selection, or (b) monkeypatching `get_sparse_attention_config` on the
-  fixture's backend instance. Until that lands, the all-column sparse,
-  threshold-gated, and sub-window smoke cases keep the kernel/wrapper
-  integration covered but the per-column sparse math is unverified.
-
-  The smoke-test helper `run_dual_chunk_sparse_sub_window_case` exercises
-  this path with a `seq_len=128` sub-window config. It verifies that the
-  sparse kernel runs, returns finite output with the expected shape, and
-  differs from the dense reference so the test catches silent dense fallback.
+- **Broaden sub-window sparse coverage** — the current regression case covers
+  `prefix_lens=(0,)`, `extend_lens=(128,)`, and no GQA. Add
+  multi-request batches, nonzero prefixes, GQA, and more sparse config variants
+  once those paths need explicit sparse pruning coverage. The 64x64
+  vertical/slash converter remains covered at the sgl-kernel layer.
