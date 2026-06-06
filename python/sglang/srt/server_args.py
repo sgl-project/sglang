@@ -2175,13 +2175,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
-                    # The AITER MXFP4 fused-MoE path for GPT-OSS expects the
-                    # SEPARATED gate/up tile layout (matches the
-                    # `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
-                    # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
-                    # callers default to INTERLEAVE; opt this path out
-                    # unless the user explicitly overrode it.
-                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
+                    ## The AITER MXFP4 fused-MoE path for GPT-OSS expects the
+                    ## SEPARATED gate/up tile layout (matches the
+                    ## `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+                    ## Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
+                    ## callers default to INTERLEAVE; opt this path out
+                    ## unless the user explicitly overrode it.
+                    # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
