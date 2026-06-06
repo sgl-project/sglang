@@ -1077,7 +1077,7 @@ class TokenizedEmbeddingReqInput(BaseReqIpc, kw_only=True):
     # The image inputs
     image_inputs: Optional[dict]
     # The token type ids
-    token_type_ids: List[int]
+    token_type_ids: Optional[List[int]]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
     # Embedding overrides to place at specific token positions.

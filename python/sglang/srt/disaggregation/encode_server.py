@@ -2887,7 +2887,7 @@ async def _dp_worker_handle_profile(
         req = (
             ProfileReq(**obj)
             if obj is not None
-            else ProfileReq(ProfileReqType.START_PROFILE)
+            else ProfileReq(req_type=ProfileReqType.START_PROFILE)
         )
         if enc.profiler is None:
             enc.profiler = EncoderProfiler(dp_rank)
@@ -3627,7 +3627,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         profile_req = None
         if obj is not None:
             profile_req = {
-                "type": ProfileReqType.START_PROFILE,
+                "req_type": ProfileReqType.START_PROFILE,
                 "output_dir": obj.output_dir,
                 "start_step": obj.start_step,
                 "num_steps": obj.num_steps,
@@ -3651,7 +3651,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         return Response(content="encoder not ready\n", status_code=503)
     req = None
     if obj is None:
-        req = ProfileReq(ProfileReqType.START_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.START_PROFILE)
     else:
         req = ProfileReq(
             req_type=ProfileReqType.START_PROFILE,
@@ -3697,7 +3697,7 @@ async def stop_profile_async():
         return Response(
             content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
         )
-    req = ProfileReq(ProfileReqType.STOP_PROFILE)
+    req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
         sock_send(socket, req)
     ok, msg = encoder.profiler.stop()

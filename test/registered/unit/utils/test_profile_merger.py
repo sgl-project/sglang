@@ -216,10 +216,10 @@ class TestProfileMergerIntegration(unittest.TestCase):
         self.assertTrue(req_input.merge_profiles)
 
         # Test ProfileReq
-        req = ProfileReq(ProfileReqType.START_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.START_PROFILE)
         self.assertFalse(req.merge_profiles)
 
-        req = ProfileReq(ProfileReqType.START_PROFILE, merge_profiles=True)
+        req = ProfileReq(req_type=ProfileReqType.START_PROFILE, merge_profiles=True)
         self.assertTrue(req.merge_profiles)
 
     def test_integration_parameters(self):

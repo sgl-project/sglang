@@ -1655,6 +1655,11 @@ def wrap_shm_features(obj):
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
+        # Use pickle to serialize the mm_inputs with SHM pointers,
+        # so that msgpack doesn't try to serialize the potentially
+        # large tensors inside mm_inputs
+        obj.mm_inputs = pickle.dumps(obj.mm_inputs)
+
     return obj
 
 

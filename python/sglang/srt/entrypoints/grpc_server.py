@@ -134,7 +134,7 @@ def _add_admin_routes(app, request_manager):
 
     async def stop_profile_handler(request):
         try:
-            req = ProfileReq(ProfileReqType.STOP_PROFILE)
+            req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
             )
