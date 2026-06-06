@@ -44,6 +44,11 @@ from sglang.srt.mem_cache.memory_pool import (  # noqa: E402
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardBatch,
     ForwardMode,
@@ -54,10 +59,7 @@ from sglang.srt.model_executor.forward_context import (  # noqa: E402
 )
 from sglang.srt.model_executor.model_runner import ModelRunner  # noqa: E402
 
-from ..mock_server_args import (
-    cuda_graph_config_from_legacy_flags,
-    make_mock_server_args,
-)
+from ..mock_server_args import make_mock_server_args
 
 # Tiny dims chosen to be the minimum that satisfies MambaMixer2's TP/chunk asserts:
 #   - num_heads % tp_size == 0  (tp_size=1)
@@ -338,9 +340,17 @@ class MockMamba2ModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            cuda_graph_config=cuda_graph_config_from_legacy_flags(
-                disable_cuda_graph=disable_cuda_graph,
-                disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
             ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
