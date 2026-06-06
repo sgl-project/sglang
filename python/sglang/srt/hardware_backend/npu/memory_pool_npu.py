@@ -90,41 +90,36 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
             # while other backends remain unchanged.
-            self.k_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.head_num,
-                        self.head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.head_num,
-                        self.v_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            self.k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.v_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.v_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
             if self.use_fia:
-                for i in range(self.layer_num):
-                    self.k_buffer[i] = self.k_buffer[i].view(
-                        -1, 1, self.head_num, self.head_dim
-                    )
-                    self.v_buffer[i] = self.v_buffer[i].view(
-                        -1, 1, self.head_num, self.v_head_dim
-                    )
+                self.k_buffer = self.k_buffer.view(
+                    self.layer_num, -1, 1, self.head_num, self.head_dim
+                )
+                self.v_buffer = self.v_buffer.view(
+                    self.layer_num, -1, 1, self.head_num, self.v_head_dim
+                )
 
     # for disagg
     def get_contiguous_buf_infos(self):
