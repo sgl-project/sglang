@@ -797,11 +797,19 @@ impl PDRouter {
     /// routes to the worker that actually shares the most prefix. Using only the
     /// first message ignores the conversation history that drives KV reuse in
     /// multi-turn chats. See https://github.com/sgl-project/sglang/issues/26263.
+    ///
+    /// Returns `None` when the conversation has no text to route on, preserving
+    /// the prior behavior of not feeding an empty key into prefix matching.
     fn build_chat_request_text(body: &ChatCompletionRequest) -> Option<String> {
         // `extract_text_for_routing` walks every message (system, prior turns,
         // current message, tool content) and is the same routing text the regular
         // (non-PD) router uses, keeping cache-aware routing consistent across both.
-        Some(body.extract_text_for_routing())
+        let text = body.extract_text_for_routing();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     async fn select_pd_pair(
@@ -1605,6 +1613,25 @@ mod tests {
         assert!(
             text.contains("oranges"),
             "routing text must include later turns (not only the first message), got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_text_none_when_no_text() {
+        // When the conversation carries no text content, no routing text should
+        // be produced (None) rather than an empty string, preserving the prior
+        // PD behavior. See https://github.com/sgl-project/sglang/issues/26263.
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": ""}
+            ]
+        }))
+        .expect("valid chat request");
+
+        assert!(
+            PDRouter::build_chat_request_text(&body).is_none(),
+            "empty conversation text should produce None, not Some(\"\")"
         );
     }
 
