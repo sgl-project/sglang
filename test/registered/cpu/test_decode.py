@@ -156,7 +156,18 @@ class TestDecodeAttention(CustomTestCase):
         return output
 
     def _test_grouped_decode_attention_once(
-        self, B, H_Q, H_KV, D, D_V, sliding_window, sink, is_cross_attn, dtype, device
+        self,
+        B,
+        H_Q,
+        H_KV,
+        D,
+        D_V,
+        sliding_window,
+        sink,
+        is_cross_attn,
+        dtype,
+        kvcache_dtype,
+        device,
     ):
         # This represents the number of tokens already in the sequence
         seq_len = 1024
@@ -174,14 +185,35 @@ class TestDecodeAttention(CustomTestCase):
         # k_buffer and v_buffer represent all previous tokens
         k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
         v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device)
+        k_scale = None
+        v_scale = None
+        if kvcache_dtype == torch.float8_e4m3fn:
+            k_scale = torch.empty((total_tokens, 1, 1), dtype=torch.float32)
+            v_scale = torch.empty((total_tokens, 1, 1), dtype=torch.float32)
+            k_buffer_fp8, k_scale0 = torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(
+                k_buffer
+            )
+            v_buffer_fp8, v_scale0 = torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(
+                v_buffer
+            )
+            k_scale.copy_(k_scale0)
+            v_scale.copy_(v_scale0)
+            k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
+            v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
+        elif kvcache_dtype == torch.float8_e5m2:
+            k_buffer_fp8 = k_buffer.to(torch.float8_e5m2)
+            v_buffer_fp8 = v_buffer.to(torch.float8_e5m2)
+            k_buffer = k_buffer_fp8.to(dtype)
+            v_buffer = v_buffer_fp8.to(dtype)
 
         key = torch.randn(B, H_KV, D, dtype=dtype)
         value = torch.randn(B, H_KV, D_V, dtype=dtype)
         loc = torch.randint(0, 10, (B,)).to(torch.int64)
 
         # set kv cache
-        k_buffer[loc] = key
-        v_buffer[loc] = value
+        if not is_cross_attn:
+            k_buffer[loc] = key
+            v_buffer[loc] = value
 
         # o will have the same shape as q
         o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
@@ -210,8 +242,18 @@ class TestDecodeAttention(CustomTestCase):
         value = value.transpose(0, 1).contiguous().transpose(0, 1)
         torch.ops.sgl_kernel.decode_attention_cpu(
             q,
-            k_buffer,
-            v_buffer,
+            (
+                k_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else k_buffer_fp8
+            ),
+            (
+                v_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else v_buffer_fp8
+            ),
+            k_scale,
+            v_scale,
             o,
             key if not is_cross_attn else None,
             value if not is_cross_attn else None,
@@ -281,27 +323,43 @@ class TestDecodeAttention(CustomTestCase):
 
         for B, H_Q, H_KV, D, D_V in configs:
             for dtype in [torch.bfloat16, torch.float16]:
-                for sink in [True, False]:
-                    if D != D_V and sink:
-                        continue
-                    for sliding_window in [None, 10]:
-                        if sliding_window is not None and not sink:
+                for kvcache_dtype in [
+                    torch.bfloat16,
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ]:
+                    for sink in [True, False]:
+                        if D != D_V and sink:
                             continue
-                        self._test_grouped_decode_attention_once(
-                            B,
-                            H_Q,
-                            H_KV,
-                            D,
-                            D_V,
-                            sliding_window,
-                            sink,
-                            False,
-                            dtype=dtype,
-                            device=device,
-                        )
-                self._test_grouped_decode_attention_once(
-                    B, H_Q, H_KV, D, D_V, None, False, True, dtype=dtype, device=device
-                )
+                        for sliding_window in [None, 10]:
+                            if sliding_window is not None and not sink:
+                                continue
+                            self._test_grouped_decode_attention_once(
+                                B,
+                                H_Q,
+                                H_KV,
+                                D,
+                                D_V,
+                                sliding_window,
+                                sink,
+                                False,
+                                dtype=dtype,
+                                kvcache_dtype=kvcache_dtype,
+                                device=device,
+                            )
+                    self._test_grouped_decode_attention_once(
+                        B,
+                        H_Q,
+                        H_KV,
+                        D,
+                        D_V,
+                        None,
+                        False,
+                        True,
+                        dtype=dtype,
+                        kvcache_dtype=kvcache_dtype,
+                        device=device,
+                    )
 
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")

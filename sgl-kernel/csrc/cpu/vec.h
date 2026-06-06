@@ -127,12 +127,34 @@ inline __m512bh cvt_e4m3_bf16_intrinsic_with_denorm(__m256i fp8_vec) {
       _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(128)), 8)));
 }
 
+inline __m256i cvt_bf16_e5m2_rne_intrinsic(__m512i bf16_vec) {
+  const __m512i vnaninf = _mm512_set1_epi16(0x7c00);
+  const __m512i vrneadd = _mm512_set1_epi16(0x007f);
+  const __m512i vfixup = _mm512_set1_epi16(0x0001);
+  const __m512i vfixupmask = _mm512_set1_epi16(0x0100);
+  __m512 b = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(bf16_vec, 0));
+  __m512 a = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(bf16_vec, 1));
+
+  __m256i ah_ = _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+  __m256i bh_ = _mm512_cvtps_ph(b, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+  const __m512i a_ = _mm512_inserti64x4(_mm512_inserti64x4(_mm512_setzero_si512(), bh_, 0), ah_, 1);
+  const __mmask32 maska1_ = _mm512_cmp_epi16_mask(_mm512_and_si512(a_, vnaninf), vnaninf, _MM_CMPINT_NE);
+  const __mmask32 maska2_ = _mm512_cmp_epi16_mask(_mm512_and_si512(a_, vfixupmask), vfixupmask, _MM_CMPINT_EQ);
+  __m512i a_rne_ = _mm512_mask_add_epi16(a_, maska1_, a_, _mm512_mask_add_epi16(vrneadd, maska2_, vrneadd, vfixup));
+  a_rne_ = _mm512_srli_epi16(a_rne_, 8);
+  return _mm512_cvtepi16_epi8(a_rne_);
+}
+
 inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 #ifdef SGLANG_CPU_FP8_CVT_FTZ
   return cvt_e4m3_bf16_intrinsic_no_nan(a);
 #else
   return cvt_e4m3_bf16_intrinsic_with_denorm(a);
 #endif
+}
+
+inline __m256i CVT_BF16_TO_FP8(__m512i a) {
+  return cvt_bf16_e5m2_rne_intrinsic(a);
 }
 
 // faster version of float8_e4m3fn conversion to bfloat16
@@ -282,6 +304,7 @@ inline void quantize_row_int8<at::BFloat16>(
   }
   As = scale;
 }
+
 #endif
 
 // transpose utils

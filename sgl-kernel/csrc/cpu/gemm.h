@@ -371,3 +371,18 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack = true);
+
+// quantizeation
+template <typename scalar_t>
+void quantize_tensor_fp8(
+    at::Float8_e4m3fn* __restrict__ Aq,
+    float& As,
+    const scalar_t* __restrict__ A,
+    int64_t B,
+    int64_t M,
+    int64_t K,
+    int64_t strideB_Aq,
+    int64_t strideB_A,
+    int64_t strideM_Aq,
+    int64_t strideM_A,
+    float eps = 1e-12);

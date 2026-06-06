@@ -89,6 +89,8 @@ void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& k_cache,
     at::Tensor& v_cache,
+    std::optional<at::Tensor> k_cache_scale,
+    std::optional<at::Tensor> v_cache_scale,
     at::Tensor& output,
     const std::optional<at::Tensor>& key,
     const std::optional<at::Tensor>& value,
@@ -111,6 +113,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    std::optional<at::Tensor> k_buf_scale,
+    std::optional<at::Tensor> v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -157,6 +161,7 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+std::tuple<at::Tensor, at::Tensor> quantize_fp8_e4m3fn_cpu(at::Tensor& A);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -500,8 +505,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
-      "value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor? k_cache_scale, Tensor? "
+      "v_cache_scale, Tensor(a!) output, Tensor? key, Tensor? value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
@@ -509,7 +514,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // extend
   m.def(
       "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
-      "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
+      "Tensor v_buffer, Tensor? k_buf_scale, Tensor? v_buf_scale, Tensor req_to_token, Tensor req_pool_indices, Tensor "
+      "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
       "encoder_lens, Tensor? sinks) -> ()");
@@ -539,6 +545,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
+  m.def("quantize_fp8_e4m3fn_cpu(Tensor A) -> (Tensor, Tensor)");
+  m.impl("quantize_fp8_e4m3fn_cpu", torch::kCPU, &quantize_fp8_e4m3fn_cpu);
 
   // igemm
   m.def(
