@@ -65,10 +65,12 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
-    ALLOC_MEMORY_FUNCS,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
-    get_allocator_from_storage,
     synchronized,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
