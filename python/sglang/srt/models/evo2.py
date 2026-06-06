@@ -129,10 +129,28 @@ def generate_evo2_tokenizer_files(model_path: str, vocab_size: int = 512) -> Non
     }
 
     os.makedirs(model_path, exist_ok=True)
-    with open(tok_path, "w") as f:
-        json.dump(tokenizer_json, f, indent=2)
-    with open(cfg_path, "w") as f:
-        json.dump(tokenizer_config, f, indent=2)
+
+    # Atomic write: write to temp files first, then os.replace (atomic on POSIX)
+    # prevents race conditions when multiple TP ranks share the model directory
+    temp_tok_path = tok_path + ".tmp"
+    temp_cfg_path = cfg_path + ".tmp"
+    try:
+        with open(temp_tok_path, "w") as f:
+            json.dump(tokenizer_json, f, indent=2)
+        os.replace(temp_tok_path, tok_path)
+
+        with open(temp_cfg_path, "w") as f:
+            json.dump(tokenizer_config, f, indent=2)
+        os.replace(temp_cfg_path, cfg_path)
+    except Exception:
+        # Clean up temp files on failure
+        for p in (temp_tok_path, temp_cfg_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        raise
 
     logger.info(f"Generated Evo 2 tokenizer files in {model_path}")
 
