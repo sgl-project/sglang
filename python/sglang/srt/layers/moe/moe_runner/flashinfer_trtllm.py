@@ -38,6 +38,8 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 logger = __import__("logging").getLogger(__name__)
 
 
@@ -1216,3 +1218,9 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
     )
+
+
+# Register the experimental experimental_sgl_trtllm MoE fused-func (MoeRunner needs it at
+# build time even for LoRA); gated by the master switch so the upstream path is untouched.
+if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+    from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401
