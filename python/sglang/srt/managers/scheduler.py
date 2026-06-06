@@ -3702,10 +3702,6 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("retract", "in_place"), (
-            f"Scheduler.pause_generation got unsupported mode {recv_req.mode!r}; "
-            f"abort is handled in TokenizerManager and must not reach the scheduler"
-        )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
