@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
-    "joy-echo": "JoyEchoPipeline",
 }
 
 

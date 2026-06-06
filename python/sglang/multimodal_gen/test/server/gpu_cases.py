@@ -38,7 +38,6 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
-    DEFAULT_JOY_ECHO_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
@@ -440,7 +439,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "joy_echo_t2v",
         DiffusionServerArgs(
-            model_path=DEFAULT_JOY_ECHO_MODEL_NAME_FOR_TEST,
+            model_path="jdopensource/JoyAI-Echo",
             env_vars={
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             },
