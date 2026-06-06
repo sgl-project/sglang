@@ -57,23 +57,40 @@ def _ensure_evo2_tokenizer_files(tokenizer_name: str) -> None:
     UTF-8 value (A=65, C=67, G=71, T=84). If the model directory contains a
     config.json with tokenizer_type='CharLevelTokenizer' but no tokenizer.json,
     this function generates the required files automatically.
+
+    Supports both local directories and HuggingFace Hub repo names
+    (e.g. ``arcinstitute/evo2_1b_base``).
     """
     try:
-        model_dir = tokenizer_name
-        if not os.path.isdir(model_dir):
-            return
-        config_path = os.path.join(model_dir, "config.json")
-        if not os.path.isfile(config_path):
-            return
+        # Resolve config.json path — works for local dirs and HF Hub names
+        config_path = _resolve_local_or_cached_file(
+            tokenizer_name, "config.json"
+        )
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        logger.debug(
+            "Failed to read config.json for %s: %s", tokenizer_name, e
+        )
+        return
+
+    try:
         with open(config_path) as f:
             cfg = json.load(f)
-        if cfg.get("tokenizer_type") == "CharLevelTokenizer":
-            vocab_size = cfg.get("vocab_size", 512)
-            from sglang.srt.models.evo2 import generate_evo2_tokenizer_files
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug(
+            "Failed to parse config.json for %s: %s", tokenizer_name, e
+        )
+        return
 
-            generate_evo2_tokenizer_files(model_dir, vocab_size)
-    except Exception:
-        pass  # Don't block model loading for tokenizer generation failures
+    if cfg.get("tokenizer_type") != "CharLevelTokenizer":
+        return
+
+    model_dir = os.path.dirname(config_path)
+    vocab_size = cfg.get("vocab_size", 512)
+    from sglang.srt.models.evo2 import generate_evo2_tokenizer_files
+
+    generate_evo2_tokenizer_files(model_dir, vocab_size)
 
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
