@@ -34,6 +34,8 @@ def _server_args_for_transformer_component(
     if component_name not in ("transformer_2", "unconditional_transformer"):
         return server_args
 
+    # Some pipelines have secondary DiT components with their own quantized
+    # weight file. Keep the mapping model-owned and the loader generic.
     component_weights_paths = getattr(
         server_args, "component_transformer_weights_paths", {}
     )

@@ -197,6 +197,9 @@ class Ideogram4Nvfp4Pipeline(Ideogram4Pipeline):
         model_resolution = self._get_model_resolution(server_args)
         server_args.transformer_weights_path = model_resolution.transformer_weights_path
         if model_resolution.unconditional_transformer_weights_path is not None:
+            # The loader treats transformer_weights_path as the base DiT override.
+            # Route the sibling unconditional DiT weights through the generic
+            # per-component override map instead of hard-coding Ideogram there.
             component_transformer_weights_paths = dict(
                 getattr(server_args, "component_transformer_weights_paths", {})
             )
