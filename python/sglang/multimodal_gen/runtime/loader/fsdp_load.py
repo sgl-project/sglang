@@ -629,6 +629,13 @@ def load_model_from_full_model_state_dict(
             else None
         )
 
+        if missing_param_init == "error":
+            raise ValueError(
+                f"Required checkpoint parameter '{new_param_name}' was not loaded. "
+                "This usually indicates a checkpoint/model-arch mismatch or a "
+                "broken weight-name mapping."
+            )
+
         if missing_param_init is None and not any(
             pattern in new_param_name for pattern in LEGACY_ALLOWED_NEW_PARAM_PATTERNS
         ):
