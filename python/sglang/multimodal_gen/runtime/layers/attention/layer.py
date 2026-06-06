@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
+import functools
 from contextlib import nullcontext
 from typing import Type
 
@@ -51,6 +52,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+from sglang.srt.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
@@ -1002,3 +1007,38 @@ class USPAttention(nn.Module):
         )
         out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
         return torch.cat([out_shard, out_rep], dim=1)
+
+
+def _make_breakable_attention_forward(forward_method):
+    """Wrap a DiT attention module's ``forward`` so it becomes a breakable
+    CUDA graph (BCG) break point.
+
+    During BCG capture the whole attention forward runs eagerly between
+    captured graph segments -- the sequence-parallel all-to-all collectives,
+    varlen packing, and dynamic/sparse attention kernels that live here
+    cannot (or should not) be captured into a static CUDA graph. When BCG is
+    disabled this is a transparent pass-through to the original method.
+    """
+    bcg_forward = eager_on_graph(True)(forward_method)
+
+    @functools.wraps(forward_method)
+    def forward(self, *args, **kwargs):
+        if is_in_breakable_cuda_graph():
+            return bcg_forward(self, *args, **kwargs)
+        return forward_method(self, *args, **kwargs)
+
+    return forward
+
+
+# Install the break points on every DiT attention entry point. All diffusion
+# models route attention through one of these modules (e.g. FLUX -> USPAttention),
+# so wrapping here gives universal, model-agnostic BCG break points without
+# touching individual model files.
+for _attn_cls in (
+    UlyssesAttention,
+    UlyssesAttention_VSA,
+    LocalAttention,
+    USPAttention,
+):
+    _attn_cls.forward = _make_breakable_attention_forward(_attn_cls.forward)
+del _attn_cls

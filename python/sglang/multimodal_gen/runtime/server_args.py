@@ -231,6 +231,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # Compilation
     enable_torch_compile: bool = False
 
+    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
+    # segments split at attention modules (SP all-to-all / dynamic attention
+    # stay eager). Mutually exclusive with --enable-torch-compile and
+    # Cache-DiT; BCG takes priority when more than one is requested.
+    enable_breakable_cuda_graph: bool = False
+
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
 
@@ -1303,6 +1309,15 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
             help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+        )
+        parser.add_argument(
+            "--enable-breakable-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_breakable_cuda_graph,
+            help="Capture the DiT forward as breakable CUDA graph segments "
+            "(split at attention; SP all-to-all / dynamic attention stay "
+            "eager) to cut per-kernel launch overhead. Mutually exclusive "
+            "with --enable-torch-compile and Cache-DiT (BCG takes priority).",
         )
 
         parser.add_argument(

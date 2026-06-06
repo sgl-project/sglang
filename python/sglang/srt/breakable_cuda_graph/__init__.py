@@ -11,26 +11,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Backward-compatible re-export shim.
+"""Model-agnostic breakable CUDA graph (BCG) primitives.
 
-The breakable CUDA graph primitives moved to the model-agnostic package
-:mod:`sglang.srt.breakable_cuda_graph` so the diffusion runtime
-(``sglang.multimodal_gen``) can share them with the LLM runtime. This module
-preserves the historical import path.
+Shared by the LLM runtime (``sglang.srt.model_executor``) and the diffusion
+runtime (``sglang.multimodal_gen``). Capture a forward region as a sequence of
+``torch.cuda.CUDAGraph`` segments separated by eager break points inserted via
+:func:`eager_on_graph`-decorated callables.
 """
 
-from sglang.srt.breakable_cuda_graph.breakable_cuda_graph import (  # noqa: F401
+from sglang.srt.breakable_cuda_graph.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     break_graph,
     eager_on_graph,
-    get_current_stream,
+)
+from sglang.srt.breakable_cuda_graph.context import (
+    enable_breakable_cuda_graph,
+    is_in_breakable_cuda_graph,
 )
 
 __all__ = [
-    "eager_on_graph",
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
-    "get_current_stream",
+    "eager_on_graph",
+    "enable_breakable_cuda_graph",
+    "is_in_breakable_cuda_graph",
 ]
