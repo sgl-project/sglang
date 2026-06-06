@@ -45,10 +45,6 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         primary = self._primary_shots[:num_primary]
         secondary = [self._secondary_pool[i] for i in secondary_indices]
         combined = primary + secondary
-        combined_indices = list(range(num_primary)) + [
-            self._num_shots + i for i in secondary_indices
-        ]
-        print(f"[mixed_prefix_gsm8k idx={idx}] combined={combined_indices}")
         return "".join(
             get_one_example(combined, i, include_answer=True) + "\n\n"
             for i in range(len(combined))

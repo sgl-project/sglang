@@ -378,19 +378,6 @@ if __name__ == "__main__":
         default=None,
         help="Path to GSM8K data file (e.g., test.jsonl)",
     )
-    parser.add_argument(
-        "--mixed-prefix-gsm8k-secondary-pool-size",
-        type=int,
-        default=15,
-        help="Size of secondary example pool for eval_name=mixed_prefix_gsm8k (default: 15)",
-    )
-    parser.add_argument(
-        "--mixed-prefix-gsm8k-seed",
-        type=int,
-        default=42,
-        help="Seed for per-question random sampling in mixed_prefix_gsm8k (default: 42)",
-    )
-
     args = parser.parse_args()
 
     run_eval(args)

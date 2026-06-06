@@ -74,9 +74,6 @@ class GSM8KEval(Eval):
     def _build_prefix(self, idx: int) -> str:
         return self._few_shot_prompt
 
-    def _extra_sample_metrics(self, idx: int, score: float) -> dict:
-        return {}
-
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(idx: int) -> SingleEvalResult:
             question = get_one_example(self._lines, idx, include_answer=False)
@@ -108,7 +105,6 @@ class GSM8KEval(Eval):
                 html=html,
                 score=score,
                 convo=convo,
-                metrics=self._extra_sample_metrics(idx, score),
             )
 
         results = common.map_with_progress(

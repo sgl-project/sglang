@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from sglang.test.scripted_runtime.context.radix import _node_lock_ref
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.context.api import ScriptedContext
@@ -47,15 +49,10 @@ class ScriptedReqHandle:
 
     @property
     def lock_refs(self) -> int:
-        # SWA radix nodes split the lock ref into full + swa counts.
-        from sglang.srt.mem_cache.swa_radix_cache import TreeNode as SWATreeNode
-
         req = self.req
         if req is None:
             return 0
         node = req.last_node
         if node is None:
             return 0
-        if isinstance(node, SWATreeNode):
-            return node.full_lock_ref + node.swa_lock_ref
-        return node.lock_ref
+        return _node_lock_ref(node)
