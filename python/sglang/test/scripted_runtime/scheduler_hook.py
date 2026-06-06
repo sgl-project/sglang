@@ -57,14 +57,18 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
     server_args = scheduler.server_args
     if server_args.skip_server_warmup:
+        logger.info("scripted_runtime: skip_server_warmup set, not driving warmup")
         return
+
+    logger.info("scripted_runtime: driving engine until server warmup completes")
+    start_time = time.monotonic()
 
     # is_fully_idle() can transiently report idle while a PP microbatch result
     # is still in flight, so require it to hold for two full microbatch
     # rotations after the warmup request was observed on the recv socket.
     quiesce_iters = 2 * (server_args.pp_size + server_args.pp_async_batch_depth)
     proxy = ctx._tokenizer_recv_proxy
-    deadline = time.monotonic() + WARMUP_DRIVE_TIMEOUT_S
+    deadline = start_time + WARMUP_DRIVE_TIMEOUT_S
 
     idle_streak = 0
     while idle_streak < quiesce_iters:
@@ -80,6 +84,12 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
             idle_streak += 1
         else:
             idle_streak = 0
+
+    logger.info(
+        "scripted_runtime: server warmup drained in %.1fs (work_reqs_seen=%d)",
+        time.monotonic() - start_time,
+        proxy.work_reqs_seen,
+    )
 
 
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
