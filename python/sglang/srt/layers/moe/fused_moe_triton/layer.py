@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
@@ -567,40 +568,6 @@ class FusedMoE(torch.nn.Module):
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 
-    @staticmethod
-    def _quantize_mxfp4_weight(
-        weight: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantize BF16/FP32 weight to packed MXFP4 and e8m0 scales."""
-        assert weight.shape[-1] % 32 == 0
-
-        original_shape = weight.shape
-        x = weight.reshape(-1, 32).to(torch.float32)
-        x_amax = x.abs().max(dim=-1, keepdim=True).values
-        descale = x_amax / 6.0
-        min_exp = torch.tensor(-127.0, device=x.device)
-        scale_exp = torch.ceil(torch.maximum(torch.log2(descale), min_exp))
-        x_scaled = x / torch.exp2(scale_exp)
-
-        bounds = torch.tensor(
-            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-            device=x.device,
-            dtype=torch.float32,
-        )
-        sign_bit = (x_scaled < 0).to(torch.uint8) << 3
-        magnitude = torch.sum(
-            (x_scaled.abs().unsqueeze(-1) - bounds) > 0,
-            dim=-1,
-        ).to(torch.uint8)
-        fp4 = (sign_bit + magnitude).view(original_shape)
-
-        packed = (fp4[..., 1::2] << 4) + fp4[..., 0::2]
-        scale = (scale_exp.squeeze(-1) + 127).to(torch.uint8)
-        scale = scale.view(*original_shape[:-1], original_shape[-1] // 32)
-        return packed.contiguous().view(torch.int8), scale.contiguous().view(
-            torch.float8_e8m0fnu
-        )
-
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
         param: torch.nn.Parameter,
@@ -659,7 +626,14 @@ class FusedMoE(torch.nn.Module):
                     128, dim=-1
                 )[..., : fp8_weight.shape[-2], : fp8_weight.shape[-1]]
             ).to(torch.bfloat16)
-            fp4_weight, fp4_scale = self._quantize_mxfp4_weight(dequant_weight)
+            fp4_quantized, fp4_scale = MXFP4QuantizeUtil.quantize(
+                dequant_weight, block_size=32
+            )
+            fp4_weight = fp4_quantized.quantized_data.contiguous().view(torch.int8)
+            fp4_scale = fp4_scale.view(
+                *dequant_weight.shape[:-1], dequant_weight.shape[-1] // 32
+            )
+            fp4_scale = fp4_scale.contiguous().view(torch.float8_e8m0fnu)
 
             weight_data = weight_param.data[expert_id]
             scale_data = scale_param.data[expert_id]
