@@ -90,11 +90,6 @@ jobs:
         with:
           ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
 
-      - name: Load GB300 runner profile
-        if: inputs.runner_config == '4-gpu-gb300'
-        run: |
-          echo "BASH_ENV=/etc/profile.d/sglang-ci.sh" >> "$GITHUB_ENV"
-
       - name: Resolve runner_config
         id: rc
         run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
