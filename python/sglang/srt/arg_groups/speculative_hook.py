@@ -119,6 +119,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
     if server_args.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
+        if server_args.speculative_adaptive:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                validate_adaptive_initial_steps,
+            )
+
+            validate_adaptive_initial_steps(
+                server_args.speculative_num_steps,
+                server_args.speculative_adaptive_config,
+            )
 
 
 def _handle_dflash(server_args: "ServerArgs") -> None:
