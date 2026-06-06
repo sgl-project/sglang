@@ -316,55 +316,81 @@ def _detect_evo2_variant(model: str) -> str:
 def patch_evo2_config_json(model: str) -> None:
     """Auto-generate a complete config.json for Evo 2 Hub checkpoints.
 
-    Vortex/Hub checkpoints ship with minimal config.json files lacking
-    model_type, intermediate_size, and other critical fields that SGLang
-    and HuggingFace transformers need for model loading.
-
-    This function reads the existing config.json, detects the Evo2 variant,
-    and writes a complete config with all fields from the Vortex YAML configs.
+    Some Evo2 repos ship with config.yml instead of config.json.
+    This handles both, detects the Evo2 variant, and writes a complete
+    config.json with all fields from the Vortex YAML configs.
     """
-    import os
     import json
+    import os
+    import yaml
 
-    config_path = os.path.join(model, "config.json")
-    if not os.path.isfile(config_path):
-        try:
-            from huggingface_hub import hf_hub_download
+    cfg_path = os.path.join(model, "config.json")
+    cfg = None
 
-            config_path = hf_hub_download(model, "config.json")
-        except Exception:
-            return
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    else:
+        yml_path = os.path.join(model, "config.yml")
+        if os.path.isfile(yml_path):
+            with open(yml_path) as f:
+                cfg = yaml.safe_load(f)
+        else:
+            # Try HuggingFace Hub download
+            try:
+                from huggingface_hub import hf_hub_download
+                for fname in ("config.json", "config.yml"):
+                    try:
+                        cfg_path = hf_hub_download(model, fname)
+                        with open(cfg_path) as f:
+                            cfg = json.load(f) if fname.endswith(".json") else yaml.safe_load(f)
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
-    with open(config_path) as f:
-        cfg = json.load(f)
+    if cfg is None:
+        # No config file exists at all — generate from variant defaults alone
+        variant = _detect_evo2_variant(str(model))
+        cfg = {"_name_or_path": str(model)}
 
+    # Detect if this is an Evo2 model
     architectures = cfg.get("architecture") or cfg.get("architectures") or []
-    if "StripedHyena2" not in architectures or "model_type" in cfg:
+    model_name = str(model).lower()
+    cfg_model_name = cfg.get("model_name", "") or cfg.get("name", "") or ""
+    is_evo2 = (
+        "StripedHyena2" in architectures
+        or cfg_model_name.startswith("shc-evo2")
+        or "evo2" in model_name
+        or "evo-2" in model_name
+    )
+    if not is_evo2:
         return
 
     variant = _detect_evo2_variant(
-        cfg.get("name", "") or cfg.get("_name_or_path", "") or str(model)
+        cfg.get("name", "") or cfg.get("_name_or_path", "") or cfg.get("model_name", "") or str(model)
     )
 
     # Build complete defaults
     defaults = dict(_EVO2_BASE_DEFAULTS)
-    # Layer base params first
     base_key = "7b" if "7b" in variant else "1b"
     defaults.update(_EVO2_VARIANT_DEFAULTS[base_key])
-    # Then variant-specific overrides
     defaults.update(_EVO2_VARIANT_DEFAULTS.get(variant, {}))
 
-    # Merge: existing config.json values take priority
+    # Merge: existing config values take priority
     patched = dict(defaults)
     patched.update(cfg)
     patched["model_type"] = "evo2"
     patched["architectures"] = ["Evo2ForCausalLM"]
 
-    tmp_path = config_path + ".tmp"
+    # Always write config.json
+    out_path = os.path.join(model, "config.json")
+    tmp_path = out_path + ".tmp"
     try:
         with open(tmp_path, "w") as f:
             json.dump(patched, f, indent=2)
-        os.replace(tmp_path, config_path)
+        os.replace(tmp_path, out_path)
     except Exception:
         if os.path.exists(tmp_path):
             try:
