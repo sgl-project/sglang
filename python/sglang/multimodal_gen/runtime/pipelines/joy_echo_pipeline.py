@@ -3,8 +3,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
     JoyEchoPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
-    _BaseLTX2Pipeline,
     _add_ltx2_front_stages,
+    _BaseLTX2Pipeline,
     prepare_ltx2_mu,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (

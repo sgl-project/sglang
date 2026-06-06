@@ -40,7 +40,9 @@ def latent_window_size_to_pixel_window_size(
     is_causal: bool = True,
 ) -> int:
     if latent_window_size <= 0:
-        raise ValueError(f"latent_window_size must be positive, got {latent_window_size}")
+        raise ValueError(
+            f"latent_window_size must be positive, got {latent_window_size}"
+        )
     if downsample_factor <= 0:
         raise ValueError(f"downsample_factor must be positive, got {downsample_factor}")
 
@@ -55,7 +57,9 @@ def select_max_response_audio_window_with_bounds(
     window_size: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
     if segment.dim() != 4:
-        raise ValueError(f"Expected segment shape [B, C, T, F], got {tuple(segment.shape)}")
+        raise ValueError(
+            f"Expected segment shape [B, C, T, F], got {tuple(segment.shape)}"
+        )
     if window_size <= 0:
         raise ValueError(f"window_size must be positive, got {window_size}")
 
@@ -65,7 +69,11 @@ def select_max_response_audio_window_with_bounds(
 
     scan_stride = max(1, window_size // 4)
     offsets = torch.arange(window_size, device=segment.device)
-    max_start_idx = num_time_steps - window_size if num_time_steps >= window_size else num_time_steps - 1
+    max_start_idx = (
+        num_time_steps - window_size
+        if num_time_steps >= window_size
+        else num_time_steps - 1
+    )
     candidate_start_indices = list(range(0, max_start_idx + 1, scan_stride))
     if candidate_start_indices[-1] != max_start_idx:
         candidate_start_indices.append(max_start_idx)
@@ -127,7 +135,9 @@ def select_audio_window_with_bounds(
             ],
             dim=0,
         )
-        end_indices = torch.clamp(start_indices + window_size - 1, max=num_time_steps - 1)
+        end_indices = torch.clamp(
+            start_indices + window_size - 1, max=num_time_steps - 1
+        )
         return selected_windows, start_indices, end_indices
     raise ValueError(f"Unsupported audio window selection mode: {mode}")
 
@@ -188,8 +198,9 @@ def select_video_frame_indices_from_time_range(
     if len(selected) < count:
         selected.extend([selected[-1]] * (count - len(selected)))
     return selected
-# --- Slot-aware attention masks ---
 
+
+# --- Slot-aware attention masks ---
 
 
 def memory_slot_ranges(total_seq_len: int, num_slots: int) -> list[tuple[int, int]]:
@@ -253,7 +264,8 @@ def build_paired_memory_cross_mask(
     for batch_idx in range(batch_size):
         query_lengths = (
             query_segment_lengths[batch_idx]
-            if query_segment_lengths is not None and batch_idx < len(query_segment_lengths)
+            if query_segment_lengths is not None
+            and batch_idx < len(query_segment_lengths)
             else None
         )
         kv_lengths = (
@@ -303,6 +315,8 @@ def build_memory_self_attention_block_mask(
     attention_mask[:, :memory_seq_len, :] = False
     attention_mask[:, :memory_seq_len, :memory_seq_len] = True
     return attention_mask
+
+
 # --- Memory VAE encode ---
 
 
@@ -373,6 +387,8 @@ def encode_memory_frames_batch(
         packed_latents.append(torch.cat(per_slot_latents, dim=1))
 
     return torch.cat(packed_latents, dim=0)
+
+
 # --- Memory RoPE coordinates ---
 
 
@@ -441,9 +457,7 @@ def build_memory_video_rope_coords(
         fps=JOYAI_VIDEO_ROPE_FPS,
         start_frame=0,
     )
-    memory_coords = apply_memory_video_downscale(
-        memory_coords, memory_downscale_factor
-    )
+    memory_coords = apply_memory_video_downscale(memory_coords, memory_downscale_factor)
 
     target_start_frame = (
         memory_latent_frames if position_mode == "prefix_continuous" else 0
@@ -477,9 +491,7 @@ def build_memory_audio_rope_coords(
         device=device,
         start_frame=0,
     )
-    target_start_frame = (
-        memory_audio_len if position_mode == "prefix_continuous" else 0
-    )
+    target_start_frame = memory_audio_len if position_mode == "prefix_continuous" else 0
     target_coords = audio_rope.prepare_audio_coords(
         batch_size=batch_size,
         num_frames=target_audio_len,
@@ -487,6 +499,8 @@ def build_memory_audio_rope_coords(
         start_frame=target_start_frame,
     )
     return torch.cat([memory_coords, target_coords], dim=2)
+
+
 # --- Paired audio-video memory bank ---
 
 
@@ -531,10 +545,15 @@ def normalize_audio_waveform_for_media(
         waveform = waveform[0]
     if waveform.ndim == 1:
         waveform = waveform.unsqueeze(0)
-    elif waveform.ndim == 2 and waveform.shape[0] not in {1, 2} and waveform.shape[1] in {
-        1,
-        2,
-    }:
+    elif (
+        waveform.ndim == 2
+        and waveform.shape[0] not in {1, 2}
+        and waveform.shape[1]
+        in {
+            1,
+            2,
+        }
+    ):
         waveform = waveform.transpose(0, 1)
     elif waveform.ndim != 2:
         raise ValueError(
@@ -634,7 +653,10 @@ class PairedAudioVideoMemoryBank:
         center_frame = max(0, min(int(center_frame), len(frames) - 1))
         left_context = (video_clip_num_frames - 1) // 2
         clip_start = max(
-            0, min(center_frame - left_context, max(len(frames) - video_clip_num_frames, 0))
+            0,
+            min(
+                center_frame - left_context, max(len(frames) - video_clip_num_frames, 0)
+            ),
         )
         clip_end = min(clip_start + video_clip_num_frames, len(frames))
         clip = list(frames[clip_start:clip_end])
@@ -720,9 +742,7 @@ class PairedAudioVideoMemoryBank:
                 )
                 center_latent = int(
                     round(
-                        center_time_sec
-                        / duration_sec
-                        * float(max(total_frames - 1, 0))
+                        center_time_sec / duration_sec * float(max(total_frames - 1, 0))
                     )
                 )
                 window_start = max(
@@ -810,7 +830,10 @@ class PairedAudioVideoMemoryBank:
         assert first is not None
         for audio_latent in audio_latents:
             assert audio_latent is not None
-            if audio_latent.shape[0] != first.shape[0] or audio_latent.shape[2] != first.shape[2]:
+            if (
+                audio_latent.shape[0] != first.shape[0]
+                or audio_latent.shape[2] != first.shape[2]
+            ):
                 raise ValueError(
                     "All memory audio latents must share batch and channel dimensions"
                 )
@@ -830,7 +853,6 @@ class PairedAudioVideoMemoryBank:
 
     def __len__(self) -> int:
         return len(self.memory)
-
 
 
 # --- Pipeline stages ---
@@ -865,9 +887,7 @@ class JoyEchoMemoryBankFetchStage(PipelineStage):
 
         device = get_local_torch_device()
         vae_dtype = self._resolve_vae_encode_dtype(self.vae)
-        latent_dtype = (
-            batch.latents.dtype if batch.latents is not None else vae_dtype
-        )
+        latent_dtype = batch.latents.dtype if batch.latents is not None else vae_dtype
 
         memory_frames = self.memory_bank.get_memory_frames()
         memory_video = encode_memory_frames_batch(
@@ -951,10 +971,15 @@ class JoyEchoAVDecodingStage(LTX2AVDecodingStage):
             elif video_np.ndim == 4:
                 video_uint8 = torch.from_numpy(video_np)
             else:
-                logger.warning("Unexpected decoded video shape for memory commit: %s", video_np.shape)
+                logger.warning(
+                    "Unexpected decoded video shape for memory commit: %s",
+                    video_np.shape,
+                )
                 return output_batch
         else:
-            logger.warning("Unsupported decoded video type for memory commit: %s", type(video_np))
+            logger.warning(
+                "Unsupported decoded video type for memory commit: %s", type(video_np)
+            )
             return output_batch
 
         if video_uint8.dtype != torch.uint8:

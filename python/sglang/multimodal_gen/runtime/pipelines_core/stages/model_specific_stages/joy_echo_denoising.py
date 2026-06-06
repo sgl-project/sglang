@@ -4,12 +4,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
     JoyEchoPipelineConfig,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo_memory import (
-    build_memory_audio_rope_coords,
-    build_memory_self_attention_block_mask,
-    build_memory_video_rope_coords,
-    build_paired_memory_cross_mask,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
     LTX2AVDenoisingStage,
 )
@@ -18,7 +13,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import 
     LTX2DenoisingContext,
     LTX2ModelInputs,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo_memory import (
+    build_memory_audio_rope_coords,
+    build_memory_self_attention_block_mask,
+    build_memory_video_rope_coords,
+    build_paired_memory_cross_mask,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -52,12 +52,18 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         dtype = timestep.dtype
         if timestep.ndim == 3:
             memory_ts = torch.zeros(
-                batch_size, memory_seq_len, timestep.shape[-1], device=device, dtype=dtype
+                batch_size,
+                memory_seq_len,
+                timestep.shape[-1],
+                device=device,
+                dtype=dtype,
             )
             target_ts = timestep[:, :target_seq_len, :]
             return torch.cat([memory_ts, target_ts], dim=1)
         if timestep.ndim == 2:
-            memory_ts = torch.zeros(batch_size, memory_seq_len, device=device, dtype=dtype)
+            memory_ts = torch.zeros(
+                batch_size, memory_seq_len, device=device, dtype=dtype
+            )
             target_ts = timestep[:, :target_seq_len]
             return torch.cat([memory_ts, target_ts], dim=1)
         if timestep.ndim == 1:
@@ -100,7 +106,10 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         target_video_len = int(target_video.shape[1])
         target_audio_len = int(target_audio.shape[1])
         tokens_per_latent_frame = int(ctx.latent_height) * int(ctx.latent_width)
-        if tokens_per_latent_frame <= 0 or memory_video_len % tokens_per_latent_frame != 0:
+        if (
+            tokens_per_latent_frame <= 0
+            or memory_video_len % tokens_per_latent_frame != 0
+        ):
             num_memory_slots = int(memory_info["num_memory_slots"])
         else:
             num_memory_slots = memory_video_len // tokens_per_latent_frame
@@ -169,9 +178,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             memory_position_mode=str(
                 memory_info.get("memory_position_mode", memory_position_mode)
             ),
-            memory_downscale_factor=int(
-                memory_info.get("memory_downscale_factor", 1)
-            ),
+            memory_downscale_factor=int(memory_info.get("memory_downscale_factor", 1)),
         )
         audio_coords = build_memory_audio_rope_coords(
             audio_rope=step_model.audio_rope,

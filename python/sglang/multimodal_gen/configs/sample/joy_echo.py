@@ -23,9 +23,7 @@ class JoyEchoSamplingParams(LTX2SamplingParams):
     guidance_scale: float = 1.0
     num_inference_steps: int = 8
 
-    sigmas: tuple[float, ...] = field(
-        default_factory=lambda: JOY_ECHO_DEFAULT_SIGMAS
-    )
+    sigmas: tuple[float, ...] = field(default_factory=lambda: JOY_ECHO_DEFAULT_SIGMAS)
 
     negative_prompt: str | None = None
 

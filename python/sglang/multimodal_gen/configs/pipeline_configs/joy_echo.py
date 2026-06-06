@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import dataclasses
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -12,6 +11,7 @@ def _default_joy_echo_vae_config() -> LTXVideoVAEConfig:
     vae_config = LTXVideoVAEConfig()
     vae_config.arch_config.ltx_variant = "ltx_2_3"
     return vae_config
+
 
 JOY_ECHO_DEFAULT_SIGMAS: tuple[float, ...] = (
     1.0,

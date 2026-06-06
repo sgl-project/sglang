@@ -61,11 +61,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     Ideogram4PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
-    JoyImageEditPipelineConfig,
-)
 from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
     JoyEchoPipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+    JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
@@ -1053,9 +1053,7 @@ def _register_configs():
             "jdopensource/JoyAI-Echo",
         ],
         model_detectors=[
-            lambda hf_id: (
-                "joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower()
-            )
+            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
             and "image-edit" not in hf_id.lower(),
         ],
     )
