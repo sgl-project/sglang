@@ -357,10 +357,34 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
             return self.sparse.forward(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        else:
-            return self.dense.forward(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
+
+        # Dense layers delegate to the stock backend (e.g. flashinfer). Under DP
+        # attention the per-rank token block is padded to an even length
+        # (prepare_mlp_sync_batch -> ceil_align(num_tokens, attn_cp_size * 2)), but
+        # flashinfer builds qo_indptr from extend_seq_lens, so q.shape[0] (padded)
+        # != qo_indptr[-1] (real) and the paged-prefill kernel raises. Trim q to
+        # the real token count and re-pad the output; k/v stay untrimmed so the
+        # KV-cache write stays aligned with out_cache_loc. Prefill-only.
+        mode = forward_batch.forward_mode
+        if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+            original_num_tokens = q.shape[0]
+            if actual_num_tokens < original_num_tokens:
+                o = self.dense.forward(
+                    q[:actual_num_tokens],
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    **kwargs,
+                )
+                pad_len = original_num_tokens - actual_num_tokens
+                return torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
+
+        return self.dense.forward(
+            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+        )
 
     def forward_extend(
         self,
