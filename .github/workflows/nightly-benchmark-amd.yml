@@ -118,7 +118,11 @@ jobs:
         env:
           CONFIGS_FILTER: ${{ inputs.configs }}
         run: |
-          pip install pyyaml -q
+          # pyyaml is preinstalled on ubuntu-latest; only (re)install if missing,
+          # and never let pip's PEP668 exit code abort this `bash -e` step.
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install -q pyyaml --break-system-packages 2>/dev/null \
+            || python3 -m pip install -q pyyaml 2>/dev/null || true
           GROUPS=$(python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml --list-groups)
           echo "groups=$GROUPS" >> "$GITHUB_OUTPUT"
           echo "Model groups: $GROUPS"

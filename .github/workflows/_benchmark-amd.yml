@@ -87,7 +87,11 @@ jobs:
           OVERRIDE_CONC_LIST: ${{ inputs.conc_list }}
           OVERRIDE_MODEL: ${{ inputs.model_path }}
         run: |
-          pip install pyyaml -q
+          # pyyaml is preinstalled on ubuntu-latest; only (re)install if missing,
+          # and never let pip's PEP668 exit code abort this `bash -e` step.
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install -q pyyaml --break-system-packages 2>/dev/null \
+            || python3 -m pip install -q pyyaml 2>/dev/null || true
           MATRIX=$(python3 scripts/ci/amd/generate_benchmark_matrix.py scripts/ci/amd/benchmark-configs.yaml)
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "Matrix for group '${{ inputs.group }}':"
