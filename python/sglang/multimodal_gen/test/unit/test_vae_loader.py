@@ -3,6 +3,15 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    FastWan2_2_TI2V_5B_Config,
+    Wan2_2_I2V_A14B_Config,
+    WanT2V480PConfig,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
@@ -15,26 +24,6 @@ class _FakeServerArgs:
     def __init__(self, pipeline_config, num_gpus=1):
         self.pipeline_config = pipeline_config
         self.num_gpus = num_gpus
-
-
-class QwenImagePipelineConfig:
-    pass
-
-
-class WanT2V480PConfig:
-    pass
-
-
-class FastWan2_2_TI2V_5B_Config:
-    pass
-
-
-class Wan2_2_I2V_A14B_Config:
-    pass
-
-
-class LTX2PipelineConfig:
-    pass
 
 
 class TestVAELoader(unittest.TestCase):

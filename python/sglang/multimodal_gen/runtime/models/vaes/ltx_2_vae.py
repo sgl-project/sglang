@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
@@ -12,6 +13,23 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+
+
+@lru_cache(maxsize=128)
+def _is_channels_last_3d_stride(size: tuple[int, ...], stride: tuple[int, ...]) -> bool:
+    if len(size) != 5:
+        return False
+
+    expected_stride = 1
+    for dim in (1, 4, 3, 2, 0):
+        if size[dim] == 0:
+            return True
+        if size[dim] == 1:
+            continue
+        if stride[dim] != expected_stride:
+            return False
+        expected_stride *= size[dim]
+    return True
 
 
 class PerChannelRMSNorm(nn.Module):
@@ -89,10 +107,8 @@ class LTX2VideoCausalConv3d(nn.Module):
 
     def _weight_is_channels_last_3d(self) -> bool:
         w = self.conv.weight
-        return (
-            w.dim() == 5
-            and hasattr(torch, "channels_last_3d")
-            and w.is_contiguous(memory_format=torch.channels_last_3d)
+        return hasattr(torch, "channels_last_3d") and _is_channels_last_3d_stride(
+            tuple(w.size()), tuple(w.stride())
         )
 
     def _causal_temporal_pad_channels_last(
