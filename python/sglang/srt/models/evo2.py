@@ -478,7 +478,7 @@ class Evo2HyenaFilter(nn.Module):
 
     def _update_time(self, L: int, device: torch.device):
         """Update the time vector for impulse response computation."""
-        if self.t is None or self.t.shape[-1] < L:
+        if self.t is None or self.t.device != device or self.t.shape[-1] < L:
             self.t = torch.arange(L, device=device, dtype=torch.float32)[None, None]
 
     def _compute_iir_filter(self, L: int, device: torch.device) -> torch.Tensor:
