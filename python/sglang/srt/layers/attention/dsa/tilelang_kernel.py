@@ -6,8 +6,13 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    get_fp8_e4m3_dtype,
+    get_fp8_e4m3_dtype_name,
+    is_fp8_fnuz,
+    is_gfx95_supported,
+    is_hip,
+)
 
 tilelang.set_log_level("WARNING")
 
@@ -48,8 +53,8 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
-FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
-FP8_DTYPE = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+FP8 = get_fp8_e4m3_dtype_name()
+FP8_DTYPE = get_fp8_e4m3_dtype()
 FP32 = "float32"
 INT32 = "int32"
 UINT8 = "uint8"

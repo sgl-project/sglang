@@ -5,11 +5,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_fp8_e4m3_dtype,
+    is_hip,
+)
 
 _is_hip = is_hip()
-_is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
 # uses the page_size=64 preshuffle layout (i.e. when the matching MQA gluon path
@@ -190,12 +192,11 @@ class GetKAndS:
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-
         page_size = pool.page_size
         index_head_dim = pool.index_head_dim
         quant_block_size = pool.quant_block_size
         scale_elems = index_head_dim // quant_block_size
+        fp8_dtype = get_fp8_e4m3_dtype(buf.device)
 
         kv_cache = buf.view(-1, page_size, index_head_dim + scale_elems * 4).view(
             fp8_dtype
@@ -437,10 +438,8 @@ def _set_k_and_s_triton(
 
     assert buf.dtype == torch.uint8
     assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
-    if _is_fp8_fnuz:
-        assert index_k.dtype == torch.float8_e4m3fnuz
-    else:
-        assert index_k.dtype == torch.float8_e4m3fn
+    fp8_dtype = get_fp8_e4m3_dtype(index_k.device)
+    assert index_k.dtype == fp8_dtype
     assert index_k_scale.dtype == torch.float32
 
     assert buf.is_contiguous()
@@ -448,10 +447,7 @@ def _set_k_and_s_triton(
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
 
-    if _is_fp8_fnuz:
-        buf_fp8 = buf.view(torch.float8_e4m3fnuz)
-    else:
-        buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp8 = buf.view(fp8_dtype)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
