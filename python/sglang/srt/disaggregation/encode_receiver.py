@@ -94,6 +94,8 @@ class EncoderBootstrapServer:
             if health_check_timeout is not None
             else envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT.get()
         )
+        self._consecutive_failures: Dict[str, int] = {}
+        self._max_consecutive_failures = 3
 
         @asynccontextmanager
         async def lifespan(fast_api_app: FastAPI):
@@ -153,6 +155,7 @@ class EncoderBootstrapServer:
         with self._lock:
             if url not in self._urls:
                 self._urls.append(url)
+                self._consecutive_failures.pop(url, None)
                 logger.info(f"Registered encoder URL: {url}")
                 return True
             logger.debug(f"Encoder URL already registered: {url}")
@@ -197,14 +200,28 @@ class EncoderBootstrapServer:
                         *(self._probe(session, url) for url in snapshot),
                         return_exceptions=True,
                     )
-                dead = [url for url, ok in zip(snapshot, results) if ok is not True]
-                if dead:
-                    with self._lock:
-                        for url in dead:
-                            if url in self._urls:
-                                self._urls.remove(url)
+                evicted = []
+                with self._lock:
+                    for url, ok in zip(snapshot, results):
+                        if ok is True:
+                            self._consecutive_failures.pop(url, None)
+                        else:
+                            self._consecutive_failures[url] = (
+                                self._consecutive_failures.get(url, 0) + 1
+                            )
+                            if (
+                                self._consecutive_failures[url]
+                                >= self._max_consecutive_failures
+                            ):
+                                if url in self._urls:
+                                    self._urls.remove(url)
+                                self._consecutive_failures.pop(url, None)
+                                evicted.append(url)
+                if evicted:
                     logger.warning(
-                        f"Health check evicted {len(dead)} encoder(s): {dead}"
+                        f"Health check evicted {len(evicted)} encoder(s) "
+                        f"after {self._max_consecutive_failures} consecutive "
+                        f"failures: {evicted}"
                     )
             except asyncio.CancelledError:
                 raise
@@ -2016,10 +2033,11 @@ class MMReceiverHTTP(MMReceiverBase):
         for i, response in enumerate(responses):
             if isinstance(response, asyncio.TimeoutError):
                 timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                encoder_label = encode_requests[i].get('encoder_url', f"idx={encode_requests[i].get('encoder_idx')}")
                 logger.error(
                     f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id} "
                     f"(request {i}), "
-                    f"encoder={self.encode_urls[encode_requests[i]['encoder_idx']]}"
+                    f"encoder={encoder_label}"
                 )
                 return False
             elif isinstance(response, Exception):
@@ -2087,6 +2105,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 encode_requests.append(
                     {
                         "encoder_idx": idx,
+                        "encoder_url": effective_urls[idx],
                         "mm_items": [
                             mm_item.get("url")
                             for mm_item in mm_data_modality[
@@ -2360,7 +2379,7 @@ def create_mm_receiver(
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
         logger.debug(f"MMReceiver transport_mode from env: {transport_mode}")
 
-    _validate_transport_mode(transport_mode, server_args.encoder_urls)
+    _validate_transport_mode(transport_mode, encode_urls or server_args.encoder_urls)
     logger.info(f"EPD MMReceiver: using transport_mode={transport_mode}")
 
     receiver_cls = _MM_RECEIVER_BY_MODE.get(transport_mode)

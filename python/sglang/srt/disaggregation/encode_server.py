@@ -3303,6 +3303,10 @@ def _launch_server_dp(server_args: ServerArgs):
         worker_processes,
     )
 
+    # Register this encoder's URL with prefill server(s) if configured.
+    if server_args.encoder_register_urls:
+        _register_encoder_url_with_bootstrap(server_args)
+
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
