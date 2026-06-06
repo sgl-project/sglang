@@ -13,6 +13,18 @@ register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
 class _PDPerturbBase(CanaryPDFixture):
     target_group: ClassVar[TargetGroupKind]
 
+    # The parallel requests share one prompt, and P-side radix caching rewrites
+    # each request's req_to_token row to the first-inserted (canonical) copy's
+    # slots in cache_unfinished_req BEFORE send_kv_chunk snapshots the indices.
+    # A flip on a non-canonical duplicate slot is then freed without ever being
+    # transferred or re-verified, so the asserted D-side violation flakes away.
+    # Disable the radix cache so every request transfers exactly the slots the
+    # post-forward perturb can hit.
+    extra_server_args: ClassVar[tuple[str, ...]] = (
+        *CanaryPDFixture.extra_server_args,
+        "--disable-radix-cache",
+    )
+
     @classmethod
     def setUpClass(cls) -> None:
         if cls is _PDPerturbBase:
