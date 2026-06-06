@@ -106,15 +106,19 @@ class Mixer2RMSNormGated(MultiPlatformOp):
             # Keep gate in float32 for numerical stability during silu
             return x * torch.nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
 
-        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
+        if (self.n_groups % self.tp_size) != 0:
             return self.forward_native(x, gate)
 
+        # When groups shard evenly across tensor-parallel ranks, each rank can
+        # normalize its local groups without a collective.
+        group_size = None if self.n_groups == 1 else self.group_size
         return rms_norm_gated(
             x=x,
             weight=self.weight.data,
             bias=None,
             z=gate,
             eps=self.variance_epsilon,
+            group_size=group_size,
             norm_before_gate=False,
             is_rms_norm=True,
         )
