@@ -878,36 +878,66 @@ class Evo2ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights from a Vortex checkpoint.
 
-        Handles weight name remapping from Vortex format to sglang format.
+        Handles weight name remapping from Vortex format to sglang format,
+        including stacked parameters (qkv_proj, gate_up_proj) that require
+        shard_id-aware loading.
         """
+        # (param_name, shard_name, shard_id) — used for stacked parameters
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".l1", 0),      # gate
-            (".gate_up_proj", ".l2", 1),      # up
+            (".qkv_proj", ".Wqkv", 0),
+            (".gate_up_proj", ".l1", 0),
+            (".gate_up_proj", ".l2", 1),
         ]
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            # Skip non-parameter keys (like _extra_state)
+            # Skip non-parameter keys
             if name.endswith("._extra_state"):
                 continue
 
-            # Remap Vortex weight names to sglang names
-            sglang_name = self._remap_weight_name(name)
+            # Skip FP8 extra states (handled by Transformer Engine)
+            if "fp8" in name.lower() or "_extra_state" in name:
+                continue
 
+            # Remap Vortex weight name → sglang name (before stacking logic)
+            sglang_name = self._remap_weight_name(name)
+            if sglang_name is None:
+                continue
+
+            # --- Handle stacked parameters via shard_id-aware loading ---
+            matched = False
+            for param_name, shard_name, shard_id in stacked_params_mapping:
+                if shard_name not in sglang_name:
+                    continue
+                # Replace shard name with stacked param name
+                stacked_name = sglang_name.replace(shard_name, param_name)
+                if stacked_name not in params_dict:
+                    continue
+                param = params_dict[stacked_name]
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is None:
+                    weight_loader = default_weight_loader
+                weight_loader(param, loaded_weight, shard_id=shard_id)
+                loaded_params.add(stacked_name)
+                matched = True
+                break
+
+            if matched:
+                continue
+
+            # --- Direct weight loading (non-stacked parameters) ---
             if sglang_name not in params_dict:
-                logger.warning(f"Parameter {sglang_name} (from {name}) not found in model. Skipping.")
+                logger.warning(
+                    f"Parameter {sglang_name} (from {name}) not found in model. Skipping."
+                )
                 continue
 
             param = params_dict[sglang_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            
-            # Handle shape mismatches by reshaping loaded weight to match param
+
+            # Handle shape mismatches (e.g., 2D→3D unsqueeze, dtype differences)
             if param.size() != loaded_weight.size():
                 try:
                     loaded_weight = loaded_weight.reshape(param.size())
@@ -917,7 +947,7 @@ class Evo2ForCausalLM(nn.Module):
                         f"param={list(param.shape)}, loaded={list(loaded_weight.shape)}. Skipping."
                     )
                     continue
-            
+
             weight_loader(param, loaded_weight)
             loaded_params.add(sglang_name)
 
@@ -933,19 +963,16 @@ class Evo2ForCausalLM(nn.Module):
           embedding_layer.weight          → embed_tokens.weight
           blocks.{i}.pre_norm.scale       → layers.{i}.pre_norm.weight
           blocks.{i}.post_norm.scale      → layers.{i}.post_norm.weight
-          blocks.{i}.inner_mha_cls.Wqkv.weight → layers.{i}.self_attn.qkv_proj.weight
+          blocks.{i}.inner_mha_cls.Wqkv.weight → layers.{i}.self_attn.Wqkv.weight
           blocks.{i}.inner_mha_cls.out_proj.weight → layers.{i}.self_attn.out_proj.weight
-          blocks.{i}.mlp.l1.weight        → layers.{i}.mlp.gate_up_proj.weight (gate)
-          blocks.{i}.mlp.l2.weight        → layers.{i}.mlp.gate_up_proj.weight (up)
+          blocks.{i}.mlp.l1.weight        → layers.{i}.mlp.l1.weight (gate, stacked)
+          blocks.{i}.mlp.l2.weight        → layers.{i}.mlp.l2.weight (up, stacked)
           blocks.{i}.mlp.l3.weight        → layers.{i}.mlp.down_proj.weight
-          blocks.{i}.projections.weight   → layers.{i}.projections.weight
-          blocks.{i}.filter.short_filter_weight → layers.{i}.filter.short_filter_weight
-          blocks.{i}.filter.h             → layers.{i}.filter.h
-          blocks.{i}.filter.D             → layers.{i}.filter.D
-          blocks.{i}.filter.log_poles     → layers.{i}.filter.log_poles
-          blocks.{i}.filter.residues      → layers.{i}.filter.residues
-          blocks.{i}.out_filter_dense.weight → layers.{i}.out_filter_dense.weight
-          norm.scale                      → norm.weight
+          ...
+
+        Note: .l1/.l2 and .Wqkv suffixes are preserved for stacked parameter
+        loading in load_weights(), which replaces them with .gate_up_proj
+        and .qkv_proj respectively using shard_id-aware loading.
         """
         name = vortex_name
 
@@ -971,17 +998,17 @@ class Evo2ForCausalLM(nn.Module):
             if rest == "post_norm.scale":
                 return f"model.layers.{layer_idx}.post_norm.weight"
 
-            # MHA
+            # MHA — Wqkv is stacked (q,k,v); loaded via stacked_params_mapping
             if rest == "inner_mha_cls.Wqkv.weight":
-                return f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
+                return f"model.layers.{layer_idx}.self_attn.Wqkv.weight"
             if rest == "inner_mha_cls.out_proj.weight":
                 return f"model.layers.{layer_idx}.self_attn.out_proj.weight"
 
-            # MLP
+            # MLP — l1/l2 are stacked into gate_up_proj; l3 is direct
             if rest == "mlp.l1.weight":
-                return f"model.layers.{layer_idx}.mlp.gate_up_proj.weight"
+                return f"model.layers.{layer_idx}.mlp.l1.weight"
             if rest == "mlp.l2.weight":
-                return f"model.layers.{layer_idx}.mlp.gate_up_proj.weight"
+                return f"model.layers.{layer_idx}.mlp.l2.weight"
             if rest == "mlp.l3.weight":
                 return f"model.layers.{layer_idx}.mlp.down_proj.weight"
 
