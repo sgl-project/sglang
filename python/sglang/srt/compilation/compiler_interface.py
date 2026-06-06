@@ -152,6 +152,10 @@ class AlwaysHitShapeEnv:
 
     def __init__(self) -> None:
         self.guards: list[Any] = []
+        # Newer torch Inductor reads ``shape_env.var_to_hint_override`` during
+        # compilation; provide an empty mapping so this dummy shape env stays
+        # compatible across torch versions (older torch never accesses it).
+        self.var_to_hint_override: dict[Any, Any] = {}
 
     def evaluate_guards_expression(self, *args, **kwargs):
         return True
