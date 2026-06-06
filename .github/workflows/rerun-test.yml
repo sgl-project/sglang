@@ -86,6 +86,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
 
+      - name: Load GB300 runner profile
+        if: inputs.runs_on == '4-gpu-gb300'
+        run: |
+          echo "BASH_ENV=/etc/profile.d/sglang-ci.sh" >> "$GITHUB_ENV"
+
       - name: Mark runner picked up
         if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
         continue-on-error: true
