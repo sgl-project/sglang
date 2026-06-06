@@ -183,11 +183,10 @@ def compute_partitions(
 def format_fit_window(model: dict) -> str:
     """Render the model's fit window as `[start, end)` for the step summary.
 
-    `fit_window_start` is the inclusive lower bound (UTC midnight, today -
-    fit_window_days); end = start + fit_window_days. Surfacing the whole
-    span avoids reading the single lower-bound date as a staleness marker.
-    Falls back to the legacy `data_as_of` key for snapshots predating the
-    sglang-ci-stats rename (drop once that rename is deployed)."""
+    Surfacing the whole span keeps the lower-bound date from reading as a
+    staleness marker (it trails today by fit_window_days). Falls back to the
+    legacy `data_as_of` key for pre-rename sglang-ci-stats snapshots (drop
+    once the `fit_window_start` rename is deployed)."""
     start = model.get("fit_window_start") or model.get("data_as_of")
     days = model.get("fit_window_days")
     if not start or not isinstance(days, int):

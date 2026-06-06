@@ -166,8 +166,8 @@ def main():
 
     print(f"Fetching {args.model_url}", file=sys.stderr)
     model = fetch_model(args.model_url)
-    # `data_as_of` fallback covers snapshots predating the sglang-ci-stats
-    # rename to `fit_window_start` (drop once that rename is deployed).
+    # `data_as_of` fallback covers pre-rename sglang-ci-stats snapshots
+    # (drop once the `fit_window_start` rename is deployed).
     window_start = model.get("fit_window_start") or model.get("data_as_of")
     print(
         f"  model fit_window_start={window_start} "
