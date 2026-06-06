@@ -66,7 +66,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.layers.quantization.mxfp4_tensor import quantize_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
@@ -616,24 +616,13 @@ class FusedMoE(torch.nn.Module):
                 return True
 
             fp8_weight = entry.pop("weight")
-            fp8_scale = entry.pop("scale").to(torch.float32)
+            fp8_scale = entry.pop("scale")
             if not entry:
                 self._fp8_shared_to_fp4_cache.pop(key, None)
 
-            dequant_weight = (
-                fp8_weight.to(torch.float32)
-                * fp8_scale.repeat_interleave(128, dim=-2).repeat_interleave(
-                    128, dim=-1
-                )[..., : fp8_weight.shape[-2], : fp8_weight.shape[-1]]
-            ).to(torch.bfloat16)
-            fp4_quantized, fp4_scale = MXFP4QuantizeUtil.quantize(
-                dequant_weight, block_size=32
+            fp4_weight, fp4_scale = quantize_fp8_weight_to_mxfp4(
+                fp8_weight, fp8_scale
             )
-            fp4_weight = fp4_quantized.quantized_data.contiguous().view(torch.int8)
-            fp4_scale = fp4_scale.view(
-                *dequant_weight.shape[:-1], dequant_weight.shape[-1] // 32
-            )
-            fp4_scale = fp4_scale.contiguous().view(torch.float8_e8m0fnu)
 
             weight_data = weight_param.data[expert_id]
             scale_data = scale_param.data[expert_id]
