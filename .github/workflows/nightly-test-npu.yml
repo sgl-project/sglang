@@ -287,6 +287,8 @@ jobs:
     if: ${{ !cancelled() }}
     needs:
       - nightly-poc-single-node-tests
+      - nightly-poc-multi-node-tests
+      - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
     steps:
       - name: Download all metrics
@@ -307,6 +309,8 @@ jobs:
           }
 
           single_result="${{ needs.nightly-poc-single-node-tests.result }}"
+          multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
+          mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
           group_icon() {
             case "$1" in
@@ -360,4 +364,6 @@ jobs:
 
           FAIL=0
           if [ "${single_result}" != "success" ] && [ "${single_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${multi_result}" != "success" ] && [ "${multi_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${mix_result}" != "success" ] && [ "${mix_result}" != "skipped" ]; then FAIL=1; fi
           exit $FAIL
