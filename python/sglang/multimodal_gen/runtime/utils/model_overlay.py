@@ -31,7 +31,7 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "jdopensource/JoyAI-Echo": {
         "overlay_repo_id": "Niehen6174/JoyAI-Echo-overlay",
-        "overlay_revision": "6fee66af48b8ca3739ec4fab4a6545332439ac21",
+        "overlay_revision": "0a19f315c96532b7a5f61bcd765d1fefdd83dc7d",
     },
 }
 
