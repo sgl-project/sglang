@@ -1693,21 +1693,28 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        server_args = get_global_server_args()
-        if server_args.disable_shared_experts_fusion:
+        if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        fusion_reason = None
-        if server_args.enable_deepep_waterfill:
-            fusion_reason = "--enable-deepep-waterfill set"
-        elif uses_per_rank_fused_shared_slots():
-            if server_args.enforce_shared_experts_fusion:
-                fusion_reason = (
-                    f"{get_moe_a2a_backend().value} backend enabled with "
-                    "--enforce-shared-experts-fusion"
+        # Waterfill needs shared-experts fusion so it can dispatch shared
+        # expert tokens to least-loaded EP ranks.
+        if get_global_server_args().enable_deepep_waterfill:
+            if self.config.n_shared_experts != 1:
+                raise ValueError(
+                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
+                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
                 )
-            else:
-                server_args.disable_shared_experts_fusion = True
+            self.num_fused_shared_experts = self.config.n_shared_experts
+            log_info_on_rank0(
+                logger,
+                "DeepSeek V4: --enable-deepep-waterfill set; KEEP shared-experts "
+                "fusion enabled so waterfill can rebalance shared expert dispatch.",
+            )
+            return
+
+        if uses_per_rank_fused_shared_slots():
+            if not get_global_server_args().enforce_shared_experts_fusion:
+                get_global_server_args().disable_shared_experts_fusion = True
                 log_info_on_rank0(
                     logger,
                     "DeepSeek V4 per-rank shared-slot backend: fusion off by "
@@ -1716,7 +1723,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
                 return
 
-        if fusion_reason is not None:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "
@@ -1725,11 +1731,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.num_fused_shared_experts = self.config.n_shared_experts
             log_info_on_rank0(
                 logger,
-                f"DeepSeek V4: {fusion_reason}; KEEP shared-experts fusion enabled.",
+                f"DeepSeek V4: {get_moe_a2a_backend().value} backend enabled with "
+                "--enforce-shared-experts-fusion; KEEP shared-experts fusion enabled.",
             )
             return
 
-        server_args.disable_shared_experts_fusion = True
+        get_global_server_args().disable_shared_experts_fusion = True
         log_info_on_rank0(
             logger,
             "DeepSeek V4 requires different clamping for shared and routed experts. "
