@@ -17,7 +17,6 @@ class Evo2Config(PretrainedConfig):
     Supports the following variants:
     - evo2-1b-8k
     - evo2-7b-8k / evo2-7b-1m
-    - evo2-40b-8k / evo2-40b-1m
     """
 
     model_type = "evo2"
@@ -56,7 +55,8 @@ class Evo2Config(PretrainedConfig):
         hcs_layer_idxs: list = None,
         # RoPE
         rotary_emb_base: float = 10000.0,
-        rotary_emb_scaling: float = None,
+        rotary_emb_scaling_factor: float = None,
+        use_interpolated_rotary_pos_emb: bool = False,
         # Evo2-specific
         evo2_style_activations: bool = True,
         mlp_activation: str = "gelu",
@@ -66,6 +66,7 @@ class Evo2Config(PretrainedConfig):
         # Bias flags
         mha_out_proj_bias: bool = True,
         hyena_out_proj_bias: bool = True,
+        hyena_flip_x1x2: bool = False,
         qkv_proj_bias: bool = False,
         short_filter_bias: bool = False,
         # Tokenizer
@@ -77,6 +78,18 @@ class Evo2Config(PretrainedConfig):
         # Flash attention / FFT
         use_flash_attn: bool = True,
         use_flashfft: bool = False,
+        use_flash_depthwise: bool = False,
+        use_flash_rmsnorm: bool = False,
+        # Misc
+        final_norm: bool = True,
+        inference_mode: bool = True,
+        prefill_style: str = "fft",
+        tie_embeddings: bool = True,
+        proj_groups: int = 1,
+        model_parallel_size: int = 1,
+        pipe_parallel_size: int = 1,
+        print_activations: bool = False,
+        log_intermediate_values: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -126,7 +139,8 @@ class Evo2Config(PretrainedConfig):
 
         # RoPE
         self.rotary_emb_base = rotary_emb_base
-        self.rotary_emb_scaling = rotary_emb_scaling
+        self.rotary_emb_scaling_factor = rotary_emb_scaling_factor
+        self.use_interpolated_rotary_pos_emb = use_interpolated_rotary_pos_emb
 
         # Evo2 flags
         self.evo2_style_activations = evo2_style_activations
@@ -138,6 +152,7 @@ class Evo2Config(PretrainedConfig):
         # Bias flags
         self.mha_out_proj_bias = mha_out_proj_bias
         self.hyena_out_proj_bias = hyena_out_proj_bias
+        self.hyena_flip_x1x2 = hyena_flip_x1x2
         self.qkv_proj_bias = qkv_proj_bias
         self.short_filter_bias = short_filter_bias
 
@@ -148,6 +163,17 @@ class Evo2Config(PretrainedConfig):
         self.use_fp8_input_projections = use_fp8_input_projections
         self.use_flash_attn = use_flash_attn
         self.use_flashfft = use_flashfft
+        self.use_flash_depthwise = use_flash_depthwise
+        self.use_flash_rmsnorm = use_flash_rmsnorm
+        self.final_norm = final_norm
+        self.inference_mode = inference_mode
+        self.prefill_style = prefill_style
+        self.tie_embeddings = tie_embeddings
+        self.proj_groups = proj_groups
+        self.model_parallel_size = model_parallel_size
+        self.pipe_parallel_size = pipe_parallel_size
+        self.print_activations = print_activations
+        self.log_intermediate_values = log_intermediate_values
 
     @property
     def head_dim(self) -> int:
@@ -160,3 +186,189 @@ class Evo2Config(PretrainedConfig):
     @property
     def num_kv_heads(self) -> int:
         return self.num_key_value_heads
+
+    @property
+    def num_hidden_layers(self) -> int:
+        return self.num_layers
+
+    @num_hidden_layers.setter
+    def num_hidden_layers(self, value: int):
+        self.num_layers = value
+
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# YAML-derived defaults for each Evo 2 variant
+# Keys match vortex model YAML config names.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Fields shared across ALL variants (overridden per-variant below)
+_EVO2_BASE_DEFAULTS = {
+    "vocab_size": 512,
+    "short_filter_length": 3,
+    "hcm_filter_length": 128,
+    "hcs_filter_length": 7,
+    "state_size": 16,
+    "rotary_emb_base": 10000.0,
+    "short_filter_bias": False,
+    "rms_norm_eps": 1e-6,
+    "make_vocab_size_divisible_by": 8,
+    "inner_size_multiple_of": 16,
+    "proj_groups": 1,
+    "hyena_filter_groups": 1,
+    "column_split_hyena": False,
+    "column_split": True,
+    "interleave": True,
+    "evo2_style_activations": True,
+    "model_parallel_size": 1,
+    "pipe_parallel_size": 1,
+    "tie_embeddings": True,
+    "mha_out_proj_bias": True,
+    "hyena_out_proj_bias": True,
+    "hyena_flip_x1x2": False,
+    "qkv_proj_bias": False,
+    "final_norm": True,
+    "use_flash_attn": True,
+    "use_flash_rmsnorm": False,
+    "use_flash_depthwise": False,
+    "use_flashfft": False,
+    "use_laughing_hyena": False,
+    "inference_mode": True,
+    "tokenizer_type": "CharLevelTokenizer",
+    "prefill_style": "fft",
+    "mlp_activation": "gelu",
+    "max_batch_size": 1,
+    "print_activations": False,
+    "log_intermediate_values": False,
+}
+
+# Per-variant overrides
+_EVO2_VARIANT_DEFAULTS = {
+    "1b": {
+        "hidden_size": 1920,
+        "num_filters": 1920,
+        "num_layers": 25,
+        "num_attention_heads": 15,
+        "num_key_value_heads": 15,
+        "intermediate_size": 5120,
+        "hcl_filter_groups": 1920,
+        "hcm_filter_groups": 128,
+        "hcs_filter_groups": 128,
+        "attn_layer_idxs": [3, 10, 17, 24],
+        "hcl_layer_idxs": [2, 6, 9, 13, 16, 20, 23],
+        "hcm_layer_idxs": [1, 5, 8, 12, 15, 19, 22],
+        "hcs_layer_idxs": [0, 4, 7, 11, 14, 18, 21],
+        "max_position_embeddings": 8192,
+        "use_fp8_input_projections": True,
+    },
+    "7b": {
+        "hidden_size": 4096,
+        "num_filters": 4096,
+        "num_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "hcl_filter_groups": 4096,
+        "hcm_filter_groups": 256,
+        "hcs_filter_groups": 256,
+        "attn_layer_idxs": [3, 10, 17, 24, 31],
+        "hcl_layer_idxs": [2, 6, 9, 13, 16, 20, 23, 27, 30],
+        "hcm_layer_idxs": [1, 5, 8, 12, 15, 19, 22, 26, 29],
+        "hcs_layer_idxs": [0, 4, 7, 11, 14, 18, 21, 25, 28],
+    },
+    "7b-8k": {
+        "intermediate_size": 11008,
+        "max_position_embeddings": 32768,
+        "use_fp8_input_projections": False,
+    },
+    "7b-262k": {
+        "intermediate_size": 11008,
+        "max_position_embeddings": 262144,
+        "use_fp8_input_projections": True,
+        "use_interpolated_rotary_pos_emb": True,
+        "rotary_emb_scaling_factor": 32,
+    },
+    "7b-1m": {
+        "intermediate_size": 11264,
+        "max_position_embeddings": 1048576,
+        "use_fp8_input_projections": True,
+        "use_interpolated_rotary_pos_emb": True,
+        "rotary_emb_scaling_factor": 128,
+    },
+}
+
+
+def _detect_evo2_variant(model: str) -> str:
+    """Detect Evo2 variant from model name or path."""
+    name = str(model).lower()
+    if "1b" in name:
+        return "1b"
+    if "262k" in name:
+        return "7b-262k"
+    if "1m" in name:
+        return "7b-1m"
+    if "7b" in name:
+        return "7b-8k"
+    return "7b-8k"  # default
+
+
+def patch_evo2_config_json(model: str) -> None:
+    """Auto-generate a complete config.json for Evo 2 Hub checkpoints.
+
+    Vortex/Hub checkpoints ship with minimal config.json files lacking
+    model_type, intermediate_size, and other critical fields that SGLang
+    and HuggingFace transformers need for model loading.
+
+    This function reads the existing config.json, detects the Evo2 variant,
+    and writes a complete config with all fields from the Vortex YAML configs.
+    """
+    import os
+    import json
+
+    config_path = os.path.join(model, "config.json")
+    if not os.path.isfile(config_path):
+        try:
+            from huggingface_hub import hf_hub_download
+
+            config_path = hf_hub_download(model, "config.json")
+        except Exception:
+            return
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    architectures = cfg.get("architecture") or cfg.get("architectures") or []
+    if "StripedHyena2" not in architectures or "model_type" in cfg:
+        return
+
+    variant = _detect_evo2_variant(
+        cfg.get("name", "") or cfg.get("_name_or_path", "") or str(model)
+    )
+
+    # Build complete defaults
+    defaults = dict(_EVO2_BASE_DEFAULTS)
+    # Layer base params first
+    base_key = "7b" if "7b" in variant else "1b"
+    defaults.update(_EVO2_VARIANT_DEFAULTS[base_key])
+    # Then variant-specific overrides
+    defaults.update(_EVO2_VARIANT_DEFAULTS.get(variant, {}))
+
+    # Merge: existing config.json values take priority
+    patched = dict(defaults)
+    patched.update(cfg)
+    patched["model_type"] = "evo2"
+    patched["architectures"] = ["Evo2ForCausalLM"]
+
+    tmp_path = config_path + ".tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(patched, f, indent=2)
+        os.replace(tmp_path, config_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise

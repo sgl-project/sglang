@@ -27,7 +27,9 @@ from torch import nn
 
 from sglang.srt.configs.evo2 import Evo2Config
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -45,10 +47,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -174,16 +175,26 @@ def generate_evo2_tokenizer_files(model_path: str, vocab_size: int = 512) -> Non
 
 
 def _interleave(x: torch.Tensor) -> torch.Tensor:
-    """Interleave first half with second half along last dim.
+    """Interleave by stride-3 grouping along the channel dimension.
 
-    For input shape (B, L, 2D), returns (B, L, 2D) where channels are
-    interleaved: [d0, d1, d2, ..., d_{D-1}, d_D, ..., d_{2D-1}]
-    becomes    [d0, d_D, d1, d_{D+1}, ...]
+    Matches vortex.model.utils.interleave exactly:
+    For input shape (B, C, L) [channel-first] or (B, L, C) [channel-last]:
+    Channels [0,1,2,3,4,5,...] become [0,3,6,..., 1,4,7,..., 2,5,8,...].
+
+    The operation groups channels by their index mod 3.
     """
-    D = x.shape[-1] // 2
-    a, b = x[..., :D], x[..., D:]
-    stacked = torch.stack([a, b], dim=-1)  # (..., D, 2)
-    return stacked.flatten(start_dim=-2)  # (..., 2D)
+    if x.dim() == 3 and x.shape[1] % 3 == 0:
+        # Channel-first layout: (B, 3*D, L) — used by vortex short filter output
+        x1 = x[:, 0::3]
+        x2 = x[:, 1::3]
+        v = x[:, 2::3]
+        return torch.cat([x1, x2, v], dim=1)
+    else:
+        # Channel-last layout: (B, L, 3*D) — used by our short filter output
+        x1 = x[..., 0::3]
+        x2 = x[..., 1::3]
+        v = x[..., 2::3]
+        return torch.cat([x1, x2, v], dim=-1)
 
 
 def _column_split(
@@ -260,9 +271,7 @@ class Evo2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
 
         # Split gate and up
-        intermediate = gate_up.shape[-1] // 2
-        gate = gate_up[..., :intermediate]
-        up = gate_up[..., intermediate:]
+        gate, up = gate_up.chunk(2, dim=-1)
 
         # Evo2 style: only layer 0 uses activation, others use identity
         if self.evo2_style and self.layer_idx > 0:
@@ -519,6 +528,7 @@ class Evo2HyenaFilter(nn.Module):
         t = self.t[:, :, :L]  # (1, 1, L)
         # h shape: (1, G, L) then squeeze to (G, L)
         h = (residues[..., None] * (log_poles * t).exp()).sum(dim=1)  # (G, L)
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
         return h.unsqueeze(1)  # (G, 1, L)
 
     def _apply_short_filter(
@@ -545,8 +555,8 @@ class Evo2HyenaFilter(nn.Module):
         u_padded = F.pad(u_t, (pad, 0))
         u_filt = F.conv1d(
             u_padded,
-            self.short_filter_weight,
-            bias=self.short_filter_bias,
+            self.short_filter_weight.to(u.dtype),
+            bias=self.short_filter_bias.to(u.dtype) if self.short_filter_bias is not None else None,
             groups=3 * self.hidden_size,
         )
         u_filt = u_filt.transpose(1, 2)  # (B, L, 3*hidden_size)
@@ -573,63 +583,76 @@ class Evo2HyenaFilter(nn.Module):
             squeeze_back = False
 
         B, L, _ = z.shape
+        orig_dtype = z.dtype
+
+        # Run long filter in float32 for numerical stability
+        z_f = z.float()
 
         # Split into x1, x2, v based on column_split mode
         if self.column_split_hyena:
-            x2, x1, v = _column_split(z, self.num_attention_heads, self.head_dim)
+            x2, x1, v = _column_split(z_f, self.num_attention_heads, self.head_dim)
         else:
-            x1, x2, v = z.split(self.hidden_size, dim=-1)
+            x1, x2, v = z_f.split(self.hidden_size, dim=-1)
 
         # Prepare filter h
         if self.h is not None:
             # FIR mode (HCM/HCS)
-            h = self.h  # (G, 1, fir_len)
+            h = self.h.float()  # (G, 1, fir_len)
             if self.hyena_filter_groups > 1:
                 h = h.repeat_interleave(
                     self.hidden_size // self.hyena_filter_groups, dim=0
                 )
-            # Gated FIR convolution: y = x1 * v convolved with h, then * x2
             gate = x1 * v
-            # Treat as grouped conv1d
-            pad = h.shape[-1] - 1
-            gate_t = gate.transpose(1, 2)  # (B, D, L)
-            gate_padded = F.pad(gate_t, (pad, 0))
+            gate_t = gate.transpose(1, 2)  # (B, D, L) float32
             if self.fir_inner_filter_length >= 128:
-                # Flipped filter for long FIR
-                h_flipped = h.flip(-1)
+                # HCM: 128-token FIR — use FFT-based convolution
+                # matching vortex fftconv_func for numerical fidelity.
+                seqlen = gate_t.shape[-1]
+                fft_size = 2 * seqlen
+                h_squeezed = h.squeeze(1)  # (D, fir_len)
+                h_use = h_squeezed[..., :seqlen]  # (D, min(fir_len, seqlen))
+                k_f = torch.fft.rfft(h_use, n=fft_size) / fft_size  # (D, F)
+                k_f = k_f.unsqueeze(0)  # (1, D, F) for broadcast
+                u_f = torch.fft.rfft(gate_t, n=fft_size)  # (B, D, F)
+                y = torch.fft.irfft(u_f * k_f, n=fft_size, norm="forward")[
+                    ..., :seqlen
+                ]  # (B, D, L)
             else:
-                h_flipped = h
-            y = F.conv1d(gate_padded, h_flipped, groups=gate_padded.shape[1])
+                # HCS: 7-token FIR — direct conv1d (vortex uses same)
+                h_use = h
+                pad = h_use.shape[-1] - 1
+                y = F.conv1d(F.pad(gate_t, (pad, 0)), h_use, groups=gate_t.shape[1])
             if self.D is not None:
-                y = y + self.D[None, :, None] * gate_t
+                y = y + self.D.float()[None, :, None] * gate_t
             y = y.transpose(1, 2)  # (B, L, D)
             y = y * x2
         else:
             # IIR mode (HCL)
-            h_raw = self._compute_iir_filter(L, z.device)  # (G, 1, L)
+            h_raw = self._compute_iir_filter(L, z_f.device)  # (G, 1, L) float32
             if self.hyena_filter_groups > 1:
                 h_raw = h_raw.repeat_interleave(
                     self.hidden_size // self.hyena_filter_groups, dim=0
                 )
-            h = h_raw.to(z.dtype).squeeze(1)  # (D, L)
+            h = h_raw.squeeze(1)  # (D, L) float32
 
-            # Apply IIR filter via FFT convolution
-            # y = x1 * (v * h) + D * (x1 * v), then gate with x2
-            gate = x1 * v  # (B, L, D)
+            gate = x1 * v  # (B, L, D) float32
 
-            # FFT convolution: treat as (B, D, L)
-            gate_t = gate.transpose(1, 2).float()  # (B, D, L)
+            # FFT convolution in float32
+            gate_t = gate.transpose(1, 2)  # (B, D, L)
             fft_len = 2 * L
-            k_f = torch.fft.rfft(h.float(), n=fft_len) / fft_len  # (D, F)
+            k_f = torch.fft.rfft(h, n=fft_len) / fft_len  # (D, F)
             u_f = torch.fft.rfft(gate_t, n=fft_len)  # (B, D, F)
             y = torch.fft.irfft(u_f * k_f, n=fft_len, norm="forward")[
                 ..., :L
             ]  # (B, D, L)
-            y = y.transpose(1, 2).to(z.dtype)  # (B, L, D)
+            y = y.transpose(1, 2)  # (B, L, D)
 
             if self.D is not None:
-                y = y + self.D[None, None, :] * gate
+                y = y + self.D.float()[None, None, :] * gate
             y = y * x2
+
+        # Cast back
+        y = y.to(orig_dtype)
 
         if squeeze_back:
             y = y.squeeze(0)
@@ -652,14 +675,14 @@ class Evo2HyenaFilter(nn.Module):
 
         L = u.shape[1]
 
-        # 1. Short FIR filter
-        z = self._apply_short_filter(u)  # (B, L, 3*hidden_size)
+        # 1. Short FIR filter — run in float32 for 7B stability
+        z = self._apply_short_filter(u.float()).to(u.dtype)  # (B, L, 3*hidden_size)
 
         # 2. Interleave channels (Evo2 style)
         if self.interleave:
             z = _interleave(z)
 
-        # 3. Long filter (IIR or FIR)
+        # 3. Long filter (IIR or FIR) — runs float32 internally
         y = self._apply_long_filter(z)  # (B, L, hidden_size)
 
         if squeeze_back:
@@ -698,6 +721,8 @@ class Evo2HyenaConvLayer(nn.Module):
             if hyena_filter_groups is not None
             else config.hidden_size
         )
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -757,8 +782,17 @@ class Evo2HyenaConvLayer(nn.Module):
         # Input projection: (B, L, D) → (B, L, 3*D)
         proj_out, _ = self.projections(hidden_states)
 
-        # Hyena filter
+        # All-gather if using TP, because the Hyena filter's interleave step
+        # mixes channels pairwise across the full hidden dimension.
+        if self.tp_size > 1:
+            proj_out = tensor_model_parallel_all_gather(proj_out)
+
+        # Hyena filter (causal: requires forward_batch for sequence boundaries)
         z = self.filter(proj_out)  # (B, L, D)
+
+        # Split back for row-parallel output projection
+        if self.tp_size > 1:
+            z = z.chunk(self.tp_size, dim=-1)[self.tp_rank]
 
         # Output projection
         z_out, _ = self.out_filter_dense(z)
@@ -924,9 +958,10 @@ class Evo2ForCausalLM(nn.Module):
             forward_batch=forward_batch,
             inputs_embeds=inputs_embeds,
         )
-        return self.logits_processor(
+        output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        return output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights from a Vortex checkpoint.
@@ -949,10 +984,13 @@ class Evo2ForCausalLM(nn.Module):
             if name.endswith("._extra_state"):
                 continue
 
-            # Skip FP8 extra states and non-weight buffers
+            # Skip FP8 extra states, non-weight buffers, and optimizer states
             if "fp8" in name.lower() or "_extra_state" in name:
                 continue
             if any(x in name for x in (".inv_freq", "filter.t")):
+                continue
+            # Skip optimizer/scheduler states from .pt checkpoints
+            if name.startswith(("optimizer", "scheduler", "iteration")):
                 continue
 
             # Remap Vortex weight name → sglang name (before stacking logic)
