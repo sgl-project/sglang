@@ -3363,8 +3363,6 @@ class Scheduler(
     def _pp_microbatches_drained(self) -> bool:
         if self.ps.pp_size == 1:
             return True
-        # In-flight microbatches (e.g. dispatched prefill chunks whose batch
-        # results are not processed yet) are in mbs but not in running_mbs.
         return all(x.is_empty() for x in self.running_mbs) and all(
             mb is None or mb.is_empty() for mb in self.mbs
         )

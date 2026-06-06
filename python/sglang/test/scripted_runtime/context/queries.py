@@ -13,9 +13,6 @@ def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
         yield s.chunked_req
     yield from s.waiting_queue
     if s.ps.pp_size > 1:
-        # Under PP, running_batch / last_batch only alias the current
-        # microbatch slot; scan every slot so requests in other slots
-        # (e.g. in-flight dispatched chunks) stay visible.
         for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
             if mb is not None:
                 yield from mb.reqs
