@@ -650,6 +650,12 @@ export const Playground = ({ config }) => {
           }
           flags = h.insertBeforeTail(flags, adds);
 
+          // Role-specific serving port so the router's prefill:30000 / decode:30001
+          // targets line up (and prefill+decode don't collide on a single host).
+          const servePort = value.mode === "decode" ? 30001 : 30000;
+          flags = flags.map((f) =>
+            f.split(/[\s=]/)[0] === "--port" ? `--port ${servePort}` : f);
+
           // Per-backend env, gated by hw via `envWhen` (no gate = always on).
           const meta = backends.find((b) => b.id === backend);
           if (meta && meta.env && meta.env.length) {
@@ -949,10 +955,13 @@ export const Playground = ({ config }) => {
         if (at !== -1) break;
       }
       if (at === -1) at = f.findIndex((x) => x.startsWith("--model-path"));
+      // PD roles need distinct rendezvous ports so prefill+decode don't collide on a
+      // shared head host; non-PD multi-node keeps :20000 (matches _deployment.jsx).
+      const distPort = pdMode === "prefill" ? 30335 : pdMode === "decode" ? 30435 : 20000;
       f.splice(at + 1, 0,
         `--nnodes ${nnodes}`,
         `--node-rank {{NODE_RANK}}`,
-        `--dist-init-addr {{NODE0_IP}}:20000`);
+        `--dist-init-addr {{NODE0_IP}}:${distPort}`);
     }
     let cmd;
     if (mode === "docker") {
