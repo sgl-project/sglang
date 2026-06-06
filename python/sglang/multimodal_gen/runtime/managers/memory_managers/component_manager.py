@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
 
 logger = init_logger(__name__)
 
@@ -148,6 +149,10 @@ class ComponentResidencyManager:
         self._current_use_index: int = -1
         self._active_use: ComponentUse | None = None
         self._active_use_module: nn.Module | None = None
+        self._active_nvtx_key: tuple[str, str, str | None] | None = None
+        self._nvtx_hooks_by_use_key: dict[
+            tuple[str, str, str | None], tuple[int, DiffusionNvtxHooks]
+        ] = {}
         self._prefetched_use_keys: set[tuple[str, str, str | None]] = set()
         self._custom_strategies: dict[str, ComponentResidencyStrategy] = dict(
             pipeline.component_residency_strategies
@@ -161,6 +166,7 @@ class ComponentResidencyManager:
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
         if pipeline is not self.pipeline:
+            self._remove_nvtx_hooks()
             self.strategy_for.cache_clear()
             self._should_keep_single_dit.cache_clear()
             self._active_use = None
@@ -200,6 +206,7 @@ class ComponentResidencyManager:
         )
         self._active_use = None
         self._active_use_module = None
+        self._disable_active_nvtx()
         self._current_use_index = -1
         self._prefetched_use_keys.clear()
         self._uses_seen.clear()
@@ -241,11 +248,11 @@ class ComponentResidencyManager:
             return
         self._trace("stage_exit", detail=f"index={stage_index}")
 
-    def before_use(self, use: ComponentUse) -> None:
+    def before_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """component use-site starts"""
         if not self.enabled:
             return
-        self.begin_use(use)
+        self.begin_use(use, module=module)
 
     def begin_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """Begin one sequential component use interval. this is idempotent
@@ -255,8 +262,19 @@ class ComponentResidencyManager:
         3. Wait until the current component is ready, then prefetch the next heavy use.
         """
         if self._active_use is not None and self._same_use(self._active_use, use):
+            if self._use_key(self._active_use) != self._use_key(use):
+                self._mark_current_use(use)
+                self._active_use = use
+                self.state.current_use = use
+            self._enable_nvtx_for_use(
+                use,
+                module
+                or self._active_use_module
+                or self.get_module(use.component_name),
+            )
             return
         if self._active_use is not None:
+            self._disable_active_nvtx()
             # finish previous active use
             self._finish_use(
                 self._active_use,
@@ -267,9 +285,10 @@ class ComponentResidencyManager:
             self._active_use_module = None
             self.state.current_use = None
         self._mark_current_use(use)
-        self._prepare_forward_use(use, module=module)
+        module = self._prepare_forward_use(use, module=module)
         self._active_use = use
         self._active_use_module = module
+        self._enable_nvtx_for_use(use, module)
         self._prefetch_next_memory_intensive_use()
 
     def end_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
@@ -281,6 +300,7 @@ class ComponentResidencyManager:
         """
         if self._active_use is None or not self._same_use(self._active_use, use):
             return
+        self._disable_active_nvtx()
         self._finish_use(
             self._active_use,
             module=self._active_use_module or module,
@@ -323,6 +343,20 @@ class ComponentResidencyManager:
             return
         self._prepare_forward_use(use, module=module)
 
+    def remove_nvtx_hooks_for_module(self, module: nn.Module | None) -> None:
+        """Detach NVTX hooks before a component object is deleted or replaced."""
+        if module is None:
+            return
+        module_id = id(module)
+        for key, (registered_id, hooks) in list(self._nvtx_hooks_by_use_key.items()):
+            if registered_id != module_id:
+                continue
+            if self._active_nvtx_key == key:
+                hooks.set_enabled(False)
+                self._active_nvtx_key = None
+            hooks.remove_hooks()
+            del self._nvtx_hooks_by_use_key[key]
+
     def prefetch_checkpoint(self, anchor: ComponentUse | None = None) -> None:
         """Give the manager a timeline overlap point.
 
@@ -341,6 +375,7 @@ class ComponentResidencyManager:
         if self._active_use is None:
             return
         active_use = self._active_use
+        self._disable_active_nvtx()
         self._finish_use(
             active_use,
             module=self._active_use_module,
@@ -354,12 +389,12 @@ class ComponentResidencyManager:
 
     def _prepare_forward_use(
         self, use: ComponentUse, module: nn.Module | None = None
-    ) -> None:
+    ) -> nn.Module | None:
         """Prepare a component that is about to run and wait until it is ready."""
         module = module or self.get_module(use.component_name)
         if module is None:
             self._trace("skip_missing", use)
-            return
+            return None
         strategy = self.strategy_for(use.component_name, module)
         self._uses_seen[use.component_name] = use
         self.state.current_use = use
@@ -367,6 +402,66 @@ class ComponentResidencyManager:
         strategy.prepare_for_use(module, use, self.state)
         self._trace("wait", use, strategy, module)
         strategy.wait_for_use(module, use, self.state)
+        return module
+
+    def _enable_nvtx_for_use(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
+        if (
+            not self.server_args.enable_layerwise_nvtx_marker
+            or self.state.batch_is_warmup
+            or not isinstance(module, nn.Module)
+        ):
+            self._disable_active_nvtx()
+            return
+
+        key = self._use_key(use)
+        if self._active_nvtx_key != key:
+            self._disable_active_nvtx()
+
+        module_id = id(module)
+        existing = self._nvtx_hooks_by_use_key.get(key)
+        if existing is None or existing[0] != module_id:
+            if existing is not None:
+                existing[1].remove_hooks()
+                self._nvtx_hooks_by_use_key.pop(key, None)
+            hooks = DiffusionNvtxHooks()
+            prefix = self._nvtx_prefix_for_use(use)
+            total = hooks.register_hooks(module, prefix=prefix)
+            if total == 0:
+                return
+            logger.debug(
+                "[component_residency] Registered NVTX hooks for %s on %d submodules",
+                prefix,
+                total,
+            )
+            self._nvtx_hooks_by_use_key[key] = (module_id, hooks)
+        else:
+            hooks = existing[1]
+
+        hooks.set_enabled(True)
+        self._active_nvtx_key = key
+
+    def _disable_active_nvtx(self) -> None:
+        if self._active_nvtx_key is None:
+            return
+        existing = self._nvtx_hooks_by_use_key.get(self._active_nvtx_key)
+        if existing is not None:
+            existing[1].set_enabled(False)
+        self._active_nvtx_key = None
+
+    def _remove_nvtx_hooks(self) -> None:
+        self._disable_active_nvtx()
+        for _, hooks in self._nvtx_hooks_by_use_key.values():
+            hooks.remove_hooks()
+        self._nvtx_hooks_by_use_key.clear()
+
+    @staticmethod
+    def _nvtx_prefix_for_use(use: ComponentUse) -> str:
+        parts = [use.stage_name, use.component_name]
+        if use.phase is not None and use.phase != use.component_name:
+            parts.append(use.phase)
+        return ".".join(parts)
 
     def _prefetch_use(self, use: ComponentUse) -> None:
         """Prepare a future component opportunistically without waiting.

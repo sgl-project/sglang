@@ -383,10 +383,11 @@ def prepare_extend_inputs_for_correctness_test(
 ):
     for i in range(len(reqs)):
         req: Req = reqs[i]
-        req.fill_ids += input_ids[i][bench_args.cut_len :]
+        req.fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
+            # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                i, : bench_args.cut_len
+                req.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
             req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
@@ -459,6 +460,15 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
+    if (
+        batch.input_ids is None
+        and getattr(batch, "prefill_input_ids_cpu", None) is not None
+    ):
+        batch.input_ids = batch.prefill_input_ids_cpu.to(
+            batch.device, non_blocking=True
+        )
+        batch.prefill_input_ids_cpu = None
+
     forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
@@ -536,7 +546,7 @@ class _MlxBenchRunner:
         if server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = server_args.max_total_tokens
         self.mlx_runner = MlxModelRunner(**init_kwargs)
-        self.mlx_runner.init_kv_pool(req_to_token_pool=None)
+        self.mlx_runner.init_cache_pools(req_to_token_pool=None)
         self.fake_torch_runner = model_runner
 
     def clear(self):

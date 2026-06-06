@@ -271,6 +271,77 @@ python3 -m sglang.launch_server \
         --mm-attention-backend ascend_attn
 ```
 
+### Multi-node Deployment
+
+<Tip>
+Recommended model: [`Qwen/Qwen3.5-35B-A3B`](https://www.modelscope.cn/models/Qwen/Qwen3.5-35B-A3B)
+
+Other Qwen3.5 series models can also be deployed in multi-node configurations following this workflow. Simply change `--model-path` to the corresponding model, and adjust parameters like `--tp-size`, `--nnodes`, and `--mem-fraction-static` according to the model size and available resources.
+</Tip>
+
+**A2 series**
+
+Modify the IP of 2 nodes, then run the same scripts on two nodes.
+
+**node 0/1**
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export STREAMS_PER_DEVICE=32
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+export HCCL_BUFFSIZE=1000
+
+# Run command ifconfig on two nodes, find out which inet addr has same IP with your node IP. That is your public interface, which should be added here
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+
+P_IP=('your ip1' 'your ip2')
+P_MASTER="${P_IP[0]}:your port"
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        python3 -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --attention-backend ascend \
+        --device npu \
+        --tp-size 8 --nnodes 2 --node-rank $i --dist-init-addr $P_MASTER \
+        --chunked-prefill-size 16384 --max-prefill-tokens 131072 \
+        --trust-remote-code \
+        --host 127.0.0.1 \
+        --mem-fraction-static 0.8\
+        --port 8000 \
+        --served-model-name qwen3.5 \
+        --cuda-graph-max-bs 16 \
+        --disable-radix-cache
+        NODE_RANK=$i
+        break
+    fi
+done
+```
 ### Prefill-Decode Disaggregation
 
 Not tested yet.

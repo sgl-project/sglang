@@ -23,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.utils import (
@@ -46,6 +47,8 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
+    # Consumed by the captured seed iter; see `FrozenKVMTPWorker.draft_forward`.
+    bonus_tokens: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -106,6 +109,7 @@ class FrozenKVMTPCudaGraphRunner:
                 (self.max_bs, frozen_kv_mtp_worker._recurrent_hidden_size),
                 dtype=self.model_runner.dtype,
             )
+            bonus_tokens = torch.zeros((self.max_bs,), dtype=torch.int64)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -134,6 +138,7 @@ class FrozenKVMTPCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            bonus_tokens=bonus_tokens,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -207,52 +212,36 @@ class FrozenKVMTPCudaGraphRunner:
         topk_p = buffers.topk_p[:request_bs]
         topk_index = buffers.topk_index[:request_bs]
         hidden_states = buffers.hidden_states[:request_bs]
+        bonus_tokens = buffers.bonus_tokens[:request_bs]
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
-            )
-            global_num_tokens = buffers.global_num_tokens_gpu
-            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
-            global_dp_buffer_len = expanded_bs * self.dp_size
+            global_num_tokens_cpu = [expanded_bs] * self.dp_size
         elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs],
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
+            global_num_tokens_cpu = [expanded_bs]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu,
+                dtype=torch.int32,
+                device=buffers.positions.device,
             )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs],
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
-            )
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
             global_num_tokens = buffers.global_num_tokens_gpu
             global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
-            global_dp_buffer_len = expanded_bs
         else:
+            global_dp_buffer_len = None
             global_num_tokens = None
             global_num_tokens_for_logprob = None
-            global_dp_buffer_len = None
 
         spec_info = FrozenKVMTPDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            bonus_tokens=bonus_tokens,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
         spec_info.num_tokens_per_req = self.topk
@@ -266,9 +255,6 @@ class FrozenKVMTPCudaGraphRunner:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool,
-            attn_backend=self.draft_attn_backend,
             out_cache_loc=None,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -283,34 +269,42 @@ class FrozenKVMTPCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
-        self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
-            forward_batch
-        )
-
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 expanded_bs,
                 forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
 
             hidden_states_backup = forward_batch.spec_info.hidden_states
-            ret = self.frozen_kv_mtp_worker.draft_forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            # The capture batch is marked by the capture metadata helper
+            # below, so draft_forward skips its eager plan.
+            ret = self.frozen_kv_mtp_worker.draft_forward(forward_batch)
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        self.deepep_adapter.capture(is_extend_in_batch=False)
-        self._capture_init(run_once)
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+        # Swap the draft backend's token_to_kv_pool to the frozen target pool
+        # for the capture; the single backend-attr swap is seen by both
+        # ``get_token_to_kv_pool()`` (via ``get_attn_backend()``) and the
+        # backend's own reads.
+        target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
+        saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
+        self.draft_attn_backend.token_to_kv_pool = target_pool
+        try:
+            with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+                self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
+                    forward_batch
+                )
+                self.deepep_adapter.capture(is_extend_in_batch=False)
+                self._capture_init(run_once)
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once
+                )
+        finally:
+            self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
@@ -344,6 +338,9 @@ class FrozenKVMTPCudaGraphRunner:
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.positions.zero_()
+            # Pair with seq_lens fill: padded rows must point at reserved
+            # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
+            buffers.req_pool_indices.zero_()
 
         num_tokens = expanded_bs
         buffers.seq_lens[:raw_expanded_bs].copy_(forward_batch.seq_lens)
@@ -352,8 +349,8 @@ class FrozenKVMTPCudaGraphRunner:
             buffers.mrope_positions[:, :raw_num_token].copy_(
                 forward_batch.mrope_positions
             )
-        buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-        buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+        # `topk_p`/`topk_index` are produced by the captured seed iter.
+        buffers.bonus_tokens[:raw_bs].copy_(forward_batch.spec_info.bonus_tokens)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_expanded_bs].copy_(forward_batch.req_pool_indices)
 
@@ -384,7 +381,13 @@ class FrozenKVMTPCudaGraphRunner:
 
         self.raw_bs = raw_bs
         self.bs = bs
-        self._replay()
+        # NVTX span: the graph bypasses `model_runner.forward`'s record_function.
+        span_name = f"step[DRAFT_LOOP raw_bs={raw_bs} bs={bs} topk={self.topk}]"
+        if torch.autograd._profiler_enabled():
+            with torch.profiler.record_function(span_name):
+                self._replay()
+        else:
+            self._replay()
         out = self.output_buffers[bs]
 
         if bs != raw_bs:

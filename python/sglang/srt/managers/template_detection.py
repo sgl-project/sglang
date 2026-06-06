@@ -219,6 +219,12 @@ def _is_minimax(ctx):
     return ctx.has_text("<minimax:tool_call>")
 
 
+def _is_minicpm5(ctx):
+    if ctx.has_vocab("<function") and ctx.has_vocab("<param"):
+        return True
+    return ctx.has_pattern(r"<function\s+name=") and ctx.has_pattern(r"<param\s+name=")
+
+
 def _is_qwen3(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="enable_thinking", default_enabled=True
@@ -278,6 +284,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
@@ -327,12 +334,6 @@ def match_rules(
     for rule in rules:
         try:
             if rule.predicate(ctx):
-                logger.info(
-                    "Detected %s '%s' from template rule '%s'.",
-                    label,
-                    rule.value,
-                    rule.name,
-                )
                 return rule.value
         except Exception as e:
             logger.warning(
@@ -360,11 +361,6 @@ def detect_reasoning_pattern(
     )
     for rule in REASONING_MODE_RULES:
         if rule.predicate(ctx):
-            logger.info(
-                "Detected reasoning config '%s' from template rule '%s'.",
-                rule.value,
-                rule.name,
-            )
             return rule.value.always_on, rule.value
 
     return False, None
