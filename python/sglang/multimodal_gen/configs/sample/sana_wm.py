@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
     SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
     SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
     SANA_WM_DEFAULT_TRANSLATION_SPEED,
-    validate_sana_wm_motion_params,
+    normalize_sana_wm_condition_inputs,
 )
 
 # Type alias for camera tensor inputs accepted by SANA-WM.
@@ -80,33 +80,25 @@ class SanaWMSamplingParams(SamplingParams):
     def _adjust(self, server_args):
         super()._adjust(server_args)
 
-        # Validate camera motion parameters.
-        (
-            self.translation_speed,
-            self.rotation_speed_deg,
-            self.pitch_limit_deg,
-        ) = validate_sana_wm_motion_params(
-            translation_speed=self.translation_speed,
-            rotation_speed_deg=self.rotation_speed_deg,
-            pitch_limit_deg=self.pitch_limit_deg,
-        )
-
-        # Mutual exclusion: only one camera specification allowed.
-        if self.action is not None and self.camera_to_world is not None:
-            raise ValueError(
-                "SANA-WM accepts either `action` or `camera_to_world`, not both."
+        action_motion_params = (
+            (
+                self.translation_speed,
+                self.rotation_speed_deg,
+                self.pitch_limit_deg,
             )
-
-        if self.camera_conditions is not None:
-            self.condition_inputs["camera_conditions"] = self.camera_conditions
-        if self.chunk_plucker is not None:
-            self.condition_inputs["chunk_plucker"] = self.chunk_plucker
-        if self.camera_to_world is not None:
-            self.condition_inputs["camera_to_world"] = self.camera_to_world
-        if self.intrinsics is not None:
-            self.condition_inputs["intrinsics"] = self.intrinsics
-        if self.action is not None:
-            self.condition_inputs["action"] = self.action
-            self.condition_inputs["translation_speed"] = self.translation_speed
-            self.condition_inputs["rotation_speed_deg"] = self.rotation_speed_deg
-            self.condition_inputs["pitch_limit_deg"] = self.pitch_limit_deg
+            if self.action is not None
+            else None
+        )
+        self.condition_inputs = normalize_sana_wm_condition_inputs(
+            self.condition_inputs,
+            camera_conditions=self.camera_conditions,
+            chunk_plucker=self.chunk_plucker,
+            camera_to_world=self.camera_to_world,
+            intrinsics=self.intrinsics,
+            action=self.action,
+            action_motion_params=action_motion_params,
+        )
+        if self.condition_inputs.get("action") is not None:
+            self.translation_speed = self.condition_inputs["translation_speed"]
+            self.rotation_speed_deg = self.condition_inputs["rotation_speed_deg"]
+            self.pitch_limit_deg = self.condition_inputs["pitch_limit_deg"]

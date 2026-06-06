@@ -53,6 +53,7 @@ _SANA_WM_USE_TRITON_KERNELS = os.getenv(
     "SGLANG_SANA_WM_USE_TRITON_KERNELS", ""
 ).lower() in {"1", "true", "yes", "on"}
 _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+_SANA_WM_MODULE_CACHE_TOKEN_ATTR = "_sana_wm_inference_cache_token"
 _SANA_WM_TRITON_KERNELS_IMPORT_ERRORS: dict[str, BaseException] = {}
 
 
@@ -66,6 +67,28 @@ def _record_sana_wm_triton_import_error(name: str, error: BaseException) -> None
 
 def _sana_wm_triton_import_error(name: str) -> BaseException | None:
     return _SANA_WM_TRITON_KERNELS_IMPORT_ERRORS.get(name)
+
+
+def _sana_wm_triton_tensor_detail(name: str, value: object) -> str:
+    if isinstance(value, torch.Tensor):
+        return (
+            f"{name}: shape={tuple(value.shape)}, dtype={value.dtype}, "
+            f"device={value.device}, stride={tuple(value.stride())}, "
+            f"contiguous={value.is_contiguous()}"
+        )
+    if isinstance(value, (list, tuple)):
+        items = [
+            _sana_wm_triton_tensor_detail(f"{name}[{idx}]", item)
+            for idx, item in enumerate(value)
+        ]
+        return f"{name}=({', '.join(items)})"
+    return f"{name}={value!r}"
+
+
+def _sana_wm_triton_context(**values: object) -> Tuple[str, ...]:
+    return tuple(
+        _sana_wm_triton_tensor_detail(name, value) for name, value in values.items()
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -175,17 +198,21 @@ def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
     )
 
 
-def _module_state_cache_key(module: nn.Module) -> Tuple:
-    return (
-        tuple(
-            (name, _tensor_cache_key(param))
-            for name, param in module.named_parameters(recurse=True)
-        ),
-        tuple(
-            (name, _tensor_cache_key(buffer))
-            for name, buffer in module.named_buffers(recurse=True)
-        ),
-    )
+def _module_inference_cache_key(module: nn.Module) -> Tuple[str, str, int]:
+    """Return a cheap module identity token for request-scoped inference caches.
+
+    SANA-WM request caches are enabled only for no-grad inference, where model
+    weights are frozen for the lifetime of a request. The previous key walked
+    every parameter/buffer on each denoising step; this token preserves the
+    relevant module identity without adding per-step Python traversal overhead.
+    """
+
+    token = getattr(module, _SANA_WM_MODULE_CACHE_TOKEN_ATTR, None)
+    if token is None:
+        cls = type(module)
+        token = (cls.__module__, cls.__qualname__, id(module))
+        setattr(module, _SANA_WM_MODULE_CACHE_TOKEN_ATTR, token)
+    return token
 
 
 def _sana_wm_bool_env(key: str, default: bool) -> bool:
@@ -975,12 +1002,153 @@ def _apply_rotary_emb_bhnd(
     return y.type_as(hidden_states)
 
 
+def _sana_wm_repeated_batch_factor(
+    source_batch: int,
+    target_batch: int,
+    *,
+    name: str,
+) -> int:
+    if source_batch <= 0 or target_batch <= 0:
+        raise ValueError(
+            f"SANA-WM {name} batch dimensions must be positive, got "
+            f"source={source_batch}, target={target_batch}."
+        )
+    if source_batch == target_batch:
+        return 1
+    if target_batch % source_batch != 0:
+        raise ValueError(
+            f"SANA-WM {name} batch mismatch: source batch {source_batch} cannot "
+            f"be repeated to runtime batch {target_batch}."
+        )
+    return target_batch // source_batch
+
+
+def _sana_wm_materialize_repeated_batch(
+    tensor: Optional[torch.Tensor],
+    target_batch: int,
+    *,
+    name: str,
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    repeats = _sana_wm_repeated_batch_factor(
+        tensor.shape[0],
+        target_batch,
+        name=name,
+    )
+    if repeats == 1:
+        return tensor
+    if tensor.shape[0] == 1:
+        return tensor.expand(target_batch, *tensor.shape[1:]).contiguous()
+    return torch.cat([tensor] * repeats, dim=0).contiguous()
+
+
+def _sana_wm_optional_tensor_cache_key(tensor: Optional[torch.Tensor]) -> Tuple | None:
+    return None if tensor is None else _tensor_cache_key(tensor)
+
+
+def _sana_wm_materialize_repeated_raymats(
+    raymats_flat: Optional[torch.Tensor],
+    raymats_t: Optional[torch.Tensor],
+    raymats_inv: Optional[torch.Tensor],
+    target_batch: int,
+    *,
+    name: str,
+    cache: Optional[dict] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    source_tensors = tuple(
+        tensor for tensor in (raymats_flat, raymats_t, raymats_inv) if tensor is not None
+    )
+    if not source_tensors:
+        return raymats_flat, raymats_t, raymats_inv
+    if all(tensor.shape[0] == target_batch for tensor in source_tensors):
+        return raymats_flat, raymats_t, raymats_inv
+
+    cache_key = None
+    if cache is not None and not torch.is_grad_enabled():
+        cache_key = (
+            "raymats",
+            target_batch,
+            _sana_wm_optional_tensor_cache_key(raymats_flat),
+            _sana_wm_optional_tensor_cache_key(raymats_t),
+            _sana_wm_optional_tensor_cache_key(raymats_inv),
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    result = (
+        _sana_wm_materialize_repeated_batch(
+            raymats_flat,
+            target_batch,
+            name=f"{name} ray matrix",
+        ),
+        _sana_wm_materialize_repeated_batch(
+            raymats_t,
+            target_batch,
+            name=f"{name} ray matrix transpose",
+        ),
+        _sana_wm_materialize_repeated_batch(
+            raymats_inv,
+            target_batch,
+            name=f"{name} ray matrix inverse",
+        ),
+    )
+    if cache_key is not None:
+        cache[cache_key] = result
+    return result
+
+
+def _sana_wm_add_repeated_batch(
+    x: torch.Tensor,
+    addend: torch.Tensor,
+    *,
+    name: str,
+) -> torch.Tensor:
+    if addend.shape[0] == x.shape[0]:
+        return x + addend
+
+    repeats = _sana_wm_repeated_batch_factor(
+        addend.shape[0],
+        x.shape[0],
+        name=name,
+    )
+    if torch.is_grad_enabled():
+        return x + torch.cat([addend] * repeats, dim=0)
+
+    base_batch = addend.shape[0]
+    for idx in range(repeats):
+        start = idx * base_batch
+        x[start : start + base_batch].add_(addend)
+    return x
+
+
 def _apply_ray_projmat(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
     """Per-token 4x4 projmat applied to channels grouped by 4.
 
     feats: (B, H, N, D), matrix: (B, N, 4, 4).
     """
     B, Hh, N, D = feats.shape
+    matrix_batch = matrix.shape[0]
+    if matrix_batch != B:
+        repeats = _sana_wm_repeated_batch_factor(
+            matrix_batch,
+            B,
+            name="UCPE ray matrix",
+        )
+        if matrix_batch == 1:
+            matrix = matrix.expand(B, *matrix.shape[1:])
+        else:
+            return torch.cat(
+                [
+                    _apply_ray_projmat(
+                        feats[idx * matrix_batch : (idx + 1) * matrix_batch],
+                        matrix,
+                    )
+                    for idx in range(repeats)
+                ],
+                dim=0,
+            )
     return torch.einsum(
         "bnij,bhnkj->bhnki",
         matrix,
@@ -1278,7 +1446,7 @@ def _build_ucpe_apply_fns(
     head_dim: int,
     raymats: torch.Tensor,  # (B, N, 4, 4) -- ray<-world
     rotary_emb: Optional[torch.Tensor],
-) -> Tuple[Callable, Callable, Callable, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[Callable, Callable, Callable, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     P = raymats.contiguous()
     P_T = P.transpose(-1, -2).contiguous()
     P_inv = _invert_SE3(P).contiguous()
@@ -1327,7 +1495,7 @@ def _build_ucpe_apply_fns(
     def apply_o(x: torch.Tensor) -> torch.Tensor:
         return apply_pair(x, ray_proj, rope_fn_inv)
 
-    return apply_q, apply_kv, apply_o, P, P_T, P_inv
+    return apply_q, apply_kv, apply_o, P, P_T, P_inv, {}
 
 
 def _compute_fov_from_focal(focal: torch.Tensor, image_size: int) -> torch.Tensor:
@@ -2300,6 +2468,12 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self._triton_qkv_preprocess_warning_logged = False
         self._triton_cam_preprocess_warning_logged = False
         self._triton_cam_scan_warning_logged = False
+        self._out_proj_cam_local_input_only_cache: Optional[Tuple[int, bool]] = None
+        self._out_proj_cam_zero_output_cache: Optional[
+            Tuple[Tuple[int, Optional[int]], bool]
+        ] = None
+        # ``torch_chunk`` is an algebraically equivalent chunked scan, not a
+        # reset-at-chunk-boundaries approximation. State is carried across chunks.
         if self.update_rule not in ("torch_chunk", "torch_recurrent"):
             raise ValueError(f"Unsupported SANA-WM update_rule: {self.update_rule}")
         if self.cam_update_rule not in ("torch_chunk", "torch_recurrent"):
@@ -2502,6 +2676,81 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             qkv_weight, qkv_bias = self._dynamic_cam_qkv_params()
         return F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
 
+    def _try_local_out_proj_cam(self, cam_raw: torch.Tensor) -> Optional[torch.Tensor]:
+        """Project TP-sharded camera output without all-gather when weights allow it."""
+        if not self.use_tp or torch.is_grad_enabled():
+            return None
+        weight = getattr(self.out_proj_cam, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+            return None
+        local_C = cam_raw.shape[-1]
+        if weight.shape != (local_C, self.out_dim):
+            return None
+
+        local_start = self.tp_rank * local_C
+        local_end = local_start + local_C
+        weight_key = weight.data_ptr()
+        cache = self._out_proj_cam_local_input_only_cache
+        if cache is None or cache[0] != weight_key:
+            with torch.no_grad():
+                left = weight[:, :local_start]
+                right = weight[:, local_end:]
+                left_zero = left.numel() == 0 or bool(
+                    torch.count_nonzero(left).item() == 0
+                )
+                right_zero = right.numel() == 0 or bool(
+                    torch.count_nonzero(right).item() == 0
+                )
+                local_only = left_zero and right_zero
+                flag = torch.tensor(
+                    [1.0 if local_only else 0.0],
+                    device=weight.device,
+                    dtype=torch.float32,
+                )
+                flag = tensor_model_parallel_all_reduce(flag)
+                local_only = bool(flag.item() == self.tp_size)
+            self._out_proj_cam_local_input_only_cache = (weight_key, local_only)
+        else:
+            local_only = cache[1]
+
+        if not local_only:
+            return None
+        bias = getattr(self.out_proj_cam, "bias", None)
+        return F.linear(cam_raw, weight[:, local_start:local_end], bias)
+
+    def _can_skip_camera_branch(self) -> bool:
+        """Skip UCPE camera work when its zero output projection makes it a no-op."""
+        if torch.is_grad_enabled():
+            return False
+        weight = getattr(self.out_proj_cam, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            return False
+        bias = getattr(self.out_proj_cam, "bias", None)
+        if bias is not None and not isinstance(bias, torch.Tensor):
+            return False
+
+        bias_key = None if bias is None else bias.data_ptr()
+        cache_key = (weight.data_ptr(), bias_key)
+        cache = self._out_proj_cam_zero_output_cache
+        if cache is not None and cache[0] == cache_key:
+            return cache[1]
+
+        with torch.no_grad():
+            weight_zero = bool(torch.count_nonzero(weight).item() == 0)
+            bias_zero = bias is None or bool(torch.count_nonzero(bias).item() == 0)
+            local_zero = weight_zero and bias_zero
+            if self.use_tp:
+                flag = torch.tensor(
+                    [1.0 if local_zero else 0.0],
+                    device=weight.device,
+                    dtype=torch.float32,
+                )
+                flag = tensor_model_parallel_all_reduce(flag)
+                local_zero = bool(flag.item() == self.tp_size)
+
+        self._out_proj_cam_zero_output_cache = (cache_key, local_zero)
+        return local_zero
+
     def _handle_triton_fallback(
         self,
         *,
@@ -2509,18 +2758,22 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         reason: str,
         warning_attr: str,
         error: BaseException | None = None,
+        details: Optional[Tuple[str, ...]] = None,
         disable_fast_path: bool = False,
     ) -> None:
         detail = f"SANA-WM {kernel_name} {reason}"
         if error is not None:
             detail = f"{detail}: {error}"
+        if details:
+            detail = f"{detail}. Context: " + "; ".join(details)
 
         if not self.allow_triton_fallback:
             message = (
-                f"{detail}. Triton kernels are enabled for CUDA inference, so "
-                "SANA-WM refuses to silently fall back to the slower torch path. "
-                "Set use_triton_kernels=False for the reference torch path, or "
-                "set allow_triton_fallback=True when the slowdown is intentional."
+                f"{detail}. SANA-WM Triton strict mode is enabled for CUDA "
+                "inference, so SANA-WM refuses to silently fall back to the "
+                "slower torch path. Set use_triton_kernels=False for the "
+                "reference torch path, or set allow_triton_fallback=True when "
+                "the slowdown is intentional."
             )
             if error is not None:
                 raise _SanaWMTritonFallbackBlocked(message) from error
@@ -2564,6 +2817,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if Hh != self.local_heads or D != self.dim or N != T * S:
             return None
 
+        beta_f = beta.float().contiguous()
+        decay_f = decay.float().contiguous()
         kernels = _get_sana_wm_triton_main_gdn()
         if kernels is None:
             self._handle_triton_fallback(
@@ -2571,12 +2826,23 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="is unavailable",
                 warning_attr="_triton_main_gdn_warning_logged",
                 error=_sana_wm_triton_import_error("main_gdn"),
+                details=_sana_wm_triton_context(
+                    path="tp" if self.use_tp else "single_rank",
+                    qkv=qkv,
+                    beta=beta_f,
+                    decay=decay_f,
+                    rotary_emb=rotary_emb,
+                    F=T,
+                    S=S,
+                    local_heads=Hh,
+                    head_dim=D,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                ),
             )
             return None
 
         fused_bigdn, can_use, fused_bigdn_with_inv_rms, can_use_with_inv_rms = kernels
-        beta_f = beta.float().contiguous()
-        decay_f = decay.float().contiguous()
 
         q_weight = _sana_wm_local_rms_norm_weight(
             self.q_norm,
@@ -2616,6 +2882,23 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                         kernel_name="Triton main GDN kernel",
                         reason="does not support the current TP tensors",
                         warning_attr="_triton_main_gdn_warning_logged",
+                        details=_sana_wm_triton_context(
+                            path="tp",
+                            qkv=qkv,
+                            q_inv_rms=q_inv_rms,
+                            k_inv_rms=k_inv_rms,
+                            q_weight=q_weight,
+                            k_weight=k_weight,
+                            rotary_emb=rotary_emb,
+                            beta=beta_f,
+                            decay=decay_f,
+                            F=T,
+                            S=S,
+                            local_heads=Hh,
+                            head_dim=D,
+                            tp_size=self.tp_size,
+                            tp_rank=self.tp_rank,
+                        ),
                     )
                     return None
                 return fused_bigdn_with_inv_rms(
@@ -2648,6 +2931,19 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     kernel_name="Triton main GDN kernel",
                     reason="does not support the current tensors",
                     warning_attr="_triton_main_gdn_warning_logged",
+                    details=_sana_wm_triton_context(
+                        path="single_rank",
+                        qkv=qkv,
+                        q_weight=q_weight,
+                        k_weight=k_weight,
+                        rotary_emb=rotary_emb,
+                        beta=beta_f,
+                        decay=decay_f,
+                        F=T,
+                        S=S,
+                        local_heads=Hh,
+                        head_dim=D,
+                    ),
                 )
                 return None
             return fused_bigdn(
@@ -2671,6 +2967,19 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="failed",
                 warning_attr="_triton_main_gdn_warning_logged",
                 error=exc,
+                details=_sana_wm_triton_context(
+                    path="tp" if self.use_tp else "single_rank",
+                    qkv=qkv,
+                    beta=beta_f,
+                    decay=decay_f,
+                    rotary_emb=rotary_emb,
+                    F=T,
+                    S=S,
+                    local_heads=Hh,
+                    head_dim=D,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                ),
                 disable_fast_path=True,
             )
             return None
@@ -2703,6 +3012,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="is unavailable",
                 warning_attr="_triton_qkv_preprocess_warning_logged",
                 error=_sana_wm_triton_import_error("qkv_preprocess"),
+                details=_sana_wm_triton_context(
+                    qkv=qkv,
+                    q_weight=self.q_norm.weight,
+                    k_weight=self.k_norm.weight,
+                    rotary_emb=rotary_emb,
+                    use_tp=self.use_tp,
+                ),
             )
             return None
 
@@ -2724,6 +3040,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     kernel_name="Triton QKV preprocess kernel",
                     reason="does not support the current tensors",
                     warning_attr="_triton_qkv_preprocess_warning_logged",
+                    details=_sana_wm_triton_context(
+                        qkv=qkv,
+                        q_weight=self.q_norm.weight,
+                        k_weight=self.k_norm.weight,
+                        rotary_emb=rotary_emb,
+                        use_tp=self.use_tp,
+                    ),
                 )
                 return None
             q, k, v = preprocess(
@@ -2742,6 +3065,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="failed",
                 warning_attr="_triton_qkv_preprocess_warning_logged",
                 error=exc,
+                details=_sana_wm_triton_context(
+                    qkv=qkv,
+                    q_weight=self.q_norm.weight,
+                    k_weight=self.k_norm.weight,
+                    rotary_emb=rotary_emb,
+                    use_tp=self.use_tp,
+                ),
                 disable_fast_path=True,
             )
             return None
@@ -2785,6 +3115,22 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="is unavailable",
                 warning_attr="_triton_cam_preprocess_warning_logged",
                 error=_sana_wm_triton_import_error("cam_preprocess"),
+                details=_sana_wm_triton_context(
+                    path="tp" if self.use_tp else "single_rank",
+                    q=q,
+                    k=k,
+                    v=v,
+                    raymats_flat=raymats_flat,
+                    raymats_t=raymats_t,
+                    raymats_inv=raymats_inv,
+                    rotary_emb=rotary_emb,
+                    F=T,
+                    S=S,
+                    local_heads=Hh,
+                    head_dim=D,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                ),
             )
             return None
 
@@ -2849,6 +3195,25 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                         kernel_name="Triton camera preprocess kernel",
                         reason="does not support the current TP tensors",
                         warning_attr="_triton_cam_preprocess_warning_logged",
+                        details=_sana_wm_triton_context(
+                            path="tp",
+                            q=q,
+                            k=k,
+                            v=v,
+                            q_inv_rms=q_inv_rms,
+                            k_inv_rms=k_inv_rms,
+                            q_weight=q_weight,
+                            k_weight=k_weight,
+                            P_T=P_T,
+                            P_inv=P_inv,
+                            rotary_emb_cam=rotary_emb_cam,
+                            F=T,
+                            S=S,
+                            local_heads=Hh,
+                            head_dim=D,
+                            tp_size=self.tp_size,
+                            tp_rank=self.tp_rank,
+                        ),
                     )
                     return None
                 return preprocess_with_inv_rms(
@@ -2880,6 +3245,21 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     kernel_name="Triton camera preprocess kernel",
                     reason="does not support the current tensors",
                     warning_attr="_triton_cam_preprocess_warning_logged",
+                    details=_sana_wm_triton_context(
+                        path="single_rank",
+                        q=q,
+                        k=k,
+                        v=v,
+                        q_weight=q_weight,
+                        k_weight=k_weight,
+                        P_T=P_T,
+                        P_inv=P_inv,
+                        rotary_emb_cam=rotary_emb_cam,
+                        F=T,
+                        S=S,
+                        local_heads=Hh,
+                        head_dim=D,
+                    ),
                 )
                 return None
 
@@ -2903,6 +3283,20 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="failed",
                 warning_attr="_triton_cam_preprocess_warning_logged",
                 error=exc,
+                details=_sana_wm_triton_context(
+                    path="tp" if self.use_tp else "single_rank",
+                    q=q,
+                    k=k,
+                    v=v,
+                    raymats_flat=raymats_flat,
+                    rotary_emb=rotary_emb,
+                    F=T,
+                    S=S,
+                    local_heads=Hh,
+                    head_dim=D,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                ),
                 disable_fast_path=True,
             )
             return None
@@ -2937,6 +3331,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="is unavailable",
                 warning_attr="_triton_cam_preprocess_warning_logged",
                 error=_sana_wm_triton_import_error("cam_preprocess"),
+                details=_sana_wm_triton_context(
+                    x=x,
+                    raymats_flat=raymats_flat,
+                    rotary_emb=rotary_emb,
+                    local_heads=Hh,
+                    head_dim=D,
+                ),
             )
             return None
 
@@ -2948,6 +3349,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 kernel_name="Triton camera output kernel",
                 reason="does not support the current tensors",
                 warning_attr="_triton_cam_preprocess_warning_logged",
+                details=_sana_wm_triton_context(
+                    x=x,
+                    P=P,
+                    rotary_emb_cam=rotary_emb_cam,
+                    local_heads=Hh,
+                    head_dim=D,
+                ),
             )
             return None
 
@@ -2961,6 +3369,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="failed",
                 warning_attr="_triton_cam_preprocess_warning_logged",
                 error=exc,
+                details=_sana_wm_triton_context(
+                    x=x,
+                    raymats_flat=raymats_flat,
+                    rotary_emb=rotary_emb,
+                    local_heads=Hh,
+                    head_dim=D,
+                ),
                 disable_fast_path=True,
             )
             return None
@@ -3003,6 +3418,22 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="is unavailable",
                 warning_attr="_triton_cam_preprocess_warning_logged",
                 error=_sana_wm_triton_import_error("cam_preprocess"),
+                details=_sana_wm_triton_context(
+                    q=q,
+                    k=k,
+                    v=v,
+                    raymats_flat=raymats_flat,
+                    raymats_t=raymats_t,
+                    raymats_inv=raymats_inv,
+                    rotary_emb=rotary_emb,
+                    F=T,
+                    H=H_sp,
+                    W=W_sp,
+                    local_heads=Hh,
+                    head_dim=D,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                ),
             )
             return None
 
@@ -3059,6 +3490,25 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     kernel_name="Triton softmax camera preprocess kernel",
                     reason="does not support the current tensors",
                     warning_attr="_triton_cam_preprocess_warning_logged",
+                    details=_sana_wm_triton_context(
+                        q=q,
+                        k=k,
+                        v=v,
+                        q_inv_rms=q_inv_rms,
+                        k_inv_rms=k_inv_rms,
+                        q_weight=q_weight,
+                        k_weight=k_weight,
+                        P_T=P_T,
+                        P_inv=P_inv,
+                        rotary_emb_cam=rotary_emb_cam,
+                        F=T,
+                        H=H_sp,
+                        W=W_sp,
+                        local_heads=Hh,
+                        head_dim=D,
+                        tp_size=self.tp_size,
+                        tp_rank=self.tp_rank,
+                    ),
                 )
                 return None
             return softmax_preprocess_with_inv_rms(
@@ -3082,6 +3532,20 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="failed",
                 warning_attr="_triton_cam_preprocess_warning_logged",
                 error=exc,
+                details=_sana_wm_triton_context(
+                    q=q,
+                    k=k,
+                    v=v,
+                    raymats_flat=raymats_flat,
+                    rotary_emb=rotary_emb,
+                    F=T,
+                    H=H_sp,
+                    W=W_sp,
+                    local_heads=Hh,
+                    head_dim=D,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                ),
                 disable_fast_path=True,
             )
             return None
@@ -3111,7 +3575,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         S = H_sp * W_sp
         if Hh != self.local_heads or D != self.dim or N != T * S:
             return None
-        del chunk_size
 
         kernels = _get_sana_wm_triton_cam_scan()
         if kernels is None:
@@ -3120,6 +3583,18 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="is unavailable",
                 warning_attr="_triton_cam_scan_warning_logged",
                 error=_sana_wm_triton_import_error("cam_scan"),
+                details=_sana_wm_triton_context(
+                    q_rot=q_rot,
+                    k_rot=k_rot,
+                    v=v,
+                    beta=beta,
+                    decay=decay,
+                    F=T,
+                    S=S,
+                    chunk_size=chunk_size,
+                    local_heads=Hh,
+                    head_dim=D,
+                ),
             )
             return None
 
@@ -3129,6 +3604,18 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 kernel_name="Triton camera scan kernel",
                 reason="does not support the current tensors",
                 warning_attr="_triton_cam_scan_warning_logged",
+                details=_sana_wm_triton_context(
+                    q_rot=q_rot,
+                    k_rot=k_rot,
+                    v=v,
+                    beta=beta,
+                    decay=decay,
+                    F=T,
+                    S=S,
+                    chunk_size=chunk_size,
+                    local_heads=Hh,
+                    head_dim=D,
+                ),
             )
             return None
 
@@ -3148,6 +3635,18 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 reason="failed",
                 warning_attr="_triton_cam_scan_warning_logged",
                 error=exc,
+                details=_sana_wm_triton_context(
+                    q_rot=q_rot,
+                    k_rot=k_rot,
+                    v=v,
+                    beta=beta,
+                    decay=decay,
+                    F=T,
+                    S=S,
+                    chunk_size=chunk_size,
+                    local_heads=Hh,
+                    head_dim=D,
+                ),
                 disable_fast_path=True,
             )
             return None
@@ -3356,15 +3855,26 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
             k = k.reshape(B, N, self.local_heads, self.dim)
 
+        (
+            raymats_flat_triton,
+            raymats_t_triton,
+            raymats_inv_triton,
+        ) = _sana_wm_materialize_repeated_raymats(
+            raymats_flat,
+            raymats_t,
+            raymats_inv,
+            B,
+            name="camera",
+        )
         cam_preprocessed = self._try_triton_cam_gdn_preprocess(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
             HW=HW,
             rotary_emb=rotary_emb,
-            raymats_flat=raymats_flat,
-            raymats_t=raymats_t,
-            raymats_inv=raymats_inv,
+            raymats_flat=raymats_flat_triton,
+            raymats_t=raymats_t_triton,
+            raymats_inv=raymats_inv_triton,
         )
         if cam_preprocessed is not None:
             q_dn, k_dn, v_dn, inflation_sq = cam_preprocessed
@@ -3408,7 +3918,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             triton_out_bhnd = self._try_triton_cam_output_apply_o(
                 out_bhnd,
                 rotary_emb=rotary_emb,
-                raymats_flat=raymats_flat,
+                raymats_flat=raymats_flat_triton,
             )
             out_bhnd = (
                 apply_o(out_bhnd)
@@ -3530,15 +4040,26 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
             k = k.reshape(B, N, self.local_heads, self.dim)
 
+        (
+            raymats_flat_triton,
+            raymats_t_triton,
+            raymats_inv_triton,
+        ) = _sana_wm_materialize_repeated_raymats(
+            raymats_flat,
+            raymats_t,
+            raymats_inv,
+            B,
+            name="softmax camera",
+        )
         cam_preprocessed = self._try_triton_cam_softmax_preprocess(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
             HW=HW,
             rotary_emb=rotary_emb,
-            raymats_flat=raymats_flat,
-            raymats_t=raymats_t,
-            raymats_inv=raymats_inv,
+            raymats_flat=raymats_flat_triton,
+            raymats_t=raymats_t_triton,
+            raymats_inv=raymats_inv_triton,
         )
         if cam_preprocessed is None:
             q_flat, k_flat = _sana_wm_tp_qk_rms_norm(
@@ -3596,7 +4117,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         triton_out_bhnd = self._try_triton_cam_output_apply_o(
             out_bhnd,
             rotary_emb=rotary_emb,
-            raymats_flat=raymats_flat,
+            raymats_flat=raymats_flat_triton,
         )
         out_bhnd = apply_o(out_bhnd) if triton_out_bhnd is None else triton_out_bhnd
         out = out_bhnd.transpose(1, 2).reshape(B, N, local_C)
@@ -3625,11 +4146,22 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         else:
             main_raw, beta, decay = self._main_branch_gdn(x, HW, rotary_emb)
 
-        if prope_fns is not None:
+        if prope_fns is not None and not self._can_skip_camera_branch():
             apply_q, apply_kv, apply_o = prope_fns[:3]
             raymats_flat = prope_fns[3] if len(prope_fns) > 3 else None
             raymats_t = prope_fns[4] if len(prope_fns) > 4 else None
             raymats_inv = prope_fns[5] if len(prope_fns) > 5 else None
+            raymat_cache = prope_fns[6] if len(prope_fns) > 6 else None
+            if not isinstance(raymat_cache, dict):
+                raymat_cache = None
+            raymats_flat, raymats_t, raymats_inv = _sana_wm_materialize_repeated_raymats(
+                raymats_flat,
+                raymats_t,
+                raymats_inv,
+                x.shape[0],
+                name="camera",
+                cache=raymat_cache,
+            )
             if self.softmax_main:
                 cam_raw = self._cam_branch_softmax(
                     x,
@@ -3660,9 +4192,12 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     raymats_t=raymats_t,
                     raymats_inv=raymats_inv,
                 )
-            if self.use_tp:
-                cam_raw = _sana_wm_all_gather_hidden(cam_raw, self.tp_size)
-            combined = main_raw + _sana_wm_linear(self.out_proj_cam, cam_raw)
+            cam_contrib = self._try_local_out_proj_cam(cam_raw)
+            if cam_contrib is None:
+                if self.use_tp:
+                    cam_raw = _sana_wm_all_gather_hidden(cam_raw, self.tp_size)
+                cam_contrib = _sana_wm_linear(self.out_proj_cam, cam_raw)
+            combined = main_raw + cam_contrib
         else:
             combined = main_raw
 
@@ -3753,8 +4288,8 @@ class MultiHeadCrossAttention(nn.Module):
                     self.head_dim,
                     self.tp_size,
                     _tensor_cache_key(cond),
-                    _module_state_cache_key(self.kv_linear),
-                    _module_state_cache_key(self.k_norm),
+                    _module_inference_cache_key(self.kv_linear),
+                    _module_inference_cache_key(self.k_norm),
                 )
                 cached = request_cache.get("entry")
                 if cached is not None and cached[0] == key:
@@ -3905,6 +4440,23 @@ class SanaWMBlock(nn.Module):
         tokens_per_frame = N // num_frames
         return x.reshape(B, num_frames, tokens_per_frame, C), tokens_per_frame
 
+    def _add_plucker_post_attn(
+        self,
+        x: torch.Tensor,
+        plucker_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.plucker_proj is None:
+            return x
+        if plucker_emb.shape[0] == x.shape[0]:
+            return x + _sana_wm_linear(self.plucker_proj, plucker_emb)
+
+        projected = _sana_wm_linear(self.plucker_proj, plucker_emb)
+        return _sana_wm_add_repeated_batch(
+            x,
+            projected,
+            name="Plucker embedding",
+        )
+
     def forward(
         self,
         x: torch.Tensor,  # (B, N, D)
@@ -3961,7 +4513,7 @@ class SanaWMBlock(nn.Module):
 
         # Plucker post-attn injection (zero-init linear)
         if self.plucker_proj is not None and plucker_emb is not None:
-            x = x + _sana_wm_linear(self.plucker_proj, plucker_emb)
+            x = self._add_plucker_post_attn(x, plucker_emb)
 
         # Cross-attention
         x = x + self.cross_attn(x, y, mask=mask)
@@ -4212,7 +4764,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         *,
         HW: Tuple[int, int, int],
         freqs: torch.Tensor,
-    ) -> Tuple[Callable, Callable, Callable, torch.Tensor]:
+    ) -> Tuple[Callable, Callable, Callable, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         head_dim = self.attention_head_dim
         cache_enabled = _sana_wm_request_runtime_cache_enabled()
         request_cache = None
@@ -4309,9 +4861,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     batch_size,
                     bool(self.y_norm),
                     _tensor_cache_key(encoder_hidden_states),
-                    _module_state_cache_key(self.y_embedder),
+                    _module_inference_cache_key(self.y_embedder),
                     (
-                        _module_state_cache_key(self.attention_y_norm)
+                        _module_inference_cache_key(self.attention_y_norm)
                         if self.y_norm
                         else None
                     ),
@@ -4461,12 +5013,22 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Plucker post-attn embedding (shared across all blocks)
         plucker_emb = precomputed_plucker_emb
         if plucker_emb is not None:
-            if plucker_emb.shape[0] != B or plucker_emb.shape[1] != x.shape[1]:
+            plucker_batch_ok = False
+            try:
+                _sana_wm_repeated_batch_factor(
+                    plucker_emb.shape[0],
+                    B,
+                    name="precomputed Plucker embedding",
+                )
+                plucker_batch_ok = True
+            except ValueError:
+                plucker_batch_ok = False
+            if not plucker_batch_ok or plucker_emb.shape[1] != x.shape[1]:
                 raise ValueError(
                     "SANA-WM precomputed Plucker embedding shape mismatch: "
-                    f"got {tuple(plucker_emb.shape)}, expected batch/token "
-                    f"({B}, {x.shape[1]})."
-        )
+                    f"got {tuple(plucker_emb.shape)}, expected token count "
+                    f"{x.shape[1]} and batch repeatable to {B}."
+                )
         needs_plucker_emb = (
             plucker_emb is None
             and chunk_plucker is not None
@@ -4480,7 +5042,11 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )  # (B, T*H*W, D)
 
         if self.use_chunk_plucker_input and plucker_emb is not None:
-            x = x + plucker_emb
+            x = _sana_wm_add_repeated_batch(
+                x,
+                plucker_emb,
+                name="Plucker input embedding",
+            )
 
         if not self.use_chunk_plucker_post_attn:
             plucker_emb = None

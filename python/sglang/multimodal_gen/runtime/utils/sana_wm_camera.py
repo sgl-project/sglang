@@ -17,6 +17,146 @@ SANA_WM_MIN_DEFAULT_FOV_DEG = 25.0
 SANA_WM_MAX_DEFAULT_FOV_DEG = 120.0
 SANA_WM_DEFAULT_HORIZONTAL_FOV_ENV = "SGLANG_SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG"
 SANA_WM_ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
+SANA_WM_CAMERA_SOURCE_KEYS: frozenset[str] = frozenset(
+    ("action", "camera_to_world", "camera_conditions")
+)
+SANA_WM_CAMERA_AUXILIARY_KEYS: frozenset[str] = frozenset(
+    ("chunk_plucker", "intrinsics")
+)
+SANA_WM_CAMERA_MOTION_KEYS: frozenset[str] = frozenset(
+    ("translation_speed", "rotation_speed_deg", "pitch_limit_deg")
+)
+SANA_WM_CONDITION_INPUT_KEYS: frozenset[str] = (
+    SANA_WM_CAMERA_SOURCE_KEYS
+    | SANA_WM_CAMERA_AUXILIARY_KEYS
+    | SANA_WM_CAMERA_MOTION_KEYS
+)
+
+
+def _present_condition_input_keys(condition_inputs: dict[str, Any]) -> set[str]:
+    return {key for key, value in condition_inputs.items() if value is not None}
+
+
+def normalize_sana_wm_condition_inputs(
+    condition_inputs: Any = None,
+    *,
+    camera_conditions: Any = None,
+    chunk_plucker: Any = None,
+    camera_to_world: Any = None,
+    intrinsics: Any = None,
+    action: Any = None,
+    action_motion_params: tuple[Any, Any, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate and normalize SANA-WM request camera controls.
+
+    Camera source semantics are intentionally centralized here so API sampling
+    params, stage verification, and runtime camera construction reject the same
+    ambiguous requests.
+    """
+
+    if condition_inputs is None:
+        normalized: dict[str, Any] = {}
+    elif not isinstance(condition_inputs, dict):
+        raise ValueError(
+            "SANA-WM condition_inputs must be a dict, "
+            f"got {type(condition_inputs).__name__}."
+        )
+    else:
+        normalized = {
+            key: value for key, value in condition_inputs.items() if value is not None
+        }
+
+    for key, value in (
+        ("camera_conditions", camera_conditions),
+        ("chunk_plucker", chunk_plucker),
+        ("camera_to_world", camera_to_world),
+        ("intrinsics", intrinsics),
+        ("action", action),
+    ):
+        if value is not None:
+            normalized[key] = value
+
+    if action_motion_params is not None and normalized.get("action") is not None:
+        (
+            normalized["translation_speed"],
+            normalized["rotation_speed_deg"],
+            normalized["pitch_limit_deg"],
+        ) = action_motion_params
+
+    unknown_keys = sorted(set(normalized) - SANA_WM_CONDITION_INPUT_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            "SANA-WM condition_inputs contains unknown keys "
+            f"{unknown_keys}; allowed keys are "
+            f"{sorted(SANA_WM_CONDITION_INPUT_KEYS)}."
+        )
+
+    present = _present_condition_input_keys(normalized)
+    source_keys = sorted(present & SANA_WM_CAMERA_SOURCE_KEYS)
+
+    if len(source_keys) > 1:
+        raise ValueError(
+            "SANA-WM camera source inputs are mutually exclusive; got "
+            f"{source_keys}. Use exactly one of action, camera_to_world, or "
+            "camera_conditions. chunk_plucker is allowed only as an auxiliary "
+            "conditioning tensor."
+        )
+
+    if "action" in present and "chunk_plucker" in present:
+        raise ValueError(
+            "SANA-WM action is mutually exclusive with chunk_plucker because "
+            "the action trajectory derives its own Plucker conditioning."
+        )
+
+    if "camera_conditions" in present and "intrinsics" in present:
+        raise ValueError(
+            "SANA-WM camera_conditions already contains flattened camera pose "
+            "and intrinsics, so it cannot be combined with intrinsics."
+        )
+
+    if (present & SANA_WM_CAMERA_MOTION_KEYS) and "action" not in present:
+        raise ValueError(
+            "SANA-WM motion parameters "
+            f"{sorted(present & SANA_WM_CAMERA_MOTION_KEYS)} require action."
+        )
+
+    if "action" in present:
+        # Validate the action DSL here so stage verification, API params, and
+        # runtime construction fail on the same malformed request.
+        sana_wm_action_num_frames(normalized["action"])
+        (
+            normalized["translation_speed"],
+            normalized["rotation_speed_deg"],
+            normalized["pitch_limit_deg"],
+        ) = validate_sana_wm_motion_params(
+            translation_speed=normalized.get(
+                "translation_speed", SANA_WM_DEFAULT_TRANSLATION_SPEED
+            ),
+            rotation_speed_deg=normalized.get(
+                "rotation_speed_deg", SANA_WM_DEFAULT_ROTATION_SPEED_DEG
+            ),
+            pitch_limit_deg=normalized.get(
+                "pitch_limit_deg", SANA_WM_DEFAULT_PITCH_LIMIT_DEG
+            ),
+        )
+
+    return normalized
+
+
+def validate_sana_wm_condition_inputs(
+    condition_inputs: Any,
+) -> dict[str, Any]:
+    """Validate SANA-WM request camera controls and return normalized inputs."""
+
+    return normalize_sana_wm_condition_inputs(condition_inputs)
+
+
+def sana_wm_condition_inputs_are_valid(condition_inputs: Any) -> bool:
+    try:
+        validate_sana_wm_condition_inputs(condition_inputs)
+    except ValueError:
+        return False
+    return True
 
 
 def validate_sana_wm_motion_params(

@@ -50,21 +50,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
-    SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
-    SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
-    SANA_WM_DEFAULT_TRANSLATION_SPEED,
     coerce_sana_wm_action_camera_to_world,
     coerce_sana_wm_camera_to_world,
     coerce_sana_wm_intrinsics_vec4,
     default_sana_wm_static_camera,
     flatten_sana_wm_camera_conditions,
     latent_frame_sana_wm_camera_conditions,
+    normalize_sana_wm_condition_inputs,
     pad_or_trim_sana_wm_frames,
     relative_sana_wm_camera_poses,
     sana_wm_action_num_frames,
+    sana_wm_condition_inputs_are_valid,
     sana_wm_default_horizontal_fov_deg,
     scale_sana_wm_intrinsics_to_latent,
-    validate_sana_wm_motion_params,
 )
 from sglang.multimodal_gen.runtime.utils.sana_wm_runtime_cache import (
     clear_sana_wm_request_runtime_cache,
@@ -414,47 +412,8 @@ def _sana_wm_none_or_positive_int(value: Any) -> bool:
     return value is None or V.positive_int(value)
 
 
-def _sana_wm_condition_inputs_dict(value: Any) -> bool:
-    return value is None or isinstance(value, dict)
-
-
-def _sana_wm_condition_inputs_mutually_compatible(value: Any) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, dict):
-        return False
-    if value.get("action") is None:
-        return True
-    return (
-        value.get("camera_to_world") is None
-        and value.get("camera_conditions") is None
-        and value.get("chunk_plucker") is None
-    )
-
-
-def _sana_wm_condition_inputs_motion_params_valid(value: Any) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, dict):
-        return False
-    motion_keys = ("translation_speed", "rotation_speed_deg", "pitch_limit_deg")
-    if not any(key in value for key in motion_keys):
-        return True
-    try:
-        validate_sana_wm_motion_params(
-            translation_speed=value.get(
-                "translation_speed", SANA_WM_DEFAULT_TRANSLATION_SPEED
-            ),
-            rotation_speed_deg=value.get(
-                "rotation_speed_deg", SANA_WM_DEFAULT_ROTATION_SPEED_DEG
-            ),
-            pitch_limit_deg=value.get(
-                "pitch_limit_deg", SANA_WM_DEFAULT_PITCH_LIMIT_DEG
-            ),
-        )
-    except ValueError:
-        return False
-    return True
+def _sana_wm_condition_inputs_valid(value: Any) -> bool:
+    return sana_wm_condition_inputs_are_valid(value)
 
 
 def _sana_wm_condition_image_not_empty(value: Any) -> bool:
@@ -1394,22 +1353,18 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         result.add_check(
             "condition_inputs",
             getattr(batch, "condition_inputs", None),
-            [
-                _sana_wm_condition_inputs_dict,
-                _sana_wm_condition_inputs_mutually_compatible,
-                _sana_wm_condition_inputs_motion_params_valid,
-            ],
+            _sana_wm_condition_inputs_valid,
         )
         return result
 
     @torch.no_grad()
     def _vae_encode_image(
         self,
-        image: torch.Tensor,  # (1, C, H, W) or (1, C, 1, H, W) in [0, 1] float
+        image: torch.Tensor,  # (B, C, H, W) or (B, C, 1, H, W) in [0, 1] float
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        """Encode a single image frame through the VAE encoder."""
+        """Encode one or more first-frame images through the VAE encoder."""
         vae = self.vae
         configure_sana_wm_ltx2_vae_for_long_video(vae, self.pipeline_config)
         vae_dtype = PRECISION_TO_TYPE.get(
@@ -1471,7 +1426,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             z = z * scaling_factor
 
         log_sana_wm_tensor_stats("first_frame.latent_normalized", z)
-        return z.to(dtype=dtype)  # (1, 128, 1, H_sp, W_sp)
+        return z.to(dtype=dtype)  # (B, 128, 1, H_sp, W_sp)
 
     @staticmethod
     def _extract_vae_latents(encoded: Any) -> torch.Tensor:
@@ -1825,7 +1780,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         target_h = H_sp * self.pipeline_config.vae_stride[1]  # 32
         target_w = W_sp * self.pipeline_config.vae_stride[2]  # 32
         condition_images = self._condition_images_for_batch(condition_image, B)
-        first_frame_latents = []
+        first_frame_images = []
         preprocess_infos = []
         for image in condition_images:
             img_tensor, preprocess_info = self._preprocess_condition_image(
@@ -1834,9 +1789,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 target_w=target_w,
             )
             preprocess_infos.append(preprocess_info)
-            first_frame_latents.append(
-                self._vae_encode_image(img_tensor, dtype, device)
-            )
+            first_frame_images.append(img_tensor)
 
         preprocess_info_for_batch = (
             preprocess_infos[0] if len(preprocess_infos) == 1 else preprocess_infos
@@ -1855,7 +1808,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 "Processed %d batched first-frame images.", len(preprocess_infos)
             )
 
-        first_frame_z = torch.cat(first_frame_latents, dim=0)
+        first_frame_image_batch = torch.cat(first_frame_images, dim=0)
+        first_frame_z = self._vae_encode_image(first_frame_image_batch, dtype, device)
         return self._splice_first_frame_latent(latents, first_frame_z)
 
     @staticmethod
@@ -1877,13 +1831,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
     @staticmethod
     def _condition_inputs(batch: Req) -> dict[str, Any]:
-        condition_inputs = getattr(batch, "condition_inputs", None) or {}
-        if not isinstance(condition_inputs, dict):
-            raise TypeError(
-                "SANA-WM condition_inputs must be a dict, "
-                f"got {type(condition_inputs).__name__}."
-            )
-        return condition_inputs
+        condition_inputs = getattr(batch, "condition_inputs", None)
+        return normalize_sana_wm_condition_inputs(condition_inputs)
 
     @staticmethod
     def _action_num_frames_for_request(batch: Req) -> int | None:
@@ -1944,13 +1893,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             getattr(arch, "use_chunk_plucker_post_attn", False)
             or getattr(arch, "use_chunk_plucker_input", False)
         )
-        if action is not None and (
-            camera_conditions is not None or chunk_plucker is not None
-        ):
-            raise ValueError(
-                "SANA-WM action cannot be combined with prepacked "
-                "camera_conditions/chunk_plucker."
-            )
         if camera_conditions is not None:
             camera_conditions = (
                 camera_conditions
@@ -2012,31 +1954,14 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         else:
             camera_to_world = condition_inputs.get("camera_to_world")
             intrinsics = condition_inputs.get("intrinsics")
-            if action is not None and camera_to_world is not None:
-                raise ValueError(
-                    "SANA-WM action and camera_to_world are mutually exclusive."
-                )
 
             if action is not None:
                 source = (
                     "action" if intrinsics is not None else "action_default_intrinsics"
                 )
-                translation_speed, rotation_speed_deg, pitch_limit_deg = (
-                    validate_sana_wm_motion_params(
-                        translation_speed=condition_inputs.get(
-                            "translation_speed",
-                            SANA_WM_DEFAULT_TRANSLATION_SPEED,
-                        ),
-                        rotation_speed_deg=condition_inputs.get(
-                            "rotation_speed_deg",
-                            SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
-                        ),
-                        pitch_limit_deg=condition_inputs.get(
-                            "pitch_limit_deg",
-                            SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
-                        ),
-                    )
-                )
+                translation_speed = condition_inputs["translation_speed"]
+                rotation_speed_deg = condition_inputs["rotation_speed_deg"]
+                pitch_limit_deg = condition_inputs["pitch_limit_deg"]
                 camera_to_world = coerce_sana_wm_action_camera_to_world(
                     action,
                     batch_size=batch_size,
@@ -2230,12 +2155,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         return camera_conditions, chunk_plucker, source
 
-    @staticmethod
-    def _duplicate_condition_for_cfg(value: torch.Tensor | None) -> torch.Tensor | None:
-        if value is None:
-            return None
-        return torch.cat([value, value], dim=0)
-
     def _prepare_transformer_static_conditioning(
         self,
         *,
@@ -2245,18 +2164,14 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         do_cfg: bool,
         cfg_parallel: bool,
     ) -> dict[str, Any]:
+        # Static camera/Plucker conditioning stays at request batch size. Serial
+        # CFG repeats the latent/text batch during denoising, and the transformer
+        # applies these static tensors batch-wise without pre-materializing 2B.
+        del do_cfg, cfg_parallel
         if self.transformer is None:
             return {}
         if camera_conditions is None and chunk_plucker is None:
             return {}
-
-        model_camera_conditions = camera_conditions
-        model_chunk_plucker = chunk_plucker
-        if do_cfg and not cfg_parallel:
-            model_camera_conditions = self._duplicate_condition_for_cfg(
-                camera_conditions
-            )
-            model_chunk_plucker = self._duplicate_condition_for_cfg(chunk_plucker)
 
         with self.use_declared_component(
             component_name="transformer",
@@ -2274,8 +2189,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             if prepare_static is None:
                 return {}
             static_kwargs = prepare_static(
-                camera_conditions=model_camera_conditions,
-                chunk_plucker=model_chunk_plucker,
+                camera_conditions=camera_conditions,
+                chunk_plucker=chunk_plucker,
                 latent_shape=latent_shape,
             )
 

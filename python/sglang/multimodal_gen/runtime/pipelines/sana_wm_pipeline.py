@@ -73,29 +73,29 @@ def _resolve_sana_wm_startup_choice(
 ) -> str:
     mode = _nonempty_config_string(getattr(server_args, field_name, None))
     if mode is not None:
-        return normalizer(mode, strict=False, name=f"server_args.{field_name}")
+        return normalizer(mode, strict=True, name=f"server_args.{field_name}")
 
     pipeline_config = getattr(server_args, "pipeline_config", None)
     pipeline_mode = _nonempty_config_string(getattr(pipeline_config, field_name, None))
     if pipeline_mode is not None and pipeline_mode.lower() != "auto":
         return normalizer(
             pipeline_mode,
-            strict=False,
+            strict=True,
             name=f"pipeline_config.{field_name}",
         )
 
     mode = _nonempty_config_string(os.getenv(env_name))
     if mode is not None:
-        return normalizer(mode, strict=False, name=env_name)
+        return normalizer(mode, strict=True, name=env_name)
 
     if pipeline_mode is not None:
         return normalizer(
             pipeline_mode,
-            strict=False,
+            strict=True,
             name=f"pipeline_config.{field_name}",
         )
 
-    return normalizer("auto", strict=False, name=field_name)
+    return normalizer("auto", strict=True, name=field_name)
 
 
 def _configured_sana_wm_refiner_backend(server_args: ServerArgs) -> str:
@@ -112,6 +112,8 @@ def _configured_sana_wm_refiner_backend(server_args: ServerArgs) -> str:
         tp_size = max(int(getattr(server_args, "tp_size", 1) or 1), 1)
     except (TypeError, ValueError):
         tp_size = 1
+    if tp_size > 1 and getattr(server_args, "enable_cfg_parallel", False):
+        return "official"
     return "native" if tp_size > 1 else "official"
 
 
@@ -306,8 +308,19 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         pipeline_config = getattr(server_args, "pipeline_config", None)
         if sana_wm_skip_refiner_enabled(pipeline_config=pipeline_config):
             return
-        if _configured_sana_wm_refiner_backend(server_args) != "native":
+        refiner_backend = _configured_sana_wm_refiner_backend(server_args)
+        if refiner_backend != "native":
             return
+
+        if getattr(server_args, "enable_cfg_parallel", False):
+            raise ValueError(
+                "SANA-WM two-stage native refiner does not support "
+                "enable_cfg_parallel with tp_size > 1. The native refiner is "
+                "tensor-parallel and must run on all TP ranks, while CFG "
+                "parallel refiner execution currently runs only one branch/rank. "
+                "Use sana_wm_refiner_backend=official, disable CFG parallelism, "
+                "or set sana_wm_skip_refiner=true."
+            )
 
         stage1_heads = _sana_wm_dit_num_attention_heads(
             getattr(pipeline_config, "dit_config", None)
