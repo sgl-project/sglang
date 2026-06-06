@@ -43,10 +43,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import (
-    is_in_piecewise_cuda_graph,
-    is_piecewise_compiled,
-)
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -557,12 +554,6 @@ class GroupCoordinator:
             maybe_pymscclpp_context: Any
             if not pymscclpp_comm:
                 maybe_pymscclpp_context = nullcontext()
-            elif is_piecewise_compiled():
-                # Do not enable pymscclpp during piecewise CUDA graph
-                # capture. Enabling it here changes the `disabled` flag
-                # which invalidates torch.compile guards recorded during
-                # the compile phase, triggering recompilation.
-                maybe_pymscclpp_context = nullcontext()
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             with maybe_pynccl_context, maybe_pymscclpp_context:
@@ -603,14 +594,14 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        should_use_pymscclpp = (
+        should_use_pymscclpp_allreduce = (
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
-            and not should_use_pymscclpp
+            and not should_use_pymscclpp_allreduce
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
@@ -621,7 +612,7 @@ class GroupCoordinator:
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
-            and not should_use_pymscclpp
+            and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
@@ -631,7 +622,7 @@ class GroupCoordinator:
             and self.qr_comm.should_quick_allreduce(input_)
         ):
             outplace_all_reduce_method = "qr"
-        elif self.pymscclpp_comm is not None and should_use_pymscclpp:
+        elif self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             outplace_all_reduce_method = "pymscclpp"
         elif (
             self.torch_symm_mem_comm is not None
