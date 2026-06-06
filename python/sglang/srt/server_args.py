@@ -1996,6 +1996,20 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+                if self.enable_two_batch_overlap and (
+                    index_topk_freq > 1
+                    or (index_topk_pattern is not None and "S" in index_topk_pattern)
+                ):
+                    raise ValueError(
+                        "--enable-two-batch-overlap is not supported with DSA "
+                        "index-topk sharing (index_topk_freq > 1 or an "
+                        "index_topk_pattern containing shared layers): the TBO op "
+                        "path does not propagate topk indices across layers, so "
+                        "shared layers would run sparse attention without indices."
+                    )
+
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_dsa_prefill_context_parallel:
                         logger.warning(
@@ -2320,13 +2334,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
-                    # The AITER MXFP4 fused-MoE path for GPT-OSS expects the
-                    # SEPARATED gate/up tile layout (matches the
-                    # `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
-                    # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
-                    # callers default to INTERLEAVE; opt this path out
-                    # unless the user explicitly overrode it.
-                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
+                    ## The AITER MXFP4 fused-MoE path for GPT-OSS expects the
+                    ## SEPARATED gate/up tile layout (matches the
+                    ## `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+                    ## Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
+                    ## callers default to INTERLEAVE; opt this path out
+                    ## unless the user explicitly overrode it.
+                    # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions

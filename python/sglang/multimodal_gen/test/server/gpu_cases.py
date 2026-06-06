@@ -554,6 +554,15 @@ else:
             run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
+            "ideogram4_nvfp4_t2i",
+            model_path="Comfy-Org/Ideogram-4",
+            modality="image",
+            sampling_params=IDEOGRAM4_CI_sampling_params,
+            extras=[],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
             model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",

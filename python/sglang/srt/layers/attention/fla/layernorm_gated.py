@@ -14,11 +14,13 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -90,7 +92,11 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
     group = tl.program_id(1)
@@ -172,6 +178,9 @@ def _layer_norm_fwd_1pass_kernel(
     # Write output
     tl.store(Y_base, y, mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 @lru_cache
 def _get_sm_count(device: torch.device) -> int:
@@ -243,6 +252,7 @@ def _layer_norm_fwd(
     rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     with device_context(x.device):
         _layer_norm_fwd_1pass_kernel[grid](
             x,
@@ -266,6 +276,7 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            **pdl_kwargs,
         )
     return out, mean, rstd
 

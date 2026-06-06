@@ -74,6 +74,53 @@ if is_cuda() or is_musa():
     )
 
 
+def duplicate_prefix_tail_to_draft_branches(
+    token_to_kv_pool,
+    rows: torch.Tensor,
+    prefix_base: torch.Tensor,
+    last_page: torch.Tensor,
+    num_new_pages: torch.Tensor,
+    topk: int,
+    page_size: int,
+) -> None:
+    """Copy the prefix partial-tail page into each branch's first-page holes (page>1 + topk>1).
+
+    The draft-decode expand pass reads each branch's own draft page by block id
+    (cache_loc // page_size), so branch b>=1's hole slots [0, last_page) must hold the
+    real prefix tail (branch 0's first page already is it). Mirrors V1 #7725.
+    """
+    if topk <= 1:
+        return
+    bs = rows.shape[0]
+    page_off = torch.arange(page_size, device=rows.device, dtype=torch.int64)
+    branches = torch.arange(1, topk, device=rows.device, dtype=torch.int64).view(
+        1, topk - 1, 1
+    )
+    # Source: the prefix tail page [prefix_base, prefix_base + page_size), one per branch.
+    src_pos = (prefix_base.view(bs, 1, 1) + page_off.view(1, 1, page_size)).expand(
+        bs, topk - 1, page_size
+    )
+    # Target: branch b's first page [prefix_base + b*num_new_pages*page, + page_size).
+    tgt_pos = (
+        prefix_base.view(bs, 1, 1)
+        + branches * (num_new_pages.view(bs, 1, 1) * page_size)
+        + page_off.view(1, 1, page_size)
+    )
+    # Only [0, last_page) holds real prefix KV; [last_page, page_size) are the branch's
+    # own draft slots and must not be overwritten.
+    vmask = (page_off.view(1, 1, page_size) < last_page.view(bs, 1, 1)).expand(
+        bs, topk - 1, page_size
+    )
+    src_slots = torch.gather(rows, 1, src_pos.reshape(bs, -1)).reshape(
+        bs, topk - 1, page_size
+    )[vmask]
+    tgt_slots = torch.gather(rows, 1, tgt_pos.reshape(bs, -1)).reshape(
+        bs, topk - 1, page_size
+    )[vmask]
+    if src_slots.numel() > 0:
+        token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
+
+
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
@@ -128,6 +175,21 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
+        # Fail fast if the page>1 + topk>1 draft over-allocation
+        # (2 * get_alloc_len_per_decode) outgrows the req_to_token row: the write below
+        # would OOB and free would leak KV. The row is widened to hold it in _init_pools
+        # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
+        from sglang.srt.server_args import get_global_server_args
+
+        if page_size > 1 and (get_global_server_args().speculative_eagle_topk or 1) > 1:
+            max_alloc_len = int(nxt_kv_lens_cpu.max())
+            row_width = batch.req_to_token_pool.req_to_token.shape[1]
+            assert max_alloc_len <= row_width, (
+                f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
+                f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
+                f"row to hold committed + 2 * get_alloc_len_per_decode (PR #26972)."
+            )
+
         # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
         # barrier has chained to the prev forward -> host stalls a full forward.
         cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
@@ -171,22 +233,65 @@ class EagleDraftInputV2Mixin:
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
 
-            # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.device,
-            )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
+            # Assign cache locations (draft-write targets).
+            page_size = batch.token_to_kv_pool_allocator.page_size
+            if page_size == 1 or topk == 1:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.device,
+                )
+                # FIXME(lsyin): align with the default code path
+                assign_draft_cache_locs_page_size_1[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                )
+            else:
+                # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
+                # Reduce out_cache_loc from the page-aligned tree region down to the
+                # dense draft slots (skip each branch's duplicated prefix-tail slots
+                # and trailing padding), matching generate_draft_decode_kv_indices'
+                # paged read formula: prefix_base + t*num_new_pages*page + last_page + s.
+                # base is batch.seq_lens (== KV-ready committed prefix at draft time;
+                # the bonus is the tree root written by verify, not part of [0:seq_lens]).
+                rows = req_to_token_pool.req_to_token[batch.req_pool_indices.long()]
+                seq_lens = batch.seq_lens.to(torch.int64)
+                last_page = seq_lens % page_size
+                prefix_base = seq_lens - last_page
+                num_new_pages = (last_page + num_steps + page_size - 1) // page_size
+                topk_ids = torch.arange(
+                    topk, device=rows.device, dtype=torch.int64
+                ).view(1, topk)
+                starts = (
+                    prefix_base.view(bs, 1)
+                    + topk_ids * (num_new_pages.view(bs, 1) * page_size)
+                    + last_page.view(bs, 1)
+                )
+                steps = torch.arange(
+                    num_steps, device=rows.device, dtype=torch.int64
+                ).view(1, 1, num_steps)
+                pos = (starts.view(bs, topk, 1) + steps).reshape(bs, topk * num_steps)
+                batch.out_cache_loc = (
+                    torch.gather(rows, 1, pos).reshape(-1).contiguous()
+                )
+
+                # Each branch's page-aligned region starts with `last_page` hole slots
+                # overlapping the prefix tail page; duplicate the real prefix-tail KV
+                # into them so whole-page reads stay coherent (see helper docstring).
+                duplicate_prefix_tail_to_draft_branches(
+                    draft_model_runner.token_to_kv_pool,
+                    rows,
+                    prefix_base,
+                    last_page,
+                    num_new_pages,
+                    topk,
+                    page_size,
+                )
 
         # Get a forward batch
         self.num_tokens_per_req = topk
