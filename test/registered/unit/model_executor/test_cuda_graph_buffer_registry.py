@@ -438,10 +438,8 @@ class TestMissingAndOptionalSlots(unittest.TestCase):
         )
 
     def test_extract_carries_none_for_absent_plain_slot(self):
-        # A plain copy-from-FB slot whose FB field is None this iter (e.g.
-        # mrope_positions on a non-multimodal batch) must be carried from the
-        # template as None, not exposed as the stale/zero slot buffer — handing
-        # the model a zeros tensor in place of None would change its behavior.
+        # A plain copy slot absent this iter (mrope on a non-multimodal batch)
+        # must be carried as None, not exposed as the stale/zero buffer.
         r = _make_registry(max_bs=4, max_num_tokens=8)
         r.register_slot(
             GraphSlot("input_ids", lambda bs, mt: (mt,), torch.int64, axis="tokens")
@@ -471,9 +469,8 @@ class TestMissingAndOptionalSlots(unittest.TestCase):
         self.assertIsNone(fb_view.mrope_positions)
 
     def test_extract_exposes_computed_slot_even_when_fb_field_none(self):
-        # A computed slot (copy_from_fb=False + post_fill) produces its own
-        # value; its buffer must be exposed even though the same-named FB field
-        # is None — the None-skip carry applies only to plain copy slots.
+        # A computed slot (copy_from_fb=False) is always exposed, even when its
+        # FB field is None — the None-skip carry applies only to plain copies.
         def _fill_two(buf, fb, ctx):
             buf.fill_(2)
 
@@ -951,12 +948,9 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertEqual(int(src.num_token_non_padded.item()), 4)
 
     def test_register_global_num_tokens_false_carries_fb_values(self):
-        # The global_num_tokens_* slots are computed (copy_from_fb=False); with
-        # require_gathered_buffer=False their post_fill is a no-op, so the buffer
-        # stays zero, and extract_buffer always exposes computed slots. The eager
-        # decode path passes register_global_num_tokens=False so the values
-        # prepare_mlp_sync_batch already wrote onto the batch (DP attention)
-        # survive extract_buffer instead of being clobbered by the zero buffer.
+        # register_global_num_tokens=False (eager) excludes the computed
+        # global_num_tokens_* slots so the batch's DP values are carried, not
+        # clobbered by the zero buffer extract_buffer would otherwise expose.
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
@@ -1309,10 +1303,8 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.all(ids[3:8] == 0))
 
     def test_register_input_embeds_false_keeps_mrope_carries_embeds(self):
-        # The eager extend path passes register_input_embeds=False: mrope is
-        # still registered (multimodal), but input_embeds is NOT — it must be
-        # carried from the FB (a real read input) rather than handed back as a
-        # reset-only zero buffer.
+        # register_input_embeds=False (eager): mrope stays registered but
+        # input_embeds is carried from the FB (a read input), not a zero buffer.
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )

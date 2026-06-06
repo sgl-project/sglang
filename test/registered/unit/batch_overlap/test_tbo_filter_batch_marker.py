@@ -84,10 +84,9 @@ def _make_valued_batch(bs: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchOnRegistryView(CustomTestCase):
-    """The eager forward path hands TBO a ForwardBatch view backed by the
-    CudaGraphBufferRegistry (extract_buffer), not the raw batch. TBO runs one
-    forward on that parent and splits it via filter_batch, so the buffer-backed
-    view must filter into children identically to the raw batch."""
+    """TBO runs one forward on the parent and splits via filter_batch, so an
+    eager registry-backed view must filter into children identically to the raw
+    batch."""
 
     def _registry_view(self, batch: ForwardBatch) -> ForwardBatch:
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (

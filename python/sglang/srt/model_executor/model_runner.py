@@ -3087,18 +3087,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _ensure_eager_decode_registry(
         self, raw_bs: int, raw_num_tokens: int
     ) -> "CudaGraphBufferRegistry":
-        """Lazily build (and grow) the decode buffer registry for the eager path.
-
-        Eager decode batches can exceed the cuda-graph capture buckets, so the
-        graph runner's registry (sized to ``max(capture_bs)``) cannot be reused.
-        Eager has no graph address burn-in, so growing by reallocation is safe:
-        build on first use and grow on demand (next power of two).
-
-        The DP-computed slots (``num_token_non_padded`` / ``global_num_tokens_*``)
-        are not registered — ``prepare_mlp_sync_batch`` already set their values
-        on the batch and ``extract_buffer`` carries them through. ``share_pool``
-        is off so the eager buffers are never aliased with a graph's.
-        """
         reg = getattr(self, "_eager_decode_registry", None)
         cap_bs, cap_tokens = getattr(self, "_eager_decode_registry_capacity", (0, 0))
         if reg is not None and raw_bs <= cap_bs and raw_num_tokens <= cap_tokens:
@@ -3114,11 +3102,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
             max_bs=new_bs,
             max_num_token=new_tokens,
-            # Eager applies no padding (raw == padded), so the seq_lens
-            # FILL_SENTINEL only initializes the [raw:padded] tail, which is
-            # empty and never read here. Use 0 rather than the backend's
-            # cuda-graph fill value, which non-cuda-graph backends
-            # (torch_native / torch_flex / intel_amx / ...) do not implement.
+            # Eager has no padding so this sentinel is never read; 0 avoids the
+            # cuda-graph-only fill-value method that some backends lack.
             seq_len_fill_value=0,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
@@ -3131,8 +3116,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if is_encoder_decoder
                 else 0
             ),
-            enable_num_token_non_padded=False,  # eager carries it from the FB
-            register_global_num_tokens=False,  # eager carries these from the FB
+            enable_num_token_non_padded=False,
+            register_global_num_tokens=False,
             require_gathered_buffer=False,
             require_mlp_tp_gather=False,
             dp_size=self.server_args.dp_size,
@@ -3146,13 +3131,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _eager_decode_fb_view(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> ForwardBatch:
-        """Return a ForwardBatch view whose shared input tensors are backed by
-        the eager decode buffer registry. The batch is already DP-padded in
-        place by ``_forward_raw``, so ``raw == padded`` (no capture-bucket
-        padding, no idle substitution).
-
-        With ``SGLANG_EAGER_INPUT_NO_COPY`` set, skip the registry copy and wrap
-        the batch's own tensors in a fresh view instead (no per-iter D2D copy)."""
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
@@ -3175,16 +3153,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _ensure_eager_prefill_registry(
         self, raw_bs: int, raw_num_tokens: int
     ) -> "CudaGraphBufferRegistry":
-        """Lazily build (and grow) the token-axis prefill buffer registry for
-        the eager ``forward_extend`` path (same grow rationale as the decode
-        registry).
-
-        ``input_embeds`` is not registered (``register_input_embeds=False``):
-        on the eager path it is a read input, carried from the batch rather than
-        written into a reset-only buffer. ``mamba_track_*`` / ``seq_lens`` /
-        ``req_pool_indices`` are carried too; only the token-axis inputs
-        (``input_ids`` / ``positions`` / ``out_cache_loc`` and, for multimodal
-        models, ``mrope_positions``) are buffered."""
         reg = getattr(self, "_eager_prefill_registry", None)
         cap_bs, cap_tokens = getattr(self, "_eager_prefill_registry_capacity", (0, 0))
         if reg is not None and raw_bs <= cap_bs and raw_num_tokens <= cap_tokens:
@@ -3201,8 +3169,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             max_num_token=new_tokens,
             cache_loc_dtype=torch.int64,
             is_multimodal=self.is_multimodal,
-            enable_mamba_track=False,  # eager carries mamba_track_* from the FB
-            register_input_embeds=False,  # eager reads input_embeds; carry it
+            enable_mamba_track=False,
+            register_input_embeds=False,
             share_pool=False,
             source=None,
         )
@@ -3213,12 +3181,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _eager_extend_fb_view(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> ForwardBatch:
-        """Return a ForwardBatch view whose token-axis input tensors are backed
-        by the eager prefill buffer registry. ``raw == padded`` (the batch is
-        already DP-padded in place by ``_forward_raw``).
-
-        With ``SGLANG_EAGER_INPUT_NO_COPY`` set, skip the registry copy and wrap
-        the batch's own tensors in a fresh view instead (no per-iter D2D copy)."""
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
@@ -3243,10 +3205,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        # Route the eager decode input through the buffer registry (the same one
-        # capture/replay use) instead of reading the ForwardBatch directly.
-        # pdmux runs concurrent per-stream decode forwards that would race on
-        # the shared buffers, so it stays on the ForwardBatch.
         if not self.server_args.enable_pdmux:
             forward_batch = self._eager_decode_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
@@ -3337,10 +3295,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
-        # Route the eager (non-piecewise) extend input through the prefill
-        # buffer registry. input_embeds / replace_* were already read off the
-        # batch above and are carried through the view. pdmux stays on the
-        # ForwardBatch (per-stream race on shared buffers), as in forward_decode.
         if not self.server_args.enable_pdmux:
             forward_batch = self._eager_extend_fb_view(forward_batch, pp_proxy_tensors)
 
@@ -3377,10 +3331,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # called from the idle path can re-read a prior batch's req_pool
         # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
-            # Padded idle batches go through the buffer registry like
-            # forward_decode. The unpadded case (bs == 0) stays on the empty
-            # ForwardBatch — there is nothing to fill and the
-            # forward_metadata=None reset below must be exact.
             if not self.server_args.enable_pdmux:
                 forward_batch = self._eager_decode_fb_view(
                     forward_batch, pp_proxy_tensors
@@ -3411,12 +3361,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
     ) -> LogitsProcessorOutput:
-        # Not routed through the eager buffer registry (unlike forward_decode /
-        # forward_extend / forward_idle): this path is stateful across calls —
-        # it advances forward_batch.split_index in place and is re-invoked with
-        # the same ForwardBatch — so it must read and mutate the real batch. An
-        # extract_buffer view is a per-call copy whose split_index update would
-        # never reach the caller's batch.
         if forward_batch.split_index == 0 or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(

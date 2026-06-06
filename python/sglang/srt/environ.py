@@ -763,9 +763,8 @@ class Envs:
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
 
-    # When set, the eager forward path skips copying its FB-shared input tensors
-    # into the CUDA graph buffer registry and instead wraps the ForwardBatch's
-    # own tensors in a fresh view (no per-iter device-to-device copy).
+    # Eager forward wraps the ForwardBatch's own tensors instead of copying them
+    # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
 
     # Distributed
