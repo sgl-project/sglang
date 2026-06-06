@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -96,7 +95,7 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 def should_use_dsv4_dp_moe_reduce_scatterv() -> bool:
     return (
-        os.environ.get("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower()
+        get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower()
         in ("1", "true", "yes", "on")
         and is_dp_attention_enabled()
         and get_attention_dp_size() > 1
