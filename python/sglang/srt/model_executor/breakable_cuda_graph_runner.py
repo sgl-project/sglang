@@ -319,8 +319,10 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        # Match capture/replay dispatch without starting CUDA graph capture.
+        with (
+            forward_context(ForwardContext(attn_backend=self.model_runner.attn_backend)),
+            enable_breakable_cuda_graph(),
         ):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             self._run_forward(forward_batch, num_tokens)
