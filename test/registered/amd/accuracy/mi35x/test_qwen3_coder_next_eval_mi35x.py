@@ -8,11 +8,6 @@ Registry: nightly-amd-8-gpu-mi35x-qwen3-coder-next suite
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -36,21 +31,6 @@ from sglang.utils import download_and_cache_file, read_jsonl
 register_amd_ci(est_time=3600, suite="nightly-amd-8-gpu-mi35x", nightly=True)
 
 INVALID = -9999999
-
-# Model path configuration for MI35x Qwen3-Coder-Next
-# Priority: 1) env var, 2) local path
-QWEN3_CODER_NEXT_LOCAL_PATH = "/data/Qwen/Qwen3-Coder-Next/"
-QWEN3_CODER_NEXT_HF_MODEL_ID = "Qwen/Qwen3-Coder-Next"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    env_path = os.environ.get("QWEN3_CODER_NEXT_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(QWEN3_CODER_NEXT_LOCAL_PATH):
-        return QWEN3_CODER_NEXT_LOCAL_PATH
-    return QWEN3_CODER_NEXT_HF_MODEL_ID
 
 
 @dataclass
@@ -79,9 +59,8 @@ class ModelConfig:
 
 def get_qwen3_coder_next_models() -> List[ModelConfig]:
     """Get Qwen3-Coder-Next model configurations for MI35x."""
-    model_path = get_model_path()
     common_kwargs = {
-        "model_path": model_path,
+        "model_path": "Qwen/Qwen3-Coder-Next",
         "tp_size": 8,
         "accuracy_threshold": 0.90,
         "timeout": 3600,
@@ -215,19 +194,6 @@ class TestQwen3CoderNextEvalMI35x(unittest.TestCase):
 
     def test_qwen3_coder_next_accuracy(self):
         """Test Qwen3-Coder-Next models with GSM8K completion benchmark."""
-        # Check if model exists
-        model_path = get_model_path()
-        is_local_path = model_path.startswith("/")
-        if is_local_path and not os.path.exists(model_path):
-            print(f"\nSKIPPING: Local model not found at {model_path}")
-            self.skipTest(f"Local model not found at {model_path}")
-            return
-
-        if is_local_path:
-            print(f"Using local model: {model_path}")
-        else:
-            print(f"Using HuggingFace model: {model_path}")
-
         all_results = []
         summary = "### Qwen3-Coder-Next Models (MI35x)\n\n"
         summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"

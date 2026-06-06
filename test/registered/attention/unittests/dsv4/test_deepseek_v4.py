@@ -16,6 +16,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -335,6 +336,76 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.PRODUCTION_EAGLE_DRAFT_EXTEND_RUNNER_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_eagle_draft_extend_cuda_graph_runner_case(self, case)
+
+
+class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
+    """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
+
+    The KV-store consumers run in paths that never invoke
+    `init_forward_metadata_in_graph` (eager idle, runners that only run the
+    out-graph prep) or whose batch is re-padded after init (DP attention).
+    The resolver must use the per-forward cached value only when it is
+    provably current and fall back to translating `out_cache_loc` otherwise.
+    """
+
+    def _make_backend(self, mapping: torch.Tensor):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = None
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda loc: mapping[loc]
+        )
+        return backend
+
+    @staticmethod
+    def _make_fb(out_cache_loc: torch.Tensor, forward_mode: ForwardMode):
+        return SimpleNamespace(out_cache_loc=out_cache_loc, forward_mode=forward_mode)
+
+    @staticmethod
+    def _set_cached(backend, cached: torch.Tensor):
+        backend.forward_metadata = SimpleNamespace(
+            core_attn_metadata=SimpleNamespace(swa_out_cache_loc=cached)
+        )
+
+    def test_no_metadata_falls_back_to_translate(self):
+        mapping = torch.arange(10, dtype=torch.int64) * 2
+        backend = self._make_backend(mapping)
+        fb = self._make_fb(torch.tensor([3, 4]), ForwardMode.DECODE)
+        out = backend.get_swa_out_cache_loc(fb)
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out.tolist(), [6, 8])
+
+    def test_current_cached_value_is_used(self):
+        mapping = torch.arange(10, dtype=torch.int64) * 2
+        backend = self._make_backend(mapping)
+        cached = torch.tensor([6, 8], dtype=torch.int32)
+        self._set_cached(backend, cached)
+        fb = self._make_fb(torch.tensor([3, 4]), ForwardMode.DECODE)
+        self.assertIs(backend.get_swa_out_cache_loc(fb), cached)
+
+    def test_stale_shape_falls_back_to_translate(self):
+        # DP padding rebinds out_cache_loc to a longer tensor after init;
+        # a pre-pad cached value must not be used.
+        mapping = torch.arange(10, dtype=torch.int64) * 2
+        backend = self._make_backend(mapping)
+        self._set_cached(backend, torch.tensor([6, 8], dtype=torch.int32))
+        fb = self._make_fb(torch.tensor([3, 4, 0, 0]), ForwardMode.DRAFT_EXTEND_V2)
+        out = backend.get_swa_out_cache_loc(fb)
+        self.assertEqual(out.tolist(), [6, 8, 0, 0])
+
+    def test_idle_never_uses_cached_value(self):
+        # Idle forwards skip attn init, so any metadata is left over from a
+        # previous forward; writing dummy tokens to its locations would
+        # corrupt live KV. Idle must translate the zero-padded out_cache_loc.
+        mapping = torch.arange(10, dtype=torch.int64) * 2
+        backend = self._make_backend(mapping)
+        self._set_cached(backend, torch.tensor([6, 8], dtype=torch.int32))
+        fb = self._make_fb(torch.tensor([0, 0]), ForwardMode.IDLE)
+        out = backend.get_swa_out_cache_loc(fb)
+        self.assertEqual(out.tolist(), [0, 0])
 
 
 if __name__ == "__main__":
