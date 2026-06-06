@@ -600,10 +600,11 @@ class C4IndexerBackendMixin:
                     )
                 )
             else:
+                # flash_mla C4 attention requires int32 page indices.
                 core_metadata.c4_sparse_page_indices = (
                     token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
                         core_metadata.c4_sparse_page_indices
-                    )
+                    ).to(torch.int32)
                 )
 
         if capture_enabled:

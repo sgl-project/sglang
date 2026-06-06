@@ -136,6 +136,7 @@ class PrefetchOperation(StorageOperation):
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
         )
+        self.pool_transfers_done = not bool(pool_transfers)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -581,9 +582,6 @@ class HybridCacheController(BaseHiCacheController):
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
-        if kv_hit_pages > 0 and operation.pool_transfers:
-            self._sync_trailing_keys(operation.pool_transfers, hash_value, kv_hit_pages)
-
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
@@ -618,14 +616,21 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
-        # Transfer extra pools
-        if operation.pool_transfers and not operation.is_terminated():
+        # KV pools first — determines actual completed page count
+        super()._page_transfer(operation)
+
+        # Extra pools only after KV fully completes. If KV terminated early
+        # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
+        # data misalignment.
+        kv_completed_pages = operation.completed_tokens // self.page_size
+        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
+            self._sync_trailing_keys(
+                operation.pool_transfers, operation.hash_value, kv_completed_pages
+            )
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
-
-        # Transfer kv pools
-        super()._page_transfer(operation)
+        operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
         # Backup extra pools
@@ -642,14 +647,27 @@ class HybridCacheController(BaseHiCacheController):
             if transfer.indices_from_pool is None:
                 continue
             if transfer.indices_from_pool != PoolName.KV:
-                # TODO(hzh): Support storage sidecar derived pools from other sources
-                raise AssertionError(
-                    "Storage sidecar derived pool currently only supports KV-shared "
-                    f"indices, got {transfer.name} from {transfer.indices_from_pool}."
+                source = next(
+                    (
+                        t
+                        for t in operation.pool_transfers
+                        if t.indices_from_pool is None
+                        and t.name == transfer.indices_from_pool
+                    ),
+                    None,
                 )
-            transfer.host_indices = operation.host_indices
-            if transfer.keys is None:
-                transfer.keys = operation.hash_value
+                if source is None:
+                    raise AssertionError(
+                        "Storage sidecar derived pool source missing: "
+                        f"{transfer.name} from {transfer.indices_from_pool}."
+                    )
+                transfer.host_indices = source.host_indices
+                if transfer.keys is None:
+                    transfer.keys = source.keys
+            else:
+                transfer.host_indices = operation.host_indices
+                if transfer.keys is None:
+                    transfer.keys = operation.hash_value
 
     def _sync_trailing_keys(
         self,
