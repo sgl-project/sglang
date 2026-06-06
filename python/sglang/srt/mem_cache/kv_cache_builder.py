@@ -159,6 +159,8 @@ def build_kv_cache(
         tp_worker.model_runner.hybrid_gdn_config is not None
         or tp_worker.model_runner.mamba2_config is not None
         or _registry_needs_mamba
+        or tp_worker.model_runner.kimi_linear_config is not None
+        or tp_worker.model_runner.hybrid_lightning_config is not None
     )
 
     sliding_window_size = None
@@ -216,6 +218,7 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,

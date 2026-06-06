@@ -10,7 +10,6 @@ import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.server_args import ServerArgs
@@ -33,6 +32,11 @@ class GenerationBatchResult:
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
+    # PP skip output comm: True when output send/recv was skipped and
+    # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
+    # to validate that skipped output is never consumed.
+    skipped_output_comm: bool = False
+
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
@@ -40,12 +44,15 @@ class GenerationBatchResult:
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
-    future_indices: Optional[FutureIndices] = None
+    future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+
+    # Next-iter seq_lens; published via on_publish.
+    new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -233,7 +240,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
 
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.speculative_num_draft_tokens
+    spec_tokens = server_args.max_speculative_num_draft_tokens
     page_size = server_args.page_size
 
     if page_size == 1 or spec_topk == 1:

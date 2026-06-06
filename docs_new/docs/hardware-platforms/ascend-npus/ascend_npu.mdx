@@ -82,9 +82,29 @@ docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
 
 #### Python Version
 
-Only `python==3.11` is supported currently. If you don't want to break system pre-installed python, try installing with [conda](https://github.com/conda/conda).
+**Only `python==3.11` is supported currently**. If you don't want to break system pre-installed python, try installing with [conda](https://github.com/conda/conda).
 
 ```bash Command
+conda create --name sglang_npu python=3.11
+conda activate sglang_npu
+```
+
+Note on Anaconda repository restrictions
+If you encounter an error like “Terms of Service have not been accepted” during the conda create step, the default Anaconda repository is blocking package downloads. To resolve this, configure a mirror (e.g., Tsinghua Open Source Mirror):
+```bash Command
+# Add Tsinghua mirrors
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
+conda config --set show_channel_urls yes
+
+# Edit the system-level conda config to remove any hardcoded defaults
+vi /root/miniconda3/.condarc
+```
+Inside /root/miniconda3/.condarc, delete or comment out any lines containing defaults or official Anaconda URLs.
+Then remove the failed environment and recreate it:
+```bash Command
+conda clean -i
+conda env remove -n sglang_npu
 conda create --name sglang_npu python=3.11
 conda activate sglang_npu
 ```
@@ -471,6 +491,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{
     "model": "meta-llama/Llama-3.1-8B-Instruct",
     "messages": [{"role": "user", "content": "What is the capital of France?"}]
+  }'
+```
+
+Some models return responses accompanied with thinking process content. To disable this output, configure parameters as follows:
+```bash Command
+curl http://127.0.0.1:8000/v1/chat/completions
+  -H "Content-Type: application/json"
+  -d '{
+    "model": "Eco-Tech/Qwen3.5-27B-w8a8-mtp",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "chat_template_kwargs": {"enable_thinking": false}
   }'
 ```
 

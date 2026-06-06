@@ -134,8 +134,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     # branch, which always asks for the LSE.
                     if is_causal is False and return_lse is False:
                         continue
+                    # Runtime feeds fp8_e4m3fn q/k/v
                     config = (
-                        torch.bfloat16,
+                        torch.float8_e4m3fn,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,
@@ -146,7 +147,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     if config in _compiled_kernels:
                         continue
                     _compiled_kernels[config] = _compile_prefill_kernel(
-                        torch.bfloat16,
+                        torch.float8_e4m3fn,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,
@@ -249,7 +250,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         # reproduces the original [tokens, 1, qk_rope] latent layout.
         kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
         k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
-        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+        self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
             forward_batch.out_cache_loc,
             kv_a_fp8.unsqueeze(1),
