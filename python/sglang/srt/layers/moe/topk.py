@@ -96,8 +96,8 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
-from sglang.srt.layers.moe.utils import is_deepep_class_backend
+from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -127,10 +127,6 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
-
-
-def _uses_per_rank_fused_shared_slots() -> bool:
-    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
 
 
 if _is_cuda:
@@ -527,7 +523,7 @@ class TopK(MultiPlatformOp):
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
         if (
             self.topk_config.num_fused_shared_experts > 0
-            and _uses_per_rank_fused_shared_slots()
+            and uses_per_rank_fused_shared_slots()
         ):
             n = self.topk_config.num_fused_shared_experts
             topk_output = topk_output._replace(
@@ -1402,7 +1398,7 @@ def _post_process_topk_ids(
         # EPLB dispatch must only remap the routed expert columns.
         # The shared expert column (value = n_routed_experts) would be out-of-bounds
         # for the logical-to-physical dispatch table.
-        if num_fused_shared_experts > 0 and _uses_per_rank_fused_shared_slots():
+        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(
@@ -1437,7 +1433,7 @@ def _post_process_topk_ids(
 
     # DeepEP/MegaMoE: remap to interleaved expert layout where each rank's
     # shared expert has a unique ID for dispatch routing.
-    if num_fused_shared_experts > 0 and _uses_per_rank_fused_shared_slots():
+    if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None

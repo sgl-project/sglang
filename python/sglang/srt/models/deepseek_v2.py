@@ -109,6 +109,7 @@ from sglang.srt.layers.moe.utils import (
     is_deepep_class_backend,
     is_sbo_enabled,
     is_tbo_enabled,
+    uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -540,8 +541,8 @@ class DeepseekV2MoE(nn.Module):
         # DeepEP and MegaMoE shared expert fusion: shared expert is fused into
         # the same MoE kernel as a local expert at each EP rank. Expert layout
         # is expanded from 256 routed to 256+EP_size (e.g. 272 for EP=16).
-        _uses_per_rank_shared_slots = self.num_fused_shared_experts > 0 and (
-            is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+        _uses_per_rank_shared_slots = (
+            self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
         )
 
         if _uses_per_rank_shared_slots:
