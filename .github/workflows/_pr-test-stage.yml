@@ -97,7 +97,11 @@ jobs:
 
       - name: Resolve runner_config
         id: rc
-        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "${{ inputs.runner_config }}" == "4-gpu-gb300" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
 
       - name: Export rdma_devices to job env
         run: echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"
@@ -127,12 +131,18 @@ jobs:
         env:
           GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '0' }}
         run: |
+          if [[ "${{ inputs.runner_config }}" == "4-gpu-gb300" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''
         timeout-minutes: ${{ fromJson(inputs.warmup_timeout_minutes) }}
         run: |
+          if [[ "${{ inputs.runner_config }}" == "4-gpu-gb300" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
           # Activate venv if available (GITHUB_ENV may have failed to propagate)
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
@@ -142,6 +152,9 @@ jobs:
         if: inputs.warmup_server_models != ''
         timeout-minutes: ${{ fromJson(inputs.warmup_timeout_minutes) }}
         run: |
+          if [[ "${{ inputs.runner_config }}" == "4-gpu-gb300" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
@@ -161,6 +174,9 @@ jobs:
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
+          if [[ "${{ inputs.runner_config }}" == "4-gpu-gb300" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
           cd test
           python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
@@ -172,7 +188,11 @@ jobs:
       - name: Run extra pytest
         if: inputs.extra_pytest_path != ''
         timeout-minutes: 10
-        run: python3 -m pytest -q ${{ inputs.extra_pytest_path }}
+        run: |
+          if [[ "${{ inputs.runner_config }}" == "4-gpu-gb300" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          python3 -m pytest -q ${{ inputs.extra_pytest_path }}
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
