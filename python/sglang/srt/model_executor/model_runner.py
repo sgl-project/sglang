@@ -34,7 +34,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.jit_kernel.ngram_embedding import update_token_table_decode
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -2840,13 +2840,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.seq_lens
         )
         ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
-        update_token_table(
+        update_token_table_decode(
             ne_token_table=ngram_embedding_info.token_table,
             tokens=next_token_ids.to(torch.int32),
             row_indices=forward_batch.req_pool_indices,
             column_starts=ngram_embedding_info.out_column_starts,
-            req_lens=torch.ones_like(ngram_embedding_info.out_column_starts),
-            ignore_tokens=None,
         )
 
     def init_device_graphs(self):
