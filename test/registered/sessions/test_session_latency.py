@@ -1,25 +1,18 @@
 """
 Benchmark: Streaming Session Inter-Turn Latency
 
-Measures per-turn latency across three modes as context grows:
-  - no_session:        re-send full context each turn (radix tree prefix match)
-  - regular_session:   session append (radix tree insert + match)
-  - streaming_session: session append (O(1) KV direct transfer)
-
-Each mode runs NUM_CONCURRENT parallel sessions, each doing NUM_TURNS sequential
-requests (16 input / 8 output per turn).
-
-Usage:
-    python -m pytest bench_session_latency.py -s
-    python -m unittest bench_session_latency.BenchSessionLatency.test_streaming_session
-    python -m unittest bench_session_latency.BenchSessionLatency
+Tests:
+  1. Stability (bs=8):  streaming only, assert tail_avg / head_avg <= 1.15
+  2. Correctness (bs=1): regular vs streaming, assert output equal
+  3. Random lengths (bs=8): streaming only, random input/output lens, no crash
 """
 
+import random
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import requests
 from tabulate import tabulate
@@ -28,21 +21,25 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=122, stage="extra-a", runner_config="1-gpu-large")
 
-NUM_TURNS = 300
+NUM_TURNS = 150
 INPUT_LEN = 16
 GEN_LEN = 8
-NUM_CONCURRENT = 4
+NUM_CONCURRENT = 8
+HEAD_TURNS = 10
 TAIL_TURNS = 10
 SAMPLE_TURNS = 8
+
+NUM_TURNS_RANDOM = 50
+RANDOM_INPUT_LEN_RANGE = (8, 64)
+RANDOM_OUTPUT_LEN_RANGE = (4, 32)
 
 FILLER_TEXT = (
     "The quick brown fox jumps over the lazy dog. "
@@ -65,8 +62,6 @@ class TurnResult:
     turn: int
     context_len: int
     cached_tokens: int
-    prompt_tokens: int
-    completion_tokens: int
     client_latency_ms: float
     e2e_latency_ms: float
 
@@ -76,11 +71,6 @@ class ModeResult:
     mode: str
     turns: List[TurnResult] = field(default_factory=list)
     outputs: List[str] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _generate_input_chunks(
@@ -105,6 +95,36 @@ def _generate_input_chunks(
     return chunks
 
 
+def _generate_random_input_chunks(
+    tokenizer,
+    num_turns: int,
+    min_len: int,
+    max_len: int,
+    rng: random.Random,
+    offset: int = 0,
+) -> List[List[int]]:
+    all_ids = tokenizer.encode(FILLER_TEXT)
+    if all_ids and all_ids[0] == tokenizer.bos_token_id:
+        all_ids = all_ids[1:]
+
+    total_max = offset * num_turns * max_len + num_turns * max_len
+    while len(all_ids) < total_max:
+        all_ids = all_ids + all_ids
+
+    chunks: List[List[int]] = []
+    pos = offset * num_turns * max_len
+    for i in range(num_turns):
+        length = rng.randint(min_len, max_len)
+        chunk = all_ids[pos : pos + length]
+        pos += length
+        chunks.append(chunk)
+
+    if tokenizer.bos_token_id is not None:
+        chunks[0] = [tokenizer.bos_token_id] + chunks[0]
+
+    return chunks
+
+
 def _send_generate(base_url: str, payload: dict) -> dict:
     resp = requests.post(base_url + "/generate", json=payload)
     if resp.status_code != 200:
@@ -119,55 +139,27 @@ def _record_turn(
         turn=turn_idx + 1,
         context_len=context_len,
         cached_tokens=meta["cached_tokens"],
-        prompt_tokens=meta["prompt_tokens"],
-        completion_tokens=meta["completion_tokens"],
         client_latency_ms=client_latency_ms,
         e2e_latency_ms=meta.get("e2e_latency", 0) * 1000,
     )
 
 
-# ---------------------------------------------------------------------------
-# Single-session runners (called by worker threads)
-# ---------------------------------------------------------------------------
-
-
-def _run_one_no_session(
-    base_url: str, tokenizer, chunks: List[List[int]]
-) -> ModeResult:
-    result = ModeResult(mode="no_session")
-    accumulated_ids: List[int] = []
-
-    for turn_idx, chunk_ids in enumerate(chunks):
-        accumulated_ids.extend(chunk_ids)
-
-        t0 = time.perf_counter()
-        response = _send_generate(
-            base_url,
-            {"input_ids": accumulated_ids, "sampling_params": SAMPLING_PARAMS},
-        )
-        client_lat = (time.perf_counter() - t0) * 1000
-
-        meta = response["meta_info"]
-        result.turns.append(
-            _record_turn(turn_idx, len(accumulated_ids), meta, client_lat)
-        )
-        result.outputs.append(response["text"])
-
-        output_ids = tokenizer.encode(response["text"])
-        if output_ids and output_ids[0] == tokenizer.bos_token_id:
-            output_ids = output_ids[1:]
-        accumulated_ids.extend(output_ids)
-
-    return result
-
-
 def _run_one_session(
-    base_url: str, chunks: List[List[int]], streaming: bool = False
+    base_url: str,
+    chunks: List[List[int]],
+    streaming: bool = False,
+    per_turn_gen_lens: Optional[List[int]] = None,
 ) -> ModeResult:
     mode = "streaming_session" if streaming else "regular_session"
     result = ModeResult(mode=mode)
 
-    capacity = sum(len(c) for c in chunks) + len(chunks) * GEN_LEN + 1024
+    default_gen = GEN_LEN
+    if per_turn_gen_lens is not None:
+        max_gen = max(per_turn_gen_lens)
+    else:
+        max_gen = default_gen
+    capacity = sum(len(c) for c in chunks) + len(chunks) * max_gen + 1024
+
     open_payload: dict = {"capacity_of_str_len": capacity}
     if streaming:
         open_payload["streaming"] = True
@@ -179,13 +171,18 @@ def _run_one_session(
     for turn_idx, chunk_ids in enumerate(chunks):
         context_len += len(chunk_ids)
 
+        if per_turn_gen_lens is not None:
+            sp = {**SAMPLING_PARAMS, "max_new_tokens": per_turn_gen_lens[turn_idx]}
+        else:
+            sp = SAMPLING_PARAMS
+
         t0 = time.perf_counter()
         response = _send_generate(
             base_url,
             {
                 "input_ids": chunk_ids,
                 "session_params": {"id": session_id, "rid": rid},
-                "sampling_params": SAMPLING_PARAMS,
+                "sampling_params": sp,
             },
         )
         client_lat = (time.perf_counter() - t0) * 1000
@@ -201,19 +198,20 @@ def _run_one_session(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Stats & reporting
-# ---------------------------------------------------------------------------
-
-
 def _collect_latencies(
-    results: List[ModeResult], last_n: Optional[int] = None
+    results: List[ModeResult],
+    last_n: Optional[int] = None,
+    first_n: Optional[int] = None,
 ) -> List[float]:
     lats = []
     for r in results:
-        turns = r.turns[1:]  # skip turn 1
         if last_n is not None:
             turns = r.turns[-last_n:]
+        elif first_n is not None:
+            # Skip turn 1 (includes prefill), then take next `first_n` turns.
+            turns = r.turns[1 : 1 + first_n]
+        else:
+            turns = r.turns[1:]  # skip turn 1
         lats.extend(t.client_latency_ms for t in turns)
     return lats
 
@@ -256,63 +254,26 @@ def _print_mode_table(result: ModeResult, label: str = ""):
     )
 
 
-def _print_summary(all_results: Dict[str, List[ModeResult]]):
-    stats = [
-        (
-            mode,
-            _avg(_collect_latencies(rs)),
-            _avg(_collect_latencies(rs, last_n=TAIL_TURNS)),
-        )
-        for mode, rs in all_results.items()
-    ]
-    base_all, base_tail = (stats[0][1] or 1.0), (stats[0][2] or 1.0)
-    tail_label = f"last {TAIL_TURNS}"
-
-    print(f"\n  SUMMARY  ({NUM_CONCURRENT} sessions x {NUM_TURNS} turns)")
-    rows = [
-        [
-            mode,
-            f"{a:.1f}ms",
-            f"{t:.1f}ms",
-            f"{base_all / a:.2f}x" if a else "inf",
-            f"{base_tail / t:.2f}x" if t else "inf",
-        ]
-        for mode, a, t in stats
-    ]
-    print(
-        tabulate(
-            rows,
-            headers=[
-                "Mode",
-                "Avg (all)",
-                f"Avg ({tail_label})",
-                "Speedup (all)",
-                f"Speedup ({tail_label})",
-            ],
-            colalign=("left", "right", "right", "right", "right"),
-        )
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test class
-# ---------------------------------------------------------------------------
-
-
-class BenchSessionLatency(CustomTestCase):
-
+class TestSessionLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "openai/gpt-oss-20b"
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # NOTE: Overlap scheduling commits KV cache one step ahead,
+        # so the last decode token is cached (unlike non-overlap).
+        # Disable overlap to keep session cache behavior consistent.
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--attention-backend",
-                "flashinfer",
+                "--disable-overlap-schedule",
                 "--enable-streaming-session",
+                "--mem-fraction-static",
+                "0.70",
+                "--disable-piecewise-cuda-graph",
+                "--page-size",
+                "4",
             ],
         )
         cls.tokenizer = get_tokenizer(cls.model)
@@ -326,77 +287,113 @@ class BenchSessionLatency(CustomTestCase):
             },
         )
 
-        cls.all_results: Dict[str, List[ModeResult]] = {}
-
     @classmethod
     def tearDownClass(cls):
-        if len(cls.all_results) > 1:
-            _print_summary(cls.all_results)
         kill_process_tree(cls.process.pid)
 
-    def _run_concurrent_no_session(self) -> List[ModeResult]:
+    def _run_concurrent_session(
+        self,
+        streaming: bool = False,
+        num_concurrent: int = NUM_CONCURRENT,
+        num_turns: int = NUM_TURNS,
+        input_len: int = INPUT_LEN,
+        per_turn_gen_lens: Optional[List[int]] = None,
+        random_input_chunks: bool = False,
+        rng: Optional[random.Random] = None,
+    ) -> List[ModeResult]:
         requests.post(self.base_url + "/flush_cache")
 
         def run_one(session_idx):
-            chunks = _generate_input_chunks(
-                self.tokenizer, NUM_TURNS, INPUT_LEN, offset=session_idx
+            if random_input_chunks and rng is not None:
+                per_session_rng = random.Random(rng.randint(0, 2**32) + session_idx)
+                chunks = _generate_random_input_chunks(
+                    self.tokenizer,
+                    num_turns,
+                    RANDOM_INPUT_LEN_RANGE[0],
+                    RANDOM_INPUT_LEN_RANGE[1],
+                    per_session_rng,
+                    offset=session_idx,
+                )
+            else:
+                chunks = _generate_input_chunks(
+                    self.tokenizer, num_turns, input_len, offset=session_idx
+                )
+            return _run_one_session(
+                self.base_url,
+                chunks,
+                streaming=streaming,
+                per_turn_gen_lens=per_turn_gen_lens,
             )
-            return _run_one_no_session(self.base_url, self.tokenizer, chunks)
 
-        with ThreadPoolExecutor(max_workers=NUM_CONCURRENT) as pool:
-            return list(pool.map(run_one, range(NUM_CONCURRENT)))
-
-    def _run_concurrent_session(self, streaming: bool = False) -> List[ModeResult]:
-        requests.post(self.base_url + "/flush_cache")
-
-        def run_one(session_idx):
-            chunks = _generate_input_chunks(
-                self.tokenizer, NUM_TURNS, INPUT_LEN, offset=session_idx
-            )
-            return _run_one_session(self.base_url, chunks, streaming=streaming)
-
-        with ThreadPoolExecutor(max_workers=NUM_CONCURRENT) as pool:
-            return list(pool.map(run_one, range(NUM_CONCURRENT)))
-
-    # ------------------------------------------------------------------
-    # Test methods
-    # ------------------------------------------------------------------
-
-    def test_no_session(self):
-        results = self._run_concurrent_no_session()
-        self.__class__.all_results["no_session"] = results
-        _print_mode_table(results[0], label="session 0")
-
-    def test_regular_session(self):
-        results = self._run_concurrent_session(streaming=False)
-        self.__class__.all_results["regular_session"] = results
-        _print_mode_table(results[0], label="session 0")
+        with ThreadPoolExecutor(max_workers=num_concurrent) as pool:
+            return list(pool.map(run_one, range(num_concurrent)))
 
     def test_streaming_session(self):
+        """Stability: streaming reuses KV across turns, so tail/head latency
+        should stay flat. Skip turn 1 (prefill) when computing head."""
         results = self._run_concurrent_session(streaming=True)
-        self.__class__.all_results["streaming_session"] = results
         _print_mode_table(results[0], label="session 0")
 
-        reg_list = self.__class__.all_results.get("regular_session")
-        if reg_list:
-            reg_out = reg_list[0].outputs
-            stm_out = results[0].outputs
-            mismatches = sum(1 for a, b in zip(reg_out, stm_out) if a != b)
-            self.assertEqual(
-                mismatches,
-                0,
-                f"regular vs streaming (session 0): {mismatches}/{len(reg_out)} turns differ",
-            )
+        head_avg = _avg(_collect_latencies(results, first_n=HEAD_TURNS))
+        tail_avg = _avg(_collect_latencies(results, last_n=TAIL_TURNS))
+        ratio = tail_avg / head_avg if head_avg > 0 else float("inf")
+        print(
+            f"\n  streaming_session  "
+            f"head_avg(first {HEAD_TURNS})={head_avg:.1f}ms  "
+            f"tail_avg(last {TAIL_TURNS})={tail_avg:.1f}ms  "
+            f"ratio={ratio:.2f}"
+        )
+        self.assertLessEqual(
+            ratio,
+            1.15,
+            f"streaming latency should stay flat across turns "
+            f"(head={head_avg:.1f}ms, tail={tail_avg:.1f}ms, ratio={ratio:.2f} > 1.15)",
+        )
 
-            reg_tail = _avg(_collect_latencies(reg_list, last_n=TAIL_TURNS))
-            stm_tail = _avg(_collect_latencies(results, last_n=TAIL_TURNS))
-            speedup = reg_tail / stm_tail if stm_tail > 0 else float("inf")
-            self.assertGreaterEqual(
-                speedup,
-                2.0,
-                f"streaming should be >=2x faster on last {TAIL_TURNS} turns "
-                f"(regular={reg_tail:.1f}ms, streaming={stm_tail:.1f}ms, speedup={speedup:.2f}x)",
+    def test_streaming_session_correctness(self):
+        """Correctness test: bs=1, assert regular and streaming outputs match."""
+        correctness_turns = 30
+        reg = self._run_concurrent_session(
+            streaming=False, num_concurrent=1, num_turns=correctness_turns
+        )
+        stm = self._run_concurrent_session(
+            streaming=True, num_concurrent=1, num_turns=correctness_turns
+        )
+
+        _print_mode_table(reg[0], label="correctness regular")
+        _print_mode_table(stm[0], label="correctness streaming")
+
+        reg_out = reg[0].outputs
+        stm_out = stm[0].outputs
+        mismatches = sum(1 for a, b in zip(reg_out, stm_out) if a != b)
+        self.assertEqual(
+            mismatches,
+            0,
+            f"regular vs streaming (bs=1): {mismatches}/{len(reg_out)} turns differ",
+        )
+
+    def test_streaming_session_random_lengths(self):
+        """Stress test: bs=8, streaming only, random input/output lens."""
+        rng = random.Random(42)
+        gen_lens = [
+            rng.randint(*RANDOM_OUTPUT_LEN_RANGE) for _ in range(NUM_TURNS_RANDOM)
+        ]
+
+        results = self._run_concurrent_session(
+            streaming=True,
+            num_turns=NUM_TURNS_RANDOM,
+            per_turn_gen_lens=gen_lens,
+            random_input_chunks=True,
+            rng=random.Random(42),
+        )
+
+        for i, r in enumerate(results):
+            self.assertEqual(
+                len(r.turns),
+                NUM_TURNS_RANDOM,
+                f"session {i}: expected {NUM_TURNS_RANDOM} turns, got {len(r.turns)}",
             )
+        _print_mode_table(results[0], label="random streaming session 0")
 
 
 if __name__ == "__main__":

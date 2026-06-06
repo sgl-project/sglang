@@ -95,14 +95,14 @@ class EmbeddingCacheController:
         tp_rank,
         tp_size,
         max_pool_size_gb=4.0,
-        hidden_dim=1024,
+        hidden_dims: dict = None,
         tp_group=None,
         all_rank_get=False,
     ):
         self.tp_world_size = tp_size
         self.tp_group = tp_group
         self.all_rank_get = all_rank_get
-        self.hidden_dim = hidden_dim
+        self.hidden_dims = hidden_dims or {}
         self.element_size = torch.float32.itemsize
 
         # 1. Mooncake Backend & Pinned Buffer
@@ -115,7 +115,8 @@ class EmbeddingCacheController:
 
         # 2. Variable Size Memory Management
         self.allocator = ContiguousMemoryAllocator(self.total_pool_size_bytes)
-        self.hash_to_metadata = {}  # {image_hash: (offset, num_tokens, size_bytes)}
+        # {hash: (offset, num_tokens, embedding_dim, size_bytes)}
+        self.hash_to_metadata = {}
 
         # 3. Task Tracking
         self.ongoing_prefetch = {}  # {req_id: EmbeddingPrefetchOperation}
@@ -142,9 +143,19 @@ class EmbeddingCacheController:
             self.prefetch_tp_group = None
 
     def prefetch(
-        self, req_id: str, image_hashes: List[str], expected_tokens: List[int]
+        self,
+        req_id: str,
+        image_hashes: List[str],
+        expected_tokens: List[int],
+        modality=None,
     ):
         """Issues ONE batch GET for all missing images in the request."""
+        dim = self.hidden_dims.get(modality) if modality is not None else None
+        if not dim:
+            logger.warning(
+                f"Req {req_id}: Unknown dim for modality={modality}, skipping prefetch (will fallback to ViT)."
+            )
+            return
         keys, ptrs, sizes = [], [], []
 
         with self.lock:
@@ -155,12 +166,12 @@ class EmbeddingCacheController:
                     )
                     continue
 
-                size_bytes = num_tokens * self.hidden_dim * self.element_size
+                size_bytes = num_tokens * dim * self.element_size
                 offset = self.allocator.allocate(size_bytes)
                 if offset is None:
                     continue
 
-                self.hash_to_metadata[h] = (offset, num_tokens, size_bytes)
+                self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
                 sizes.append(size_bytes)
@@ -179,36 +190,58 @@ class EmbeddingCacheController:
     def insert_batch(
         self, image_hashes: List[str], embedding_tensors: List[torch.Tensor]
     ):
-        """Issues ONE batch PUT for all embeddings computed by this request."""
+        """Issues ONE batch PUT for all embeddings computed by this request.
+
+        Note: Even if the embedding exists locally, we still push to Mooncake
+        to ensure multi-node cache consistency. Mooncake's batch_put has
+        built-in deduplication to avoid redundant transfers.
+        """
         keys, ptrs, sizes = [], [], []
+        local_hit_count = 0
+        new_count = 0
+        skipped_count = 0
 
         with self.lock:
             for h, tensor in zip(image_hashes, embedding_tensors):
                 if h in self.hash_to_metadata:
+                    # Local cache hit: ensure Mooncake has it
+                    offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h][:4]
+
+                    # Still push to Mooncake for multi-node sharing
+                    # (Mooncake batch_put will deduplicate if already exists)
+                    keys.append(h)
+                    ptrs.append(self.cpu_pool.data_ptr() + offset)
+                    sizes.append(size_bytes)
+                    local_hit_count += 1
                     continue
 
-                num_tokens = tensor.shape[0]
-                size_bytes = num_tokens * self.hidden_dim * self.element_size
+                # Local cache miss: allocate and copy
+                num_tokens, dim = tensor.shape[0], tensor.shape[1]
+                size_bytes = num_tokens * dim * self.element_size
                 offset = self.allocator.allocate(size_bytes)
                 if offset is None:
+                    skipped_count += 1
                     continue
 
                 # Copy to pinned pool for RDMA
-                self.hash_to_metadata[h] = (offset, num_tokens, size_bytes)
                 target_view = (
                     self.cpu_pool[offset : offset + size_bytes]
                     .view(torch.float32)
-                    .view(num_tokens, self.hidden_dim)
+                    .view(num_tokens, dim)
                 )
                 target_view.copy_(tensor.cpu())
+                self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
 
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
                 sizes.append(size_bytes)
+                new_count += 1
 
             if keys:
                 logger.info(
-                    f"Global Cache: Inserting {len(keys)} new embeddings into Mooncake cluster."
+                    f"Global Cache: Inserting {len(keys)} embeddings into Mooncake cluster "
+                    f"({new_count} new, {local_hit_count} existing for replication, "
+                    f"{skipped_count} skipped due to allocation failure)"
                 )
                 self.insert_queue.put(EmbeddingInsertOperation(keys, ptrs, sizes))
 
@@ -277,11 +310,11 @@ class EmbeddingCacheController:
         with self.lock:
             tensors = []
             for h in image_hashes:
-                offset, num_tokens, size_bytes = self.hash_to_metadata[h]
+                offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h]
                 tensors.append(
                     self.cpu_pool[offset : offset + size_bytes]
                     .view(torch.float32)
-                    .view(num_tokens, self.hidden_dim)
+                    .view(num_tokens, dim)
                 )
             return tensors
 

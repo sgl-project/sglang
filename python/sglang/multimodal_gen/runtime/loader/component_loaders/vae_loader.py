@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -16,7 +15,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
@@ -24,6 +25,20 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+VAE_CHANNELS_LAST_3D_ENV = "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D"
+
+
+def _backfill_ltx2_audio_vae_latent_stats(
+    loaded: dict[str, torch.Tensor], component_name: str
+) -> None:
+    if component_name != "audio_vae":
+        return
+    mean_key = "per_channel_statistics.mean-of-means"
+    std_key = "per_channel_statistics.std-of-means"
+    if "latents_mean" not in loaded and mean_key in loaded:
+        loaded["latents_mean"] = loaded[mean_key]
+    if "latents_std" not in loaded and std_key in loaded:
+        loaded["latents_std"] = loaded[std_key]
 
 
 def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
@@ -43,6 +58,30 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
                 # Best-effort; skip unsupported cases.
                 continue
     return num_converted
+
+
+def _should_use_channels_last_3d(
+    server_args: ServerArgs | None, component_name: str
+) -> bool:
+    if component_name not in (
+        "vae",
+        "video_vae",
+    ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
+        return False
+
+    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
+    if override is not None and override.strip().lower() != "auto":
+        return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
+
+    if server_args is None:
+        return False
+
+    pipeline_name = server_args.pipeline_config.__class__.__name__
+    if pipeline_name.startswith("QwenImage"):
+        return True
+    if "Wan" in pipeline_name and server_args.num_gpus == 1:
+        return True
+    return False
 
 
 class VAELoader(ComponentLoader):
@@ -106,16 +145,13 @@ class VAELoader(ComponentLoader):
                     trust_remote_code=server_args.trust_remote_code,
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
-            if (
-                component_name in ("vae", "video_vae")
-                and torch.cuda.is_available()
-                and getattr(envs, "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", False)
-            ):
+            if _should_use_channels_last_3d(server_args, component_name):
                 n = _convert_conv3d_weights_to_channels_last_3d(vae)
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
+            vae = current_platform.optimize_vae(vae)
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
@@ -127,10 +163,20 @@ class VAELoader(ComponentLoader):
             vae = vae_cls(vae_config).to(target_device)
 
         safetensors_list = _list_safetensors_files(component_model_path)
+        safetensors_list = server_args.pipeline_config.select_vae_weight_files(
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            component_name=component_name,
+            vae_precision=vae_precision,
+        )
+
         assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
+            len(safetensors_list) >= 1
+        ), f"Found no safetensors files in {component_model_path}"
+        loaded = {}
+        for sf_path in safetensors_list:
+            loaded.update(safetensors_load_file(sf_path))
+        _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         vae.load_state_dict(loaded, strict=False)
 
         state_keys = set(vae.state_dict().keys())
@@ -142,13 +188,10 @@ class VAELoader(ComponentLoader):
         if unexpected_keys:
             logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
-        if (
-            component_name in ("vae", "video_vae")
-            and torch.cuda.is_available()
-            and getattr(envs, "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", False)
-        ):
+        if _should_use_channels_last_3d(server_args, component_name):
             n = _convert_conv3d_weights_to_channels_last_3d(vae)
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
+        vae = current_platform.optimize_vae(vae)
         return vae

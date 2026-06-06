@@ -52,15 +52,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-# DeepGEMM
-FetchContent_Declare(
-    repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-deepgemm)
-
 # fmt
 FetchContent_Declare(
     repo-fmt
@@ -74,7 +65,7 @@ FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-triton
     GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.5.1
+    GIT_TAG        v3.6.0
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-triton)
@@ -260,17 +251,15 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/allreduce/mscclpp_allreduce.cu"
-    "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
-    "csrc/elementwise/cast.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
+    "csrc/elementwise/dsv4_norm_rope.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
-    "csrc/elementwise/rope.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
@@ -286,12 +275,6 @@ set(SOURCES
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
-    "csrc/gemm/nvfp4_expert_quant.cu"
-    "csrc/gemm/nvfp4_quant_entry.cu"
-    "csrc/gemm/nvfp4_quant_kernels.cu"
-    "csrc/gemm/nvfp4_scaled_mm_entry.cu"
-    "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
-    "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
@@ -302,7 +285,6 @@ set(SOURCES
 
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
-    "csrc/memory/store.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
@@ -316,7 +298,6 @@ set(SOURCES
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/moe_topk_sigmoid_kernels.cu"
-    "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
@@ -525,51 +506,6 @@ install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
-
-# ============================ Extra Install: DeepGEMM (JIT) ============================= #
-# Create a separate library for DeepGEMM's Python API.
-# This keeps its compilation isolated from the main common_ops.
-set(DEEPGEMM_SOURCES
-    "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
-)
-
-Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
-
-# Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
-
-# Add include directories needed by DeepGEMM.
-target_include_directories(deep_gemm_cpp PRIVATE
-    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
-    ${repo-cutlass_SOURCE_DIR}/include
-    ${repo-fmt_SOURCE_DIR}/include
-)
-
-# Apply the same compile options as common_ops.
-target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-
-# Create an empty __init__.py to make `deepgemm` a Python package.
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
-install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
-    DESTINATION deep_gemm
-    RENAME __init__.py
-)
-
-# Install the compiled DeepGEMM API library.
-install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
-
-# Install the source files required by DeepGEMM for runtime JIT compilation.
-install(
-    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
-    DESTINATION deep_gemm
-)
-
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
-        DESTINATION "deep_gemm/include/cute")
-
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
-        DESTINATION "deep_gemm/include/cutlass")
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"

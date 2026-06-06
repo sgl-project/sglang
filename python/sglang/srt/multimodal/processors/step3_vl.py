@@ -8,10 +8,13 @@ import torch
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as F
 from transformers import BatchFeature, ProcessorMixin, TensorType
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.step3_vl import Step3VLForConditionalGeneration
 from sglang.srt.models.step3_vl_10b import StepVLForConditionalGeneration
+from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -19,14 +22,37 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 
-ImageWithPatches = tuple[Image.Image, list[Image.Image], list[int] | None]
+Step3Image = Union[Image.Image, torch.Tensor]
+ImageWithPatches = tuple[Step3Image, list[Step3Image], list[int] | None]
 
 
 class GPUToTensor(torch.nn.Module):
 
-    def forward(self, raw_image: Union[np.ndarray, Image.Image]) -> torch.Tensor:
+    def forward(
+        self, raw_image: Union[np.ndarray, Image.Image, torch.Tensor]
+    ) -> torch.Tensor:
+        if isinstance(raw_image, torch.Tensor):
+            image_tensor = raw_image
+            if image_tensor.ndim != 3:
+                raise TypeError(
+                    f"Expected CHW image tensor, got shape {tuple(image_tensor.shape)}"
+                )
+            if image_tensor.shape[0] == 1:
+                image_tensor = image_tensor.repeat(3, 1, 1)
+            elif image_tensor.shape[0] != 3:
+                raise TypeError(
+                    f"Expected CHW image tensor with 1 or 3 channels, got shape {tuple(image_tensor.shape)}"
+                )
+            if image_tensor.dtype == torch.uint8:
+                image_tensor = image_tensor.to(torch.float32).div(255)
+            elif not image_tensor.is_floating_point():
+                image_tensor = image_tensor.to(torch.float32)
+            return image_tensor.contiguous()
         if isinstance(raw_image, Image.Image):
-            return transforms.ToTensor()(raw_image)
+            image_tensor = transforms.ToTensor()(raw_image)
+            if torch.cuda.is_available():
+                image_tensor = image_tensor.to(torch.device("cuda"))
+            return image_tensor
         if raw_image.ndim == 2:
             raw_image = raw_image[:, :, None].repeat(3, -1)
         if torch.cuda.is_available():
@@ -90,6 +116,16 @@ class Step3VisionProcessor:
 
 
 class ImagePatcher:
+    def get_image_size(self, img: Step3Image) -> tuple[int, int]:
+        if isinstance(img, Image.Image):
+            return img.size
+        if isinstance(img, torch.Tensor):
+            if img.ndim != 3:
+                raise TypeError(
+                    f"Expected CHW image tensor, got shape {tuple(img.shape)}"
+                )
+            return int(img.shape[-1]), int(img.shape[-2])
+        raise TypeError(f"Unsupported image type: {type(img)}")
 
     def determine_window_size(self, long: int, short: int) -> int:
         if long <= 728:
@@ -131,14 +167,16 @@ class ImagePatcher:
             for box in windows
         ], (x_num, y_num)
 
-    def square_pad(self, img: Image.Image) -> Image.Image:
-        w, h = img.size
+    def square_pad(self, img: Step3Image) -> Step3Image:
+        w, h = self.get_image_size(img)
         if w == h:
             return img
         size = max(w, h)
-        padded = Image.new(img.mode, (size, size), 0)
-        padded.paste(img, (0, 0))
-        return padded
+        if isinstance(img, Image.Image):
+            padded = Image.new(img.mode, (size, size), 0)
+            padded.paste(img, (0, 0))
+            return padded
+        return torch.nn.functional.pad(img, (0, size - w, 0, size - h), value=0)
 
     def get_image_size_for_padding(
         self, img_width: int, img_height: int
@@ -181,9 +219,22 @@ class ImagePatcher:
             height_new = window_size * h_ratio
         return int(width_new), int(height_new)
 
-    def patch_crop(self, img: Image.Image, i: int, j: int, th: int, tw: int):
-        target = img.crop((j, i, j + tw, i + th))
-        return target
+    def resize(self, img: Step3Image, size: tuple[int, int]) -> Step3Image:
+        if isinstance(img, Image.Image):
+            return img.resize(size, Image.Resampling.BILINEAR)
+        return F.resize(
+            img,
+            [size[1], size[0]],
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        ).contiguous()
+
+    def patch_crop(
+        self, img: Step3Image, i: int, j: int, th: int, tw: int
+    ) -> Step3Image:
+        if isinstance(img, Image.Image):
+            return img.crop((j, i, j + tw, i + th))
+        return img[:, i : i + th, j : j + tw].contiguous()
 
     def get_num_patches(self, img_width: int, img_height: int) -> tuple[int, int]:
         img_width, img_height = self.get_image_size_for_padding(img_width, img_height)
@@ -211,20 +262,20 @@ class ImagePatcher:
             return len(center_list), full_rows
 
     def __call__(
-        self, img: Image.Image
-    ) -> tuple[Image.Image, list[Image.Image], list[bool] | None]:
-        img_width, img_height = img.size
+        self, img: Step3Image
+    ) -> tuple[Step3Image, list[Step3Image], list[bool] | None]:
+        img_width, img_height = self.get_image_size(img)
         new_img_width, new_img_height = self.get_image_size_for_padding(
             img_width, img_height
         )
         if new_img_width != img_width or new_img_height != img_height:
             img = self.square_pad(img)
-            img_width, img_height = img.size
+            img_width, img_height = self.get_image_size(img)
 
         new_img_width, new_img_height = self.get_image_size_for_preprocess(
             img_width, img_height
         )
-        img = img.resize((new_img_width, new_img_height), Image.Resampling.BILINEAR)
+        img = self.resize(img, (new_img_width, new_img_height))
         window_size = self.determine_window_size(
             max(new_img_height, new_img_width), min(new_img_height, new_img_width)
         )
@@ -235,9 +286,7 @@ class ImagePatcher:
                 new_img_width, new_img_height, window_size
             )
             if (new_img_width, new_img_height) != (img_width, img_height):
-                img_for_crop = img.resize(
-                    (new_img_width, new_img_height), Image.Resampling.BILINEAR
-                )
+                img_for_crop = self.resize(img, (new_img_width, new_img_height))
             else:
                 img_for_crop = img
 
@@ -319,7 +368,7 @@ class Step3VLProcessor:
 
     def _convert_images_to_pixel_values(
         self,
-        images: list[Image.Image],
+        images: list[Step3Image],
         is_patch: bool = False,
     ) -> list[torch.Tensor]:
         return [
@@ -472,7 +521,11 @@ class Step3VLProcessor:
 
 
 class Step3VLImageProcessor(SGLangBaseProcessor):
-    models = [Step3VLForConditionalGeneration, StepVLForConditionalGeneration]
+    models = [
+        Step3VLForConditionalGeneration,
+        StepVLForConditionalGeneration,
+        Step3p7ForConditionalGeneration,
+    ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # TODO, check _processor is tokenizer or processor.
@@ -503,7 +556,7 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -514,8 +567,8 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+        )

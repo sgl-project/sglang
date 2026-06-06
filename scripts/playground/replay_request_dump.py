@@ -1,16 +1,15 @@
 """
 Usage:
 # replay from a folder
-python3 replay_request_dump.py --file-number 100 --parallel 512 --input-folder /data/lianmin/sglang_request_dump/grok-mini-0220-engine-5756f8f94-28bm6/
+python3 replay_request_dump.py --file-number 100 --parallel 512 --input-folder /data/lianmin/sglang_request_dump/engine-34xd1/
 
 # replay from a single file
-python3 replay_request_dump.py --parallel 512 --input-file /data/sglang_crash_dump/memx-cti-34-sr1.xpop.twttr.net/crash_dump_2025-06-04_20-13-18.pkl
+python3 replay_request_dump.py --parallel 512 --input-file /data/sglang_crash_dump/crash_dump_2025-06-04_20-13-18.pkl
 """
 
 import argparse
 import glob
 import json
-import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -19,6 +18,7 @@ from datetime import datetime
 import requests
 
 from sglang.benchmark.utils import set_ulimit
+from sglang.srt.utils.common import safe_pickle_load
 from sglang.utils import get_exception_traceback
 
 
@@ -54,7 +54,8 @@ def normalize_request_data(json_data):
 def read_records(files):
     records = []
     for f in files:
-        tmp = pickle.load(open(f, "rb"))
+        with open(f, "rb") as fh:
+            tmp = safe_pickle_load(fh)
         if isinstance(tmp, dict) and "requests" in tmp:
             records.extend(tmp["requests"])
         else:

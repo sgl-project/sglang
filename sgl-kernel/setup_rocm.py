@@ -46,6 +46,8 @@ sources = [
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/deepseek_v4_topk.cu",
+    "csrc/elementwise/dsv4_norm_rope.cu",
     "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
@@ -118,7 +120,7 @@ ext_modules = [
 ]
 
 setup(
-    name="sgl-kernel",
+    name="sglang-kernel",
     version=_get_version(),
     packages=find_packages(where="python"),
     package_dir={"": "python"},

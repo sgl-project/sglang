@@ -6,10 +6,13 @@ Usage:
     # launch a server and benchmark on it
 
     # T2V or T2I or any other multimodal generation model
-    sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
+
+    # benchmark with SLO metrics enabled
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231 --slo --slo-scale 3.0 --warmup-requests 2
 """
 
 import argparse
@@ -17,6 +20,7 @@ import asyncio
 import json
 import os
 import time
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -35,8 +39,106 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
+
+# Patch size used for computing area units (e.g. in latent diffusion models).
+PATCH_SIZE = 16
+PATCH_AREA = PATCH_SIZE * PATCH_SIZE
+
+
+def _get_response_output_count(resp_json: Dict[str, Any]) -> int:
+    if isinstance(resp_json.get("num_outputs"), int):
+        return resp_json["num_outputs"]
+    if isinstance(resp_json.get("data"), list):
+        return len(resp_json["data"])
+    if isinstance(resp_json.get("file_paths"), list):
+        return len(resp_json["file_paths"])
+    if isinstance(resp_json.get("urls"), list):
+        return len(resp_json["urls"])
+    if resp_json.get("file_path") or resp_json.get("url"):
+        return 1
+    return 0
+
+
+def _compute_scale_factor(req: RequestFuncInput, args) -> Optional[float]:
+    """Computes the composite scale factor (area × frames × steps) for a request."""
+    width = req.width or args.width
+    height = req.height or args.height
+    if None in (width, height):
+        return None
+    frames = req.num_frames or args.num_frames
+    steps = req.num_inference_steps or args.num_inference_steps
+
+    frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
+    step_scale = steps if isinstance(steps, int) and steps > 0 else 1
+
+    area_units = max((float(width) * float(height)) / float(PATCH_AREA), 1.0)
+    return area_units * float(frame_scale) * float(step_scale)
+
+
+def _compute_expected_latency_ms_from_base(
+    req: RequestFuncInput, args, base_time_ms: Optional[float]
+) -> Optional[float]:
+    """Scales latency linearly by pixel area, frame count, and inference steps."""
+    if base_time_ms is None:
+        return None
+    scale = _compute_scale_factor(req, args)
+    if scale is None:
+        return None
+    return float(base_time_ms) * scale
+
+
+def _infer_slo_base_time_ms_from_warmups(
+    warmup_pairs: List[tuple], args
+) -> Optional[float]:
+    """Derives median base latency from successful warmup runs."""
+    candidates_ms: List[float] = []
+    for req, out in warmup_pairs:
+        if not out.success or out.latency <= 0:
+            logger.warning(
+                f"Skipping warmup result: success={out.success}, latency={out.latency:.3f}"
+            )
+            continue
+
+        scale = _compute_scale_factor(req, args)
+        if scale is None or scale <= 0:
+            continue
+
+        candidates_ms.append((out.latency * 1000.0) / scale)
+
+    return float(np.median(candidates_ms)) if candidates_ms else None
+
+
+def _populate_slo_ms_from_warmups(
+    requests_list: List[RequestFuncInput], warmup_pairs: List[tuple], args
+) -> List[RequestFuncInput]:
+    """Assigns estimated SLO targets to requests lacking them."""
+    if not any(req.slo_ms is None for req in requests_list):
+        return requests_list
+
+    base_time_ms = _infer_slo_base_time_ms_from_warmups(warmup_pairs, args)
+    if base_time_ms is None:
+        return requests_list
+
+    slo_scale = float(getattr(args, "slo_scale", 3.0))
+    if slo_scale <= 0:
+        raise ValueError(f"slo_scale must be positive, got {slo_scale}.")
+
+    updated: List[RequestFuncInput] = []
+    for req in requests_list:
+        if req.slo_ms is not None:
+            updated.append(req)
+            continue
+        expected_ms = _compute_expected_latency_ms_from_base(req, args, base_time_ms)
+        if expected_ms is not None:
+            # Create a new RequestFuncInput with updated slo_ms
+            updated.append(replace(req, slo_ms=expected_ms * slo_scale))
+        else:
+            updated.append(req)
+
+    return updated
 
 
 async def async_request_image_sglang(
@@ -54,6 +156,7 @@ async def async_request_image_sglang(
         data.add_field("model", input.model)
         data.add_field("prompt", input.prompt)
         data.add_field("response_format", "b64_json")
+        data.add_field("n", str(input.num_outputs_per_prompt))
 
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
@@ -84,6 +187,7 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
                         output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
@@ -97,12 +201,14 @@ async def async_request_image_sglang(
         payload = {
             "model": input.model,
             "prompt": input.prompt,
-            "n": 1,
+            "n": input.num_outputs_per_prompt,
             "response_format": "b64_json",
         }
 
         if input.width and input.height:
             payload["size"] = f"{input.width}x{input.height}"
+        if input.num_inference_steps:
+            payload["num_inference_steps"] = input.num_inference_steps
 
         # Merge extra parameters
         payload.update(input.extra_body)
@@ -113,6 +219,7 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
                         output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
@@ -123,6 +230,10 @@ async def async_request_image_sglang(
             output.success = False
 
     output.latency = time.perf_counter() - output.start_time
+
+    # Check SLO if defined
+    if input.slo_ms is not None and output.success:
+        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
 
     if pbar:
         pbar.update(1)
@@ -145,6 +256,7 @@ async def async_request_video_sglang(
         data = aiohttp.FormData()
         data.add_field("model", input.model)
         data.add_field("prompt", input.prompt)
+        data.add_field("num_outputs_per_prompt", str(input.num_outputs_per_prompt))
 
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
@@ -202,11 +314,14 @@ async def async_request_video_sglang(
         payload: Dict[str, Any] = {
             "model": input.model,
             "prompt": input.prompt,
+            "num_outputs_per_prompt": input.num_outputs_per_prompt,
         }
         if input.width and input.height:
             payload["size"] = f"{input.width}x{input.height}"
         if input.num_frames:
             payload["num_frames"] = input.num_frames
+        if input.num_inference_steps:
+            payload["num_inference_steps"] = input.num_inference_steps
         if input.fps:
             payload["fps"] = input.fps
 
@@ -254,6 +369,7 @@ async def async_request_video_sglang(
                     if status == "completed":
                         output.success = True
                         output.response_body = status_data
+                        output.output_count = _get_response_output_count(status_data)
                         if "peak_memory_mb" in status_data:
                             output.peak_memory_mb = status_data["peak_memory_mb"]
                         break
@@ -277,32 +393,77 @@ async def async_request_video_sglang(
 
     output.latency = time.perf_counter() - output.start_time
 
+    # Check SLO if defined
+    if input.slo_ms is not None and output.success:
+        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
+
     if pbar:
         pbar.update(1)
     return output
 
 
-def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
+def calculate_metrics(
+    outputs: List[RequestFuncOutput],
+    total_duration: float,
+    requests_list: List[RequestFuncInput],
+    args,
+    slo_enabled: bool,
+):
     success_outputs = [o for o in outputs if o.success]
     error_outputs = [o for o in outputs if not o.success]
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
-    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
+    completed_outputs = sum(o.output_count for o in success_outputs)
+    peak_memories = [
+        o.peak_memory_mb
+        for o in success_outputs
+        if o.peak_memory_mb is not None and o.peak_memory_mb > 0
+    ]
 
     metrics = {
         "duration": total_duration,
         "completed_requests": num_success,
+        "completed_outputs": completed_outputs,
         "failed_requests": len(error_outputs),
         "throughput_qps": num_success / total_duration if total_duration > 0 else 0,
+        "output_throughput_ops": (
+            completed_outputs / total_duration if total_duration > 0 else 0
+        ),
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,
-        "latency_p99": np.percentile(latencies, 99) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
+        "latency_p90": np.percentile(latencies, 90) if latencies else 0,
+        "latency_p95": np.percentile(latencies, 95) if latencies else 0,
+        "latency_p99": np.percentile(latencies, 99) if latencies else 0,
+        "num_outputs_per_prompt": args.num_outputs_per_prompt,
         "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
     }
+
+    if slo_enabled:
+        slo_defined_total = 0
+        slo_met_success = 0
+
+        for req, out in zip(requests_list, outputs):
+            if req.slo_ms is None:
+                continue
+            slo_defined_total += 1
+            if out.slo_achieved:
+                slo_met_success += 1
+
+        slo_attain_all = (
+            (slo_met_success / slo_defined_total) if slo_defined_total > 0 else 0.0
+        )
+
+        metrics.update(
+            {
+                "slo_attainment_rate": slo_attain_all,
+                "slo_met_success": slo_met_success,
+                "slo_scale": getattr(args, "slo_scale", 3.0),
+            }
+        )
 
     return metrics
 
@@ -333,7 +494,7 @@ async def benchmark(args):
 
     # Construct base_url if not provided
     if args.base_url is None:
-        args.base_url = f"http://{args.host}:{args.port}"
+        args.base_url = NetworkAddress(args.host, args.port).to_url()
 
     # Wait for service
     wait_for_service(args.base_url)
@@ -394,6 +555,11 @@ async def benchmark(args):
 
     setattr(args, "task_name", task_name)
 
+    if args.random_request_config and args.dataset != "random":
+        raise ValueError(
+            "--random-request-config can only be used with --dataset random"
+        )
+
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
     elif args.dataset == "random":
@@ -418,10 +584,39 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
-    # Run benchmark
-    pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
-
     async with aiohttp.ClientSession() as session:
+        # Run warmup requests
+        warmup_pairs: List[tuple] = []
+        if args.warmup_requests and requests_list:
+            # The server always overrides warmup requests to use
+            # num_inference_steps=1 (see Req.set_as_warmup), so we match
+            # that here to keep the benchmark's SLO estimation consistent.
+            warmup_steps = 1
+            logger.info(
+                f"Running {args.warmup_requests} warmup request(s) with "
+                f"num_inference_steps={warmup_steps}..."
+            )
+            for i in range(args.warmup_requests):
+                warm_req = requests_list[i % len(requests_list)]
+                warm_req = replace(
+                    warm_req,
+                    num_inference_steps=warmup_steps,
+                )
+                warm_out = await limited_request_func(warm_req, session, None)
+                warmup_pairs.append((warm_req, warm_out))
+                logger.info(
+                    f"Warmup {i+1}/{args.warmup_requests}: "
+                    f"latency={warm_out.latency:.2f}s, success={warm_out.success}"
+                )
+
+        # Populate SLO values from warmups if enabled
+        if args.slo:
+            requests_list = _populate_slo_ms_from_warmups(
+                requests_list=requests_list, warmup_pairs=warmup_pairs, args=args
+            )
+
+        # Run benchmark
+        pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
         start_time = time.perf_counter()
         tasks = []
         for req in requests_list:
@@ -436,10 +631,10 @@ async def benchmark(args):
         outputs = await asyncio.gather(*tasks)
         total_duration = time.perf_counter() - start_time
 
-    pbar.close()
+        pbar.close()
 
     # Calculate metrics
-    metrics = calculate_metrics(outputs, total_duration)
+    metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
@@ -460,14 +655,21 @@ async def benchmark(args):
         "Successful requests:",
         f"{metrics['completed_requests']}/{len(requests_list)}",
     )
+    print_value_formatted("Completed outputs:", metrics["completed_outputs"])
+    print_value_formatted("Outputs per prompt:", metrics["num_outputs_per_prompt"])
 
     # Section 3: Performance Metrics
     print_divider(50)
 
     print_value_formatted("Request throughput (req/s):", metrics["throughput_qps"])
+    print_value_formatted(
+        "Output throughput (outputs/s):", metrics["output_throughput_ops"]
+    )
 
     print_value_formatted("Latency Mean (s):", metrics["latency_mean"])
     print_value_formatted("Latency Median (s):", metrics["latency_median"])
+    print_value_formatted("Latency P90 (s):", metrics["latency_p90"])
+    print_value_formatted("Latency P95 (s):", metrics["latency_p95"])
     print_value_formatted("Latency P99 (s):", metrics["latency_p99"])
 
     if metrics["peak_memory_mb_max"] > 0:
@@ -477,6 +679,16 @@ async def benchmark(args):
         print_value_formatted(
             "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
         )
+
+    if args.slo and "slo_attainment_rate" in metrics:
+        print_divider(50)
+        print(
+            "{:<40} {:<15.2%}".format(
+                "SLO Attainment Rate:", metrics["slo_attainment_rate"]
+            )
+        )
+        print("{:<40} {:<15}".format("SLO Met (Success):", metrics["slo_met_success"]))
+        print("{:<40} {:<15.2f}".format("SLO Scale:", metrics["slo_scale"]))
 
     print_divider(60)
 
@@ -535,6 +747,12 @@ if __name__ == "__main__":
         "--num-prompts", type=int, default=10, help="Number of prompts to benchmark."
     )
     parser.add_argument(
+        "--num-outputs-per-prompt",
+        type=int,
+        default=1,
+        help="Number of generated outputs requested per prompt.",
+    )
+    parser.add_argument(
         "--max-concurrency",
         type=int,
         default=1,
@@ -557,6 +775,26 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
     parser.add_argument(
+        "--random-request-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON string defining random request profiles. "
+            "Each profile may contain: width, height, num_inference_steps, "
+            "num_outputs_per_prompt, etc. "
+            "The 'weight' field controls sampling probability (relative weight). "
+            "Example: "
+            '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
+            '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
+        ),
+    )
+    parser.add_argument(
+        "--random-request-seed",
+        type=int,
+        default=42,
+        help="Random seed for sampling request profiles (default: 42).",
+    )
+    parser.add_argument(
         "--num-frames", type=int, default=None, help="Number of frames (for video)."
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
@@ -572,6 +810,29 @@ if __name__ == "__main__":
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level.",
+    )
+    parser.add_argument(
+        "--slo",
+        action="store_true",
+        help="Enable SLO calculation. Uses trace-provided slo_ms or infers from warmups.",
+    )
+    parser.add_argument(
+        "--slo-scale",
+        type=float,
+        default=3.0,
+        help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
+    )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=1,
+        help="Number of warmup requests to run before measurement.",
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Number of inference steps for diffusion models.",
     )
 
     args = parser.parse_args()

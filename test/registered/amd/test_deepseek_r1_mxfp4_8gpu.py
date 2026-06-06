@@ -1,9 +1,9 @@
-import os
 import unittest
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -27,6 +27,12 @@ class TestDeepseekR1MXFP4(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_R1_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        # Workaround: AITER custom all-gather corrupts CUDA-graph IPC buffer
+        # registration and triggers a decode-time "Memory access fault" on
+        # MI35x TP=8. Disable until the AITER-side fix lands (see PR body).
+        envs.SGLANG_USE_AITER_AG.set(False)
+
         other_args = [
             "--tp",
             "8",
@@ -87,6 +93,11 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_R1_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
+        # Same AITER custom all-gather workaround as TestDeepseekR1MXFP4 above.
+        envs.SGLANG_USE_AITER_AG.set(False)
+
         other_args = [
             "--tp",
             "8",
@@ -113,8 +124,6 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
-            del os.environ["SGLANG_ENABLE_SPEC_V2"]
 
     def test_a_gsm8k(
         self,
@@ -133,7 +142,7 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

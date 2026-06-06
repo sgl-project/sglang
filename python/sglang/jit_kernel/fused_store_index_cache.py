@@ -19,6 +19,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 @cache_once
-def _jit_nsa_fused_store_module(
+def _jit_dsa_fused_store_module(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
 ) -> Module:
     """
@@ -38,13 +39,13 @@ def _jit_nsa_fused_store_module(
     return load_jit(
         "fused_store_index_k_cache",
         *args,
-        cuda_files=["nsa/fused_store_index_cache.cuh"],
+        cuda_files=["dsa/fused_store_index_cache.cuh"],
         cuda_wrappers=[
             (
                 "fused_store_index_k_cache",
                 # - Float  = bf16_t (sgl_kernel/type.cuh)
                 # - IndicesT = int64_t (out_cache_loc is int64 in SGLang SetKAndS)
-                # - kPageSize = 64 (CUDA NSA)
+                # - kPageSize = 64 (CUDA DSA)
                 f"FusedStoreCacheIndexerKernel<{args}>::run",
             )
         ],
@@ -52,18 +53,19 @@ def _jit_nsa_fused_store_module(
 
 
 @cache_once
-def can_use_nsa_fused_store(
+def can_use_dsa_fused_store(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
 ) -> bool:
     logger = logging.getLogger(__name__)
     try:
-        _jit_nsa_fused_store_module(key_dtype, indices_dtype, page_size)
+        _jit_dsa_fused_store_module(key_dtype, indices_dtype, page_size)
         return True
     except Exception as e:
-        logger.warning(f"Failed to load nsa fused store JIT kernel: {e}")
+        logger.warning(f"Failed to load dsa fused store JIT kernel: {e}")
         return False
 
 
+@debug_kernel_api
 def fused_store_index_k_cache(
     key: torch.Tensor,
     index_k_with_scale: torch.Tensor,
@@ -71,7 +73,7 @@ def fused_store_index_k_cache(
     page_size: int = 64,
 ) -> None:
     """
-    Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into NSATokenToKVPool.index_k_with_scale_buffer.
+    Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into DSATokenToKVPool.index_k_with_scale_buffer.
 
     key:            (num_tokens, 128) bf16 (or reshapeable to it)
     index_k_with_scale:  (num_pages, 64*(128+4)) uint8
@@ -99,5 +101,5 @@ def fused_store_index_k_cache(
     if not index_k_with_scale.is_contiguous():
         index_k_with_scale = index_k_with_scale.contiguous()
 
-    module = _jit_nsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
+    module = _jit_dsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
     module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)

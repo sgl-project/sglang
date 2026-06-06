@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/marlin_utils.py
 
 from __future__ import annotations
@@ -55,6 +56,8 @@ GPTQ_MARLIN_MIN_THREAD_K = 128
 GPTQ_MARLIN_MAX_PARALLEL = 16
 
 MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+# NVFP SUPPORT 16, while MXFP4 supports 32 and 16.
+FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16, 32]
 
 # In case there is a performance issue with Marlin, the variable below can be
 # changed to False, which allows Marlin to perform global reductions in fp16
@@ -136,11 +139,15 @@ def _check_marlin_supported(
             f"are supported (for group_size = {group_size}, "
             f"device_capability = {device_capability}, zp = {has_zp}).",
         )
-    if group_size is None or group_size not in MARLIN_SUPPORTED_GROUP_SIZES:
+    if quant_type == scalar_types.float4_e2m1f:
+        allowed_group_sizes = FP4_MARLIN_SUPPORTED_GROUP_SIZES
+    else:
+        allowed_group_sizes = MARLIN_SUPPORTED_GROUP_SIZES
+    if group_size is None or group_size not in allowed_group_sizes:
         return (
             False,
-            f"Marlin does not support group_size = {group_size}. "
-            f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
+            f"Marlin does not support group_size = {group_size} for "
+            f"quant_type = {quant_type}. Only group_sizes = {allowed_group_sizes} "
             "are supported.",
         )
 
@@ -238,8 +245,13 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
     supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
-    # moe marlin requires the activation to be silu
-    supports_activation = layer.moe_runner_config.activation == "silu"
+    if layer.moe_runner_config.is_gated:
+        supports_activation = layer.moe_runner_config.activation == "silu"
+    else:
+        supports_activation = layer.moe_runner_config.activation in {
+            "silu",
+            "relu2",
+        }
 
     # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
     # down: (n, k) = (hidden_size, intermediate_size_per_partition)
@@ -261,7 +273,7 @@ def marlin_make_workspace(
     device: torch.device, max_blocks_per_sm: int = 1
 ) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
-    # size. The num of threadblocks is is sms_count * max_blocks_per_sm.
+    # size. The num of threadblocks is sms_count * max_blocks_per_sm.
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(
         sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
