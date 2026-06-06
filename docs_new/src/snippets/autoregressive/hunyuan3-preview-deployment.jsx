@@ -5,15 +5,21 @@ export const Hunyuan3PreviewDeployment = () => {
   //   B200 (180GB): tp=8
   //   B300 (275GB): tp=4
   //   GB300 (275GB, 4-GPU node): tp=4
+  //   AMD MI300X / MI325X (192GB): tp=8
+  //   AMD MI350X / MI355X (288GB): tp=8
   const options = {
     hardware: {
       name: 'hardware',
       title: 'Hardware Platform',
       items: [
-        { id: 'h200',  label: 'H200',  default: true  },
-        { id: 'b200',  label: 'B200',  default: false },
-        { id: 'b300',  label: 'B300',  default: false },
-        { id: 'gb300', label: 'GB300', default: false }
+        { id: 'h200',   label: 'H200',   default: true  },
+        { id: 'b200',   label: 'B200',   default: false },
+        { id: 'b300',   label: 'B300',   default: false },
+        { id: 'gb300',  label: 'GB300',  default: false },
+        { id: 'mi300x', label: 'MI300X', default: false },
+        { id: 'mi325x', label: 'MI325X', default: false },
+        { id: 'mi350x', label: 'MI350X', default: false },
+        { id: 'mi355x', label: 'MI355X', default: false }
       ]
     },
     reasoning: {
@@ -43,10 +49,14 @@ export const Hunyuan3PreviewDeployment = () => {
   };
 
   const modelConfigs = {
-    h200:  { tp: 8, mem: 0.9 },
-    b200:  { tp: 8, mem: 0.9 },
-    b300:  { tp: 4, mem: 0.9 },
-    gb300: { tp: 4, mem: 0.9 }
+    h200:   { tp: 8, mem: 0.9 },
+    b200:   { tp: 8, mem: 0.9 },
+    b300:   { tp: 4, mem: 0.9 },
+    gb300:  { tp: 4, mem: 0.9 },
+    mi300x: { tp: 8, mem: 0.85 },
+    mi325x: { tp: 8, mem: 0.85 },
+    mi350x: { tp: 8, mem: 0.85 },
+    mi355x: { tp: 8, mem: 0.85 }
   };
 
   const resolveItems = (option, values) => {
@@ -88,6 +98,7 @@ export const Hunyuan3PreviewDeployment = () => {
   const generateCommand = () => {
     const { hardware } = values;
     const isBlackwell = hardware === 'b200' || hardware === 'b300' || hardware === 'gb300';
+    const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi350x' || hardware === 'mi355x';
     const hwConfig = modelConfigs[hardware];
     if (!hwConfig) return '# Configuration not available for the selected hardware.';
 
@@ -97,6 +108,11 @@ export const Hunyuan3PreviewDeployment = () => {
     const enableSpec = values.speculative === 'enabled';
 
     let cmd = '';
+    // AMD: until sgl-project/sglang#23581 (HIP CUDA-graph fix) and #23533
+    // (Hy3-preview model code) ship in rocm/sgl-dev, AITER's custom
+    // all-reduce must be disabled to avoid hipErrorStreamCaptureInvalidated.
+    // See bug: https://github.com/sgl-project/sglang/issues/23580
+    if (isAMD) cmd += 'SGLANG_USE_AITER_AR=0 ';
     if (enableSpec) cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
     cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
@@ -106,9 +122,10 @@ export const Hunyuan3PreviewDeployment = () => {
     if (values.toolcall  === 'enabled') cmd += ' \\\n  --tool-call-parser hunyuan';
     if (enableSpec) {
       cmd += ' \\\n  --speculative-algorithm EAGLE';
-      cmd += ' \\\n  --speculative-num-steps 3';
+      // num-steps=1 with num-draft-tokens=2 matches the model card's recommended MTP config.
+      cmd += ` \\\n  --speculative-num-steps ${isAMD ? 1 : 3}`;
       cmd += ' \\\n  --speculative-eagle-topk 1';
-      cmd += ' \\\n  --speculative-num-draft-tokens 4';
+      cmd += ` \\\n  --speculative-num-draft-tokens ${isAMD ? 2 : 4}`;
     }
 
     cmd += ' \\\n  --trust-remote-code';
