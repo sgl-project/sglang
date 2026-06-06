@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
@@ -225,6 +226,38 @@ class TestTreeNode(unittest.TestCase):
 
         node.hash_value = ["hash1", "hash2", "hash3"]
         self.assertEqual(node.get_last_hash_value(), "hash3")
+
+    def test_get_prefix_hash_values_not_shared_across_calls(self):
+        """Regression guard for cached mutable prefix hash lists."""
+        for node_cls in (TreeNode, MambaTreeNode):
+            with self.subTest(node_cls=node_cls.__module__):
+                root = node_cls()
+                n1 = node_cls()
+                n1.parent = root
+                n1.hash_value = ["h1"]
+                n2 = node_cls()
+                n2.parent = n1
+                n2.hash_value = ["h2"]
+                n3 = node_cls()
+                n3.parent = n2
+                n3.hash_value = ["h3"]
+
+                first = n3.get_prefix_hash_values(n2)
+                self.assertEqual(first, ["h1", "h2"])
+
+                # Downstream storage code extends prefix_keys in place while
+                # processing pages. A cached list must not be observable by a
+                # later call.
+                first += ["h3"]
+
+                second = n3.get_prefix_hash_values(n2)
+                self.assertEqual(second, ["h1", "h2"])
+                self.assertIsNot(second, first)
+
+                n4 = node_cls()
+                n4.parent = n3
+                n4.hash_value = ["h4"]
+                self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
     def test_lt_comparison(self):
         """Test less than comparison based on last_access_time."""

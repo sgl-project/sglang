@@ -32,6 +32,11 @@ class GenerationBatchResult:
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
+    # PP skip output comm: True when output send/recv was skipped and
+    # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
+    # to validate that skipped output is never consumed.
+    skipped_output_comm: bool = False
+
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
@@ -235,7 +240,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
 
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.speculative_num_draft_tokens
+    spec_tokens = server_args.max_speculative_num_draft_tokens
     page_size = server_args.page_size
 
     if page_size == 1 or spec_topk == 1:

@@ -124,6 +124,11 @@ if _is_cuda:
 
         _jit_rmsnorm_hf = None
 
+    from sglang.jit_kernel.norm import fused_add_rmsnorm as _jit_fused_add_rmsnorm
+    from sglang.jit_kernel.norm import (
+        is_supported_jit_fused_add_rmsnorm_hidden_size,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +183,7 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
+                    max_token_num=max(x.shape[0], 2048),
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
@@ -269,6 +275,27 @@ class RMSNorm(MultiPlatformOp):
                 out = out.reshape(original_shape)
             return out
         if residual is not None:
+            if self.cast_x_before_out_mul:
+                if (
+                    x.dtype in (torch.float16, torch.bfloat16)
+                    and self.weight.data.dtype == x.dtype
+                    and (
+                        post_residual_addition is None
+                        or post_residual_addition.dtype == x.dtype
+                    )
+                    and is_supported_jit_fused_add_rmsnorm_hidden_size(x.shape[-1])
+                ):
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    _jit_fused_add_rmsnorm(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.variance_epsilon,
+                        cast_x_before_out_mul=self.cast_x_before_out_mul,
+                    )
+                    return x, residual
+                return self.forward_native(x, residual, post_residual_addition)
             # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
@@ -586,7 +613,9 @@ class GemmaRMSNorm(MultiPlatformOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
-        self.register_buffer("gemma_weight", self.weight.data + 1.0, persistent=False)
+        self.register_buffer(
+            "gemma_weight", torch.ones_like(self.weight), persistent=False
+        )
         # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
@@ -595,7 +624,8 @@ class GemmaRMSNorm(MultiPlatformOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
-        self.gemma_weight = param.data + 1.0
+        # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
+        torch.add(param.data, 1.0, out=self.gemma_weight)
 
     def _forward_impl(
         self,
@@ -846,6 +876,15 @@ class Gemma4RMSNorm(MultiPlatformOp):
 
         if needs_reshape:
             out = out.reshape(original_shape)
+        return out
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        if self.with_scale and self.scale_shift == 1.0:
+            out = gemma_rmsnorm(x, self.weight.data, self.eps)
+        else:
+            out = rmsnorm(x, self.weight.data, self.eps)
         return out
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:

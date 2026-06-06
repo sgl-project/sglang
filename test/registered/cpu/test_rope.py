@@ -177,7 +177,7 @@ class TestROPE(CustomTestCase):
             num_kv_heads: int,
         ):
             set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-            torch.manual_seed(100)
+            torch.manual_seed(1234)
             rope_ref = RotaryEmbedding(
                 head_size,
                 rotary_dim,

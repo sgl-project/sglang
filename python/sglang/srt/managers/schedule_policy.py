@@ -38,6 +38,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
@@ -49,8 +50,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -115,6 +115,10 @@ def match_prefix_for_req(
         match_result.best_match_node,
         match_result.host_hit_length,
     )
+    max_len = req._compute_max_prefix_len(len(token_ids))
+    req.num_matched_prefix_tokens = min(
+        len(req.prefix_indices) + req.host_hit_length, max_len
+    )
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
@@ -162,14 +166,26 @@ class SchedulePolicy:
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> None:
+        policy = self._determine_active_policy(waiting_queue)
+
+        # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
+        # set it in _compute_prefix_matches; do the same full match for
+        # cache-agnostic policies when the radix supports it, so the load
+        # snapshot has it. Skip on decode (never prefills).
+        if (
+            not isinstance(policy, CacheAwarePolicy)
+            and self.tree_cache.supports_fast_match_prefix()
+            and get_global_server_args().disaggregation_mode != "decode"
+        ):
+            for r in waiting_queue:
+                match_prefix_for_req(self.tree_cache, r)
+
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
             return
-
-        policy = self._determine_active_policy(waiting_queue)
 
         if isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
@@ -279,7 +295,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
-                -len(r.prefix_indices)
+                -r.num_matched_prefix_tokens
                 if r.rid not in temporary_deprioritized
                 else float("inf")
             )
@@ -443,8 +459,10 @@ class PrefillAdder:
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
+        self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
+        self.reprocessed_log_input_tokens = 0
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -580,7 +598,11 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        retracted_stain: bool,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -599,8 +621,13 @@ class PrefillAdder:
         elif self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
 
+        # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
+        # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
+        if retracted_stain:
+            self.reprocessed_log_hit_tokens += prefix_len
+            self.reprocessed_log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -628,7 +655,7 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(prefix_len, trunc_len, 0)
+        self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -654,7 +681,9 @@ class PrefillAdder:
             if not truncated
             else 0
         )
-        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+        self._update_prefill_budget(
+            0, req.extend_input_len, max_new_tokens, req.retracted_stain
+        )
 
         # Return based on remaining token availability
         return (
@@ -693,6 +722,7 @@ class PrefillAdder:
                 if not truncated
                 else 0
             ),
+            req.retracted_stain,
         )
 
         # Return if chunked prefill not finished
@@ -794,6 +824,7 @@ class PrefillAdder:
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                req.retracted_stain,
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -806,7 +837,7 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
 
         return self.budget_state()
 
@@ -826,9 +857,7 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if (
-            self.dsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
-        ) and len(self.can_run_list) >= 1:
+        if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
@@ -928,6 +957,7 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
+                    req.retracted_stain,
                 )
             else:
                 # Make sure at least one page is available
@@ -962,7 +992,9 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(
+                    prefix_len, trunc_len, 0, req.retracted_stain
+                )
 
         return self.budget_state()
 
