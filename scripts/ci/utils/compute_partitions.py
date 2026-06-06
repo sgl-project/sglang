@@ -12,6 +12,7 @@ import json
 import math
 import os
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import yaml  # PyYAML; preinstalled on ubuntu-latest GHA runners.
 
@@ -179,6 +180,24 @@ def compute_partitions(
     return result
 
 
+def format_fit_window(model: dict) -> str:
+    """Render the model's fit window as `[start, end)` for the step summary.
+
+    `fit_window_start` is the inclusive lower bound (UTC midnight, today -
+    fit_window_days); end = start + fit_window_days. Surfacing the whole
+    span avoids reading the single lower-bound date as a staleness marker.
+    Falls back to the legacy `data_as_of` key for snapshots predating the
+    sglang-ci-stats rename (drop once that rename is deployed)."""
+    start = model.get("fit_window_start") or model.get("data_as_of")
+    days = model.get("fit_window_days")
+    if not start or not isinstance(days, int):
+        return f"fit_window_start={start}"
+    end = (datetime.strptime(start[:10], "%Y-%m-%d") + timedelta(days=days)).strftime(
+        "%Y-%m-%d"
+    )
+    return f"fit over [{start[:10]}, {end}) ({days}d window)"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", default=REPO_ROOT)
@@ -234,7 +253,7 @@ def main():
                 src_note = "no live model -- static est_time + (coeff=1, bias=0)"
             else:
                 src_note = (
-                    f"live model `data_as_of={partition_model.get('data_as_of')}`, "
+                    f"live model: {format_fit_window(partition_model)}, "
                     f"`n_runs={partition_model.get('n_runs')}`"
                 )
             f.write(
