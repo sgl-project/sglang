@@ -93,7 +93,7 @@ class SRTPlatform(DeviceMixin):
         """Return hardware-specific quantization config for the specific
         quantization scheme, raise an error if not supported or return None
         to use the default config."""
-        raise NotImplementedError
+        return None
 
     # ------------------------------------------------------------------
     # Capability flags (safe conservative defaults)
