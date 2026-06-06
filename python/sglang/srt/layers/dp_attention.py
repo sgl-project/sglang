@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -88,7 +87,7 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
-        if os.environ.get("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower() in (
+        if get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower() in (
             "1",
             "true",
             "yes",

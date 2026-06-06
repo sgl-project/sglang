@@ -955,16 +955,12 @@ class CudaGraphRunner:
             global_num_tokens_cpu=(
                 [num_tokens] * self.dp_size
                 if self.require_mlp_tp_gather
-                else [num_tokens]
-                if self.require_attn_tp_gather
-                else None
+                else [num_tokens] if self.require_attn_tp_gather else None
             ),
             global_num_tokens_for_logprob_cpu=(
                 [num_tokens] * self.dp_size
                 if self.require_mlp_tp_gather
-                else [num_tokens]
-                if self.require_attn_tp_gather
-                else None
+                else [num_tokens] if self.require_attn_tp_gather else None
             ),
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,

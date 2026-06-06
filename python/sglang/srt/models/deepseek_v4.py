@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
 import time
 from contextlib import nullcontext
 from typing import (
@@ -58,7 +57,6 @@ from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
     dp_gather_partial,
-    get_attention_dp_rank,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
@@ -1014,9 +1012,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_layer_sparse=True,
             is_previous_layer_sparse=True if layer_id > 0 else None,
             is_next_layer_sparse=(
-                True
-                if is_nextn or layer_id < config.num_hidden_layers - 1
-                else None
+                True if is_nextn or layer_id < config.num_hidden_layers - 1 else None
             ),
         )
         self.moe_post_communicator = LayerCommunicator(
@@ -1418,7 +1414,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_dp_size() > 1
             and get_moe_a2a_backend().is_none()
         )
-        _enable_moe_post_reduce_scatter = os.environ.get(
+        _enable_moe_post_reduce_scatter = get_bool_env_var(
             "DSV4_MOE_RS_TO_NEXT_ATTN", "0"
         ).lower() in ("1", "true", "yes", "on")
         use_reduce_scatter = (

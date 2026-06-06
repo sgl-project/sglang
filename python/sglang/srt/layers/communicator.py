@@ -723,7 +723,10 @@ class LayerCommunicator:
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         ):
-            if should_use_dp_reduce_scatterv() or should_use_dsv4_dp_moe_reduce_scatterv():
+            if (
+                should_use_dp_reduce_scatterv()
+                or should_use_dsv4_dp_moe_reduce_scatterv()
+            ):
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True

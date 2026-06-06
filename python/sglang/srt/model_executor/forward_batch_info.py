@@ -28,7 +28,6 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
-import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -59,6 +58,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -1103,7 +1103,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch, global_num_tokens
         )
         if (
-            os.environ.get("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower()
+            get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0").lower()
             in ("1", "true", "yes", "on")
             and not self.is_extend_in_batch
             and not self.forward_mode.is_target_verify()
