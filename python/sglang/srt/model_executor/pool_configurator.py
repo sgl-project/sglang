@@ -330,6 +330,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
+        self.online_c128_mtp_max_draft_tokens = (
+            mr.server_args.max_speculative_num_draft_tokens or 0
+        )
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -374,23 +377,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
             )
             if allow_experimental_online_c128_mtp:
-                max_draft_tokens = (
-                    envs.SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS.get()
-                )
-                assert max_draft_tokens > 0, (
-                    "SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS must be positive "
-                    "when SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
-                )
-                assert mr.server_args.speculative_num_draft_tokens <= max_draft_tokens, (
-                    "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP supports at most "
-                    f"{max_draft_tokens} draft tokens, but got "
-                    f"{mr.server_args.speculative_num_draft_tokens}. Increase "
-                    "SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS if more draft banks "
-                    "are required."
+                assert self.online_c128_mtp_max_draft_tokens > 0, (
+                    "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP requires "
+                    "speculative_num_draft_tokens to be set."
                 )
                 logger.warning(
                     "DSV4 compressed attention: experimental online c128 + MTP enabled "
-                    f"(EAGLE topk=1 only, max_draft_tokens={max_draft_tokens}). "
+                    f"(EAGLE topk=1 only, "
+                    f"draft_banks={self.online_c128_mtp_max_draft_tokens}). "
                     "Validate correctness carefully."
                 )
             else:
@@ -421,9 +415,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
         c128_state_ratio = self.c128_ring_size / self.swa_page_size
         if c128_online and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            c128_state_ratio *= (
-                1 + envs.SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS.get()
-            )
+            c128_state_ratio *= 1 + self.online_c128_mtp_max_draft_tokens
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (

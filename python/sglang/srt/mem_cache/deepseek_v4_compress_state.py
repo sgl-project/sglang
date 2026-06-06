@@ -6,7 +6,6 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -89,6 +88,7 @@ class CompressStatePool:
         ratio: int,
         online: bool = False,
         swa_page_size: int = 0,
+        online_mtp_max_draft_tokens: int = 0,
     ):
         self.ratio = ratio
         self.ring_size = ring_size
@@ -100,16 +100,10 @@ class CompressStatePool:
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
             self._logical_size = size + self.ring_size + 1
-            if envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+            if online_mtp_max_draft_tokens > 0:
                 # Bank 0 is the committed state. Banks 1..N cache per-draft
                 # prefix states for lazy commit after target verify.
-                self.online_mtp_max_draft_tokens = (
-                    envs.SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS.get()
-                )
-                assert self.online_mtp_max_draft_tokens > 0, (
-                    "SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS must be positive "
-                    "when SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
-                )
+                self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
                 self.online_mtp_state_slot_offset = self._logical_size
             self._size = self._logical_size * (
                 1 + self.online_mtp_max_draft_tokens

@@ -399,6 +399,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
+        online_mtp_max_draft_tokens: int = 0,
     ):
         super().__init__(
             swa_size,
@@ -427,6 +428,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c128_state_pool_size = c128_state_pool_size
         self.state_dtype = state_dtype
         self.compression_ratios = compression_ratios
+        self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
         if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             self.online_c128_mtp_pending_seq_lens = torch.empty(
@@ -618,6 +620,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 ratio=ratio,
                 online=(ratio == 128 and ONLINE_C128),
                 swa_page_size=self.swa_page_size,
+                online_mtp_max_draft_tokens=(
+                    self.online_mtp_max_draft_tokens if ratio == 128 else 0
+                ),
             )
 
             if ratio == 4:

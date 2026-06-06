@@ -877,7 +877,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            verify_bs = getattr(forward_batch, "_original_batch_size", bs)
+            verify_bs = forward_batch.batch_size_before_padding
             if self.online_c128_mtp.enabled() and verify_bs == 0:
                 self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
@@ -956,9 +956,7 @@ class DeepseekV4AttnBackend(
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = int(seq_lens_cpu.max().item())
-        verify_bs = getattr(
-            forward_batch, "_original_batch_size", forward_batch.batch_size
-        )
+        verify_bs = forward_batch.batch_size_before_padding
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
