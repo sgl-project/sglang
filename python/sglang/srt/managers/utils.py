@@ -256,6 +256,34 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
         return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
 
 
+def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    """KV length reserved per request at each decode step.
+
+    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
+    mode; see eagle_info_v2.prepare_for_decode.
+    """
+    return 2 * get_alloc_len_per_decode(server_args)
+
+
+def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
+    """req_to_token row headroom beyond the model context length.
+
+    Sized to hold the decode over-allocation (kv_committed_len +
+    get_alloc_reserve_per_decode). The spec v2 page>1 topk>1 holey draft footprint
+    can outgrow the default num_draft_tokens headroom (PR #26972).
+    """
+    # FIXME(lsyin): this is the temporary fix for the context length issue when
+    # using speculative decoding
+    extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
+    if (
+        server_args.speculative_algorithm is not None
+        and server_args.page_size > 1
+        and (server_args.speculative_eagle_topk or 1) > 1
+    ):
+        extra = max(extra, get_alloc_reserve_per_decode(server_args))
+    return extra
+
+
 @dataclass
 class EmbeddingBatchResult:
     """Result from an embedding/classification forward pass.
