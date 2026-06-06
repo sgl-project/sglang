@@ -26,7 +26,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -3144,7 +3144,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Return a ForwardBatch view whose shared input tensors are backed by
         the eager decode buffer registry. The batch is already DP-padded in
         place by ``_forward_raw``, so ``raw == padded`` (no capture-bucket
-        padding, no idle substitution)."""
+        padding, no idle substitution).
+
+        With ``SGLANG_EAGER_INPUT_NO_COPY`` set, skip the registry copy and wrap
+        the batch's own tensors in a fresh view instead (no per-iter D2D copy)."""
+        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+            return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         raw_num_tokens = forward_batch.input_ids.shape[0]
         registry = self._ensure_eager_decode_registry(raw_bs, raw_num_tokens)
@@ -3205,7 +3210,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ForwardBatch:
         """Return a ForwardBatch view whose token-axis input tensors are backed
         by the eager prefill buffer registry. ``raw == padded`` (the batch is
-        already DP-padded in place by ``_forward_raw``)."""
+        already DP-padded in place by ``_forward_raw``).
+
+        With ``SGLANG_EAGER_INPUT_NO_COPY`` set, skip the registry copy and wrap
+        the batch's own tensors in a fresh view instead (no per-iter D2D copy)."""
+        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+            return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         raw_num_tokens = forward_batch.input_ids.shape[0]
         registry = self._ensure_eager_prefill_registry(raw_bs, raw_num_tokens)
