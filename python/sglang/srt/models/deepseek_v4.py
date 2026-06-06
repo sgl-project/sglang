@@ -1696,52 +1696,28 @@ class DeepseekV4ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        # Waterfill needs shared-experts fusion so it can dispatch shared
-        # expert tokens to least-loaded EP ranks.
-        if get_global_server_args().enable_deepep_waterfill:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-            self.num_fused_shared_experts = self.config.n_shared_experts
+        disable_reason = None
+        if get_global_server_args().enforce_shared_experts_fusion:
+            pass
+        elif uses_per_rank_fused_shared_slots():
+            disable_reason = (
+                "DeepSeek V4 per-rank shared-slot backend: fusion off by default "
+                "(use --enforce-shared-experts-fusion to enable)."
+            )
+        else:
+            disable_reason = (
+                "DeepSeek V4 requires different clamping for shared and routed experts."
+            )
+
+        if disable_reason is not None:
+            get_global_server_args().disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
-                "DeepSeek V4: --enable-deepep-waterfill set; KEEP shared-experts "
-                "fusion enabled so waterfill can rebalance shared expert dispatch.",
+                f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
-        if uses_per_rank_fused_shared_slots():
-            if not get_global_server_args().enforce_shared_experts_fusion:
-                get_global_server_args().disable_shared_experts_fusion = True
-                log_info_on_rank0(
-                    logger,
-                    "DeepSeek V4 per-rank shared-slot backend: fusion off by "
-                    "default (use --enforce-shared-experts-fusion to enable). "
-                    "Shared experts fusion optimization is disabled.",
-                )
-                return
-
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-            self.num_fused_shared_experts = self.config.n_shared_experts
-            log_info_on_rank0(
-                logger,
-                f"DeepSeek V4: {get_moe_a2a_backend().value} backend enabled with "
-                "--enforce-shared-experts-fusion; KEEP shared-experts fusion enabled.",
-            )
-            return
-
-        get_global_server_args().disable_shared_experts_fusion = True
-        log_info_on_rank0(
-            logger,
-            "DeepSeek V4 requires different clamping for shared and routed experts. "
-            "Shared experts fusion optimization is disabled.",
-        )
+        self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
     def forward(
