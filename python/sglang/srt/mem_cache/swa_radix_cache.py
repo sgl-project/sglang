@@ -24,6 +24,7 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
 import torch
 from numpy import float64
 
@@ -992,7 +993,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # silently demotes EAGLE/MTP bigram keys → match() returns 0 →
             # _split_node assert.
             node.key = RadixKey(
-                node.key.token_ids + child.key.token_ids,
+                np.concatenate([node.key.token_ids, child.key.token_ids]),
                 node.key.extra_key,
                 is_bigram=node.key.is_bigram,
             )
