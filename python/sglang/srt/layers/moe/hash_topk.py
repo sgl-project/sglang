@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
-    _remap_topk_for_per_rank_shared_slots,
+    remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.utils import is_hip
@@ -193,7 +193,7 @@ class HashTopK(nn.Module):
                 if expert_location_dispatch_info is not None
                 else self.num_experts
             )
-            topk_ids, topk_weights = _remap_topk_for_per_rank_shared_slots(
+            topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
                 topk_ids,
                 topk_weights,
                 self.num_fused_shared_experts,

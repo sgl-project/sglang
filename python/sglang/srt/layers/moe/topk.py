@@ -1329,7 +1329,7 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
-def _remap_topk_for_per_rank_shared_slots(
+def remap_topk_for_per_rank_shared_slots(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_fused_shared_experts: int,
@@ -1353,7 +1353,7 @@ def _remap_topk_for_per_rank_shared_slots(
     ep_rank = get_moe_expert_parallel_rank()
     # Static EPLB may add redundant physical experts. At this point routed
     # topk_ids have already been remapped from logical to physical ids, so the
-    # The interleaved layout must use the physical routed count.
+    # interleaved layout must use the physical routed count.
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
@@ -1440,7 +1440,7 @@ def _post_process_topk_ids(
             if expert_location_dispatch_info is not None
             else router_logits.shape[1]
         )
-        topk_ids, topk_weights = _remap_topk_for_per_rank_shared_slots(
+        topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
             topk_ids,
             topk_weights,
             num_fused_shared_experts,
