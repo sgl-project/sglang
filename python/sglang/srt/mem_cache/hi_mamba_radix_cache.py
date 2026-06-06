@@ -1662,6 +1662,9 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             return True
 
+        if completed and operation.pool_transfers and not operation.pool_transfers_done:
+            can_terminate = False
+
         operation_terminated = operation.is_terminated()
         if self.tp_world_size > 1:
             states = torch.tensor(
