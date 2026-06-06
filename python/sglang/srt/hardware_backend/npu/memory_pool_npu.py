@@ -126,23 +126,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                         -1, 1, self.head_num, self.v_head_dim
                     )
 
-            self.data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.k_buffer + self.v_buffer],
-                dtype=torch.uint64,
-                device=self.device,
-            )
-            self.data_strides = torch.tensor(
-                [
-                    np.prod(x.shape[1:]) * x.dtype.itemsize
-                    for x in self.k_buffer + self.v_buffer
-                ],
-                device=self.device,
-            )
-
-    def _init_kv_copy_and_warmup(self):
-        # NPU does not support Triton kernels used for KV copy.
-        self._kv_copy_config = None
-
     # for disagg
     def get_contiguous_buf_infos(self):
         # layer_num x [seq_len, head_num, head_dim]
