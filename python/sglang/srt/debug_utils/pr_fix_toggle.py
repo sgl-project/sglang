@@ -87,11 +87,32 @@ patches:
 """
 
 
+_PR_REVERT_YAML_26972 = """
+patches:
+  - target: sglang.srt.model_executor.model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin._init_pools
+    edits:
+      - match: |
+          if (
+              self.server_args.speculative_algorithm is not None
+              and self.server_args.page_size > 1
+              and (self.server_args.speculative_eagle_topk or 1) > 1
+          ):
+              from sglang.srt.managers.utils import get_alloc_len_per_decode
+
+              extra_max_context_len = max(
+                  extra_max_context_len,
+                  2 * get_alloc_len_per_decode(self.server_args),
+              )
+        replacement: ""
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
     26329: _PR_REVERT_YAML_26329,
     27338: _PR_REVERT_YAML_27338,
     27360: _PR_REVERT_YAML_27360,
+    26972: _PR_REVERT_YAML_26972,
 }
 
 
