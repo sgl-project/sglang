@@ -1141,7 +1141,8 @@ def biased_grouped_topk_gpu(
         if num_fused_shared_experts > 0:
             # Append shared expert columns: ID = num_experts (first shared slot),
             # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
-            # Per-rank shared-slot fusion will overwrite both in post-process.
+            # For DeepEP/MegaMOE per-rank shared-slot layouts, post-process replaces
+            # this placeholder ID/weight with the rank-local physical shared slot.
             topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
             topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
             if routed_scaling_factor is not None:
