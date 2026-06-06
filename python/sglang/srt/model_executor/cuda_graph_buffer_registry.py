@@ -470,12 +470,23 @@ class CudaGraphBufferRegistry:
         fields are replaced with views into the registry buffers via
         ``dataclasses.replace`` — the template itself is not mutated.
 
-        NOTE: currently parked / unused. It is NOT a drop-in for the decode
-        replay path's ``build_replay_fb_view``: it returns the *padded*
-        out_cache_loc slot slice (vs the raw ``fb.out_cache_loc`` that path
-        keeps), does not recompute ``seq_lens_sum`` for the padded tail, and
-        does not split ``forward_mode`` vs ``actual_forward_mode``. Reconcile
-        those before wiring it into any replay path.
+        Consumed by the **eager** forward path (``ModelRunner.forward_decode``
+        et al.), where the FB has already been DP-padded in place so
+        ``raw == padded`` — the slot slice equals the FB value, ``seq_lens_sum``
+        is already correct on the template, and there is no IDLE substitution.
+        The decode **replay** path keeps ``build_replay_fb_view`` instead: it
+        DOES need the padded-vs-raw ``out_cache_loc`` distinction, the
+        ``seq_lens_sum`` padded-tail recompute, and the ``forward_mode`` vs
+        ``actual_forward_mode`` split — none of which apply to eager.
+
+        A plain copy-from-FB slot whose FB field is absent this iter (e.g.
+        ``mrope_positions`` on a non-multimodal batch, ``encoder_lens`` on a
+        decoder-only model) holds only stale / zero-init buffer data —
+        ``fill_from`` skipped it. Such a slot is **carried from the template**
+        (preserving the original ``None``) rather than exposed as a zero
+        buffer, mirroring ``fill_from``'s None-skip. Computed slots
+        (``post_fill`` / ``copy_from_fb=False``) are always exposed: their
+        buffer holds the produced value, not an FB copy.
         """
         import dataclasses
 
@@ -487,6 +498,15 @@ class CudaGraphBufferRegistry:
             # top-level FB attributes — their data is consumed in place off the
             # adopted backing object, not re-attached to the FB view here.
             if "." in slot.name:
+                continue
+            is_computed = slot.post_fill is not None or not slot.copy_from_fb
+            if (
+                not is_computed
+                and slot.source_fn is None
+                and getattr(forward_batch_template, slot.name, None) is None
+            ):
+                # FB didn't carry this field this iter; fill_from skipped it.
+                # Carry the template's value (None) instead of a stale buffer.
                 continue
             replace_kwargs[slot.name] = slot.slice_for(padded_bs, padded_num_tokens)
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
@@ -507,6 +527,7 @@ def build_decode_registry(
     enable_prefill_cp: bool = False,
     require_mlp_tp_gather: bool = False,
     dp_size: int = 1,
+    register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
@@ -643,28 +664,39 @@ def build_decode_registry(
             )
         )
 
-    def _global_num_tokens_post_fill(buf, fb, ctx):
-        # Filled with the padded token count on the gathered (DP) path; left
-        # untouched otherwise. Not an FB copy (copy_from_fb=False).
-        if require_gathered_buffer:
-            buf.fill_(ctx.padded_num_tokens)
+    # These are computed slots (copy_from_fb=False): the post_fill writes the
+    # gathered (DP) count and ``extract_buffer`` always exposes them. Callers
+    # that have already populated ``global_num_tokens_*`` on the batch (the
+    # eager path, where ``prepare_mlp_sync_batch`` ran before the forward) must
+    # pass ``register_global_num_tokens=False`` so the batch values are carried
+    # through instead of overwritten by a zero buffer.
+    if register_global_num_tokens:
 
-    _global_shape = (
-        (lambda _bs, _mt: (dp_size,))
-        if require_mlp_tp_gather
-        else (lambda _bs, _mt: (1,))
-    )
-    for _global_name in ("global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu"):
-        slots.append(
-            GraphSlot(
-                _global_name,
-                _global_shape,
-                torch.int32,
-                axis="none",
-                copy_from_fb=False,
-                post_fill=_global_num_tokens_post_fill,
-            )
+        def _global_num_tokens_post_fill(buf, fb, ctx):
+            # Filled with the padded token count on the gathered (DP) path; left
+            # untouched otherwise. Not an FB copy (copy_from_fb=False).
+            if require_gathered_buffer:
+                buf.fill_(ctx.padded_num_tokens)
+
+        _global_shape = (
+            (lambda _bs, _mt: (dp_size,))
+            if require_mlp_tp_gather
+            else (lambda _bs, _mt: (1,))
         )
+        for _global_name in (
+            "global_num_tokens_gpu",
+            "global_num_tokens_for_logprob_gpu",
+        ):
+            slots.append(
+                GraphSlot(
+                    _global_name,
+                    _global_shape,
+                    torch.int32,
+                    axis="none",
+                    copy_from_fb=False,
+                    post_fill=_global_num_tokens_post_fill,
+                )
+            )
 
     for slot in slots:
         bind = None
@@ -760,11 +792,21 @@ def build_prefill_registry(
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
+    register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable (prefill) cuda-graph runners.
+
+    ``register_input_embeds`` (default ``True``) controls whether the
+    ``input_embeds`` slot is registered for multimodal models. The
+    piecewise / breakable graph paths keep it ``True``: the model writes the
+    embeds into the (reset-only) buffer inside the graph. The **eager** extend
+    path passes ``False``: there ``input_embeds`` is a real *read* input
+    (``forward_extend`` does ``fb.input_embeds.bfloat16()``), not something the
+    model writes, so it must be carried through from the FB by
+    ``extract_buffer`` rather than handed back as a zero buffer.
 
     Padding policies match the inline copy/zero in
     ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
@@ -828,16 +870,17 @@ def build_prefill_registry(
                 slice_fn=lambda buf, n: buf[:, :n],
             )
         )
-        slots.append(
-            GraphSlot(
-                "input_embeds",
-                lambda _bs2, mt: (mt, hidden_size),
-                embed_dtype,
-                axis="tokens",
-                padding_policy=PaddingPolicy.ZERO,
-                copy_from_fb=False,
+        if register_input_embeds:
+            slots.append(
+                GraphSlot(
+                    "input_embeds",
+                    lambda _bs2, mt: (mt, hidden_size),
+                    embed_dtype,
+                    axis="tokens",
+                    padding_policy=PaddingPolicy.ZERO,
+                    copy_from_fb=False,
+                )
             )
-        )
     if enable_mamba_track:
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
