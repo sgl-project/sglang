@@ -19,10 +19,8 @@ def _apply_rotary_emb(
     sin: torch.Tensor,
     is_neox_style: bool,
 ) -> torch.Tensor:
-    # Inlined eager GPT-J interleaved rotary; importing the real
-    # ``_apply_rotary_emb`` triggers a ``register_custom_op_from_extern``
-    # against a stubbed ``flashinfer`` symbol that crashes pytest collection
-    # on the CPU-only harness.
+    # Inlined eager GPT-J interleaved rotary; importing the real one triggers
+    # ``register_custom_op_from_extern`` against a stubbed flashinfer at collection.
     assert not is_neox_style, "test only exercises GPT-J interleaved rotary"
     cos_b = cos.unsqueeze(-2).to(x.dtype)
     sin_b = sin.unsqueeze(-2).to(x.dtype)
@@ -34,10 +32,10 @@ def _apply_rotary_emb(
 
 
 def _make_qk_norms(head_dim: int, dtype: torch.dtype) -> tuple[RMSNorm, RMSNorm]:
-    # Non-trivial gains so a silently-dropped weight multiply would fail.
-    # NB: ``RMSNorm.__init__`` ignores its ``dtype`` kwarg for weights (always
-    # fp32); the explicit ``.to(dtype)`` is required for the fused CUDA path's
-    # ``q_norm.weight.dtype == q.dtype`` gate to pass.
+    # Non-trivial gains catch silently-dropped weight multiplies. The explicit
+    # ``.to(dtype)`` matters: ``RMSNorm.__init__`` ignores its ``dtype`` kwarg
+    # for weights (always fp32), and the fused CUDA gate requires weight dtype
+    # to match q dtype.
     torch.manual_seed(0)
     q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
     k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
@@ -192,10 +190,8 @@ def test_single_stream_split_then_fuse_parity(
 
 
 def test_helper_preserves_input_dtype_fp32():
-    # CPU path restricted to fp32: ``RMSNorm.forward_cuda`` routes bf16/fp16
-    # through a CUDA-only triton custom op when ``current_platform.is_cuda()``,
-    # which fires on any GPU host even with CPU tensors. The bf16 sibling
-    # below exercises that path on an actual CUDA device.
+    # CPU restricted to fp32: bf16/fp16 RMSNorm dispatches a CUDA-only triton
+    # op when ``current_platform.is_cuda()``. bf16 is exercised on CUDA below.
     head_dim = 64
     dtype = torch.float32
     q_norm, k_norm = _make_qk_norms(head_dim, dtype)
@@ -222,10 +218,8 @@ def test_helper_preserves_input_dtype_fp32():
     reason="bf16 RMSNorm path runs through a CUDA-only triton kernel",
 )
 def test_helper_preserves_input_dtype_bf16_cuda():
-    # Spy on ``fused_inplace_qknorm_rope`` to confirm the fused CUDA kernel
-    # actually fires; otherwise the helper would silently fall back to the
-    # eager + flashinfer-rope branch and the test would pass for the wrong
-    # reason.
+    # Spy confirms the fused CUDA kernel actually fires; without it a silent
+    # fallback to eager + flashinfer-rope would pass for the wrong reason.
     import sglang.multimodal_gen.runtime.layers.layernorm as ln_mod
 
     device = torch.device("cuda")
@@ -267,11 +261,9 @@ def test_helper_preserves_input_dtype_bf16_cuda():
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_kernel_matches_eager_reference_cuda(dtype):
-    # Numerical parity on the actual fused fast path. The fp32 parity tests
-    # above only exercise the eager fallback because the fused kernel gates
-    # on ``q.dtype in (fp16, bf16)``; this test runs at the production dtype
-    # and uses a spy to confirm the fused branch fires (not silently falling
-    # back to eager+flashinfer-rope and passing for the wrong reason).
+    # Numerical parity on the fused fast path. The fp32 parity tests above
+    # only exercise the eager fallback (the kernel gates on bf16/fp16); this
+    # runs at production dtype with a spy to confirm the fused branch fires.
     import sglang.multimodal_gen.runtime.layers.layernorm as ln_mod
 
     device = torch.device("cuda")
@@ -291,14 +283,13 @@ def test_fused_kernel_matches_eager_reference_cuda(dtype):
     sin = sin.to(device)
     cos_sin_cache = cos_sin_cache.to(device)
 
-    # Eager reference: 2x RMSNorm + 2x rotary on the SAME inputs, in dtype.
+    # Eager reference: 2x RMSNorm + 2x rotary on the same inputs.
     ref_q = q_norm(q.contiguous()).to(dtype)
     ref_k = k_norm(k.contiguous()).to(dtype)
     ref_q = _apply_rotary_emb(ref_q, cos, sin, is_neox_style=False)
     ref_k = _apply_rotary_emb(ref_k, cos, sin, is_neox_style=False)
 
-    # Fused path. allow_inplace=True so we clone inputs to avoid mutating
-    # the (already-consumed) eager-reference tensors.
+    # Clone before passing through the fused (in-place) path.
     with patch.object(
         ln_mod,
         "fused_inplace_qknorm_rope",
@@ -319,10 +310,8 @@ def test_fused_kernel_matches_eager_reference_cuda(dtype):
         "helper silently fell back to eager (likely a dtype-gate regression)"
     )
 
-    # Tolerances chosen for fused vs eager at the head_dim reductions used in
-    # HunyuanVideo. bf16 has ~7 mantissa bits so ULP near 1.0 is ~7e-3; the
-    # fused kernel does its reduction in fp32 internally then casts back, so
-    # 2e-2 atol/rtol is the loosest credible parity bar. fp16 keeps ~5e-3.
+    # Loosest credible parity for fused (fp32 internal accum) vs eager:
+    # ~few ULPs of drift -- bf16 ULP ~7e-3 near 1.0, fp16 ~5e-4.
     tol = {torch.bfloat16: 2e-2, torch.float16: 5e-3}[dtype]
     torch.testing.assert_close(out_q, ref_q, atol=tol, rtol=tol)
     torch.testing.assert_close(out_k, ref_k, atol=tol, rtol=tol)
@@ -333,9 +322,8 @@ def test_fused_kernel_matches_eager_reference_cuda(dtype):
 
 @pytest.fixture(scope="module", autouse=True)
 def _init_minimal_distributed():
-    # The blocks construct ``ReplicatedLinear`` / ``ColumnParallelLinear``
-    # which call ``get_tp_group()``. Initialise a 1-rank gloo group so
-    # construction works on CPU; tear down only if we created it.
+    # ``ReplicatedLinear`` / ``ColumnParallelLinear`` inside the blocks need
+    # ``get_tp_group()``; spin up a 1-rank gloo group so construction works on CPU.
     import torch.distributed as dist
 
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -389,11 +377,9 @@ class _StubAttention(torch.nn.Module):
 
 
 def _block_test_device() -> torch.device:
-    # ``CustomOp.forward_cuda`` (``fuse_scale_shift_kernel``,
-    # ``triton_one_pass_rms_norm``) is selected at module init from
-    # ``current_platform.is_cuda()``, not from tensor device. On CUDA hosts
-    # those dispatches assert ``x.is_cuda``, so run blocks on the device
-    # that matches the platform.
+    # ``CustomOp.forward_cuda`` is selected at module init from
+    # ``current_platform`` (not tensor device); on CUDA hosts those dispatches
+    # assert ``x.is_cuda``, so match the device to the platform.
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -463,10 +449,8 @@ def test_double_stream_block_fuses_img_and_txt_sites():
 
 
 def test_single_stream_block_fuses_img_and_txt_and_splits_before_norm():
-    # Pin: the refactor must split *before* QK-Norm. The first spy call
-    # must see Q with shape [B, img_len, H, head_dim], not the full
-    # [B, seq_len, H, head_dim] that a pre-refactor full-norm-then-split
-    # would produce.
+    # Pin: the refactor splits BEFORE QK-Norm. The img spy call must see Q
+    # with shape ``[B, img_len, H, head_dim]``, not the full ``[B, seq_len, ...]``.
     import sglang.multimodal_gen.runtime.models.dits.hunyuanvideo as hv_mod
     from sglang.multimodal_gen.runtime.models.dits.hunyuanvideo import (
         MMSingleStreamBlock,
@@ -524,11 +508,9 @@ def test_single_stream_block_fuses_img_and_txt_and_splits_before_norm():
 
 
 def test_single_stream_block_does_not_redundantly_contiguify_v():
-    # Pin: the fused QK-Norm+RoPE kernel only mutates Q/K
-    # (``mutates_args=["q", "k"]``); ``UlyssesAttention`` does
-    # ``torch.cat([q, k, v])`` which accepts non-contiguous V. Adding
-    # ``.contiguous()`` on img_v / txt_v would silently double V-sized HBM
-    # traffic per single-stream block.
+    # Pin: the fused kernel only mutates Q/K (``mutates_args=["q", "k"]``)
+    # and ``UlyssesAttention``'s downstream cat handles non-contiguous V;
+    # adding ``.contiguous()`` on img_v/txt_v would double V HBM traffic.
     import sglang.multimodal_gen.runtime.models.dits.hunyuanvideo as hv_mod
     from sglang.multimodal_gen.runtime.models.dits.hunyuanvideo import (
         MMSingleStreamBlock,

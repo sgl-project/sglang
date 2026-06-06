@@ -221,16 +221,10 @@ class MMDoubleStreamBlock(nn.Module):
         )
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
-        # Fused QK-Norm + RoPE for the image stream. Collapses two RMSNorm
-        # kernels and two _apply_rotary_emb passes into a single in-place
-        # fused JIT kernel on CUDA (fp16/bf16); falls back to eager + fused
-        # rotary otherwise. Same code path that Flux and Qwen-Image use.
-        #
-        # NOTE: the pre-refactor path did `q_norm(q).to(img_v)` and similar.
-        # RMSNorm.forward preserves input dtype, and img_v shares dtype with
-        # img_q here (both from the same qkv split), so the `.to(...)` was a
-        # no-op. Dropped intentionally; dtype preservation is covered by
-        # ``test_helper_preserves_input_dtype_*`` in the unit tests.
+        # Fused QK-Norm + RoPE on the image stream (Flux / Qwen-Image wiring).
+        # The pre-refactor `q_norm(q).to(img_v)` cast was a no-op (RMSNorm
+        # preserves dtype, img_q and img_v share dtype) and is dropped here;
+        # dtype preservation is pinned by ``test_helper_preserves_input_dtype_*``.
         cos, sin = freqs_cis
         cos_sin_cache = torch.cat(
             [
@@ -264,12 +258,9 @@ class MMDoubleStreamBlock(nn.Module):
         )
         txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
 
-        # Fused QK-Norm for the text stream (no RoPE on text tokens). Drops
-        # the two RMSNorm kernels into a single in-place fused JIT kernel.
-        # head_dim is reused from the img stream above -- safe here because
-        # HunyuanVideo's MMDoubleStreamBlock ties img and txt attention
-        # head_dim by architecture (both Q/K projections share num_heads and
-        # hidden_size); update if a future variant decouples them.
+        # Fused QK-Norm only on the text stream (no rope on text tokens).
+        # head_dim is reused from the img stream: img/txt share num_heads
+        # and hidden_size in MMDoubleStreamBlock by architecture.
         txt_q, txt_k = apply_qk_norm_with_optional_rope(
             q=txt_q.contiguous(),
             k=txt_k.contiguous(),
@@ -417,18 +408,12 @@ class MMSingleStreamBlock(nn.Module):
         qkv = qkv.view(batch_size, seq_len, 3, self.num_attention_heads, -1)
         img_len = seq_len - txt_len
 
-        # Split image / text streams BEFORE QK-Norm so the image portion can
-        # route through the fused QK-Norm + RoPE kernel in a single in-place
-        # pass (replacing the prior 2x RMSNorm + 2x _apply_rotary_emb pattern)
-        # and the text portion through the fused QK-Norm only kernel.
-        #
-        # Only Q and K need contiguous tensors: the fused kernel only mutates
-        # those (see `mutates_args=["q", "k"]` on `fused_inplace_qknorm_rope`).
-        # The V tensors stay as strided views -- ``UlyssesAttention.forward``
-        # does ``torch.cat([q, k, v], dim=0)`` downstream, which handles
-        # non-contiguous inputs fine and avoids two unnecessary full-size
-        # copies per single-stream block (~2x extra HBM traffic at LTX-2 /
-        # HunyuanVideo shapes).
+        # Split img/txt before QK-Norm so the img portion can route through
+        # fused QK-Norm + RoPE and the txt portion through fused QK-Norm only.
+        # Only Q/K are made contiguous: the fused kernel mutates only those
+        # (``mutates_args=["q", "k"]``); ``UlyssesAttention.forward`` does
+        # ``torch.cat([q, k, v])`` downstream, which accepts non-contiguous V
+        # and saves V-sized HBM copies per block at HunyuanVideo shapes.
         img_q = qkv[:, :img_len, 0].contiguous()
         img_k = qkv[:, :img_len, 1].contiguous()
         img_v = qkv[:, :img_len, 2]
@@ -458,10 +443,9 @@ class MMSingleStreamBlock(nn.Module):
             allow_inplace=True,
         )
 
-        # Text stream: fused QK-Norm only (no RoPE on text tokens). q_norm /
-        # k_norm and head_dim are shared with the img stream above -- the
-        # single-stream block uses one set of norm modules for the full
-        # qkv tensor, so the txt half reuses the same projections.
+        # Text stream: fused QK-Norm only (no rope). q_norm/k_norm/head_dim
+        # are reused -- the single-stream block has one set of norm modules
+        # for the full qkv tensor, shared between the img and txt halves.
         txt_q, txt_k = apply_qk_norm_with_optional_rope(
             q=txt_q,
             k=txt_k,
