@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8", "FP8_ALIGNMENT", "pad_to_alignment"]
 
@@ -50,7 +50,7 @@ def pad_to_alignment(
     Returns the original tensor unchanged when already aligned.
     """
     size = tensor.shape[dim]
-    pad = (-size) % alignment
+    pad = ceil_align(size, alignment) - size
     if pad == 0:
         return tensor
     # F.pad takes padding in reverse-dim order, two values per dim (left, right).
@@ -330,8 +330,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         # Swap in the pre-padded bias when N was padded at load time.
         # `_padded_bias` is None when no padding was needed OR when the layer had
         # no bias; if the caller passed bias=None (skip_bias_add=True), keep None.
-        if bias is not None:
-            bias = layer._padded_bias if layer._padded_bias is not None else bias
+        if bias is not None and layer._padded_bias is not None:
+            bias = layer._padded_bias
 
         output = apply_fp8_linear(
             input=x,
