@@ -1188,6 +1188,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "mxfp4",
+            "mxfp8",
             "auto-round",
             "quark_int4fp8_moe",
             "quark_mxfp4",

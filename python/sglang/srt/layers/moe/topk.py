@@ -777,6 +777,10 @@ def fused_topk(
                 topk_group=1,
                 need_renorm=renormalize,
             )
+            if apply_routed_scaling_factor_on_output:
+                topk_weights *= (
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                )
         else:
             assert num_fused_shared_experts <= 1
             if routed_scaling_factor is None:

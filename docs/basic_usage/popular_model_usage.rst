@@ -12,6 +12,7 @@ For more usage examples and recipes, visit the `SGLang Cookbook <https://cookboo
    glmv.md
    gpt_oss.md
    minimax_m2.md
+   minimax_m3.md
    qwen3.md
    qwen3_5.md
    qwen3_vl.md

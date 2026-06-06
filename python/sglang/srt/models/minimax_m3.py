@@ -81,13 +81,24 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_hip,
     log_info_on_rank0,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _device_sm = get_device_sm()
+
+_has_rocm_qk_norm_rope = False
+if _is_hip:
+    try:
+        from sglang.jit_kernel.minimax_m3.qk_norm_rope import qk_gemma_rmsnorm_rope
+
+        _has_rocm_qk_norm_rope = True
+    except ImportError:
+        _has_rocm_qk_norm_rope = False
 
 logger = logging.getLogger(__name__)
 
@@ -631,6 +642,44 @@ class MiniMaxM3Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def _can_use_rocm_qk_norm_rope(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> bool:
+        return (
+            _has_rocm_qk_norm_rope
+            and self.qk_norm_type == "per_head"
+            and self.use_gemma_norm
+            and not self.attention_output_gate
+            and positions.dim() == 1
+            and q.dim() == 2
+            and k.dim() == 2
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and k.dtype == q.dtype
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+            and hasattr(self.rotary_emb, "cos_sin_cache")
+            and self.rotary_emb.rotary_dim == self.rotary_dim
+            and self.rotary_dim <= self.head_dim
+        )
+
+    def _qk_norm_rope(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._can_use_rocm_qk_norm_rope(positions, q, k):
+            return qk_gemma_rmsnorm_rope(
+                q,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                self.head_dim,
+                self.rotary_dim,
+                self.rotary_emb.is_neox_style,
+            )
+        q, k = self._qk_norm(q, k)
+        return self.rotary_emb(positions, q, k)
+
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -655,6 +704,37 @@ class MiniMaxM3Attention(nn.Module):
         else:
             raise ValueError(f"Invalid qk_norm_type: {self.qk_norm_type}")
         return q, k
+
+    def _index_qk_norm_rope(
+        self, positions: torch.Tensor, idx_q: torch.Tensor, idx_k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            _has_rocm_qk_norm_rope
+            and self.use_gemma_norm
+            and positions.dim() == 1
+            and idx_q.dim() == 2
+            and idx_k.dim() == 2
+            and idx_q.dtype in (torch.bfloat16, torch.float16)
+            and idx_k.dtype == idx_q.dtype
+            and self.index_q_norm.variance_epsilon == self.index_k_norm.variance_epsilon
+            and hasattr(self.index_rotary_emb, "cos_sin_cache")
+            and self.index_rotary_emb.rotary_dim == self.rotary_dim
+            and self.rotary_dim <= self.idx_head_dim
+        ):
+            return qk_gemma_rmsnorm_rope(
+                idx_q,
+                idx_k,
+                self.index_q_norm.weight.data,
+                self.index_k_norm.weight.data,
+                positions,
+                self.index_rotary_emb.cos_sin_cache,
+                self.index_q_norm.variance_epsilon,
+                self.idx_head_dim,
+                self.rotary_dim,
+                self.index_rotary_emb.is_neox_style,
+            )
+        idx_q, idx_k = self._index_qk_norm(idx_q, idx_k)
+        return self.index_rotary_emb(positions, idx_q, idx_k)
 
     def _index_qk_norm(
         self, idx_q: torch.Tensor, idx_k: torch.Tensor
@@ -692,8 +772,7 @@ class MiniMaxM3Attention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
 
-        q, k = self._qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._qk_norm_rope(positions, q, k)
 
         if self.is_sparse_attention_layer:
             idx_q, _ = self.index_q_proj(hidden_states)
@@ -702,8 +781,7 @@ class MiniMaxM3Attention(nn.Module):
                 idx_v = None
             else:
                 idx_v, _ = self.index_v_proj(hidden_states)
-            idx_q, idx_k = self._index_qk_norm(idx_q, idx_k)
-            idx_q, idx_k = self.index_rotary_emb(positions, idx_q, idx_k)
+            idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
             inner_state = (q, k, v, gate, idx_q, idx_k, idx_v, forward_batch)
         else:
             inner_state = (q, k, v, gate, forward_batch)
@@ -1224,6 +1302,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):
                 continue
+
+            # MiniMax-M3 checkpoints name MoE blocks "block_sparse_moe", while
+            # this implementation exposes the same module as layer.mlp to match
+            # SGLang's sparse-layer conventions.
+            name = name.replace(".block_sparse_moe", ".mlp")
 
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
                 # Map shared expert weights to the last expert slot

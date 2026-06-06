@@ -1815,6 +1815,30 @@ class ServerArgs:
             self.dtype = "bfloat16"
 
         if model_arch in [
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        ]:
+            quant_method = get_quantization_config(hf_config)
+            if (
+                self.quantization is None
+                and not self._quantization_explicitly_unset
+                and quant_method is not None
+            ):
+                self.quantization = quant_method
+
+            if is_hip():
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "triton"
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "triton"
+                # AITER RoPE is faster but lower precision on ROCm. MiniMax-M3's
+                # sparse attention is accuracy-sensitive, so default to native
+                # Apex RoPE unless the user explicitly opts back into AITER.
+                os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
+                if not self.enable_aiter_allreduce_fusion:
+                    self.disable_custom_all_reduce = True
+
+        if model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
@@ -3296,7 +3320,23 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend == "auto":
+            if is_hip():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
+                elif self.moe_runner_backend not in [
+                    "triton",
+                    "cutlass",
+                    "deep_gemm",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                ]:
+                    logger.warning(
+                        "mxfp8 quantization on ROCm supports triton, cutlass, "
+                        "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
+                        f"backends. Overriding {self.moe_runner_backend!r}."
+                    )
+                    self.moe_runner_backend = "triton"
+            elif self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "flashinfer_trtllm"
             elif self.moe_runner_backend not in [
                 "cutlass",
