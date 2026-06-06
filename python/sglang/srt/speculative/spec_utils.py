@@ -77,6 +77,16 @@ TREE_SPEC_KERNEL_AVAILABLE = (
 )  # This kernel is only available for CUDA and MUSA now
 
 
+# Inverse of model_config._STR_DTYPE_TO_TORCH_DTYPE, restricted to the canonical
+# names accepted by server_args. Used by spec workers to align draft dtype with
+# target's already-resolved dtype.
+TORCH_DTYPE_TO_STR = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
+
+
 def record_stream_each(tensors, stream):
     """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
     non-tensor / non-cuda entries. Tells the caching allocator that the

@@ -65,6 +65,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    TORCH_DTYPE_TO_STR,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
@@ -834,6 +835,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
+
+        # Match draft dtype to target. EAGLE-3 / MTP drafts share target's embed/lm_head
+        # weights and aux hidden states; dtype divergence trips strict norm kernels.
+        server_args.dtype = TORCH_DTYPE_TO_STR[
+            target_worker.model_runner.model_config.dtype
+        ]
 
         self._draft_worker = EagleDraftWorker(
             server_args,
