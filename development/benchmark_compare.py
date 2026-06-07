@@ -216,12 +216,12 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
 
     # Per-request decode throughput = output_tokens / (e2e_latency - ttft), the
     # canonical client-SLO metric. bench_serving now emits it directly as
-    # `median_decode_throughput_tps`; consume that FIRST so a current task9
-    # artifact gates on the resolved metric. The `output_lens / sum(itls)`
-    # derivation and the legacy `output_throughput_*` / `per_req_output_tps_*`
-    # scalars are kept ONLY as fallback for older fixtures that predate the
-    # decode-throughput emission — a task9 row carrying the new field must not
-    # silently fall through to a differently-derived number.
+    # `median_decode_throughput_tps`; consume that FIRST so a current artifact
+    # gates on the resolved metric. The `output_lens / sum(itls)` derivation and
+    # the legacy `output_throughput_*` / `per_req_output_tps_*` scalars are kept
+    # ONLY as fallback for older fixtures that predate the decode-throughput
+    # emission — a current row carrying the new field must not silently fall
+    # through to a differently-derived number.
     decode_p50 = _float("median_decode_throughput_tps")
     if decode_p50 is not None:
         per_req_p50 = decode_p50
@@ -1072,7 +1072,7 @@ def render_markdown_report(
         rows.append(f"| {label} | {_fmt(a)} | {_fmt(b)} |")
 
     rows.append("")
-    rows.append(f"**DS SLO verdict (per-request P50 ≥ {SLO_PER_REQUEST_TPS_P50} tok/s, P99 TTFT ≤ {SLO_TTFT_P99_S} s):** {_slo_verdict(ds_metrics)}")
+    rows.append(f"**DS SLO verdict (per-request decode P50 ≥ {SLO_PER_REQUEST_TPS_P50} tok/s, P99 TTFT < {SLO_TTFT_P99_S} s):** {_slo_verdict(ds_metrics)}")
     ds_status, ds_reason = _no_op_status(ds_metrics)
     if ds_status == "clean":
         rows.append("**No-op detector:** clean")

@@ -1,9 +1,9 @@
-"""Unit tests for the AC-4 SLO gate in development/benchmark_compare.py.
+"""Unit tests for the client-SLO gate in development/benchmark_compare.py.
 
 The comparator must gate on the resolved per-request decode-throughput metric
 `median_decode_throughput_tps` (= output_tokens / (e2e - ttft)) that
 bench_serving emits, NOT silently fall back to a differently-derived number
-when that field is present. These tests pin: (a) a current task9-style artifact
+when that field is present. These tests pin: (a) a current-format artifact
 carrying only the new decode field gates correctly (not missing-data); (b) a
 contradictory legacy field does not override the new decode field; (c) a
 new-style artifact missing the decode field AND the derivation arrays fails
@@ -55,7 +55,7 @@ def _verdict_from_row(row: dict) -> tuple:
 
 class TestDecodeTpsSloGate(unittest.TestCase):
     def test_new_decode_field_gates_pass(self):
-        # task9-style row: only the new decode field + p99 ttft, no legacy/arrays.
+        # current-format row: only the new decode field + p99 ttft, no legacy/arrays.
         m, verdict = _verdict_from_row(
             {
                 "max_concurrency": 64,
@@ -128,6 +128,34 @@ class TestDecodeTpsSloGate(unittest.TestCase):
         self.assertIsNotNone(m.output_tps_p50)
         self.assertAlmostEqual(m.output_tps_p50, 100.0, places=1)
         self.assertEqual(verdict, "pass")
+
+
+    def _metrics(self, **over):
+        base = dict(
+            concurrency=64, num_prompts=320, isl=4096, osl=512,
+            output_tps_p50=73.0, output_tps_p99=80.0,
+            ttft_p50_s=5.0, ttft_p99_s=10.0,
+            tpot_p50_ms=10.0, tpot_p99_ms=12.0,
+            goodput_under_slo=None, selected_tokens_mean=None,
+            dense_fallback_total=None, total_tokens_mean=None,
+        )
+        base.update(over)
+        return BC.RunMetrics(**base)
+
+    def test_report_prints_strict_ttft_bar_and_fails_at_22s(self):
+        # The rendered SLO verdict line must advertise the strict "< 22.0 s"
+        # bar (not the old "≤ 22.0 s"), and a run at exactly 22.0 s must fail.
+        dsa = self._metrics()
+        ds = self._metrics(ttft_p99_s=22.0)  # exactly at the bar → strict fail
+        report = BC.render_markdown_report(
+            dsa, ds, baseline_path="dsa.jsonl", ds_path="ds.jsonl"
+        )
+        self.assertIn("P99 TTFT < 22.0 s", report)
+        self.assertNotIn("P99 TTFT ≤ 22.0 s", report)
+        self.assertNotIn("P99 TTFT <= 22.0 s", report)
+        # The DS SLO verdict for the 22.0 s row is fail.
+        self.assertEqual(BC._slo_verdict(ds), "fail")
+        self.assertIn("verdict", report.lower())
 
 
 if __name__ == "__main__":
