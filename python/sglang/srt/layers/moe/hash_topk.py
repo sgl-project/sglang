@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
-    post_process_topk_ids_for_per_rank_shared_slots,
+    remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.utils import is_hip
@@ -177,27 +177,28 @@ class HashTopK(nn.Module):
 
         num_fused_shared_experts = self.num_fused_shared_experts
         if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+            shared_cols = topk_ids[:, -num_fused_shared_experts:]
+            routed_cols = topk_ids[:, :-num_fused_shared_experts]
+            routed_cols = topk_ids_logical_to_physical(
+                routed_cols, expert_location_dispatch_info
+            )
+            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+
             num_physical_routed_experts = (
                 expert_location_dispatch_info.num_physical_experts
                 if expert_location_dispatch_info is not None
                 else self.num_experts
             )
-
-            def routed_postprocess(routed_cols: torch.Tensor) -> torch.Tensor:
-                return topk_ids_logical_to_physical(
-                    routed_cols, expert_location_dispatch_info
-                )
-
-            topk_ids, topk_weights = post_process_topk_ids_for_per_rank_shared_slots(
+            topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
                 topk_ids,
                 topk_weights,
+                num_fused_shared_experts,
+                num_physical_routed_experts,
                 TopKConfig(
                     top_k=self.topk,
                     num_fused_shared_experts=num_fused_shared_experts,
                     routed_scaling_factor=self.routed_scaling_factor,
                 ),
-                num_physical_routed_experts,
-                routed_postprocess,
             )
         else:
             topk_ids = topk_ids_logical_to_physical(
