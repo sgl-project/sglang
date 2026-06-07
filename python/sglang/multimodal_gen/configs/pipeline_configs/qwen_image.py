@@ -298,6 +298,66 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         txt_cos_sin_cache = torch.cat([txt_cos_half, txt_sin_half], dim=-1)
         return img_cos_sin_cache, txt_cos_sin_cache
 
+    @staticmethod
+    def _expand_cond_tensor_batch(
+        tensor: torch.Tensor, target_batch_size: int, cond_name: str
+    ) -> torch.Tensor:
+        current_batch_size = tensor.shape[0]
+        if current_batch_size == target_batch_size:
+            return tensor
+
+        if current_batch_size == 0 or target_batch_size % current_batch_size != 0:
+            raise ValueError(
+                f"QwenImage expects `{cond_name}` batch size ({current_batch_size}) "
+                f"to divide target batch size ({target_batch_size})."
+            )
+
+        repeat_factor = target_batch_size // current_batch_size
+        return tensor.repeat_interleave(repeat_factor, dim=0).contiguous()
+
+    @classmethod
+    def _expand_cond_batch(
+        cls,
+        cond: list[torch.Tensor] | torch.Tensor | None,
+        batch,
+        cond_name: str,
+    ) -> list[torch.Tensor] | torch.Tensor | None:
+        if cond is None:
+            return None
+
+        target_batch_size = batch.batch_size
+        if isinstance(cond, list):
+            return [
+                cls._expand_cond_tensor_batch(tensor, target_batch_size, cond_name)
+                for tensor in cond
+            ]
+        return cls._expand_cond_tensor_batch(cond, target_batch_size, cond_name)
+
+    @staticmethod
+    def _expand_cond_seq_lens(
+        seq_lens: list[int], target_batch_size: int, cond_name: str
+    ) -> list[int]:
+        current_batch_size = len(seq_lens)
+        if current_batch_size == target_batch_size:
+            return [int(seq_len) for seq_len in seq_lens]
+
+        if current_batch_size == 0 or target_batch_size % current_batch_size != 0:
+            raise ValueError(
+                f"QwenImage expects `{cond_name}` batch size ({current_batch_size}) "
+                f"to divide target batch size ({target_batch_size})."
+            )
+
+        repeat_factor = target_batch_size // current_batch_size
+        return [int(seq_len) for seq_len in seq_lens for _ in range(repeat_factor)]
+
+    def get_pos_prompt_embeds(self, batch):
+        return self._expand_cond_batch(batch.prompt_embeds, batch, "prompt_embeds")
+
+    def get_neg_prompt_embeds(self, batch):
+        return self._expand_cond_batch(
+            batch.negative_prompt_embeds, batch, "negative_prompt_embeds"
+        )
+
     def _prepare_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
     ):
@@ -366,7 +426,12 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             return [text_seq_len], None
 
         txt_seq_lens = self.require_text_seq_lens(
-            batch, encoder_index, negative=negative, expected_batch_size=batch_size
+            batch, encoder_index, negative=negative
+        )
+        txt_seq_lens = self._expand_cond_seq_lens(
+            txt_seq_lens,
+            batch_size,
+            "negative_prompt_seq_lens" if negative else "prompt_seq_lens",
         )
         encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
             batch,
@@ -410,12 +475,22 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         )
         if masks_by_encoder is not None and encoder_index < len(masks_by_encoder):
             mask = masks_by_encoder[encoder_index]
-            if mask.shape != (batch_size, text_seq_len):
-                raise ValueError(
-                    "QwenImage text conditioning mask has shape "
-                    f"{tuple(mask.shape)}, expected {(batch_size, text_seq_len)}."
+            if mask is not None:
+                mask = self._expand_cond_tensor_batch(
+                    mask,
+                    batch_size,
+                    (
+                        "negative_prompt_embeds_mask"
+                        if negative
+                        else "prompt_embeds_mask"
+                    ),
                 )
-            return mask
+                if mask.shape != (batch_size, text_seq_len):
+                    raise ValueError(
+                        "QwenImage text conditioning mask has shape "
+                        f"{tuple(mask.shape)}, expected {(batch_size, text_seq_len)}."
+                    )
+                return mask
 
         # TODO: cache positions by (device, text_seq_len) if this allocation shows up hot.
         positions = torch.arange(text_seq_len, device=batch.prompt_embeds[0].device)
@@ -428,13 +503,18 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_cond_kwargs(
-            batch, batch.prompt_embeds, rotary_emb, device, dtype, negative=False
+            batch,
+            self.get_pos_prompt_embeds(batch),
+            rotary_emb,
+            device,
+            dtype,
+            negative=False,
         )
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_cond_kwargs(
             batch,
-            batch.negative_prompt_embeds,
+            self.get_neg_prompt_embeds(batch),
             rotary_emb,
             device,
             dtype,
