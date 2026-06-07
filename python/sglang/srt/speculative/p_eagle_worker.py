@@ -29,26 +29,21 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
-    EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    build_tree_kernel_efficient,
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -58,7 +53,6 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.speculative.triton_ops.fused_draft_input import (
     fused_parallel_draft_input,
-    fused_parallel_draft_input_torch,
 )
 
 logger = logging.getLogger(__name__)
