@@ -185,7 +185,7 @@ class PEAGLEWorker(EAGLEWorker):
 
         # Shared hidden state: [hidden_dim] — mean over batch h_fused
         hidden_dim = self._get_hidden_dim()
-        self._h_shared = torch.zeros(hidden_dim, dtype=torch.float16, device='cuda')
+        self._h_shared = torch.zeros(hidden_dim, dtype=self.target_worker.model_runner.model_config.dtype, device='cuda')
 
         # Resolve MASK token ID from draft model
         self._mask_token_id = self._resolve_mask_token_id()
