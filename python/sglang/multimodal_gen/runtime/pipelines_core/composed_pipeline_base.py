@@ -1013,6 +1013,11 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
