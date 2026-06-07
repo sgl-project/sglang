@@ -18,8 +18,19 @@ if TYPE_CHECKING:
 
 
 def _await_control(
-    ctx: "ScriptedContext", *, path: str, json, expect_type: type
+    ctx: "ScriptedContext",
+    *,
+    path: str,
+    json,
+    expect_type: type,
+    await_arrival: bool = True,
 ) -> None:
+    if not await_arrival:
+        # Caller knows this control produces no recv echo to wait for (e.g. abort
+        # of an unknown/finished rid that TokenizerManager drops without
+        # forwarding); skip the arrival barrier instead of timing out.
+        _http_post_fire_and_forget(ctx, path=path, json=json)
+        return
     _http_post_and_await_recv_msg(
         ctx,
         path=path,
@@ -59,18 +70,12 @@ def abort_all(ctx: "ScriptedContext") -> None:
 
 
 def abort(ctx: "ScriptedContext", *, rid: str, await_arrival: bool = True) -> None:
-    if not await_arrival:
-        _http_post_fire_and_forget(
-            ctx,
-            path="/abort_request",
-            json={"rid": rid, "abort_all": False},
-        )
-        return
     _await_control(
         ctx,
         path="/abort_request",
         json={"rid": rid, "abort_all": False},
         expect_type=AbortReq,
+        await_arrival=await_arrival,
     )
 
 
