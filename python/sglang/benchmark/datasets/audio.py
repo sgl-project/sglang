@@ -216,7 +216,10 @@ def sample_audio_requests(
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
       counts text + audio tokens; ``text_prompt_len`` counts text only.
     """
-    if random_audio_count:
+    if audio_count <= 0:
+        # Degenerate config: no audio per request (graceful text-only fallback).
+        audio_counts = np.zeros(num_requests, dtype=int)
+    elif random_audio_count:
         audio_counts = np.random.randint(1, audio_count + 1, size=num_requests)
     else:
         audio_counts = np.full(num_requests, audio_count)
@@ -240,19 +243,23 @@ def sample_audio_requests(
             int(input_lens[i]),
         )
 
-        audios, audios_base64, audios_bytes = zip(
-            *[
-                gen_audio_data_uri(audio_content, audio_length, sample_rate)
-                for _ in range(request_audio_count)
-            ]
-        )
-        total_audio_bytes += sum(audios_bytes)
+        if request_audio_count > 0:
+            audios, audios_base64, audios_bytes = zip(
+                *[
+                    gen_audio_data_uri(audio_content, audio_length, sample_rate)
+                    for _ in range(request_audio_count)
+                ]
+            )
+            audios, audios_base64 = list(audios), list(audios_base64)
+            total_audio_bytes += sum(audios_bytes)
+        else:
+            audios, audios_base64 = [], []
 
         dataset.append(
             create_audio_data_row(
                 text_prompt,
-                list(audios),
-                list(audios_base64),
+                audios,
+                audios_base64,
                 int(output_lens[i]),
                 processor,
                 sample_rate,
