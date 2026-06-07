@@ -75,6 +75,8 @@ def fused_parallel_draft_input(
       BLOCK_H = 512 → hidden_tiles = hidden_dim / 512
       Occupancy: batch × K × hidden_tiles programs (e.g. 16 × 4 = 64 for K=4, h=2048)
     """
+    h_fused = h_fused.contiguous()
+    last_tokens = last_tokens.contiguous()
     batch_size, hidden_dim = h_fused.shape
 
     output = torch.empty(batch_size * K, hidden_dim, dtype=h_fused.dtype, device=h_fused.device)
