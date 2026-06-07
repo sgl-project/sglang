@@ -9823,6 +9823,115 @@ class TestMlaNopeExtractionDualShape(unittest.TestCase):
                 self.assertTrue(torch.allclose(out, torch.ones(T, H, nope)))
 
 
+class TestGlmArtifactContractRoundTrip(unittest.TestCase):
+    """The calibrated mask's artifact contract must round-trip at GLM's MLA
+    shapes (no-PE head_dim=192, layers=78) with a GLM-native label_dim (32, per
+    DEC-3): save -> load (content_sha256 re-verifies, indices in [0,192)) ->
+    verify_bind_shapes passes against GLM dims, and a head_dim=128 mask fails.
+
+    CPU proof that the on-hardware calibration run's output will be loadable and
+    runtime-valid before any GPU time is spent.
+    """
+
+    GLM_NOPE = 192
+    GLM_LABEL_DIM = 32  # DEC-3: GLM-native (not the V3.2 value 16); see recipe.
+    GLM_LAYERS = 78
+
+    def _build_and_save(self, path, *, head_dim, label_dim, layers, heads):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+
+        # Distinct in-range channel indices per (layer, head): the first
+        # label_dim channels, well within [0, head_dim).
+        base = torch.arange(label_dim, dtype=torch.int32)
+        sel = base.view(1, 1, label_dim).expand(layers, heads, label_dim).contiguous()
+        weights = torch.ones(layers, heads, label_dim, dtype=torch.float32)
+        return save_channel_mask(
+            path,
+            sel,
+            weights,
+            dtype="fp8_e4m3",
+            head_dim=head_dim,
+            page_size=64,
+            label_dim=label_dim,
+            created_at="2026-06-07T00:00:00Z",
+            extra_metadata={"calibration_source": "synthetic-test"},
+        )
+
+    def test_glm_shape_mask_roundtrips_and_validates(self):
+        import tempfile
+
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            load_channel_mask,
+            verify_bind_shapes,
+        )
+
+        heads = 8
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "glm51-fp8-channel-mask.safetensors")
+            sha = self._build_and_save(
+                path,
+                head_dim=self.GLM_NOPE,
+                label_dim=self.GLM_LABEL_DIM,
+                layers=self.GLM_LAYERS,
+                heads=heads,
+            )
+            # load re-verifies content_sha256 and the [0, head_dim) index bound.
+            mask = load_channel_mask(path)
+            self.assertEqual(mask.head_dim, self.GLM_NOPE)
+            self.assertEqual(mask.label_dim, self.GLM_LABEL_DIM)
+            self.assertEqual(mask.page_size, 64)
+            self.assertEqual(mask.num_layers, self.GLM_LAYERS)
+            self.assertEqual(mask.content_sha256, sha)
+            self.assertLess(int(mask.channel_selection.max()), self.GLM_NOPE)
+            # runtime validation against the GLM model dims must pass.
+            verify_bind_shapes(
+                mask,
+                model_nope_head_dim=self.GLM_NOPE,
+                num_local_heads=heads,
+                tp_size=1,
+                num_hidden_layers=self.GLM_LAYERS,
+                server_page_size=64,
+                server_label_dim=self.GLM_LABEL_DIM,
+                server_kv_cache_dtype="fp8_e4m3",
+            )
+
+    def test_v32_headdim_mask_fails_against_glm(self):
+        # AC-3 negative: a mask calibrated for the narrower 128 no-PE width must
+        # NOT validate against a 192 model (silent wrong-channel selection).
+        import tempfile
+
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            load_channel_mask,
+            verify_bind_shapes,
+        )
+
+        heads = 8
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "v32-fp8-channel-mask.safetensors")
+            self._build_and_save(
+                path,
+                head_dim=128,
+                label_dim=16,
+                layers=self.GLM_LAYERS,
+                heads=heads,
+            )
+            mask = load_channel_mask(path)
+            with self.assertRaises(ValueError) as cm:
+                verify_bind_shapes(
+                    mask,
+                    model_nope_head_dim=self.GLM_NOPE,
+                    num_local_heads=heads,
+                    tp_size=1,
+                    num_hidden_layers=self.GLM_LAYERS,
+                    server_page_size=64,
+                    server_label_dim=16,
+                    server_kv_cache_dtype="fp8_e4m3",
+                )
+            self.assertIn("head_dim", str(cm.exception))
+
+
 class TestVerifyBindShapes(unittest.TestCase):
     """Bind-time shape gate: a calibrated mask must match the running model's
     no-PE head width / head count / layer count, or DS hard-errors naming the
