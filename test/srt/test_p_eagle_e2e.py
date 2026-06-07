@@ -17,8 +17,8 @@ For live server test (requires SGLang server + model weights):
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 import time
 
 import pytest

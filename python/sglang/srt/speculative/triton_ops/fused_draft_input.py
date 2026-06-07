@@ -14,9 +14,9 @@ Reference: vLLM v0.16.0 p_eagle_proposer.py
 SGLang issue: github.com/sgl-project/sglang/issues/23171
 """
 
+import torch
 import triton
 import triton.language as tl
-import torch
 
 
 @triton.jit
