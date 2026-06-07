@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.utils import (
+    assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
@@ -1705,11 +1706,14 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices_used = seq_lens_sum + (
                     self.num_draft_tokens * bs if self.use_mla else 0
                 )
-                assert kv_indices_used <= kv_indices.numel(), (
-                    f"aiter target_verify kv_indices too small: need "
-                    f"{kv_indices_used} > {kv_indices.numel()} (bs={bs}, "
-                    f"seq_lens_sum={seq_lens_sum}, "
-                    f"num_draft_tokens={self.num_draft_tokens}, use_mla={self.use_mla})."
+                assert_buffer_fits(
+                    kv_indices_used,
+                    kv_indices.numel(),
+                    "aiter target_verify kv_indices",
+                    bs=bs,
+                    seq_lens_sum=seq_lens_sum,
+                    num_draft_tokens=self.num_draft_tokens,
+                    use_mla=self.use_mla,
                 )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
