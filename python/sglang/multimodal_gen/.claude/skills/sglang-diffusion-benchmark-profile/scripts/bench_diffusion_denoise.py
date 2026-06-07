@@ -763,6 +763,7 @@ def run_benchmark_once(
 
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    cfg = MODELS[model_key]
     for key, value in cfg.get("env", {}).items():
         env.setdefault(key, str(value))
     if env.get("HF_TOKEN") and not env.get("HUGGINGFACE_HUB_TOKEN"):
