@@ -3271,8 +3271,8 @@ class UnifiedRadixCacheSuite:
             swa_comp.commit_hicache_transfer(
                 chain[-1], CacheTransferPhase.LOAD_BACK, transfers=transfers
             )
-            tree.dec_host_lock_ref(chain[-1], host_lock.to_dec_params())
             released = True
+            tree.dec_host_lock_ref(chain[-1], host_lock.to_dec_params())
 
             offset = 0
             for n in loaded_nodes:
