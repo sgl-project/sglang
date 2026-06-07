@@ -33,6 +33,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DDTREE = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -109,6 +110,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_ddtree(self) -> bool:
+        return self == SpeculativeAlgorithm.DDTREE
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -116,7 +120,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash()
+        return self.is_dflash() or self.is_ddtree()
 
     def create_future_map(
         self,
@@ -175,6 +179,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
+
+        if self.is_ddtree():
+            if enable_overlap:
+                raise ValueError(
+                    "DDTREE does not support overlap scheduling (spec v2)."
+                )
+            from sglang.srt.speculative.ddtree_worker import DDTreeWorker
+
+            return DDTreeWorker
 
         if self.is_frozen_kv_mtp():
             if enable_overlap:
@@ -248,6 +261,7 @@ class SpecInputType(IntEnum):
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
+    DDTREE_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -273,6 +287,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
+            SpecInputType.DDTREE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
 
