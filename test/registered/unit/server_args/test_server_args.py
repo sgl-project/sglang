@@ -523,12 +523,6 @@ class TestNgramExternalSamArgs(CustomTestCase):
 
 
 class TestDeepEPWaterfillArgs(CustomTestCase):
-    @staticmethod
-    def _set_arch(server_args, architecture):
-        server_args.model_path = "mock-model"
-        server_args.model_config = MagicMock()
-        server_args.model_config.hf_config.architectures = [architecture]
-
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -552,20 +546,6 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         server_args._handle_a2a_moe()
 
         self.assertEqual(server_args.moe_a2a_backend, "deepep")
-        self.assertTrue(server_args.enforce_shared_experts_fusion)
-
-    def test_deepseek_v4_megamoe_waterfill_keeps_megamoe(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="megamoe",
-            enable_deepep_waterfill=True,
-            disable_shared_experts_fusion=True,
-        )
-        self._set_arch(server_args, "DeepseekV4ForCausalLM")
-        server_args._handle_a2a_moe()
-
-        self.assertEqual(server_args.moe_a2a_backend, "megamoe")
-        self.assertFalse(server_args.disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_supports_deepep_low_latency_mode(self):

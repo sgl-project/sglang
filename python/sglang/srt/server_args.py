@@ -3445,30 +3445,12 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
-        def get_model_arch_or_none():
-            model_config = getattr(self, "model_config", None)
-            if model_config is None and self.model_path == "dummy":
-                return None
-            if model_config is None:
-                model_config = self.get_model_config()
-            return model_config.hf_config.architectures[0]
-
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
-            model_arch = get_model_arch_or_none()
-            if (
-                self.moe_a2a_backend == "megamoe"
-                and model_arch == "DeepseekV4ForCausalLM"
-            ):
-                logger.info(
-                    "DeepSeek V4 MegaMoE Waterfill is enabled; keeping "
-                    "--moe-a2a-backend megamoe and enabling shared expert fusion."
-                )
-            else:
-                logger.warning(
-                    "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-                    "Waterfill requires the DeepEP backend."
-                )
-                self.moe_a2a_backend = "deepep"
+            logger.warning(
+                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
+                "Waterfill requires the DeepEP backend."
+            )
+            self.moe_a2a_backend = "deepep"
 
         if (
             envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
@@ -3488,14 +3470,6 @@ class ServerArgs:
                 f"Mega MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            if self.enable_deepep_waterfill:
-                if self.disable_shared_experts_fusion:
-                    logger.warning(
-                        "disable_shared_experts_fusion is overridden to False because "
-                        "MegaMoE Waterfill requires shared expert fusion."
-                    )
-                    self.disable_shared_experts_fusion = False
-                self.enforce_shared_experts_fusion = True
 
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":

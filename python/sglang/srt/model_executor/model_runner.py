@@ -1493,7 +1493,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 if num_routed_experts is None:
                     raise ValueError(
-                        "Waterfill requires model config n_routed_experts."
+                        "DeepEP waterfill requires model config n_routed_experts."
                     )
             if balancer_cls is None:
                 from sglang.srt.layers.moe.deepep_waterfill import (
@@ -1523,7 +1523,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_prepared += 1
         if num_prepared:
             log_info_on_rank0(
-                logger, f"Prepared {num_prepared} waterfill TopK modules."
+                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
             )
 
     def update_expert_location(
