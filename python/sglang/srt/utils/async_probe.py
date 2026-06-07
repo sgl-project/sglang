@@ -33,14 +33,22 @@ def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
 
 
 def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: str):
-    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point."""
+    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point.
+
+    Low/high asserted separately so the message names which failed (low =
+    negative/sentinel, high = out of range).
+    """
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
         return
     if indices is None or indices.numel() == 0:
         return
     torch._assert_async(
-        (indices.min() >= low) & (indices.max() < high),
-        f"OOB indices not in [{low}, {high}): {msg}",
+        indices.min() >= low,
+        f"index < {low} (negative / unmasked sentinel?): {msg}",
+    )
+    torch._assert_async(
+        indices.max() < high,
+        f"index >= {high} (out of range): {msg}",
     )
 
 
