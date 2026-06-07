@@ -99,6 +99,16 @@ class StandaloneWorker(EAGLEWorker):
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
+        # Validate that the draft model shares the same vocabulary as the target model.
+        # vocab_size equality is a quick necessary check, but not sufficient: two models
+        # can have the same vocab_size with different token strings.  We also compare the
+        # full token-to-id mapping of both tokenizers (the same approach used by
+        # HuggingFace Transformers to detect homogeneous vs heterogeneous vocabularies).
+        self._validate_vocab_compatibility(
+            target_vocab_size=target_worker.model_runner.model_config.vocab_size,
+            target_tokenizer=target_worker.tokenizer,
+        )
+
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
@@ -119,3 +129,50 @@ class StandaloneWorker(EAGLEWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+    def _validate_vocab_compatibility(
+        self,
+        target_vocab_size: int,
+        target_tokenizer,
+    ) -> None:
+        """Raise ValueError if the draft and target vocabularies are incompatible.
+
+        STANDALONE requires both models to share the same vocabulary.  Two
+        conditions are checked:
+        1. ``vocab_size`` must be identical (fast check).
+        2. The full token-to-id mapping from ``get_vocab()`` must be identical
+           (catches same-size but different-content tokenizers).
+
+        Either tokenizer being ``None`` (e.g. ``--skip-tokenizer-init``) or a
+        tokenizer type that does not implement ``get_vocab()`` (e.g.
+        ``TiktokenTokenizer``) skips the deep mapping check.
+
+        The ``get_vocab()`` comparison is O(vocab_size) but runs only once at
+        startup; on a 256 k-token vocabulary it takes ~300 ms, which is
+        negligible relative to model-loading time.
+        """
+        draft_vocab_size = self.draft_model_runner.model_config.vocab_size
+        draft_tokenizer = self.tokenizer
+        if target_vocab_size != draft_vocab_size:
+            raise ValueError(
+                f"STANDALONE speculative decoding requires the draft model to share the "
+                f"same vocabulary as the target model, but got "
+                f"target vocab_size={target_vocab_size} and "
+                f"draft vocab_size={draft_vocab_size}. "
+                f"Use a draft model with a matching vocabulary, or a speculative "
+                f"algorithm that supports heterogeneous vocabularies."
+            )
+        if (
+            target_tokenizer is not None
+            and draft_tokenizer is not None
+            and hasattr(target_tokenizer, "get_vocab")
+            and hasattr(draft_tokenizer, "get_vocab")
+            and target_tokenizer.get_vocab() != draft_tokenizer.get_vocab()
+        ):
+            raise ValueError(
+                "STANDALONE speculative decoding requires the draft model to share the "
+                "same vocabulary as the target model, but the two tokenizers have "
+                "different token-to-id mappings even though their vocab sizes match. "
+                "Use a draft model with a matching vocabulary, or a speculative "
+                "algorithm that supports heterogeneous vocabularies."
+            )
