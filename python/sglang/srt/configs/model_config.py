@@ -452,6 +452,12 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["Step3p5MTP"]
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -468,6 +474,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "Qwen3MoeForCausalLM":
+            self.hf_config.architectures[0] = "Qwen3MoeForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
@@ -480,7 +490,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
@@ -491,7 +504,7 @@ class ModelConfig:
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
-            is_hybrid_swa_model(self.hf_config.architectures)
+            is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
             and not self.disable_hybrid_swa_memory
         )
 
@@ -518,6 +531,7 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         ]
 
     def _detect_attention_sinks(self) -> bool:
@@ -1131,6 +1145,7 @@ class ModelConfig:
             "mxfp4",
             "auto-round",
             "quark_int4fp8_moe",
+            "quark_mxfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -1153,6 +1168,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "modelslim",
+            "quark_mxfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -1496,11 +1512,13 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 multimodal_model_archs = [
     "CLIPModel",
+    "Cohere2VisionForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
@@ -1554,6 +1572,7 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
+    "Step3p7ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
 
@@ -1657,7 +1676,10 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     return base_scaling * mscale * mscale
 
 
-def is_hybrid_swa_model(model_architectures: List[str]):
+def is_hybrid_swa_model(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig] = None,
+):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
@@ -1668,11 +1690,19 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
+        "Step3p7ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
     }
-    return any(arch in hybrid_swa_archs for arch in model_architectures)
+    if any(arch in hybrid_swa_archs for arch in model_architectures):
+        return True
+    # Also recognize models that explicitly opt-in via their HF text config,
+    # so custom hybrid-SWA architectures don't need to be added to the allowlist.
+    if hf_text_config is not None and getattr(hf_text_config, "is_hybrid_swa", False):
+        return True
+    return False
 
 
 def get_hybrid_layer_ids(
@@ -1706,7 +1736,10 @@ def get_hybrid_layer_ids(
     elif "MiMoV2MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
-    elif "Step3p5ForCausalLM" in model_architectures:
+    elif (
+        "Step3p5ForCausalLM" in model_architectures
+        or "Step3p7ForConditionalGeneration" in model_architectures
+    ):
         layer_types = hf_text_config.layer_types
         swa_attention_layer_ids = [
             i
@@ -1724,6 +1757,7 @@ def get_hybrid_layer_ids(
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
+        or "Gemma4UnifiedForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
@@ -1739,6 +1773,17 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
+    elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
+        # Generic fallback for custom hybrid SWA models that opt in via
+        # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern
+        # (1 = SWA, 0 = full) without needing to be added to the allowlist.
+        hybrid_layer_pattern = hf_text_config.hybrid_layer_pattern
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     else:
         swa_attention_layer_ids = None

@@ -31,6 +31,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda, is_npu
 
+_is_npu = is_npu()
+
+
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
@@ -1018,9 +1021,12 @@ class DFlashWorker:
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
-            k, v = attn.kv_proj_only(ctx_hidden)
-            k = attn.apply_k_norm(k)
-            k = attn.apply_k_rope(ctx_positions, k)
+            if _is_npu:
+                _, k, v = attn.forward_prepare_npu(ctx_positions, ctx_hidden)
+            else:
+                k, v = attn.kv_proj_only(ctx_hidden)
+                k = attn.apply_k_norm(k)
+                k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(

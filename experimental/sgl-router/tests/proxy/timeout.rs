@@ -13,8 +13,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -34,18 +34,16 @@ fn config(_worker_url: &str) -> Config {
             port: 0,
         },
         observability: ObservabilityConfig::default(),
-        models: vec![ModelConfig {
+        model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
-        }],
-        discovery: DiscoveryConfig {
-            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-                urls: vec!["http://placeholder:0".into()],
-            }),
         },
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            urls: vec!["http://placeholder:0".into()],
+        }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
     }

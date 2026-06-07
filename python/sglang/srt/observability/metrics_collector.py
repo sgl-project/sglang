@@ -109,6 +109,9 @@ class SchedulerStats:
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
+    # Adaptive speculative decoding (currently active tier).
+    spec_num_steps: int = 0
+    spec_num_draft_tokens: int = 0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -402,6 +405,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
             documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_num_steps = Gauge(
+            name="sglang:spec_num_steps",
+            documentation="Currently active speculative_num_steps.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_num_draft_tokens = Gauge(
+            name="sglang:spec_num_draft_tokens",
+            documentation="Currently active speculative_num_draft_tokens (decouples from steps under topk>1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1248,6 +1263,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
+        self._log_gauge(self.spec_num_draft_tokens, stats.spec_num_draft_tokens)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)

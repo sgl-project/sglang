@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import addict
 import yaml
@@ -27,11 +27,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
-from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
-    DisaggArgsMixin,
-    add_disagg_cli_args,
-    convert_disagg_role_string,
-)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -52,9 +47,11 @@ from sglang.multimodal_gen.runtime.server_args_auto_tune import (
     PERFORMANCE_MODES,
     ServerArgsAutoTuner,
 )
+from sglang.multimodal_gen.runtime.server_args_disagg import DisaggServerArgsMixin
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
+    normalize_gpu_ids,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _sanitize_for_logging,
@@ -116,7 +113,7 @@ class Backend(str, Enum):
 
 
 @dataclasses.dataclass
-class ServerArgs(DisaggArgsMixin):
+class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
@@ -146,6 +143,8 @@ class ServerArgs(DisaggArgsMixin):
     # Parallelism
     num_gpus: int = 1
     performance_mode: str = "auto"
+    base_gpu_id: int = 0
+    gpu_ids: list[int] | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -185,6 +184,11 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    # Per-component transformer weight overrides (key = model_index.json component name).
+    # Pipelines use this when a checkpoint ships separate quantized weights for
+    # secondary DiT components; the generic loader consumes it without model-specific
+    # filename logic.
+    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
 
     # Quantization method for online quantization
     quantization: str | None = None
@@ -282,13 +286,21 @@ class ServerArgs(DisaggArgsMixin):
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
-    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
-    # CLI registration in disagg_args.add_disagg_cli_args().
-    base_gpu_id: int = 0
+    # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
-    disagg_timeout: int = 600
+    disagg_timeout: int = 3600
+    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
+    disagg_instance_id: int = 0
+    disagg_max_slots_per_instance: int = 8
+    disagg_transfer_redundancy: float = 1.25
+    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
+    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
     encoder_urls: str | None = None
     denoiser_urls: str | None = None
@@ -298,12 +310,12 @@ class ServerArgs(DisaggArgsMixin):
     denoiser_sp: int | None = None
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
+    decoder_sp: int | None = None
     decoder_tp: int | None = None
-    disagg_transfer_pool_size: int = 256 * 1024 * 1024
-    disagg_p2p_hostname: str = "127.0.0.1"
-    disagg_ib_device: str | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
+    pool_control_endpoint: str | None = None
+    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -312,8 +324,6 @@ class ServerArgs(DisaggArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
-
-    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -334,6 +344,7 @@ class ServerArgs(DisaggArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
+        self._adjust_disagg_parallelism_aliases()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
@@ -354,6 +365,21 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
+
+    def _adjust_disagg_parallelism_aliases(self):
+        if self.decoder_tp is None:
+            return
+        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
+            raise ValueError(
+                "decoder_tp is deprecated in favor of decoder_sp; "
+                "please set only one of them or keep the same value."
+            )
+        if self.decoder_sp is None:
+            logger.warning(
+                "decoder_tp is deprecated and is treated as decoder_sp for "
+                "decoder/VAE parallel decode. Please use decoder_sp instead."
+            )
+            self.decoder_sp = self.decoder_tp
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -729,15 +755,15 @@ class ServerArgs(DisaggArgsMixin):
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
 
-        if current_platform.is_cpu() and (self.tp_size or 1) > 1:
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        if current_platform.is_cpu() and self.tp_size > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
-
-        if self.tp_size is None:
-            self.tp_size = 1
 
         # --cfg-parallel-size takes precedence over --enable-cfg-parallel bool.
         if self.cfg_parallel_degree is not None:
@@ -893,21 +919,18 @@ class ServerArgs(DisaggArgsMixin):
 
         if explicitly_set_component_names is not None:
             self.layerwise_offload_components = explicitly_set_component_names
-            self._disable_cpu_offload_for_layerwise_components(
+            self._disable_non_dit_cpu_offload_for_layerwise_components(
                 explicitly_set_component_names
             )
             return
 
-    def _disable_cpu_offload_for_layerwise_components(
+    def _disable_non_dit_cpu_offload_for_layerwise_components(
         self, component_names: list[str]
     ) -> None:
-        # Layerwise offload owns H2D/D2H for selected component weights.
+        # non-DiT layerwise offload replaces the corresponding component-level CPU offload
         flag_names = cpu_offload_flags_for_layerwise_components(component_names)
         disabled_flag_names: list[str] = []
 
-        if "dit_cpu_offload" in flag_names and self.dit_cpu_offload is not False:
-            self.dit_cpu_offload = False
-            disabled_flag_names.append("dit_cpu_offload")
         if (
             "text_encoder_cpu_offload" in flag_names
             and self.text_encoder_cpu_offload is not False
@@ -986,7 +1009,9 @@ class ServerArgs(DisaggArgsMixin):
         configure_logger(server_args=self)
 
         # Convert string disagg_role to enum (from CLI/config)
-        convert_disagg_role_string(self.__dict__)
+        if isinstance(self.disagg_role, str):
+            self.disagg_role = RoleType.from_string(self.disagg_role)
+        self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 
         # 1. adjust parameters
         self._adjust_parameters()
@@ -1103,6 +1128,23 @@ class ServerArgs(DisaggArgsMixin):
             help="The number of GPUs to use.",
         )
         parser.add_argument(
+            "--base-gpu-id",
+            type=int,
+            default=ServerArgs.base_gpu_id,
+            help="The starting GPU ID for this instance. Used with --disagg-role "
+            "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
+        )
+        parser.add_argument(
+            "--gpu-ids",
+            nargs="+",
+            default=None,
+            help=(
+                "Physical GPU IDs for this instance, e.g. --gpu-ids 0 1 6 7 "
+                "or --gpu-ids 0,1,6,7. Overrides --base-gpu-id for standalone "
+                "disagg roles."
+            ),
+        )
+        parser.add_argument(
             "--tp-size",
             type=int,
             default=None,
@@ -1147,6 +1189,7 @@ class ServerArgs(DisaggArgsMixin):
             "--data-parallel-size",
             "--dp-size",
             "--dp",
+            dest="dp_size",
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
@@ -1172,8 +1215,7 @@ class ServerArgs(DisaggArgsMixin):
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
 
-        # Disaggregated diffusion args (defined in disagg_args.py)
-        add_disagg_cli_args(parser)
+        ServerArgs.add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -1254,7 +1296,9 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
             "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
-            "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. May be combined with "
+            "--dit-cpu-offload, in which case DiT weights stay on host memory and only the "
+            "layers needed for the current step are brought on-device (lowest peak GPU memory).",
         )
         parser.add_argument(
             "--layerwise-offload-components",
@@ -1331,9 +1375,11 @@ class ServerArgs(DisaggArgsMixin):
             help=(
                 "Quantization method for the transformer. If omitted, the method is "
                 "auto-detected from the checkpoint config or safetensors metadata when "
-                "possible. Applies to both pre-quantized checkpoints and online "
-                "quantization. Use this flag to override auto-detection. "
-                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "possible. Use this flag to override auto-detection. "
+                "Online (post-load) quantization from a BF16/FP16 checkpoint "
+                "is supported for 'fp8' and 'mxfp4'. Other methods "
+                "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
+                "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
                 "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
             ),
@@ -1769,7 +1815,8 @@ class ServerArgs(DisaggArgsMixin):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
 
         # Convert disagg_role string to enum if necessary
-        convert_disagg_role_string(kwargs)
+        if "disagg_role" in kwargs and isinstance(kwargs["disagg_role"], str):
+            kwargs["disagg_role"] = RoleType.from_string(kwargs["disagg_role"])
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         kwargs["_explicit_arg_names"] = explicit_arg_names
@@ -1793,10 +1840,16 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
-        if "mode" in provided_arg_names:
-            provided_arg_names.add("performance_mode")
-        if "layerwise_offload_modules" in provided_arg_names:
-            provided_arg_names.add("layerwise_offload_components")
+        cli_aliases = {
+            "cfg_parallel_size": "cfg_parallel_degree",
+            "data_parallel_size": "dp_size",
+            "dp": "dp_size",
+            "layerwise_offload_modules": "layerwise_offload_components",
+            "mode": "performance_mode",
+        }
+        for alias_name, dest_name in cli_aliases.items():
+            if alias_name in provided_arg_names:
+                provided_arg_names.add(dest_name)
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -1834,20 +1887,14 @@ class ServerArgs(DisaggArgsMixin):
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
-            if self.use_fsdp_inference and should_disable_dit_cpu_offload:
+            is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
+            if self.use_fsdp_inference and is_dit_layerwise_offload_selected:
                 logger.warning(
                     "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
 
-            if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
-                logger.warning(
-                    "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."
-                )
-                self.dit_cpu_offload = False
-
-            if envs.SGLANG_CACHE_DIT_ENABLED and should_disable_dit_cpu_offload:
+            if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
                 raise ValueError(
                     "DiT layerwise offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "

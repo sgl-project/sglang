@@ -12,8 +12,11 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
@@ -55,7 +58,9 @@ from sglang.srt.speculative.eagle_info_v2 import (
 )
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
+    _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    organize_draft_results,
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -138,6 +143,11 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        self._topk1_parents_prealloc = None
+        self._topk1_score_indices_prealloc = None
+        self._rebuild_topk1_chain_buffers()
+
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
@@ -204,9 +214,41 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             self.init_cuda_graphs()
 
+        if (c := self.draft_runner.canary_manager) is not None:
+            c.mark_init_finished()
+
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def _rebuild_topk1_chain_buffers(self) -> None:
+        # For topk=1 the draft tree degenerates to a chain, so parent_list and
+        # top_scores_index are runtime-invariant. Must be rebuilt after any
+        # change to speculative_num_steps / speculative_num_draft_tokens.
+        if self.topk != 1:
+            return
+        # _override_worker_state can set both directly, bypassing the hook that
+        # pins this relation; the fast path is only valid when it holds.
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
+        num_steps = self.speculative_num_steps
+        sa = self.server_args
+        max_bs = max(
+            sa.cuda_graph_max_bs or 0,
+            sa.max_running_requests or 0,
+            1,
+        )
+        # A single-step chain has no parent entries (slow path drops the last
+        # step). repeat (not expand): the kernel reads these as contiguous.
+        parent_width = num_steps if num_steps > 1 else 0
+        self._topk1_parents_prealloc = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
+        self._topk1_score_indices_prealloc = torch.arange(
+            num_steps, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
 
     def init_token_map(self):
         # Load hot token ids
@@ -324,10 +366,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
-            isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
-            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
-            or isinstance(self.draft_extend_attn_backend, TokenspeedMLABackend)
+        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and isinstance(
+            self.draft_extend_attn_backend,
+            (
+                TritonAttnBackend,
+                TRTLLMMLABackend,
+                TRTLLMHAAttnBackend,
+                TokenspeedMLABackend,
+            ),
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
@@ -362,22 +408,34 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
-        # Run draft
-        if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch,
+        n_inner = self.speculative_num_steps - 1
+        canary_outside_ctx = (
+            c.with_ops_outside_graph(
+                single_forward_indices=list(range(n_inner)),
+                maybe_inaccurate_forward_batch=forward_batch,
             )
-        else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                # Skip attention backend init for 1-step draft,
-                # `draft_forward` only does sample in this case.
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
-            )
+            if (c := self.draft_runner.canary_manager) is not None
+            else contextlib.nullcontext()
+        )
+
+        with canary_outside_ctx:
+            # Run draft
+            if can_cuda_graph:
+                parent_list, top_scores_index, draft_tokens = (
+                    self.cuda_graph_runner.replay(forward_batch)
+                )
+            else:
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and self.speculative_num_steps > 1
+                ):
+                    # Skip attention backend init for 1-step draft,
+                    # `draft_forward` only does sample in this case.
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                    forward_batch.mark_forward_metadata_ready()
+                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                    forward_batch
+                )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -392,6 +450,19 @@ class EagleDraftWorker(BaseDraftWorker):
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
+        # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
+        # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is None:
+                max_context_len = (
+                    self.target_worker.model_runner.attn_backend.max_context_len
+                )
+                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+            else:
+                # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+                seq_lens_sum = 0
+
         (
             tree_mask,
             position,
@@ -405,7 +476,7 @@ class EagleDraftWorker(BaseDraftWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
@@ -473,18 +544,28 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
+            # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
+            # argument must be contiguous.
+            if (
+                self.draft_runner.model_config.hf_config.architectures[0]
+                == "Qwen3MoeForCausalLMMTP"
+            ):
+                out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             spec_info.hidden_states = hidden_states
 
             # Run forward under a per-step ForwardContext so the model layer
-            # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
-            # honors the outer context and does not override.
+            # reads attn_backends[i] for the i-th draft step, plus a canary
+            # index context so canary tracks which draft step is active.
+            canary_index_ctx = (
+                c.with_active_single_forward_manager(i)
+                if (c := self.draft_runner.canary_manager) is not None
+                else contextlib.nullcontext()
+            )
             with forward_context(
                 ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ):
-                logits_output = self.draft_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
+            ), canary_index_ctx:
+                logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.topk == 1 and not _is_hip:
@@ -512,32 +593,24 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.positions.add_(1)
 
         # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
-        )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+        if (
+            self.topk == 1
+            and token_list[0].shape[0] <= self._topk1_parents_prealloc.shape[0]
+        ):
+            # Chain topology: draft_tokens = concat of per-step tokens; the
+            # full-length topk/sort/gather over score_list collapses to an
+            # identity. parent_list and top_scores_index are runtime-invariant
+            # constants pre-allocated on the worker. Oversized batches (rare,
+            # would silently truncate the slice) fall through to the slow path.
+            bs = token_list[0].shape[0]
+            draft_tokens = torch.cat(token_list, dim=1)
+            top_scores_index = self._topk1_score_indices_prealloc[:bs]
+            parent_list = self._topk1_parents_prealloc[:bs]
+            return parent_list, top_scores_index, draft_tokens
 
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
-
-        return parent_list, top_scores_index, draft_tokens
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
 
     def draft_extend(self):
         pass
@@ -559,11 +632,13 @@ class EagleDraftWorker(BaseDraftWorker):
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
+            # Chunked-prefill-aware tail tokens (see PR #26329).
+            tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
                 batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], next_token_ids[i].reshape(1))
+                    (input_ids[1:], tail_tokens[i].reshape(1))
                 )
                 pt += extend_len
 
@@ -591,7 +666,20 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_runner.forward(forward_batch).logits_output
+
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
+            )
+            if (c := self.draft_runner.canary_manager) is not None
+            else contextlib.nullcontext()
+        )
+        with canary_ctx:
+            logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -609,8 +697,10 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_req=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
+            # Draft-extend fills the whole tree width (num_draft_tokens) per req,
+            # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -645,14 +735,27 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
-        if can_cuda_graph:
-            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
+
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
             )
-        else:
-            draft_logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            if (c := self.draft_runner.canary_manager) is not None
+            else contextlib.nullcontext()
+        )
+        with canary_ctx:
+            if can_cuda_graph:
+                draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                    forward_batch
+                )
+            else:
+                draft_logits_output = self.draft_runner.forward(
+                    forward_batch
+                ).logits_output
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
@@ -671,6 +774,8 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
+        # The draft-extend graph only anchors full logits; selected-row topk is
+        # owned by the worker for both graph and eager paths.
         if self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
@@ -746,7 +851,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
-                self, config_path=server_args.speculative_adaptive_config
+                self,
+                config_path=server_args.speculative_adaptive_config,
             )
 
         # Some dummy tensors
@@ -778,7 +884,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
-                self.adaptive_controller.init_states()
+                self.adaptive_controller.init_states(
+                    cuda_graph_bs=(
+                        None
+                        if self.server_args.disable_cuda_graph
+                        else self.server_args.cuda_graph_bs
+                    ),
+                )
+
+    @property
+    def spec_v2_attn_backends(self) -> tuple:
+        # Every attn backend a spec_v2 forward touches; consumed by
+        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        return (
+            self._target_worker.model_runner.attn_backend,
+            self._draft_worker.draft_attn_backend,
+            self._draft_worker.draft_extend_attn_backend,
+        )
 
     @property
     def target_worker(self):
@@ -828,6 +950,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            self.activate_step_by_batch(batch.seq_lens.shape[0])
+
             if batch.spec_info is None:
                 capture_mode = (
                     CaptureHiddenMode.NULL
@@ -866,21 +990,34 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
-    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req, batch_size=batch_size
+            )
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.activate_step_by_batch(batch_size)
 
     # -- Adaptive speculative decoding protocol --
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs=None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
-            speculative_num_steps, speculative_num_draft_tokens
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
         ):
             self._draft_worker.init_attention_backend()
             self._draft_worker.init_cuda_graphs()
@@ -897,7 +1034,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             target_graph_runner = None
             if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
+                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else CudaGraphRunner
+                target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
@@ -951,6 +1089,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.cuda_graph_runner = state.cuda_graph_runner
         dw.draft_extend_attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
+        dw._rebuild_topk1_chain_buffers()
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
@@ -964,7 +1103,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     @contextlib.contextmanager
     def _override_worker_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -981,6 +1123,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs,
+            sa.disable_cuda_graph,
         )
 
         self.speculative_num_steps = speculative_num_steps
@@ -989,6 +1133,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        if cuda_graph_bs is not None:
+            sa.cuda_graph_bs = cuda_graph_bs
+            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
+            # for steps that no BS range uses (e.g. step=1). Disable graph
+            # capture for those steps; restore in finally so subsequent steps
+            # are not affected.
+            if not cuda_graph_bs:
+                sa.disable_cuda_graph = True
+        dw._rebuild_topk1_chain_buffers()
 
         try:
             yield
@@ -1005,7 +1158,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
+                sa.cuda_graph_bs,
+                sa.disable_cuda_graph,
             ) = backup
+            dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
@@ -1068,13 +1224,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute).
-        # Only skip metadata init when cuda-graph already ran replay_prepare;
-        # the non-cuda-graph path needs forward_extend's init (post-pad).
+        # Metadata init is skipped iff cuda-graph already ran replay_prepare —
+        # prepare_for_v2_verify marked the batch in exactly that case; the
+        # non-cuda-graph path stays unmarked and gets forward_extend's init
+        # (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=can_run_cuda_graph,
         )
         logits_output = forward_batch_output.logits_output
 
@@ -1121,11 +1278,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            # stride = accept_tokens per-req width = accept_index.shape[1]
+            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
             fill_bonus_tokens[(bs,)](
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
-                self.speculative_num_draft_tokens,
+                accept_index.shape[1],
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
@@ -1133,6 +1292,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
+            )
+
+        if not batch.forward_mode.is_idle() and self.topk > 1:
+            # topk == 1 needs nothing here: the accepted path is already the front
+            # chain, so the whole compaction is an identity transform.
+            predict = self._finalize_accepted_tree_path(
+                batch, accept_index, accept_lens, predict, logits_output, bs
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
@@ -1216,6 +1382,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model=self.target_worker.model_runner.model,
             )
 
+    def _finalize_accepted_tree_path(
+        self,
+        batch: ScheduleBatch,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+        predict: torch.Tensor,
+        logits_output,
+        bs: int,
+    ) -> torch.Tensor:
+        """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
+        hidden_states -- to the contiguous front of each per-req block, which the
+        downstream chain-layout code (draft-extend select_index, committed-KV reads)
+        assumes. Returns compacted predict; mutates logits_output.hidden_states
+        (moved only when present)."""
+        self.move_accepted_tokens_to_target_kvcache(
+            batch, accept_index, accept_lens - 1
+        )
+        predict = self._compact_accepted_to_front(predict, accept_index, bs)
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = self._compact_accepted_to_front(
+                logits_output.hidden_states, accept_index, bs
+            )
+        return predict
+
     def move_accepted_tokens_to_target_kvcache(
         self,
         batch: ScheduleBatch,
@@ -1232,7 +1422,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
-        size = bs * self.speculative_num_draft_tokens
+        # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
+        # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
+        size = bs * accept_index.shape[1]
 
         # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
         maybe_detect_oob(
@@ -1268,6 +1460,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
+
+    def _compact_accepted_to_front(
+        self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
+    ) -> torch.Tensor:
+        """Gather the accepted tree path to the front of each per-req block.
+
+        ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
+        ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
+        Padded entries clamp to node 0 but land past accept_lens (never read);
+        trailing unaccepted slots stay and are freed as overshoot.
+        """
+        nd = self.speculative_num_draft_tokens
+        s1 = accept_index.shape[1]  # spec_steps + 1
+        safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
+        gathered = x[safe]
+        out = x.clone()
+        out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
+        return out
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self._draft_worker.draft_runner.update_weights_from_disk(

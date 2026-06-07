@@ -1,4 +1,4 @@
-"""MI35x DeepSeek-R1-0528 FP8 HiCache PR Test (8-GPU)
+"""MI35x DeepSeek-R1-0528 FP8 HiCache Nightly Test (8-GPU)
 
 Regression guard: launches DeepSeek-R1-0528 (native FP8, MLA, aiter attention
 backend) on MI35x with the full L1+L2+L3 HiCache hierarchy wired up
@@ -6,13 +6,13 @@ backend) on MI35x with the full L1+L2+L3 HiCache hierarchy wired up
 GSM8K few-shot completion and asserts the accuracy still matches the
 established threshold. The goal is to catch regressions where HiCache
 breaks DSR1-0528 generation correctness, not to stress-test the cascade
-overflow path (that lives in the nightly suite).
+overflow path.
 
-Acceptance: GSM8K (200 questions, 5-shot, completion API) score >= 0.93,
+Acceptance: GSM8K (1319 questions, 5-shot, completion API) score >= 0.93,
 matching ``test_deepseek_r1_eval_mi35x.py`` /
 ``test_deepseek_r1_eval_amd.py``.
 
-Registry: stage-c-test-large-8-gpu-amd-mi35x (per-commit PR suite).
+Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-hicache suite.
 """
 
 import os
@@ -20,12 +20,6 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
-
-# MI35x CI runner caches HF models on a fast local volume. We only fall
-# back to this if HF_HOME isn't already set by the runner (e.g. repro_ci.sh
-# points HF_HOME at /sgl-data/hf-cache); never force HF_HUB_CACHE so
-# huggingface_hub keeps deriving it as $HF_HOME/hub.
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -38,18 +32,21 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# ~15 min: 5-8 min weight load + ~2-3 min GSM8K + slack.
-register_amd_ci(est_time=900, suite="stage-c-test-large-8-gpu-amd-mi35x")
+# DSR1-0528 can spend 20+ min in weight loading on MI35x before warmup.
+register_amd_ci(
+    est_time=5400,
+    suite="nightly-amd-8-gpu-mi35x-deepseek-r1-hicache",
+    nightly=True,
+)
 
 DEEPSEEK_R1_MODEL_PATH = "deepseek-ai/DeepSeek-R1-0528"
-SERVER_LAUNCH_TIMEOUT = 1500
+SERVER_LAUNCH_TIMEOUT = 3600
 
 # Threshold matches the existing nightly AMD DSR1-0528 accuracy tests:
 #   test/registered/amd/accuracy/mi35x/test_deepseek_r1_eval_mi35x.py
 #   test/registered/amd/accuracy/mi30x/test_deepseek_r1_eval_amd.py
 GSM8K_ACCURACY_THRESHOLD = 0.93
-GSM8K_NUM_EXAMPLES = 200
-GSM8K_NUM_SHOTS = 5
+GSM8K_NUM_EXAMPLES = None
 GSM8K_NUM_THREADS = 64
 
 
@@ -140,31 +137,29 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
         """GSM8K few-shot completion against the HiCache-enabled DSR1-0528."""
         args = SimpleNamespace(
             base_url=self.base_url,
+            model=self.model,
             eval_name="gsm8k",
             api="completion",
             num_examples=GSM8K_NUM_EXAMPLES,
-            num_shots=GSM8K_NUM_SHOTS,
             num_threads=GSM8K_NUM_THREADS,
             max_tokens=512,
             temperature=0.0,
         )
         metrics = run_eval(args)
+        print(f"{metrics=}", flush=True)
         score = metrics["score"]
-        print(f"GSM8K {metrics=}", flush=True)
 
         if is_in_ci():
             write_github_step_summary(
                 "### DeepSeek-R1-0528 FP8 HiCache GSM8K (MI35x)\n\n"
-                f"- score: `{score:.3f}` (threshold `{GSM8K_ACCURACY_THRESHOLD}`)\n"
-                f"- latency: `{metrics.get('latency', 0):.1f}s`\n"
+                "| Model | Examples | Max Parallel | Score | Threshold | Latency |\n"
+                "| ----- | --------- | ------------ | ----- | --------- | ------- |\n"
+                f"| {self.model} | full | {GSM8K_NUM_THREADS} | "
+                f"{score:.3f} | {GSM8K_ACCURACY_THRESHOLD:.2f} | "
+                f"{metrics.get('latency', 0):.1f}s |\n"
             )
 
-        self.assertGreater(
-            score,
-            GSM8K_ACCURACY_THRESHOLD,
-            f"DSR1-0528 FP8 + HiCache GSM8K accuracy {score:.3f} "
-            f"below threshold {GSM8K_ACCURACY_THRESHOLD}",
-        )
+        self.assertGreaterEqual(score, GSM8K_ACCURACY_THRESHOLD)
 
 
 if __name__ == "__main__":

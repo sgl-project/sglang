@@ -246,7 +246,7 @@ class BaseLayerWithLoRA(nn.Module):
         self,
         lora_list: list[LoRAWeightEntry],
     ) -> bool:
-        if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "0") != "1":
+        if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "1") != "1":
             return False
         for _, _, lora_path, _, _, _ in lora_list:
             if lora_path and "distilled-lora" in lora_path.lower():
@@ -257,6 +257,18 @@ class BaseLayerWithLoRA(nn.Module):
     def merge_lora_weights(self, strength: float | None = None) -> None:
         if strength is not None:
             self.strength = strength
+            if self.lora_weights_list:
+                self.lora_weights_list = [
+                    (lora_A, lora_B, lora_path, strength, lora_rank, lora_alpha)
+                    for (
+                        lora_A,
+                        lora_B,
+                        lora_path,
+                        _,
+                        lora_rank,
+                        lora_alpha,
+                    ) in self.lora_weights_list
+                ]
 
         if self.disable_lora:
             return
