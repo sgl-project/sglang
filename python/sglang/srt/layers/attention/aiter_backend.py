@@ -1450,7 +1450,15 @@ class AiterAttnBackend(AttentionBackend):
             # metadata sites + paged_attention_ragged call site + FP8 KV
             # coordination, after which this allocation can revert to
             # per-page (gated on use_mla).
-            buffer_numel = max_bs * max_num_blocks_per_seq * self.page_size
+            # MLA target_verify writes kv_lens = seq_len + num_draft_tokens per
+            # row (see _apply_cuda_graph_metadata); reserve that slack here.
+            # create_flashinfer_kv_indices_triton bounds writes only per-row
+            # (req_to_token stride), not against this buffer, so without the slack
+            # a near-full sequence silently overflows. Mirrors dsa / flashmla.
+            draft_slack = self.num_draft_tokens or 0
+            buffer_numel = max_bs * (
+                max_num_blocks_per_seq * self.page_size + draft_slack
+            )
             self.cuda_graph_kv_indices = torch.zeros(
                 (buffer_numel,),
                 dtype=torch.int32,
@@ -1691,6 +1699,20 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
+            # Fail fast on an undersized buffer: the kernel bounds writes only
+            # per-row (req_to_token stride), not against kv_indices, so an
+            # overflow would silently corrupt memory. seq_lens_sum is None during
+            # capture (dummy seq_lens, no overflow); check on replay.
+            if seq_lens_sum is not None:
+                kv_indices_used = seq_lens_sum + (
+                    self.num_draft_tokens * bs if self.use_mla else 0
+                )
+                assert kv_indices_used <= kv_indices.numel(), (
+                    f"aiter target_verify kv_indices too small: need "
+                    f"{kv_indices_used} > {kv_indices.numel()} (bs={bs}, "
+                    f"seq_lens_sum={seq_lens_sum}, "
+                    f"num_draft_tokens={self.num_draft_tokens}, use_mla={self.use_mla})."
+                )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
