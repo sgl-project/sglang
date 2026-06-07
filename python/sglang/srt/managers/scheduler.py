@@ -2445,10 +2445,22 @@ class Scheduler(
         if self.ps.pp_size <= 1 or not hasattr(self, "mbs"):
             return set()
         rids = set()
-        for mb in self.mbs:
+        for mb_i, mb in enumerate(self.mbs):
             if mb is None or mb is self.last_batch:
                 continue
+            if not mb.forward_mode.is_extend():
+                # Only EXTEND (prefill) batches can have in-flight last-chunk
+                # results that race with decode in another mb.  DECODE batches
+                # are already past the prefill→decode transition.
+                continue
             for r in mb.reqs:
+                if r is mb.chunked_req:
+                    # r is still mid-chunked-prefill in this mb — the other mb's
+                    # chunked_req_to_exclude mechanism already handles it.  Only
+                    # reqs whose LAST chunk forward is in this mb (mb.chunked_req
+                    # is None or a different req) can cause KV corruption if they
+                    # race into a decode step in another mb.
+                    continue
                 # max_new_tokens is normalized to a non-None int in
                 # _prepare_input_for_image_request / similar paths during
                 # request admission, but defensively handle missing/zero.
