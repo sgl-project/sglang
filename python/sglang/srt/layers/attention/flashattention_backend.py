@@ -2644,6 +2644,11 @@ class FlashAttentionBackend(AttentionBackend):
             if metadata_swa is None
             else metadata_swa.page_table
         )
+        assert_buffer_fits(
+            metadata.max_seq_len_k + metadata_expand.page_table.shape[1],
+            page_table.shape[1],
+            "FA3 swa-spec page_table",
+        )
 
         page_table_a = metadata.page_table
         page_table_b = metadata_expand.page_table
