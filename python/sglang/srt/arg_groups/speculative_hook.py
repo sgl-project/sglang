@@ -499,7 +499,11 @@ def _init_adaptive_speculative_params(server_args: "ServerArgs") -> None:
 def _auto_choose_speculative_params(
     server_args: "ServerArgs", model_arch: str
 ) -> tuple:
-    """Pick default (num_steps, topk, num_draft_tokens) when not specified."""
+    """
+    Automatically choose the parameters for speculative decoding.
+
+    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
+    """
     if server_args.speculative_algorithm == "STANDALONE":
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
