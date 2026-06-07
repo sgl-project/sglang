@@ -99,24 +99,28 @@ def _draft_sample_with_dsl_kernel(
         # Load logits for this sequence, position k
         base_ptr = logits_ptr + seq_id * K * vocab_size + k * vocab_size
 
-        # Two-pass max to find top-1 and top-2 logits for confidence
+        # Pass 1: find global max1 and its position (argmax)
         max1 = -1e9
-        max2 = -1e9
         argmax = 0
 
         for v_start in range(0, vocab_size, BLOCK_V):
             v_offs = v_start + tl.arange(0, BLOCK_V)
             v_mask = v_offs < vocab_size
             logits_block = tl.load(base_ptr + v_offs, mask=v_mask, other=-1e9)
-
             block_max = tl.max(logits_block, axis=0)
             block_argmax = tl.argmax(logits_block, axis=0) + v_start
-
             if block_max > max1:
-                max2 = max1
                 max1 = block_max
                 argmax = block_argmax
-            elif block_max > max2:
+
+        # Pass 2: find global max2 by masking out argmax position
+        max2 = -1e9
+        for v_start in range(0, vocab_size, BLOCK_V):
+            v_offs = v_start + tl.arange(0, BLOCK_V)
+            v_mask = (v_offs < vocab_size) & (v_offs != argmax)
+            logits_block = tl.load(base_ptr + v_offs, mask=v_mask, other=-1e9)
+            block_max = tl.max(logits_block, axis=0)
+            if block_max > max2:
                 max2 = block_max
 
         confidence = max1 - max2
@@ -129,15 +133,18 @@ def _draft_sample_with_dsl_kernel(
         if confidence < confidence_threshold:
             should_continue = False
 
-        # Greedy sample (temperature=0) or top-1 (fast path for spec decode)
+        # Greedy sample: argmax from pass 1
         token = argmax
 
-        # Log-probability of sampled token (for rejection sampling in verify)
-        # Compute log_softmax at the sampled position
-        log_sum_exp = tl.log(tl.sum(tl.exp(
-            tl.load(base_ptr + tl.arange(0, BLOCK_V), mask=tl.arange(0, BLOCK_V) < vocab_size, other=-1e9)
-            - max1
-        ), axis=0)) + max1
+        # Log-probability via numerically-stable log-sum-exp over full vocab
+        # (needed for rejection sampling in the verify step)
+        sum_exp = 0.0
+        for v_start in range(0, vocab_size, BLOCK_V):
+            v_offs = v_start + tl.arange(0, BLOCK_V)
+            v_mask = v_offs < vocab_size
+            logits_block = tl.load(base_ptr + v_offs, mask=v_mask, other=-1e9)
+            sum_exp += tl.sum(tl.exp(logits_block - max1), axis=0)
+        log_sum_exp = tl.log(sum_exp) + max1
         token_logit = tl.load(base_ptr + token)
         log_prob = token_logit - log_sum_exp
 
@@ -183,7 +190,8 @@ class PEAGLEWorker(EAGLEWorker):
 
         # Shared hidden state: [hidden_dim] — mean over batch h_fused
         hidden_dim = self._get_hidden_dim()
-        self._h_shared = torch.zeros(hidden_dim, dtype=torch.float16, device='cuda')
+        model_dtype = self.target_worker.model_runner.model_config.dtype
+        self._h_shared = torch.zeros(hidden_dim, dtype=model_dtype, device="cuda")
 
         # Resolve MASK token ID from draft model
         self._mask_token_id = self._resolve_mask_token_id()
@@ -413,6 +421,11 @@ class PEAGLEDSLWorker(PEAGLEWorker):
         batch_size = hidden_states.shape[0]
         K = self.speculative_num_steps
 
+        # Reset continue_buf for the current batch — each new request starts True.
+        # Without this, a stale False from a previous request's slot causes
+        # spurious early exits for newly arrived requests.
+        self._dsl_continue_buf[:batch_size].fill_(True)
+
         h_fused = hidden_states
         self._h_shared.copy_(h_fused.mean(dim=0))
 
@@ -493,18 +506,36 @@ class PEAGLEDSLWorker(PEAGLEWorker):
         batch_size: int,
         K: int,
     ):
-        """Build draft tree, respecting DSL early-exit masks."""
-        topk_p    = spec_info.topk_p
+        """
+        Build draft tree using DSL-sampled tokens.
+
+        Sequences that exited early (draft_scores[:, k] == -1e9) have their
+        step logits overridden to a peaked distribution at the DSL-sampled
+        token so select_top_k_tokens produces a valid (but low-score) node
+        rather than arbitrary garbage tokens.
+        """
+        topk_p = spec_info.topk_p
         topk_index = spec_info.topk_index
         hidden_states = spec_info.hidden_states
 
-        score_list    = []
-        token_list    = []
-        parents_list  = []
+        score_list = []
+        token_list = []
+        parents_list = []
         scores = None
 
+        # Sentinel: DSL kernel writes score=-1e9 for exited positions
+        exited_sentinel = -1e8
+
         for i in range(K):
-            step_logits = all_logits[:, i, :]  # [batch, vocab]
+            step_logits = all_logits[:, i, :].clone()  # [batch, vocab]
+
+            # Override logits for early-exited sequences so topk always picks
+            # the DSL-sampled token (preserving tree validity without junk tokens)
+            exited = draft_scores[:, i] < exited_sentinel  # [batch] bool
+            if exited.any():
+                exit_tokens = draft_tokens[exited, i].long()  # [n_exited]
+                step_logits[exited] = float("-inf")
+                step_logits[exited, exit_tokens] = 0.0
 
             if i == 0:
                 step_topk_p, step_topk_index = topk_p, topk_index

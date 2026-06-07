@@ -75,18 +75,32 @@ def fused_parallel_draft_input(
       BLOCK_H = 512 → hidden_tiles = hidden_dim / 512
       Occupancy: batch × K × hidden_tiles programs (e.g. 16 × 4 = 64 for K=4, h=2048)
     """
+    # All input tensors must be contiguous for Triton pointer arithmetic
+    h_fused = h_fused.contiguous()
+    embed_table = embed_table.contiguous()
+    last_tokens = last_tokens.contiguous()
+    h_shared = h_shared.contiguous()
+
     batch_size, hidden_dim = h_fused.shape
 
-    output = torch.empty(batch_size * K, hidden_dim, dtype=h_fused.dtype, device=h_fused.device)
+    output = torch.empty(
+        batch_size * K, hidden_dim, dtype=h_fused.dtype, device=h_fused.device
+    )
 
-    BLOCK_H      = min(triton.next_power_of_2(hidden_dim), 512)
+    BLOCK_H = min(triton.next_power_of_2(hidden_dim), 512)
     hidden_tiles = triton.cdiv(hidden_dim, BLOCK_H)
 
     grid = (batch_size, K, hidden_tiles)
     _fused_parallel_draft_input_kernel[grid](
-        h_fused, embed_table, last_tokens, h_shared,
-        mask_token_id, output,
-        hidden_dim, K, BLOCK_H,
+        h_fused,
+        embed_table,
+        last_tokens,
+        h_shared,
+        mask_token_id,
+        output,
+        hidden_dim,
+        K,
+        BLOCK_H,
     )
 
     return output
