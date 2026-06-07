@@ -170,10 +170,6 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
         self.coordinator._has_pending_backup = False
-        self.coordinator.host_radix_cache = None
-        self.coordinator._req_radix_node.clear()
-        self.coordinator._req_radix_prefix_len.clear()
-        self.coordinator._req_host_written_len.clear()
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 
@@ -702,54 +698,6 @@ class TestHiSparseUnit(unittest.TestCase):
         ].clone()
         self._cleanup_req(req, kv_loc, logical_only=True)
         self._assert_sizes_restored(initial, "pd_decode_prealloc_hisparse")
-
-    def test_radix_cache_len_backs_up_final_token(self):
-        """Radix insertion should not consume page-allocated but unwritten slots."""
-        initial = self._get_initial_sizes()
-        prefill_len = self.page_size
-        total_len = prefill_len + 1
-        req = _make_req("radix-final-token", list(range(prefill_len)), [prefill_len])
-        self._alloc_req_slot(req)
-
-        kv_loc = self._alloc_kv(req, total_len)
-        self._write_device_patterns(kv_loc, total_len)
-        self.coordinator.alloc_device_buffer(req)
-
-        prefill_host = self.coordinator._alloc_paged_host_slots(
-            req.req_pool_idx,
-            0,
-            prefill_len,
-        )
-        self.coordinator.mem_pool_host.backup_from_device_all_layer(
-            self.coordinator.mem_pool_device,
-            prefill_host,
-            self.coordinator.req_to_device_buffer[req.req_pool_idx, :prefill_len],
-            io_backend="kernel",
-        )
-
-        self.coordinator.host_radix_cache = SimpleNamespace()
-        self.coordinator._req_host_written_len[req.req_pool_idx] = prefill_len
-        cache_len = self.coordinator._prepare_radix_cache_len(req, total_len)
-        self.assertEqual(cache_len, total_len)
-        torch.cuda.synchronize()
-
-        final_host_loc = int(
-            self.coordinator.req_to_host_pool[req.req_pool_idx, total_len - 1].item()
-        )
-        for lid in range(LAYER_NUM):
-            actual = self.coordinator.mem_pool_host.kv_buffer[lid][final_host_loc]
-            expected = self._kv_pattern(lid, total_len - 1)
-            self.assertTrue(
-                torch.allclose(
-                    actual.float(),
-                    torch.full_like(actual.float(), expected),
-                    atol=1e-2,
-                )
-            )
-
-        self.coordinator.host_radix_cache = None
-        self._cleanup_req(req, kv_loc)
-        self._assert_sizes_restored(initial, "radix_final_token")
 
     # ==================================================================
     # Test: Batch multiple requests

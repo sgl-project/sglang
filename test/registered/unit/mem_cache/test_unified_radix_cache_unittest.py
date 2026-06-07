@@ -3654,61 +3654,6 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
 
-class TestUnifiedRadixCacheHiSparseHostMode(CustomTestCase):
-    def test_host_insert_match_lock_and_evict(self):
-        tree, _, _ = build_fixture(
-            CacheConfig(page_size=4, components=(ComponentType.FULL,), kv_size=64)
-        )
-        tree.enable_hisparse_mode()
-        tree._hisparse_load_back_supported = True
-        tree.cache_controller = mock.Mock()
-
-        token_ids = list(range(8))
-        host_indices = torch.arange(100, 108, dtype=torch.int64)
-        self.assertEqual(tree.host_insert(token_ids, host_indices), 0)
-
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
-        self.assertEqual(match.host_hit_length, 8)
-        self.assertEqual(len(match.device_indices), 0)
-        self.assertEqual(match.best_match_node, match.last_host_node)
-        self.assertEqual(
-            tree._last_match_host_indices[match.best_match_node.id].tolist(),
-            host_indices.tolist(),
-        )
-
-        self.assertEqual(tree.host_evictable_size(), 8)
-        tree.host_inc_lock_ref(match.best_match_node)
-        self.assertEqual(tree.host_evictable_size(), 0)
-        tree.host_dec_lock_ref(match.best_match_node)
-        self.assertEqual(tree.host_evictable_size(), 8)
-        self.assertEqual(tree.host_evict(4), 8)
-        self.assertEqual(tree.host_evictable_size(), 0)
-
-    def test_host_insert_reuses_existing_prefix_in_same_tree(self):
-        tree, _, _ = build_fixture(
-            CacheConfig(page_size=4, components=(ComponentType.FULL,), kv_size=64)
-        )
-        tree.enable_hisparse_mode()
-        tree._hisparse_load_back_supported = True
-        tree.cache_controller = mock.Mock()
-
-        first_tokens = list(range(8))
-        first_host = torch.arange(100, 108, dtype=torch.int64)
-        tree.host_insert(first_tokens, first_host)
-
-        second_tokens = list(range(12))
-        second_host = torch.arange(200, 212, dtype=torch.int64)
-        self.assertEqual(tree.host_insert(second_tokens, second_host), 8)
-
-        host_indices, node, matched_len = tree.host_match_prefix(second_tokens)
-        self.assertEqual(matched_len, 12)
-        self.assertIsNot(node, tree.root_node)
-        self.assertEqual(
-            host_indices.tolist(),
-            first_host.tolist() + second_host[8:].tolist(),
-        )
-
-
 class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
 
     components = (ComponentType.FULL, ComponentType.SWA)

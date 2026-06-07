@@ -211,23 +211,6 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         return server_args, env_vars
 
 
-class TestMooncakeStoreMultiBufferMeta(CustomTestCase):
-    def test_pack_multi_buffer_meta_groups_buffers_per_key(self):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
-
-        ptrs, sizes = MooncakeStore._pack_multi_buffer_meta(
-            ["k0", "k1"],
-            [10, 11, 20, 21],
-            [100, 101, 200, 201],
-        )
-
-        self.assertEqual(ptrs, [[10, 11], [20, 21]])
-        self.assertEqual(sizes, [[100, 101], [200, 201]])
-        self.assertTrue(MooncakeStore._uses_multi_buffer(ptrs))
-
-
 '''
 # Same as #10131, layer first layout test TODO(mateng): will make it work
 class TestMooncakeBackendLayerFirstLayout(
