@@ -2033,7 +2033,9 @@ class MMReceiverHTTP(MMReceiverBase):
         for i, response in enumerate(responses):
             if isinstance(response, asyncio.TimeoutError):
                 timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
-                encoder_label = encode_requests[i].get('encoder_url', f"idx={encode_requests[i].get('encoder_idx')}")
+                encoder_label = encode_requests[i].get(
+                    "encoder_url", f"idx={encode_requests[i].get('encoder_idx')}"
+                )
                 logger.error(
                     f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id} "
                     f"(request {i}), "
