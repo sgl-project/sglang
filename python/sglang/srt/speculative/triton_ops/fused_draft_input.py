@@ -21,12 +21,12 @@ import triton.language as tl
 
 @triton.jit
 def _fused_parallel_draft_input_kernel(
-    h_fused_ptr,      # [batch, hidden_dim] fp16
-    embed_ptr,        # [vocab_size, hidden_dim] fp16
+    h_fused_ptr,  # [batch, hidden_dim] fp16
+    embed_ptr,  # [vocab_size, hidden_dim] fp16
     last_tokens_ptr,  # [batch] int64
-    h_shared_ptr,     # [hidden_dim] fp16
-    mask_token_id,    # scalar constexpr
-    output_ptr,       # [batch * K, hidden_dim] fp16
+    h_shared_ptr,  # [hidden_dim] fp16
+    mask_token_id,  # scalar constexpr
+    output_ptr,  # [batch * K, hidden_dim] fp16
     hidden_dim: tl.constexpr,
     K: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -49,21 +49,23 @@ def _fused_parallel_draft_input_kernel(
         # Sequence-specific: h_fused[seq] + embed[last_token[seq]]
         token_id = tl.load(last_tokens_ptr + seq_id)
         h = tl.load(h_fused_ptr + seq_id * hidden_dim + h_offs, mask=h_mask, other=0.0)
-        e = tl.load(embed_ptr   + token_id * hidden_dim + h_offs, mask=h_mask, other=0.0)
+        e = tl.load(embed_ptr + token_id * hidden_dim + h_offs, mask=h_mask, other=0.0)
     else:
         # Shared context: h_shared + embed[mask_token]
         # All pos>0 programs access the same embed row → L2 cache hit after first
         h = tl.load(h_shared_ptr + h_offs, mask=h_mask, other=0.0)
-        e = tl.load(embed_ptr + mask_token_id * hidden_dim + h_offs, mask=h_mask, other=0.0)
+        e = tl.load(
+            embed_ptr + mask_token_id * hidden_dim + h_offs, mask=h_mask, other=0.0
+        )
 
     tl.store(output_ptr + out_row * hidden_dim + h_offs, h + e, mask=h_mask)
 
 
 def fused_parallel_draft_input(
-    h_fused: torch.Tensor,          # [batch, hidden_dim]
-    embed_table: torch.Tensor,      # [vocab_size, hidden_dim]
-    last_tokens: torch.Tensor,      # [batch] int64
-    h_shared: torch.Tensor,         # [hidden_dim]
+    h_fused: torch.Tensor,  # [batch, hidden_dim]
+    embed_table: torch.Tensor,  # [vocab_size, hidden_dim]
+    last_tokens: torch.Tensor,  # [batch] int64
+    h_shared: torch.Tensor,  # [hidden_dim]
     mask_token_id: int,
     K: int,
 ) -> torch.Tensor:
@@ -116,8 +118,8 @@ def fused_parallel_draft_input_torch(
 ) -> torch.Tensor:
     """PyTorch reference (correctness / fallback). Returns [batch * K, hidden_dim]."""
     batch_size = h_fused.shape[0]
-    pos0       = h_fused + embed_table[last_tokens]                      # [B, H]
-    pos_shared = h_shared + embed_table[mask_token_id]                   # [H]
-    pos_shared = pos_shared.unsqueeze(0).expand(batch_size, -1)          # [B, H]
-    all_inputs = torch.stack([pos0] + [pos_shared] * (K - 1), dim=1)    # [B, K, H]
+    pos0 = h_fused + embed_table[last_tokens]  # [B, H]
+    pos_shared = h_shared + embed_table[mask_token_id]  # [H]
+    pos_shared = pos_shared.unsqueeze(0).expand(batch_size, -1)  # [B, H]
+    all_inputs = torch.stack([pos0] + [pos_shared] * (K - 1), dim=1)  # [B, K, H]
     return all_inputs.reshape(batch_size * K, -1)

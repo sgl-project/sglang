@@ -177,7 +177,9 @@ class TestFusedDraftInputKernel(unittest.TestCase):
         original_item = torch.Tensor.item
 
         def _no_item(self):
-            raise AssertionError("fused_parallel_draft_input called .item() — violates sync-free contract")
+            raise AssertionError(
+                "fused_parallel_draft_input called .item() — violates sync-free contract"
+            )
 
         torch.Tensor.item = _no_item
         try:

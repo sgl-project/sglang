@@ -62,12 +62,13 @@ logger = logging.getLogger(__name__)
 # Sync-Free DSL: Triton kernel — samples draft tokens and writes DSL flags
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _draft_sample_with_dsl_kernel(
-    logits_ptr,           # [batch, K, vocab_size] float32
-    output_tokens_ptr,    # [batch, K] int32 output
-    output_scores_ptr,    # [batch, K] float32 output
-    continue_buf_ptr,     # [batch] bool output — written for NEXT step
+    logits_ptr,  # [batch, K, vocab_size] float32
+    output_tokens_ptr,  # [batch, K] int32 output
+    output_scores_ptr,  # [batch, K] float32 output
+    continue_buf_ptr,  # [batch] bool output — written for NEXT step
     temperature: tl.constexpr,
     confidence_threshold: tl.constexpr,
     vocab_size: tl.constexpr,
@@ -156,6 +157,7 @@ def _draft_sample_with_dsl_kernel(
 # PEAGLEWorker
 # ---------------------------------------------------------------------------
 
+
 class PEAGLEWorker(EAGLEWorker):
     """
     P-EAGLE speculative decoding for SGLang.
@@ -174,8 +176,9 @@ class PEAGLEWorker(EAGLEWorker):
 
     MASK_TOKEN_FALLBACK_ID: int = 2  # <s> token as MASK fallback if model has no MASK
 
-    def __init__(self, *args, enable_dsl: bool = False,
-                 dsl_threshold: float = 2.0, **kwargs):
+    def __init__(
+        self, *args, enable_dsl: bool = False, dsl_threshold: float = 2.0, **kwargs
+    ):
         super().__init__(*args, **kwargs)
 
         self.enable_dsl = enable_dsl
@@ -183,10 +186,8 @@ class PEAGLEWorker(EAGLEWorker):
 
         # Persistent GPU buffer for sync-free DSL: [max_batch] bool
         # True = continue drafting for this sequence next step
-        max_batch = getattr(self.server_args, 'max_num_seqs', 256)
-        self._dsl_continue_buf = torch.ones(
-            max_batch, dtype=torch.bool, device='cuda'
-        )
+        max_batch = getattr(self.server_args, "max_num_seqs", 256)
+        self._dsl_continue_buf = torch.ones(max_batch, dtype=torch.bool, device="cuda")
 
         # Shared hidden state: [hidden_dim] — mean over batch h_fused
         hidden_dim = self._get_hidden_dim()
@@ -213,9 +214,9 @@ class PEAGLEWorker(EAGLEWorker):
         try:
             cfg = self.draft_model_runner.model_config.hf_config
             # EAGLE-3 stores mask_token_id in eagle_config
-            eagle_cfg = getattr(cfg, 'eagle_config', {})
-            if isinstance(eagle_cfg, dict) and 'mask_token_id' in eagle_cfg:
-                return eagle_cfg['mask_token_id']
+            eagle_cfg = getattr(cfg, "eagle_config", {})
+            if isinstance(eagle_cfg, dict) and "mask_token_id" in eagle_cfg:
+                return eagle_cfg["mask_token_id"]
         except Exception:
             pass
         return self.MASK_TOKEN_FALLBACK_ID
@@ -224,7 +225,7 @@ class PEAGLEWorker(EAGLEWorker):
     def _embed_table(self) -> torch.Tensor:
         """Token embedding table shared with the target model."""
         embed, _ = self.target_worker.model_runner.model.get_embed_and_head()
-        return embed.weight if hasattr(embed, 'weight') else embed
+        return embed.weight if hasattr(embed, "weight") else embed
 
     def draft_forward(self, forward_batch: ForwardBatch):
         """
@@ -235,9 +236,9 @@ class PEAGLEWorker(EAGLEWorker):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        hidden_states = spec_info.hidden_states    # [batch, hidden_dim]
-        topk_p        = spec_info.topk_p           # [batch, topk]
-        topk_index    = spec_info.topk_index       # [batch, topk]
+        hidden_states = spec_info.hidden_states  # [batch, hidden_dim]
+        topk_p = spec_info.topk_p  # [batch, topk]
+        topk_index = spec_info.topk_index  # [batch, topk]
 
         if hidden_states is None or len(hidden_states) == 0:
             # Fallback to standard EAGLE for edge cases
@@ -306,10 +307,22 @@ class PEAGLEWorker(EAGLEWorker):
 
         # Create a copy of spec_info with expanded hidden states
         expanded_spec_info = EagleDraftInput(
-            topk_p=spec_info.topk_p.repeat_interleave(K, dim=0) if spec_info.topk_p is not None else None,
-            topk_index=spec_info.topk_index.repeat_interleave(K, dim=0) if spec_info.topk_index is not None else None,
+            topk_p=(
+                spec_info.topk_p.repeat_interleave(K, dim=0)
+                if spec_info.topk_p is not None
+                else None
+            ),
+            topk_index=(
+                spec_info.topk_index.repeat_interleave(K, dim=0)
+                if spec_info.topk_index is not None
+                else None
+            ),
             hidden_states=parallel_inputs,  # [batch*K, hidden_dim]
-            bonus_tokens=spec_info.bonus_tokens.repeat_interleave(K, dim=0) if spec_info.bonus_tokens is not None else None,
+            bonus_tokens=(
+                spec_info.bonus_tokens.repeat_interleave(K, dim=0)
+                if spec_info.bonus_tokens is not None
+                else None
+            ),
             capture_hidden_mode=spec_info.capture_hidden_mode,
             num_tokens_per_req=spec_info.num_tokens_per_req,
             num_tokens_for_logprob_per_req=spec_info.num_tokens_for_logprob_per_req,
@@ -320,9 +333,15 @@ class PEAGLEWorker(EAGLEWorker):
             forward_mode=original_batch.forward_mode,
             batch_size=batch_size * K,
             input_ids=original_batch.input_ids.repeat_interleave(K, dim=0),
-            req_pool_indices=original_batch.req_pool_indices.repeat_interleave(K, dim=0),
+            req_pool_indices=original_batch.req_pool_indices.repeat_interleave(
+                K, dim=0
+            ),
             seq_lens=original_batch.seq_lens.repeat_interleave(K, dim=0),
-            out_cache_loc=original_batch.out_cache_loc.repeat_interleave(K, dim=0) if original_batch.out_cache_loc is not None else None,
+            out_cache_loc=(
+                original_batch.out_cache_loc.repeat_interleave(K, dim=0)
+                if original_batch.out_cache_loc is not None
+                else None
+            ),
             spec_info=expanded_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states=False,
@@ -334,7 +353,7 @@ class PEAGLEWorker(EAGLEWorker):
     def _build_draft_tree_from_parallel_logits(
         self,
         all_logits: torch.Tensor,  # [batch, K, vocab]
-        topk_p: torch.Tensor,      # [batch, topk]
+        topk_p: torch.Tensor,  # [batch, topk]
         topk_index: torch.Tensor,  # [batch, topk]
         spec_info: EagleDraftInput,
         forward_batch: ForwardBatch,
@@ -461,8 +480,13 @@ class PEAGLEDSLWorker(PEAGLEWorker):
         )
 
         return self._build_draft_tree_from_logits_and_dsl(
-            all_logits, draft_tokens, draft_scores,
-            spec_info, forward_batch, batch_size, K
+            all_logits,
+            draft_tokens,
+            draft_scores,
+            spec_info,
+            forward_batch,
+            batch_size,
+            K,
         )
 
     def _sample_with_dsl_kernel(
@@ -477,8 +501,8 @@ class PEAGLEDSLWorker(PEAGLEWorker):
         Writes continue_buf (for next step) and returns sampled tokens + scores.
         """
         vocab_size = all_logits.shape[-1]
-        output_tokens = torch.empty(batch_size, K, dtype=torch.int32, device='cuda')
-        output_scores = torch.empty(batch_size, K, dtype=torch.float32, device='cuda')
+        output_tokens = torch.empty(batch_size, K, dtype=torch.int32, device="cuda")
+        output_scores = torch.empty(batch_size, K, dtype=torch.float32, device="cuda")
 
         BLOCK_V = min(triton.next_power_of_2(vocab_size), 4096)
 
@@ -487,7 +511,7 @@ class PEAGLEDSLWorker(PEAGLEWorker):
             output_tokens,
             output_scores,
             self._dsl_continue_buf,
-            temperature=0.0,       # greedy for P-EAGLE (rejection sampling handles stochasticity)
+            temperature=0.0,  # greedy for P-EAGLE (rejection sampling handles stochasticity)
             confidence_threshold=self.dsl_threshold,
             vocab_size=vocab_size,
             K=K,

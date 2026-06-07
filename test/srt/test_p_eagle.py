@@ -84,7 +84,9 @@ def test_peagle_dsl_threshold_default():
     from sglang.srt.server_args import ServerArgs
 
     fields = {f.name: f for f in dataclasses.fields(ServerArgs)}
-    assert "peagle_dsl_threshold" in fields, "peagle_dsl_threshold not found in ServerArgs"
+    assert (
+        "peagle_dsl_threshold" in fields
+    ), "peagle_dsl_threshold not found in ServerArgs"
     assert fields["peagle_dsl_threshold"].default == 2.0
 
 
@@ -113,8 +115,12 @@ def test_fused_kernel_matches_torch_reference(batch_size, K, hidden_dim):
 
     torch.manual_seed(42)
     h_fused = torch.randn(batch_size, hidden_dim, dtype=torch.float16, device=device)
-    embed_table = torch.randn(vocab_size, hidden_dim, dtype=torch.float16, device=device)
-    last_tokens = torch.randint(0, vocab_size, (batch_size,), dtype=torch.int64, device=device)
+    embed_table = torch.randn(
+        vocab_size, hidden_dim, dtype=torch.float16, device=device
+    )
+    last_tokens = torch.randint(
+        0, vocab_size, (batch_size,), dtype=torch.int64, device=device
+    )
     h_shared = h_fused.mean(dim=0)
 
     out_triton = fused_parallel_draft_input(
@@ -134,9 +140,10 @@ def test_fused_kernel_matches_torch_reference(batch_size, K, hidden_dim):
         K=K,
     )
 
-    assert out_triton.shape == (batch_size * K, hidden_dim), (
-        f"Expected shape {(batch_size * K, hidden_dim)}, got {out_triton.shape}"
-    )
+    assert out_triton.shape == (
+        batch_size * K,
+        hidden_dim,
+    ), f"Expected shape {(batch_size * K, hidden_dim)}, got {out_triton.shape}"
     assert out_torch.shape == (batch_size * K, hidden_dim)
 
     torch.testing.assert_close(
@@ -157,8 +164,12 @@ def test_fused_kernel_output_shape():
     mask_token_id = 1
 
     for batch_size, K in [(1, 1), (8, 4), (32, 6)]:
-        h_fused = torch.randn(batch_size, hidden_dim, dtype=torch.float16, device=device)
-        embed_table = torch.randn(vocab_size, hidden_dim, dtype=torch.float16, device=device)
+        h_fused = torch.randn(
+            batch_size, hidden_dim, dtype=torch.float16, device=device
+        )
+        embed_table = torch.randn(
+            vocab_size, hidden_dim, dtype=torch.float16, device=device
+        )
         last_tokens = torch.zeros(batch_size, dtype=torch.int64, device=device)
         h_shared = h_fused.mean(0)
 
@@ -170,9 +181,10 @@ def test_fused_kernel_output_shape():
             mask_token_id=mask_token_id,
             K=K,
         )
-        assert out.shape == (batch_size * K, hidden_dim), (
-            f"batch={batch_size} K={K}: expected ({batch_size * K}, {hidden_dim}), got {out.shape}"
-        )
+        assert out.shape == (
+            batch_size * K,
+            hidden_dim,
+        ), f"batch={batch_size} K={K}: expected ({batch_size * K}, {hidden_dim}), got {out.shape}"
 
 
 @pytest.mark.skipif(not _is_cuda_available(), reason="CUDA required")
@@ -189,7 +201,9 @@ def test_position0_is_seq_specific():
     batch_size, K, hidden_dim, vocab_size = 4, 3, 256, 128
 
     h_fused = torch.eye(batch_size, hidden_dim, dtype=torch.float16, device=device)
-    embed_table = torch.zeros(vocab_size, hidden_dim, dtype=torch.float16, device=device)
+    embed_table = torch.zeros(
+        vocab_size, hidden_dim, dtype=torch.float16, device=device
+    )
     last_tokens = torch.zeros(batch_size, dtype=torch.int64, device=device)
     h_shared = torch.zeros(hidden_dim, dtype=torch.float16, device=device)
 
@@ -222,7 +236,9 @@ def test_positions_gt0_are_shared():
     batch_size, K, hidden_dim, vocab_size = 4, 4, 256, 128
 
     h_fused = torch.randn(batch_size, hidden_dim, dtype=torch.float16, device=device)
-    embed_table = torch.zeros(vocab_size, hidden_dim, dtype=torch.float16, device=device)
+    embed_table = torch.zeros(
+        vocab_size, hidden_dim, dtype=torch.float16, device=device
+    )
     last_tokens = torch.zeros(batch_size, dtype=torch.int64, device=device)
     h_shared = torch.ones(hidden_dim, dtype=torch.float16, device=device)
 
@@ -273,7 +289,9 @@ def test_fused_kernel_no_item_call(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "item", _no_item)
 
     h_fused = torch.randn(batch_size, hidden_dim, dtype=torch.float16, device=device)
-    embed_table = torch.randn(vocab_size, hidden_dim, dtype=torch.float16, device=device)
+    embed_table = torch.randn(
+        vocab_size, hidden_dim, dtype=torch.float16, device=device
+    )
     last_tokens = torch.zeros(batch_size, dtype=torch.int64, device=device)
     h_shared = h_fused.mean(0)
 
