@@ -285,10 +285,6 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    # Spec v2 tree drafting supports topk > 1 at page_size == 1 and page_size > 1
-    # (the latter via partial-page duplication; backend-gated below), including
-    # mamba / linear-attn state models -- the spec v2 verify path carries the
-    # tree-aware mamba state update, same as spec v1.
     spec_v1_reason = None
     if (
         not envs.SGLANG_ENABLE_SPEC_V2.get()
