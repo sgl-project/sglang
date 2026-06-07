@@ -61,10 +61,9 @@ class GSM8KEval(Eval):
         # The evaluation data should not include the few-shot examples to prevent data leakage.
         self._lines = all_lines[pool_size:]
         if num_examples is not None:
-            assert num_examples <= len(self._lines), (
-                f"num_examples={num_examples} exceeds available test lines "
-                f"({len(self._lines)})"
-            )
+            # Slice caps silently when num_examples exceeds the available lines,
+            # matching upstream: callers like test_basic_sanity_eagle3 pass a
+            # num_examples larger than the dataset on purpose.
             self._lines = self._lines[:num_examples]
 
     def _setup_prefix_pool(self, all_lines: list, num_shots: int) -> int:
