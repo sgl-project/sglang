@@ -303,8 +303,9 @@ class TestProcessorTokenizersBackend(CustomTestCase):
                 "get_tokenizer_from_processor",
                 side_effect=lambda proc: proc.tokenizer,
             ),
-            patch("sglang.srt.utils.hf_transformers.tokenizer.get_tokenizer")
-            as mock_get_tokenizer,
+            patch(
+                "sglang.srt.utils.hf_transformers.tokenizer.get_tokenizer"
+            ) as mock_get_tokenizer,
             patch.object(processor_utils, "patch_mistral_common_tokenizer"),
             patch.object(processor_utils, "_fix_special_tokens_pattern"),
             patch.object(processor_utils, "_fix_added_tokens_encoding"),
@@ -323,7 +324,9 @@ class TestProcessorTokenizersBackend(CustomTestCase):
         mock_get_tokenizer.assert_not_called()
 
     def test_non_llava_still_reloads_tokenizersbackend(self):
-        processor, result, mock_get_tokenizer = self._run_get_processor("deepseek_vl_v2")
+        processor, result, mock_get_tokenizer = self._run_get_processor(
+            "deepseek_vl_v2"
+        )
 
         self.assertIs(result, processor)
         self.assertIs(processor.tokenizer, mock_get_tokenizer.return_value)
