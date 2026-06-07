@@ -1,3 +1,6 @@
+import sys
+
+import pytest
 import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -56,3 +59,7 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     # shared slot: [0..63, shared, 64..127, shared, ...].
     assert output.topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(output.topk_weights[:, -1], torch.full((2,), 0.4))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
