@@ -27,6 +27,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
@@ -1538,8 +1539,6 @@ class FlashInferMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
-
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
