@@ -13,12 +13,8 @@ register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
-    class MegaMoeBackend:
-        def is_megamoe(self):
-            return True
-
     monkeypatch.setattr(
-        hash_topk_module, "get_moe_a2a_backend", lambda: MegaMoeBackend()
+        hash_topk_module, "uses_per_rank_fused_shared_slots", lambda: True
     )
     monkeypatch.setattr(topk_module, "get_moe_expert_parallel_world_size", lambda: 4)
     monkeypatch.setattr(topk_module, "get_moe_expert_parallel_rank", lambda: 2)

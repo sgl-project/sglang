@@ -7,9 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -20,7 +18,7 @@ from sglang.srt.layers.moe.topk import (
     _mask_topk_ids_padded_region,
     remap_topk_for_per_rank_shared_slots,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -177,7 +175,7 @@ class HashTopK(nn.Module):
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
 
-        if self.num_fused_shared_experts > 0 and get_moe_a2a_backend().is_megamoe():
+        if self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
             shared_cols = topk_ids[:, -self.num_fused_shared_experts :]
             routed_cols = topk_ids[:, : -self.num_fused_shared_experts]
             routed_cols = topk_ids_logical_to_physical(
