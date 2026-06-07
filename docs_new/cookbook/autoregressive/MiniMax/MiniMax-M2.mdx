@@ -69,6 +69,78 @@ This section provides a progressive guide from quick deployment to performance o
 
 <MiniMaxM2Deployment />
 
+#### 3.1.1 NVIDIA GPU Deployment
+
+The interactive command generator above covers AMD deployments. For NVIDIA GPUs (H100/H200/B200), use these explicit commands:
+
+**4-GPU deployment (up to 400K context):**
+
+```bash Command
+python -m sglang.launch_server \
+    --model-path MiniMaxAI/MiniMax-M2 \
+    --tp-size 4 \
+    --tool-call-parser minimax-m2 \
+    --reasoning-parser minimax-append-think \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --port 30000 \
+    --mem-fraction-static 0.85
+```
+
+**8-GPU deployment (up to 3M context):**
+
+```bash Command
+python -m sglang.launch_server \
+    --model-path MiniMaxAI/MiniMax-M2 \
+    --tp-size 8 \
+    --ep-size 8 \
+    --tool-call-parser minimax-m2 \
+    --reasoning-parser minimax-append-think \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --port 30000 \
+    --mem-fraction-static 0.85
+```
+
+### 3.2 System Requirements
+
+Recommended configurations — actual requirements depend on workload:
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>GPUs</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Context Length Support</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4× 96 GB GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Up to 400K tokens</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8× 144 GB GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Up to 3M tokens</td>
+    </tr>
+  </tbody>
+</table>
+
+### 3.3 Testing Deployment
+
+After the server starts, verify with:
+
+```shell Command
+curl http://localhost:30000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "MiniMaxAI/MiniMax-M2",
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]},
+            {"role": "user", "content": [{"type": "text", "text": "Who won the world series in 2020?"}]}
+        ]
+    }'
+```
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
