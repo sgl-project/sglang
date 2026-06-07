@@ -1376,6 +1376,35 @@ def remap_topk_for_per_rank_shared_slots(
     return topk_ids, topk_weights
 
 
+def post_process_topk_ids_for_per_rank_shared_slots(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_config: TopKConfig,
+    num_physical_routed_experts: int,
+    routed_postprocess: Callable[[torch.Tensor], torch.Tensor],
+    before_remap: Optional[
+        Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Post-process fused shared expert columns for per-rank shared-slot layouts."""
+    num_fused_shared_experts = topk_config.num_fused_shared_experts
+    shared_cols = topk_ids[:, -num_fused_shared_experts:]
+    routed_cols = topk_ids[:, :-num_fused_shared_experts]
+    routed_cols = routed_postprocess(routed_cols)
+    topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+
+    if before_remap is not None:
+        topk_ids, topk_weights = before_remap(topk_ids, topk_weights)
+
+    return remap_topk_for_per_rank_shared_slots(
+        topk_ids,
+        topk_weights,
+        num_fused_shared_experts,
+        num_physical_routed_experts,
+        topk_config,
+    )
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1426,32 +1455,26 @@ def _post_process_topk_ids(
         # EPLB dispatch must only remap the routed expert columns.
         # The shared expert column (value = n_routed_experts) would be out-of-bounds
         # for the logical-to-physical dispatch table.
-        if _is_cuda:
-            shared_cols = topk_ids[:, -num_fused_shared_experts:]
-            routed_cols = topk_ids[:, :-num_fused_shared_experts]
-            routed_cols = _biased_grouped_topk_postprocess(
-                routed_cols, expert_location_dispatch_info, num_token_non_padded
-            )
-            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
-
-        topk_ids, topk_weights = append_shared_experts_for_aiter(
-            topk_ids,
-            topk_weights,
-        )
-
-        # DeepEP/MegaMoE: remap to interleaved expert layout where each rank's
-        # shared expert has a unique ID for dispatch routing.
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None
             else router_logits.shape[1]
         )
-        topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
+
+        def routed_postprocess(routed_cols: torch.Tensor) -> torch.Tensor:
+            if not _is_cuda:
+                return routed_cols
+            return _biased_grouped_topk_postprocess(
+                routed_cols, expert_location_dispatch_info, num_token_non_padded
+            )
+
+        topk_ids, topk_weights = post_process_topk_ids_for_per_rank_shared_slots(
             topk_ids,
             topk_weights,
-            num_fused_shared_experts,
-            num_physical_routed_experts,
             topk_config,
+            num_physical_routed_experts,
+            routed_postprocess,
+            before_remap=append_shared_experts_for_aiter,
         )
     else:
         if _is_cuda:
