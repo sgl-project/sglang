@@ -490,13 +490,15 @@ export const Deployment = ({ config, benchmarks }) => {
     if (mode === "docker") {
       // Image picked by hardware; falls back to `:dev` if unmapped.
       const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
+      const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
         "docker run --gpus all",
         "  --shm-size 32g",
         // Multi-node needs host networking so the cross-node rendezvous port
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
-        multinode ? "  --network host" : "  -p {{PORT}}:{{PORT}}",
+        multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
@@ -872,7 +874,7 @@ export const Deployment = ({ config, benchmarks }) => {
     window.dispatchEvent(new CustomEvent("sglang-deploy-sel", { detail: sel }));
   }, [sel]);
 
-  const [modal, setModal] = useState(null); // 'curl' | 'env' | null
+  const [modal, setModal] = useState(null); // 'curl' | 'env' | 'bench' | null
   useEffect(() => {
     if (modal === null) return;
     const onKey = (e) => { if (e.key === "Escape") setModal(null); };

@@ -182,13 +182,21 @@ sgl-eval run aime25 \\
         options: [
           { id: null,                label: "Inherited" },
           { id: "deepep",            label: "DeepEP",
-            flags: ["--moe-a2a-backend deepep"] },
+            flags: ["--moe-a2a-backend deepep"],
+            disable: { megamoeOn: [true] },
+            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
           { id: "megamoe",           label: "MegaMoE",
-            flags: ["--moe-a2a-backend megamoe"] },
+            flags: ["--moe-a2a-backend megamoe"],
+            disable: { megamoeOn: [true] },
+            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
-            flags: ["--moe-runner-backend flashinfer_mxfp4"] },
+            flags: ["--moe-runner-backend flashinfer_mxfp4"],
+            disable: { megamoeOn: [true] },
+            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
           { id: "marlin",            label: "Marlin (W4A16)",
-            flags: ["--moe-runner-backend marlin"] },
+            flags: ["--moe-runner-backend marlin"],
+            disable: { megamoeOn: [true] },
+            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
         ],
       },
       ep: { label: "EP", values: [
@@ -258,9 +266,9 @@ sgl-eval run aime25 \\
         command:
 `python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
-  --prefill http://<prefill-host>:30000 \\
-  --decode http://<decode-host>:30001 \\
-  --host 0.0.0.0 --port 8000 \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`,
       },
@@ -268,6 +276,7 @@ sgl-eval run aime25 \\
 
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
+      excludesHw: ["rtx6000"],
       backends: [
         { id: null,        label: "Auto" },
         { id: "file",      label: "File" },

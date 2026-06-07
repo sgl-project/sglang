@@ -38,6 +38,10 @@ export const Playground = ({ config }) => {
   const STORAGE_KEY = "sglang-deploy-env";
 
   const pgFeatures = config.playgroundFeatures || {};
+  const PD_PORTS = {
+    prefill: { serve: 30000, dist: 30335 },
+    decode:  { serve: 30001, dist: 30435 },
+  };
 
   // ==========================================================================
   // 2. Pure data helpers
@@ -559,6 +563,11 @@ export const Playground = ({ config }) => {
         if (value === "current") return { flags, env };
         // No-op when the pick already matches base (preserves flag position).
         if (derived && value === derived) return { flags, env };
+        const picked = (fc.options || []).find((p) => p.id === value);
+        if (picked && h.evaluateChip(picked,
+            { dpAttnOn: h.hasFlag(flags, "--enable-dp-attention") }).disabled) {
+          return { flags, env };
+        }
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
@@ -624,13 +633,7 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
-        // Strip all per-backend env up front (idempotent); re-add below.
         const backends = fc.transferBackends || [];
-        const ownedEnvKeys = [];
-        for (const b of backends) {
-          for (const e of (b.env || [])) ownedEnvKeys.push(e.split("=")[0]);
-        }
-        if (ownedEnvKeys.length) env = h.stripEnvByPrefix(env, ownedEnvKeys);
 
         if (value.mode === "prefill" || value.mode === "decode") {
           const backend = value.transferBackend || "mooncake";
@@ -645,24 +648,27 @@ export const Playground = ({ config }) => {
           // from the renderer).
           if (sel.nodes === "single"
               && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
-            const bootstrapPort = value.mode === "prefill" ? 30335 : 30435;
-            adds.push(`--dist-init-addr 127.0.0.1:${bootstrapPort}`);
+            adds.push(`--dist-init-addr 127.0.0.1:${PD_PORTS[value.mode].dist}`);
           }
           flags = h.insertBeforeTail(flags, adds);
 
-          // Role-specific serving port so the router's prefill:30000 / decode:30001
-          // targets line up (and prefill+decode don't collide on a single host).
-          const servePort = value.mode === "decode" ? 30001 : 30000;
+          // Role-specific serving port so the router's prefill / decode targets
+          // line up (and prefill+decode don't collide on a single host).
+          const servePort = PD_PORTS[value.mode].serve;
           flags = flags.map((f) =>
             f.split(/[\s=]/)[0] === "--port" ? `--port ${servePort}` : f);
 
-          // Per-backend env, gated by hw via `envWhen` (no gate = always on).
+          // Add the selected backend's env (gated by hw via `envWhen`), keeping
+          // any the base cell already carries in place. We don't strip base env
+          // (e.g. gb200 NCCL_*): a blanket strip would drop it when PD is off and
+          // show a spurious remove+add in the diff. apply is pure from baseEnv, so
+          // no stale backend env accumulates across renders.
           const meta = backends.find((b) => b.id === backend);
           if (meta && meta.env && meta.env.length) {
             const gate = meta.envWhen;
             const ok = !gate || Object.keys(gate).every(
               (k) => (gate[k] || []).includes(sel[k]));
-            if (ok) env = [...env, ...meta.env];
+            if (ok) env = [...env, ...meta.env.filter((e) => !env.includes(e))];
           }
         }
         return { flags, env };
@@ -795,7 +801,8 @@ export const Playground = ({ config }) => {
         return changed ? next : value;
       },
 
-      apply: ({ flags, env, value, h }) => {
+      apply: ({ flags, env, value, fc, sel, h }) => {
+        if (fc.excludesHw && sel && fc.excludesHw.includes(sel.hw)) return { flags, env };
         flags = h.stripFlagsByFirstToken(flags, [
           "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
           "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
@@ -824,6 +831,7 @@ export const Playground = ({ config }) => {
       },
 
       render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect }) => {
+        if (fc.excludesHw && fc.excludesHw.includes(base.hw)) return null;
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         const hasBackends = (fc.backends || []).length > 0;
         const hasPolicies = (fc.writePolicies || []).length > 0;
@@ -957,7 +965,7 @@ export const Playground = ({ config }) => {
       if (at === -1) at = f.findIndex((x) => x.startsWith("--model-path"));
       // PD roles need distinct rendezvous ports so prefill+decode don't collide on a
       // shared head host; non-PD multi-node keeps :20000 (matches _deployment.jsx).
-      const distPort = pdMode === "prefill" ? 30335 : pdMode === "decode" ? 30435 : 20000;
+      const distPort = (pdMode && PD_PORTS[pdMode]) ? PD_PORTS[pdMode].dist : 20000;
       f.splice(at + 1, 0,
         `--nnodes ${nnodes}`,
         `--node-rank {{NODE_RANK}}`,
@@ -966,13 +974,12 @@ export const Playground = ({ config }) => {
     let cmd;
     if (mode === "docker") {
       const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
+      const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
         "docker run --gpus all",
         "  --shm-size 32g",
-        // Multi-node needs host networking so the cross-node rendezvous port
-        // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
-        // just maps the serve port.
-        multinode ? "  --network host" : "  -p {{PORT}}:{{PORT}}",
+        (multinode || pdMode) ? "  --network host" : `  -p ${servePort}:${servePort}`,
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
@@ -1520,7 +1527,8 @@ export const Playground = ({ config }) => {
   const dpAttnOn = (effDpAttn === true)
     || (typeof effDpAttn === "number" && effDpAttn > 0);
   const pdMode = (deltas.pdDisagg && deltas.pdDisagg.mode) || "off";
-  const constraintBase = { ...base, dpAttnOn, pdMode };
+  const megamoeOn = !!(deltas.megamoe && deltas.megamoe !== "disabled");
+  const constraintBase = { ...base, dpAttnOn, pdMode, megamoeOn };
 
   let baseCommand = "";
   let playgroundCommand = "";
@@ -1572,7 +1580,13 @@ export const Playground = ({ config }) => {
     : env;
   const curlText = interpolate(config.curl || "", curlEnv, modelName);
   const routerText = pdRouter && pdRouter.command
-    ? interpolate(pdRouter.command, env, modelName) : "";
+    ? interpolate(pdRouter.command, {
+        ...env,
+        PREFILL_PORT: PD_PORTS.prefill.serve,
+        DECODE_PORT: PD_PORTS.decode.serve,
+        ROUTER_PORT: pdRouter.port,
+      }, modelName)
+    : "";
 
   const resetAll = () => setDeltas(initialDeltas());
 
