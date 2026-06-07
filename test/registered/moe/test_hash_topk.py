@@ -26,7 +26,6 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         vocab_size=2,
         scoring_func="softmax",
         routed_scaling_factor=2.5,
-        use_megamoe_fused_shared_slots=True,
     )
     with torch.no_grad():
         topk.tid2eid.copy_(torch.tensor([[0, 65], [63, 127]], dtype=torch.int32))

@@ -184,7 +184,6 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
-        use_megamoe_fused_shared_slots: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -195,7 +194,6 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
-        self.use_megamoe_fused_shared_slots = use_megamoe_fused_shared_slots
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -205,12 +203,10 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
 
-        # DeepEP, and explicitly-enabled MegaMOE, use one physical shared slot
-        # per rank. Other backends keep the shared expert as a global slot.
+        # DeepEP/MegaMOE use one physical shared slot per rank. Other backends
+        # keep the shared expert as a global slot.
         # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots(
-            self.use_megamoe_fused_shared_slots
-        ):
+        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
             num_shared_slots = num_fused_shared_experts * self.moe_ep_size
         else:
             num_shared_slots = num_fused_shared_experts
@@ -737,9 +733,7 @@ class FusedMoE(torch.nn.Module):
         if 0 <= shared_expert_id < self.num_fused_shared_experts:
             # Checkpoint shared experts start after logical routed experts, while
             # local fused MoE weights store them after physical routed experts.
-            if require_global_experts and uses_per_rank_fused_shared_slots(
-                self.use_megamoe_fused_shared_slots
-            ):
+            if require_global_experts and uses_per_rank_fused_shared_slots():
                 physical_expert_ids = [
                     rank * self.num_local_experts
                     + self._num_local_routed
