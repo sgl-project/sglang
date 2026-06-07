@@ -8,6 +8,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <cassert>
 #include <cstdint>
 
 namespace {
@@ -23,7 +24,7 @@ struct StoreKVCacheParams {
   int64_t stride_cache_bytes;
   int64_t stride_indices;
   uint32_t batch_size;
-  int64_t pool_size;
+  int64_t size_limit;
 };
 
 constexpr uint32_t kNumWarps = 4;
@@ -96,7 +97,7 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   const auto& [
     k_input, v_input, k_cache, v_cache, indices, // ptr
     stride_k, stride_v, stride_cache, stride_indices, batch_size, // size
-    pool_size // bound
+    size_limit // bound
   ] = params;
   if (item_id >= batch_size) return;
 
@@ -104,11 +105,9 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   PDLWaitPrimary<kUsePDL>();
 
   const auto index = *index_ptr;
-  // Bound the slot value: a stale/OOB index skips the write instead of an IMA.
-  if (index < 0 || index >= pool_size) {
-    PDLTriggerSecondary<kUsePDL>();
-    return;
-  }
+  // A stale/OOB slot id would cause an illegal memory access in the store below;
+  // fail fast at the culprit instead. always-on (kvcache JIT compiles without NDEBUG).
+  assert(index >= 0 && index < size_limit);
   const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kSplitSize);
   const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kSplitSize);
   const auto k_dst = pointer::offset(k_cache, index * stride_cache, split_id * kSplitSize);
@@ -146,7 +145,7 @@ struct StoreKVCacheKernel {
       const tvm::ffi::TensorView v_cache,
       const tvm::ffi::TensorView indices,
       const int num_split,
-      const int64_t pool_size) {
+      const int64_t size_limit) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto D = SymbolicSize{"element_size"};
@@ -196,7 +195,7 @@ struct StoreKVCacheKernel {
         .stride_cache_bytes = S.unwrap() * dtype_size,
         .stride_indices = I.unwrap(),
         .batch_size = static_cast<uint32_t>(B.unwrap()),
-        .pool_size = pool_size,
+        .size_limit = size_limit,
     };
     // select kernel and update num_split if needed
     const auto use_int32 = indice_dtype.is_type<int32_t>();

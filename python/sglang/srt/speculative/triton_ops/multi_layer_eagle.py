@@ -284,28 +284,24 @@ def assign_hidden_states_pool_kernel(
     pool_vec_offset_base = req_idx * stride_pool_req
 
     for i in range(pool_size):
-        # When extend_len < pool_size the earliest rows underflow into the prior
-        # seq's region; skip any row before this seq's start_loc.
-        seq_off = end_loc - pool_size + i
-        if seq_off >= start_loc:
-            for off_h in range(0, HIDDEN_DIM, BLOCK_HID):
-                offs_h = off_h + tl.arange(0, BLOCK_HID)
-                mask_h = offs_h < HIDDEN_DIM
+        for off_h in range(0, HIDDEN_DIM, BLOCK_HID):
+            offs_h = off_h + tl.arange(0, BLOCK_HID)
+            mask_h = offs_h < HIDDEN_DIM
 
-                hid_ptr = (
-                    hidden_states_ptr
-                    + seq_off * stride_hidden_seq
-                    + offs_h * stride_hidden_dim
-                )
-                hid_val = tl.load(hid_ptr, mask=mask_h)
+            hid_ptr = (
+                hidden_states_ptr
+                + (end_loc - pool_size + i) * stride_hidden_seq
+                + offs_h * stride_hidden_dim
+            )
+            hid_val = tl.load(hid_ptr, mask=mask_h)
 
-                pool_ptr = (
-                    req_to_hidden_states_pool_ptr
-                    + pool_vec_offset_base
-                    + i * stride_pool_step
-                    + offs_h * stride_pool_dim
-                )
-                tl.store(pool_ptr, hid_val, mask=mask_h)
+            pool_ptr = (
+                req_to_hidden_states_pool_ptr
+                + pool_vec_offset_base
+                + i * stride_pool_step
+                + offs_h * stride_pool_dim
+            )
+            tl.store(pool_ptr, hid_val, mask=mask_h)
 
 
 def assign_hidden_states_pool_triton(
