@@ -1692,12 +1692,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        server_args = get_global_server_args()
-        if server_args.disable_shared_experts_fusion:
+        if get_global_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None
-        if server_args.enable_deepep_waterfill:
+        if get_global_server_args().enable_deepep_waterfill:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
@@ -1705,7 +1704,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
         elif (
             get_moe_a2a_backend().is_megamoe()
-            and server_args.enforce_shared_experts_fusion
+            and get_global_server_args().enforce_shared_experts_fusion
         ):
             pass
         elif get_moe_a2a_backend().is_megamoe():
@@ -1713,7 +1712,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "DeepSeek V4 MegaMOE backend: fusion off by default "
                 "(use --enforce-shared-experts-fusion to enable)."
             )
-        elif server_args.enforce_shared_experts_fusion:
+        elif get_global_server_args().enforce_shared_experts_fusion:
             disable_reason = (
                 "DeepSeek V4 only supports enforced shared-experts fusion with "
                 "MegaMOE or DeepEP Waterfill."
