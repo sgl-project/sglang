@@ -195,13 +195,19 @@ def _sm120_sparse_decode_fwd(
 
 # SM120 FlashMLA backend selection.
 # "flashinfer" uses FlashInfer's native SM120 sparse MLA (requires flashinfer >= 0.6.12).
-#   SGLang DSv4 SWA uses swa_page_size=64 to match FlashInfer's decode_dsv4 fast path.
+#   Page-split at call site converts SGLang's swa_page_size=256 to FlashInfer's pbs=64.
 # "triton" uses the custom Triton kernel.
 # "torch" uses the pure-PyTorch fallback.
+# Controlled by SGLANG_SM120_FLASHMLA_BACKEND env var (auto/flashinfer/triton/torch).
+# Legacy: SGLANG_SM120_TRITON_FLASHMLA=0 maps to "torch" for backward compat.
 def _detect_sm120_backend():
     env = os.environ.get("SGLANG_SM120_FLASHMLA_BACKEND", "auto")
     if env != "auto":
         return env
+    # Backward compat: honor legacy env var if new one is not set
+    legacy = os.environ.get("SGLANG_SM120_TRITON_FLASHMLA")
+    if legacy is not None:
+        return "torch" if legacy == "0" else "triton"
     try:
         from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_paged_attention  # noqa: F401
         return "flashinfer"
@@ -213,7 +219,10 @@ _sm120_default_backend = _detect_sm120_backend()
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
-    """SM120 FlashMLA sparse decode entry point."""
+    """SM120 FlashMLA sparse decode entry point.
+
+    Dispatches to FlashInfer (default if available), Triton, or PyTorch fallback.
+    """
     q = kwargs["q"]
     k_cache = kwargs["k_cache"]
     indices = kwargs["indices"]
@@ -229,9 +238,16 @@ def flash_mla_with_kvcache_sm120(**kwargs):
 
     if _sm120_default_backend == "flashinfer":
         return _flash_mla_flashinfer(
-            q, k_cache, indices, topk_length, attn_sink,
-            head_dim_v, softmax_scale,
-            extra_k_cache, extra_indices, extra_topk_length,
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
         )
 
     if _sm120_default_backend == "triton":
@@ -240,22 +256,36 @@ def flash_mla_with_kvcache_sm120(**kwargs):
         )
 
         out, lse = flash_mla_sparse_decode_triton(
-            q, k_cache, indices, topk_length, attn_sink,
-            head_dim_v, softmax_scale,
-            extra_k_cache, extra_indices, extra_topk_length,
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
         )
         return (out, lse)
 
     out, lse = _sm120_sparse_decode_fwd(
-        q, k_cache, indices, topk_length, attn_sink,
-        head_dim_v, softmax_scale,
-        extra_k_cache, extra_indices, extra_topk_length,
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        attn_sink,
+        head_dim_v,
+        softmax_scale,
+        extra_k_cache,
+        extra_indices,
+        extra_topk_length,
     )
     return (out, lse)
 
 
-# Lazily initialized FlashInfer wrapper (reused across calls).
-_flashinfer_wrapper = None
+# Lazily initialized FlashInfer wrapper per device (reused across calls).
+_flashinfer_wrapper = {}  # device -> wrapper
 
 # --- Page-split utilities: pbs=256 → pbs=64 ---
 # SGLang SWA KV cache footer layout per 256-token page:
@@ -273,55 +303,98 @@ _BYTES_PER_DST_PAGE = (
 import math as _math
 _BYTES_PER_DST_PAGE_PADDED = _math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
-# Pre-allocated buffer for page-split output (lazily sized).
-_split_buf = None
+# Pre-allocated buffer for page-split output per device (lazily sized).
+_split_buf = {}  # device -> tensor
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _page_split_kernel(
+    src_ptr, dst_ptr,
+    N_pages,
+    src_stride0: tl.constexpr,
+    dst_stride0: tl.constexpr,
+    DATA_PER_SUB: tl.constexpr,   # 64 * 576 = 36864
+    SCALE_PER_SUB: tl.constexpr,  # 64 * 8 = 512
+    SRC_SCALE_OFF: tl.constexpr,  # 256 * 576 = 147456
+    DST_SCALE_OFF: tl.constexpr,  # 64 * 576 = 36864
+    RATIO: tl.constexpr,          # 4
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused page-split: copy data+scale for all sub-pages in one kernel."""
+    pid = tl.program_id(0)
+    page_idx = pid // RATIO
+    sub = pid % RATIO
+
+    if page_idx >= N_pages:
+        return
+
+    src_base = src_ptr + page_idx * src_stride0
+    dst_base = dst_ptr + (page_idx * RATIO + sub) * dst_stride0
+
+    # Copy data region: DATA_PER_SUB bytes from src offset sub*DATA_PER_SUB
+    data_src_off = sub * DATA_PER_SUB
+    for start in range(0, DATA_PER_SUB, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < DATA_PER_SUB
+        vals = tl.load(src_base + data_src_off + offs, mask=mask)
+        tl.store(dst_base + offs, vals, mask=mask)
+
+    # Copy scale region: SCALE_PER_SUB bytes
+    scale_src_off = SRC_SCALE_OFF + sub * SCALE_PER_SUB
+    for start in range(0, SCALE_PER_SUB, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < SCALE_PER_SUB
+        vals = tl.load(src_base + scale_src_off + offs, mask=mask)
+        tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
 def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
-    Input:  (N_pages, src_pbs, 1, 584) uint8
-    Output: (N_pages * src_pbs/64, 64, 1, 584) uint8, pbs=64 footer layout
-
-    Footer layout per page: [data: pbs*576] [scale: pbs*8] [padding]
+    Uses a fused Triton kernel to do all sub-page copies in a single launch
+    instead of 8 separate copy kernels (4 sub-pages × 2 regions).
     """
-    global _split_buf
     assert src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST
     if src_pbs == _PBS_DST:
-        return kv_u8  # already pbs=64, no split needed
+        return kv_u8
 
     N = kv_u8.shape[0]
     ratio = src_pbs // _PBS_DST
     num_dst_pages = N * ratio
 
-    # Lazily allocate output buffer
-    if _split_buf is None or _split_buf.shape[0] < num_dst_pages:
-        _split_buf = torch.empty(
+    dev = kv_u8.device
+    buf = _split_buf.get(dev)
+    if buf is None or buf.shape[0] < num_dst_pages:
+        buf = torch.empty(
             num_dst_pages, _BYTES_PER_DST_PAGE_PADDED,
-            dtype=torch.uint8, device=kv_u8.device,
+            dtype=torch.uint8, device=dev,
         )
-    out = _split_buf[:num_dst_pages]
+        _split_buf[dev] = buf
+    out = buf[:num_dst_pages]
 
     # Get raw 2D view of source
     src_2d = kv_u8
     if src_2d.ndim == 4:
         src_stride0 = src_2d.stride(0)
         src_2d = torch.as_strided(src_2d, (N, src_stride0), (src_stride0, 1))
+    else:
+        src_stride0 = src_2d.stride(0)
 
-    src_scale_offset = src_pbs * _NOPE_ROPE_STRIDE
-    dst_scale_offset = _PBS_DST * _NOPE_ROPE_STRIDE  # 36864
-
-    for s in range(ratio):
-        # Data: copy 64 tokens of nope+rope
-        data_src_start = s * _PBS_DST * _NOPE_ROPE_STRIDE
-        data_size = _PBS_DST * _NOPE_ROPE_STRIDE
-        out[s::ratio, :data_size] = src_2d[:, data_src_start:data_src_start + data_size]
-
-        # Scale: copy 64 tokens of scale
-        scale_src_start = src_scale_offset + s * _PBS_DST * _SCALE_STRIDE
-        scale_size = _PBS_DST * _SCALE_STRIDE
-        out[s::ratio, dst_scale_offset:dst_scale_offset + scale_size] = \
-            src_2d[:, scale_src_start:scale_src_start + scale_size]
+    grid = (N * ratio,)
+    _page_split_kernel[grid](
+        src_2d, out,
+        N,
+        src_stride0, _BYTES_PER_DST_PAGE_PADDED,
+        _PBS_DST * _NOPE_ROPE_STRIDE,   # DATA_PER_SUB = 36864
+        _PBS_DST * _SCALE_STRIDE,        # SCALE_PER_SUB = 512
+        src_pbs * _NOPE_ROPE_STRIDE,     # SRC_SCALE_OFF = 147456
+        _PBS_DST * _NOPE_ROPE_STRIDE,    # DST_SCALE_OFF = 36864
+        ratio,                            # RATIO = 4
+        1024,                             # BLOCK_SIZE
+    )
 
     bpt = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 584
     return out.as_strided(
@@ -358,16 +431,18 @@ def _flash_mla_flashinfer(
     FlashInfer decode_dsv4 fast path requires page_block_size=64 (footer: 64*576 + 64*8).
     We split 256-token pages into 4 virtual 64-token pages and remap indices.
     """
-    global _flashinfer_wrapper
     from flashinfer.sparse_mla_sm120 import BatchSparseMLAPagedAttentionWrapper
 
     B, _, H, D = q.shape  # (batch, 1, num_heads, head_dim)
 
-    if _flashinfer_wrapper is None:
-        _flashinfer_wrapper = BatchSparseMLAPagedAttentionWrapper(
+    dev = q.device
+    wrapper = _flashinfer_wrapper.get(dev)
+    if wrapper is None:
+        wrapper = BatchSparseMLAPagedAttentionWrapper(
             d_v=head_dim_v,
-            device=q.device,
+            device=dev,
         )
+        _flashinfer_wrapper[dev] = wrapper
 
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
@@ -409,7 +484,7 @@ def _flash_mla_flashinfer(
     mid_out = torch.empty(B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=q.device)
     mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=q.device)
 
-    _flashinfer_wrapper.run(
+    wrapper.run(
         q=q,  # (B, 1, H, D) — wrapper handles squeeze
         kv_cache=kv_64,
         indices=idx_64,
