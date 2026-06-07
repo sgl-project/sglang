@@ -64,10 +64,6 @@ class SanaWMArchConfig(DiTArchConfig):
 
     chunk_split_strategy: str = "first_chunk_plus_one"
     chunk_size: int = 10
-    # Upstream currently forwards chunk metadata through the softmax blocks but
-    # does not apply a chunk-causal mask there. Keep this disabled by default
-    # for checkpoint-output parity; it can be enabled for experiments.
-    use_chunked_softmax_attention: bool = False
     # SANA-WM's released checkpoint uses 112-wide softmax attention heads, which
     # FlashAttention backends do not accept. Pad to 128 inside SANA-WM attention
     # by default; users can still disable this with the top-level DiT option.
@@ -116,16 +112,11 @@ class SanaWMArchConfig(DiTArchConfig):
 class SanaWMConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=SanaWMArchConfig)
     prefix: str = "SanaWM"
-    use_chunked_softmax_attention: bool | None = None
     pad_attention_head_dim_to_flash: bool | None = None
     use_triton_kernels: bool | None = None
     allow_triton_fallback: bool | None = None
 
     def apply_user_flags_to_arch_config(self) -> None:
-        if self.use_chunked_softmax_attention is not None:
-            self.arch_config.use_chunked_softmax_attention = (
-                self.use_chunked_softmax_attention
-            )
         if self.pad_attention_head_dim_to_flash is not None:
             self.arch_config.pad_attention_head_dim_to_flash = (
                 self.pad_attention_head_dim_to_flash

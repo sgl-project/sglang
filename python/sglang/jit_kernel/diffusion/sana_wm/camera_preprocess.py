@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -425,6 +427,10 @@ def _sana_wm_cam_output_apply_o_kernel(
     STRIDE_H: tl.constexpr,
     STRIDE_N: tl.constexpr,
     STRIDE_D: tl.constexpr,
+    OUT_STRIDE_B: tl.constexpr,
+    OUT_STRIDE_H: tl.constexpr,
+    OUT_STRIDE_N: tl.constexpr,
+    OUT_STRIDE_D: tl.constexpr,
     BLOCK_D_ROPE: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
 ):
@@ -483,21 +489,33 @@ def _sana_wm_cam_output_apply_o_kernel(
     ).to(tl.float32)
     x_rope_out = x_r * cos_v - x_pair * sin_v
 
-    out_base = ((b_idx * H + h_idx) * N + n_idx) * D
+    out_base = (
+        b_idx * OUT_STRIDE_B
+        + h_idx * OUT_STRIDE_H
+        + n_idx * OUT_STRIDE_N
+    )
     offs_d_half = offs_g[:, None] * 4 + offs_i[None, :]
-    tl.store(out_ptr + out_base + offs_d_half, x_half_out, mask=mask_gj)
-    tl.store(out_ptr + out_base + D_HALF + offs_r, x_rope_out, mask=mask_r)
+    tl.store(
+        out_ptr + out_base + offs_d_half * OUT_STRIDE_D,
+        x_half_out,
+        mask=mask_gj,
+    )
+    tl.store(
+        out_ptr + out_base + (D_HALF + offs_r) * OUT_STRIDE_D,
+        x_rope_out,
+        mask=mask_r,
+    )
 
 
 def sana_wm_cam_output_apply_o(
     x: torch.Tensor,
     proj_o: torch.Tensor,
-    rotary_emb_cam: torch.Tensor | None,
+    rotary_emb_cam: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Apply SANA-WM camera output inverse UCPE transform in Triton.
 
-    ``x`` is ``(B, H, N, D)`` and may be non-contiguous. The output is a
-    contiguous ``(B, H, N, D)`` tensor.
+    ``x`` is ``(B, H, N, D)`` and may be non-contiguous. The output keeps
+    the same shape and stride contract as ``x``.
     """
     if x.dim() != 4:
         raise ValueError(f"Expected x shape (B, H, N, D), got {x.shape}.")
@@ -518,10 +536,16 @@ def sana_wm_cam_output_apply_o(
         D_HALF,
         x.device,
     )
-    out = torch.empty((B, H, N, D), device=x.device, dtype=x.dtype)
+    out = torch.empty_strided(
+        (B, H, N, D),
+        x.stride(),
+        device=x.device,
+        dtype=x.dtype,
+    )
     block_d_rope = triton.next_power_of_2(D_HALF)
     block_groups = triton.next_power_of_2(D_HALF // 4)
     stride_b, stride_h, stride_n, stride_d = x.stride()
+    out_stride_b, out_stride_h, out_stride_n, out_stride_d = out.stride()
 
     with torch.get_device_module().device(x.device):
         _sana_wm_cam_output_apply_o_kernel[(B * N * H,)](
@@ -539,6 +563,10 @@ def sana_wm_cam_output_apply_o(
             STRIDE_H=stride_h,
             STRIDE_N=stride_n,
             STRIDE_D=stride_d,
+            OUT_STRIDE_B=out_stride_b,
+            OUT_STRIDE_H=out_stride_h,
+            OUT_STRIDE_N=out_stride_n,
+            OUT_STRIDE_D=out_stride_d,
             BLOCK_D_ROPE=block_d_rope,
             BLOCK_GROUPS=block_groups,
             num_warps=1,
@@ -554,7 +582,7 @@ def sana_wm_cam_gdn_preprocess(
     k_weight: torch.Tensor,
     proj_q: torch.Tensor,
     proj_kv: torch.Tensor,
-    rotary_emb_cam: torch.Tensor | None,
+    rotary_emb_cam: Optional[torch.Tensor],
     *,
     k_scale: float,
     eps: float,
@@ -600,7 +628,7 @@ def sana_wm_cam_gdn_preprocess_with_inv_rms(
     k_weight: torch.Tensor,
     proj_q: torch.Tensor,
     proj_kv: torch.Tensor,
-    rotary_emb_cam: torch.Tensor | None,
+    rotary_emb_cam: Optional[torch.Tensor],
     *,
     k_scale: float,
     eps: float,
@@ -698,7 +726,7 @@ def sana_wm_cam_softmax_preprocess(
     k_weight: torch.Tensor,
     proj_q: torch.Tensor,
     proj_kv: torch.Tensor,
-    rotary_emb_cam: torch.Tensor | None,
+    rotary_emb_cam: Optional[torch.Tensor],
     *,
     norm_eps: float,
     downscale_eps: float = 1e-6,
@@ -744,7 +772,7 @@ def sana_wm_cam_softmax_preprocess_with_inv_rms(
     k_weight: torch.Tensor,
     proj_q: torch.Tensor,
     proj_kv: torch.Tensor,
-    rotary_emb_cam: torch.Tensor | None,
+    rotary_emb_cam: Optional[torch.Tensor],
     *,
     downscale_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -826,8 +854,8 @@ def sana_wm_cam_softmax_preprocess_with_inv_rms(
 
 def can_use_sana_wm_cam_output_apply_o(
     x: torch.Tensor,
-    proj_o: torch.Tensor | None,
-    rotary_emb_cam: torch.Tensor | None,
+    proj_o: Optional[torch.Tensor],
+    rotary_emb_cam: Optional[torch.Tensor],
 ) -> bool:
     if x.dim() != 4 or not x.is_cuda:
         return False
@@ -851,9 +879,9 @@ def can_use_sana_wm_cam_gdn_preprocess(
     v_raw: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    proj_q: torch.Tensor | None,
-    proj_kv: torch.Tensor | None,
-    rotary_emb_cam: torch.Tensor | None,
+    proj_q: Optional[torch.Tensor],
+    proj_kv: Optional[torch.Tensor],
+    rotary_emb_cam: Optional[torch.Tensor],
 ) -> bool:
     if q_raw.shape != k_raw.shape or q_raw.shape != v_raw.shape:
         return False
@@ -885,9 +913,9 @@ def can_use_sana_wm_cam_gdn_preprocess_with_inv_rms(
     k_inv_rms: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    proj_q: torch.Tensor | None,
-    proj_kv: torch.Tensor | None,
-    rotary_emb_cam: torch.Tensor | None,
+    proj_q: Optional[torch.Tensor],
+    proj_kv: Optional[torch.Tensor],
+    rotary_emb_cam: Optional[torch.Tensor],
 ) -> bool:
     if not can_use_sana_wm_cam_gdn_preprocess(
         q_raw,
@@ -912,9 +940,9 @@ def can_use_sana_wm_cam_softmax_preprocess(
     v_raw: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    proj_q: torch.Tensor | None,
-    proj_kv: torch.Tensor | None,
-    rotary_emb_cam: torch.Tensor | None,
+    proj_q: Optional[torch.Tensor],
+    proj_kv: Optional[torch.Tensor],
+    rotary_emb_cam: Optional[torch.Tensor],
 ) -> bool:
     return can_use_sana_wm_cam_gdn_preprocess(
         q_raw,
@@ -936,9 +964,9 @@ def can_use_sana_wm_cam_softmax_preprocess_with_inv_rms(
     k_inv_rms: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    proj_q: torch.Tensor | None,
-    proj_kv: torch.Tensor | None,
-    rotary_emb_cam: torch.Tensor | None,
+    proj_q: Optional[torch.Tensor],
+    proj_kv: Optional[torch.Tensor],
+    rotary_emb_cam: Optional[torch.Tensor],
 ) -> bool:
     return can_use_sana_wm_cam_gdn_preprocess_with_inv_rms(
         q_raw,

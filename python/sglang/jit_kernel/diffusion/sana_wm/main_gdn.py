@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from sglang.jit_kernel.diffusion.sana_wm.fused_gdn_chunkwise import (
@@ -18,7 +20,7 @@ def sana_wm_fused_bigdn_bidi(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rotary_emb: torch.Tensor | None,
+    rotary_emb: Optional[torch.Tensor],
     beta: torch.Tensor,
     decay: torch.Tensor,
     *,
@@ -64,7 +66,7 @@ def sana_wm_fused_bigdn_bidi_with_inv_rms(
     k_inv_rms: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rotary_emb: torch.Tensor | None,
+    rotary_emb: Optional[torch.Tensor],
     beta: torch.Tensor,
     decay: torch.Tensor,
     *,
@@ -111,7 +113,7 @@ def can_use_sana_wm_fused_bigdn_bidi_with_inv_rms(
     k_inv_rms: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rotary_emb: torch.Tensor | None,
+    rotary_emb: Optional[torch.Tensor],
     beta: torch.Tensor,
     decay: torch.Tensor,
     *,
@@ -148,7 +150,7 @@ def can_use_sana_wm_fused_bigdn_bidi(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rotary_emb: torch.Tensor | None,
+    rotary_emb: Optional[torch.Tensor],
     beta: torch.Tensor,
     decay: torch.Tensor,
     *,

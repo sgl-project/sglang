@@ -114,7 +114,7 @@ def _configured_sana_wm_refiner_backend(server_args: ServerArgs) -> str:
         tp_size = 1
     if tp_size > 1 and getattr(server_args, "enable_cfg_parallel", False):
         return "official"
-    return "native" if tp_size > 1 else "official"
+    return "native"
 
 
 def _configured_sana_wm_two_stage_residency(server_args: ServerArgs) -> str:
@@ -477,7 +477,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
         memory_usage = get_memory_usage_of_component(module)
         logger.info(
-            "Loaded %s: %s (official native version). model size: %s GB",
+            "Loaded %s: %s (official diffusers version). model size: %s GB",
             module_name,
             module.__class__.__name__,
             memory_usage if memory_usage is not None else "NA",
@@ -536,8 +536,11 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
         is_manual_memory_path = performance_mode in ("manual", "memory")
         is_tp_without_cfg_path = tp_size > 1 and not cfg_parallel
+        # Single-GPU runs cannot hold stage-1 and refiner simultaneously;
+        # always use sequential offloading to avoid OOM.
+        is_single_gpu = tp_size <= 1
 
-        if is_manual_memory_path or is_tp_without_cfg_path:
+        if is_manual_memory_path or is_tp_without_cfg_path or is_single_gpu:
             return (
                 True,
                 "auto detected no FSDP/layerwise policy with "

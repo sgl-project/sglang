@@ -1666,8 +1666,6 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
         argv = [
             "--model-path",
             "Efficient-Large-Model/SANA-WM_bidirectional",
-            "--dit-config.use-chunked-softmax-attention",
-            "true",
             "--dit-config.pad-attention-head-dim-to-flash",
             "true",
             "--dit-config.use-triton-kernels",
@@ -1681,7 +1679,6 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         arch = server_args.pipeline_config.dit_config.arch_config
-        self.assertTrue(arch.use_chunked_softmax_attention)
         self.assertTrue(arch.pad_attention_head_dim_to_flash)
         self.assertTrue(arch.use_triton_kernels)
         self.assertTrue(arch.allow_triton_fallback)

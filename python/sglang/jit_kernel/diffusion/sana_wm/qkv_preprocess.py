@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -177,7 +179,7 @@ def sana_wm_fused_qk_inv_rms(
 
 
 def prepare_sana_wm_rope_tables(
-    rotary_emb: torch.Tensor | None,
+    rotary_emb: Optional[torch.Tensor],
     N: int,
     D: int,
     device: torch.device,
@@ -291,7 +293,7 @@ def sana_wm_qkv_gdn_preprocess_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rotary_emb: torch.Tensor | None,
+    rotary_emb: Optional[torch.Tensor],
     *,
     k_scale: float,
     eps: float,
@@ -379,7 +381,7 @@ def can_use_sana_wm_qkv_gdn_preprocess_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rotary_emb: torch.Tensor | None,
+    rotary_emb: Optional[torch.Tensor],
 ) -> bool:
     if not can_use_sana_wm_qkv_gdn_preprocess(qkv, q_weight, k_weight):
         return False

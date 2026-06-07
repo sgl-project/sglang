@@ -80,16 +80,6 @@ class DiTConfig(ModelConfig):
             help="Quantization configuration for the DiT model",
         )
         parser.add_argument(
-            f"--{prefix}.use-chunked-softmax-attention",
-            action=StoreBoolean,
-            dest=f"{prefix.replace('-', '_')}.use_chunked_softmax_attention",
-            default=None,
-            help=(
-                "Enable SANA-WM chunked softmax attention. Ignored by "
-                "models that do not expose this DiT option."
-            ),
-        )
-        parser.add_argument(
             f"--{prefix}.pad-attention-head-dim-to-flash",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.pad_attention_head_dim_to_flash",

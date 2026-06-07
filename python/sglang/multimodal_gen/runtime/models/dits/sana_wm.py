@@ -1238,68 +1238,6 @@ def _sana_wm_normalize_chunk_index(
     return normalized
 
 
-def _sana_wm_chunk_boundaries_for_attention(
-    HW: Tuple[int, int, int],
-    chunk_size: Optional[int],
-    chunk_split_strategy: str,
-    chunk_index: Optional[List[int]],
-) -> Optional[list[int]]:
-    T, _, _ = HW
-    if chunk_index is None and (chunk_size is None or int(chunk_size) >= T):
-        return None
-
-    boundaries = _sana_wm_normalize_chunk_index(
-        chunk_index,
-        T,
-        chunk_size=chunk_size,
-        chunk_split_strategy=chunk_split_strategy,
-    )
-    if boundaries == [0, T]:
-        return None
-    return boundaries
-
-
-def _sana_wm_sdpa(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    softmax_scale: float,
-) -> torch.Tensor:
-    q_sdpa = q.transpose(1, 2)
-    k_sdpa = k.transpose(1, 2)
-    v_sdpa = v.transpose(1, 2)
-
-    dtype_orig = q_sdpa.dtype
-    head_dim = q_sdpa.shape[-1]
-    need_pad = head_dim not in (32, 64, 128, 256) and head_dim < 256
-    if need_pad:
-        pad_to = 128 if head_dim <= 128 else 256
-        pad_size = pad_to - head_dim
-        q_sdpa = F.pad(q_sdpa, (0, pad_size))
-        k_sdpa = F.pad(k_sdpa, (0, pad_size))
-        v_sdpa = F.pad(v_sdpa, (0, pad_size))
-
-    # CUDA SDPA cannot use flash kernels for fp32; SANA's reference code casts
-    # to bf16 on that path and casts the output back to the caller dtype.
-    if q_sdpa.device.type == "cuda" and q_sdpa.dtype == torch.float32:
-        q_sdpa = q_sdpa.bfloat16()
-        k_sdpa = k_sdpa.bfloat16()
-        v_sdpa = v_sdpa.bfloat16()
-
-    out = F.scaled_dot_product_attention(
-        q_sdpa,
-        k_sdpa,
-        v_sdpa,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=softmax_scale,
-    )
-    if need_pad:
-        out = out[..., :head_dim]
-    return out.transpose(1, 2).to(dtype_orig)
-
-
 def _sana_wm_padded_attention_head_size(head_size: int) -> int:
     if head_size in _SANA_WM_FLASH_ATTN_HEAD_SIZES:
         return head_size
@@ -1371,45 +1309,6 @@ def _make_sana_wm_local_attention(
 ) -> nn.Module:
     attn_cls = _SanaWMPaddedLocalAttention if pad_head_dim_to_flash else LocalAttention
     return attn_cls(num_heads=num_heads, head_size=head_size, **kwargs)
-
-
-def _sana_wm_chunked_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    HW: Tuple[int, int, int],
-    chunk_size: Optional[int],
-    chunk_split_strategy: str,
-    chunk_index: Optional[List[int]],
-    softmax_scale: float,
-) -> Optional[torch.Tensor]:
-    """Exact chunk-causal softmax attention without materializing an NxN mask."""
-    boundaries = _sana_wm_chunk_boundaries_for_attention(
-        HW,
-        chunk_size,
-        chunk_split_strategy,
-        chunk_index,
-    )
-    if boundaries is None:
-        return None
-
-    _, H_sp, W_sp = HW
-    tokens_per_frame = H_sp * W_sp
-    out_chunks = []
-    for start_frame, end_frame in zip(boundaries[:-1], boundaries[1:]):
-        query_start = start_frame * tokens_per_frame
-        query_end = end_frame * tokens_per_frame
-        kv_end = end_frame * tokens_per_frame
-        out_chunks.append(
-            _sana_wm_sdpa(
-                q[:, query_start:query_end],
-                k[:, :kv_end],
-                v[:, :kv_end],
-                softmax_scale=softmax_scale,
-            )
-        )
-    return torch.cat(out_chunks, dim=1)
 
 
 def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
@@ -2430,7 +2329,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         update_rule: str = "torch_chunk",
         cam_update_rule: str = "torch_chunk",
         chunk_gdn_chunk_size: int = 21,
-        use_chunked_softmax_attention: bool = False,
         pad_attention_head_dim_to_flash: bool = False,
         use_triton_kernels: bool = True,
         allow_triton_fallback: bool = False,
@@ -2461,7 +2359,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.update_rule = update_rule
         self.cam_update_rule = cam_update_rule
         self.chunk_gdn_chunk_size = chunk_gdn_chunk_size
-        self.use_chunked_softmax_attention = use_chunked_softmax_attention
         self.use_triton_kernels = bool(use_triton_kernels)
         self.allow_triton_fallback = bool(allow_triton_fallback)
         self._triton_main_gdn_warning_logged = False
@@ -3807,20 +3704,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         q_in = q.transpose(1, 2).contiguous()
         k_in = k.transpose(1, 2).contiguous()
         v_in = v.transpose(1, 2).contiguous()
-        out = None
-        if self.use_chunked_softmax_attention:
-            out = _sana_wm_chunked_attention(
-                q_in,
-                k_in,
-                v_in,
-                HW=HW,
-                chunk_size=chunk_size,
-                chunk_split_strategy=chunk_split_strategy,
-                chunk_index=chunk_index,
-                softmax_scale=self.softmax_attn.softmax_scale,
-            )
-        if out is None:
-            out = self.softmax_attn(q_in, k_in, v_in)
+        out = self.softmax_attn(q_in, k_in, v_in)
         out = out.reshape(B, N, local_C)
         return out
 
@@ -4098,20 +3982,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         q_in = q_dn.permute(0, 3, 1, 2).contiguous()
         k_in = k_dn.permute(0, 3, 1, 2).contiguous()
         v_in = v_dn.permute(0, 3, 1, 2).contiguous()
-        out = None
-        if self.use_chunked_softmax_attention:
-            out = _sana_wm_chunked_attention(
-                q_in,
-                k_in,
-                v_in,
-                HW=HW,
-                chunk_size=chunk_size,
-                chunk_split_strategy=chunk_split_strategy,
-                chunk_index=chunk_index,
-                softmax_scale=self.softmax_attn.softmax_scale,
-            )
-        if out is None:
-            out = self.softmax_attn(q_in, k_in, v_in)  # (B, N, H, D)
+        out = self.softmax_attn(q_in, k_in, v_in)  # (B, N, H, D)
 
         out_bhnd = out.transpose(1, 2).contiguous()
         triton_out_bhnd = self._try_triton_cam_output_apply_o(
@@ -4366,7 +4237,6 @@ class SanaWMBlock(nn.Module):
         update_rule: str = "torch_chunk",
         cam_update_rule: str = "torch_chunk",
         chunk_gdn_chunk_size: int = 21,
-        use_chunked_softmax_attention: bool = False,
         pad_attention_head_dim_to_flash: bool = False,
         use_triton_kernels: bool = True,
         allow_triton_fallback: bool = False,
@@ -4390,7 +4260,6 @@ class SanaWMBlock(nn.Module):
             update_rule=update_rule,
             cam_update_rule=cam_update_rule,
             chunk_gdn_chunk_size=chunk_gdn_chunk_size,
-            use_chunked_softmax_attention=use_chunked_softmax_attention,
             pad_attention_head_dim_to_flash=pad_attention_head_dim_to_flash,
             use_triton_kernels=use_triton_kernels,
             allow_triton_fallback=allow_triton_fallback,
@@ -4638,9 +4507,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.use_chunk_plucker_input = arch.use_chunk_plucker_input
         self.chunk_size = getattr(arch, "chunk_size", None)
         self.chunk_split_strategy = getattr(arch, "chunk_split_strategy", "uniform")
-        self.use_chunked_softmax_attention = bool(
-            getattr(arch, "use_chunked_softmax_attention", False)
-        )
         self.pad_attention_head_dim_to_flash = bool(
             getattr(arch, "pad_attention_head_dim_to_flash", False)
         )
@@ -4675,13 +4541,12 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         self.softmax_block_indices = tuple(sorted(softmax_idx))
         logger.info(
-            "SANA-WM attention config: use_chunked_softmax_attention=%s, "
-            "pad_attention_head_dim_to_flash=%s, attention_head_dim=%d, "
+            "SANA-WM attention config: pad_attention_head_dim_to_flash=%s, "
+            "attention_head_dim=%d, "
             "effective_softmax_head_dim=%d, tp_size=%d, local_attention_heads=%d, "
             "softmax_blocks=%s, chunk_size=%s, chunk_split_strategy=%s, "
             "use_triton_kernels=%s, allow_triton_fallback=%s, "
             "true_sp_supported=%s",
-            self.use_chunked_softmax_attention,
             self.pad_attention_head_dim_to_flash,
             arch.linear_head_dim,
             effective_softmax_head_dim,
@@ -4720,7 +4585,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     update_rule=getattr(arch, "update_rule", "torch_chunk"),
                     cam_update_rule=getattr(arch, "cam_update_rule", "torch_chunk"),
                     chunk_gdn_chunk_size=getattr(arch, "chunk_gdn_chunk_size", 21),
-                    use_chunked_softmax_attention=self.use_chunked_softmax_attention,
                     pad_attention_head_dim_to_flash=self.pad_attention_head_dim_to_flash,
                     use_triton_kernels=self.use_triton_kernels,
                     allow_triton_fallback=self.allow_triton_fallback,

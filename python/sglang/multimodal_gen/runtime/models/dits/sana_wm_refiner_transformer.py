@@ -337,13 +337,13 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
                 patch_size=self.patch_size,
                 patch_size_t=self.patch_size_t,
             )
-            packed_input = True
+            packed_input = False
         else:
             if num_frames is None or height is None or width is None:
                 raise ValueError(
                     "num_frames/height/width are required when hidden_states is pre-packed."
                 )
-            packed_input = False
+            packed_input = True
 
         B = hidden_states.size(0)
 

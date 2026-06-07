@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from sglang.jit_kernel.diffusion.sana_wm.fused_gdn_chunkwise import (
@@ -16,7 +18,7 @@ def sana_wm_cam_scan_bidi_chunkwise(
     beta: torch.Tensor,
     decay: torch.Tensor,
     *,
-    dot_precision: int | None = None,
+    dot_precision: Optional[int] = None,
 ) -> torch.Tensor:
     """SGLang wrapper for Sana's full phase-A/B/C camera scan port."""
     return cam_scan_bidi_chunkwise(
