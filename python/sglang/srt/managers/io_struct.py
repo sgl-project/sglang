@@ -1175,7 +1175,19 @@ class BatchTokenIDOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: Optional[List[Optional[List[Optional[float]]]]]
+    output_hidden_states: Optional[
+        List[
+            Optional[
+                List[
+                    Optional[
+                        Union[
+                            float, List[Optional[Union[float, List[Optional[float]]]]]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+    ]
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
@@ -1264,7 +1276,19 @@ class BatchStrOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: Optional[List[Optional[List[Optional[float]]]]]
+    output_hidden_states: Optional[
+        List[
+            Optional[
+                List[
+                    Optional[
+                        Union[
+                            float, List[Optional[Union[float, List[Optional[float]]]]]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+    ]
 
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
