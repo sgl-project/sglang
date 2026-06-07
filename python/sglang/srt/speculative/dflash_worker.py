@@ -109,12 +109,18 @@ class DFlashWorker:
             import torch as _torch
 
             draft_backend = (
-                "ascend" if is_npu() else "triton" if _torch.version.hip else "flashinfer"
+                "ascend"
+                if is_npu()
+                else "triton" if _torch.version.hip else "flashinfer"
             )
         elif draft_backend == "trtllm_mha":
             import torch as _torch
 
-            _fb = "ascend" if is_npu() else "triton" if _torch.version.hip else "flashinfer"
+            _fb = (
+                "ascend"
+                if is_npu()
+                else "triton" if _torch.version.hip else "flashinfer"
+            )
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
                 "draft path requires non-causal attention. Falling back to "
@@ -125,7 +131,11 @@ class DFlashWorker:
         elif draft_backend not in supported_draft_backends:
             import torch as _torch
 
-            _fb = "ascend" if is_npu() else "triton" if _torch.version.hip else "flashinfer"
+            _fb = (
+                "ascend"
+                if is_npu()
+                else "triton" if _torch.version.hip else "flashinfer"
+            )
             logger.warning(
                 "DFLASH draft worker only supports attention_backend in %s for now, "
                 "but got %r. Falling back to '%s'.",
