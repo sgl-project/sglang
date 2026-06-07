@@ -134,12 +134,14 @@ def _draft_sample_with_dsl_kernel(
 
         # Log-probability of sampled token (for rejection sampling in verify)
         # Compute log_softmax at the sampled position
-        log_sum_exp = tl.log(tl.sum(tl.exp(
-            tl.load(base_ptr + tl.arange(0, BLOCK_V), mask=tl.arange(0, BLOCK_V) < vocab_size, other=-1e9)
-            - max1
-        ), axis=0)) + max1
-        token_logit = tl.load(base_ptr + token)
-        log_prob = token_logit - log_sum_exp
+        sum_exp = 0.0
+        for v_start in range(0, vocab_size, BLOCK_V):
+            v_offs = v_start + tl.arange(0, BLOCK_V)
+            v_mask = v_offs < vocab_size
+            logits_block = tl.load(base_ptr + v_offs, mask=v_mask, other=-1e9)
+            sum_exp += tl.sum(tl.exp(logits_block - max1), axis=0)
+        log_sum_exp = tl.log(sum_exp) + max1
+        log_prob = max1 - log_sum_exp
 
         tl.store(output_tokens_ptr + seq_id * K + k, token)
         tl.store(output_scores_ptr + seq_id * K + k, log_prob)
