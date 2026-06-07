@@ -8,6 +8,7 @@ python3 test_forward_split_prefill.py
 """
 
 import unittest
+from array import array
 
 import numpy as np
 import torch
@@ -91,7 +92,7 @@ class TestForwardSplitPrefill(CustomTestCase):
             req = Req(
                 rid=i,
                 origin_input_text="",
-                origin_input_ids=list(input_ids[i]),
+                origin_input_ids=array("q", input_ids[i]),
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids

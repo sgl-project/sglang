@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -199,6 +200,7 @@ class Eagle3MLAModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
         )
 
         target_hidden_size = (

@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -45,7 +46,6 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -72,6 +72,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+
+# Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
+# ForwardBatch.apply_deprecated_skip_attn_backend_init.
+_skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 
@@ -381,6 +385,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
+    topk_indices: Optional[torch.Tensor] = None
+    reuse_mtp_topk_indices: Optional[bool] = False
+
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
@@ -459,6 +467,94 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # kv-canary token-id validator snapshot
     req_all_ids_flat: Optional[torch.Tensor] = None
     req_all_ids_lens: Optional[torch.Tensor] = None
+
+    # Attention planning state. True iff attention metadata for this batch has
+    # already been planned outside ModelRunner.forward (multi-step draft
+    # pre-plan, plan-stream replay_prepare, hand-built spec batches), so the
+    # forward path must not plan again. Only such pre-planners may set this —
+    # ModelRunner / graph runners never mark after their own planning. The
+    # marker is only valid for the planning regime (backend set) it was set
+    # under; a fresh batch from init_new always starts unplanned.
+    forward_metadata_ready: bool = False
+    # Shapes the batch had when it was marked (plan record). Lets the
+    # judgment predicate detect staleness when DP padding
+    # (prepare_mlp_sync_batch) reshapes the batch after pre-planning.
+    # Deliberately plain ints — no planner object ref on ForwardBatch
+    # (runtime refs were removed from this dataclass on purpose).
+    forward_metadata_planned_bs: Optional[int] = None
+    forward_metadata_planned_num_tokens: Optional[int] = None
+    # Whether the forward path may re-plan this batch when its shapes no
+    # longer match the plan record. Only mark sites where the forward
+    # path's own init_forward_metadata is equivalent to the pre-plan
+    # (same backend object, no special context) may opt in; multi-step
+    # wrapper plans and view-context plans must keep this False — a
+    # forward-path re-plan would clobber their metadata.
+    forward_metadata_replan_equivalent: bool = False
+
+    def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
+        """Record that attention metadata was pre-planned for this batch.
+
+        Call right next to the out-of-forward planning action
+        (e.g. ``draft_attn_backend.init_forward_metadata(fb)`` or
+        ``graph_runner.replay_prepare(fb)``). Records the batch shapes so
+        staleness is detectable; pass ``replan_equivalent=True`` only when
+        a forward-path re-plan is equivalent to the pre-plan (see field
+        docs).
+        """
+        self.forward_metadata_ready = True
+        self.forward_metadata_planned_bs = self.batch_size
+        self.forward_metadata_planned_num_tokens = (
+            self.input_ids.shape[0] if self.input_ids is not None else 0
+        )
+        self.forward_metadata_replan_equivalent = replan_equivalent
+
+    def needs_forward_metadata_init(self) -> bool:
+        """Single judgment point for whether the forward path must plan.
+
+        A marked batch is treated as stale — and re-planned — when its
+        shapes no longer match the plan record AND the mark site declared
+        the re-plan safe (replan_equivalent). This runs after
+        prepare_mlp_sync_batch in _forward_raw, so the re-plan sees the
+        padded (final) shapes. Sites that cannot opt in (multi-step
+        wrapper plans etc.) keep today's behavior: marked stays skipped,
+        backends' defensive checks remain the backstop.
+        """
+        if not self.forward_metadata_ready:
+            return True
+        if not self.forward_metadata_replan_equivalent:
+            return False
+        num_tokens = self.input_ids.shape[0] if self.input_ids is not None else 0
+        return (
+            self.batch_size != self.forward_metadata_planned_bs
+            or num_tokens != self.forward_metadata_planned_num_tokens
+        )
+
+    def apply_deprecated_skip_attn_backend_init(
+        self, skip_attn_backend_init: Optional[bool]
+    ) -> None:
+        """Map the deprecated ``skip_attn_backend_init`` kwarg onto the marker.
+
+        Mapped, not ignored: callers passing True relied on planning being
+        skipped — ignoring the flag would silently re-plan and corrupt
+        pre-planned multi-step draft metadata. Warns once per process (a
+        module flag, not the warnings filter, so the hot decode loop never
+        pays warnings.warn per forward).
+        """
+        if skip_attn_backend_init is None:
+            return
+        global _skip_attn_backend_init_warned
+        if not _skip_attn_backend_init_warned:
+            _skip_attn_backend_init_warned = True
+            warnings.warn(
+                "skip_attn_backend_init is deprecated and will be removed; "
+                "pre-planners should call "
+                "ForwardBatch.mark_forward_metadata_ready() after planning "
+                "instead. The flag is mapped onto the marker for now.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        if skip_attn_backend_init:
+            self.mark_forward_metadata_ready()
 
     @classmethod
     def init_new(
@@ -978,6 +1074,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
+        # Local import: a module-level cp_utils import here is circular (#27014).
+        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -990,11 +1089,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
-        # make sure that each rank has the same number of tokens to do collective communication and
-        # we can divide the tokens into 2 * CP chunks for load balance.
-        attn_cp_size = get_attention_cp_size()
+        # make sure that each rank has the same number of tokens to do collective communication.
+        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
+        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
+        # prefill with NaN draft logits, see #23269).
+        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
+        cp_align_size = get_cp_padding_align_size()
         for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size * 2)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1081,9 +1183,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-        self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
-            bs - self.seq_lens.shape[0]
-        )
+        # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
+        # attention backend over-allocate from an upper bound (see #26738).
+        if self.seq_lens_sum is not None:
+            self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+                bs - self.seq_lens.shape[0]
+            )
         self.seq_lens = self._pad_tensor_to_size(
             self.seq_lens, bs, value=seq_len_fill_value
         )
@@ -1231,6 +1336,46 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 def enable_num_token_non_padded():
     return get_moe_expert_parallel_world_size() > 1
+
+
+def build_inner_fb_view(
+    forward_batch: ForwardBatch,
+    *,
+    bs: int,
+    forward_mode: ForwardMode,
+    encoder_lens: Optional[torch.Tensor] = None,
+):
+    """Build a ForwardBatch-like view for MultiStep draft wrapper dispatch.
+
+    MultiStep draft wrappers (FlashInferMultiStepDraftBackend,
+    AiterMultiStepDraftBackend, TritonMultiStepDraftBackend, etc.) need
+    to dispatch to per-step inner backends'
+    :py:meth:`AttentionBackend.init_forward_metadata_out_graph` with an
+    overridden ``forward_mode`` (typically pinned to ``DECODE``) and
+    sometimes overridden ``encoder_lens``. The result is a thin
+    namespace mirroring just the fields backend init reads, avoiding
+    the cost of allocating a real ``ForwardBatch``.
+
+    ``actual_forward_mode`` carries the original runtime
+    ``forward_batch.forward_mode`` (e.g., spec-decode draft) so backends
+    that check it for IDLE substitution (DSV4) see the unaltered value.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        batch_size=bs,
+        forward_mode=forward_mode,
+        actual_forward_mode=forward_batch.forward_mode,
+        input_ids=getattr(forward_batch, "input_ids", None),
+        positions=getattr(forward_batch, "positions", None),
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=forward_batch.seq_lens,
+        seq_lens_sum=forward_batch.seq_lens_sum,
+        seq_lens_cpu=forward_batch.seq_lens_cpu,
+        encoder_lens=encoder_lens,
+        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        spec_info=forward_batch.spec_info,
+    )
 
 
 class PPProxyTensors:

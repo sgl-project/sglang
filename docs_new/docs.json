@@ -1005,6 +1005,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Super"
@@ -1102,6 +1103,7 @@
                   "cookbook/diffusion/intro",
                   {
                     "group": "Cosmos",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Cosmos/Cosmos3"
                     ]
@@ -1110,6 +1112,13 @@
                     "group": "FLUX",
                     "pages": [
                       "cookbook/diffusion/FLUX/FLUX"
+                    ]
+                  },
+                  {
+                    "group": "Ideogram",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Ideogram/Ideogram4"
                     ]
                   },
                   {
@@ -1139,6 +1148,12 @@
                     ]
                   },
                   {
+                    "group": "ERNIE-Image",
+                    "pages": [
+                      "cookbook/diffusion/Ernie-Image/Ernie-Image"
+                    ]
+                  },
+                  {
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
@@ -1146,6 +1161,7 @@
                   },
                   {
                     "group": "LingBot World",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World"
                     ]
@@ -1194,6 +1210,7 @@
                 "group": "Performance Optimization",
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
+                  "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
                   {
