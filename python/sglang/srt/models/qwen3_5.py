@@ -142,6 +142,7 @@ def _enable_qwen35_fused_ar_quant() -> bool:
         return False
     return bool(get_global_server_args().enable_aiter_allreduce_fusion)
 
+
 def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
