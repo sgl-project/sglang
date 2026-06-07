@@ -1402,13 +1402,11 @@ class TritonMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            forward_batch.batch_size, self.topk, self.max_context_len
+        )
         kv_indices = torch.empty(
-            (
-                self.speculative_num_steps,
-                draft_kv_indices_buffer_width(
-                    forward_batch.batch_size, self.topk, self.max_context_len
-                ),
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int64,
             device=self.device,
         )
@@ -1425,11 +1423,11 @@ class TritonMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            max_bs, self.topk, self.max_context_len
+        )
         self.cuda_graph_kv_indices = torch.zeros(
-            (
-                self.speculative_num_steps,
-                draft_kv_indices_buffer_width(max_bs, self.topk, self.max_context_len),
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int64,
             device=self.device,
         )

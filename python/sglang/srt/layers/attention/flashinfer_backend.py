@@ -1636,13 +1636,11 @@ class FlashInferMultiStepDraftBackend:
         global_override_indptr_cpu = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            forward_batch.batch_size, self.topk, self.max_context_len
+        )
         kv_indices = torch.empty(
-            (
-                self.speculative_num_steps,
-                draft_kv_indices_buffer_width(
-                    forward_batch.batch_size, self.topk, self.max_context_len
-                ),
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device="cuda",
         )
@@ -1662,11 +1660,11 @@ class FlashInferMultiStepDraftBackend:
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
         # so the row needs the topk factor -- same as the eager init_forward_metadata
         # (batch_size * topk * max_context_len). Dropping it overflows the buffer.
+        kv_indices_width = draft_kv_indices_buffer_width(
+            max_bs, self.topk, self.max_context_len
+        )
         self.cuda_graph_kv_indices = torch.zeros(
-            (
-                self.speculative_num_steps,
-                draft_kv_indices_buffer_width(max_bs, self.topk, self.max_context_len),
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device="cuda",
         )
