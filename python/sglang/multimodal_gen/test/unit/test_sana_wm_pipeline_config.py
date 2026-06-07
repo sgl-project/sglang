@@ -74,6 +74,9 @@ from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     VanillaD2HStrategy,
 )
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    _maybe_build_sana_wm_cache_dit_adapter,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -638,6 +641,29 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertFalse(attn.out_proj_cam.gather_output)
         self.assertIsInstance(attn.proj, FakeRowParallelLinear)
         self.assertTrue(attn.proj.input_is_parallel)
+
+    def test_dit_exposes_cache_dit_transformer_blocks_alias(self) -> None:
+        model = object.__new__(SanaWMTransformer3DModel)
+        torch.nn.Module.__init__(model)
+        model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+
+        self.assertIs(model.transformer_blocks, model.blocks)
+
+    def test_dit_uses_sana_wm_cache_dit_block_adapter(self) -> None:
+        from cache_dit import ForwardPattern
+
+        model = object.__new__(SanaWMTransformer3DModel)
+        torch.nn.Module.__init__(model)
+        model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+
+        adapter = _maybe_build_sana_wm_cache_dit_adapter(model)
+
+        self.assertIsNotNone(adapter)
+        self.assertIs(adapter.transformer, model)
+        self.assertIs(adapter.blocks, model.blocks)
+        self.assertEqual(adapter.blocks_name, "blocks")
+        self.assertEqual(adapter.forward_pattern, ForwardPattern.Pattern_3)
+        self.assertFalse(adapter.check_forward_pattern)
 
     def test_dit_sp_helpers_default_to_noop_without_model_parallel(self) -> None:
         self.assertEqual(_sana_wm_sp_world_size(), 1)
@@ -1387,9 +1413,15 @@ class TestSanaWMTwoStagePipeline(_GlobalStageArgsMixin, unittest.TestCase):
             )
         self.assertNotIn("tokenizer_2", pipeline.component_residency_strategies)
 
-    def test_two_stage_pipeline_auto_residency_skips_safe_auto_path(self) -> None:
+    def test_two_stage_pipeline_auto_residency_skips_cfg_parallel_auto_path(
+        self,
+    ) -> None:
         pipeline = self._make_two_stage_pipeline()
-        server_args = self._make_two_stage_server_args(performance_mode="auto")
+        server_args = self._make_two_stage_server_args(
+            performance_mode="auto",
+            tp_size=2,
+            enable_cfg_parallel=True,
+        )
 
         with patch.dict(
             os.environ,
@@ -1928,6 +1960,26 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         }
         kwargs.update(overrides)
         return Req(**kwargs)
+
+    def test_warmup_single_frame_raises_to_two_latent_frames(self) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+        batch = SimpleNamespace(num_frames=1, is_warmup=True, condition_inputs={})
+
+        num_frames = stage._adjust_num_frames_for_request(batch)
+
+        self.assertEqual(num_frames, pipeline_config.vae_stride[0] + 1)
+        shape = pipeline_config.prepare_latent_shape(
+            SimpleNamespace(height=704, width=1280),
+            batch_size=1,
+            num_frames=num_frames,
+        )
+        self.assertEqual(shape[2], 2)
 
     def test_verify_input_accepts_prepared_sana_wm_request(self) -> None:
         pipeline_config = SanaWMPipelineConfig()
@@ -4039,6 +4091,13 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(_refiner_config_value(module, "patch_size"), 1)
 
     def test_native_refiner_preserves_packed_and_5d_return_contract(self) -> None:
+        class FakeTPGroup:
+            world_size = 1
+            rank_in_group = 0
+
+            def all_gather(self, input_, dim=-1):
+                return input_
+
         arch = SanaWMRefinerArchConfig(
             in_channels=1,
             out_channels=1,
@@ -4053,10 +4112,15 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
             base_height=2,
             base_width=2,
         )
-        model = SanaWMLTX2VideoRefiner(
-            SanaWMRefinerConfig(arch_config=arch),
-            hf_config={},
-        ).eval()
+        fake_tp_group = FakeTPGroup()
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+            return_value=fake_tp_group,
+        ):
+            model = SanaWMLTX2VideoRefiner(
+                SanaWMRefinerConfig(arch_config=arch),
+                hf_config={},
+            ).eval()
         prompt_embeds = torch.randn(1, 3, 4)
         timestep = torch.zeros(1, 8)
 

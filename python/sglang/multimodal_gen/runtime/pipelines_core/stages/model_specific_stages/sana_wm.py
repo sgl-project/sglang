@@ -2420,7 +2420,18 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 action_num_frames,
                 requested_num_frames,
             )
-        return self.pipeline_config.adjust_num_frames(requested_num_frames)
+        num_frames = self.pipeline_config.adjust_num_frames(requested_num_frames)
+        if getattr(batch, "is_warmup", False):
+            min_warmup_frames = int(self.pipeline_config.vae_stride[0]) + 1
+            if num_frames < min_warmup_frames:
+                self.log_info(
+                    "SANA-WM warmup num_frames raised from %d to %d so temporal "
+                    "stages receive at least two latent frames.",
+                    num_frames,
+                    min_warmup_frames,
+                )
+                return min_warmup_frames
+        return num_frames
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

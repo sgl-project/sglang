@@ -4198,6 +4198,11 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # FSDP shard targets
         self.layer_names = ["blocks"]
 
+    @property
+    def transformer_blocks(self) -> nn.ModuleList:
+        """Compatibility alias for Cache-DiT's Sana block adapter."""
+        return self.blocks
+
     def post_load_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, WanRotaryPosEmbed):

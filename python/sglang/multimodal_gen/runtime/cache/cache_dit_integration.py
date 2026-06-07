@@ -222,6 +222,32 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+def _maybe_build_sana_wm_cache_dit_adapter(
+    transformer: torch.nn.Module,
+) -> BlockAdapter | None:
+    if transformer.__class__.__name__ != "SanaWMTransformer3DModel":
+        return None
+    blocks = getattr(transformer, "blocks", None)
+    if blocks is None:
+        return None
+
+    # SANA-WM's blocks use a native signature:
+    #   forward(x, *, y, t, HW, rotary_emb, ...)
+    # cache-dit's built-in Sana adapter assumes diffusers-style
+    # `transformer_blocks` with `hidden_states` naming and rejects the
+    # signature during pattern checks. Pattern_3 is still the right data-flow
+    # shape (single hidden-state tensor in, single hidden-state tensor out), and
+    # cache-dit will pass through SANA-WM's kwargs when the signature check is
+    # disabled.
+    return BlockAdapter(
+        transformer=transformer,
+        blocks=blocks,
+        blocks_name="blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+        check_forward_pattern=False,
+    )
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
@@ -249,8 +275,10 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
+    block_adapter = _maybe_build_sana_wm_cache_dit_adapter(transformer)
+
     # Check if the transformer is pre-registered in cache-dit
-    if not BlockAdapterRegister.is_supported(transformer):
+    if block_adapter is None and not BlockAdapterRegister.is_supported(transformer):
         transformer_cls_name = transformer.__class__.__name__
         raise ValueError(
             f"{transformer_cls_name} is not officially supported by cache-dit. "
@@ -313,7 +341,7 @@ def enable_cache_on_transformer(
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
     cache_dit.enable_cache(
-        transformer,
+        block_adapter or transformer,
         cache_config=cache_config,
         calibrator_config=calibrator_config,
         parallelism_config=None,
