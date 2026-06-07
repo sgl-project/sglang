@@ -98,6 +98,7 @@ def _set_kv_buffer_impl(
     row_dim: int,  # head_num * head_dim
     store_dtype: torch.dtype,
     device_module: Any,
+    pool_size: int,
     alt_stream: Optional[torch.cuda.Stream] = None,
     same_kv_dim: bool = True,
 ) -> None:
@@ -110,6 +111,7 @@ def _set_kv_buffer_impl(
             v_cache.view(-1, row_dim),
             indices,
             row_bytes=row_bytes,
+            pool_size=pool_size,
         )
 
     if _is_cpu and _cpu_has_amx_support:
@@ -960,6 +962,7 @@ class MHATokenToKVPool(KVCache):
             dummy_loc,
             dummy_loc,
             1,
+            self.size + self.page_size,
             chunk_upper,
             BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
             num_warps=self._kv_copy_config["num_warps"],
@@ -1154,6 +1157,7 @@ class MHATokenToKVPool(KVCache):
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
             device_module=self.device_module,
+            pool_size=self.size + self.page_size,
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
@@ -1192,6 +1196,7 @@ class MHATokenToKVPool(KVCache):
                 tgt_loc,
                 src_loc,
                 N,
+                self.size + self.page_size,
                 upper,
                 BYTES_PER_TILE=cfg["bytes_per_tile"],
                 num_warps=cfg["num_warps"],
@@ -1210,6 +1215,7 @@ class MHATokenToKVPool(KVCache):
                 tgt_loc[start:end],
                 src_loc[start:end],
                 chunk_len,
+                self.size + self.page_size,
                 upper,
                 BYTES_PER_TILE=cfg["bytes_per_tile"],
                 num_warps=cfg["num_warps"],

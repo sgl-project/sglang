@@ -57,6 +57,7 @@ def store_cache(
     *,
     row_bytes: int = 0,
     num_split: int = 0,  # can be tuned for performance
+    pool_size: int = 0,
 ) -> None:
     """Store key and value tensors into KV cache at specified indices.
 
@@ -66,6 +67,9 @@ def store_cache(
         k_cache (torch.Tensor): Key cache tensor of shape (num_pages, H * D).
         v_cache (torch.Tensor): Value cache tensor of shape (num_pages, H * D).
         indices (torch.Tensor): Indices tensor of shape (batch_size,).
+        pool_size (int): Valid slot bound; an index outside [0, pool_size) skips
+            its write instead of an illegal memory access. Defaults to the cache
+            row count when 0.
     """
     row_bytes = row_bytes or k.shape[-1] * k.element_size()
     module = _jit_kvcache_module(row_bytes)
@@ -76,6 +80,8 @@ def store_cache(
             num_split = 2
         else:
             num_split = 1
+    if pool_size <= 0:
+        pool_size = k_cache.shape[0]
     module.store_cache(
         k,
         v,
@@ -83,4 +89,5 @@ def store_cache(
         v_cache,
         indices,
         num_split,
+        pool_size,
     )
