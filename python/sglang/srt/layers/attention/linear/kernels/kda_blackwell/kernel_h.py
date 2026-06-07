@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # KDA (Kimi Delta Attention) SM100 chunk recurrent-state kernel.
 #
-# Adapted from gdn_blackwell/kernel_h.py (GDN). KDA differs from GDN only in the
+# Idea is adopted from GDN blackwell kernel. KDA differs from GDN only in the
 # decay gate, which is PER-CHANNEL (one decay per key-dim k) instead of a single
 # scalar per head. The hard cross-token part of the per-channel decay is folded
 # OUTSIDE this kernel into the pre-scaled key tensor `kg`:

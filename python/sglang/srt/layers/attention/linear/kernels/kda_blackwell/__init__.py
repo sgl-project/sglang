@@ -51,7 +51,12 @@ def _kda_workspace(q, T, Hv, K, V, cu_seqlens):
     import torch as _t
 
     dev = q.device
-    key = (Hv, K, V, dev, q.dtype)
+    # Key by the current CUDA stream too: the scratch is process-global and
+    # mutable, so two KDA forwards running concurrently on different streams
+    # (e.g. two-batch overlap) must not share buffers. Within one forward all
+    # KDA layers run on the same stream -> same key -> the reuse benefit holds.
+    stream = _t.cuda.current_stream(device=dev).cuda_stream
+    key = (Hv, K, V, dev, q.dtype, stream)
     ws = _KDA_WS.get(key)
 
     # metadata: recompute only when cu_seqlens changes (object identity -> no
@@ -90,9 +95,11 @@ def _kda_workspace(q, T, Hv, K, V, cu_seqlens):
         eye = ws["eye"]
         hw = max(ws["eye_hw"], T)
         eye[:hw].zero_()
-        tok = _t.arange(T, device=dev)
-        seq_of = _t.searchsorted(cu_seqlens.long(), tok, right=True) - 1
-        pos = (tok - cu_seqlens.long()[seq_of]) % 64
+        # Match cu_seqlens' dtype (typically int32) so searchsorted/indexing avoid
+        # the int64 casts, while staying correct if cu_seqlens is passed as int64.
+        tok = _t.arange(T, device=dev, dtype=cu_seqlens.dtype)
+        seq_of = _t.searchsorted(cu_seqlens, tok, right=True) - 1
+        pos = (tok - cu_seqlens[seq_of]) % 64
         eye[tok, :, pos] = 1.0
         ws["eye_hw"] = T
         ws["cu"] = cu_seqlens
