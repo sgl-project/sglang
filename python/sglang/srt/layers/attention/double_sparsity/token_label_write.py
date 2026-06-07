@@ -1,11 +1,12 @@
 """Token-label write — per-slot channel projection from projected K_nope.
 
 Each KV slot is stored as a ``[num_heads_local, label_dim]`` fp16 label
-row by selecting ``label_dim`` channels from the 128-d projected nope K.
+row by selecting ``label_dim`` channels from the projected no-PE K.
 
 The ``k_nope`` argument (shape ``[num_tokens, num_heads_local, nope_dim]``)
-must already be the projected 128-d K_nope produced by applying the
-``kv_b_proj`` K-side projection at the write hook site in ``dsa_backend.py``.
+must already be the projected K_nope (``nope_dim == qk_nope_head_dim`` columns
+per head) produced by applying the ``kv_b_proj`` K-side projection at the write
+hook site in ``dsa_backend.py``.
 This module does NOT perform FP8 dequant or ``kv_b_proj`` projection; it
 performs only the channel selection step.
 

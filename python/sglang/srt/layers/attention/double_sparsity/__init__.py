@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.double_sparsity.channel_mask import (
     slice_per_rank,
     startup_sanity_probe,
     validate_against_runtime,
+    verify_bind_shapes,
 )
 from sglang.srt.layers.attention.double_sparsity.config import (
     DoubleSparsityConfig,
@@ -53,4 +54,5 @@ __all__ = [
     "token_label_write",
     "validate_against_runtime",
     "validate_double_sparsity",
+    "verify_bind_shapes",
 ]

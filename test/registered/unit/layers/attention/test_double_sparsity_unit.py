@@ -9767,5 +9767,174 @@ class TestBlockedTopKExactness(unittest.TestCase):
         self._assert_eq(sc, K, bw)
 
 
+class TestVerifyBindShapes(unittest.TestCase):
+    """Bind-time shape gate: a calibrated mask must match the running model's
+    no-PE head width / head count / layer count, or DS hard-errors naming the
+    field instead of silently selecting the wrong channels.
+
+    Parameterized across the narrower (128/128) and wider (192/256) MLA shapes
+    so a change that hardens one shape cannot silently drop the other.
+    """
+
+    # (nope_head_dim, v_head_dim, num_heads, num_layers, label_dim)
+    SHAPES = {
+        "narrow_128": (128, 128, 128, 61, 16),
+        "wide_192": (192, 256, 96, 78, 32),
+    }
+
+    def _make_mask(
+        self,
+        *,
+        head_dim: int,
+        label_dim: int,
+        num_layers: int,
+        num_heads: int,
+        max_index: int = None,
+        weights_shape=None,
+    ):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+
+        hi = head_dim if max_index is None else max_index
+        sel = torch.randint(
+            0, max(hi, 1), (num_layers, num_heads, label_dim), dtype=torch.int32
+        )
+        w = torch.ones(
+            weights_shape or (num_layers, num_heads, label_dim), dtype=torch.float32
+        )
+        return ChannelMask(
+            channel_selection=sel,
+            channel_weights=w,
+            schema_version="ds_channel_mask_v1",
+            dtype="fp8_e4m3",
+            head_dim=head_dim,
+            page_size=64,
+            label_dim=label_dim,
+            content_sha256="0" * 64,
+            created_at="2026-06-07T00:00:00Z",
+        )
+
+    def _verify(self, mask, *, nope, num_heads, num_layers, label_dim, tp_size=1):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            verify_bind_shapes,
+        )
+
+        verify_bind_shapes(
+            mask,
+            model_nope_head_dim=nope,
+            num_local_heads=num_heads // tp_size,
+            tp_size=tp_size,
+            num_hidden_layers=num_layers,
+            server_page_size=64,
+            server_label_dim=label_dim,
+            server_kv_cache_dtype="fp8_e4m3",
+        )
+
+    def test_matching_mask_passes_both_shapes(self):
+        for name, (nope, _v, h, L, ld) in self.SHAPES.items():
+            with self.subTest(shape=name):
+                mask = self._make_mask(
+                    head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
+                )
+                # Must not raise.
+                self._verify(mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld)
+
+    def test_matching_mask_passes_with_tp_split(self):
+        nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
+        )
+        self._verify(
+            mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld, tp_size=8
+        )
+
+    def test_narrow_mask_on_wide_model_hard_errors_naming_head_dim(self):
+        # A mask calibrated for the 128 no-PE width loaded against a 192 model:
+        # indices stay in range (no crash) but the head_dim equality must fail.
+        _nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=128, label_dim=ld, num_layers=L, num_heads=h, max_index=128
+        )
+        with self.assertRaises(ValueError) as cm:
+            self._verify(mask, nope=192, num_heads=h, num_layers=L, label_dim=ld)
+        self.assertIn("head_dim", str(cm.exception))
+
+    def test_index_out_of_nope_range_hard_errors(self):
+        nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
+        )
+        # Force a selection index past the no-PE width.
+        mask.channel_selection[0, 0, 0] = nope + 5
+        with self.assertRaises(ValueError) as cm:
+            self._verify(mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld)
+        self.assertIn("max index", str(cm.exception))
+
+    def test_layer_count_mismatch_hard_errors(self):
+        nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=nope, label_dim=ld, num_layers=L - 1, num_heads=h
+        )
+        with self.assertRaises(ValueError) as cm:
+            self._verify(mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld)
+        self.assertIn("layers", str(cm.exception))
+
+    def test_head_count_mismatch_hard_errors(self):
+        nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
+        )
+        with self.assertRaises(ValueError) as cm:
+            self._verify(
+                mask, nope=nope, num_heads=h + 8, num_layers=L, label_dim=ld
+            )
+        self.assertIn("num_heads", str(cm.exception))
+
+    def test_label_dim_mismatch_hard_errors(self):
+        nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
+        )
+        with self.assertRaises(ValueError) as cm:
+            self._verify(mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld + 1)
+        self.assertIn("label_dim", str(cm.exception))
+
+    def test_weights_shape_mismatch_hard_errors(self):
+        nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=nope,
+            label_dim=ld,
+            num_layers=L,
+            num_heads=h,
+            weights_shape=(L, h, ld + 2),
+        )
+        with self.assertRaises(ValueError) as cm:
+            self._verify(mask, nope=nope, num_heads=h, num_layers=L, label_dim=ld)
+        self.assertIn("channel_weights", str(cm.exception))
+
+    def test_auto_kv_dtype_skips_dtype_leg(self):
+        # When the server dtype is still "auto", the dtype mismatch leg is a
+        # no-op (head_dim is the real check); a matching mask still passes.
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            verify_bind_shapes,
+        )
+
+        nope, _v, h, L, ld = self.SHAPES["wide_192"]
+        mask = self._make_mask(
+            head_dim=nope, label_dim=ld, num_layers=L, num_heads=h
+        )
+        verify_bind_shapes(
+            mask,
+            model_nope_head_dim=nope,
+            num_local_heads=h,
+            tp_size=1,
+            num_hidden_layers=L,
+            server_page_size=64,
+            server_label_dim=ld,
+            server_kv_cache_dtype="auto",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

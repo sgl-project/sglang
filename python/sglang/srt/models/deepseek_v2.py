@@ -1881,6 +1881,7 @@ class DeepseekV2AttentionMLA(
         from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             slice_per_rank,
+            verify_bind_shapes,
         )
         from sglang.srt.layers.attention.double_sparsity.token_label_table import (
             allocate_token_label_table,
@@ -1899,6 +1900,44 @@ class DeepseekV2AttentionMLA(
                 "_double_sparsity_channel_mask. validate_double_sparsity must "
                 "run before model construction."
             )
+
+        # Authoritative shape gate: the attention layer is now constructed, so
+        # its per-head no-PE width (qk_nope_head_dim) and head/layer counts are
+        # final. Reject a mask calibrated for a different model shape here with a
+        # diagnostic naming every offending field, rather than letting an in-range
+        # but wrong-width channel selection silently score the wrong channels.
+        # This runs only on the explicit Double Sparsity path; native attention
+        # never reaches it.
+        tp_size = max(attn_tp_size, 1)
+        num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
+        verify_bind_shapes(
+            full_mask,
+            model_nope_head_dim=int(self.qk_nope_head_dim),
+            num_local_heads=int(self.num_local_heads),
+            tp_size=tp_size,
+            num_hidden_layers=num_hidden_layers,
+            server_page_size=int(ds_parsed.page_size),
+            server_label_dim=int(full_mask.label_dim),
+            server_kv_cache_dtype=getattr(server_args, "kv_cache_dtype", None),
+        )
+        logger.info(
+            "double_sparsity bind shape check passed (layer %d, tp_rank %d): "
+            "qk_nope_head_dim=%d qk_rope_head_dim=%d v_head_dim=%d "
+            "kv_lora_rank=%d num_local_heads=%d layers=%d page_size=%d "
+            "label_dim=%d head_dim=%d kv_dtype=%s",
+            self.layer_id,
+            attn_tp_rank,
+            int(self.qk_nope_head_dim),
+            int(self.qk_rope_head_dim),
+            int(self.v_head_dim),
+            int(self.kv_lora_rank),
+            int(self.num_local_heads),
+            num_hidden_layers,
+            int(ds_parsed.page_size),
+            int(full_mask.label_dim),
+            int(full_mask.head_dim),
+            getattr(server_args, "kv_cache_dtype", None),
+        )
 
         # Per-rank head slice of the calibrated mask. Production safe even at
         # attn_tp_size == 1 because slice_per_rank accepts tp_size=1.

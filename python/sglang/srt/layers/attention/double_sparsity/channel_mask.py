@@ -426,6 +426,109 @@ def validate_against_runtime(
         )
 
 
+def verify_bind_shapes(
+    mask: ChannelMask,
+    *,
+    model_nope_head_dim: int,
+    num_local_heads: int,
+    tp_size: int,
+    num_hidden_layers: int,
+    server_page_size: int,
+    server_label_dim: int,
+    server_kv_cache_dtype: Optional[str] = None,
+) -> None:
+    """Hard-error (naming every offending field) if a calibrated channel mask is
+    shape-incompatible with the running model, at the attention bind site.
+
+    The startup validator can only best-effort the per-head no-PE width because
+    the attention layer is not yet constructed when it runs; the projection width
+    becomes authoritative only here. This is the gate that turns an explicit
+    Double Sparsity request on an unsupported shape into a diagnostic failure
+    instead of a silent wrong-channel selection — e.g. a mask calibrated for a
+    narrower no-PE head (``head_dim``) loaded against a wider one keeps its
+    indices in range, so the channel gather would not crash; it would quietly
+    score the wrong channels.
+
+    ``model_nope_head_dim`` is the per-head no-PE width the selection indices live
+    in (``qk_nope_head_dim``). All checks aggregate so one error names every
+    mismatch at once. The caller invokes this only when Double Sparsity is
+    explicitly enabled, so the native attention path is unaffected when it is off.
+    """
+
+    problems: list[str] = []
+
+    # dtype / head_dim / page_size / label_dim agreement with the running config.
+    # Skip the dtype leg only when the server dtype is still unresolved (auto);
+    # the startup validator already gates dtype, and head_dim is the new check.
+    effective_dtype = (
+        mask.dtype
+        if server_kv_cache_dtype in (None, "auto")
+        else server_kv_cache_dtype
+    )
+    try:
+        validate_against_runtime(
+            mask,
+            server_kv_cache_dtype=effective_dtype,
+            server_page_size=server_page_size,
+            server_label_dim=server_label_dim,
+            model_head_dim=model_nope_head_dim,
+        )
+    except ValueError as exc:
+        problems.append(str(exc))
+
+    # label_dim must agree across the mask metadata, the stored tensor, and the
+    # selector buffer — a partial match silently truncates/over-reads labels.
+    sel = mask.channel_selection
+    tensor_label_dim = int(sel.shape[-1])
+    if tensor_label_dim != int(server_label_dim):
+        problems.append(
+            f"channel_selection label_dim={tensor_label_dim} != selector "
+            f"label_dim={int(server_label_dim)}"
+        )
+
+    # Per-head weights must line up with the per-head selection exactly.
+    if tuple(mask.channel_weights.shape) != tuple(sel.shape):
+        problems.append(
+            f"channel_weights shape {tuple(mask.channel_weights.shape)} != "
+            f"channel_selection shape {tuple(sel.shape)}"
+        )
+
+    # Layer count must match the model so layer_id indexing stays in range.
+    mask_layers = int(sel.shape[0])
+    if mask_layers != int(num_hidden_layers):
+        problems.append(
+            f"channel mask layers={mask_layers} != model "
+            f"num_hidden_layers={int(num_hidden_layers)}"
+        )
+
+    # Head count must divide cleanly into this rank's local-head slice.
+    h_full = int(sel.shape[1])
+    if h_full != num_local_heads * tp_size:
+        problems.append(
+            f"channel mask num_heads={h_full} != num_local_heads={num_local_heads} "
+            f"x tp_size={tp_size}"
+        )
+
+    # Selection indices must address the model's no-PE channel space. A mask from
+    # a narrower model keeps small indices in range, so the equality check on
+    # head_dim above is what catches it; this guards a too-wide mask.
+    if sel.numel():
+        cs_max = int(sel.max())
+        if cs_max >= int(model_nope_head_dim):
+            problems.append(
+                f"channel_selection max index={cs_max} >= model no-PE "
+                f"head_dim={int(model_nope_head_dim)}"
+            )
+
+    if problems:
+        raise ValueError(
+            "Double Sparsity channel mask is incompatible with the running model "
+            "(Double Sparsity was explicitly requested, so this is a hard error "
+            "rather than a silent fall back to native attention):\n  "
+            + "\n  ".join(problems)
+        )
+
+
 @dataclass
 class SanityProbeResult:
     passed: bool

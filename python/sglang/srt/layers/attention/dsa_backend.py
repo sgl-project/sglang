@@ -516,8 +516,16 @@ class DeepseekSparseAttnBackend(
         self._ds_channel_selection = getattr(
             model_runner.server_args, "_ds_channel_selection", None
         )
+        # Published by finalize_double_sparsity_bind() (which runs before this
+        # backend is constructed). Fall back to the model's own no-PE head width
+        # rather than a fixed default so a missing publish can never silently
+        # truncate a wider no-PE projection to a narrower one.
         self._ds_qk_nope_head_dim: int = int(
-            getattr(model_runner.server_args, "_ds_qk_nope_head_dim", 128)
+            getattr(
+                model_runner.server_args,
+                "_ds_qk_nope_head_dim",
+                self.qk_nope_head_dim,
+            )
         )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -1563,9 +1571,10 @@ class DeepseekSparseAttnBackend(
     ) -> None:
         """Write per-slot token labels after a KV-cache write.
 
-        Projects the 512-d MLA latent key ``k`` through ``layer.kv_b_proj``
-        to obtain 128-d K_noPE per local head, then writes the selected
-        ``label_dim`` channels to the shared token label table.
+        Projects the MLA latent key ``k`` (``kv_lora_rank``-wide) through
+        ``layer.kv_b_proj`` to obtain the per-head no-PE K (``qk_nope_head_dim``
+        columns of each per-head ``[K_nope | V]`` block), then writes the
+        selected ``label_dim`` channels to the shared token label table.
 
         No-ops if DS is not enabled or the bind context is unavailable.
         ``k`` shape: ``[T, 1, kv_lora_rank]``.
