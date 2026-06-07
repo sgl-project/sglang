@@ -176,6 +176,19 @@ PYTHONPATH=python python3 "$BENCH_PY" \
 Nightly-aligned presets come first, followed by current-source extras from the
 registry / GPU test cases, then broader skill-only stress presets.
 
+Use the preset categories this way:
+- **Nightly-aligned**: exact mirrors of
+  `scripts/ci/utils/diffusion/comparison_configs.json`; use these when the goal
+  is apples-to-apples comparison with CI / nightly coverage.
+- **Current-source extras**: models or request shapes with explicit support
+  evidence in the current registry, GPU cases, compatibility matrix, pipeline
+  files, or unit tests, but without a nightly comparison case yet.
+- **Skill-only stress / coverage presets**: extra profiling scenarios kept by
+  this skill to stress a topology, high-resolution path, multi-GPU mode, or
+  model-specific stage. These may be older than the latest registry additions,
+  so re-check the active source tree before treating them as support-matrix
+  commitments.
+
 | Preset | Model | Nightly | Notes |
 | --- | --- | --- | --- |
 | `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, `--dit-layerwise-offload false`; no explicit steps/guidance override |

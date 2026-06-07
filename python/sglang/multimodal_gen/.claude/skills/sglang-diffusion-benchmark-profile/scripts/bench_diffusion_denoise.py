@@ -85,7 +85,7 @@ NIGHTLY_PRESET_ORDER = (
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
 # Nightly-aligned presets mirror scripts/ci/utils/diffusion/comparison_configs.json
-# first, followed by skill-only extras.
+# first, followed by current-source extras and skill-only stress / coverage presets.
 # Each entry produces the same `sglang generate` command as shown in that doc.
 # ---------------------------------------------------------------------------
 MODELS = {
