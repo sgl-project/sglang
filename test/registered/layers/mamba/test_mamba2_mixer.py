@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/tests/kernels/mamba/test_mamba_mixer2.py
 
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -96,6 +97,9 @@ def mixer2_gated_norm_tensor_parallel(
             "MASTER_PORT": "12345",
         }
     )
+    # Torch 2.12 bundles NCCL 2.29, which hard-fails NVLS multicast bind
+    # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
     # initialize distributed
     init_distributed_environment(
