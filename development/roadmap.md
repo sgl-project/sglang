@@ -236,9 +236,19 @@ These are not tied to one client requirement but must land before "shippable to 
 From `CLIENT_SLOS.md` "Deferred Client requirements ordered from most important to least." Each is a
 candidate RLCR loop; sizing/dependencies noted.
 
-### Loop 7 — ⭐ DS long-context RECALL R&D (Tier-2 / AC-10) — HIGH PRIORITY (deferred out of Loop 6; gate OPEN)
-*The high-priority carryover from Loop 6.* The strategic gate (§4.0) **resolved to pursue this AFTER the
-Tier-1 spine** — which has now landed — so the gate is **open**. Draft: [`development/loop7/draft.md`](loop7/draft.md).
+> **Re-prioritization (2026-06-07):** with Loop 7 landed, the client pulled **GLM-5.1 (Loop 10 below,
+> deferred client #1)** forward as the **next active loop** — ahead of the original Loops 8/9 (nvfp4, knob
+> compat), which are deferred behind it. The GLM-5.1 loop is drafted (out of roadmap order) on disk at
+> [`development/loop8/draft.md`](loop8/draft.md) — i.e. **disk `loop8` = roadmap Loop 10**.
+
+### Loop 7 — ✅ LANDED — DS long-context RECALL R&D (Tier-2 / AC-10) (closed 2026-06-02)
+*Outcome:* gap **rigorously characterized + partially closed** — M0 oracle attributed the regimes (4K
+budget-limited / 16K budget-partial ~46% cap / 64K scorer-limited); the Tier-2.B hybrid scorer lifted 16K
+**6%→38%** (decode-free), the opt-in production-ready Tier-2.A lifted-budget path recovered 4K **75%→95%**,
+DSA default + Tier-1 op-point non-regressed. Final decision record supersedes the gate's Tier-2.A-primary
+ordering (Tier-2.B primary long-context, Tier-2.A bounded 4K lever); 64K residual → learned-selector
+follow-on (Loop 11). Process: `.humanize/rlcr/2026-06-01_09-27-07/`; decision: `development/loop7/m12_final_decision.md`.
+The strategic gate (§4.0) **resolved to pursue this AFTER the Tier-1 spine** — which had landed — so the gate was **open**. Draft: [`development/loop7/draft.md`](loop7/draft.md).
 The core problem (established on hardware in Loop 6): DS recall **4K 75% / 16K 5% / 64K 0%** vs DSA **100%** at
 the same 2048 budget + same kernel; dense DS = 100% and DS MMLU == DSA, so the gap is **selection quality +
 the `index_topk=2048` kernel lock**, not a decode bug.
@@ -273,11 +283,20 @@ NGRAM, pdmux all crash at scheduler init). Treat as a matrix, not one task:
 - [ ] Overlap scheduling × DS (currently disabled under Option B)
 - [ ] Piecewise CUDA graph × DS (currently disabled under Option B)
 
-### Loop 10 — GLM-5.1 (deferred client #1 — highest client priority, largest lift)
-*Listed as most important deferred requirement, but it's a whole new model bring-up.*
-- [ ] Determine whether GLM-5.1 ships a native sparse indexer (the strategic §4.0 question recurs — DS
-  is most valuable here **if GLM-5.1 has no trained indexer**).
-- [ ] Calibrate a GLM-5.1 channel mask; bring up the DS serving path on the GLM architecture.
+### Loop 10 — ⭐ NOW ACTIVE — GLM-5.1 (deferred client #1; pulled forward 2026-06-07 → disk `development/loop8/`)
+*Highest client priority; a whole new model bring-up.* Draft: [`development/loop8/draft.md`](loop8/draft.md).
+Weights already staged at `/cluster-storage/models/models--zai-org--GLM-5.1-FP8/`.
+- [x] **§4.0 question ANSWERED — GLM-5.1 ships a native trained DSA indexer.** Config is
+  `GlmMoeDsaForCausalLM` / `model_type: glm_moe_dsa` (MLA + DSA indexer + 256-expert MoE, FP8 e4m3 block-quant,
+  78 layers, ~198k max ctx) with `self_attn.indexer` / `indexers_proj` modules. **`is_deepseek_dsa()` returns
+  True for it** (`model_config.py:111`, gated on `index_topk`), so GLM-5.1 routes through the **same
+  `dsa_backend.py`** as V3.2. ⇒ same posture as V3.2: **DSA-native is the default; DS is the opt-in fallback**,
+  most valuable only where the trained indexer underperforms.
+- [ ] **Wire DS into the preexisting GLM DSA backend** (NOT a standalone GLM DS path): reuse the existing
+  DS↔`dsa_backend.py` wiring pattern (bind site + `TokenLabelTable` + selection/label hooks); generalize the
+  DS model-forward hooks (today DeepSeek-specific in `deepseek_v2.py`) onto the GLM model forward. DSA-native
+  default untouched.
+- [ ] Calibrate a GLM-5.1 channel mask; bring up the DS serving path (TP=8, FP8) on the GLM architecture.
 - [ ] Re-run the full accuracy + SLO gates on GLM-5.1.
 
 ---
