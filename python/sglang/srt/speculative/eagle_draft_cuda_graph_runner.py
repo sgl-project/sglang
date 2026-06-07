@@ -377,6 +377,9 @@ class EAGLEDraftCudaGraphRunner:
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
+            # The capture batch is planned here (out-of-forward), so the
+            # per-step forwards inside draft_forward must not re-plan.
+            forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
             self._capture_init(run_once)
             out = self._capture_graph(

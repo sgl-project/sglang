@@ -593,6 +593,7 @@ mod tests {
                 topic: String::new(),
                 block_size: 64,
                 dp_size,
+                is_bigram: false,
             }
         }
 
