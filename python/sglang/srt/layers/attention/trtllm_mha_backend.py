@@ -125,9 +125,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
-        # separate index spaces; SWA layers need a translated page_table. Resolve
-        # the pool from the allocator (stable at construction), not from
-        # token_to_kv_pool, which FROZEN_KV MTP swaps per forward call.
+        # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
 
         # Forward metadata
@@ -147,11 +145,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
 
-        Read it from the allocator: in FROZEN_KV MTP the draft shares the
-        target's SWA allocator while its own token_to_kv_pool stays non-SWA
-        until swapped per call. The getattr only tolerates the minimal
-        allocator stub used by attention test fixtures.
+        EAGLE draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's
+        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
+        draft path reads target KV directly, so it still needs the allocator
+        pool when the active pool is not SWA.
         """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+
+        if getattr(model_runner, "is_draft_worker", False):
+            spec_algorithm = getattr(model_runner, "spec_algorithm", None)
+            is_frozen_kv_mtp = getattr(
+                spec_algorithm, "is_frozen_kv_mtp", lambda: False
+            )
+            if not is_frozen_kv_mtp():
+                return None
+
         allocator = model_runner.token_to_kv_pool_allocator
         get_kvcache = getattr(allocator, "get_kvcache", None)
         kvcache = get_kvcache() if get_kvcache is not None else None
