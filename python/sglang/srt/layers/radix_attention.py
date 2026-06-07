@@ -29,6 +29,7 @@ from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import 
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -135,7 +136,7 @@ class RadixAttention(nn.Module):
                 )
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            return get_attn_backend().forward(
                 q,
                 k,
                 v,
@@ -150,8 +151,8 @@ class RadixAttention(nn.Module):
 @register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
     output: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
@@ -159,6 +160,12 @@ def unified_attention_with_output(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
+    # they must appear in the schema when --enforce-piecewise-cuda-graph is on.
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> None:
     context = get_forward_context()
     forward_batch = context.forward_batch
@@ -167,8 +174,10 @@ def unified_attention_with_output(
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
     query = query[:real_num_tokens]
-    key = key[:real_num_tokens]
-    value = value[:real_num_tokens]
+    if key is not None:
+        key = key[:real_num_tokens]
+    if value is not None:
+        value = value[:real_num_tokens]
 
     kwargs = {}
     if q_rope is not None:
@@ -177,25 +186,26 @@ def unified_attention_with_output(
         kwargs["k_rope"] = k_rope[:real_num_tokens]
     if sinks is not None:
         kwargs["sinks"] = sinks
+    if cos_sin_cache is not None:
+        kwargs["cos_sin_cache"] = cos_sin_cache
+    if is_neox is not None:
+        kwargs["is_neox"] = is_neox
+    if llama_4_scaling is not None:
+        kwargs["llama_4_scaling"] = llama_4_scaling
+    if topk_indices is not None:
+        kwargs["topk_indices"] = topk_indices[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
-    if original_out_cache_loc_swa is not None:
-        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
-        if hasattr(token_to_kv_pool, "set_swa_loc"):
-            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
     # Store pre-allocated output for FA backend to write directly into.
     # Must slice to real_num_tokens to match the narrowed query shape —
     # the FA kernel validates out.size(0) == q.size(0).
     forward_batch._attn_output = output[:real_num_tokens]
 
-    ret = forward_batch.attn_backend.forward(
+    ret = get_attn_backend().forward(
         query,
         key,
         value,
@@ -205,11 +215,6 @@ def unified_attention_with_output(
         **kwargs,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
-    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None and hasattr(
-        token_to_kv_pool, "set_swa_loc"
-    ):
-        token_to_kv_pool.set_swa_loc(original_swa_loc)
 
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)

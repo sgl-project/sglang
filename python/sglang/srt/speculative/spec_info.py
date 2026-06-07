@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
+import torch
+
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -15,7 +17,8 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -79,6 +82,9 @@ class SpeculativeAlgorithm(Enum):
             spec_class=spec_class,
         )
 
+    def is_some(self) -> bool:
+        return self != SpeculativeAlgorithm.NONE
+
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
@@ -109,8 +115,48 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def supports_target_verify_for_draft(self) -> bool:
+        return self.is_dflash()
+
+    def create_future_map(
+        self,
+        device: torch.device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+    ) -> FutureMap:
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+
+    def build_disagg_draft_input(
+        self,
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+        last_tokens_tensor: torch.Tensor,
+        future_map: FutureMap,
+    ) -> Optional[SpecInput]:
+        if self.is_eagle():
+            from sglang.srt.speculative.eagle_disaggregation import (
+                build_eagle_disagg_draft_input,
+            )
+
+            return build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
+        return None
+
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # FIXME: Remove this after the forward mode refactor. Target verify is
+        # essentially a fixed sequence length prefill/extend with full cuda
+        # graph support. We can use it for target verify, or we can use it for
+        # other cases which is not target verify but fixed length prefill.
+        # Here, we expose this interface to allow the other use cases.
+        return num_draft_tokens
 
     def create_worker(
         self, server_args: ServerArgs
@@ -209,9 +255,11 @@ class SpecInput(ABC):
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
+    # Cross-algorithm phase guards. Used by attention backends and
+    # ForwardBatch padding logic to dispatch on phase without hardcoding the
+    # specific algo class (EAGLE / FROZEN_KV_MTP / DFLASH / NGRAM each have
+    # their own draft / verify SpecInput subclasses).
     def is_draft_input(self) -> bool:
-        # FIXME: remove this function which is only used for assertion
-        # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,
@@ -233,11 +281,11 @@ class SpecInput(ABC):
         pass
 
     def get_spec_adjusted_global_num_tokens(
-        self, forward_batch: ModelWorkerBatch
+        self, batch: ScheduleBatch
     ) -> Tuple[List[int], List[int]]:
         c1, c2 = self.get_spec_adjust_token_coefficient()
-        global_num_tokens = [x * c1 for x in forward_batch.global_num_tokens]
+        global_num_tokens = [x * c1 for x in batch.global_num_tokens]
         global_num_tokens_for_logprob = [
-            x * c2 for x in forward_batch.global_num_tokens_for_logprob
+            x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
