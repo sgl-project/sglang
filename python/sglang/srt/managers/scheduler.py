@@ -419,6 +419,10 @@ class Scheduler(
         # Init mamba backend
         self.init_mamba_backend()
 
+        # Must precede init_model_worker: revert targets like _init_pools run during it,
+        # so patching them afterwards is a no-op.
+        maybe_revert_pr_fix()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -443,6 +447,7 @@ class Scheduler(
             ),
             ps=self.ps,
             tp_group=self.tp_group,
+            pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
@@ -545,6 +550,8 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
 
+        self.maybe_init_scripted_scheduler_hook()
+
         self.init_request_receiver()
 
         self.init_dp_attn_adapter()
@@ -560,8 +567,6 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
-
-        maybe_revert_pr_fix()
 
         self.is_initializing = False
 
@@ -611,6 +616,7 @@ class Scheduler(
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
             ),
+            enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
         self.load_snapshot_writer = None
@@ -1167,22 +1173,6 @@ class Scheduler(
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
-        if use_mlx():
-            # MLX: no CUDA streams / FutureMap.
-            self.future_map = None
-            self.result_queue: Deque = deque()
-            return
-
-        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
-        # via scheduler_pp_mixin; init unconditionally to match main.
-        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.forward_stream
-        )
-        self.copy_stream: CudaStream = self.device_module.Stream()
-        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.copy_stream
-        )
-
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
         # override; fall back to target-only so the helper still produces a
@@ -1200,6 +1190,23 @@ class Scheduler(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+        )
+
+        if use_mlx():
+            # MLX uses its own overlap loop and does not create CUDA streams,
+            # but the normal non-overlap scheduler path still relays decode
+            # input IDs through FutureMap.
+            self.result_queue: Deque = deque()
+            return
+
+        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
+        # via scheduler_pp_mixin; init unconditionally to match main.
+        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.forward_stream
+        )
+        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.copy_stream
         )
 
         if not self.enable_overlap:
@@ -1600,6 +1607,19 @@ class Scheduler(
     def init_grammar_manager(self) -> None:
         self.grammar_manager = GrammarManager(self)
 
+    def maybe_init_scripted_scheduler_hook(self) -> None:
+        if envs.SGLANG_TEST_SCRIPTED_RUNTIME.get():
+            from sglang.test.scripted_runtime.scheduler_hook import (
+                ScriptedSchedulerHook,
+            )
+
+            self.scripted_scheduler_hook = ScriptedSchedulerHook(
+                scheduler=self,
+                tokenizer_recv_proxy=self.ipc_channels.recv_from_tokenizer,
+            )
+        else:
+            self.scripted_scheduler_hook = None
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
@@ -1622,6 +1642,7 @@ class Scheduler(
             get_last_forward_mode=lambda: (
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
+            scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2641,6 +2662,9 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is not None:
+            mamba_pool.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2706,6 +2730,9 @@ class Scheduler(
                     )
                     req.mamba_pool_idx = None
                 break
+
+        if mamba_pool is not None:
+            mamba_pool.alloc_group_end()
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -2970,6 +2997,9 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_run_batch(batch)
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
@@ -3976,7 +4006,11 @@ def run_scheduler_process(
 
     # Set up tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         thread_label = "Scheduler"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill Scheduler"

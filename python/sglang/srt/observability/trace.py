@@ -22,13 +22,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_int_env_var
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
@@ -37,6 +33,9 @@ _trace_context_propagator = None
 tracer: Optional[trace.Tracer] = None
 
 global_trace_level = get_int_env_var("SGLANG_TRACE_LEVEL", 3)
+
+# Modules allowed to emit spans (from --trace-modules); None means no filtering.
+global_trace_modules: Optional[List[str]] = None
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
 
@@ -162,10 +161,19 @@ def _get_host_id() -> str:
 
 
 # Should be called by each tracked process.
-def process_tracing_init(otlp_endpoint, server_name):
+def process_tracing_init(
+    otlp_endpoint, server_name, trace_modules: Optional[str] = None
+):
     global opentelemetry_initialized
     global get_cur_time_ns
     global tracer
+    global global_trace_modules
+
+    if trace_modules is not None:
+        global_trace_modules = [
+            module.strip() for module in trace_modules.split(",") if module.strip()
+        ]
+
     if not opentelemetry_imported:
         opentelemetry_initialized = False
         raise RuntimeError(
@@ -263,8 +271,13 @@ class TraceReqContext:
         self.trace_level = global_trace_level
         self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
 
-        server_args: ServerArgs = get_global_server_args()
-        if module_name not in server_args.trace_modules.split(","):
+        # Filter by --trace-modules only for explicitly named modules; contexts
+        # created with the default empty module_name are always traced.
+        if (
+            module_name
+            and global_trace_modules is not None
+            and module_name not in global_trace_modules
+        ):
             self.tracing_enable = False
 
         if not self.tracing_enable:

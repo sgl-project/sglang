@@ -95,6 +95,7 @@ class UnifiedTreeNode:
         )
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
+        self.write_through_pending_id: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -306,11 +307,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
+        self.pp_group = params.pp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
             else torch.distributed.get_world_size(group=self.tp_group)
         )
+        self.pp_rank = params.pp_rank
+        self.pp_size = params.pp_size
+        self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -342,6 +347,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
+    def _reap_completed_async_work(self):
+        """
+        Poll outstanding async work and reap completed ones.
+
+        Must be called in the scheduler thread.
+        """
+        count = 0
+        while count < len(self.work_list) and self.work_list[count].is_completed():
+            count += 1
+        if count > 0:
+            logger.debug(f"Reap {count} completed async work")
+            self.work_list = self.work_list[count:]
+
+    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+        """
+        Synchronize data across all TP and PP ranks.
+
+        In particular, "tp_reduce_op" is performed on all TP ranks of the first PP rank,
+        and then the result is propagated to all following PP ranks.
+
+        Must be called in the scheduler thread.
+        """
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(data, tp_reduce_op)
+        self._pp_sync(data)
+
+    def _pp_sync(self, data: torch.Tensor) -> None:
+        """
+        Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
+        """
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        if self.pp_rank > 0:
+            torch.distributed.recv(
+                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+            )
+        if self.pp_rank + 1 < self.pp_size:
+            copy_of_data = data.clone()
+            send_work = torch.distributed.isend(
+                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+            )
+            self.work_list.append(send_work)
+
     def reset(self) -> None:
         self._reset_full()
 
@@ -369,7 +417,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for ct in self.tree_components
         }
         self.ongoing_write_through: dict[
-            int, tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
+            int,
+            tuple[
+                UnifiedTreeNode,
+                Optional[DecLockRefParams],
+                list[UnifiedTreeNode],
+            ],
         ] = {}
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.enable_storage = False
@@ -457,7 +510,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 256
+        self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         if storage_backend is not None:
@@ -915,6 +968,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
+        if child.backuped:
+            self._replace_pending_write_through_node(child, [new_node, child])
+
         self._for_each_component_lru(
             new_node, UnifiedLRUList.insert_mru, skip_existing=True
         )
@@ -1112,9 +1168,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if len(key):
                 child_key = key.child_key(self.page_size)
 
-        result = InsertResult(
-            prefix_len=matched_length,
-        )
+        result = InsertResult(prefix_len=matched_length, total_len=total_len)
         if len(key) == 0:
             if (
                 node is not self.root_node
@@ -1466,8 +1520,62 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         lock_params = None
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
-        self.ongoing_write_through[node.id] = (node, lock_params)
+        self._track_write_through_node(node, lock_params)
         return len(host_indices)
+
+    def _track_write_through_node(
+        self,
+        node: UnifiedTreeNode,
+        lock_params: Optional[DecLockRefParams],
+    ) -> None:
+        node.write_through_pending_id = node.id
+        self.ongoing_write_through[node.id] = (node, lock_params, [node])
+
+    def _replace_pending_write_through_node(
+        self, old_node: UnifiedTreeNode, new_nodes: list[UnifiedTreeNode]
+    ) -> None:
+        ack_id = old_node.write_through_pending_id
+        if ack_id is None:
+            return
+
+        pending = self.ongoing_write_through.get(ack_id)
+        if pending is None:
+            return
+
+        lock_node, lock_params, publish_nodes = pending
+        updated_nodes = []
+        replaced = False
+        for node in publish_nodes:
+            if node is old_node:
+                updated_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                updated_nodes.append(node)
+
+        if not replaced:
+            return
+
+        for node in new_nodes:
+            node.write_through_pending_id = ack_id
+        self.ongoing_write_through[ack_id] = (
+            lock_node,
+            lock_params,
+            updated_nodes,
+        )
+
+    def _finish_write_through_ack(self, ack_id: int) -> None:
+        lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        for node in publish_nodes:
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            self._record_store_event(node, medium=StorageMedium.CPU)
+        if lock_params is not None:
+            self.dec_lock_ref(lock_node, lock_params)
+        if self.enable_storage:
+            # Back up each fragment: after a split, lock_node only holds the
+            # suffix; the prefix fragment must be persisted as well.
+            for node in publish_nodes:
+                self.write_backup_storage(node)
 
     def load_back(
         self,
@@ -1599,6 +1707,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             transfers.append(
                 PoolTransfer(
                     name=spec.pool_name,
+                    keys=indices_source.keys,
                     hit_policy=spec.hit_policy,
                     indices_from_pool=spec.indices_from_pool,
                 )
@@ -1787,16 +1896,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             return True
+        if (
+            completed
+            and getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+        ):
+            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                states, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
@@ -1822,16 +1934,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             operation
         )
         min_completed_tokens = completed_tokens
+        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
+            # Reduce full completed tokens together with the sidecar pools that
+            # this prefetch actually transferred, in one all_reduce.
+            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
+            packed = torch.tensor(
+                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+                dtype=torch.int,
             )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = int(completed_tokens_tensor.item())
+            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+            min_completed_tokens = int(packed[0].item())
+            for i, p in enumerate(sidecar_pools, start=1):
+                hit_pages[p] = int(packed[i].item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -1904,8 +2019,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+        self._barrier_attn_groups()
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(
@@ -2028,10 +2142,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
@@ -2141,14 +2252,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        entry = self.ongoing_write_through.pop(ack_id, None)
-                        if entry is not None:
-                            node, params = entry
-                            self._record_store_event(node, medium=StorageMedium.CPU)
-                            if params is not None:
-                                self.dec_lock_ref(node, params)
-                            if self.enable_storage:
-                                self.write_backup_storage(node)
+                        if ack_id in self.ongoing_write_through:
+                            self._finish_write_through_ack(ack_id)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -2157,26 +2262,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in cc.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
 
-        # Keep cache state transitions identical across CPxTP participants.
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
-        finish_count = int(queue_size.item())
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
 
         # Process completed acks
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node, params = self.ongoing_write_through.pop(ack_id)
-                self._record_store_event(node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(node, params)
-                if self.enable_storage:
-                    self.write_backup_storage(node)
+                self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -2185,14 +2286,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if cc is None or not self.ongoing_load_back:
             return
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_load_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in cc.ack_load_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
+
+        while finish_count > 0:
+            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
+            finish_event.synchronize()
             for ack_id in ack_list:
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
-        del cc.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -2248,6 +2357,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        self._reap_completed_async_work()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -2626,7 +2736,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         # ── PART 5: Ongoing Operations ──
-        for nid, (n, _) in self.ongoing_write_through.items():
+        for nid, (n, _, _) in self.ongoing_write_through.items():
             if n not in all_node_set:
                 E(f"[Ongoing] write_through node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
