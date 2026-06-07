@@ -1450,11 +1450,10 @@ class AiterAttnBackend(AttentionBackend):
             # metadata sites + paged_attention_ragged call site + FP8 KV
             # coordination, after which this allocation can revert to
             # per-page (gated on use_mla).
-            # MLA target_verify writes kv_lens = seq_len + num_draft_tokens per
-            # row (see _apply_cuda_graph_metadata); reserve that slack here.
-            # create_flashinfer_kv_indices_triton bounds writes only per-row
-            # (req_to_token stride), not against this buffer, so without the slack
-            # a near-full sequence silently overflows. Mirrors dsa / flashmla.
+            # Reserve draft slack: MLA target_verify writes seq_len +
+            # num_draft_tokens per row and the kernel doesn't bound writes to
+            # this buffer, so a near-full sequence would silently overflow.
+            # Mirrors dsa / flashmla.
             draft_slack = self.num_draft_tokens or 0
             buffer_numel = max_bs * (
                 max_num_blocks_per_seq * self.page_size + draft_slack
@@ -1699,10 +1698,9 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
-            # Fail fast on an undersized buffer: the kernel bounds writes only
-            # per-row (req_to_token stride), not against kv_indices, so an
-            # overflow would silently corrupt memory. seq_lens_sum is None during
-            # capture (dummy seq_lens, no overflow); check on replay.
+            # Safety guard: fail fast on an undersized buffer (silent overflow
+            # otherwise). seq_lens_sum is None at capture (dummy seq_lens); only
+            # check on replay.
             if seq_lens_sum is not None:
                 kv_indices_used = seq_lens_sum + (
                     self.num_draft_tokens * bs if self.use_mla else 0
