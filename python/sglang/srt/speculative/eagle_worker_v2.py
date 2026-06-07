@@ -1336,13 +1336,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 device=accept_lens.device,
             )
             req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-            # `accept_index` is [bs, spec_steps + 1] of global draft-tree node
-            # indices; the last accepted slot per req sits at column
-            # `accept_lens - 1`. Subtracting the per-req tree base offset recovers
-            # the draft-tree step that holds the correct mamba state. For topk == 1
-            # the accepted path is the front chain, so this reduces to
-            # `accept_lens - 1`; for topk > 1 it follows the accepted branch through
-            # the tree (mirrors spec v1 `eagle_worker.py` `_mamba_verify_update`).
+            # Per-req tree step of the last accepted node, i.e. the step whose
+            # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
             last_correct_step_indices = (
                 accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
                 - accepted_indices_offset
