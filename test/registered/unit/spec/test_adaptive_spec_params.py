@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
+    DEFAULT_ADAPTIVE_CONFIG,
     resolve_candidate_steps_from_config,
     validate_adaptive_initial_steps,
 )
@@ -221,6 +222,55 @@ class TestAdaptiveStepSlot(unittest.TestCase):
         self.assertEqual(params.ceiling_coeff, 0)
 
 
+class TestAntiOscillation(unittest.TestCase):
+    def _slot(self, initial_steps, **cfg):
+        cfg.setdefault("candidate_steps", [1, 3, 7])
+        cfg.setdefault("ema_alpha", 1.0)
+        cfg.setdefault("warmup_batches", 0)
+        cfg.setdefault("update_interval", 1)
+        return AdaptiveStepSlot(initial_steps=initial_steps, cfg=cfg)
+
+    @staticmethod
+    def _count_switches(slot, sequence):
+        return sum(1 for v in sequence if slot.update([v]))
+
+    def test_failed_upshift_backs_off_pingpong(self):
+        sequence = [3, 1] * 12
+        baseline = self._slot(
+            3,
+            candidate_steps=[1, 3, 7],
+            failed_upshift_backoff_window=0,
+            up_hysteresis=0.0,
+            down_hysteresis=0.0,
+        )
+        guarded = self._slot(
+            3,
+            candidate_steps=[1, 3, 7],
+            failed_upshift_backoff_window=16,
+            up_hysteresis=0.0,
+            down_hysteresis=0.0,
+        )
+
+        baseline_switches = self._count_switches(baseline, sequence)
+        guarded_switches = self._count_switches(guarded, sequence)
+
+        self.assertGreaterEqual(baseline_switches, 20)
+        self.assertLessEqual(guarded_switches, 4)
+        self.assertEqual(guarded.current_steps, 3)
+
+    def test_default_bs1_uses_uniform_down_hysteresis_for_7_to_3(self):
+        cfg = {
+            **DEFAULT_ADAPTIVE_CONFIG["1"],
+            "ema_alpha": 1.0,
+            "warmup_batches": 0,
+            "update_interval": 1,
+        }
+        slot = AdaptiveStepSlot(initial_steps=7, cfg=cfg)
+
+        self.assertFalse(slot.update([3, 3]))
+        self.assertEqual(slot.current_steps, 7)
+
+
 class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
         params = AdaptiveSpeculativeParams(initial_steps=3)
@@ -228,6 +278,9 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
         self.assertEqual(params._slots[8].candidate_steps, [1, 3])
         self.assertEqual(params._slots[32].candidate_steps, [1])
+        self.assertEqual(params._slots[1].up_hysteresis, 0.4)
+        self.assertEqual(params._slots[8].down_hysteresis, -0.25)
+        self.assertEqual(params._slots[1].failed_upshift_backoff_window, 64)
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:

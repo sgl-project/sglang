@@ -23,15 +23,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
         "candidate_steps": [1, 3, 7],
-        "up_hysteresis": 0.0,
+        "up_hysteresis": 0.4,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
+        "failed_upshift_backoff_window": 64,
     },
     "8": {
         "candidate_steps": [1, 3],
-        "up_hysteresis": 0.0,
-        "down_hysteresis": 0.0,
+        "up_hysteresis": 0.4,
+        "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
+        "failed_upshift_backoff_window": 128,
     },
     "32": {
         "candidate_steps": [1],
@@ -145,11 +147,9 @@ class AdaptiveStepSlot:
     The core idea: if drafts are consistently accepted, try more steps;
     if drafts are consistently rejected early, reduce steps to avoid waste.
 
-    Formula: target_steps = clamp(round(ema_accept_len) + 1, min_steps, max_steps)
-    - Probes one step beyond observed acceptance
-    - EMA smoothing prevents oscillation
-    - Only updates every `update_interval` batches for stability
-    - num_steps can be selected from different candidate sets on different batch_sizes
+    EMA, interval gating, hysteresis, adjacent upshift, and failed-upshift backoff
+    damp oscillation while preserving fast downshift when acceptance collapses.
+    num_steps can be selected from different candidate sets on different batch_sizes.
     """
 
     def __init__(self, initial_steps: int, cfg: dict):
@@ -164,6 +164,11 @@ class AdaptiveStepSlot:
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
         self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
 
+        self.failed_upshift_backoff_window = cfg.get("failed_upshift_backoff_window", 0)
+        assert (
+            self.failed_upshift_backoff_window >= 0
+        ), "failed_upshift_backoff_window must be >= 0"
+
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
         else:
@@ -172,6 +177,10 @@ class AdaptiveStepSlot:
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
+
+        self._last_switch_direction = 0
+        self._blocked_upshift_target: int | None = None
+        self._upshift_backoff_remaining = 0
 
     def update(self, num_correct_drafts_per_req: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
@@ -201,22 +210,21 @@ class AdaptiveStepSlot:
         old_steps = self.current_steps
         current_idx = self.candidate_steps.index(old_steps)
 
-        # TODO: Consider limiting step changes to avoid overshooting.
+        downshifted = False
         while current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
             drop_threshold = prev_step - 0.5 + self.down_hysteresis
             if self.ema_accept_len <= drop_threshold:
                 current_idx -= 1
+                downshifted = True
             else:
                 break
 
-        while current_idx < len(self.candidate_steps) - 1:
+        if not downshifted and current_idx < len(self.candidate_steps) - 1:
             current_step = self.candidate_steps[current_idx]
             rise_threshold = current_step - 0.5 + self.up_hysteresis
             if self.ema_accept_len > rise_threshold:
                 current_idx += 1
-            else:
-                break
 
         target = self.candidate_steps[current_idx]
         # EMA ceiling: only caps downward — never blocks step-ups, so the
@@ -228,15 +236,40 @@ class AdaptiveStepSlot:
                     current_idx -= 1
                 target = self.candidate_steps[current_idx]
 
-        if target != old_steps:
-            self.current_steps = target
-            log_info_on_rank0(
-                logger,
-                f"Adaptive spec params updated: steps {old_steps} -> {target} "
-                f"(ema_accept_len={self.ema_accept_len:.2f})",
-            )
-            return True
-        return False
+        direction = (target > old_steps) - (target < old_steps)  # sign(target-old)
+
+        if direction == 0:
+            if self._upshift_backoff_remaining > 0:
+                self._upshift_backoff_remaining -= 1
+            return False
+
+        if (
+            direction > 0
+            and self._upshift_backoff_remaining > 0
+            and self._blocked_upshift_target is not None
+            and target >= self._blocked_upshift_target
+        ):
+            self._upshift_backoff_remaining -= 1
+            return False
+
+        self.current_steps = target
+        if direction < 0 and self._last_switch_direction > 0:
+            self._blocked_upshift_target = old_steps
+            self._upshift_backoff_remaining = self.failed_upshift_backoff_window
+        elif direction > 0:
+            if (
+                self._blocked_upshift_target is None
+                or target >= self._blocked_upshift_target
+            ):
+                self._blocked_upshift_target = None
+                self._upshift_backoff_remaining = 0
+        self._last_switch_direction = direction
+        log_info_on_rank0(
+            logger,
+            f"Adaptive spec params updated: steps {old_steps} -> {target} "
+            f"(ema_accept_len={self.ema_accept_len:.2f})",
+        )
+        return True
 
 
 class AdaptiveSpeculativeParams:
