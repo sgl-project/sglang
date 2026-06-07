@@ -139,7 +139,7 @@ def _load_platform_class(qualname: str) -> type:
     return cls
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> SRTPlatform:
     """Lazy initialization of current_platform on first access."""
     if name == "current_platform":
         global _current_platform

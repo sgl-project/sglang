@@ -142,6 +142,7 @@ def build_kv_cache(
     enable_kv_cache_events: bool,
     ps: "ParallelState",
     tp_group: "GroupCoordinator",
+    pp_group: "GroupCoordinator",
     enable_hierarchical_cache: bool,
 ) -> "KVCacheBuildResult":
     sliding_window_size: Optional[int] = None
@@ -214,6 +215,7 @@ def build_kv_cache(
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
+        pp_cache_group=pp_group.cpu_group,
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
