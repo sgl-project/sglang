@@ -101,11 +101,7 @@ class GSM8KEval(Eval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
-            return SingleEvalResult(
-                html=html,
-                score=score,
-                convo=convo,
-            )
+            return SingleEvalResult(html=html, score=score, convo=convo)
 
         results = common.map_with_progress(
             fn, list(range(len(self._lines))), num_threads=self._num_threads
