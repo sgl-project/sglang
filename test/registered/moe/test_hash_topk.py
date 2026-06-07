@@ -1,9 +1,12 @@
 import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.hash_topk import HashTopK
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):

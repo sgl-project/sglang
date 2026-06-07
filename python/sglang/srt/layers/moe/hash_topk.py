@@ -177,10 +177,7 @@ class HashTopK(nn.Module):
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
 
-        if (
-            self.num_fused_shared_experts > 0
-            and get_moe_a2a_backend().is_megamoe()
-        ):
+        if self.num_fused_shared_experts > 0 and get_moe_a2a_backend().is_megamoe():
             shared_cols = topk_ids[:, -self.num_fused_shared_experts :]
             routed_cols = topk_ids[:, : -self.num_fused_shared_experts]
             routed_cols = topk_ids_logical_to_physical(

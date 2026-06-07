@@ -601,9 +601,7 @@ class FusedMoE(torch.nn.Module):
 
         weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
         scale_param = (
-            self.w2_weight_scale_inv
-            if shard_id == "w2"
-            else self.w13_weight_scale_inv
+            self.w2_weight_scale_inv if shard_id == "w2" else self.w13_weight_scale_inv
         )
         if param is not weight_param and param is not scale_param:
             return False
@@ -620,9 +618,7 @@ class FusedMoE(torch.nn.Module):
             if not entry:
                 self._fp8_shared_to_fp4_cache.pop(key, None)
 
-            fp4_weight, fp4_scale = quantize_fp8_weight_to_mxfp4(
-                fp8_weight, fp8_scale
-            )
+            fp4_weight, fp4_scale = quantize_fp8_weight_to_mxfp4(fp8_weight, fp8_scale)
 
             weight_data = weight_param.data[expert_id]
             scale_data = scale_param.data[expert_id]

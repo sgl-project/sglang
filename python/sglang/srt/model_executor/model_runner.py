@@ -1522,7 +1522,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             num_prepared += 1
         if num_prepared:
-            log_info_on_rank0(logger, f"Prepared {num_prepared} waterfill TopK modules.")
+            log_info_on_rank0(
+                logger, f"Prepared {num_prepared} waterfill TopK modules."
+            )
 
     def update_expert_location(
         self,
