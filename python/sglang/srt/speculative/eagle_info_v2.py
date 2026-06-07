@@ -16,10 +16,10 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     set_mamba_track_indices_from_reqs,
 )
-from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    get_alloc_reserve_per_decode,
     get_last_loc,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -150,8 +150,7 @@ class EagleDraftInputV2Mixin:
             )
 
         page_size = batch.token_to_kv_pool_allocator.page_size
-        alloc_len_per_decode = get_alloc_len_per_decode()
-        double_alloc = alloc_len_per_decode + alloc_len_per_decode
+        double_alloc = get_alloc_reserve_per_decode()
 
         cur_kv_lens = [0] * bs
         nxt_kv_lens = [0] * bs
@@ -176,7 +175,7 @@ class EagleDraftInputV2Mixin:
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
         # Fail fast if the page>1 + topk>1 draft over-allocation
-        # (2 * get_alloc_len_per_decode) outgrows the req_to_token row: the write below
+        # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
         # would OOB and free would leak KV. The row is widened to hold it in _init_pools
         # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
         from sglang.srt.server_args import get_global_server_args
@@ -187,7 +186,7 @@ class EagleDraftInputV2Mixin:
             assert max_alloc_len <= row_width, (
                 f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
                 f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
-                f"row to hold committed + 2 * get_alloc_len_per_decode (PR #26972)."
+                f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
             )
 
         # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR

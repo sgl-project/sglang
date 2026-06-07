@@ -496,8 +496,11 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
-    # TRTLLM backend requires K dimension >= 256.
-    if backend == "trtllm" and input_2d.shape[1] < 256:
+    # TRTLLM backend requires K >= 256 and weight scales in UE8M0/R128c4
+    # packed format. Fall back to triton when scales are plain float32.
+    if backend == "trtllm" and (
+        input_2d.shape[1] < 256 or not getattr(weight_scale, "format_ue8m0", False)
+    ):
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
