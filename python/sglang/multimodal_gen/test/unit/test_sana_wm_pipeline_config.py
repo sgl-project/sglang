@@ -492,7 +492,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num_attention_heads"):
             SanaWMTransformer3DModel._validate_tp_config(arch, 3)
 
-    def test_dit_stage1_tp_uses_parallel_linear_for_unsharded_edges(self) -> None:
+    def test_dit_stage1_tp_keeps_low_compute_convs_replicated(self) -> None:
         module_path = "sglang.multimodal_gen.runtime.models.dits.sana_wm"
 
         class FakeColumnParallelLinear(torch.nn.Linear):
@@ -595,23 +595,22 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
                 use_triton_kernels=False,
             )
 
-        self.assertEqual(patch_embed.proj.tp_size, 2)
-        self.assertTrue(patch_embed.proj.gather_output)
-        self.assertEqual(tuple(patch_embed.proj.weight.shape), (8, 3, 1, 1, 1))
+        self.assertIsInstance(patch_embed.proj, torch.nn.Conv3d)
+        self.assertFalse(hasattr(patch_embed.proj, "tp_size"))
+        self.assertEqual(tuple(patch_embed.proj.weight.shape), (16, 3, 1, 1, 1))
 
-        self.assertEqual(glumb.inverted_conv.conv.tp_size, 2)
-        self.assertTrue(glumb.inverted_conv.conv.paired_output)
-        self.assertFalse(glumb.inverted_conv.conv.gather_output)
+        self.assertIsInstance(glumb.inverted_conv.conv, torch.nn.Conv2d)
+        self.assertFalse(hasattr(glumb.inverted_conv.conv, "tp_size"))
         self.assertEqual(
-            tuple(glumb.inverted_conv.conv.weight.shape), (24, 16, 1, 1)
+            tuple(glumb.inverted_conv.conv.weight.shape), (48, 16, 1, 1)
         )
-        self.assertEqual(glumb.depth_conv.conv.tp_size, 2)
-        self.assertEqual(tuple(glumb.depth_conv.conv.weight.shape), (24, 1, 3, 3))
-        self.assertEqual(glumb.point_conv.conv.tp_size, 2)
-        self.assertEqual(tuple(glumb.point_conv.conv.weight.shape), (16, 12, 1, 1))
-        self.assertEqual(glumb.t_conv.tp_size, 2)
-        self.assertTrue(glumb.t_conv.gather_output)
-        self.assertEqual(tuple(glumb.t_conv.weight.shape), (8, 16, 3, 1))
+        self.assertIsInstance(glumb.depth_conv.conv, torch.nn.Conv2d)
+        self.assertEqual(tuple(glumb.depth_conv.conv.weight.shape), (48, 1, 3, 3))
+        self.assertIsInstance(glumb.point_conv.conv, torch.nn.Conv2d)
+        self.assertEqual(tuple(glumb.point_conv.conv.weight.shape), (16, 24, 1, 1))
+        self.assertIsInstance(glumb.t_conv, torch.nn.Conv2d)
+        self.assertFalse(hasattr(glumb.t_conv, "tp_size"))
+        self.assertEqual(tuple(glumb.t_conv.weight.shape), (16, 16, 3, 1))
 
         self.assertIsInstance(block.plucker_proj, FakeColumnParallelLinear)
         self.assertTrue(block.plucker_proj.gather_output)
@@ -2347,6 +2346,30 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one image or one image per batch"):
             SanaWMBeforeDenoisingStage._condition_images_for_batch(["a", "b", "c"], 2)
 
+    def test_condition_image_tensor_preprocess_matches_pil_lanczos_path(self) -> None:
+        import PIL.Image
+
+        src_h, src_w = 23, 37
+        pixels = torch.arange(src_h * src_w * 3, dtype=torch.uint8).reshape(
+            src_h, src_w, 3
+        )
+        pil_image = PIL.Image.fromarray(pixels.numpy())
+        tensor_image = pixels.permute(2, 0, 1)
+
+        pil_out, pil_info = SanaWMBeforeDenoisingStage._preprocess_condition_image(
+            pil_image,
+            target_h=17,
+            target_w=31,
+        )
+        tensor_out, tensor_info = SanaWMBeforeDenoisingStage._preprocess_condition_image(
+            tensor_image,
+            target_h=17,
+            target_w=31,
+        )
+
+        self.assertEqual(tensor_info, pil_info)
+        torch.testing.assert_close(tensor_out, pil_out, rtol=0.0, atol=0.0)
+
     def test_first_frame_preprocess_records_official_crop_geometry(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -2825,6 +2848,44 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         ref_rms = ref.square().mean(dim=2, keepdim=True).sqrt()
         stabilized_rms = stabilized.square().mean(dim=2, keepdim=True).sqrt()
         self.assertTrue(torch.all(stabilized_rms <= ref_rms + 1e-5))
+
+    def test_gdn_camera_fallback_does_not_apply_post_ucpe_renorm(self) -> None:
+        attn = BidirectionalGDNUCPESinglePathLiteLA(
+            in_dim=8,
+            heads=2,
+            head_dim=4,
+            conv_kernel_size=0,
+            softmax_main=False,
+            cam_update_rule="torch_recurrent",
+            use_triton_kernels=False,
+        )
+        attn.eval()
+        x = torch.randn(1, 4, 8)
+        beta = torch.full((1, 2, 2), 0.1)
+        decay = torch.full((1, 2, 2), 0.9)
+
+        def fail_downscale(*args, **kwargs):
+            raise AssertionError("GDN camera fallback should match BothTriton prep")
+
+        with patch(
+            f"{_SANA_WM_DIT_MODULE}._downscale_to_reference_rms",
+            side_effect=fail_downscale,
+        ):
+            with torch.no_grad():
+                out = attn._cam_branch(
+                    x,
+                    HW=(2, 1, 2),
+                    apply_q=lambda tensor: tensor,
+                    apply_kv=lambda tensor: tensor,
+                    apply_o=lambda tensor: tensor,
+                    beta=beta,
+                    decay=decay,
+                    rotary_emb=None,
+                    raymats_flat=None,
+                )
+
+        self.assertEqual(tuple(out.shape), (1, 4, 8))
+        self.assertFalse(torch.isnan(out).any())
 
     def test_rmsnorm_scale_factor_initializes_weight(self) -> None:
         norm = _RMSNorm(4, scale_factor=0.01)

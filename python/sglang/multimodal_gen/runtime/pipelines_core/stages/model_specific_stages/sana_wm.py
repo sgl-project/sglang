@@ -1606,36 +1606,82 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         return image.contiguous()
 
     @staticmethod
+    def _resize_center_crop_pil_image(
+        image: Any,
+        *,
+        target_h: int,
+        target_w: int,
+    ) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
+        """Match official SANA-WM resize-then-center-crop preprocessing."""
+        import PIL.Image
+        import torchvision.transforms.functional as TF
+
+        image = image.convert("RGB")
+        src_w, src_h = image.size
+        scale = max(target_h / float(src_h), target_w / float(src_w))
+        resized_w = max(target_w, int(round(src_w * scale)))
+        resized_h = max(target_h, int(round(src_h * scale)))
+        resampling_enum = getattr(PIL.Image, "Resampling", None)
+        resampling = (
+            resampling_enum.LANCZOS
+            if resampling_enum is not None
+            else PIL.Image.LANCZOS
+        )
+        image = image.resize((resized_w, resized_h), resampling)
+        left = (resized_w - target_w) // 2
+        top = (resized_h - target_h) // 2
+        image = image.crop((left, top, left + target_w, top + target_h))
+        return TF.to_tensor(image).unsqueeze(0), {
+            "source_size": (src_w, src_h),
+            "resized_size": (resized_w, resized_h),
+            "crop_offset": (left, top),
+            "target_size": (target_w, target_h),
+        }
+
+    @staticmethod
+    def _condition_tensor_to_pil_images(image: torch.Tensor) -> list[Any]:
+        """Convert tensor inputs to RGB PIL images before official preprocessing."""
+        import PIL.Image
+
+        image = SanaWMBeforeDenoisingStage._canonical_condition_image_tensor(image)
+        pil_images = []
+        for sample in image.detach().cpu():
+            sample = sample.float()
+            if sample.max() > 1.5:
+                sample = sample / 255.0
+            elif sample.min() < 0.0:
+                sample = (sample + 1.0) * 0.5
+            sample = sample.clamp(0.0, 1.0)
+            sample_u8 = (
+                sample.mul(255.0)
+                .round()
+                .to(torch.uint8)
+                .permute(1, 2, 0)
+                .contiguous()
+            )
+            pil_images.append(PIL.Image.fromarray(sample_u8.numpy()))
+        return pil_images
+
+    @staticmethod
     def _resize_center_crop_tensor(
         image: torch.Tensor,
         *,
         target_h: int,
         target_w: int,
     ) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
-        """Match official SANA-WM resize-then-center-crop preprocessing."""
-        image = SanaWMBeforeDenoisingStage._canonical_condition_image_tensor(image)
-        src_h, src_w = int(image.shape[-2]), int(image.shape[-1])
-        scale = max(target_h / float(src_h), target_w / float(src_w))
-        resized_w = max(target_w, int(round(src_w * scale)))
-        resized_h = max(target_h, int(round(src_h * scale)))
-        if resized_h != src_h or resized_w != src_w:
-            import torch.nn.functional as F
-
-            image = F.interpolate(
-                image,
-                size=(resized_h, resized_w),
-                mode="bilinear",
-                align_corners=False,
+        """Route tensor inputs through the same PIL/LANCZOS path as upstream."""
+        pil_images = SanaWMBeforeDenoisingStage._condition_tensor_to_pil_images(image)
+        resized = [
+            SanaWMBeforeDenoisingStage._resize_center_crop_pil_image(
+                pil_image,
+                target_h=target_h,
+                target_w=target_w,
             )
-        left = (resized_w - target_w) // 2
-        top = (resized_h - target_h) // 2
-        image = image[..., top : top + target_h, left : left + target_w].contiguous()
-        return image, {
-            "source_size": (src_w, src_h),
-            "resized_size": (resized_w, resized_h),
-            "crop_offset": (left, top),
-            "target_size": (target_w, target_h),
-        }
+            for pil_image in pil_images
+        ]
+        image_tensors = [item[0] for item in resized]
+        preprocess_info = resized[0][1]
+        return torch.cat(image_tensors, dim=0), preprocess_info
 
     @staticmethod
     def _preprocess_condition_image(
@@ -1656,29 +1702,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             condition_image = condition_image[0]
 
         if isinstance(condition_image, PIL.Image.Image):
-            import torchvision.transforms.functional as TF
-
-            image = condition_image.convert("RGB")
-            src_w, src_h = image.size
-            scale = max(target_h / float(src_h), target_w / float(src_w))
-            resized_w = max(target_w, int(round(src_w * scale)))
-            resized_h = max(target_h, int(round(src_h * scale)))
-            resampling_enum = getattr(PIL.Image, "Resampling", None)
-            resampling = (
-                resampling_enum.LANCZOS
-                if resampling_enum is not None
-                else PIL.Image.LANCZOS
+            return SanaWMBeforeDenoisingStage._resize_center_crop_pil_image(
+                condition_image,
+                target_h=target_h,
+                target_w=target_w,
             )
-            image = image.resize((resized_w, resized_h), resampling)
-            left = (resized_w - target_w) // 2
-            top = (resized_h - target_h) // 2
-            image = image.crop((left, top, left + target_w, top + target_h))
-            return TF.to_tensor(image).unsqueeze(0), {
-                "source_size": (src_w, src_h),
-                "resized_size": (resized_w, resized_h),
-                "crop_offset": (left, top),
-                "target_size": (target_w, target_h),
-            }
 
         if isinstance(condition_image, torch.Tensor):
             return SanaWMBeforeDenoisingStage._resize_center_crop_tensor(

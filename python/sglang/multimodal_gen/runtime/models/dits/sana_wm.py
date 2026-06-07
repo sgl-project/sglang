@@ -359,379 +359,6 @@ def _sana_wm_row_parallel_or_linear(
     )
 
 
-class _SanaWMColumnParallelConvNd(nn.Module):
-    _conv_fn: Callable
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias: bool = True,
-        gather_output: bool = False,
-        paired_output: bool = False,
-    ) -> None:
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = 1
-        self.gather_output = gather_output
-        self.paired_output = paired_output
-        self.tp_size = _sana_wm_tp_world_size()
-        self.tp_rank = _sana_wm_tp_rank()
-
-        if self.tp_size <= 1:
-            self.local_out_channels = out_channels
-        elif paired_output:
-            if out_channels % (2 * self.tp_size) != 0:
-                raise ValueError(
-                    "SANA-WM paired column-parallel conv requires out_channels "
-                    f"to be divisible by 2*tp_size, got out_channels={out_channels}, "
-                    f"tp_size={self.tp_size}."
-                )
-            self.local_out_channels = out_channels // self.tp_size
-        else:
-            if out_channels % self.tp_size != 0:
-                raise ValueError(
-                    "SANA-WM column-parallel conv requires out_channels to be "
-                    f"divisible by tp_size, got out_channels={out_channels}, "
-                    f"tp_size={self.tp_size}."
-                )
-            self.local_out_channels = out_channels // self.tp_size
-
-        self.weight = nn.Parameter(
-            torch.empty(self.local_out_channels, in_channels, *kernel_size)
-        )
-        set_weight_attrs(
-            self.weight,
-            {
-                "output_dim": 0,
-                "weight_loader": self.weight_loader,
-            },
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.empty(self.local_out_channels))
-            set_weight_attrs(
-                self.bias,
-                {
-                    "output_dim": 0,
-                    "weight_loader": self.weight_loader,
-                },
-            )
-        else:
-            self.register_parameter("bias", None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in = self.in_channels * math.prod(self.kernel_size)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def _local_output_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
-        if self.tp_size <= 1 or tuple(loaded_weight.shape) == tuple(
-            self.weight.shape
-        ):
-            return loaded_weight
-
-        if self.paired_output:
-            # Expected: full checkpoint weight with shape (out_channels, in_channels, *K)
-            # where out_channels is split into two equal groups [G0 | G1] and each
-            # TP rank takes slice [tp_rank*half_shard : (tp_rank+1)*half_shard] from
-            # each group, then concatenates them.
-            full_out_channels = self.out_channels
-            if loaded_weight.shape[0] != full_out_channels:
-                raise ValueError(
-                    f"SANA-WM paired_output weight loader expected first dim "
-                    f"{full_out_channels} (full) or {self.local_out_channels} "
-                    f"(already TP-sharded, caught by early-exit above), "
-                    f"but got {loaded_weight.shape[0]}. "
-                    "Check that the checkpoint was saved with the same "
-                    "out_channels and has not been pre-sharded."
-                )
-            if full_out_channels % 2 != 0:
-                raise ValueError(
-                    f"paired_output requires even out_channels, got {full_out_channels}."
-                )
-            half = full_out_channels // 2
-            local_half = half // self.tp_size
-            start = self.tp_rank * local_half
-            first = loaded_weight.narrow(0, start, local_half)
-            second = loaded_weight.narrow(0, half + start, local_half)
-            return torch.cat((first, second), dim=0)
-
-        shard_size = self.local_out_channels
-        start = self.tp_rank * shard_size
-        return loaded_weight.narrow(0, start, shard_size)
-
-    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        output_dim = getattr(param, "output_dim", None)
-        if output_dim == 0 and tuple(param.shape) != tuple(loaded_weight.shape):
-            loaded_weight = self._local_output_shard(loaded_weight)
-        assert param.shape == loaded_weight.shape
-        param.data.copy_(loaded_weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self._conv_fn(
-            x,
-            self.weight,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
-        if self.gather_output and self.tp_size > 1:
-            out = tensor_model_parallel_all_gather(out.contiguous(), dim=1)
-        return out
-
-
-class _SanaWMColumnParallelConv2d(_SanaWMColumnParallelConvNd):
-    _conv_fn = staticmethod(F.conv2d)
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias: bool = True,
-        gather_output: bool = False,
-        paired_output: bool = False,
-    ) -> None:
-        kernel_size = nn.modules.utils._pair(kernel_size)
-        stride = nn.modules.utils._pair(stride)
-        padding = nn.modules.utils._pair(padding)
-        dilation = nn.modules.utils._pair(dilation)
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            bias=bias,
-            gather_output=gather_output,
-            paired_output=paired_output,
-        )
-
-
-class _SanaWMColumnParallelConv3d(_SanaWMColumnParallelConvNd):
-    _conv_fn = staticmethod(F.conv3d)
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias: bool = True,
-        gather_output: bool = False,
-    ) -> None:
-        kernel_size = nn.modules.utils._triple(kernel_size)
-        stride = nn.modules.utils._triple(stride)
-        padding = nn.modules.utils._triple(padding)
-        dilation = nn.modules.utils._triple(dilation)
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            bias=bias,
-            gather_output=gather_output,
-        )
-
-
-class _SanaWMPairedDepthwiseConv2d(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias: bool = True,
-    ) -> None:
-        super().__init__()
-        self.channels = channels
-        self.kernel_size = nn.modules.utils._pair(kernel_size)
-        self.stride = nn.modules.utils._pair(stride)
-        self.padding = nn.modules.utils._pair(padding)
-        self.dilation = nn.modules.utils._pair(dilation)
-        self.tp_size = _sana_wm_tp_world_size()
-        self.tp_rank = _sana_wm_tp_rank()
-        if self.tp_size <= 1:
-            self.local_channels = channels
-        else:
-            if channels % (2 * self.tp_size) != 0:
-                raise ValueError(
-                    "SANA-WM paired depthwise conv requires channels to be "
-                    f"divisible by 2*tp_size, got channels={channels}, "
-                    f"tp_size={self.tp_size}."
-                )
-            self.local_channels = channels // self.tp_size
-        self.out_channels = self.local_channels
-        self.groups = self.local_channels
-        self.weight = nn.Parameter(
-            torch.empty(self.local_channels, 1, *self.kernel_size)
-        )
-        set_weight_attrs(
-            self.weight,
-            {
-                "output_dim": 0,
-                "weight_loader": self.weight_loader,
-            },
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.empty(self.local_channels))
-            set_weight_attrs(
-                self.bias,
-                {
-                    "output_dim": 0,
-                    "weight_loader": self.weight_loader,
-                },
-            )
-        else:
-            self.register_parameter("bias", None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in = math.prod(self.kernel_size)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def _local_channel_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
-        if self.tp_size <= 1 or tuple(loaded_weight.shape) == tuple(
-            self.weight.shape
-        ):
-            return loaded_weight
-        half = loaded_weight.shape[0] // 2
-        local_half = half // self.tp_size
-        start = self.tp_rank * local_half
-        first = loaded_weight.narrow(0, start, local_half)
-        second = loaded_weight.narrow(0, half + start, local_half)
-        return torch.cat((first, second), dim=0)
-
-    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        output_dim = getattr(param, "output_dim", None)
-        if output_dim == 0 and tuple(param.shape) != tuple(loaded_weight.shape):
-            loaded_weight = self._local_channel_shard(loaded_weight)
-        assert param.shape == loaded_weight.shape
-        param.data.copy_(loaded_weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(
-            x,
-            self.weight,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
-
-
-class _SanaWMRowParallelConv2d(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias: bool = True,
-    ) -> None:
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = nn.modules.utils._pair(kernel_size)
-        self.stride = nn.modules.utils._pair(stride)
-        self.padding = nn.modules.utils._pair(padding)
-        self.dilation = nn.modules.utils._pair(dilation)
-        self.groups = 1
-        self.tp_size = _sana_wm_tp_world_size()
-        self.tp_rank = _sana_wm_tp_rank()
-        if self.tp_size <= 1:
-            self.local_in_channels = in_channels
-        else:
-            if in_channels % self.tp_size != 0:
-                raise ValueError(
-                    "SANA-WM row-parallel conv requires in_channels to be "
-                    f"divisible by tp_size, got in_channels={in_channels}, "
-                    f"tp_size={self.tp_size}."
-                )
-            self.local_in_channels = in_channels // self.tp_size
-        self.weight = nn.Parameter(
-            torch.empty(out_channels, self.local_in_channels, *self.kernel_size)
-        )
-        set_weight_attrs(
-            self.weight,
-            {
-                "input_dim": 1,
-                "weight_loader": self.weight_loader,
-            },
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_channels))
-            set_weight_attrs(
-                self.bias,
-                {
-                    "weight_loader": self.weight_loader,
-                },
-            )
-        else:
-            self.register_parameter("bias", None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in = self.local_in_channels * math.prod(self.kernel_size)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        input_dim = getattr(param, "input_dim", None)
-        if input_dim == 1 and tuple(param.shape) != tuple(loaded_weight.shape):
-            shard_size = param.shape[input_dim]
-            start = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start, shard_size)
-        assert param.shape == loaded_weight.shape
-        param.data.copy_(loaded_weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bias = None if self.tp_rank > 0 else self.bias
-        out = F.conv2d(
-            x,
-            self.weight,
-            bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
-        if self.tp_size > 1:
-            out = tensor_model_parallel_all_reduce(out)
-        return out
-
-
 def _sana_wm_all_gather_hidden(x: torch.Tensor, tp_size: int) -> torch.Tensor:
     if tp_size == 1:
         return x
@@ -1560,23 +1187,13 @@ class PatchEmbedMS3D(nn.Module):
         kernel_size = kernel_size or patch_size
         assert patch_size[0] == 1, "Temporal patch must be 1 for SANA-WM."
         self.patch_size = patch_size
-        if _sana_wm_tp_world_size() > 1:
-            self.proj = _SanaWMColumnParallelConv3d(
-                in_chans,
-                embed_dim,
-                kernel_size=kernel_size,
-                stride=patch_size,
-                bias=bias,
-                gather_output=True,
-            )
-        else:
-            self.proj = nn.Conv3d(
-                in_chans,
-                embed_dim,
-                kernel_size=kernel_size,
-                stride=patch_size,
-                bias=bias,
-            )
+        self.proj = nn.Conv3d(
+            in_chans,
+            embed_dim,
+            kernel_size=kernel_size,
+            stride=patch_size,
+            bias=bias,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)  # (B, D, T, H, W)
@@ -1726,64 +1343,27 @@ class GLUMBConvTemp(nn.Module):
         self, in_features: int, hidden_features: int, t_kernel_size: int = 3
     ) -> None:
         super().__init__()
-        tp_size = _sana_wm_tp_world_size()
-        if tp_size > 1:
-            inverted_conv = _SanaWMColumnParallelConv2d(
-                in_features,
-                hidden_features * 2,
-                1,
-                1,
-                0,
-                bias=True,
-                gather_output=False,
-                paired_output=True,
-            )
-            depth_conv = _SanaWMPairedDepthwiseConv2d(
-                hidden_features * 2,
-                3,
-                1,
-                1,
-                bias=True,
-            )
-            point_conv = _SanaWMRowParallelConv2d(
-                hidden_features,
-                in_features,
-                1,
-                1,
-                0,
-                bias=False,
-            )
-            t_conv = _SanaWMColumnParallelConv2d(
-                in_features,
-                in_features,
-                kernel_size=(t_kernel_size, 1),
-                stride=1,
-                padding=(t_kernel_size // 2, 0),
-                bias=False,
-                gather_output=True,
-            )
-        else:
-            inverted_conv = nn.Conv2d(
-                in_features, hidden_features * 2, 1, 1, 0, bias=True
-            )
-            depth_conv = nn.Conv2d(
-                hidden_features * 2,
-                hidden_features * 2,
-                3,
-                1,
-                1,
-                groups=hidden_features * 2,
-                bias=True,
-            )
-            point_conv = nn.Conv2d(hidden_features, in_features, 1, 1, 0, bias=False)
-            t_conv = nn.Conv2d(
-                in_features,
-                in_features,
-                kernel_size=(t_kernel_size, 1),
-                stride=1,
-                padding=(t_kernel_size // 2, 0),
-                bias=False,
-            )
+        inverted_conv = nn.Conv2d(
+            in_features, hidden_features * 2, 1, 1, 0, bias=True
+        )
+        depth_conv = nn.Conv2d(
+            hidden_features * 2,
+            hidden_features * 2,
+            3,
+            1,
+            1,
+            groups=hidden_features * 2,
+            bias=True,
+        )
+        point_conv = nn.Conv2d(hidden_features, in_features, 1, 1, 0, bias=False)
+        t_conv = nn.Conv2d(
+            in_features,
+            in_features,
+            kernel_size=(t_kernel_size, 1),
+            stride=1,
+            padding=(t_kernel_size // 2, 0),
+            bias=False,
+        )
         self.inverted_conv = _ConvLayer(
             inverted_conv,
             act=nn.SiLU(inplace=False),
@@ -3843,10 +3423,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
-        q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
-        k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
-        v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
-
+        # Match the official BothTriton camera path: feed raw UCPE-transformed
+        # tensors into GDN and only use key inflation for beta discounting.
         pre_ucpe_k_norm = torch.linalg.vector_norm(
             k_pre_dn.float(), dim=2, keepdim=True
         ).clamp_min(1e-6)
