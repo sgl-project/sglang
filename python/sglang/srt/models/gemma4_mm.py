@@ -236,7 +236,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        self.lm_head = self.language_model.embed_tokens
 
         # Tied embeddings: under PP the embed_tokens lives on the first rank
         # while logits run on the last rank, so we can't reuse the embedding
@@ -301,14 +300,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
-
-    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if layer_ids is None:
-            raise ValueError(
-                "DFLASH requires explicit layer_ids for aux hidden capture."
-            )
-        self.capture_aux_hidden_states = True
-        self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def prepare_attn_masks(
         self,
