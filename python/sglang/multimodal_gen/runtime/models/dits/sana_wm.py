@@ -4203,6 +4203,25 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         """Compatibility alias for Cache-DiT's Sana block adapter."""
         return self.blocks
 
+    def get_cache_dit_block_adapter(self):
+        from cache_dit import BlockAdapter, ForwardPattern
+
+        blocks = getattr(self, "blocks", None)
+        if blocks is None:
+            return None
+
+        # SANA-WM blocks use the native signature:
+        #   forward(x, *, y, t, HW, rotary_emb, ...)
+        # Pattern_3 matches the tensor flow, while disabling signature checks lets
+        # cache-dit pass through SANA-WM's native kwargs unchanged.
+        return BlockAdapter(
+            transformer=self,
+            blocks=blocks,
+            blocks_name="blocks",
+            forward_pattern=ForwardPattern.Pattern_3,
+            check_forward_pattern=False,
+        )
+
     def post_load_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, WanRotaryPosEmbed):

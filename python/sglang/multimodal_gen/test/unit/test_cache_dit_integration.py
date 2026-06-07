@@ -8,14 +8,26 @@ from unittest.mock import patch
 
 
 class _FakeDBCacheConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
     def reset(self, **kwargs):
         return kwargs
 
 
 def _install_cache_dit_stub():
     cache_dit = types.ModuleType("cache_dit")
+    cache_dit.enable_cache_calls = []
     cache_dit.refresh_calls = []
     cache_dit.steps_mask_calls = []
+
+    def enable_cache(target, **kwargs):
+        cache_dit.enable_cache_calls.append(
+            {
+                "target": target,
+                **kwargs,
+            }
+        )
 
     def refresh_context(transformer, cache_config, verbose=False):
         cache_dit.refresh_calls.append(
@@ -32,6 +44,7 @@ def _install_cache_dit_stub():
         )
         return [1] * total_steps
 
+    cache_dit.enable_cache = enable_cache
     cache_dit.refresh_context = refresh_context
     cache_dit.steps_mask = steps_mask
     cache_dit.BlockAdapter = object
@@ -43,9 +56,11 @@ def _install_cache_dit_stub():
     block_adapters = types.ModuleType("cache_dit.caching.block_adapters")
 
     class _FakeBlockAdapterRegister:
-        @staticmethod
-        def is_supported(_transformer):
-            return True
+        supported = True
+
+        @classmethod
+        def is_supported(cls, _transformer):
+            return cls.supported
 
     block_adapters.BlockAdapterRegister = _FakeBlockAdapterRegister
 
@@ -213,6 +228,36 @@ class TestCacheDitRefreshContext(unittest.TestCase):
                 "steps_computation_mask": None,
                 "steps_computation_policy": None,
             },
+        )
+
+    def test_enable_cache_uses_transformer_custom_block_adapter_before_registry(self):
+        module = self._import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+
+        custom_adapter = object()
+
+        class _Transformer(module.torch.nn.Module):
+            def __init__(self):
+                self.adapter_calls = 0
+
+            def get_cache_dit_block_adapter(self):
+                self.adapter_calls += 1
+                return custom_adapter
+
+        transformer = _Transformer()
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=4)
+
+        returned = module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(returned, transformer)
+        self.assertEqual(transformer.adapter_calls, 1)
+        self.assertEqual(len(module.cache_dit.enable_cache_calls), 1)
+        self.assertIs(module.cache_dit.enable_cache_calls[0]["target"], custom_adapter)
+        self.assertEqual(
+            module.cache_dit.enable_cache_calls[0]["cache_config"].kwargs[
+                "num_inference_steps"
+            ],
+            4,
         )
 
 

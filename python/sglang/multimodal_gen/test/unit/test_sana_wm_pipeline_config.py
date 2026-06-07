@@ -74,9 +74,6 @@ from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     VanillaD2HStrategy,
 )
-from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-    _maybe_build_sana_wm_cache_dit_adapter,
-)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -656,7 +653,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         torch.nn.Module.__init__(model)
         model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
 
-        adapter = _maybe_build_sana_wm_cache_dit_adapter(model)
+        adapter = model.get_cache_dit_block_adapter()
 
         self.assertIsNotNone(adapter)
         self.assertIs(adapter.transformer, model)

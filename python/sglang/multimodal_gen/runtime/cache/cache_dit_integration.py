@@ -7,7 +7,7 @@ on transformer modules in SGLang's modular pipeline architecture.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -222,30 +222,17 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
-def _maybe_build_sana_wm_cache_dit_adapter(
+def _maybe_get_custom_cache_dit_block_adapter(
     transformer: torch.nn.Module,
-) -> BlockAdapter | None:
-    if transformer.__class__.__name__ != "SanaWMTransformer3DModel":
+) -> Any | None:
+    adapter_builder = getattr(transformer, "get_cache_dit_block_adapter", None)
+    if adapter_builder is None:
         return None
-    blocks = getattr(transformer, "blocks", None)
-    if blocks is None:
-        return None
-
-    # SANA-WM's blocks use a native signature:
-    #   forward(x, *, y, t, HW, rotary_emb, ...)
-    # cache-dit's built-in Sana adapter assumes diffusers-style
-    # `transformer_blocks` with `hidden_states` naming and rejects the
-    # signature during pattern checks. Pattern_3 is still the right data-flow
-    # shape (single hidden-state tensor in, single hidden-state tensor out), and
-    # cache-dit will pass through SANA-WM's kwargs when the signature check is
-    # disabled.
-    return BlockAdapter(
-        transformer=transformer,
-        blocks=blocks,
-        blocks_name="blocks",
-        forward_pattern=ForwardPattern.Pattern_3,
-        check_forward_pattern=False,
-    )
+    if not callable(adapter_builder):
+        raise TypeError(
+            f"{transformer.__class__.__name__}.get_cache_dit_block_adapter must be callable."
+        )
+    return adapter_builder()
 
 
 def enable_cache_on_transformer(
@@ -255,10 +242,11 @@ def enable_cache_on_transformer(
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.nn.Module:
-    """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
+    """Enable cache-dit on a transformer module, by wrapping the module with cache-dit.
 
-    This function enables cache-dit acceleration using the BlockAdapterRegister
-    for pre-registered models
+    This function enables cache-dit acceleration using cache-dit's
+    BlockAdapterRegister for pre-registered models, or a transformer-provided
+    custom BlockAdapter hook for models with native signatures.
 
     Args:
         model_name: Name of the model for logging purposes.
@@ -275,7 +263,7 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
-    block_adapter = _maybe_build_sana_wm_cache_dit_adapter(transformer)
+    block_adapter = _maybe_get_custom_cache_dit_block_adapter(transformer)
 
     # Check if the transformer is pre-registered in cache-dit
     if block_adapter is None and not BlockAdapterRegister.is_supported(transformer):
