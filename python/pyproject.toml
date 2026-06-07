@@ -76,7 +76,7 @@ dependencies = [
   "torchvision",
   "tqdm",
   "mistral_common>=1.11.0",
-  "transformers==5.8.1",
+  "transformers==5.11.0",
   "uvicorn",
   "uvloop",
   "watchfiles",
