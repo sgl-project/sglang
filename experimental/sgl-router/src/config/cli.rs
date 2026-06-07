@@ -573,6 +573,19 @@ mod tests {
         );
     }
 
+    /// `--policy load_based` parses to the load-based selector.
+    #[test]
+    fn parses_load_based_policy() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--policy",
+            "load_based",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.policy, PolicyKind::LoadBased);
+    }
+
     /// clap rejects `--cb-threshold 0` because the field is `NonZeroU32`.
     #[test]
     fn rejects_zero_cb_threshold() {
