@@ -43,9 +43,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.token_dispatcher.standard import (
-    StandardDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -84,6 +82,8 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+logger = logging.getLogger(__name__)
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -617,6 +617,13 @@ class FusedMoE(torch.nn.Module):
             fp8_scale = entry.pop("scale")
             if not entry:
                 self._fp8_shared_to_fp4_cache.pop(key, None)
+
+            logger.warning_once(
+                "Loading FP8 shared expert weights into FP4 fused MoE weights. "
+                "The shared expert is quantized at load time and may differ "
+                "slightly from a checkpoint that stores shared experts directly "
+                "in FP4."
+            )
 
             fp4_weight, fp4_scale = quantize_fp8_weight_to_mxfp4(fp8_weight, fp8_scale)
 
