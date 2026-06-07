@@ -280,7 +280,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "cutedsl"
 ]
 
 
@@ -340,6 +340,15 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+
+        if "cutedsl" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            sa = model_runner.server_args
+            self.b12x_decode_max_bs = model_runner.req_to_token_pool.size
+            cps = sa.chunked_prefill_size
+            self.b12x_extend_max_q = cps if cps and cps > 0 else sa.max_prefill_tokens
+            # b12x extend takes per-query-token cache_seqlens, so the batch axis is
+            # the total query-token count, not the request count.
+            self.b12x_extend_max_batch = self.b12x_extend_max_q
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -855,6 +864,12 @@ class DeepseekSparseAttnBackend(
                 else None
             ),
         }
+        if self.dsa_decode_impl == "cutedsl":
+            from sglang.srt.layers.attention.cutedsl_sparse_mla import (
+                prealloc_decode_workspace,
+            )
+
+            prealloc_decode_workspace(self)
 
     def _build_forward_metadata_cuda_graph(
         self,
@@ -1405,7 +1420,7 @@ class DeepseekSparseAttnBackend(
             else self.dsa_prefill_impl
         )
 
-        if dsa_impl == "trtllm" and not self.use_mha:
+        if dsa_impl in ("trtllm", "cutedsl") and not self.use_mha:
             return self._forward_trtllm(
                 q,
                 k,
@@ -1605,7 +1620,7 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
-        if self.dsa_decode_impl == "trtllm":
+        if self.dsa_decode_impl in ("trtllm", "cutedsl"):
             return self._forward_trtllm(
                 q,
                 k,
@@ -2121,9 +2136,10 @@ class DeepseekSparseAttnBackend(
         import flashinfer.decode
 
         metadata = self.forward_metadata
+        impl = self.dsa_prefill_impl if is_prefill else self.dsa_decode_impl
 
         merge_query = q_rope is not None
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
+        if self.kv_cache_dtype == torch.float8_e4m3fn and impl != "cutedsl":
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
@@ -2187,6 +2203,27 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+            )
+
+        if impl == "cutedsl":
+            from sglang.srt.layers.attention.cutedsl_sparse_mla import (
+                forward_b12x_sparse_mla,
+            )
+
+            if is_prefill:
+                nsa_seqlens = (page_table_1 >= 0).sum(dim=1, dtype=torch.int32)
+            else:
+                nsa_seqlens = metadata.dsa_cache_seqlens_int32
+            return forward_b12x_sparse_mla(
+                self,
+                is_prefill=is_prefill,
+                q_all=q_all,
+                kv_cache=k_cache,
+                page_table_1=page_table_1,
+                cache_seqlens=seq_lens,
+                nsa_seqlens=nsa_seqlens,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
             )
 
         q_scale = 1.0
@@ -2285,6 +2322,9 @@ class DeepseekSparseAttnBackend(
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
+
+        if "cutedsl" in (self.dsa_decode_impl, self.dsa_prefill_impl):
+            self.use_mha = False
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
