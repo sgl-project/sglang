@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import init_device_mesh
-from transformers import AutoModel
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
@@ -109,10 +108,10 @@ class TextEncoderLoader(ComponentLoader):
             1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
-        model_class = self._resolve_transformers_text_encoder_class(
+        transformers_model_class = self._resolve_transformers_text_encoder_class(
             component_model_path, server_args
         )
-        return model_class.from_pretrained(
+        return transformers_model_class.from_pretrained(
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
@@ -123,11 +122,11 @@ class TextEncoderLoader(ComponentLoader):
     def _resolve_transformers_text_encoder_class(component_model_path, server_args):
         """Resolve the concrete transformers class for a text encoder.
 
-        AutoModel maps encoder-decoder model types (e.g. T5/UMT5) to their
-        full seq2seq class (T5Model/UMT5Model), whose forward expects
-        decoder inputs and raises when the module is used purely as a text
-        encoder. For such checkpoints, prefer the encoder-only class recorded in
-        the config architectures (e.g. UMT5EncoderModel). Encoders that
+        AutoModel maps encoder-decoder model types (e.g. T5/UMT5) to full
+        seq2seq classes, whose forward expects decoder inputs and raises when
+        the module is used purely as a text encoder. For such checkpoints,
+        prefer the encoder-only class from the config architectures or map the
+        full seq2seq architecture to its encoder-only counterpart. Encoders that
         are not encoder-decoder keep using AutoModel unchanged.
         """
         import transformers
@@ -142,10 +141,19 @@ class TextEncoderLoader(ComponentLoader):
         except Exception:
             return AutoModel
         if getattr(config, "is_encoder_decoder", False):
+            encoder_only_map = {
+                "T5Model": "T5EncoderModel",
+                "T5ForConditionalGeneration": "T5EncoderModel",
+                "UMT5Model": "UMT5EncoderModel",
+                "UMT5ForConditionalGeneration": "UMT5EncoderModel",
+                "MT5Model": "MT5EncoderModel",
+                "MT5ForConditionalGeneration": "MT5EncoderModel",
+            }
             for arch in getattr(config, "architectures", None) or []:
-                model_class = getattr(transformers, arch, None)
-                if isinstance(model_class, type):
-                    return model_class
+                encoder_arch = encoder_only_map.get(arch, arch)
+                transformers_model_class = getattr(transformers, encoder_arch, None)
+                if isinstance(transformers_model_class, type):
+                    return transformers_model_class
         return AutoModel
 
     def _prepare_weights(

@@ -34,10 +34,30 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         self.assertIs(
             self._resolve(True, ["UMT5EncoderModel"]), transformers.UMT5EncoderModel
         )
+        self.assertIs(self._resolve(True, ["UMT5Model"]), transformers.UMT5EncoderModel)
+        self.assertIs(
+            self._resolve(True, ["UMT5ForConditionalGeneration"]),
+            transformers.UMT5EncoderModel,
+        )
 
     def test_t5_encoder_decoder_uses_encoder_only_class(self):
         self.assertIs(
             self._resolve(True, ["T5EncoderModel"]), transformers.T5EncoderModel
+        )
+        self.assertIs(self._resolve(True, ["T5Model"]), transformers.T5EncoderModel)
+        self.assertIs(
+            self._resolve(True, ["T5ForConditionalGeneration"]),
+            transformers.T5EncoderModel,
+        )
+
+    def test_mt5_encoder_decoder_uses_encoder_only_class(self):
+        self.assertIs(
+            self._resolve(True, ["MT5EncoderModel"]), transformers.MT5EncoderModel
+        )
+        self.assertIs(self._resolve(True, ["MT5Model"]), transformers.MT5EncoderModel)
+        self.assertIs(
+            self._resolve(True, ["MT5ForConditionalGeneration"]),
+            transformers.MT5EncoderModel,
         )
 
     def test_non_encoder_decoder_keeps_automodel(self):
