@@ -369,6 +369,11 @@ def _load_calibration_model(model_path: str, use_cuda: bool):
         ) from exc
 
     config = _resolve_calibration_config(model_path)
+    # Keep device_map="auto" (full GPU placement): a per-GPU max_memory cap makes
+    # accelerate spill modules to cpu/disk, which the on-the-fly finegrained-fp8
+    # quantizer rejects. The large-FP8 mid-load OOM is fragmentation (the failed
+    # alloc is small while ~12 GiB sits reserved-but-unallocated), so the fix is
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the launch env, not a cap.
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         config=config,

@@ -45,23 +45,42 @@ remap in `calibrate._resolve_calibration_config`), **`glm_moe_dsa` IS registered
 3. The one-block `--dry-run-blocks 1` placement guard must show FP8 sharding (no bf16 upcast) and the
    K/Q hooks firing on all 78 layers at `H, head_dim=192` before the full run.
 
-## Recipe — calibration command (hardware round)
+## Recipe — calibration command (VALIDATED on 8×H200, 2026-06-07)
 
 ```bash
-GLM=/cluster-storage/models/models--zai-org--GLM-5.1-FP8/snapshots/<hash>   # 142 FP8 shards
+SNAP=/cluster-storage/models/models--zai-org--GLM-5.1-FP8/snapshots/f396cf805182f4ca10fa675e1a99815b3ca384db
+# expandable_segments is REQUIRED: the large FP8 load otherwise OOMs mid-conversion
+# on the fullest GPU (~12 GiB sits reserved-but-unallocated = fragmentation). Do NOT
+# pass a per-GPU --max-memory cap: it makes accelerate spill to cpu/disk, which the
+# on-the-fly finegrained-fp8 quantizer hard-rejects. device_map="auto" (the default)
+# fits the model on the 8 GPUs; expandable_segments reclaims the fragmented reserve.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -m sglang.srt.layers.attention.double_sparsity.calibrate \
-  --model "$GLM" \
+  --model "$SNAP" \
+  --dtype fp8_e4m3 --tp 8 \
   --output /models/glm51-fp8-channel-mask.safetensors \
   --label-dim 32 \
   --page-size 64 \
   --num-samples 256 --block-size 512 \
-  --dataset development/loop8/calib_corpus.txt \
+  --dataset runs/20260528_dsv32_mvp/calib_corpus_pileval.txt \
   -v
-# Do NOT pass --head-dim: calibrate auto-derives the no-PE width (192) from the
-# config and writes it as the mask's head_dim metadata, which is exactly what
-# the runtime verify_bind_shapes(model_nope_head_dim=qk_nope_head_dim) checks.
-# Run --dry-run-blocks 1 first to confirm hooks fire + FP8 placement.
+# --dtype fp8_e4m3 is REQUIRED (not optional). --tp 8 is metadata only — calibrate
+# does a single-process forward and shards via HF device_map="auto" (needs the
+# `accelerate` package: `pip install accelerate`). Do NOT pass --head-dim: calibrate
+# auto-derives the no-PE width (192) from the config and writes it as the mask's
+# head_dim metadata, exactly what runtime verify_bind_shapes(model_nope_head_dim=
+# qk_nope_head_dim) checks. Run --dry-run-blocks 1 first.
 ```
+
+### On-hardware dry-run evidence (2026-06-07, `runs/20260607_glm51_loop8/calib_dryrun3.log`)
+`--dry-run-blocks 1` on the real GLM-5.1-FP8 across 8× H200 logged:
+`DRY RUN complete: calibration hooks fired on all 78 layers (H=64, head_dim=192) over 1 block` with the
+parameter report `dtype histogram={bfloat16:624, float8_e4m3fn:930, float32:930}, float8_present=True`
+(no bf16 upcast of the FP8 weights) sharded `cuda:0..7`, via the Triton finegrained-fp8 fallback
+(`_force_triton_fp8_for_calibration` — DeepGEMM skipped). This confirms the calibration path is correct
+for GLM at head_dim=192 with NO calibrate.py code change. (Boot-chain hazards needed: `pip install
+accelerate`; `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; do NOT set `HF_HUB_OFFLINE=1` — the
+Triton kernel publisher-trust check needs the online API.)
 
 ## Recipe — serving the calibrated mask (hardware round)
 
