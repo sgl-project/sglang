@@ -314,7 +314,7 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
+        mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
         if tree_cache.supports_mamba():
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
@@ -486,7 +486,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
-            tree_cache.req_to_token_pool.mamba_pool.free(
+            tree_cache.req_to_token_pool.mamba_allocator.free(
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
