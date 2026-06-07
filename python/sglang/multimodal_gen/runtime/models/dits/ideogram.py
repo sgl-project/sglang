@@ -57,12 +57,6 @@ class Ideogram4ColumnParallelLinear(ColumnParallelLinear):
         return super().forward(x)[0]
 
 
-def _tp_world_size() -> int:
-    if not model_parallel_is_initialized():
-        return 1
-    return get_tp_world_size()
-
-
 def _linear(
     in_features: int,
     out_features: int,
@@ -70,7 +64,7 @@ def _linear(
     quant_config: QuantizationConfig | None = None,
     prefix: str = "",
 ):
-    tp_size = _tp_world_size()
+    tp_size = get_tp_world_size() if model_parallel_is_initialized() else 1
     use_column_parallel = tp_size > 1 and out_features % tp_size == 0
     if quant_config is None:
         if use_column_parallel:
