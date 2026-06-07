@@ -305,8 +305,8 @@ class PEAGLEWorker(EAGLEWorker):
             hidden_states=parallel_inputs,  # [batch*K, hidden_dim]
             bonus_tokens=spec_info.bonus_tokens.repeat_interleave(K, dim=0) if spec_info.bonus_tokens is not None else None,
             capture_hidden_mode=spec_info.capture_hidden_mode,
-            num_tokens_per_req=spec_info.num_tokens_per_req,
-            num_tokens_for_logprob_per_req=spec_info.num_tokens_for_logprob_per_req,
+            num_tokens_per_req=[val for val in spec_info.num_tokens_per_req for _ in range(K)] if spec_info.num_tokens_per_req is not None else None,
+            num_tokens_for_logprob_per_req=[val for val in spec_info.num_tokens_for_logprob_per_req for _ in range(K)] if spec_info.num_tokens_for_logprob_per_req is not None else None,
         )
 
         # Clone batch metadata for expansion
