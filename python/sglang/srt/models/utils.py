@@ -275,7 +275,7 @@ class AutoWeightsLoader:
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache.
+    """Enable fused set_kv_buffer on CUDA with bfloat16 KV cache and HIP with bf16/fp16/fp8 KV cache.
 
     SHUFFLE 5D pools on HIP also work — the underlying triton kernel
     (`fused_qk_rope_reshape_and_cache`) natively supports the 5D

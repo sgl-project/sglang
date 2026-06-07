@@ -416,7 +416,7 @@ class Envs:
     # post-attention layernorm output in one launch and the MoE method
     # skips the explicit pad. Currently only takes effect on the
     # post_attention_layernorm path with aiter backend and TP=1.
-    SGLANG_FUSE_RMSNORM_PAD = EnvBool(False)
+    SGLANG_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
     # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
     # (size, head_num, head_dim) per-token storage that
     # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.

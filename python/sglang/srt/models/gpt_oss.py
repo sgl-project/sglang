@@ -178,7 +178,7 @@ def _resolve_moe_input_pad_multiple(
         return 0
     from sglang.srt.environ import envs
 
-    if not envs.SGLANG_FUSE_RMSNORM_PAD.get():
+    if not envs.SGLANG_AITER_FUSE_RMSNORM_PAD.get():
         return 0
     if not (_is_hip and envs.SGLANG_USE_AITER.get()):
         return 0
@@ -284,7 +284,7 @@ class GptOssSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         # `hidden_states` may arrive pre-padded along the last dim when the
         # preceding RMSNorm fused the MoE input pad (gated by
-        # SGLANG_FUSE_RMSNORM_PAD). Router/topk are computed on the
+        # SGLANG_AITER_FUSE_RMSNORM_PAD). Router/topk are computed on the
         # unpadded slice so the small bf16 router GEMM dimensions stay
         # untouched, while the experts call gets to keep the padded view
         # and skip the duplicate pad inside the MXFP4 method. The output
@@ -565,7 +565,7 @@ class GptOssDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Optionally fuse the MoE-input zero-pad into post_attention_layernorm
         # via aiter's `fused_add_rmsnorm_pad`. Only enabled when:
-        #   * SGLANG_FUSE_RMSNORM_PAD=1
+        #   * SGLANG_AITER_FUSE_RMSNORM_PAD=1
         #   * Quant method is MXFP4 (the only path that demands a 256-pad)
         #   * Communication path between layernorm and MoE is the no-op
         #     `_simple` route (attn_tp_size == 1) — otherwise the padded
