@@ -20,12 +20,18 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_utils import (
+    draft_kv_indices_buffer_width,
+    draft_kv_indices_used_len,
+    generate_draft_decode_kv_indices,
+)
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -281,7 +287,7 @@ class AiterAttnBackend(AttentionBackend):
             # so all num_head size does not use qh16 kernel to simulate
             # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)
             # it will cause gpu-fault or accuracy issue
-            if self.num_head == 32 or self.num_head == 128:
+            if self.num_head in (32, 64, 128):
                 fast_mode = True
                 intra_batch_mode = False
 
@@ -488,8 +494,8 @@ class AiterAttnBackend(AttentionBackend):
         tile_q = 256
         qhead_granularity = gqa_ratio
         qlen_granularity = tile_q // qhead_granularity
-        kvlen_granularity = max(128, self.page_size)
-        block_size = self.page_size
+        kvlen_granularity = 128
+        block_size = 1
 
         qo_indptr_cpu = qo_indptr.to("cpu", dtype=torch.int32)
         kv_indptr_cpu = kv_indptr.to("cpu", dtype=torch.int32)
@@ -820,6 +826,25 @@ class AiterAttnBackend(AttentionBackend):
         )
         return output
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        seq_lens_cpu = (
+            forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
+        )
+        self._apply_cuda_graph_metadata(
+            bs=forward_batch.batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_sum=None if in_capture else forward_batch.seq_lens_sum,
+            encoder_lens=forward_batch.encoder_lens,
+            forward_mode=forward_batch.forward_mode,
+            spec_info=forward_batch.spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
 
@@ -868,7 +893,9 @@ class AiterAttnBackend(AttentionBackend):
                         bs, max_kv_len, dtype=torch.int32, device=self.device
                     )
 
-                    create_flashmla_kv_indices_triton[(bs,)](
+                    create_flashmla_kv_indices_triton[
+                        (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
+                    ](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -880,10 +907,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     if self.use_sliding_window_kv_pool:
+                        # AITER attention kernels require int32 page indices;
+                        # full_to_swa_index_mapping is stored as int64.
                         swa_page_table = (
                             self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 kv_indices
-                            )
+                            ).to(torch.int32)
                         )
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
@@ -1359,10 +1388,13 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if self.use_sliding_window_kv_pool:
+                    # AITER attention kernels (e.g. mha_batch_prefill_func)
+                    # require int32 page indices; full_to_swa_index_mapping is
+                    # stored as int64.
                     swa_page_table = (
                         self.token_to_kv_pool.translate_loc_from_full_to_swa(
                             self.indices_updater_prefill.kv_indices
-                        )
+                        ).to(torch.int32)
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -1482,28 +1514,7 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens.cpu(),
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
@@ -1579,10 +1590,12 @@ class AiterAttnBackend(AttentionBackend):
                         ]
 
                         if self.use_sliding_window_kv_pool:
+                            # AITER attention kernels require int32 page indices;
+                            # full_to_swa_index_mapping is stored as int64.
                             swa_page_indices = (
                                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                     page_indices
-                                )
+                                ).to(torch.int32)
                             )
 
                             page_indices = self._transform_table_1_to_real(page_indices)
@@ -2768,8 +2781,6 @@ class AiterMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
-
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
@@ -2830,16 +2841,16 @@ class AiterMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
+                : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
             ]
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            forward_batch.batch_size, self.topk, self.max_context_len
+        )
         kv_indices = torch.empty(
-            (
-                self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * self.max_context_len,
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device=self.device,
         )
@@ -2856,8 +2867,11 @@ class AiterMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            max_bs, self.topk, self.max_context_len
+        )
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device=self.device,
         )
@@ -2866,33 +2880,26 @@ class AiterMultiStepDraftBackend:
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        def call_fn(i, _forward_batch):
+            self.attn_backends[i].init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
