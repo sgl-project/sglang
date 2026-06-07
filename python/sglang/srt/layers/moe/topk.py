@@ -1125,6 +1125,16 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = -1
 
 
+def _zero_topk_weights_padded_region(
+    topk_weights: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+):
+    if num_token_non_padded is None:
+        return
+    indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
+    topk_weights[indices >= num_token_non_padded, :] = 0.0
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
@@ -1495,6 +1505,12 @@ def _post_process_topk_ids(
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
+    elif _is_hip:
+        # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
+        # (negative indices cause illegal memory access). Instead, zero the
+        # routing weights for padded tokens so their MoE output contributes
+        # nothing to the hidden state after the weighted sum.
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
@@ -1535,6 +1551,12 @@ def _post_process_topk_ids(
             num_physical_routed_experts,
             topk_config,
         )
+
+    if _is_hip:
+        # Shared-expert append/remap can introduce non-zero weights after the
+        # initial HIP padding mask above. Ensure padded tokens leave this helper
+        # with all expert weights zeroed.
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     return topk_ids, topk_weights, recorder_topk_ids
 
