@@ -83,9 +83,8 @@ def draft_kv_indices_buffer_width(
 ) -> int:
     """Per-step row width of the EAGLE draft-decode kv_indices buffer.
 
-    Each of the num_seqs * topk draft branches attends to up to max_context_len
-    KV slots, so the row holds num_seqs * topk * max_context_len indices. The topk
-    factor is mandatory: dropping it under-allocates and overflows the row (#27338, #27460).
+    num_seqs * topk branches each attend up to max_context_len KV slots; the topk
+    factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
     return num_seqs * topk * max_context_len
 
@@ -93,11 +92,10 @@ def draft_kv_indices_buffer_width(
 def draft_kv_indices_used_len(
     seq_lens_sum: int, topk: int, bs: int, num_steps: int
 ) -> int:
-    """kv_indices length actually used through num_steps draft-decode steps.
+    """kv_indices length used through num_steps draft-decode steps.
 
-    bs = topk * num_seqs branches; each step appends one index per branch. Used both
-    to slice the per-step kv_indices view (num_steps = i + 1) and to assert the row is
-    wide enough (num_steps = speculative_num_steps).
+    bs = topk * num_seqs branches, one index appended per branch per step. Called with
+    num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
     """
     return seq_lens_sum * topk + bs * num_steps
 
