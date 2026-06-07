@@ -212,6 +212,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    use_megamoe_fused_shared_slots: bool = False
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -350,6 +351,7 @@ class TopK(MultiPlatformOp):
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
+        use_megamoe_fused_shared_slots: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -390,6 +392,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            use_megamoe_fused_shared_slots=use_megamoe_fused_shared_slots,
         )
 
     def _apply_deepep_waterfill(
@@ -523,7 +526,9 @@ class TopK(MultiPlatformOp):
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
         if (
             self.topk_config.num_fused_shared_experts > 0
-            and uses_per_rank_fused_shared_slots()
+            and uses_per_rank_fused_shared_slots(
+                self.topk_config.use_megamoe_fused_shared_slots
+            )
         ):
             n = self.topk_config.num_fused_shared_experts
             topk_output = topk_output._replace(
@@ -1399,7 +1404,9 @@ def _post_process_topk_ids(
         # EPLB dispatch must only remap the routed expert columns.
         # The shared expert column (value = n_routed_experts) would be out-of-bounds
         # for the logical-to-physical dispatch table.
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots(
+            topk_config.use_megamoe_fused_shared_slots
+        ):
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(
@@ -1434,7 +1441,9 @@ def _post_process_topk_ids(
 
     # DeepEP/MegaMoE: remap to interleaved expert layout where each rank's
     # shared expert has a unique ID for dispatch routing.
-    if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+    if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots(
+        topk_config.use_megamoe_fused_shared_slots
+    ):
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None

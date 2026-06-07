@@ -34,6 +34,7 @@ class HashTopK(nn.Module):
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
         apply_routed_scaling_factor_on_output=False,
+        use_megamoe_fused_shared_slots=False,
     ):
         super().__init__()
         self.layer_id = None
@@ -54,6 +55,7 @@ class HashTopK(nn.Module):
         self.topk = topk
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.use_megamoe_fused_shared_slots = use_megamoe_fused_shared_slots
         self.score_func = scoring_func
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
@@ -176,7 +178,9 @@ class HashTopK(nn.Module):
             topk_weights = topk_weights.to(torch.float32)
 
         num_fused_shared_experts = self.num_fused_shared_experts
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots(
+            self.use_megamoe_fused_shared_slots
+        ):
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = topk_ids_logical_to_physical(
@@ -188,7 +192,9 @@ class HashTopK(nn.Module):
                 topk_ids, expert_location_dispatch_info
             )
 
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots(
+            self.use_megamoe_fused_shared_slots
+        ):
             num_physical_routed_experts = (
                 expert_location_dispatch_info.num_physical_experts
                 if expert_location_dispatch_info is not None
@@ -203,6 +209,7 @@ class HashTopK(nn.Module):
                     top_k=self.topk,
                     num_fused_shared_experts=num_fused_shared_experts,
                     routed_scaling_factor=self.routed_scaling_factor,
+                    use_megamoe_fused_shared_slots=self.use_megamoe_fused_shared_slots,
                 ),
             )
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)

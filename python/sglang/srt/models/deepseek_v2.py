@@ -538,11 +538,13 @@ class DeepseekV2MoE(nn.Module):
         # mlp.shared_experts → mlp.experts.256 when > 0.
         self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
 
-        # DeepEP and MegaMoE shared expert fusion: shared expert is fused into
-        # the same MoE kernel as a local expert at each EP rank. Expert layout
-        # is expanded from 256 routed to 256+EP_size (e.g. 272 for EP=16).
+        # DeepEP shared expert fusion, plus the DeepSeek V4 MegaMOE path, fuse
+        # the shared expert as a rank-local MoE slot. Do not enable MegaMOE
+        # shared-slot layout for V2/V3 through this shared module.
+        use_megamoe_fused_shared_slots = is_deepseek_v4
         _uses_per_rank_shared_slots = (
-            self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+            self.num_fused_shared_experts > 0
+            and uses_per_rank_fused_shared_slots(use_megamoe_fused_shared_slots)
         )
 
         if _uses_per_rank_shared_slots:
@@ -615,6 +617,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
+            use_megamoe_fused_shared_slots=use_megamoe_fused_shared_slots,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -627,6 +630,7 @@ class DeepseekV2MoE(nn.Module):
                 scoring_func=config.scoring_func,
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+                use_megamoe_fused_shared_slots=use_megamoe_fused_shared_slots,
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -643,6 +647,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                use_megamoe_fused_shared_slots=use_megamoe_fused_shared_slots,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(

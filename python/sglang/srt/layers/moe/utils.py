@@ -361,9 +361,11 @@ def is_deepep_class_backend() -> bool:
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
 
 
-def uses_per_rank_fused_shared_slots() -> bool:
+def uses_per_rank_fused_shared_slots(include_megamoe: bool = False) -> bool:
     """Check whether fused shared experts use per-rank physical slots."""
-    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+    return is_deepep_class_backend() or (
+        include_megamoe and get_moe_a2a_backend().is_megamoe()
+    )
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:

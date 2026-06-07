@@ -6134,10 +6134,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_deepep_waterfill,
             help="Enable DeepEP Waterfill: dispatch the shared expert as the 9th "
-            "routed expert to the least-loaded EP rank. Usually routes through "
-            "DeepEP and supports --deepep-mode auto, normal, or low_latency; "
-            "DeepSeek V4 with --moe-a2a-backend megamoe keeps MegaMoE. "
-            "Implicitly enables shared-expert fusion.",
+            "routed expert to the least-loaded EP rank. Automatically sets "
+            "--moe-a2a-backend deepep, implicitly enables shared-expert fusion, "
+            "and supports --deepep-mode auto, normal, or low_latency. Use auto "
+            "or low_latency for production decode so CUDA graph remains enabled. "
+            "Supported on DeepSeek-V3/R1 "
+            "with EP >= 2.",
         )
         parser.add_argument(
             "--elastic-ep-rejoin",
@@ -6719,9 +6721,9 @@ class ServerArgs:
             action="store_true",
             help=(
                 "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. "
-                "Note: Waterfill (--enable-deepep-waterfill) still routes shared expert "
-                "as an extra MoE slot, so shared expert is not separated from the MoE path "
-                "when Waterfill is enabled."
+                "Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert "
+                "through DeepEP as an extra MoE slot, so shared expert is not separated from the "
+                "MoE path when Waterfill is enabled."
             ),
         )
         parser.add_argument(
