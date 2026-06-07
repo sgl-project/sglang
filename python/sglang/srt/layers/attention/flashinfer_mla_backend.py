@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
@@ -892,8 +893,6 @@ class FlashInferMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
-
         if topk > 1:
             raise ValueError(
                 "Currently Flashinfer MLA only supports topk=1 for speculative decoding"

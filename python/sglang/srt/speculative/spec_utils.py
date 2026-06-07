@@ -9,15 +9,13 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
@@ -53,6 +51,9 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
