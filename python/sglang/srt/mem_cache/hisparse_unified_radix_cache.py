@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
 
@@ -37,6 +37,13 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+class HiSparseHostInsertResult(NamedTuple):
+    prefix_len: int
+    node: Optional[UnifiedTreeNode]
+    duplicate_host_indices: torch.Tensor
+    canonical_host_indices: Optional[torch.Tensor]
 
 
 class HiSparseUnifiedRadixCache(UnifiedRadixCache):
@@ -342,6 +349,142 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
     def host_evict(self, num_tokens: int) -> int:
         return self.evict_host(num_tokens)
 
+    def evict_host_if_needed(self, host_pool, need: int) -> None:
+        if need <= 0 or host_pool.available_size() >= need:
+            return
+
+        deficit = need - host_pool.available_size()
+        if self.host_evictable_size() >= deficit:
+            self.host_evict(deficit)
+
+    def indexer_pool_transfer_for_range(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        start_pos: int,
+        end_pos: int,
+    ) -> Optional[PoolTransfer]:
+        if self._hisparse_host_pool_group() is None:
+            return None
+
+        aligned_start = (
+            (start_pos + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        aligned_end = (end_pos // self.page_size) * self.page_size
+        if aligned_end <= aligned_start:
+            return None
+
+        host_indices = host_indices[aligned_start:aligned_end]
+        if host_indices.numel() == 0:
+            return None
+        return PoolTransfer(
+            name=PoolName.INDEXER,
+            host_indices=host_indices,
+            device_indices=device_indices[aligned_start:aligned_end].to(
+                dtype=torch.int64
+            ),
+        )
+
+    def indexer_pool_transfer_for_completed_page(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        written_end: int,
+    ) -> Optional[PoolTransfer]:
+        if written_end <= 0 or written_end % self.page_size != 0:
+            return None
+        return self.indexer_pool_transfer_for_range(
+            host_indices,
+            device_indices,
+            written_end - self.page_size,
+            written_end,
+        )
+
+    def backup_from_device_all_layer(
+        self,
+        default_host_pool,
+        mem_pool_device,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> None:
+        host_pool_group = self._hisparse_host_pool_group()
+        if host_pool_group is None:
+            default_host_pool.backup_from_device_all_layer(
+                mem_pool_device,
+                host_indices,
+                device_indices,
+                io_backend="kernel",
+            )
+            return
+
+        host_pool_group.backup_from_device_all_layer(
+            mem_pool_device,
+            host_indices,
+            device_indices,
+            io_backend=getattr(self.cache_controller, "io_backend", "kernel"),
+            pool_transfers=pool_transfers,
+        )
+
+    def match_and_lock_host_prefix(
+        self,
+        token_ids: list[int],
+        extra_key: Optional[str],
+        max_len: int,
+    ) -> tuple[torch.Tensor, UnifiedTreeNode, int]:
+        host_prefix, node, raw_match_len = self.host_match_prefix(token_ids, extra_key)
+        prefix_len = min(raw_match_len, max_len)
+        if prefix_len > 0 and node is not None:
+            self.host_inc_lock_ref(node)
+        return host_prefix, node, prefix_len
+
+    def insert_host_indices(
+        self,
+        token_ids: list[int],
+        host_indices: torch.Tensor,
+        extra_key: Optional[str],
+        protected_len: int,
+        old_node: Optional[UnifiedTreeNode] = None,
+        lock_new_node: bool = False,
+        return_canonical_indices: bool = False,
+    ) -> HiSparseHostInsertResult:
+        prefix_len = self.host_insert(token_ids, host_indices, extra_key)
+        duplicate_host_indices = host_indices.new_empty((0,))
+        canonical_host_indices = None
+
+        need_match = old_node is not None or lock_new_node
+        if prefix_len > protected_len:
+            duplicate_host_indices = host_indices[protected_len:prefix_len]
+            need_match |= (
+                return_canonical_indices and duplicate_host_indices.numel() > 0
+            )
+
+        new_node = None
+        if need_match:
+            canonical_host_indices_all, new_node, _ = self.host_match_prefix(
+                token_ids, extra_key
+            )
+            if return_canonical_indices and duplicate_host_indices.numel() > 0:
+                canonical_host_indices = canonical_host_indices_all[
+                    protected_len:prefix_len
+                ]
+
+        if old_node is not None and old_node is not self.root_node:
+            self.host_dec_lock_ref(old_node)
+        if lock_new_node and new_node is not None and new_node is not self.root_node:
+            self.host_inc_lock_ref(new_node)
+
+        return HiSparseHostInsertResult(
+            prefix_len=prefix_len,
+            node=new_node,
+            duplicate_host_indices=duplicate_host_indices,
+            canonical_host_indices=canonical_host_indices,
+        )
+
+    def release_host_node(self, node: Optional[UnifiedTreeNode]) -> None:
+        if node is not None and node is not self.root_node:
+            self.host_dec_lock_ref(node)
+
     def init_load_back(
         self,
         params: InitLoadBackParams,
@@ -395,9 +538,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         mapping[logical_indices] = hisparse_indices
 
         pool_transfers = None
-        host_pool_group = getattr(self.cache_controller, "mem_pool_host", None)
-        entry_map = getattr(host_pool_group, "entry_map", None)
-        if entry_map and PoolName.INDEXER in entry_map:
+        if self._hisparse_host_pool_group() is not None:
             from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
                 CacheOperation,
             )
@@ -432,6 +573,18 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             host_indices.numel(),
         )
         return logical_indices, best_match_node
+
+    def _hisparse_host_pool_group(self):
+        cache_controller = getattr(self, "cache_controller", None)
+        host_pool_group = getattr(cache_controller, "mem_pool_host", None)
+        entry_map = getattr(host_pool_group, "entry_map", {})
+        anchor_entry = getattr(host_pool_group, "anchor_entry", None)
+        if (
+            PoolName.INDEXER in entry_map
+            and getattr(anchor_entry, "host_pool", None) is self.hisparse_host_pool
+        ):
+            return host_pool_group
+        return None
 
     def _collect_host_indices(self, node: UnifiedTreeNode) -> torch.Tensor:
         chunks: list[torch.Tensor] = []
