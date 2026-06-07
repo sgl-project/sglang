@@ -25,7 +25,11 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+from sglang.srt.speculative.spec_utils import (
+    draft_kv_indices_buffer_width,
+    draft_kv_indices_used_len,
+    generate_draft_decode_kv_indices,
+)
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
@@ -944,8 +948,8 @@ class FlashInferMLAMultiStepDraftBackend:
 
         # Fail fast on an undersized kv_indices row: the kernel would otherwise
         # write OOB and silently corrupt memory.
-        required_kv_indices_len = (
-            seq_lens_sum * self.topk + bs * self.speculative_num_steps
+        required_kv_indices_len = draft_kv_indices_used_len(
+            seq_lens_sum, self.topk, bs, self.speculative_num_steps
         )
         assert required_kv_indices_len <= kv_indices_buffer.shape[1], (
             f"EAGLE draft kv_indices row too small: need {required_kv_indices_len} "
@@ -979,16 +983,16 @@ class FlashInferMLAMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
+                : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
             ]
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            forward_batch.batch_size, self.topk, self.max_context_len
+        )
         kv_indices = torch.zeros(
-            (
-                self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * self.max_context_len,
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device="cuda",
         )
@@ -1007,8 +1011,11 @@ class FlashInferMLAMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # Row holds topk per-branch sequences (generate_draft_decode_kv_indices), so
         # it needs the topk factor, matching the eager init_forward_metadata.
+        kv_indices_width = draft_kv_indices_buffer_width(
+            max_bs, self.topk, self.max_context_len
+        )
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int32,
             device="cuda",
         )
