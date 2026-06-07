@@ -9,6 +9,7 @@
 #include <sgl_kernel/utils.h>   // RuntimeCheck, Panic
 
 #include <sgl_kernel/utils.cuh>  // LaunchKernel, fp8_e4m3_t, SGL_DEVICE, device::PDLWaitPrimary/TriggerSecondary
+#include <sgl_kernel/warp.cuh>   // device::warp::reduce_max
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -26,27 +27,38 @@ SGL_DEVICE float GroupReduceMax(float val) {
   static_assert(
       (THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 && THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1,
       "THREADS_PER_SUBWARP must be 1, 2, 4, 8, or 16");
-  // Mask of exactly this thread's contiguous THREADS_PER_SUBWARP-lane subgroup.
-  // A hardcoded 0xffffffff is UB / can hang when the block is < 32 lanes (small
-  // num_groups => block = subwarps_per_block * THREADS_PER_SUBWARP, e.g. 8 or 16).
-  constexpr unsigned kSub = (1u << THREADS_PER_SUBWARP) - 1u;
-  const unsigned mask = kSub << (THREADS_PER_SUBWARP * ((threadIdx.x % 32) / THREADS_PER_SUBWARP));
-  if constexpr (THREADS_PER_SUBWARP >= 16) val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
-  if constexpr (THREADS_PER_SUBWARP >= 8) val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
-  if constexpr (THREADS_PER_SUBWARP >= 4) val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
-  if constexpr (THREADS_PER_SUBWARP >= 2) val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
-  return val;
+  // Reduce within this thread's contiguous THREADS_PER_SUBWARP-lane subgroup via
+  // the shared warp primitive, but pass an explicit subgroup mask instead of its
+  // default 0xffffffff: the block can be < 32 lanes (subwarps_per_block *
+  // THREADS_PER_SUBWARP, e.g. 1..16), where a full-warp mask names non-existent
+  // lanes and is UB / can hang.
+  constexpr device::warp::mask_t kSub = (device::warp::mask_t{1} << THREADS_PER_SUBWARP) - 1;
+  const device::warp::mask_t mask = kSub << (THREADS_PER_SUBWARP * ((threadIdx.x % 32) / THREADS_PER_SUBWARP));
+  return device::warp::reduce_max<THREADS_PER_SUBWARP>(val, mask);
 }
 
 SGL_DEVICE float silu(const float& val) {
+  // Match the AOT v2 kernel: tanh-based silu on SM100+ (Blackwell), exp-based
+  // elsewhere, so the fused silu+mul output stays bit-identical to the AOT op.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  float half = 0.5f * val;
+  float t = __tanhf(half);
+  return half * (1.0f + t);
+#else
   return val / (1.0f + __expf(-val));
+#endif
 }
 
 SGL_DEVICE float2 fmul2_rn(float2 a, float2 b) {
+  // Match the AOT v2 kernel: use the __fmul2_rn intrinsic on SM100+.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  return __fmul2_rn(a, b);
+#else
   float2 result;
   result.x = a.x * b.x;
   result.y = a.y * b.y;
   return result;
+#endif
 }
 
 // Copied from DeepEP.
@@ -94,18 +106,6 @@ SGL_DEVICE OUT_DTYPE_T extract_required_scale_format(float value) {
   } else {
     return value;
   }
-}
-
-SGL_DEVICE void st_global(const int4* ptr, const int4& value) {
-  asm volatile(
-      "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
-}
-SGL_DEVICE int4 ld_global_nc(const int4* ptr) {
-  int4 ret;
-  asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
-               : "l"(ptr));
-  return ret;
 }
 
 template <bool FUSE_SILU_AND_MUL>
@@ -254,17 +254,17 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
 
 #pragma unroll
         for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-          input_primary_int4[j] = ld_global_nc(
-              reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+          // Ordinary 128-bit vectorized load (LDG.128); .nc gave no measurable
+          // gain on this streaming read-once kernel, so no inline asm.
+          input_primary_int4[j] =
+              reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE)[j];
         }
         if constexpr (FUSE_SILU_AND_MUL) {
           const int secondary_offset = hidden_dim_num_groups * GROUP_SIZE;
 #pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-            input_secondary_int4[j] = ld_global_nc(
-                reinterpret_cast<const int4*>(
-                    input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset) +
-                j);
+            input_secondary_int4[j] = reinterpret_cast<const int4*>(
+                input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset)[j];
           }
         }
 
@@ -337,9 +337,9 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
           }
         }
 
-        st_global(
-            reinterpret_cast<int4*>(output_q + offset_num_groups * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE),
-            output_buf);
+        // Ordinary 128-bit vectorized store (STG.128); no inline asm.
+        *reinterpret_cast<int4*>(output_q + offset_num_groups * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE) =
+            output_buf;
       });
 
   device::PDLTriggerSecondary<kUsePDL>();
@@ -422,7 +422,7 @@ struct PerTokenGroupQuant8bitV2Kernel {
       const int32_t* masked_m) {
     constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;
 
-    auto go = [&](auto sched_tag, auto colmajor_tag, auto ue8m0_tag, auto silu_tag) {
+    auto launch_with_config = [&](auto sched_tag, auto colmajor_tag, auto ue8m0_tag, auto silu_tag) {
       using SCHEDULER = typename decltype(sched_tag)::type;
       int subwarps_per_block;
       dim3 grid, block;
@@ -453,17 +453,17 @@ struct PerTokenGroupQuant8bitV2Kernel {
       if (scale_ue8m0) {
         if (fuse_silu_and_mul) {
           if (masked_layout)
-            go(TypeTag<MaskedLayoutScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{});
+            launch_with_config(TypeTag<MaskedLayoutScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{});
           else
-            go(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{});
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{});
         } else {
-          go(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{});
+          launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{});
         }
       } else {
-        go(TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{});
+        launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{});
       }
     } else {
-      go(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
+      launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
     }
   }
 

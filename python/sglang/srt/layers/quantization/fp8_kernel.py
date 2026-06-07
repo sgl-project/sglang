@@ -534,10 +534,24 @@ def sglang_per_token_group_quant_fp8(
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
-            if enable_v2:
-                # JIT v2 (bit-exact with and same perf as the AOT
-                # sgl_per_token_group_quant_8bit_v2, which stays available as a
-                # fallback). Routed here by default.
+            if enable_v2 and _is_musa:
+                # The JIT v2 .cuh uses CUDA-only inline PTX (ld/st.global.v4) and
+                # has no MUSA fallback, so keep MUSA on the AOT v2 op, which
+                # carries the USE_MUSA vector load/store fallbacks.
+                sgl_per_token_group_quant_8bit(
+                    x,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0,
+                    fuse_silu_and_mul,
+                    masked_m,
+                    enable_v2=True,
+                )
+            elif enable_v2:
                 sgl_per_token_group_quant_8bit_jit_v2(
                     x,
                     x_q,
