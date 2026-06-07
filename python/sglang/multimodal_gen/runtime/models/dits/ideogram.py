@@ -393,6 +393,8 @@ class Ideogram4Transformer2DModel(BaseDiT):
         position_ids: torch.Tensor,
         segment_ids: torch.Tensor,
         indicator: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        attn_mask_meta: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         param_dtype = self.embed_image_indicator.weight.dtype
@@ -421,8 +423,10 @@ class Ideogram4Transformer2DModel(BaseDiT):
         cos = cos.unsqueeze(2)
         sin = sin.unsqueeze(2)
         # ideogram uses -1 padding; varlen meta enables fa packed attention
-        attn_mask = segment_ids > 0
-        attn_mask_meta = build_varlen_mask_meta(attn_mask)
+        if attn_mask is None:
+            attn_mask = segment_ids > 0
+        if attn_mask_meta is None:
+            attn_mask_meta = build_varlen_mask_meta(attn_mask)
         for layer in self.layers:
             h = layer(
                 h,
