@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import time
 from contextlib import contextmanager
@@ -8,6 +9,7 @@ import torch
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
@@ -30,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
@@ -63,8 +66,6 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     get_last_loc_large_page_size_large_top_k,
     load_token_map,
-    maybe_detect_nan,
-    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils import (
@@ -76,6 +77,11 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     next_power_of_2,
+)
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -119,7 +125,8 @@ class EAGLEWorker(TpModelWorker):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
-                self, config_path=server_args.speculative_adaptive_config
+                self,
+                config_path=server_args.speculative_adaptive_config,
             )
 
         # Override the context length of the draft model to be the same as the target model.
@@ -238,7 +245,13 @@ class EAGLEWorker(TpModelWorker):
                         cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
                     )
                 )
-                self.adaptive_controller.init_states()
+                self.adaptive_controller.init_states(
+                    cuda_graph_bs=(
+                        None
+                        if self.server_args.disable_cuda_graph
+                        else self.server_args.cuda_graph_bs
+                    ),
+                )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -346,14 +359,19 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
-            speculative_num_steps, speculative_num_draft_tokens
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
         ):
             # Reuse existing init methods for draft attention backend and cuda graphs
             self.init_attention_backend()
@@ -371,7 +389,8 @@ class EAGLEWorker(TpModelWorker):
 
             target_graph_runner = None
             if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
+                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else CudaGraphRunner
+                target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
@@ -404,7 +423,10 @@ class EAGLEWorker(TpModelWorker):
 
     @contextmanager
     def _override_worker_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -418,11 +440,21 @@ class EAGLEWorker(TpModelWorker):
             self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs,
+            sa.disable_cuda_graph,
         )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        if cuda_graph_bs is not None:
+            sa.cuda_graph_bs = cuda_graph_bs
+            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
+            # for steps that no BS range uses (e.g. step=1). Disable graph
+            # capture for those steps; restore in finally so subsequent steps
+            # are not affected.
+            if not cuda_graph_bs:
+                sa.disable_cuda_graph = True
         try:
             yield
         finally:
@@ -436,6 +468,8 @@ class EAGLEWorker(TpModelWorker):
                 self.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
+                sa.cuda_graph_bs,
+                sa.disable_cuda_graph,
             ) = backup
 
     @property
@@ -480,6 +514,9 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.activate_step_by_batch(batch.batch_size())
+
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
             with (
@@ -540,7 +577,8 @@ class EAGLEWorker(TpModelWorker):
 
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
-                    verify_output.num_correct_drafts_per_req_cpu
+                    verify_output.num_correct_drafts_per_req_cpu,
+                    batch_size=batch.batch_size(),
                 )
 
             return GenerationBatchResult(
@@ -776,6 +814,7 @@ class EAGLEWorker(TpModelWorker):
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
@@ -858,6 +897,17 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        # Reuse NSA/DSA topk_indices from the first draft forward step for
+        # subsequent steps, analogous to skip_topk in deepseek_v2.py layers.
+        # Only safe with topk == 1: select_top_k_tokens reorders candidate rows
+        # each step, which would desync the cached indices from their rows.
+        index_share_for_mtp_iteration = (
+            getattr(self.model_config.hf_config, "index_share_for_mtp_iteration", False)
+            and self.topk == 1
+        )
+        if index_share_for_mtp_iteration:
+            forward_batch.reuse_mtp_topk_indices = True
+            forward_batch.topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -872,23 +922,29 @@ class EAGLEWorker(TpModelWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
-            # This is a temporary fix for the case that the user is using standalone
-            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
-            # rope kernel needs cache_loc to be contiguous.
+            # Some draft model RoPE kernels need cache_loc to be contiguous.
             if (
                 self.server_args.speculative_algorithm == "STANDALONE"
                 and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+            ) or self.model_config.hf_config.architectures[0] == (
+                "Qwen3MoeForCausalLMMTP"
             ):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
-            # Run forward
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            # Run forward under a per-step ForwardContext so the model layer
+            # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
+            # is no-op for the attn_backend half when a context is already
+            # active, so this outer wrap is what reaches RadixAttention.
+            with forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
+            ):
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch
+                ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
+            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
@@ -900,8 +956,13 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
+            maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
             forward_batch.positions.add_(1)
 
+        if index_share_for_mtp_iteration:
+            forward_batch.topk_indices = None
+            forward_batch.reuse_mtp_topk_indices = False
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
@@ -962,6 +1023,7 @@ class EAGLEWorker(TpModelWorker):
                 batch.sampling_info.vocab_mask = None
 
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -1197,16 +1259,24 @@ class EAGLEWorker(TpModelWorker):
             hidden_states = logits_output.hidden_states
         else:
             forward_batch.can_run_dp_cuda_graph = False
+            attn_backend = None
             if not forward_batch.forward_mode.is_idle():
                 attn_backend = (
                     self.draft_extend_attn_backend
                     or self.draft_model_runner.attn_backend
                 )
                 attn_backend.init_forward_metadata(forward_batch)
-                forward_batch.attn_backend = attn_backend
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+                forward_batch.mark_forward_metadata_ready()
+            # Publish the chosen backend via ForwardContext so model code
+            # picks it up for this forward (no runner-attr mutation).
+            if attn_backend is not None:
+                ctx_mgr = forward_context(ForwardContext(attn_backend=attn_backend))
+            else:
+                ctx_mgr = contextlib.nullcontext()
+            with ctx_mgr:
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch
+                ).logits_output
             # Non-cuda-graph path: compute topk_p / topk_index inline.
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)

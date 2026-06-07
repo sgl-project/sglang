@@ -9,6 +9,10 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -55,6 +59,7 @@ class ForwardBatchDeepSeekMHAMixin:
 
     def prepare_chunked_kv_indices(self, device: torch.device):
         self.prefix_chunk_kv_indices = []
+        req_to_token = get_req_to_token_pool().req_to_token
         for idx in range(self.num_prefix_chunks):
             chunk_starts = self.prefix_chunk_starts[idx]
             chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
@@ -66,13 +71,13 @@ class ForwardBatchDeepSeekMHAMixin:
             )
 
             create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
-                self.req_to_token_pool.req_to_token,
+                req_to_token,
                 self.req_pool_indices,
                 chunk_starts,
                 chunk_seq_lens,
                 chunk_cu_seq_lens,
                 chunk_kv_indices,
-                self.req_to_token_pool.req_to_token.shape[1],
+                req_to_token.shape[1],
             )
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
@@ -108,10 +113,15 @@ class ForwardBatchDeepSeekMHAMixin:
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
     def prepare_chunked_prefix_cache_info(self, device: torch.device):
 
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MLATokenToKVPool,
+        )
 
-        assert isinstance(
-            self.token_to_kv_pool, MLATokenToKVPool
+        token_to_kv_pool = get_token_to_kv_pool()
+        assert isinstance(token_to_kv_pool, MLATokenToKVPool) or (
+            isinstance(token_to_kv_pool, HybridLinearKVPool)
+            and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):
@@ -191,14 +201,15 @@ class ForwardBatchDeepSeekMHAMixin:
             device=self.req_pool_indices.device,
         )
         kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        req_to_token = get_req_to_token_pool().req_to_token
         create_flashinfer_kv_indices_triton[(self.batch_size,)](
-            self.req_to_token_pool.req_to_token,
+            req_to_token,
             self.req_pool_indices,
             self.seq_lens,
             kv_indptr,
             None,
             kv_indices,
-            self.req_to_token_pool.req_to_token.shape[1],
+            req_to_token.shape[1],
         )
         self.mha_one_shot_kv_indices = kv_indices
         return kv_indices

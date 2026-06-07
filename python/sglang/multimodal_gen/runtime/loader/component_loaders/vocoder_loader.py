@@ -33,10 +33,10 @@ class VocoderLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         config = get_diffusers_component_config(component_path=component_model_path)
-        class_name = config.pop("_class_name", None)
+        class_name = config.pop("_class_name", None) or self.component_architecture
         assert (
             class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        ), "Vocoder class name must be available from component config or pipeline config."
 
         server_args.model_paths[component_name] = component_model_path
 
