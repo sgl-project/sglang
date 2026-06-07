@@ -4,9 +4,16 @@ import logging
 from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+from http import HTTPStatus
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -51,6 +58,7 @@ class SchedulerDllmMixin:
 
         can_run_list = adder.can_run_list
         if not can_run_list:
+            self._break_dllm_pool_deadlock()
             return None
 
         # Record metrics and update state
@@ -87,9 +95,22 @@ class SchedulerDllmMixin:
 
                 req.output_ids.extend(next_token_ids)
                 req.update_finish_state(new_accepted_len=new_tokens)
+                if (
+                    not req.finished()
+                    and req.seqlen + self.dllm_config.block_size
+                    > self.model_config.context_len
+                ):
+                    # The next canvas would overrun the req_to_token row.
+                    req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
 
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
+                    # Uniform: the last canvas KV is the decoder's transient
+                    # denoising KV, keep it out of the radix tree.
+                    release_kv_cache(
+                        req,
+                        self.tree_cache,
+                        is_insert=not self.dllm_config.is_uniform,
+                    )
                     req.time_stats.set_completion_time()
 
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -103,7 +124,26 @@ class SchedulerDllmMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    def _dllm_pool_headroom(self: Scheduler) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        if hasattr(allocator, "full_available_size"):
+            return min(
+                int(allocator.full_available_size())
+                + self.tree_cache.full_evictable_size(),
+                int(allocator.swa_available_size())
+                + self.tree_cache.swa_evictable_size(),
+            )
+        return int(allocator.available_size()) + self.tree_cache.evictable_size()
+
     def _fetch_waiting_reqs(self: Scheduler):
+        # Back-pressure: while the pool cannot fit one canvas round, admitting
+        # another request only burns the survivors' headroom on its prefill.
+        if (
+            self.dllm_manager.waiting_queue
+            and self._dllm_pool_headroom()
+            <= self.dllm_config.block_size + self.token_to_kv_pool_allocator.page_size
+        ):
+            return
         # Calculate how many requests can be added to DLLM manager
         max_dllm_capacity = self.dllm_config.max_running_requests - len(
             self.dllm_manager.waiting_queue
@@ -237,6 +277,43 @@ class SchedulerDllmMixin:
         )
 
         return new_batch
+
+    def _break_dllm_pool_deadlock(self: Scheduler):
+        """Break the deadlock where staged requests hold the whole pool.
+
+        Nothing runs and nothing can extend, so nothing would ever finish.
+        Abort the least-progressed holder so the others run to completion.
+        """
+        if len(self.running_batch.reqs) > 0:
+            return
+        holders = [
+            r
+            for r in self.dllm_manager.waiting_queue
+            if r.dllm_phase
+            in (DllmReqPhase.STAGING_PREFILL, DllmReqPhase.STAGING_DECODE)
+        ]
+        if not holders:
+            return
+        if (
+            self._dllm_pool_headroom()
+            > self.dllm_config.block_size + self.token_to_kv_pool_allocator.page_size
+        ):
+            return
+
+        req = min(holders, key=lambda r: len(r.output_ids))
+        self.dllm_manager.waiting_queue = [
+            r for r in self.dllm_manager.waiting_queue if r is not req
+        ]
+        self.dllm_manager.staging_queue = [
+            r for r in self.dllm_manager.staging_queue if r is not req
+        ]
+        req.finished_reason = FINISH_ABORT(
+            "KV pool exhausted. Retry the request.",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        self.output_streamer.stream_output([req], req.return_logprob)
+        logger.warning("dLLM pool deadlock: aborted %s", req.rid)
 
     def process_dllm_incoming_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]

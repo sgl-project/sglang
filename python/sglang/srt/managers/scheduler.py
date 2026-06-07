@@ -2211,6 +2211,33 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # Uniform-state diffusion samples the canvas from the renoise schedule and
+        # bypasses logit post-processing, so request-level sampling controls have no
+        # effect. Reject them explicitly rather than ignore them silently.
+        if self.dllm_config is not None and self.dllm_config.is_uniform:
+            sp = req.sampling_params
+            unsupported = []
+            if req.return_logprob:
+                unsupported.append("logprobs")
+            if sp.regex or sp.json_schema or sp.ebnf or sp.structural_tag:
+                unsupported.append("structured output (regex/json_schema/ebnf/structural_tag)")
+            if sp.logit_bias:
+                unsupported.append("logit_bias")
+            if (
+                sp.frequency_penalty
+                or sp.presence_penalty
+                or sp.repetition_penalty != 1.0
+            ):
+                unsupported.append("presence/frequency/repetition penalties")
+            if unsupported:
+                req.set_finish_with_abort(
+                    "DiffusionGemma does not support "
+                    + ", ".join(unsupported)
+                    + " (sampling is governed by the renoise schedule)."
+                )
+                self._add_request_to_queue(req)
+                return
+
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
@@ -2613,7 +2640,40 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+                if (
+                    self.dllm_config.is_uniform
+                    and not req.is_dllm_prefill()
+                    and req.fill_len > self.dllm_config.block_size
+                ):
+                    # Uniform dLLM: drop the canvas from the cached prefix so the
+                    # next round re-encodes it causally (its KV is the decoder's
+                    # transient denoising KV). Free its slots except the page
+                    # shared with the context.
+                    block = self.dllm_config.block_size
+                    ctx = req.fill_len - block
+                    req_to_token = self.req_to_token_pool.req_to_token
+                    slots = req_to_token[req.req_pool_idx, ctx : ctx + block].to(
+                        torch.int64
+                    )
+                    page = self.token_to_kv_pool_allocator.page_size
+                    retained = 0
+                    if ctx > 0:
+                        shared_page = (
+                            int(req_to_token[req.req_pool_idx, ctx - 1].item()) // page
+                        )
+                        keep = (slots // page) == shared_page
+                        retained = int(keep.sum().item())
+                        slots = slots[~keep]
+                    self.token_to_kv_pool_allocator.free(slots)
+                    # Shrink the KV bookkeeping past the retained shared-page
+                    # slots so a later release cannot re-free the freed ones.
+                    req.kv_committed_len = ctx + retained
+                    req.kv_allocated_len = ctx + retained
+                    req.fill_len = ctx
+                    self.stash_chunked_request(req)
+                    req.fill_len = ctx + block
+                else:
+                    self.stash_chunked_request(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -3549,7 +3609,9 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
-            and not self.dllm_manager.any_staging_reqs()
+            # dLLM requests hold KV in dllm_manager.waiting_queue between
+            # rounds, so a starved round must not count as idle.
+            and self.dllm_manager.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
