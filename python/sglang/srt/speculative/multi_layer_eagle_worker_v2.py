@@ -389,7 +389,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         maybe_detect_oob(
             next_token_ids,
             0,
-            self.draft_runner_list[0].model_config.vocab_size,
+            self.model_config.vocab_size,
             "draft_extend_for_prefill: next_token_ids before draft embed",
         )
 
