@@ -42,6 +42,8 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
     decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
     gsm8k_threshold = 0.90
     num_gsm8k_questions = 100
+    tp_size = 4
+    pp_size = 1
 
     @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
     def test_multiturn_logprobs_match(self):
@@ -58,7 +60,9 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             other_args=[
                 "--trust-remote-code",
                 "--tp-size",
-                "4",
+                cls.tp_size,
+                "--pp-size",
+                cls.pp_size,
                 "--attention-backend",
                 "compressed",
                 "--page-size",
@@ -103,6 +107,13 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
+
+
+class TestUnifiedDeepSeekV4FlashHiCachePP(TestUnifiedDeepSeekV4FlashHiCache):
+    """DeepSeek V4 Flash HiCache + PP"""
+
+    tp_size = 1
+    pp_size = 4
 
 
 # ─── DeepSeek V4 Flash + HiCache L3 (file backend) ──────────────────────
