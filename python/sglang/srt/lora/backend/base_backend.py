@@ -199,7 +199,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         w2 = getattr(qinfo, "w2_weight", None)
         if w2 is None:
             w2 = qinfo.gemm2_weights
-        E, N, _ = w13.shape
+        # Don't unpack a fixed ndim: FP8/FP4 weights are 3-D [E, N, K(/pack)], while the
+        # bf16 BlockMajorK-prepared weights are 4-D [E, N, K/128, 128]. dims 0/1 are
+        # E and N either way.
+        E, N = w13.shape[0], w13.shape[1]
         hidden_dim = w2.shape[1]
         device = w13.device
         dtype = compute_dtype
