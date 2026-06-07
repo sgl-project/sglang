@@ -568,28 +568,6 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertFalse(server_args.disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
-    def test_deepseek_v3_rejects_megamoe(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="megamoe",
-        )
-        self._set_arch(server_args, "DeepseekV3ForCausalLM")
-
-        with self.assertRaisesRegex(ValueError, "DeepSeek V3 does not support"):
-            server_args._handle_a2a_moe()
-
-    def test_deepseek_v3_megamoe_waterfill_still_routes_to_deepep(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="megamoe",
-            enable_deepep_waterfill=True,
-        )
-        self._set_arch(server_args, "DeepseekV3ForCausalLM")
-        server_args._handle_a2a_moe()
-
-        self.assertEqual(server_args.moe_a2a_backend, "deepep")
-        self.assertTrue(server_args.enforce_shared_experts_fusion)
-
     def test_waterfill_supports_deepep_low_latency_mode(self):
         server_args = ServerArgs(
             model_path="dummy",

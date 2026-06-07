@@ -3481,12 +3481,6 @@ class ServerArgs:
             )
 
         if self.moe_a2a_backend == "megamoe":
-            if get_model_arch_or_none() == "DeepseekV3ForCausalLM":
-                raise ValueError(
-                    "DeepSeek V3 does not support the MegaMoE backend. "
-                    "Use --moe-a2a-backend deepep for DeepSeek V3, or use "
-                    "--enable-deepep-waterfill to route waterfill through DeepEP."
-                )
             self.ep_size = self.tp_size
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
