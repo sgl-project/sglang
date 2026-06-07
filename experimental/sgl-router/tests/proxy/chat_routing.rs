@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -29,18 +29,16 @@ fn config_for(_worker_url: &str) -> Config {
             port: 0,
         },
         observability: ObservabilityConfig::default(),
-        models: vec![ModelConfig {
+        model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
-        }],
-        discovery: DiscoveryConfig {
-            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-                urls: vec!["http://placeholder:0".into()],
-            }),
         },
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            urls: vec!["http://placeholder:0".into()],
+        }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
     }
@@ -619,7 +617,7 @@ async fn no_healthy_workers_returns_503() {
     );
 }
 
-/// A worker is registered for a model that is NOT in `cfg.models` (so the
+/// A worker is registered for a model that is NOT the configured `cfg.model` (so the
 /// policy registry has no entry for it).  The handler returns 404
 /// `model_not_found` rather than 500 — clients can recover by sending a
 /// different model name; an internal_error would mask the misconfiguration.
