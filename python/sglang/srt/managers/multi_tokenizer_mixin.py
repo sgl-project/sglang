@@ -749,11 +749,9 @@ class SenderWrapper:
         self,
         port_args: PortArgs,
         send_to_scheduler: zmq.Socket,
-        is_multi_tokenizer: bool = False,
     ):
         self.port_args = port_args
         self.send_to_scheduler = send_to_scheduler
-        self.is_multi_tokenizer = is_multi_tokenizer
 
     def send_obj(self, obj):
         if hasattr(obj, "http_worker_ipc"):

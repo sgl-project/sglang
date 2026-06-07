@@ -7995,7 +7995,7 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
-        if server_args.tokenizer_worker_num == 1:
+        if server_args.tokenizer_worker_num == 1 and not server_args.enable_http2:
             tokenizer_worker_ipc_name = None
         else:
             tokenizer_worker_ipc_name = (

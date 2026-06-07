@@ -380,7 +380,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if self.server_args.tokenizer_worker_num == 1:
+        # for http2, use the connect instead of binding
+        if (
+            self.server_args.tokenizer_worker_num == 1
+            and not self.server_args.enable_http2
+        ):
             send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
@@ -391,7 +395,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler, True)
+            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
         self.load_snapshot_reader = create_load_snapshot_reader(
             self.server_args,

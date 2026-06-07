@@ -2576,7 +2576,7 @@ def _setup_and_run_http_server(
             # workers (forked or spawned) can locate the shared memory
             # segment created above.
             envs.SGLANG_GRANIAN_PARENT_PID.set(os.getpid())
-            _close_main_process_sockets()
+            # _close_main_process_sockets()
             _run_granian_server(server_args)
         finally:
             if multi_tokenizer_args_shm is not None:
