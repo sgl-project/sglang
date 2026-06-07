@@ -1452,9 +1452,8 @@ class AiterAttnBackend(AttentionBackend):
             # coordination, after which this allocation can revert to
             # per-page (gated on use_mla).
             # Reserve draft slack: MLA target_verify writes seq_len +
-            # num_draft_tokens per row and the kernel doesn't bound writes to
-            # this buffer, so a near-full sequence would silently overflow.
-            # Mirrors dsa / flashmla.
+            # num_draft_tokens per row; without it a near-full sequence
+            # overflows the buffer. Mirrors dsa / flashmla.
             draft_slack = self.num_draft_tokens or 0
             buffer_numel = max_bs * (
                 max_num_blocks_per_seq * self.page_size + draft_slack
@@ -1699,9 +1698,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
-            # Safety guard: fail fast on an undersized buffer (silent overflow
-            # otherwise). seq_lens_sum is None at capture (dummy seq_lens); only
-            # check on replay.
+            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
             if seq_lens_sum is not None:
                 kv_indices_used = seq_lens_sum + (
                     self.num_draft_tokens * bs if self.use_mla else 0
@@ -1712,8 +1709,6 @@ class AiterAttnBackend(AttentionBackend):
                     "aiter target_verify kv_indices",
                     bs=bs,
                     seq_lens_sum=seq_lens_sum,
-                    num_draft_tokens=self.num_draft_tokens,
-                    use_mla=self.use_mla,
                 )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,

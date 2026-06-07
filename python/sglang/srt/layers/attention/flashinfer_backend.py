@@ -1590,8 +1590,6 @@ class FlashInferMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        # Fail fast on an undersized kv_indices row: the kernel would otherwise write
-        # OOB and *silently* corrupt memory, only sometimes surfacing as a crash.
         required_kv_indices_len = draft_kv_indices_used_len(
             seq_lens_sum, self.topk, bs, self.speculative_num_steps
         )
@@ -1599,10 +1597,8 @@ class FlashInferMultiStepDraftBackend:
             required_kv_indices_len,
             kv_indices_buffer.shape[1],
             "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
-            topk=self.topk,
-            num_seqs=num_seqs,
+            bs=bs,
             seq_lens_sum=seq_lens_sum,
-            num_steps=self.speculative_num_steps,
         )
 
         self.generate_draft_decode_kv_indices[

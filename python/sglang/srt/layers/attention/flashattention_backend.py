@@ -2112,9 +2112,6 @@ class FlashAttentionBackend(AttentionBackend):
                             cache_loc.shape[1],
                             metadata_expand.page_table.shape[1],
                             "draft expand page_table (width decode_length + 1)",
-                            page_size=self.page_size,
-                            topk=self.topk,
-                            num_steps=self.speculative_num_steps,
                         )
                         draft_decode_set_expand_metadata(
                             cache_seqlens_int32=metadata_expand.cache_seqlens_int32,
