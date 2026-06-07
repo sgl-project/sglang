@@ -3455,13 +3455,6 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
-        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
-            logger.warning(
-                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-                "Waterfill requires the DeepEP backend."
-            )
-            self.moe_a2a_backend = "deepep"
-
         if (
             envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
             and self.moe_a2a_backend != "megamoe"
@@ -3471,6 +3464,24 @@ class ServerArgs:
                 "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
                 "auto-configuring --moe-a2a-backend megamoe."
             )
+
+        if self.enable_deepep_waterfill and self.moe_a2a_backend not in (
+            "deepep",
+            "megamoe",
+        ):
+            logger.warning(
+                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
+                "Waterfill requires the DeepEP backend."
+            )
+            self.moe_a2a_backend = "deepep"
+
+        if self.enable_deepep_waterfill:
+            if self.disable_shared_experts_fusion:
+                logger.warning(
+                    "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+                )
+                self.disable_shared_experts_fusion = False
+            self.enforce_shared_experts_fusion = True
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
@@ -3490,12 +3501,6 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
             if self.enable_deepep_waterfill:
-                if self.disable_shared_experts_fusion:
-                    logger.warning(
-                        "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
-                    )
-                    self.disable_shared_experts_fusion = False
-                self.enforce_shared_experts_fusion = True
                 logger.info(
                     "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
                 )

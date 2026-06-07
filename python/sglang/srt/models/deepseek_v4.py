@@ -1395,7 +1395,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             not _use_cp
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_attention_tp_size() > 1
-            and not get_moe_a2a_backend().is_none()
+            and get_moe_a2a_backend().is_deepep()
         )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
@@ -1700,26 +1700,32 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
+        server_args = get_global_server_args()
+        if server_args.disable_shared_experts_fusion:
             return
 
-        # Waterfill needs shared-experts fusion so it can dispatch shared
-        # expert tokens to least-loaded EP ranks.
-        if get_global_server_args().enable_deepep_waterfill:
+        # Waterfill and MegaMoE need shared-experts fusion so the shared expert
+        # is represented as a MegaMoE slot. Use --disable-shared-experts-fusion
+        # only when explicitly measuring the non-fused baseline.
+        if server_args.enable_deepep_waterfill or get_moe_a2a_backend().is_megamoe():
             if self.config.n_shared_experts != 1:
                 raise ValueError(
-                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
+                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
                     f"expert, but got n_shared_experts={self.config.n_shared_experts}."
                 )
             self.num_fused_shared_experts = self.config.n_shared_experts
+            fusion_reason = (
+                "--enable-deepep-waterfill set"
+                if server_args.enable_deepep_waterfill
+                else "MegaMoE backend enabled"
+            )
             log_info_on_rank0(
                 logger,
-                "DeepSeek V4: --enable-deepep-waterfill set; KEEP shared-experts "
-                "fusion enabled so waterfill can rebalance shared expert dispatch.",
+                f"DeepSeek V4: {fusion_reason}; KEEP shared-experts fusion enabled.",
             )
             return
 
-        get_global_server_args().disable_shared_experts_fusion = True
+        server_args.disable_shared_experts_fusion = True
         log_info_on_rank0(
             logger,
             "DeepSeek V4 requires different clamping for shared and routed experts. "
