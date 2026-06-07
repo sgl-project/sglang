@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -46,6 +47,9 @@ if _is_hip:
         fused_qk_rope_reshape_and_cache,
     )
 
+if _is_xpu:
+    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+
 
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
@@ -79,6 +83,7 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
             and not (_is_mps)
+            and not (current_platform.is_out_of_tree())
         ):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
@@ -419,14 +424,35 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
-        return torch.ops.sgl_kernel.rotary_embedding(
-            positions,
-            query,
-            key,
-            self.head_size,
-            self.cos_sin_cache,
-            self.is_neox_style,
-        )
+        self._match_cos_sin_cache_dtype(query)
+
+        # Fused_qk_rope only supports aligned head_size
+        if self.head_size in [128, 256, 512]:
+            num_tokens = positions.size(0)
+            q_rope = query.view(num_tokens, -1, self.head_size)
+            k_rope = key.view(num_tokens, -1, self.head_size)
+            if self.head_size != self.rotary_dim:
+                q_rope = q_rope[..., : self.rotary_dim]
+                k_rope = k_rope[..., : self.rotary_dim]
+            fused_qk_rope_with_cos_sin_cache_inplace(
+                q_rope,
+                k_rope,
+                self.cos_sin_cache,
+                positions,
+                self.rotary_dim,
+                self.is_neox_style,
+            )
+            return query, key
+        else:
+            # Use fallback kernel of 'rotary_embedding'
+            return torch.ops.sgl_kernel.rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

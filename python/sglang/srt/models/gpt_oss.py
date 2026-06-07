@@ -81,6 +81,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_cuda_version,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_npu,
@@ -89,6 +90,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_tinygemm_supported = (
@@ -881,7 +883,8 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
-            weight = weight.cuda()
+            if _is_cuda:
+                weight = weight.cuda()
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1163,6 +1166,22 @@ class GptOssForCausalLM(nn.Module):
                         param = params_dict[name]
                         if "sinks" in name:
                             start = get_attention_tp_rank() * param.numel()
+                            tp_size = get_tensor_model_parallel_world_size()
+                            full_shard_size = param.numel() * tp_size
+                            # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
+                            # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
+                            if (
+                                _is_cpu
+                                and full_shard_size > loaded_weight.size(0)
+                                and start + param.numel() >= loaded_weight.size(0)
+                            ):
+                                pad_size = start + param.numel() - loaded_weight.size(0)
+                                pad_tensor = torch.zeros(pad_size).to(
+                                    loaded_weight.dtype
+                                )
+                                loaded_weight = torch.cat(
+                                    [loaded_weight, pad_tensor], dim=0
+                                ).to(loaded_weight.dtype)
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )

@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.managers.schedule_batch import get_global_server_args
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -72,6 +73,12 @@ class XPUAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
+        self.use_sliding_window_kv_pool = (
+            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
+            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+        )
+        if self.use_sliding_window_kv_pool:
+            self.token_to_kv_pool = model_runner.token_to_kv_pool
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
@@ -193,6 +200,7 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -373,6 +381,16 @@ class XPUAttentionBackend(AttentionBackend):
                 ),
             ]
 
+        # Translate full-pool indices to SWA-pool indices for hybrid models
+        if self.use_sliding_window_kv_pool:
+            # flash_attn_with_kvcache requires int32 page tables; the SWA index
+            # mapping is int64, so cast (matches flashattention_backend.py).
+            metadata.swa_page_table = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    metadata.page_table
+                ).to(torch.int32)
+            )
+
         if self.use_mla:
             workspace_size = flash_mla_get_workspace_size(
                 max_seq_len=self.max_context_len,
@@ -389,11 +407,27 @@ class XPUAttentionBackend(AttentionBackend):
                     workspace_size, device=self.device, dtype=torch.uint8
                 )
 
+        # Translate full-pool indices to SWA-pool indices for hybrid models
+        if self.use_sliding_window_kv_pool:
+            # flash_attn_with_kvcache requires int32 page tables; the SWA index
+            # mapping is int64, so cast (matches flashattention_backend.py).
+            metadata.swa_page_table = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    metadata.page_table
+                ).to(torch.int32)
+            )
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
+
+            if self.use_sliding_window_kv_pool and metadata.swa_page_table is not None:
+                metadata.swa_page_table = (
+                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
+                )
+
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
@@ -413,8 +447,17 @@ class XPUAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        if k is not None:
-            assert v is not None
+        if k is None and v is None:
+            # Cross-layer KV sharing (Gemma 4): the layer reuses another
+            # layer's KV cache. The paged kernel reads K/V directly via
+            # page_table, and pool.get_kv_buffer(layer.layer_id) routes
+            # to the correct sub-pool because RadixAttention is initialized
+            # with layer_id=kv_shared_layer_index for shared layers. No
+            # materialization needed; just skip the write path.
+            pass
+        elif k is None or v is None:
+            raise ValueError("Both k and v should be None or not None")
+        else:
             if save_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
@@ -497,6 +540,13 @@ class XPUAttentionBackend(AttentionBackend):
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
+            if is_hybrid_swa and self.use_sliding_window_kv_pool:
+                if metadata.swa_page_table is not None:
+                    page_table = metadata.swa_page_table
+                else:
+                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        metadata.page_table
+                    ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -525,7 +575,7 @@ class XPUAttentionBackend(AttentionBackend):
                 page_table=page_table,
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
@@ -546,7 +596,7 @@ class XPUAttentionBackend(AttentionBackend):
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    cu_seqlens_k_new=None,
                     max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
                     softmax_scale=layer.scaling,
                     causal=False,
@@ -648,7 +698,7 @@ class XPUAttentionBackend(AttentionBackend):
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    cu_seqlens_k_new=None,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
@@ -668,7 +718,7 @@ class XPUAttentionBackend(AttentionBackend):
                             page_table=self.forward_metadata_spec_decode_expand.page_table,
                             cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                             cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                            cu_seqlens_k_new=None,
                             max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
                             softmax_scale=layer.scaling,
                             causal=False,
@@ -688,7 +738,8 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return out
 
     def forward_decode(
         self,
@@ -703,8 +754,12 @@ class XPUAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if k is not None:
-            assert v is not None
+        if k is None and v is None:
+            # Cross-layer KV sharing (Gemma 4): see forward_extend for details.
+            pass
+        elif k is None or v is None:
+            raise ValueError("Both k and v should be None or not None")
+        else:
             if save_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
@@ -787,7 +842,7 @@ class XPUAttentionBackend(AttentionBackend):
                     page_table=metadata.encoder_page_table,
                     cache_seqlens=metadata.encoder_lens_int32,
                     cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
+                    cu_seqlens_k_new=None,
                     max_seqlen_q=1,
                     softmax_scale=layer.scaling,
                     causal=False,
@@ -817,7 +872,24 @@ class XPUAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
+                is_swa_layer = (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                )
+
                 page_table = metadata.page_table
+                # For SWA layers on hybrid models, use the translated
+                # SWA-pool page table so KV reads hit the correct pool.
+                if is_swa_layer and self.use_sliding_window_kv_pool:
+                    if metadata.swa_page_table is not None:
+                        page_table = metadata.swa_page_table
+                    else:
+                        page_table = (
+                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                metadata.page_table
+                            ).to(torch.int32)
+                        )
+
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
@@ -833,7 +905,7 @@ class XPUAttentionBackend(AttentionBackend):
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k,
+                    cu_seqlens_k_new=None,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
@@ -854,7 +926,7 @@ class XPUAttentionBackend(AttentionBackend):
                             page_table=self.forward_metadata_spec_decode_expand.page_table,
                             cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                             cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                            cu_seqlens_k_new=None,
                             max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
                             softmax_scale=layer.scaling,
                             causal=False,
@@ -899,14 +971,18 @@ class XPUAttentionBackend(AttentionBackend):
                 layer.scaling,
             )
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return out
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
     def _init_local_attn_metadata(
-        self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
+        self,
+        forwardbatch: ForwardBatch,
+        metadata: FlashAttentionMetadata,
+        device,
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
         if self.attention_chunk_size is None:
@@ -924,6 +1000,17 @@ class XPUAttentionBackend(AttentionBackend):
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
+
+        # make_local_attention_virtual_batches expects a page-granularity block table:
+        # column p is the logical page number, and the value stored at that column is the
+        # physical page index. The raw req_to_token table is token-granularity (column i =
+        # the KV slot for token i), so when page_size > 1 we must stride and divide first
+        # so that block_starts = k_seqstarts_absolute // page_size correctly indexes the table.
+        if self.page_size > 1:
+            strided_indices = torch.arange(
+                0, page_table.shape[1], self.page_size, device=page_table.device
+            )
+            page_table = page_table[:, strided_indices] // self.page_size
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seq_lens_np = cache_seqlens_int32.cpu().numpy()

@@ -39,6 +39,8 @@ default parameters when initializing and generating videos.
 | Helios Distilled             | `BestWishYsh/Helios-Distilled`                     | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |               ❌               |                   ❌                    |             ❌             |
 | LTX-2 (one/two-stage/TI2V)   | `Lightricks/LTX-2`                                | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |               ❌               |                   ❌                    |             ❌             |
 | LTX-2.3 (one/two-stage/TI2V/HQ) | `Lightricks/LTX-2.3`                           | 768×512<br>1536×1024<br>1920×1088 (HQ default) |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |               ❌               |                   ❌                    |             ❌             |             ❌             |
+| Cosmos3-Nano (T2V / I2V / T2I)  | `nvidia/Cosmos3-Nano`                          | 720p · 480p<br>1024×1024 (T2I)                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |               ❌               |                   ❌                    |             ❌             |
+| Cosmos3-Super (T2V / I2V / T2I) | `nvidia/Cosmos3-Super`                         | 720p · 480p<br>1024×1024 (T2I)                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |               ❌               |                   ❌                    |             ❌             |
 
 **Note**:
 
@@ -56,6 +58,11 @@ default parameters when initializing and generating videos.
    - `resident` usually provides the best latency/throughput but uses much more VRAM.
    - `original` keeps official two-stage semantics without the premerged stage-2 transformer path.
    - Example (one prior run): `original` `154.67s`, `snapshot` `114.05s`, `resident` `75.71s`; peak VRAM trend is `original < snapshot < resident`.
+5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (8B) and
+   `nvidia/Cosmos3-Super` (32B). Both share the same pipeline; the only
+   difference is transformer depth and width, picked up from
+   `transformer/config.json` at load time. A single checkpoint serves T2V,
+   I2V (`--image-path`), and T2I (`--num-frames 1`).
 
 ### Image Generation Models
 
@@ -66,8 +73,6 @@ default parameters when initializing and generating videos.
 | FLUX.2-dev-NVFP4          | `black-forest-labs/FLUX.2-dev-NVFP4`                     |
 | FLUX.2-Klein-4B           | `black-forest-labs/FLUX.2-klein-4B`                      |
 | FLUX.2-Klein-9B           | `black-forest-labs/FLUX.2-klein-9B`                      |
-| FLUX.2-Klein-Base-4B      | `black-forest-labs/FLUX.2-klein-base-4B`                 |
-| FLUX.2-Klein-Base-9B      | `black-forest-labs/FLUX.2-klein-base-9B`                 |
 | Z-Image                   | `Tongyi-MAI/Z-Image`                                    |
 | Z-Image-Turbo             | `Tongyi-MAI/Z-Image-Turbo`                              |
 | GLM-Image                 | `zai-org/GLM-Image`                                     |
