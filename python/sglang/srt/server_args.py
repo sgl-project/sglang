@@ -1851,6 +1851,20 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+                if self.enable_two_batch_overlap and (
+                    index_topk_freq > 1
+                    or (index_topk_pattern is not None and "S" in index_topk_pattern)
+                ):
+                    raise ValueError(
+                        "--enable-two-batch-overlap is not supported with DSA "
+                        "index-topk sharing (index_topk_freq > 1 or an "
+                        "index_topk_pattern containing shared layers): the TBO op "
+                        "path does not propagate topk indices across layers, so "
+                        "shared layers would run sparse attention without indices."
+                    )
+
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_dsa_prefill_context_parallel:
                         logger.warning(
