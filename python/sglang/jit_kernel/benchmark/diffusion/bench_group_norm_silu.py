@@ -38,8 +38,28 @@ CASES = [
     Case("video_3d_small", (1, 64, 4, 16, 16), 32),
     Case("threshold_3d", (1, 128, 1, 256, 256), 32),
     Case("hunyuan_video_large", (1, 128, 20, 256, 256), 32),
+    # LTX-2 latent upsampler (`LatentUpsampler` + `ResBlock`) operates on
+    # `[B, mid_channels=512, F, H, W]` tensors with num_groups=32. The
+    # `small` and `pre_720p` cases stay in the default set; the larger
+    # `post_720p` case is opt-in via LARGE_CASES below.
+    Case("ltx2_upsampler_small", (1, 512, 8, 45, 80), 32),
+    Case("ltx2_upsampler_pre_720p", (1, 512, 16, 90, 160), 32),
 ]
-CASE_BY_NAME = {case.name: case for case in CASES}
+
+# Cases too large to fit comfortably alongside the native-path intermediates
+# on consumer GPUs (e.g. 24 GB L4). Opt in with `--cases large` (large only),
+# `--cases all-large` (default + large), or by name.
+#
+# `ltx2_upsampler_post_720p` is ~471M bf16 elements (~940 MB tensor) and the
+# eager `silu(group_norm(x))` reference materializes mean / variance /
+# normalized / silu intermediates -- working set lands around 5 GB. On
+# H100 / H200 this is fine and surfaces the asymptotic ~14x kernel speedup;
+# on a 24 GB GPU it can OOM, so it's gated out of `--cases all`.
+LARGE_CASES = [
+    Case("ltx2_upsampler_post_720p", (1, 512, 16, 180, 320), 32),
+]
+
+CASE_BY_NAME = {case.name: case for case in CASES + LARGE_CASES}
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -70,6 +90,10 @@ def parse_dtypes(text: str) -> list[torch.dtype]:
 def parse_cases(text: str) -> list[Case]:
     if text == "all":
         return CASES
+    if text == "large":
+        return LARGE_CASES
+    if text == "all-large":
+        return CASES + LARGE_CASES
     names = [item.strip() for item in text.split(",") if item.strip()]
     missing = sorted(set(names) - CASE_BY_NAME.keys())
     if missing:
@@ -239,7 +263,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark fused GroupNorm+SiLU against PyTorch GroupNorm+SiLU."
     )
-    parser.add_argument("--cases", default="all")
+    parser.add_argument(
+        "--cases",
+        default="all",
+        help=(
+            "Comma-separated case names, or one of: 'all' (default-sized "
+            "cases only), 'large' (high-memory cases only -- requires "
+            "H100/H200-class GPU), 'all-large' (both). See CASES + LARGE_CASES."
+        ),
+    )
     parser.add_argument("--dtypes", default="bf16,fp16")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=25)
