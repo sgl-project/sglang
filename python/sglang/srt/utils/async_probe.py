@@ -27,10 +27,8 @@ def maybe_detect_inf(tensor: torch.Tensor, msg: str = ""):
 def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
     """Async OOB check — no GPU-CPU sync, error surfaces at next sync point.
 
-    Lower and upper bounds are asserted separately so the message names the failure
-    mode: a lower-bound hit is almost always an unmasked sentinel (a torch.full(-1)
-    gathered before being masked); an upper-bound hit is an out-of-range value
-    (off-by-one, under-allocation, or a bad input id).
+    Low/high asserted separately so the message names which failed (low =
+    negative/sentinel, high = out of range).
     """
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
         return
