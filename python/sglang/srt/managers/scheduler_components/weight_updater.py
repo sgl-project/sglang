@@ -95,12 +95,14 @@ class SchedulerWeightUpdaterManager:
             self.flush_cache_after_weight_update(recv_req)
         if not success:
             logger.error(message)
-        return UpdateWeightFromDiskReqOutput(success, message, 0)
+        return UpdateWeightFromDiskReqOutput(
+            success=success, message=message, num_paused_requests=0
+        )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return InitWeightsUpdateGroupReqOutput(success, message)
+        return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
         self,
@@ -108,7 +110,7 @@ class SchedulerWeightUpdaterManager:
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
-        return DestroyWeightsUpdateGroupReqOutput(success, message)
+        return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def update_weights_from_distributed(
         self,
@@ -120,7 +122,7 @@ class SchedulerWeightUpdaterManager:
             self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
-        return UpdateWeightsFromDistributedReqOutput(success, message)
+        return UpdateWeightsFromDistributedReqOutput(success=success, message=message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
@@ -134,7 +136,7 @@ class SchedulerWeightUpdaterManager:
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
-        return UpdateWeightsFromTensorReqOutput(success, message)
+        return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
@@ -147,7 +149,7 @@ class SchedulerWeightUpdaterManager:
         if not success:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
-        return UpdateWeightsFromIPCReqOutput(success, message)
+        return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
