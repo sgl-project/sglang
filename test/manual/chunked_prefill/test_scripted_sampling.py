@@ -16,7 +16,6 @@ class TestSamplingBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_max_new_tokens_zero_prefill_only(self):
-        """max_new_tokens=0 finishes on prefill with one sampled token and no decode forward."""
         self.server.execute_script(self._script_max_new_tokens_zero_prefill_only)
 
     @staticmethod
@@ -25,10 +24,6 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        # A generation model always samples one token on the final prefill chunk
-        # (batch_result_processor process_batch_result_prefill, unconditional on
-        # max_new_tokens); a prefill-only (max_new_tokens=0) req then finishes
-        # immediately and never runs a decode forward.
         assert len(r.req.output_ids) == 1, (
             f"max_new_tokens=0 finishes on the prefill chunk with one sampled "
             f"token; got {len(r.req.output_ids)}"
@@ -44,7 +39,6 @@ class TestSamplingBasic(ScriptedTestCase):
         )
 
     def test_max_new_tokens_one_long_chunked(self):
-        """max_new_tokens=1 over a chunked prompt yields exactly one token."""
         self.server.execute_script(self._script_max_new_tokens_one_long_chunked)
 
     @staticmethod
@@ -59,7 +53,6 @@ class TestSamplingBasic(ScriptedTestCase):
         )
 
     def test_max_new_tokens_1000_long_chunked(self):
-        """ignore_eos with a 1000-token budget decodes exactly 1000 tokens after chunking."""
         self.server.execute_script(self._script_max_new_tokens_1000_long_chunked)
 
     @staticmethod
@@ -78,7 +71,6 @@ class TestSamplingBasic(ScriptedTestCase):
         )
 
     def test_return_logprob_chunked(self):
-        """return_logprob over a chunked prompt reports one output logprob per token."""
         self.server.execute_script(self._script_return_logprob_chunked)
 
     @staticmethod
@@ -96,7 +88,6 @@ class TestSamplingBasic(ScriptedTestCase):
         assert len(r.req.logprob.output_token_logprobs_val) == 4
 
     def test_ignore_eos_chunked(self):
-        """ignore_eos forces a chunked request to finish via the length cap."""
         self.server.execute_script(self._script_ignore_eos_chunked)
 
     @staticmethod
@@ -114,7 +105,6 @@ class TestSamplingBasic(ScriptedTestCase):
         )
 
     def test_return_logprob_top_logprobs_chunked(self):
-        """top_logprobs_num reports exactly k entries per output token across chunks."""
         self.server.execute_script(self._script_return_logprob_top_logprobs_chunked)
 
     @staticmethod
@@ -143,7 +133,6 @@ class TestSamplingBasic(ScriptedTestCase):
             )
 
     def test_explicit_rid_chunked(self):
-        """An explicit rid is preserved through the chunked lifecycle."""
         self.server.execute_script(self._script_explicit_rid_chunked)
 
     @staticmethod
@@ -161,7 +150,6 @@ class TestSamplingBasic(ScriptedTestCase):
         assert len(r.req.output_ids) == 2
 
     def test_default_sampling_short(self):
-        """A short prompt under default sampling never enters the chunked path."""
         self.server.execute_script(self._script_default_sampling_short)
 
     @staticmethod
@@ -173,7 +161,6 @@ class TestSamplingBasic(ScriptedTestCase):
         assert len(r.req.output_ids) == 2
 
     def test_chunked_logprob_input_accumulates_across_chunks(self):
-        """Input logprobs accumulate one-per-token across every prefill chunk."""
         self.server.execute_script(
             self._script_chunked_logprob_input_accumulates_across_chunks
         )
@@ -181,13 +168,6 @@ class TestSamplingBasic(ScriptedTestCase):
     @staticmethod
     def _script_chunked_logprob_input_accumulates_across_chunks(t: ScriptedContext):
         prompt_len = VERY_LONG_PROMPT_LEN
-        # logprob_start_len=0 requests an input logprob for every prompt token;
-        # the default (-1) resolves to len(origin_input_ids), which starts
-        # logprob computation at the end of the prompt and returns NO input
-        # logprobs (schedule_batch compute_extend_logprob, ~L1973). With
-        # logprob_start_len=0 the engine returns one input logprob PER PROMPT
-        # TOKEN (the documented per-token contract; the LoRA logprob test
-        # likewise asserts == prompt_len), so request logprobs from the start.
         r = t.start_req(
             prompt_len=prompt_len,
             max_new_tokens=4,
@@ -207,7 +187,6 @@ class TestSamplingBasic(ScriptedTestCase):
         )
 
     def test_logprob_start_len_inside_chunk_2(self):
-        """logprob_start_len landing mid-chunk reports input logprobs only from that offset."""
         self.server.execute_script(self._script_logprob_start_len_inside_chunk_2)
 
     @staticmethod
@@ -233,25 +212,12 @@ class TestSamplingBasic(ScriptedTestCase):
         )
 
     def test_finish_reason_value_eos_vs_length_chunked(self):
-        """Chunked decode reports FINISH_MATCHED_TOKEN for EOS and FINISH_LENGTH for the cap."""
         self.server.execute_script(
             self._script_finish_reason_value_eos_vs_length_chunked
         )
 
     @staticmethod
     def _script_finish_reason_value_eos_vs_length_chunked(t: ScriptedContext):
-        # FINISH_MATCHED_TOKEN must be reached deterministically. Relying on the
-        # model emitting its real EOS within a token budget is model/prompt
-        # dependent (Qwen3-0.6B on a synthetic repeated-token prompt never emits
-        # EOS within 999 tokens, so it hit the length cap instead). Instead, probe
-        # the model's deterministic FIRST output token under greedy sampling
-        # (temperature=0 makes the token a pure function of the prompt, immune to
-        # the engine's random seed), flush the radix cache so the real request
-        # re-chunks the full prompt instead of cache-hitting the probe's prefix,
-        # then issue the real request with THAT token as a stop token. The engine
-        # finishes via the matched-token path (schedule_batch ~L1224-1233 sets
-        # FINISH_MATCHED_TOKEN when an output token is in stop_token_ids) on the
-        # first decode step, exactly exercising the matched-token finish.
         probe = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=1,
@@ -263,10 +229,6 @@ class TestSamplingBasic(ScriptedTestCase):
         assert probe.finished
         first_token = probe.req.output_ids[0]
 
-        # flush_cache() is a no-op unless the scheduler is fully idle; drain any
-        # in-flight release first so the real request re-chunks the full prompt
-        # instead of cache-hitting the probe's prefix (which would skip prefill
-        # entirely and report chunks_done=0).
         for _ in range(40):
             if t.is_fully_idle:
                 break

@@ -26,9 +26,6 @@ def _await_control(
     await_arrival: bool = True,
 ) -> None:
     if not await_arrival:
-        # Caller knows this control produces no recv echo to wait for (e.g. abort
-        # of an unknown/finished rid that TokenizerManager drops without
-        # forwarding); skip the arrival barrier instead of timing out.
         _http_post_fire_and_forget(ctx, path=path, json=json)
         return
     _http_post_and_await_recv_msg(

@@ -5,11 +5,8 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestChunkedFeaturePageSize(ChunkedTestBase):
-    __test__ = True  # re-enable: the shared base sets __test__ = False
+    __test__ = True
     model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-    # Llama-3.2-1B-Instruct measures 0.38-0.41 on mixed_prefix_gsm8k (H200,
-    # greedy); chunking corruption collapses the score to ~0, so 0.30 keeps
-    # full detection power for the model this class actually runs.
     gsm8k_threshold = 0.30
     feature_args = [
         "--page-size",

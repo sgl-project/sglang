@@ -34,8 +34,6 @@ def _http_post_fire_and_forget(
     path: str,
     json: Optional[Dict[str, Any]],
 ) -> None:
-    # No recv echo to await: TokenizerManager drops an unknown/finished-rid
-    # abort without forwarding anything to the scheduler.
     _submit_post(ctx, path=path, json=json)
 
 

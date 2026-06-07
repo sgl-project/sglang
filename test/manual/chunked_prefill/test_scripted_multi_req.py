@@ -15,11 +15,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 
 def _drain_flush_then_assert_no_kv_leak(t: ScriptedContext, baseline: dict):
-    # A finished req commits its prompt prefix to the radix tree, so its KV counts
-    # as cached-not-free until the tree is flushed; comparing kv_pool_free without
-    # flushing therefore reads legitimate caching as a leak. Drain the one-step
-    # overlap pipeline lag to idle, flush the now-unreferenced cached KV, then
-    # compare -- mirroring test_engine_stats_tracks_kv in the registered suite.
     for _ in range(5):
         yield
     t.flush_cache()
@@ -81,11 +76,6 @@ class TestMultiReqBasic(ScriptedTestCase):
     @staticmethod
     def _script_mixed_ten_chunked_ten_short(t: ScriptedContext):
         baseline = t.engine_stats()
-        # Distinct prompt_token per chunked req: identical-length prompts are
-        # byte-identical token streams that dedup in the radix tree, so all but the
-        # first would hit the cache and chunk zero times -- making chunks_done >= 2
-        # unsatisfiable. Distinct fill tokens give each req a non-shared prefix so
-        # each genuinely chunks.
         chunked = [
             t.start_req(
                 prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=100 + i
@@ -275,9 +265,6 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_multiple_chunked_staggered(t: ScriptedContext):
-        # Distinct prompt_token per req: identical-length prompts dedup in the radix
-        # tree, so later reqs would hit the cache and chunk zero times, breaking the
-        # per-req chunks_done >= 2 assertion below.
         reqs = []
         for i in range(4):
             reqs.append(
@@ -304,8 +291,6 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_eight_concurrent_chunked(t: ScriptedContext):
-        # Distinct prompt_token per req so identical-length prompts do not dedup in
-        # the radix tree (a cache hit would drop a later req's chunks_done to zero).
         reqs = [
             t.start_req(
                 prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=100 + i
@@ -347,10 +332,6 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_mixed_prefill_lengths(t: ScriptedContext):
-        # chunked_prefill_size is DEFAULT_CHUNK_SIZE (256): prompts that fit in a
-        # single chunk never become chunked_req, while prompts spanning multiple
-        # chunks must chunk at least twice. 256 sits on the boundary, so it stays
-        # loose.
         lens = [8, 16, 32, 64, 128, 256, 512, 1024]
         reqs = [t.start_req(prompt_len=L, max_new_tokens=2) for L in lens]
         by_len = dict(zip(lens, reqs))
@@ -439,9 +420,6 @@ class TestMultiReqPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_parallel_with_priority(t: ScriptedContext):
-        # schedule_low_priority_values_first defaults to False, so a larger
-        # priority value wins; the preemption threshold defaults to 10, so the
-        # high req's priority must exceed each normal's by more than 10.
         normal = [
             t.start_req(
                 prompt_len=16,
@@ -453,8 +431,6 @@ class TestMultiReqPriority(ScriptedTestCase):
         ]
         yield from run_until(normal[-1], lambda h: h.status == "running")
 
-        # Squeeze the KV pool down to nothing so the incoming high-priority req
-        # cannot be admitted without evicting a running normal req.
         t.exhaust_kv(leave_pages=0)
         high = t.start_req(prompt_len=16, max_new_tokens=2, priority=100)
 
@@ -476,11 +452,6 @@ class TestMultiReqPriority(ScriptedTestCase):
 
 
 class TestMultiReqMixedChunk(ScriptedTestCase):
-    # enable_mixed_chunk lets a chunked prefill share its forward batch with
-    # running decode. Only then does the scheduler pass
-    # num_mixed_decode_tokens = running_bs into PrefillAdder, which subtracts it
-    # from rem_chunk_tokens (schedule_policy.py:436-437) so each prefill chunk is
-    # smaller than chunked_prefill_size while a decode is co-running.
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         enable_mixed_chunk=True,
@@ -493,24 +464,12 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
 
     @staticmethod
     def _script_long_prefill_chunks_more_with_concurrent_decode(t: ScriptedContext):
-        """Concurrent decode steals chunk budget, so a 4-chunk prompt chunks >= 4 times."""
-        # Push a short req into the decoding state first so a decode is in flight
-        # when the long prompt arrives and starts chunking.
         decoder = t.start_req(prompt_len=16, max_new_tokens=64)
         yield from run_until(decoder, lambda h: h.status == "running")
 
-        # prompt_len = 4 * chunk_size: without decode-stealing this would chunk
-        # exactly 4 times. With enable_mixed_chunk, the co-running decode consumes
-        # part of rem_chunk_tokens each mixed iteration (rem_chunk_tokens -=
-        # num_mixed_decode_tokens), shrinking each chunk, so the long req needs at
-        # least as many chunks -- and page-aligned truncation plus the timing of
-        # when decode co-runs make the exact count non-deterministic.
         long_req = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(long_req, lambda h: h.is_chunking)
 
-        # Confirm the scheduler actually produced a MIXED batch (chunked prefill +
-        # running decode in one forward pass) at least once during the run; this is
-        # the precondition for any decode-stealing to occur.
         saw_mixed_batch: bool = False
         for _ in range(DEFAULT_MAX_STEPS * 5):
             if t.last_batch_forward_mode == "MIXED":
@@ -531,12 +490,6 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_plus_decode_in_batch(t: ScriptedContext):
-        # Every mid-chunk of a 2048/256 prompt consumes the entire 256-token chunk
-        # budget, so a second PREFILL can never co-batch with an in-flight chunked
-        # req -- by the time it ran, r1 had already finished chunking. The reachable
-        # "chunked + another req in one batch" scenario is chunked prefill MIXED
-        # WITH A DECODING req: bring r2 to a decoding state first, then start the
-        # long r1 so it chunks while r2 keeps decoding.
         r2 = t.start_req(prompt_len=8, max_new_tokens=64, ignore_eos=True)
         yield from run_until(
             r2, lambda h: h.status == "running" and len(h.req.output_ids) >= 1
@@ -545,11 +498,6 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
 
-        # The overlap scheduler may alternate chunk batches and decode batches
-        # rather than landing both subsets in one sampled step, so latch across
-        # r1's whole chunking window: r2's decode must PROGRESS while r1 chunks
-        # (the real coexistence consequence), and whenever a sampled step shows
-        # both, the chunked subset must stay disjoint from prefill/decode.
         r2_out_before = len(r2.req.output_ids)
         saw_chunked_r1 = False
         saw_r2_decode_during_chunking = False
@@ -557,9 +505,6 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
             comp = t.batch_composition()
             if r1.rid in comp.get("chunked", []):
                 saw_chunked_r1 = True
-                # a MIXED batch's forward_mode is in the extend family, so a
-                # co-batched decode req lands in the 'prefill' bucket of
-                # batch_composition; accept either bucket as the witness.
                 if r2.rid in comp.get("decode", []) + comp.get("prefill", []):
                     saw_r2_decode_during_chunking = True
                 chunked_set = set(comp.get("chunked", []))
@@ -579,8 +524,6 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
             "the chunked slot"
         )
 
-        # Abort the long-running decoder so the class teardown starts from a clean,
-        # drained pool; let r1 finish naturally.
         t.abort(r2)
         yield from run_until_finished(r1)
         for _ in range(40):

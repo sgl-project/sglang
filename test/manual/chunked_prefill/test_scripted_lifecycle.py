@@ -14,10 +14,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 
 def _drain_until_released(t, *handles):
-    # Under the overlap scheduler a req's row/KV/lock_ref are released a few
-    # forward steps after `finished` first flips True, so a release assertion
-    # placed immediately after run_until_finished can observe a still-held row.
-    # Advance the loop until every handle has fully released, then return.
     for _ in range(12):
         if all(
             h.kv_pages == 0
@@ -240,9 +236,6 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r1)
         yield from _drain_until_released(t, r1)
         assert r1.req.req_pool_idx is None and r1.kv_pages == 0 and r1.lock_refs == 0
-        # Capture r1's output length while its req is still live: admitting and
-        # running r2 recycles r1's finished req object to None, so reading
-        # r1.req.output_ids after r2 finishes would raise AttributeError.
         r1_output_len = len(r1.req.output_ids)
 
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
@@ -296,9 +289,6 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_alternating_short_long_seq(t: ScriptedContext):
-        # Distinct prompt_token per iteration: these reqs run sequentially in one
-        # script (no inter-script flush), so an identical fill token would let each
-        # long req hit the previous one's cached prefix and chunk fewer than 8 times.
         for i in range(6):
             prompt = 8 if i % 2 == 0 else VERY_LONG_PROMPT_LEN
             r = t.start_req(
@@ -321,9 +311,6 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_seq_with_growing_prompt(t: ScriptedContext):
-        # Distinct prompt_token per iteration: each growing prompt would otherwise
-        # be a prefix of the next, so a longer req would hit the shorter one's
-        # cached prefix and chunk fewer times than its cold ceil(L/chunk) count.
         for idx, L in enumerate([8, 32, 128, 512, 1024]):
             r = t.start_req(
                 prompt_len=L, max_new_tokens=1, ignore_eos=True, prompt_token=10 + idx
@@ -332,9 +319,6 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 1
             yield from _drain_until_released(t, r)
-            # A fully-released req may already be removed from the scheduler
-            # (r.req is None) -- removal is a strictly stronger row-release
-            # witness than req_pool_idx is None.
             assert r.req is None or r.req.req_pool_idx is None
             assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
@@ -349,10 +333,6 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_seq_with_shrinking_prompt(t: ScriptedContext):
-        # Distinct prompt_token per iteration: each shorter prompt is a prefix of
-        # the previous longer one, so an identical fill token would let the shorter
-        # req hit the longer one's cached prefix and chunk fewer times than its cold
-        # ceil(L/chunk) count.
         for idx, L in enumerate([1024, 512, 128, 32, 8]):
             r = t.start_req(
                 prompt_len=L, max_new_tokens=1, ignore_eos=True, prompt_token=10 + idx
@@ -361,9 +341,6 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 1
             yield from _drain_until_released(t, r)
-            # A fully-released req may already be removed from the scheduler
-            # (r.req is None) -- removal is a strictly stronger row-release
-            # witness than req_pool_idx is None.
             assert r.req is None or r.req.req_pool_idx is None
             assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
@@ -392,8 +369,6 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_then_short_seq(t: ScriptedContext):
-        # Distinct prompt_token per iteration so each long req chunks cold (8x)
-        # instead of hitting the previous long req's cached prefix.
         seq = [VERY_LONG_PROMPT_LEN, 8, VERY_LONG_PROMPT_LEN, 8]
         for idx, L in enumerate(seq):
             r = t.start_req(
@@ -420,8 +395,6 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 2
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
-        # Finished reqs leave their prompt prefixes cached in the radix tree, so the
-        # pool only returns to baseline after draining the overlap lag and flushing.
         for _ in range(5):
             yield
         t.flush_cache()
@@ -436,7 +409,6 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_all_during_chunked(t: ScriptedContext):
-        # abort_all terminates an in-flight chunked req and releases its KV/row.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.abort_all()

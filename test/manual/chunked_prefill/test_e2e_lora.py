@@ -4,11 +4,9 @@ from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 
 
 class TestChunkedFeatureLoRA(ChunkedTestBase):
-    __test__ = True  # re-enable: the shared base sets __test__ = False
+    __test__ = True
     model = "meta-llama/Llama-3.2-1B-Instruct"
-    gsm8k_threshold = (
-        0.20  # Llama-3.2-1B-Instruct baseline; chunking corruption collapses it to ~0
-    )
+    gsm8k_threshold = 0.20
     feature_args = [
         "--enable-lora",
         "--lora-paths",

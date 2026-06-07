@@ -92,10 +92,6 @@ class TestChunkSizeDefault(ScriptedTestCase):
 
     @staticmethod
     def _script_prompt_n_chunks_plus_minus_1(t: ScriptedContext):
-        # Each req gets a distinct prompt_token: all reqs run in this one script
-        # (no inter-script radix flush), and an identical fill token would make every
-        # prompt a prefix of the longer ones, so later reqs would hit the cache and
-        # chunk fewer times than the exact boundary count asserted below.
         for n in range(1, 6):
             prompt_minus = n * DEFAULT_CHUNK_SIZE - 1
             r_minus = t.start_req(
@@ -346,9 +342,6 @@ class TestChunkSize2048MaxPrefill1024(ScriptedTestCase):
         r = t.start_req(prompt_len=512, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        # chunked prefill is governed by chunked_prefill_size (2048), not by
-        # max_prefill_tokens (1024): a 512-token prompt stays under the 2048
-        # chunk budget and completes in one non-chunked shot.
         assert r.chunks_done == 0
 
     def test_prompt_between_max_prefill_and_chunk_size(self):
@@ -361,10 +354,6 @@ class TestChunkSize2048MaxPrefill1024(ScriptedTestCase):
         r = t.start_req(prompt_len=1536, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        # 1536 sits between max_prefill_tokens (1024) and chunked_prefill_size
-        # (2048). Chunked prefill is bounded by rem_chunk_tokens (chunk_size
-        # 2048), not by max_prefill_tokens (1024), so the prompt stays under the
-        # chunk budget and completes in one non-chunked shot.
         assert r.chunks_done == 0
 
 

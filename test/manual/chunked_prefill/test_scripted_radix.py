@@ -64,10 +64,6 @@ class TestRadixBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
         assert r1.finished
-        # evict_radix(None) flushes the tree, but flush only frees nodes once they
-        # are unreferenced. r1 lingers in the running batch for one overlap step
-        # after finishing, so drain to idle before flushing or the flush is a no-op
-        # and r2 re-hits r1's stale prefix.
         for _ in range(5):
             yield
         t.evict_radix(prefix_tokens=None)
@@ -95,9 +91,6 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r1)
         assert r1.finished
 
-        # Residual past the cached prefix must EXCEED chunk_size, or it completes in
-        # one non-chunked prefill (a residual of exactly chunk_size does not chunk).
-        # 2 * chunk_size of fresh tail guarantees the chunked-resume branch runs.
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN + 2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2
         )
@@ -126,9 +119,6 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_all_finished(reqs)
         for r in reqs:
             assert r.finished
-            # The shared 4-chunk prefix must actually be hit (this pins that
-            # prefix-sharing happened); the 8-token tail is too short to chunk,
-            # so cached_tokens -- not chunks_done -- is the right witness.
             assert r.req.cached_tokens > 0
             assert r.lock_refs == 0
 
@@ -141,10 +131,6 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r1)
         r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=1)
         yield from run_until_finished(r2)
-        # r2 hits r1's full chunk_size prefix, leaving a residual of exactly
-        # chunk_size. A residual equal to chunk_size completes in one non-chunked
-        # prefill (the chunked path engages only when the residual exceeds the chunk
-        # budget), so chunks_done is 0 -- the defining behavior at this boundary.
         assert r2.chunks_done == 0, (
             f"residual of exactly chunk_size must not chunk; "
             f"chunks_done={r2.chunks_done} cached_tokens={r2.req.cached_tokens}"
@@ -155,9 +141,6 @@ class TestRadixBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_two_distinct_prefixes(t: ScriptedContext):
-        # Distinct prompt_token values fork the radix tree into two sibling
-        # branches off the root instead of a single linear chain, so each
-        # re-submission must hit only its own branch's cached prefix.
         r_a = t.start_req(
             prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=11
         )
@@ -252,8 +235,6 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r_warm, max_steps=400)
         assert r_warm.finished
 
-        # Drain the overlap lag so r_warm is fully unreferenced before flushing;
-        # otherwise evict_radix's flush is a no-op and the warm prefix survives.
         for _ in range(5):
             yield
         t.evict_radix(prefix_tokens=None)
@@ -263,8 +244,6 @@ class TestRadixBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        # The warm prefix was evicted before r was submitted, so r must miss
-        # the cache and re-chunk its whole 6-chunk prompt from scratch.
         assert r.req.cached_tokens == 0, (
             f"eviction must clear the warm prefix; "
             f"cached_tokens={r.req.cached_tokens} chunks_done={r.chunks_done}"
@@ -308,21 +287,12 @@ class TestRadixNoTailChunked(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_page_size_one_chunked_has_no_partial_page_tail(self):
-        """At page_size=1 chunked caching takes the no-tail else branch every step."""
         self.server.execute_script(
             self._script_page_size_one_chunked_has_no_partial_page_tail
         )
 
     @staticmethod
     def _script_page_size_one_chunked_has_no_partial_page_tail(t: ScriptedContext):
-        # GPU validation pending (manual scripted-runtime suite).
-        # Contrast to TestRadixPartialPage (page_size=4 takes the `if` partial-
-        # tail branch at radix_cache.py:517-520, where len(prefix_indices) >
-        # cache_protected_len). At the default page_size=1 every kv index is page
-        # aligned, so cache_unfinished_req always lands on the `else` no-tail
-        # branch at radix_cache.py:521-522 (req.prefix_indices = new_indices),
-        # making len(prefix_indices) == cache_protected_len at every mid-chunk
-        # observation.
         s = t.scheduler
         prompt_len: int = 4 * DEFAULT_CHUNK_SIZE
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
@@ -407,18 +377,12 @@ class TestRadixHitCountNonChunked(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_non_chunked_prefix_hit_increments_hit_count_by_one(self):
-        """Non-chunked finished req hitting a warm prefix bumps node hit_count by 1."""
         self.server.execute_script(
             self._script_non_chunked_prefix_hit_increments_hit_count_by_one
         )
 
     @staticmethod
     def _script_non_chunked_prefix_hit_increments_hit_count_by_one(t: ScriptedContext):
-        # GPU validation pending (manual scripted-runtime suite).
-        # Contrast to TestRadixHitCountInvariant (chunked=True leaves hit_count
-        # untouched): when a NON-chunked finished req re-traverses an existing
-        # warm prefix, _inc_hit_count(chunked=False) at radix_cache.py:672 runs
-        # and bumps the matched ancestor node's hit_count by exactly 1.
         def _snapshot_hit_counts(root) -> dict:
             snapshot: dict = {}
             stack = [root]
@@ -430,8 +394,6 @@ class TestRadixHitCountNonChunked(ScriptedTestCase):
 
         s = t.scheduler
 
-        # Warm a 2-chunk prefix on its own radix branch (prompt_token=11). This
-        # creates the node(s) whose hit_count we then watch.
         r_warm = t.start_req(
             prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=1, prompt_token=11
         )
@@ -440,10 +402,6 @@ class TestRadixHitCountNonChunked(ScriptedTestCase):
 
         baseline = _snapshot_hit_counts(s.tree_cache.root_node)
 
-        # A full-fit re-submission on the same prefix: residual beyond the cached
-        # 2-chunk prefix is a single token (<= chunk_size), so it never chunks
-        # (chunks_done == 0) and finishes via the non-chunked cache_finished_req
-        # -> insert(chunked=False) path.
         r2 = t.start_req(
             prompt_len=2 * DEFAULT_CHUNK_SIZE + 1, max_new_tokens=1, prompt_token=11
         )
@@ -459,9 +417,6 @@ class TestRadixHitCountNonChunked(ScriptedTestCase):
         )
 
         cur = _snapshot_hit_counts(s.tree_cache.root_node)
-        # At least one pre-existing node that r2 traversed must show exactly a +1
-        # increment, and no pre-existing node may move by more than 1 (a single
-        # non-chunked insert visits each matched node once).
         incremented_by_one = 0
         for node_id, base_count in baseline.items():
             if node_id not in cur:
@@ -501,17 +456,6 @@ class TestRadixPartialPage(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        # While the req is the in-flight chunked_req, cache_unfinished_req only ever
-        # commits page-aligned slices: chunked_prefill_size must be divisible by
-        # page_size (server_args validation), so every mid-chunk fill_ids length is
-        # page aligned and len(new_indices) == len(kv_indices). The partial-page
-        # tail branch at radix_cache.py:517-520 (len(prefix_indices) >
-        # cache_protected_len) is therefore NOT reachable mid-chunk -- it fires only
-        # at the completing extend, when the non-page-aligned prompt remainder (+7)
-        # is finally committed, and that batch no longer carries the rid as
-        # chunked_req. The observable, durable safety property mid-chunk is the
-        # one-directional invariant that prefix_indices never drops below
-        # cache_protected_len (the committed tail is never freed prematurely).
         for _ in range(800):
             req = s.chunked_req
             if req is not None and req.rid == r.rid:
@@ -526,14 +470,6 @@ class TestRadixPartialPage(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        # The real partial-page-tail invariant: a non-page-aligned prompt (+7 over a
-        # page boundary) is committed through the chunked lifecycle and the trailing
-        # partial page is freed exactly once. flush_cache is a no-op unless the
-        # scheduler is fully idle (it bails while the just-finished req still lingers
-        # in the overlap pipeline), so drain until is_fully_idle BEFORE flushing -- a
-        # fixed 5-yield drain is not always enough and leaves the committed prefix
-        # un-flushed, reading as a ~prompt-sized leak. A net-zero free-count delta
-        # proves the partial-page tail was neither leaked nor double-freed.
         for _ in range(40):
             if t.is_fully_idle:
                 break
@@ -574,13 +510,6 @@ class TestRadixFcfs(ScriptedTestCase):
 
 
 class TestRadixDisabled(ScriptedTestCase):
-    # disable_radix_cache=True swaps the radix tree for a ChunkCache, which the
-    # scripted harness's KV-canary walker (walk_radix_cache_for_canary) does not
-    # support -- it raises NotImplementedError on ChunkCache and crashes the
-    # server at startup. The canary is a harness-side integrity layer, not part of
-    # the v1 engine under test, so turn it off for this radix-disabled class
-    # (sweep_interval must also drop to 0 or server_args validation rejects the
-    # combination).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disable_radix_cache=True,
@@ -614,21 +543,14 @@ class TestRadixLpm(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_lpm_policy_chunked_priority(t: ScriptedContext):
-        # Warm a 2-chunk prefix on the prompt_token=1 branch.
         r_warm = t.start_req(
             prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=1
         )
         yield from run_until_finished(r_warm)
         assert r_warm.finished
-        # Drain the overlap lag so r_warm fully leaves the running batch before the
-        # competitors start; otherwise it lingers as the "first admitted" rid.
         for _ in range(5):
             yield
 
-        # Submit two reqs at once so calc_priority orders the waiting queue:
-        # r_long shares the full 2-chunk warm prefix (longest prefix match),
-        # r_short is on a disjoint branch (zero prefix match). LPM must admit
-        # r_long first, so it is the first rid to enter chunked prefill.
         r_long = t.start_req(
             prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=1
         )
@@ -636,8 +558,6 @@ class TestRadixLpm(ScriptedTestCase):
             prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=7
         )
 
-        # cached_tokens is set at admission but the req object is cleared on
-        # finish (handle.req becomes None), so capture it live each step.
         first_admitted = None
         cached_tokens_by_rid: dict = {}
         for _ in range(DEFAULT_MAX_STEPS):
@@ -678,8 +598,6 @@ class TestRadixDfsWeight(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_dfs_weight_policy_chunked(t: ScriptedContext):
-        # Warm two distinct branches (different prompt_token) so waiting reqs
-        # hang off two different radix nodes.
         warm_a = t.start_req(
             prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=3
         )
@@ -689,9 +607,6 @@ class TestRadixDfsWeight(ScriptedTestCase):
         )
         yield from run_until_finished(warm_b)
 
-        # Branch A carries a heavier subtree weight (3 waiting reqs) than branch
-        # B (1 waiting req). dfs-weight traverses the heavier child subtree
-        # first, so all branch-A reqs must finish before the lone branch-B req.
         heavy = [
             t.start_req(
                 prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=3
@@ -703,8 +618,6 @@ class TestRadixDfsWeight(ScriptedTestCase):
         )
         all_reqs = heavy + [light]
 
-        # cached_tokens is set at admission and is stable, but req objects are
-        # cleared on finish (handle.req becomes None), so capture it live each step.
         finish_order: list = []
         cached_tokens_by_rid: dict = {}
         for _ in range(DEFAULT_MAX_STEPS * 4):
@@ -741,15 +654,9 @@ class TestRadixPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_prefix_match_with_priority(t: ScriptedContext):
-        # enable_priority_scheduling forces fcfs+priority sorting; with the
-        # default schedule_low_priority_values_first=False a larger priority
-        # value wins. Both reqs hit the same warm prefix, so priority -- not
-        # prefix length -- decides admission order.
         r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
         yield from run_until_finished(r_warm)
         assert r_warm.finished
-        # Drain the overlap lag so r_warm fully leaves the running batch before the
-        # competitors start; otherwise it lingers as the "first admitted" rid.
         for _ in range(5):
             yield
 
@@ -760,14 +667,6 @@ class TestRadixPriority(ScriptedTestCase):
             prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, priority=10
         )
 
-        # Evaluate both finished flags into locals every step. A short-circuited
-        # `r_low.finished and r_high.finished` would skip the r_high.finished probe
-        # on every step where r_low is not yet finished -- but r_high is admitted
-        # first (priority) and finishes first, so it would never be observed live
-        # and is_finished would report it "unknown" forever, hanging the loop. We
-        # must call find_req_by_rid on r_high while it is still live.
-        # cached_tokens is set at admission but the req object is cleared on finish
-        # (handle.req becomes None), so capture it live each step.
         first_admitted = None
         low_done = False
         high_done = False
@@ -808,18 +707,6 @@ class TestRadixPriority(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.is_chunking)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0)
 
-        # The scheduler does not record which admission branch it took. The
-        # observable consequence of skipping r1's chunked-resume in the priority
-        # calc is that the lower-priority r2 never preempts r1's in-flight chunked
-        # prefill: r1's chunk progress only advances (a preemption/retract would
-        # drop it back to waiting and reset chunks_done), and r1 -- which started
-        # chunking first and outranks r2 -- finishes no later than r2.
-        #
-        # Note: do NOT assert r1 finishes *strictly* before r2. Both reqs have the
-        # same prompt and max_new_tokens, and under the overlap scheduler the coarse
-        # per-step observation lands their completions on the same step (r1 and r2
-        # both observed finished at the same yield). The genuine v1 invariant is
-        # "r1 finishes no later than r2", captured as r1_fin_step <= r2_fin_step.
         prev_chunks_done = r1.chunks_done
         r1_fin_step = None
         r2_fin_step = None

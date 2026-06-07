@@ -19,12 +19,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 
 def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
-    # Under the overlap scheduler an abort is injected at the top of the next
-    # get_next_batch_to_run, but the actual KV/row/lock release lands a couple of
-    # forward steps later -- the in-flight forward's result must drain first. Step
-    # the loop until every aborted handle is fully released (KV pages, req-pool row,
-    # AND the last_node lock ref, which can linger one extra step past the row)
-    # instead of asserting after a single yield.
     for _ in range(12):
         if all(
             h.kv_pages == 0
@@ -205,15 +199,11 @@ class TestAbortBasic(ScriptedTestCase):
     @staticmethod
     def _script_abort_unknown_rid_noop(t: ScriptedContext):
         bogus = ScriptedReqHandle(rid="never-submitted-rid", context=t)
-        # Unknown rid: TokenizerManager drops the abort without forwarding it to
-        # the scheduler, so no AbortReq transits the recv socket; fire-and-forget.
         t.abort(bogus, await_arrival=False)
         yield
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        # The finished req's KV/row/lock release lands a couple of steps after the
-        # finished flag flips under overlap; drain before asserting full release.
         for _ in range(12):
             if r.kv_pages == 0 and r.lock_refs == 0:
                 break
@@ -230,11 +220,6 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
 
-        # run_until_finished returns the step `finished` flips; the finished req's
-        # KV release and any lazy radix bookkeeping land a couple of forward steps
-        # later. Drain to a fully-idle, stable pool before asserting full release
-        # and before snapshotting the baseline, so the abort-is-noop comparison is
-        # not corrupted by background release that was still in flight.
         for _ in range(12):
             if t.is_fully_idle:
                 break
@@ -243,14 +228,10 @@ class TestAbortBasic(ScriptedTestCase):
         assert r.lock_refs == 0
         kv_pool_free_before = t.engine_stats()["kv_pool_free"]
 
-        # The req is already finished, so TokenizerManager drops the abort without
-        # forwarding it to the scheduler; fire-and-forget (no AbortReq ever
-        # transits the recv socket to await).
         t.abort(r, await_arrival=False)
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         kv_pool_free_after = t.engine_stats()["kv_pool_free"]
         assert kv_pool_free_after == kv_pool_free_before, (
             f"abort-after-finish must not move KV pool; "
@@ -300,7 +281,6 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_abort_during_decode(self):
         self.server.execute_script(self._script_abort_during_decode)
@@ -314,7 +294,6 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_abort_one_of_three_others_finish(self):
         self.server.execute_script(self._script_abort_one_of_three_others_finish)
@@ -362,11 +341,8 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
 
-        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         assert r.kv_pages == 0
 
-        # abort at the chunk boundary must not revive: subsequent steps produce
-        # no new chunk and the req does not reappear as a live chunked req.
         chunks_after_abort = r.chunks_done
         yield
         yield
@@ -384,23 +360,6 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_mid_chunk_no_extra_radix_node(
         t: ScriptedContext,
     ):
-        """Aborting a chunked req mid-chunk leaves no locked radix node and does not revive it."""
-        # NOTE: this intentionally does NOT exercise the skipped-stash branch
-        # (`if self._chunked_req_scheduled_last_iter: stash_chunked_request(...)`
-        # in get_next_batch_to_run). On a non-SWA engine that flag is only False
-        # when chunked_req is None, so a held chunked_req is always stashed; the
-        # "chunked req parked in waiting_queue with the flag False" inter-chunk gap
-        # is hybrid-SWA-specific and unreachable here.
-        #
-        # The reachable, abort-specific invariant is NOT "no new radix node": a
-        # held chunked_req is stashed via cache_unfinished_req at the top of every
-        # get_next_batch_to_run (stash_chunked_request), so its partial prefix is
-        # legitimately cached and lock-protected WHILE it chunks -- that caching is
-        # normal prefill behavior, not an abort artifact, and one more such stash
-        # can land between the abort being injected and taking effect. What the
-        # abort must guarantee is that once the req is released it leaves NO radix
-        # node still LOCKED on its behalf (the chunk's protective lock is dropped),
-        # and that it does not revive.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=220
         )
@@ -409,9 +368,6 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
 
-        # The abort releases the req and does not revive it. The abort lands
-        # when the req exits the chunked state, so chunks_done may legitimately
-        # advance between injection and landing; once RELEASED it must freeze.
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
         chunks_after_release = r.chunks_done
@@ -422,8 +378,6 @@ class TestAbortBasic(ScriptedTestCase):
             f"{chunks_after_release} -> {r.chunks_done}"
         )
 
-        # No radix node remains locked once the aborted chunked req is released:
-        # the protective lock the in-flight chunk held while stashed is dropped.
         lock_refs_after = t.get_all_node_lock_refs()
         assert all(ref == 0 for ref in lock_refs_after.values()), (
             f"abort mid-chunk left a locked radix node behind; "
@@ -462,11 +416,6 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_during_gap_inflight_middle_chunks_positive(t: ScriptedContext):
-        # The "gap" state (inflight_middle_chunks > 0 AND not is_chunking) is
-        # unreachable on v1: the in-flight latch bumps and clears in the same
-        # transition as the chunked_req slot. Abort while the req is mid-flight in a
-        # middle chunk -- inflight_middle_chunks > 0 holds during chunking once at
-        # least one chunk has run.
         r = t.start_req(
             prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=240
         )
@@ -482,8 +431,6 @@ class TestAbortBasic(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
 
-        # abort during the gap must block Stage A revival: the req stays out of
-        # the chunked slot across subsequent steps.
         assert not r.is_chunking, "aborted gap req must not re-enter chunking"
         yield
         assert not r.is_chunking, "aborted gap req must stay out of chunking"
@@ -507,10 +454,6 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
 
-        # The handle's KV/row/lock are released by the drain above, but the
-        # scheduler-wide idle state (chunked slot cleared, waiting_queue and
-        # running_batch drained) can settle one extra step later under overlap.
-        # Step until idle instead of asserting immediately after release.
         for _ in range(12):
             if t.scheduler.chunked_req is None and t.is_idle:
                 break
@@ -575,7 +518,6 @@ class TestAbortBasic(ScriptedTestCase):
             f"force_retract + abort same yield must release lock_refs; "
             f"got {r1.lock_refs}"
         )
-        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         yield
         t.continue_generation()
 
@@ -584,8 +526,6 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_chunked_with_baton_handoff(t: ScriptedContext):
-        # Distinct prompt_token so r2 does not hit r1's partially-cached prefix
-        # after r1 is aborted -- it must re-chunk from scratch to take the baton.
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=280
         )
@@ -636,9 +576,6 @@ class TestAbortPP(ScriptedTestCase):
 
 
 class TestAbortSmallPool(ScriptedTestCase):
-    # A capped KV pool lets two real ballast decode reqs create genuine,
-    # engine-resolvable admission pressure; raw exhaust_kv pages have no backing
-    # Req and repeatedly wedged the engine (unkillable teardown hangs).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         max_total_tokens=SMALL_KV_POOL_MAX_TOTAL_TOKENS,
@@ -651,27 +588,7 @@ class TestAbortSmallPool(ScriptedTestCase):
 
     @staticmethod
     def _script_waiting_timeout_sweep_aborts_pressured_waiting_req(t: ScriptedContext):
-        # NOTE: source-true behavior of the waiting-timeout sweep. The scheduler
-        # runs _abort_on_waiting_timeout() at the top of get_next_batch_to_run on
-        # every NON-paused iteration (only when SGLANG_REQ_WAITING_TIMEOUT > 0).
-        # It scans the WHOLE waiting_queue and aborts every req whose
-        # wait_queue_entry_time is older than the deadline -- there is NO
-        # chunked-resume immunity guard, so a parked chunked-resume req (which
-        # also lives in waiting_queue carrying its original entry_time) is swept
-        # out exactly like any other waiting req. This test drives that sweep
-        # through the REAL event loop -- no pause, no scheduler-private call -- by
-        # holding a req in waiting_queue under real KV pressure and letting the
-        # loop's own sweep abort it.
-        #
-        # The timeout-abort path only notifies the tokenizer and drops the req
-        # from waiting_queue; it does NOT itself release KV/row (the req under
-        # test never held any, since it never got admitted). So the observable
-        # consequence asserted here is removal from waiting_queue + aborted status.
 
-        # Real admission pressure, engine-native: two long-lived ballast decode
-        # reqs fill the small pool's rem_total (held tokens + clipped decode
-        # reservations), so the 16-token newcomer cannot admit -- yet the loop
-        # keeps running get_next_batch_to_run (and thus the sweep) every step.
         b1 = t.start_req(
             prompt_len=SMALL_KV_POOL_BALLAST_PROMPT_LEN,
             max_new_tokens=SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -692,20 +609,10 @@ class TestAbortSmallPool(ScriptedTestCase):
         def waiting_rids():
             return {req.rid for req in t.scheduler.waiting_queue}
 
-        # The req parks in waiting_queue with a real wait_queue_entry_time set by
-        # _add_request_to_queue; it cannot be admitted because there is no free KV.
         yield from run_until(r, lambda h: r.rid in waiting_rids())
         assert r.kv_pages == 0, "pressured waiting req must not own KV before admission"
 
-        # Enable the timeout with a value tiny enough that, after the req has been
-        # queued and a couple of real-time yields pass, entry_time is already past
-        # perf_counter() - timeout_s. The override stays active across the yields
-        # below (the script frame is suspended inside the with-block), so the
-        # scheduler reads it when it runs the sweep at the top of
-        # get_next_batch_to_run on each non-paused iteration.
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-6):
-            # Drive the REAL loop until the scheduler's own sweep removes the req
-            # from waiting_queue.
             for _ in range(DEFAULT_MAX_STEPS):
                 if r.rid not in waiting_rids():
                     break
@@ -727,7 +634,6 @@ class TestAbortSmallPool(ScriptedTestCase):
         )
         assert r.kv_pages == 0, "timeout-abort of an unadmitted req owns no KV"
 
-        # Clean up the ballasts so teardown starts from a drained engine.
         t.abort(b1)
         t.abort(b2)
         yield from _drain_until_released(t, b1, b2)
