@@ -103,7 +103,7 @@ ARG USE_CCACHE=1
 #   NVCC_THREADS: per-compilation-unit NVCC --threads (multi-arch PTXAS)
 ARG BUILD_JOBS=0
 ARG NVCC_THREADS=32
-# Re-declare so CMake third-party FetchContent uses the same mirror as deps stage
+# Redeclare so CMake third-party FetchContent uses the same mirror as deps stage
 ARG GITHUB_ARTIFACTORY=github.com
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
