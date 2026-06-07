@@ -35,7 +35,9 @@ def copy_all_layer_kv_cache_tiled(
     tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]
 
     # Bound the slot VALUE (not just the count) so a stale/OOB index masks its
-    # load/store instead of causing an illegal memory access.
+    # load/store instead of causing an illegal memory access. Cast pool_size to the
+    # slot dtype: some triton backends (ROCm) reject an int32-scalar vs int64-src compare.
+    pool_size = tl.cast(pool_size, src.dtype)
     src_in_range = (src[:, None] >= 0) & (src[:, None] < pool_size)
     tgt_in_range = (tgt[:, None] >= 0) & (tgt[:, None] < pool_size)
     mask = mask_loc[:, None] & mask_byte[None, :] & src_in_range & tgt_in_range
