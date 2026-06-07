@@ -310,6 +310,10 @@ class KimiVLForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, **kwargs)
         if self.language_model is not None:
+            self.post_load_weights()
+
+    def post_load_weights(self) -> None:
+        if self.language_model is not None:
             self.language_model.post_load_weights()
 
 
