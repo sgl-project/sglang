@@ -756,11 +756,11 @@ class SenderWrapper:
         self.is_multi_tokenizer = is_multi_tokenizer
 
     def send_obj(self, obj):
-        if not self.is_multi_tokenizer and hasattr(obj, "http_worker_ipc"):
+        if hasattr(obj, "http_worker_ipc"):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
         sock_send(self.send_to_scheduler, obj)
 
     async def async_send_obj(self, obj):
-        if not self.is_multi_tokenizer and hasattr(obj, "http_worker_ipc"):
+        if hasattr(obj, "http_worker_ipc"):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
         await async_sock_send(self.send_to_scheduler, obj)

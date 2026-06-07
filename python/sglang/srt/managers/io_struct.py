@@ -1303,7 +1303,7 @@ class BatchEmbeddingOutput(BaseBatchReqIpc, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[Dict[str, Any]]]  # List[BaseFinishReason]
     # The output embedding
-    embeddings: List[Union[List[float], Dict[int, float], float]]
+    embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
@@ -2249,21 +2249,37 @@ def _maybe_unwrap_pickle(obj: Any) -> Any:
     return obj
 
 
+def msgpack_encode(obj: Any) -> bytes:
+    return _msgpack_encoder.encode(_maybe_wrap_pickle(obj))
+
+
+def msgpack_decode(data: bytes) -> Any:
+    return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
+
+
 def sock_send(socket: Socket, obj: Any, flags=0):
-    obj = _maybe_wrap_pickle(obj)
-    socket.send(_msgpack_encoder.encode(obj), flags=flags)
+    socket.send(msgpack_encode(obj), flags=flags)
 
 
 def sock_recv(socket: Socket, flags=0) -> Any:
     data = socket.recv(flags=flags)
-    return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
+    if isinstance(data, bytes):
+        return msgpack_decode(data)
+    else:
+        # for non-bytes data, we assume it has been decoded
+        # e.g. ScriptedTokenizerRecvProxy
+        return data
 
 
 async def async_sock_send(socket: AsyncSocket, obj: Any, flags=0):
-    obj = _maybe_wrap_pickle(obj)
-    await socket.send(_msgpack_encoder.encode(obj), flags=flags)
+    await socket.send(msgpack_encode(obj), flags=flags)
 
 
 async def async_sock_recv(socket: AsyncSocket, flags=0) -> Any:
     data = await socket.recv(flags=flags)
-    return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
+    if isinstance(data, bytes):
+        return msgpack_decode(data)
+    else:
+        # for non-bytes data, we assume it has been decoded
+        # e.g. ScriptedTokenizerRecvProxy
+        return data

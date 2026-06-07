@@ -6,6 +6,8 @@ from typing import Any, Callable
 
 import zmq
 
+from sglang.srt.managers.io_struct import sock_recv
+
 
 class ScriptedTokenizerRecvProxy:
 
@@ -13,7 +15,7 @@ class ScriptedTokenizerRecvProxy:
         self._underlying = underlying
         self._buffer: deque = deque()
 
-    def recv_pyobj(self, flags: int = 0) -> Any:
+    def recv(self, flags: int = 0) -> Any:
         self._drain_underlying()
 
         if self._buffer:
@@ -49,7 +51,7 @@ class ScriptedTokenizerRecvProxy:
     def _drain_underlying(self) -> None:
         while True:
             try:
-                req = self._underlying.recv_pyobj(zmq.NOBLOCK)
+                req = sock_recv(self._underlying, flags=zmq.NOBLOCK)
             except zmq.ZMQError:
                 break
             self._buffer.append(req)
