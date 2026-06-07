@@ -2051,6 +2051,11 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
 
+                    assert_buffer_fits(
+                        max_seq_pages,
+                        metadata.page_table.shape[1],
+                        "FA3 draft-decode page_table",
+                    )
                     normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
@@ -2135,6 +2140,11 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
+                assert_buffer_fits(
+                    max_seq_pages,
+                    metadata.page_table.shape[1],
+                    "FA3 decode page_table",
+                )
                 normal_decode_set_metadata(
                     metadata.cache_seqlens_int32,
                     metadata.cu_seqlens_k,
