@@ -184,6 +184,6 @@ def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     into the adjacent row. Fail fast on the host-known extent instead. All args
     are host ints, so this is always-on (no device sync, unlike async probes).
     """
-    assert used <= capacity, f"{what}: need {used} > capacity {capacity}" + (
+    assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
         f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
     )
