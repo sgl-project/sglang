@@ -36,10 +36,6 @@ class TestLoRASingleAdapter(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        # Another (A, 2048-all-ones) method in this class shares the same radix
-        # namespace and runs earlier, so this req may hit a cached prefix that
-        # cuts its effective new tokens; the exact chunk count is therefore not
-        # deterministic. Keep a tight lower bound rather than guess an exact ==.
         assert r.chunks_done >= 2
         assert r.kv_pages == 0
         assert r.lock_refs == 0
@@ -51,9 +47,6 @@ class TestLoRASingleAdapter(ScriptedTestCase):
     @staticmethod
     def _script_lora_logprob_chunked_pass_idx(t: ScriptedContext):
         prompt_len: int = VERY_LONG_PROMPT_LEN
-        # logprob_start_len=0 requests an input logprob for every prompt token;
-        # the default (-1) starts logprob computation at the prompt end and
-        # returns no input logprobs.
         r = t.start_req(
             prompt_len=prompt_len,
             max_new_tokens=2,
@@ -63,9 +56,6 @@ class TestLoRASingleAdapter(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        # First (A, 2048-all-ones) req in this class: no prior same-namespace
-        # prefix exists, so it does a full fresh prefill of 2048 tokens at chunk
-        # size 256 -> exactly 8 chunks.
         assert r.chunks_done == prompt_len // DEFAULT_CHUNK_SIZE
         assert len(r.req.logprob.input_token_logprobs_val) == prompt_len
 
@@ -140,10 +130,6 @@ class TestLoRAAdapterSwitch(ScriptedTestCase):
         )
         yield from run_until_all_finished(handles=[r_a, r_b])
         assert r_a.finished and r_b.finished
-        # r_a (A) and r_b (B) use distinct adapters, so their radix namespaces
-        # are disjoint and neither can prefix-hit the other; each is the only
-        # req of its adapter in this class, so both do a full fresh prefill of
-        # 2048 tokens at chunk size 256 -> exactly 8 chunks each.
         expected_chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
         assert r_a.chunks_done == expected_chunks
         assert r_b.chunks_done == expected_chunks
@@ -178,14 +164,6 @@ class TestLoRAAllDistinctAdapters(ScriptedTestCase):
         for r in reqs:
             assert r.kv_pages == 0
             assert r.lock_refs == 0
-        # adapters == [A, B, A, B]. The first A and first B cannot prefix-hit;
-        # with max_loras_per_batch=2 both load concurrently, but the scheduler
-        # admits one new chunked seq at a time (the prefill log shows #new-seq: 1
-        # per step, never splitting a single 256-token chunk across both), so
-        # each first-of-adapter processes all 2048 tokens in 256-chunks -> exactly
-        # 8 chunks. Their same-adapter twins run only after the first commits the
-        # whole 2048-token prefix to radix, so each twin prefix-hits the entire
-        # prompt and may chunk 0 times.
         expected_first_chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
         assert reqs[0].chunks_done == expected_first_chunks
         assert reqs[1].chunks_done == expected_first_chunks
@@ -243,18 +221,12 @@ class TestLoRAAdapterEviction(ScriptedTestCase):
         yield
 
         t.abort(r_a)
-        # Aborting a mid-chunk req lands several forward steps later (the
-        # chunked-prefill result path keeps prefilling until the req leaves the
-        # chunked state); drain until the abort is realized, matching the abort
-        # suite's _drain_until_released pattern.
         for _ in range(12):
             if r_a.kv_pages == 0 and (r_a.req is None or r_a.req.req_pool_idx is None):
                 break
             yield
 
         assert r_a.status in ("finished", "unknown")
-        # An aborted req may be fully dropped from the scheduler (req is None);
-        # only assert KV/lock cleanup while it is still live to avoid dereferencing None.
         if r_a.req is not None:
             assert r_a.kv_pages == 0
             assert r_a.lock_refs == 0

@@ -4,7 +4,7 @@ from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 
 
 class TestChunkedFeaturePP(ChunkedTestBase):
-    __test__ = True  # re-enable: the shared base sets __test__ = False
+    __test__ = True
     gsm8k_threshold = 0.50
     feature_args = [
         "--tp-size",

@@ -27,8 +27,6 @@ DEFAULT_NUM_THREADS: int = 128
 DEFAULT_MAX_TOKENS: int = 512
 DEFAULT_SEED: int = 42
 
-# The canary CLI is --kv-canary <mode> (+ companions); --enable-kv-canary does
-# not exist and made every launched server exit at argparse.
 KV_CANARY_ARGS: List[str] = [
     "--kv-canary",
     "raise",
@@ -36,17 +34,12 @@ KV_CANARY_ARGS: List[str] = [
     "partial",
     "--kv-canary-sweep-interval",
     "100",
-    # canary's SingleForwardManager design requires piecewise cuda graph off
-    # (same pairing the scripted harness uses).
     "--disable-piecewise-cuda-graph",
 ]
 
 
 class ChunkedGsm8kMixin:
-    # mixin: not collectible as a test on its own
     __test__ = False
-    # canary is unsupported on some engine paths (ChunkCache, hisparse, some
-    # pools); such classes opt out, mirroring the scripted TestRadixDisabled.
     use_kv_canary: ClassVar[bool] = True
     model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
@@ -94,7 +87,6 @@ class ChunkedGsm8kMixin:
 
 
 class ChunkedTestBase(ChunkedGsm8kMixin, CustomTestCase):
-    # base class: not collectible as a test on its own
     __test__ = False
 
     base_url: ClassVar[str] = DEFAULT_URL_FOR_TEST
@@ -118,10 +110,7 @@ class ChunkedTestBase(ChunkedGsm8kMixin, CustomTestCase):
 
 
 class ChunkedTestPDBase(ChunkedGsm8kMixin, PDDisaggregationServerBase):
-    # base class: not collectible as a test on its own
     __test__ = False
-    # Extra args for the decode server only (e.g. matching its TP to the prefill
-    # side so the transferred KV layout lines up).
     decode_feature_args: ClassVar[List[str]] = []
 
     @classmethod

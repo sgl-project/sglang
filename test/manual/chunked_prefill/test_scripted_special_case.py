@@ -19,9 +19,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 
 def _load_inquirer_pending_for_rid(t: ScriptedContext, rid: str) -> int:
-    # Per-rid contribution to the scheduler load inquirer's pending-token tally:
-    # the chunked req counts only its not-yet-committed remainder, a waiting-queue
-    # req counts its full seqlen.
     s = t.scheduler
     chunked = s.chunked_req
     if chunked is not None and chunked.rid == rid:
@@ -100,8 +97,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
-        # The overlap pipeline clears the chunked slot and releases the req's KV/row
-        # over several steps after the abort is injected, not in a single yield.
         for _ in range(12):
             if t.scheduler.chunked_req is None and r.kv_pages == 0 and r.lock_refs == 0:
                 break
@@ -284,21 +279,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_retract_during_gap_inflight_middle_chunks_positive(t: ScriptedContext):
-        # Retract a chunked req mid-prefill (after >= 1 chunk has committed, so
-        # inflight_middle_chunks is the latched 1 and a committed prefix exists) and
-        # verify retract releases KV/row, resets inflight_middle_chunks, and re-queues
-        # the req to the waiting queue, then resumes it to completion.
-        #
-        # The "parked gap" state this test was originally written around
-        # (inflight_middle_chunks > 0 AND not is_chunking) is never reached on the
-        # single-engine overlap path: empirically the trajectory is
-        # (chunks_done=1, inflight=1, is_chunking=True) -> (chunks_done=2, inflight=0,
-        # is_chunking=False); inflight_middle_chunks is the 0/1 latch that bumps only
-        # while the req is still the chunked_req, and clears in the same transition
-        # that clears chunked_req. So land while genuinely chunking instead. Retract of
-        # a still-chunking req (even with an empty running_batch) clears chunked_req,
-        # releases its KV, resets inflight_middle_chunks to 0, and moves it to the
-        # waiting queue.
         r = t.start_req(
             prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=180
         )
@@ -337,14 +317,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_load_inquirer_pending_tokens_dedup_chunked(t: ScriptedContext):
-        # The dual-queue dedup invariant for the in-flight chunked req is the real v1
-        # formula (load_inquirer.py:69-72): its pending-token contribution is its full
-        # seqlen MINUS the committed radix prefix (len(prefix_indices)), never the full
-        # seqlen. Asserting against r.remaining_prompt_tokens (origin_input_ids -
-        # kv_committed_len) is wrong: prefix_indices lags kv_committed_len by up to one
-        # chunk, so the two legitimately differ mid-flight. Compare against the
-        # prefix-subtracting formula directly and require the subtraction actually
-        # happened once a prefix is committed (strictly below the full seqlen).
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=190
         )
@@ -387,12 +359,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_load_inquirer_chunked_contribution_exact_remainder(t: ScriptedContext):
-        # load_inquirer.py:70-72 chunked branch: with no waiting-queue reqs, the
-        # entire pending-token tally comes from the in-flight chunked_req and must
-        # equal exactly seqlen - len(prefix_indices) (its not-yet-committed tail),
-        # NOT the full seqlen. Force is_chunking with an otherwise-empty queue and
-        # assert the exact remainder, so a regression that drops the prefix
-        # subtraction (over-counts the committed prefix) is caught.
         s = t.scheduler
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=200
@@ -428,12 +394,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_load_inquirer_chunk_deduct_subtracts_planned_chunk(t: ScriptedContext):
-        # load_inquirer.py:72 chunk_deduct param: at batch-scheduling time the
-        # current chunk is planned but not yet in prefix_indices, so the scheduler
-        # passes chunk_deduct=extend_input_len and the deducted tally must be
-        # exactly extend_input_len less than the default (chunk_deduct=0) tally.
-        # This is the branch that distinguishes the two call sites of
-        # _get_num_pending_tokens (load-reporting vs batch-scheduling).
         s = t.scheduler
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=210
@@ -480,9 +440,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, prompt_token=220
         )
-        # Drive a retract/resume mid-chunk: retract clears chunked_req (so
-        # is_chunking flips to False) and must also reset inflight_middle_chunks
-        # in the same transition, otherwise the cross-subsystem invariant breaks.
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         assert_invariant()
 
@@ -505,15 +462,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_init_next_round_input_resets_chunk_state(t: ScriptedContext):
-        # init_next_round_input rebuilds fill_ids = origin_input_ids + output_ids
-        # (schedule_batch.py:1050); the chunked-admission path then truncates it to the
-        # committed prefix plus the chunk about to run
-        # (schedule_policy.py: fill_ids = fill_ids[:len(prefix_indices)+extend_input_len]).
-        # So mid-chunk the invariant is len(fill_ids) == len(prefix_indices) +
-        # extend_input_len, NOT len(fill_ids) == len(prefix_indices) (that equality only
-        # holds at the instant a chunk boundary commits, before the next chunk is loaded;
-        # with the overlap pipeline the observable state is always mid-chunk where the
-        # current chunk's tokens are appended past the committed prefix).
         r = t.start_req(
             prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=230
         )
@@ -578,11 +526,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_second_chunked_admit_blocked_when_chunked_req_set(t: ScriptedContext):
-        # Distinct prompt_token per req so r2 chunks cold: with the default fill
-        # token both prompts are identical, r2 fully hits r1's committed radix prefix
-        # and admits non-chunked (never entering is_chunking), so saw_r2 would stay
-        # False. Distinct tokens force both to chunk over their lifetime while still
-        # exercising the single-chunked-slot mutual exclusion.
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10
         )
@@ -610,14 +553,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             f"{saw_r1_chunking}, saw_r2={saw_r2_chunking}"
         )
 
-    # Removed test_chunked_exclude_falls_back_to_last_batch_reqs_when_no_pp: it
-    # probed t.last_chunked_exclude_set_source, which would require the scheduler
-    # to durably record which structure (last_batch.chunked_req vs last_batch.reqs)
-    # it sourced the exclude set from. That is a pure implementation detail, not an
-    # observable invariant. The behavior that actually matters -- excluding the
-    # correct in-flight reqs from the local running set -- is covered by the
-    # in_flight_other_mb_rids regression test (filter_batch exclusion).
-
     def test_scheduler_continues_with_only_chunked_req_no_waiting(self):
         self.server.execute_script(
             self._script_scheduler_continues_with_only_chunked_req_no_waiting
@@ -627,13 +562,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def _script_scheduler_continues_with_only_chunked_req_no_waiting(
         t: ScriptedContext,
     ):
-        # "while a chunked req is in flight" means precisely while r.is_chunking
-        # (chunked_req points at r). Once the final chunk commits, chunked_req clears
-        # and the req moves on to decode/finish; the step right after the last chunk
-        # (and the finishing step) legitimately observes is_idle, so the non-idle
-        # assertion must be guarded by r.is_chunking, mirroring the passing
-        # test_chunked_in_flight_no_idle. The real invariant under test is that the
-        # sole chunked req keeps advancing with an empty waiting_queue.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=250
         )
@@ -660,12 +588,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
 
 class TestSpecialCaseRowPoolExhaustion(ScriptedTestCase):
-    # req_to_token_pool.size == max_running_requests (model_runner_kv_cache_mixin.py:
-    # max_num_reqs = self.max_running_requests). The default pool is thousands of rows,
-    # which the ballast reqs can never fully occupy because the KV pool exhausts long
-    # before the row pool does. Cap max_running_requests small so exhaust_row_pool can
-    # actually drive get_num_allocatable_reqs() to 0 while the in-flight chunked req
-    # (already admitted into the chunked slot) keeps progressing -- the bypass under test.
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         max_running_requests=8,
@@ -710,13 +632,6 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
 
     @staticmethod
     def _script_mix_with_running_chunked_plus_decode(t: ScriptedContext):
-        # Drive the decoders past their own prefill into the decoding state (each
-        # has emitted at least one token) so they sit in running_batch as decode
-        # reqs when the long chunked prompt arrives. The chunked prefill then rides
-        # the same forward pass as the running decodes, producing a MIXED batch.
-        # The exact iteration at which the merge happens is not deterministic (the
-        # chunk admits over several passes), so poll for the MIXED co-batch across
-        # the run rather than asserting it at a single instant.
         decodes = [t.start_req(prompt_len=8, max_new_tokens=16) for _ in range(3)]
         for d in decodes:
             yield from advance_to_decode_step(d, 1)
@@ -733,9 +648,6 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
         all_reqs = [r_chunk, *decodes]
         for _ in range(DEFAULT_MAX_STEPS * 2):
             comp = t.batch_composition()
-            # ForwardMode.MIXED.is_extend() is True, so batch_composition reports the
-            # merged-in decode reqs (everything but the chunked rid) under the
-            # "prefill" bucket, not "decode". Union all batch buckets to catch them.
             batch_rids = (
                 set(comp.get("prefill", []))
                 | set(comp.get("decode", []))
@@ -808,12 +720,6 @@ class TestSpecialCaseTransformers(ScriptedTestCase):
 
     @staticmethod
     def _script_transformers_text_model_still_chunks(t: ScriptedContext):
-        # Chunked prefill is force-disabled (chunked_prefill_size=-1) only for
-        # *multimodal* models (server_args.py:1353,1413 gated on
-        # model_config.is_multimodal), not by the Transformers backend itself. A
-        # text model (Qwen3-0.6B) on the Transformers backend therefore chunks a
-        # long prompt exactly like the native backend. A distinct prompt_token
-        # makes the req chunk cold so the count matches _expected_chunks.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10
         )
@@ -845,17 +751,10 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
         raise AssertionError("req did not finish under disabled chunking")
 
 
-# Deterministic flashinfer rounds chunked-prefill splits to its attention
-# alignment size; chunk_size == the align size keeps the req chunking exactly
-# once before the sub-align tail admits as the non-chunked last chunk.
 DETERMINISTIC_ALIGN_SIZE = 4096
 
 
 class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
-    # Deterministic inference with flashinfer forces the radix cache off (it is not
-    # yet compatible), so the tree_cache is a ChunkCache that the scripted harness's
-    # default kv_canary="raise" cannot walk (walk_radix_cache_for_canary does not
-    # support ChunkCache), crashing the scheduler. Opt out of the kv canary here.
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DETERMINISTIC_ALIGN_SIZE,
         page_size=16,
@@ -870,9 +769,6 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_truncation_align_size(t: ScriptedContext):
-        # A distinct prompt_token forces a cold chunk (no radix prefix overlap). The
-        # prompt is one full chunk plus a tail so the first chunk truncates to the
-        # align size and the remaining tail completes as the last (non-chunked) chunk.
         r = t.start_req(
             prompt_len=DETERMINISTIC_ALIGN_SIZE + 1024,
             max_new_tokens=2,
@@ -895,11 +791,6 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
 
 
 class TestSpecialCaseHiCache(ScriptedTestCase):
-    # enable_hierarchical_cache=True makes the tree_cache a HiRadixCache, which the
-    # scripted harness's default kv_canary="raise" cannot walk
-    # (walk_radix_cache_for_canary does not support HiRadixCache), crashing the
-    # scheduler. Opt out of the kv canary (and zero its sweep interval, which is only
-    # valid for a non-none kv_canary; server_args.py:7407).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         enable_hierarchical_cache=True,
@@ -951,9 +842,6 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
             req = t.find_req_by_rid(r.rid)
-            # Only start tracking once the req is actually mid-chunk (chunks_done
-            # >= 1); the set-once invariant is meaningless before the first
-            # chunk boundary writes the cached_tokens_* breakdown.
             if req is not None and r.is_chunking and r.chunks_done >= 1:
                 saw_chunking = True
                 cur = (
@@ -980,10 +868,6 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
 
 
 def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
-    # Mirror of the helper in test_scripted_chunk_size.py: the number of prefill
-    # forward passes a chunked prompt takes. 0 when the whole prompt fits one
-    # non-chunked shot; otherwise ceil(prompt_len / chunk_size) with the tail
-    # iteration counted.
     if prompt_len <= chunk_size:
         return 0
     return (prompt_len + chunk_size - 1) // chunk_size
@@ -1000,19 +884,10 @@ class TestSpecialCaseDynamicChunkingPP1(ScriptedTestCase):
 
     @staticmethod
     def _script_dynamic_chunking_forced_off_on_pp1(t: ScriptedContext):
-        # scheduler.py:947-948: enable_dynamic_chunking = server_args.enable_dynamic_chunking
-        # AND ps.pp_size > 1. On a single GPU (pp_size == 1) the conjunct forces it
-        # OFF even though the server arg is True, so the scheduler.py:2612 dynamic
-        # chunk-size predictor is never consulted and the prompt is chunked with the
-        # uniform chunked_prefill_size — exactly _expected_chunks(...) chunks.
-        # GPU validation pending.
         assert t.scheduler.enable_dynamic_chunking is False, (
             "pp_size==1 must force enable_dynamic_chunking off even when the "
             "server arg is True (the 'and ps.pp_size > 1' conjunct)"
         )
-        # A distinct prompt_token makes the req chunk cold: with the default fill
-        # token the all-identical prompt overlaps the radix tree and the chunk
-        # boundary count drifts off the exact _expected_chunks value.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10
         )
@@ -1026,19 +901,6 @@ class TestSpecialCaseDynamicChunkingPP1(ScriptedTestCase):
 
 
 class TestSpecialCaseSmallPool(ScriptedTestCase):
-    # Forced-admission (add_chunked_req force-re-add) tests under TRUE,
-    # engine-resolvable KV pressure -- a small KV pool with real reqs, never raw
-    # exhaust_kv pages. The schedule_policy force-re-add branch sets
-    # _rem_tokens = rem_chunk_tokens when min(rem_chunk_tokens, rem_total_tokens)
-    # <= 0 so an in-flight chunked req is never silently dropped (which would leak
-    # its held row + KV). Driving rem_total_tokens <= 0 with raw exhaust_kv pages
-    # crashes the scheduler (the force-re-add then allocs against pages that are
-    # gone), so instead a long-lived ballast decode req plus the in-flight chunked
-    # req share a capped pool: when their combined reservation drives
-    # rem_total_tokens <= 0 the force-re-add fires, the alloc succeeds (the pages
-    # are physically free), and the engine resolves the over-commitment by
-    # retracting the ballast on the decode-OOM path -- the named branch intent is
-    # genuinely reached without a crash.
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         max_total_tokens=SMALL_KV_POOL_MAX_TOTAL_TOKENS,
@@ -1057,12 +919,6 @@ class TestSpecialCaseSmallPool(ScriptedTestCase):
     def _run_force_readd_then_complete(
         t: ScriptedContext, *, chunk_token: int, ballast_token: int
     ):
-        # Shared body for the force-re-add forced-admission tests: admit the chunked
-        # req first (guaranteed into the chunked slot on the empty pool), then add a
-        # ballast so the pool runs out and the chunked resume hits the force-re-add
-        # branch. The engine retracts the ballast and the chunked req completes,
-        # releasing all resources (the consequence of "force-re-added, not silently
-        # dropped"). Returns nothing; asserts inline.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=chunk_token
         )
@@ -1104,13 +960,6 @@ class TestSpecialCaseSmallPool(ScriptedTestCase):
     def _script_add_chunked_req_rem_nonpositive_forces_rem_chunk_tokens(
         t: ScriptedContext,
     ):
-        # schedule_policy.py add_chunked_req non-SWA branch: when a chunked resume
-        # sees _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0, the req
-        # must still be re-added (forced to rem_chunk_tokens) rather than silently
-        # dropped, otherwise its held row/KV leaks forever. The ballast drives
-        # rem_total_tokens <= 0 so the force-re-add branch executes; the engine
-        # retracts the ballast and the chunked req completes and releases all
-        # resources -- the observable consequence of "re-added, not dropped".
         yield from TestSpecialCaseSmallPool._run_force_readd_then_complete(
             t, chunk_token=700, ballast_token=701
         )
@@ -1120,10 +969,6 @@ class TestSpecialCaseSmallPool(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_forced_admission_avoids_leak(t: ScriptedContext):
-        # Same force-re-add branch, asserted as "no row/KV leak after the forced
-        # admission completes". Real ballast pressure drives rem_total_tokens <= 0
-        # so the in-flight chunked req takes the force-re-add path; once the engine
-        # retracts the ballast it finishes and leaks no row.
         yield from TestSpecialCaseSmallPool._run_force_readd_then_complete(
             t, chunk_token=710, ballast_token=711
         )
@@ -1135,10 +980,6 @@ class TestSpecialCaseSmallPool(ScriptedTestCase):
 
     @staticmethod
     def _script_add_chunked_req_non_swa_forced_admit_on_rem_zero(t: ScriptedContext):
-        # The non-SWA force-admit-on-rem-zero branch: on a non-SWA model the
-        # force-re-add executes (it does not park as the SWA path would). The
-        # ballast drives _rem_tokens == 0; the chunked req is force-admitted,
-        # completes after the ballast is retracted, and releases all resources.
         yield from TestSpecialCaseSmallPool._run_force_readd_then_complete(
             t, chunk_token=720, ballast_token=721
         )
@@ -1156,14 +997,6 @@ class TestSpecialCaseRetractMerge(ScriptedTestCase):
     def _script_retract_merges_extend_chunk_batch_before_retract_all(
         t: ScriptedContext,
     ):
-        # scheduler.py:3705-3721: on retract, if last_batch.is_extend() the scheduler
-        # filter_batch(chunked_req_to_exclude=[]) (empty exclude) and merges the just-run
-        # extend/chunk batch into running_batch BEFORE retract_all runs at 3726-3734.
-        # Drive a chunked req until is_chunking so last_batch is the extend chunk batch
-        # and running_batch is empty; pin that pre-state, then retract and witness the
-        # merge-then-retract: last_batch cleared, running_batch drained (the chunk batch
-        # was folded in and retracted, not stranded as a separate batch). GPU validation
-        # pending.
         s = t.scheduler
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
@@ -1210,14 +1043,6 @@ class TestSpecialCaseChunkBudgetDefer(ScriptedTestCase):
     def _script_co_submitted_waiter_deferred_when_chunk_budget_zero(
         t: ScriptedContext,
     ):
-        # schedule_policy.py:577-578 (budget_state: rem_chunk_tokens is not None and
-        # <= 0 -> OTHER). When the long prompt consumes the full chunk-token budget in
-        # a pass, rem_chunk_tokens hits 0 and budget_state() refuses any further
-        # candidate in that pass. Submit the long chunked prompt plus a second long
-        # waiter that would otherwise admit; on the iters where the chunked rid is
-        # active, witness the second waiter sitting in 'waiting' with no KV — deferred
-        # specifically because the chunk-token budget was driven to 0. Both finish.
-        # GPU validation pending.
         r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r_wait = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE + 8, max_new_tokens=2)
         yield from run_until(r_chunk, lambda h: h.is_chunking)
@@ -1249,17 +1074,6 @@ class TestSpecialCaseChunkBudgetDefer(ScriptedTestCase):
 
 
 class TestSpecialCaseIgnoreEosNoRadix(ScriptedTestCase):
-    # disable_radix_cache=True is the load-bearing precondition: add_one_req routes to
-    # add_one_req_ignore_eos only when req.sampling_params.ignore_eos AND
-    # getattr(self.tree_cache, "disable", True) (schedule_policy.py:835). With radix
-    # enabled the guard fails and ignore_eos reqs go through add_one_req instead.
-    #
-    # disable_radix_cache=True makes the tree_cache a ChunkCache, which the scripted
-    # harness's default kv_canary="raise" cannot walk (walk_radix_cache_for_canary
-    # does not support ChunkCache), crashing the scheduler on the first forward pass.
-    # Opt out of the kv canary for this config so the ignore_eos path can actually
-    # run (sweep_interval must also be zeroed; sweep_interval>0 requires a non-none
-    # kv_canary, server_args.py:7407).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disable_radix_cache=True,
@@ -1272,11 +1086,6 @@ class TestSpecialCaseIgnoreEosNoRadix(ScriptedTestCase):
 
     @staticmethod
     def _script_ignore_eos_chunked_truncate_path(t: ScriptedContext):
-        # schedule_policy.py:798-809 (add_one_req_ignore_eos else: chunked truncate,
-        # new_chunked_req=req). A long ignore_eos prompt with radix disabled routes to
-        # add_one_req_ignore_eos and, exceeding the chunk budget, takes the chunked
-        # truncation path that carries it as new_chunked_req. Witness it goes
-        # is_chunking and completes the expected number of chunks. GPU validation pending.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
         )
@@ -1294,11 +1103,6 @@ class TestSpecialCaseIgnoreEosNoRadix(ScriptedTestCase):
 
     @staticmethod
     def _script_ignore_eos_nonchunked_fits_chunk_budget(t: ScriptedContext):
-        # schedule_policy.py:787-797 (add_one_req_ignore_eos: rem_chunk_tokens is None
-        # or extend_input_len <= rem_chunk_tokens -> non-chunked admit). A short
-        # ignore_eos prompt (<= chunk budget) with radix disabled takes the non-chunked
-        # ignore_eos admit branch: it must never chunk and report zero chunks_done.
-        # GPU validation pending.
         r = t.start_req(prompt_len=8, max_new_tokens=2, ignore_eos=True)
         for _ in range(DEFAULT_MAX_STEPS):
             assert not r.is_chunking, (
@@ -1323,11 +1127,6 @@ class TestSpecialCaseIgnoreEosNoRadix(ScriptedTestCase):
     def _script_ignore_eos_second_long_waiter_deferred_on_chunk_budget_zero(
         t: ScriptedContext,
     ):
-        # schedule_policy.py:799-800 (add_one_req_ignore_eos nested guard:
-        # rem_chunk_tokens <= 0 -> OTHER). Two long ignore_eos prompts with radix
-        # disabled both route to add_one_req_ignore_eos; once the first occupies the
-        # chunk budget, the second must be deferred (the nested <=0 OTHER guard) sitting
-        # in 'waiting' with no KV. Both finish. GPU validation pending.
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
         )
@@ -1372,12 +1171,6 @@ class TestSpecialCaseRetractedStain(ScriptedTestCase):
 
     @staticmethod
     def _script_retracted_stain_suppresses_cached_token_recount(t: ScriptedContext):
-        # schedule_batch.py:1916-1918 gated by retracted_stain (set at 1315): on a
-        # post-retract resume, prepare_for_extend must NOT re-add pre_len -
-        # already_computed to cached_tokens, because retracted_stain is True. Drive a
-        # chunked req past >=1 chunk, snapshot cached_tokens, retract+resume, then
-        # witness retracted_stain True AND cached_tokens unchanged across the resume
-        # (no double-count). GPU validation pending.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         cached_before = r.req.cached_tokens
@@ -1408,13 +1201,6 @@ class TestSpecialCaseResultSkipRetracted(ScriptedTestCase):
 
     @staticmethod
     def _script_result_skip_retracted_emits_no_stray_token(t: ScriptedContext):
-        # batch_result_processor.py:218-221: for (req, next_token), if req.finished()
-        # or req.is_retracted -> continue. Retract a chunked req mid-prefill so a
-        # prefill result for it is in flight while it is is_retracted; the skip must
-        # suppress any output append / inflight_middle_chunks decrement on that entry.
-        # ignore_eos pins the resumed req to exactly max_new_tokens, so a stray token
-        # from the skipped retracted entry would show up as output_ids length > 2.
-        # GPU validation pending.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
         )
@@ -1439,11 +1225,6 @@ class TestSpecialCaseMiddleChunkNoToken(ScriptedTestCase):
 
     @staticmethod
     def _script_middle_chunk_appends_no_token_no_finish(t: ScriptedContext):
-        # batch_result_processor.py:270-289 (else branch, skip_stream_req): a middle
-        # chunk whose prefill is not finished must NOT append an output token nor mark
-        # the req finished. Step the engine while is_chunking and witness at every
-        # middle-chunk iter that output_ids stays empty and status is not finished;
-        # output only grows once is_chunking flips False. GPU validation pending.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 

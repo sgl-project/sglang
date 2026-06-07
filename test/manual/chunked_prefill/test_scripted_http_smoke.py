@@ -42,11 +42,6 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
         assert r1.finished
         assert r2.finished
         assert r1.chunks_done == 0
-        # r2 prefills alone (r1 already finished), so its 512-token prompt
-        # chunks into exactly ceil(512 / 256) = 2 partial-prefill iterations.
-        # When r1 co-batches into r2's first chunk it steals chunk budget (8 of
-        # 256) and splits r2 into 3 chunks -- run r1 to completion first to
-        # keep the count exact.
         assert r2.chunks_done == 2
 
 

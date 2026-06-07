@@ -21,12 +21,6 @@ class TestPriorityBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_retract_mid_chunk_releases_kv(t: ScriptedContext):
-        # The only path that moves the in-flight CHUNKED req itself back to
-        # waiting on a non-priority engine is the explicit force-retract:
-        # retract_decode acts on the decode running batch (a peer), never on the
-        # chunked prefill req, and exhaust_kv holds raw pages with no backing Req
-        # so the chunked req's next-chunk alloc_for_extend would hard-OOM rather
-        # than retract. Drive the reachable retract and assert the KV release.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
@@ -41,8 +35,6 @@ class TestPriorityBasic(ScriptedTestCase):
         ), f"force-retracted chunked req must be back in waiting; got {r.status}"
         assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
 
-        # Resume generation: leaving the engine paused would poison every
-        # subsequent test in the class (start_req never reaches the scheduler).
         t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
@@ -172,9 +164,6 @@ class TestPriorityBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         t.pause_generation(mode="retract")
         t.abort(r)
-        # retract + abort on the same yield must idempotently release every
-        # resource; the aborted req is dropped from the waiting queue, not
-        # resumed to a normal finish. Drain the overlap lag, then assert release.
         for _ in range(12):
             if (
                 r.kv_pages == 0
@@ -188,7 +177,6 @@ class TestPriorityBasic(ScriptedTestCase):
         assert r.req is None or r.req.req_pool_idx is None
         t.continue_generation()
         yield
-        # the aborted req must not revive after generation resumes
         assert r.kv_pages == 0 and r.lock_refs == 0
 
     def test_retract_chunked_resume_in_waiting(self):
@@ -196,10 +184,6 @@ class TestPriorityBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_retract_chunked_resume_in_waiting(t: ScriptedContext):
-        # A chunked req lives in scheduler.chunked_req with status "running"
-        # between chunks; it never sits in waiting_queue mid-chunk on v1, so
-        # waiting is only reachable AFTER a force-retract. Retract first, then
-        # observe the req parked in waiting, then resume it to completion.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         t.pause_generation(mode="retract")
@@ -256,12 +240,6 @@ class TestPriorityPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_naive_priority_chunked(t: ScriptedContext):
-        # The high-priority short req must finish while the low-priority long
-        # chunked req is still prefilling: a short extend req joins the same
-        # prefill pass as the in-flight chunk and completes long before the long
-        # prompt walks all its chunks. Assert the guaranteed priority consequence
-        # (high finishes first, low not yet done) rather than a single-step mid
-        # state.
         low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority=0)
         yield from run_until(low, lambda h: h.is_chunking)
 
@@ -276,15 +254,6 @@ class TestPriorityPriority(ScriptedTestCase):
 
 
 class TestPriorityPreempt(ScriptedTestCase):
-    # Force deterministic priority preemption: max_running_requests=1 makes the
-    # running batch full after a single decode req, so admitting any further req
-    # must go through preempt_to_schedule (running_batch.batch_is_full is set in
-    # get_new_batch_prefill). The default preemption threshold (10) requires
-    # priority_diff STRICTLY greater than the threshold, so the test's 10-vs-0
-    # gap would never preempt; lower it to 0 so a 10-vs-0 gap (diff 10 > 0)
-    # preempts. This is genuine preemption of a running DECODE victim back to
-    # waiting -- not the OOM retract_decode-abort path that a raw exhaust_kv page
-    # grab triggers (which kills the only running req rather than parking it).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         enable_priority_scheduling=True,
@@ -299,12 +268,6 @@ class TestPriorityPreempt(ScriptedTestCase):
 
     @staticmethod
     def _script_priority_preempt_decode_victim_to_waiting(t: ScriptedContext):
-        # A long-lived low-priority decode req fills the single running slot; a
-        # higher-priority req then cannot be admitted normally (batch full) and
-        # preempts the low-priority victim back to the waiting queue. Assert the
-        # victim lands in waiting with its KV released, then the high-priority req
-        # finishes. (The victim never finishes -- it is a long-lived ballast req
-        # that the per-script engine reset aborts on teardown.)
         low = t.start_req(
             prompt_len=8,
             max_new_tokens=BALLAST_MAX_NEW_TOKENS,
@@ -327,9 +290,6 @@ class TestPriorityPreempt(ScriptedTestCase):
 
     @staticmethod
     def _script_priority_preempt_release_invariant(t: ScriptedContext):
-        # Same deterministic preemption (running decode victim, not a chunked
-        # req): assert the victim releases every KV page when preempted to
-        # waiting.
         r_low = t.start_req(
             prompt_len=8,
             max_new_tokens=BALLAST_MAX_NEW_TOKENS,

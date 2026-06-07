@@ -83,8 +83,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         rids = {h.rid for h in actives}
         assert r1.rid in rids or r2.rid in rids
         yield from run_until_all_finished([r1, r2])
-        # The overlap scheduler keeps a finished req in its batch structures for
-        # a step or two after the finish is observed; drain until it leaves.
         for _ in range(12):
             actives_after = t.list_active_reqs()
             if all(h.rid not in (r1.rid, r2.rid) for h in actives_after):
@@ -135,8 +133,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         before = t.engine_stats()["kv_pool_free"]
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
         yield from run_until_all_finished(reqs)
-        # Committed prompt prefixes stay cached (not leaked); drain + flush
-        # before comparing free pages against the baseline.
         for _ in range(40):
             if t.is_fully_idle:
                 break
@@ -154,8 +150,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         baseline = t.engine_stats()
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(100)]
         yield from run_until_all_finished(reqs, max_steps=4000)
-        # Finished prompts stay committed in the radix tree (cached != leaked);
-        # drain to idle and flush before the leak comparison.
         for _ in range(40):
             if t.is_fully_idle:
                 break
@@ -182,8 +176,6 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield from run_until_all_finished(reqs, max_steps=2000)
             for r in reqs:
                 assert r.finished
-        # Committed prompts stay in the radix tree across reps (cached !=
-        # leaked); drain to idle and flush before the final leak comparison.
         for _ in range(40):
             if t.is_fully_idle:
                 break
@@ -198,11 +190,6 @@ class TestInvariantsBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_sustained_long_chunked_load(t: ScriptedContext):
-        # VERY_LONG_PROMPT_LEN == 8 * DEFAULT_CHUNK_SIZE, so each req's prompt is
-        # scheduled across exactly ceil(prompt_len/chunk_size) == 8 chunk iters.
-        # Distinct prompt_token per req so each chunks cold (8x): an identical
-        # fill token would let later reqs hit an earlier one's cached prefix and
-        # chunk fewer times (chunks_done == 0 on a full prefix hit).
         expected_chunks_done = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
         baseline_kv = t.engine_stats()["kv_pool_free"]
         reqs = [
@@ -218,9 +205,6 @@ class TestInvariantsBasic(ScriptedTestCase):
                 f"VERY_LONG_PROMPT_LEN must take exactly {expected_chunks_done} "
                 f"chunks; got chunks_done={r.chunks_done}"
             )
-        # The 30 distinct finished prompts legitimately stay committed in the
-        # radix tree (cached != leaked); drain to idle and flush before the
-        # leak comparison so only genuinely-held pages would fail it.
         for _ in range(40):
             if t.is_fully_idle:
                 break
@@ -247,8 +231,6 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield from run_until_all_finished(shorts + chunked, max_steps=2000)
             for r in shorts + chunked:
                 assert r.finished
-        # Finished short+chunked prompts stay committed in the radix tree
-        # (cached != leaked); drain to idle and flush before comparing.
         for _ in range(40):
             if t.is_fully_idle:
                 break
@@ -263,9 +245,6 @@ class TestInvariantsBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_long_decode_then_many_short(t: ScriptedContext):
-        # The long req's prompt is VERY_LONG_PROMPT_LEN == 8 * DEFAULT_CHUNK_SIZE,
-        # so it really chunks (ceil(prompt_len/chunk_size) == 8) and then has a
-        # long decode tail while the many short reqs interleave through the batch.
         expected_chunks_done = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
         long_max_new_tokens = 256
         long_decode = t.start_req(
@@ -296,9 +275,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         for _ in range(10):
             reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
             yield from run_until_all_finished(reqs)
-            # Sampled outputs differ across reps and commit new radix branches
-            # (cached != leaked); drain + flush before each measurement so the
-            # monotone check sees genuinely-held pages only.
             for _ in range(40):
                 if t.is_fully_idle:
                     break
@@ -316,11 +292,6 @@ class TestInvariantsBasic(ScriptedTestCase):
     @staticmethod
     def _script_inflight_middle_chunks_caps_at_one(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        # r.req is None before the engine pulls the req into a scheduler structure
-        # and again after it finishes and is removed from the scheduler; in both
-        # cases the req holds no in-flight chunk, so a missing req reads as 0.
-        # Sample every step from the start so the mid-chunk 1 is observed (a
-        # 2048/256 prompt has 7 mid-chunks where inflight_middle_chunks == 1).
         running_max = 0
         running_max_post_finish = 0
         post_finish_samples = 0
@@ -439,15 +410,9 @@ class TestInvariantsBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_extend_batch_idx_monotonic_invariant(t: ScriptedContext):
-        # Drive a real mid-life retract so the only legal extend_batch_idx
-        # regression (reset_for_retract zeroes it and flips is_retracted) is
-        # actually exercised; max_new_tokens is large enough that r is still
-        # decoding when pause(mode="retract") retracts the running batch.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=64)
         observed_regression: bool = False
 
-        # Advance r past chunked prefill into decode (whole prompt committed,
-        # extend_batch_idx advanced past 0), then capture the pre-retract idx.
         yield from run_until(
             r,
             lambda h: (
@@ -461,8 +426,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         pre_retract_idx: int = r.req.extend_batch_idx
         assert not r.req.is_retracted
 
-        # reset_for_retract runs synchronously inside pause_generation, so the
-        # regression is observable before any further engine step.
         t.pause_generation(mode="retract")
         retracted = t.find_req_by_rid(r.rid)
         assert retracted is not None, "retracted req must stay live in the queue"
@@ -474,13 +437,6 @@ class TestInvariantsBasic(ScriptedTestCase):
             )
         t.continue_generation()
 
-        # The monotonic invariant must keep holding while r re-prefills and
-        # decodes to completion.
-        # On re-admission the engine clears is_retracted BEFORE the first new
-        # chunk restarts extend_batch_idx, so sampling the flag cannot pin the
-        # restart step. The honest invariant: across the single retract episode
-        # above, extend_batch_idx may restart exactly once; it must otherwise
-        # be monotone.
         prev_extend_batch_idx: int = -1
         regressions: int = 0
         for _ in range(DEFAULT_MAX_STEPS):

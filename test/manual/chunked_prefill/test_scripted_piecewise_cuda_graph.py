@@ -38,9 +38,6 @@ class TestPiecewiseBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        # prompt_len=4*256+1=1025 at chunk_size=256: ceil(1025/256)=5. All five
-        # chunk iterations (256/512/768/1024 plus the 1-token tail) are counted;
-        # the final tail iteration counts too -> chunks_done is exactly 5.
         assert r.chunks_done == 5
 
 

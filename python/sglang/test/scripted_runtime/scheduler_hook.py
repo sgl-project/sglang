@@ -95,7 +95,6 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
-    # A paused event loop cannot drain; resume before resetting.
     if scheduler._engine_paused:
         ctx.continue_generation()
 

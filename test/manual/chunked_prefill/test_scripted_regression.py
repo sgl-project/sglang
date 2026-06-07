@@ -16,8 +16,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 
 def _in_flight_other_mb_rids(t: ScriptedContext) -> List[str]:
-    # Rids held in pipeline micro-batch slots other than the one currently being
-    # serviced (running_batch). running_mbs only exists on the PP path.
     s = t.scheduler
     if not hasattr(s, "running_mbs"):
         return []
@@ -30,9 +28,6 @@ def _in_flight_other_mb_rids(t: ScriptedContext) -> List[str]:
 
 
 def _drain_until_released(t, *handles):
-    # Under the overlap scheduler an abort/retract releases a req's KV/row/lock_ref
-    # over several forward steps, not in the single step right after the call.
-    # Advance the loop until every handle has fully released, then return.
     for _ in range(12):
         if all(
             h.kv_pages == 0
@@ -91,11 +86,6 @@ class TestRegressionBasic(ScriptedTestCase):
             prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, ignore_eos=True
         )
 
-        # Step one at a time so observed_max sees every intermediate value of
-        # inflight_middle_chunks, not just the values at the run_until landings.
-        # Read r.req once per iter and skip None: once the req finishes its object
-        # is recycled to None, and under the overlap scheduler that can happen on
-        # the same step the chunk loop would otherwise break.
         observed_max = 0
         saw_chunking_bump = False
         cleared_inflight = False
@@ -147,13 +137,6 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
 
-    # Removed test_stage_a_chunk_stash_iter_boundary: it probed t.last_scheduler_path
-    # / t.last_admission_path, which require the scheduler to durably record which
-    # internal branch (stash vs adder.build) it took. That ordering is a deep
-    # stage-internal implementation detail, not an externally observable invariant,
-    # and belongs in a dedicated scheduler unit test rather than the scripted
-    # runtime. No durable path probe is added.
-
     def test_merge_batch_assert_widened(self):
         self.server.execute_script(self._script_merge_batch_assert_widened)
 
@@ -173,13 +156,6 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_pending_tokens_subtract_prefix(t: ScriptedContext):
-        # load_inquirer._get_num_pending_tokens (load_inquirer.py:69-72) is the real
-        # v1 invariant: waiting-queue reqs contribute their full seqlen, while the
-        # in-flight chunked req contributes seqlen MINUS its committed prefix
-        # (len(prefix_indices)). Set up exactly that mix -- r1 as the in-flight
-        # chunked req holding a committed prefix, r2 sitting in the waiting queue --
-        # and assert the total matches the prefix-subtracting formula, and that the
-        # subtraction actually happened (it is strictly below the no-subtraction sum).
         r1 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
 
@@ -216,15 +192,6 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_admission_reuse_branch_balanced(t: ScriptedContext):
-        # The reuse-branch bug this guards against is re-acquiring a lock_ref on the
-        # SAME node every chunk (a node's lock_ref climbing to 2, 3, ...). It is NOT
-        # that the total ref sum is constant: each committed chunk forks a new radix
-        # node and inc_lock_ref locks the whole ancestor path, so the *sum* of
-        # per-node lock_refs legitimately grows with the committed prefix depth
-        # (chunk 3 -> 2, chunk 4 -> 3, ...). The correct witnesses are that the
-        # chunked req holds exactly ONE lock on its current last_node every chunk
-        # (r.lock_refs stays 1, never doubling) and that no single node is ever
-        # locked more than once, so the whole lifecycle nets to zero.
         baseline_refs = sum(t.get_all_node_lock_refs().values())
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
@@ -255,15 +222,6 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_multiturn_full_hit_no_reuse_branch(t: ScriptedContext):
-        # The scripted harness has no session support (start_req takes no
-        # session_id), so the multi-turn reuse invariant is exercised with two
-        # plain prefix-sharing reqs instead: a short warm-up req commits a 64-token
-        # prefix, then an identical follow-up req fully hits that prefix. The
-        # durable invariant is that the full-hit follow-up does NOT take the chunked
-        # reuse branch (it never chunks) and leaves no lingering lock_refs. Compare
-        # the total lock-ref count, not the node set -- the warm prefix legitimately
-        # remains cached (lock_ref==0) in the radix tree, so a dict equality against
-        # the empty baseline would spuriously fail.
         baseline_refs = sum(t.get_all_node_lock_refs().values())
         r1 = t.start_req(prompt_len=64, max_new_tokens=2)
         yield from run_until_finished(r1)
@@ -276,8 +234,6 @@ class TestRegressionBasic(ScriptedTestCase):
             f"follow-up req must fully hit the warm prefix to exercise the "
             f"no-reuse path; got cached_tokens={r2.req.cached_tokens}"
         )
-        # Drain the overlap lag so r2 fully leaves the running batch before reading
-        # the final lock-ref total.
         for _ in range(5):
             yield
         assert sum(t.get_all_node_lock_refs().values()) == baseline_refs, (
@@ -293,11 +249,6 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_chunked_resume_releases_all_resources(t: ScriptedContext):
-        # The invariant is on the total lock-ref count, not the node set:
-        # aborting a mid-chunk req commits its prefix to the radix tree, so new
-        # (lock_ref==0) nodes legitimately remain afterward. Comparing the full
-        # {node_id: ref} dict to the empty baseline would spuriously fail; sum the
-        # ref counts instead.
         baseline_refs = sum(t.get_all_node_lock_refs().values())
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
@@ -336,9 +287,6 @@ class TestRegressionBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        # pause(retract) releases the row/KV/lock_ref and re-queues the req into
-        # the waiting_queue (it is NOT discarded), so it is back in "waiting" with
-        # its row freed -- the engine is not fully idle here.
         assert r.req.req_pool_idx is None, (
             f"f38e69f87d: pause(retract) must release waiting "
             f"chunked-resume row; got row_idx={r.req.req_pool_idx!r}"
@@ -353,8 +301,6 @@ class TestRegressionBasic(ScriptedTestCase):
         assert t.scheduler.chunked_req is None
         assert t.scheduler.running_batch.is_empty()
 
-        # Resuming proves the released row/KV were a clean retract, not a leak:
-        # the re-queued req re-prefills from scratch and finishes normally.
         t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
@@ -368,9 +314,6 @@ class TestRegressionBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
-        # Only one chunked_req slot exists: while r1 holds it, r2 cannot become the
-        # chunked req and instead sits in the waiting_queue, so wait for r2 to be
-        # admitted as "waiting" rather than for an is_chunking state it never reaches.
         yield from run_until(r2, lambda h: h.status == "waiting")
 
         t.pause_generation(mode="retract")
@@ -388,7 +331,6 @@ class TestRegressionBasic(ScriptedTestCase):
             assert r.kv_pages == 0
             assert not r.is_chunking
 
-        # pause(retract) also pauses generation; resume so the re-queued reqs run.
         t.continue_generation()
         yield from run_until_all_finished([r1, r2])
 
@@ -419,9 +361,6 @@ class TestRegressionPp(ScriptedTestCase):
             f"waiting_queue; got {occurrences} occurrences of rid="
             f"{r.rid} (pre-fix bug would yield 3)"
         )
-        # The dedup assertion above must read running_batch exactly one yield after
-        # the abort. The actual finish/release then lands a few forward steps later
-        # under PP, so drain before asserting the req is gone.
         yield from _drain_until_released(t, r)
         assert r.finished
 
@@ -430,9 +369,6 @@ class TestRegressionPp(ScriptedTestCase):
 
     @staticmethod
     def _script_pp_other_mb_chunked_exclude(t: ScriptedContext):
-        # Distinct prompt_token per req: identical prompts share radix prefix nodes,
-        # so r_ctrl would resume from r_long's cached chunks and report chunks_done==0
-        # instead of chunking cold. Distinct tokens force both to chunk independently.
         r_long = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=5
         )
@@ -476,12 +412,6 @@ class TestRegressionPp(ScriptedTestCase):
             "69ef71edc4: never observed r_long in another mb's in-flight "
             "set — cross-mb exclude path was not exercised"
         )
-        # The max_new_tokens == 1 control must NOT be excluded from local running
-        # while in another mb's in-flight set: the wrong decode is filtered by the
-        # req.finished() check before being appended, so excluding it would only add
-        # a needless 1-mb stall. The non-exclusion is observable only when the control
-        # is actually caught in the in-flight set, so assert it conditionally on that
-        # observation rather than coupling it to r_long's unrelated exclusion.
         assert ctrl_exclude_engaged or not ctrl_seen_in_flight, (
             "69ef71edc4: max_new_tokens == 1 control was seen in another mb's "
             "in-flight set but never in local running — it must NOT be excluded"
@@ -506,14 +436,6 @@ class TestRegressionPriority(ScriptedTestCase):
             ignore_eos=True,
         )
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
-        # aaf3752d2b: when a higher-priority r2 arrives, calc_priority must SKIP the
-        # in-flight chunked req r1 -- it must not re-run r1's chunked-resume prefix
-        # match. The signature of a wrongful re-match is r1's host_hit_length
-        # changing. Note that prefix_indices and lock_refs are NOT valid witnesses
-        # here: r1 keeps committing its own chunks under the overlap scheduler, so
-        # those grow from r1's legitimate progress regardless of r2. The durable,
-        # r2-isolated invariant is that host_hit_length stays put and that r2 never
-        # preempts r1 (r1's chunk progress is monotonic and it completes normally).
         r1_host_hit_before = r1.req.host_hit_length
 
         r2 = t.start_req(
@@ -568,12 +490,6 @@ class TestRegressionLpm(ScriptedTestCase):
                 f"chunks_done stuck at {initial_chunks}"
             )
 
-        # The tiny shorts (prompt_len=4, max_new_tokens=1) finish within one or two
-        # forward steps. run_until_all_finished short-circuits its all(...) check, so
-        # a short that is admitted and recycled between two yields is never observed
-        # live -- is_finished then reports it not-finished forever and the wait
-        # hangs. Latch each req's finished state by probing every handle every step
-        # (find_req_by_rid registers it as seen while live), then check the latches.
         all_reqs = [r_long, *shorts]
         done = {r.rid: False for r in all_reqs}
         for _ in range(DEFAULT_MAX_STEPS):
@@ -600,12 +516,6 @@ class TestRegressionLpm(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
-        # When r2 arrives, LPM's calc_priority must SKIP the in-flight chunked req
-        # r1 (not re-run its prefix match). The signature of a wrongful re-match is
-        # r1's host_hit_length changing. last_node.id, prefix_indices and lock_refs
-        # are NOT valid witnesses: r1 keeps committing its own chunks, advancing its
-        # last_node down the radix tree and growing its prefix/lock count on every
-        # chunk regardless of r2. host_hit_length is the r2-isolated invariant.
         host_hit_before = r1.req.host_hit_length
 
         r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)

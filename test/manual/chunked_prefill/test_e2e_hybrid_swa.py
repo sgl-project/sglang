@@ -7,7 +7,7 @@ from sglang.test.chunked_prefill_test_utils import (
 
 
 class TestChunkedFeatureHybridSWA(ChunkedTestBase):
-    __test__ = True  # re-enable: the shared base sets __test__ = False
+    __test__ = True
     model = "openai/gpt-oss-20b"
     num_shots = LONG_PROMPT_NUM_SHOTS
     gsm8k_threshold = 0.50

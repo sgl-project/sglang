@@ -41,8 +41,6 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
-    # Probe every handle every step: an unprobed handle is never registered
-    # for post-recycle finished-tracking and would report not-finished forever.
     done = [False] * len(handles)
     for _ in range(max_steps):
         for i, h in enumerate(handles):
@@ -68,16 +66,10 @@ def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_ST
     yield from run_until_finished(handle, max_steps=max_steps)
 
 
-# Never finishes within any test's step budget, yet stays within the test
-# model's context window so admission does not reject it.
 BALLAST_MAX_NEW_TOKENS: int = 30000
 
-# Small-KV-pool pressure classes: ballast + a chunked req run the capped pool
-# out so the engine's own decode-OOM retract path resolves the pressure.
 SMALL_KV_POOL_MAX_TOTAL_TOKENS: int = 4096
 
-# Must keep the ballast ADMISSIBLE into the capped pool (its clipped decode
-# reservation counts against rem_total_tokens at admission).
 SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS: int = 512
 
 SMALL_KV_POOL_BALLAST_PROMPT_LEN: int = 1536
