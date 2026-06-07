@@ -3317,6 +3317,45 @@ class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
 
 
 class TestSanaWMDenoisingStage(unittest.TestCase):
+    class _FakeCompileBlock(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.compile_calls: list[tuple[tuple, dict]] = []
+
+        def compile(self, *args, **kwargs):
+            self.compile_calls.append((args, kwargs))
+            return self
+
+    class _FakeIgnoredBlock(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.compile_calls: list[tuple[tuple, dict]] = []
+
+        def compile(self, *args, **kwargs):
+            self.compile_calls.append((args, kwargs))
+            return self
+
+    class _FakeRegionalCompileTransformer(torch.nn.Module):
+        _repeated_blocks = ["_FakeCompileBlock"]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(
+                [
+                    TestSanaWMDenoisingStage._FakeCompileBlock(),
+                    TestSanaWMDenoisingStage._FakeIgnoredBlock(),
+                    TestSanaWMDenoisingStage._FakeCompileBlock(),
+                ]
+            )
+
+    @staticmethod
+    def _make_compile_stage() -> SanaWMDenoisingStage:
+        stage = object.__new__(SanaWMDenoisingStage)
+        stage.server_args = SimpleNamespace(enable_torch_compile=True)
+        stage._cache_dit_enabled = False
+        stage._torch_compiled_module_ids = set()
+        return stage
+
     @staticmethod
     def _make_verify_batch(**overrides) -> Req:
         kwargs = {
@@ -3334,6 +3373,50 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         }
         kwargs.update(overrides)
         return Req(**kwargs)
+
+    def test_torch_compile_regionally_compiles_repeated_blocks_by_default(
+        self,
+    ) -> None:
+        stage = self._make_compile_stage()
+        transformer = self._FakeRegionalCompileTransformer()
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TORCH_COMPILE_MODE": "",
+                "SGLANG_SANA_WM_TORCH_COMPILE_MODE": "",
+            },
+        ):
+            stage._maybe_enable_torch_compile(transformer)
+
+        compiled_blocks = [transformer.blocks[0], transformer.blocks[2]]
+        self.assertEqual(
+            [len(block.compile_calls) for block in compiled_blocks],
+            [1, 1],
+        )
+        self.assertEqual(transformer.blocks[1].compile_calls, [])
+        for block in compiled_blocks:
+            _, kwargs = block.compile_calls[0]
+            self.assertEqual(kwargs["dynamic"], True)
+            self.assertEqual(kwargs["fullgraph"], False)
+            self.assertNotIn("mode", kwargs)
+
+    def test_torch_compile_sana_wm_mode_env_overrides_default(self) -> None:
+        stage = self._make_compile_stage()
+        transformer = self._FakeRegionalCompileTransformer()
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_TORCH_COMPILE_MODE": "max-autotune-no-cudagraphs",
+                "SGLANG_SANA_WM_TORCH_COMPILE_MODE": "reduce-overhead",
+            },
+        ):
+            stage._maybe_enable_torch_compile(transformer)
+
+        _, kwargs = transformer.blocks[0].compile_calls[0]
+        self.assertEqual(kwargs["dynamic"], True)
+        self.assertEqual(kwargs["mode"], "reduce-overhead")
 
     def test_verify_input_accepts_prepared_denoising_request(self) -> None:
         stage = object.__new__(SanaWMDenoisingStage)

@@ -6,8 +6,11 @@ import time
 from typing import Any
 
 import torch
+import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -47,6 +50,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
@@ -68,6 +72,7 @@ from sglang.multimodal_gen.runtime.utils.sana_wm_runtime_cache import (
     clear_sana_wm_request_runtime_cache,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -83,6 +88,11 @@ _SANA_WM_DEFAULT_VAE_TILE_STRIDE_FRAMES = 64
 _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY = "sana_wm_condition_image_preprocess"
 _SANA_WM_PRECOMPUTED_PROPE_FNS_KEY = "precomputed_prope_fns"
 _SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY = "precomputed_plucker_emb"
+_SANA_WM_TORCH_COMPILE_MODE_ENV = "SGLANG_SANA_WM_TORCH_COMPILE_MODE"
+_SANA_WM_TORCH_COMPILE_CACHE_SIZE_LIMIT_ENV = (
+    "SGLANG_SANA_WM_TORCH_COMPILE_CACHE_SIZE_LIMIT"
+)
+_SANA_WM_TORCH_COMPILE_DEFAULT_CACHE_SIZE_LIMIT = 128
 
 
 def _clear_sana_wm_precomputed_static_conditioning(batch: Req) -> None:
@@ -91,6 +101,14 @@ def _clear_sana_wm_precomputed_static_conditioning(batch: Req) -> None:
         return
     extra.pop(_SANA_WM_PRECOMPUTED_PROPE_FNS_KEY, None)
     extra.pop(_SANA_WM_PRECOMPUTED_PLUCKER_EMB_KEY, None)
+
+
+def _sana_wm_nonempty_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 def _sana_wm_effective_guidance_scale(batch: Req) -> float:
@@ -770,6 +788,111 @@ class SanaWMDenoisingStage(DenoisingStage):
         if self.server_args.enable_cfg_parallel:
             return StageParallelismType.CFG_PARALLEL
         return StageParallelismType.REPLICATED
+
+    def _maybe_enable_torch_compile(self, module: object) -> None:
+        """Regionally compile SANA-WM blocks while keeping GDN/UCPE attention eager."""
+        if not self.server_args.enable_torch_compile or not isinstance(
+            module, nn.Module
+        ):
+            return
+        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+            logger.debug(
+                "Deferring SANA-WM regional torch.compile until cache-dit is enabled"
+            )
+            return
+        module_id = id(module)
+        if module_id in self._torch_compiled_module_ids:
+            return
+
+        repeated_block_names = tuple(getattr(module, "_repeated_blocks", ()) or ())
+        if not repeated_block_names:
+            super()._maybe_enable_torch_compile(module)
+            return
+
+        compile_targets = [
+            submodule
+            for submodule in module.modules()
+            if submodule.__class__.__name__ in repeated_block_names
+        ]
+        if not compile_targets:
+            logger.warning(
+                "SANA-WM regional torch.compile skipped: repeated block classes "
+                "%s were not found in %s.",
+                repeated_block_names,
+                module.__class__.__name__,
+            )
+            return
+
+        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
+        if current_platform.is_npu():
+            compile_kwargs["backend"] = get_compiler_backend()
+            compile_kwargs["dynamic"] = False
+            logger.info(
+                "Regionally compiling SANA-WM blocks with torchair backend on NPU"
+            )
+        else:
+            self._maybe_raise_torch_compile_cache_limit(len(compile_targets))
+            try:
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+            except ImportError:
+                pass
+            # Match vLLM's regional compile default: torch.compile(dynamic=True)
+            # with no explicit mode. Users can still opt into max-autotune or
+            # another mode with the SANA-WM-specific env, or the global one.
+            mode = _sana_wm_nonempty_env(
+                _SANA_WM_TORCH_COMPILE_MODE_ENV
+            ) or _sana_wm_nonempty_env("SGLANG_TORCH_COMPILE_MODE")
+            if mode is not None:
+                compile_kwargs["mode"] = mode
+            compile_kwargs["dynamic"] = True
+            logger.info(
+                "Regionally compiling %d SANA-WM blocks with mode=%s",
+                len(compile_targets),
+                mode or "default",
+            )
+
+        if self._needs_nvfp4_jit_prewarm(module):
+            logger.info(
+                "Prewarming NVFP4 JIT modules before SANA-WM regional torch.compile "
+                "to avoid Dynamo tracing JIT initialization."
+            )
+            prewarm_nvfp4_jit_modules()
+
+        for submodule in compile_targets:
+            submodule.compile(**compile_kwargs)
+
+        logger.info(
+            "Regionally compiled %d SANA-WM blocks with torch.compile kwargs: %s",
+            len(compile_targets),
+            compile_kwargs,
+        )
+        self._torch_compiled_module_ids.add(module_id)
+
+    @staticmethod
+    def _maybe_raise_torch_compile_cache_limit(num_compile_targets: int) -> None:
+        try:
+            import torch._dynamo.config as _dynamo_cfg
+        except ImportError:
+            return
+
+        configured_limit = _SANA_WM_TORCH_COMPILE_DEFAULT_CACHE_SIZE_LIMIT
+        configured = _sana_wm_nonempty_env(_SANA_WM_TORCH_COMPILE_CACHE_SIZE_LIMIT_ENV)
+        if configured is not None:
+            try:
+                configured_limit = int(configured)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid %s=%r; expected an integer.",
+                    _SANA_WM_TORCH_COMPILE_CACHE_SIZE_LIMIT_ENV,
+                    configured,
+                )
+
+        target_limit = max(configured_limit, num_compile_targets * 4)
+        current_limit = getattr(_dynamo_cfg, "cache_size_limit", 64)
+        if current_limit < target_limit:
+            _dynamo_cfg.cache_size_limit = target_limit
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

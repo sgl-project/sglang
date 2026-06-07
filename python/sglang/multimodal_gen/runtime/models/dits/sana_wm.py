@@ -222,6 +222,20 @@ def _sana_wm_bool_env(key: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _sana_wm_torch_compile_disable(fn: Callable) -> Callable:
+    compiler = getattr(torch, "compiler", None)
+    disable = getattr(compiler, "disable", None)
+    if callable(disable):
+        return disable(fn)
+
+    dynamo = getattr(torch, "_dynamo", None)
+    disable = getattr(dynamo, "disable", None)
+    if callable(disable):
+        return disable(fn)
+
+    return fn
+
+
 @functools.lru_cache(maxsize=1)
 def _sana_wm_cross_attn_kv_cache_max_bytes() -> int:
     """Return the cross-attention KV-cache byte budget (resolved once at startup)."""
@@ -3572,6 +3586,10 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         out = out_bhnd.transpose(1, 2).reshape(B, N, local_C)
         return out
 
+    # Keep this Triton-heavy attention branch eager when regional torch.compile
+    # captures the surrounding block. The GDN/UCPE kernels build launch grids from
+    # concrete runtime shapes; symbolic Dynamo shapes can break those launches.
+    @_sana_wm_torch_compile_disable
     def forward(
         self,
         x: torch.Tensor,
@@ -3980,6 +3998,7 @@ class SanaWMBlock(nn.Module):
 
 
 class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+    _repeated_blocks = ["SanaWMBlock"]
     _fsdp_shard_conditions = SanaWMConfig()._fsdp_shard_conditions
     _compile_conditions = SanaWMConfig()._compile_conditions
     _supported_attention_backends = SanaWMConfig()._supported_attention_backends
