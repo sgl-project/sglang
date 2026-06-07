@@ -343,6 +343,20 @@ class DeepseekSparseAttnBackend(
 
         if "cutedsl" in (self.dsa_prefill_impl, self.dsa_decode_impl):
             sa = model_runner.server_args
+            if self.dsa_prefill_impl != "cutedsl" or self.dsa_decode_impl != "cutedsl":
+                raise ValueError(
+                    "cutedsl DSA backend must be set for both "
+                    "--dsa-prefill-backend and --dsa-decode-backend."
+                )
+            if model_runner.kv_cache_dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "cutedsl DSA backend requires an fp8_e4m3 KV cache "
+                    "(--kv-cache-dtype fp8_e4m3)."
+                )
+            if sa.speculative_algorithm is not None:
+                raise ValueError(
+                    "cutedsl DSA backend does not support speculative decoding yet."
+                )
             self.b12x_decode_max_bs = model_runner.req_to_token_pool.size
             cps = sa.chunked_prefill_size
             self.b12x_extend_max_q = cps if cps and cps > 0 else sa.max_prefill_tokens
