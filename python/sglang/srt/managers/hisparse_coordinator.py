@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import Dict, List, NamedTuple, Union
+from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 
@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     MLATokenToKVPoolHost,
@@ -196,6 +197,82 @@ class HiSparseCoordinator:
     def set_host_radix_cache(self, cache) -> None:
         self.host_radix_cache = cache
 
+    def _hicache_host_pool_group(self):
+        if self.host_radix_cache is None or self.is_dsv4_hisparse:
+            return None
+
+        cache_controller = getattr(self.host_radix_cache, "cache_controller", None)
+        host_pool_group = getattr(cache_controller, "mem_pool_host", None)
+        entry_map = getattr(host_pool_group, "entry_map", {})
+        anchor_entry = getattr(host_pool_group, "anchor_entry", None)
+        if (
+            PoolName.INDEXER in entry_map
+            and getattr(anchor_entry, "host_pool", None) is self.mem_pool_host
+        ):
+            return host_pool_group
+        return None
+
+    def _build_indexer_pool_transfer_for_range(
+        self, req_idx: int, start_pos: int, end_pos: int
+    ) -> Optional[PoolTransfer]:
+        if self._hicache_host_pool_group() is None:
+            return None
+
+        aligned_start = (
+            (start_pos + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        aligned_end = (end_pos // self.page_size) * self.page_size
+        if aligned_end <= aligned_start:
+            return None
+
+        host_indices = self.req_to_host_pool[req_idx, aligned_start:aligned_end]
+        if host_indices.numel() == 0:
+            return None
+        device_indices = self.req_to_token_pool.req_to_token[
+            req_idx, aligned_start:aligned_end
+        ].to(dtype=torch.int64)
+        return PoolTransfer(
+            name=PoolName.INDEXER,
+            host_indices=host_indices,
+            device_indices=device_indices,
+        )
+
+    def _build_indexer_pool_transfer_for_completed_page(
+        self, req_idx: int, written_end: int
+    ) -> Optional[PoolTransfer]:
+        if written_end <= 0 or written_end % self.page_size != 0:
+            return None
+        return self._build_indexer_pool_transfer_for_range(
+            req_idx,
+            written_end - self.page_size,
+            written_end,
+        )
+
+    def _backup_from_device_all_layer(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> None:
+        host_pool_group = self._hicache_host_pool_group()
+        if host_pool_group is None:
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                io_backend="kernel",
+            )
+            return
+
+        cache_controller = self.host_radix_cache.cache_controller
+        host_pool_group.backup_from_device_all_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            io_backend=getattr(cache_controller, "io_backend", "kernel"),
+            pool_transfers=pool_transfers,
+        )
+
     def _ensure_host_capacity(self, need: int) -> None:
         if need <= 0 or self.mem_pool_host.available_size() >= need:
             return
@@ -294,17 +371,24 @@ class HiSparseCoordinator:
                 suffix_len,
             )
             suffix_device_indices = device_indices[radix_prefix_len:]
+            indexer_transfer = self._build_indexer_pool_transfer_for_range(
+                req.req_pool_idx,
+                radix_prefix_len,
+                prefill_len,
+            )
+            pool_transfers = (
+                [indexer_transfer] if indexer_transfer is not None else None
+            )
 
             start_event = device_module.Event()
             finish_event = device_module.Event()
             start_event.record()
             with device_module.stream(self.write_staging_stream):
                 start_event.wait(self.write_staging_stream)
-                self.mem_pool_host.backup_from_device_all_layer(
-                    self.mem_pool_device,
+                self._backup_from_device_all_layer(
                     suffix_host_indices,
                     suffix_device_indices,
-                    io_backend="kernel",
+                    pool_transfers=pool_transfers,
                 )
                 finish_event.record()
                 if suffix_host_indices.is_cuda:
@@ -675,6 +759,7 @@ class HiSparseCoordinator:
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
         host_locs_list = []
+        pool_transfers = []
         for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
@@ -688,6 +773,12 @@ class HiSparseCoordinator:
                 self._req_host_written_len.get(req_idx, 0),
                 start_pos + 1,
             )
+            indexer_transfer = self._build_indexer_pool_transfer_for_completed_page(
+                req_idx,
+                start_pos + 1,
+            )
+            if indexer_transfer is not None:
+                pool_transfers.append(indexer_transfer)
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
@@ -696,11 +787,10 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
+            self._backup_from_device_all_layer(
                 host_locs,
                 device_locs,
-                io_backend="kernel",
+                pool_transfers=pool_transfers or None,
             )
             self._backup_done_event.record()
             if host_locs.is_cuda:
@@ -977,11 +1067,15 @@ class HiSparseCoordinator:
         host_locs = self._alloc_paged_host_slots(req_idx, written_len, 1)
         device_slot = min(written_len, self.device_buffer_size)
         device_locs = self.req_to_device_buffer[req_idx, device_slot : device_slot + 1]
-        self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device,
+        indexer_transfer = self._build_indexer_pool_transfer_for_completed_page(
+            req_idx,
+            written_len + 1,
+        )
+        pool_transfers = [indexer_transfer] if indexer_transfer is not None else None
+        self._backup_from_device_all_layer(
             host_locs,
             device_locs,
-            io_backend="kernel",
+            pool_transfers=pool_transfers,
         )
         written_len += 1
         self._req_host_written_len[req_idx] = written_len

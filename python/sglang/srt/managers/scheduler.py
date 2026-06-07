@@ -471,7 +471,8 @@ class Scheduler(
             if hasattr(self.tree_cache, "init_hisparse_radix_cache"):
                 self.enable_hisparse_radix_cache = (
                     self.tree_cache.init_hisparse_radix_cache(
-                        self.hisparse_coordinator.mem_pool_host
+                        self.hisparse_coordinator.mem_pool_host,
+                        self.server_args,
                     )
                 )
                 if self.enable_hisparse_radix_cache:

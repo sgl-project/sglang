@@ -542,7 +542,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         self.hisparse_mode = True
 
-    def init_hisparse_radix_cache(self, host_pool) -> bool:
+    def init_hisparse_radix_cache(
+        self, host_pool, server_args: Optional[ServerArgs] = None
+    ) -> bool:
         """Attach the HiSparse coordinator host pool to the unified tree.
 
         Returns False when the current HiSparse pool cannot load host entries
@@ -552,7 +554,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.hisparse_host_pool = host_pool
         self.components[BASE_COMPONENT_TYPE]._full_kv_pool_host = host_pool
 
-        compress_ratio = getattr(self.token_to_kv_pool_allocator, "compress_ratio", 1)
+        allocator = self.token_to_kv_pool_allocator
+        kvcache = allocator.get_kvcache()
+        compress_ratio = getattr(allocator, "compress_ratio", 1)
         can_load = compress_ratio == 1 and hasattr(
             host_pool, "load_to_device_per_layer"
         )
@@ -565,6 +569,121 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 type(host_pool).__name__,
             )
             return False
+
+        if (
+            server_args is not None
+            and server_args.enable_hierarchical_cache
+            and hasattr(kvcache, "index_k_with_scale_buffer")
+        ):
+            from sglang.srt.mem_cache.memory_pool_host import (
+                DSAIndexerPoolHost,
+                HostPoolGroup,
+                PoolEntry,
+            )
+
+            storage_backend = server_args.hicache_storage_backend
+            storage_extra_config = None
+            storage_prefetch_threshold = 256
+            prefetch_timeout_base = 1.0
+            prefetch_timeout_per_ki_token = 0.25
+            hicache_storage_pass_prefix_keys = False
+            if storage_backend is not None:
+                (
+                    storage_extra_config,
+                    storage_prefetch_threshold,
+                    prefetch_timeout_base,
+                    prefetch_timeout_per_ki_token,
+                    hicache_storage_pass_prefix_keys,
+                ) = HybridCacheController.parse_storage_backend_extra_config(
+                    server_args.hicache_storage_backend_extra_config
+                )
+
+            self.load_cache_event = threading.Event()
+            self.sidecar_pool_specs.clear()
+            self.extra_metric_labels = server_args.extra_metric_labels
+            layer_num = kvcache.layer_num
+            def layer_mapper(layer_id):
+                return layer_id
+
+            indexer_layout = (
+                "page_first_direct"
+                if server_args.hicache_io_backend == "direct"
+                else "page_first"
+            )
+            indexer_host_pool = DSAIndexerPoolHost(
+                kvcache,
+                host_pool,
+                indexer_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+            host_pool_group = HostPoolGroup(
+                [
+                    PoolEntry(
+                        name=PoolName.KV,
+                        host_pool=host_pool,
+                        device_pool=kvcache,
+                        layer_mapper=layer_mapper,
+                        is_primary_index_anchor=True,
+                    ),
+                    PoolEntry(
+                        name=PoolName.INDEXER,
+                        host_pool=indexer_host_pool,
+                        device_pool=kvcache,
+                        layer_mapper=layer_mapper,
+                    ),
+                ]
+            )
+            self.host_pool_group = host_pool_group
+            self.cache_controller = HybridCacheController(
+                self.token_to_kv_pool_allocator,
+                host_pool_group,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
+                pp_group=self.pp_group,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=storage_backend,
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=storage_extra_config,
+                transfer_layer_num=layer_num,
+                enable_storage_metrics=self._enable_metrics_flag,
+            )
+            self.full_kv_pool_host = host_pool
+            self.register_sidecar_pool(
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                )
+            )
+            kvcache.register_layer_transfer_counter(
+                self.cache_controller.layer_done_counter
+            )
+            self.write_through_threshold = (
+                1 if server_args.hicache_write_policy == "write_through" else 2
+            )
+            self.load_back_threshold = 0
+            self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+            if storage_backend is not None:
+                self._apply_storage_runtime_config(
+                    storage_backend=storage_backend,
+                    prefetch_threshold=storage_prefetch_threshold,
+                    prefetch_timeout_base=prefetch_timeout_base,
+                    prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+                    hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+                    enable_storage=self.cache_controller.enable_storage,
+                    enable_storage_metrics=self._enable_metrics_flag,
+                    extra_metric_labels=self.extra_metric_labels,
+                )
+            logger.info(
+                "HiSparse unified radix cache enabled with DSA HiCache sidecar "
+                "(host_pool=%s).",
+                type(host_pool).__name__,
+            )
+            return True
 
         from sglang.srt.managers.cache_controller import HiCacheController
 
@@ -991,6 +1110,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.parent = parent
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
+        if self.enable_storage:
+            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
         parent.children[key.child_key(self.page_size)] = new_node
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -1031,6 +1152,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key):
             new_node = self._add_new_host_node(node, key, host_value)
             self._inc_hit_count(new_node)
+            self.write_backup_storage(new_node)
         return total_prefix_length
 
     def _hisparse_inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -2677,13 +2799,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         mapping[logical_indices] = hisparse_indices
 
-        from sglang.srt.managers.cache_controller import CacheOperation
+        pool_transfers = None
+        host_pool_group = getattr(self.cache_controller, "mem_pool_host", None)
+        entry_map = getattr(host_pool_group, "entry_map", None)
+        if entry_map and PoolName.INDEXER in entry_map:
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+                CacheOperation,
+            )
 
+            pool_transfers = [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    host_indices=host_indices,
+                    device_indices=logical_indices,
+                )
+            ]
+        else:
+            from sglang.srt.managers.cache_controller import CacheOperation
+
+        kwargs = {"pool_transfers": pool_transfers} if pool_transfers else {}
         self.cache_controller.load_queue.append(
             CacheOperation(
                 host_indices=host_indices,
                 device_indices=hisparse_indices,
                 node_id=best_match_node.id,
+                **kwargs,
             )
         )
         self.ongoing_load_back[best_match_node.id] = (
