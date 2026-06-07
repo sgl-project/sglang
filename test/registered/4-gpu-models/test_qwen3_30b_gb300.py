@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=180, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 GSM8K_ACCURACY_THRESHOLD = 0.93
