@@ -3545,7 +3545,7 @@ class UnifiedRadixCacheSuite:
         xfer = tree.components[ComponentType.MAMBA].build_hicache_transfers(
             node, CacheTransferPhase.LOAD_BACK
         )[0]
-        new_mamba = req_to_token_pool.mamba_pool.alloc(1)
+        new_mamba = req_to_token_pool.mamba_allocator.alloc(1)
         self.assertIsNotNone(new_mamba)
         xfer.device_indices = new_mamba
         tree.components[ComponentType.MAMBA].commit_hicache_transfer(

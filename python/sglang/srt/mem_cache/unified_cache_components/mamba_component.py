@@ -96,7 +96,7 @@ class MambaComponent(TreeComponent):
         if cow_mamba and mamba_value is not None:
             assert req is not None
             if req.mamba_pool_idx is None:
-                dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     # Capture the inc result and thread swa_uuid_for_lock back
                     # into dec. Without it, SWA's release walks past this
@@ -105,7 +105,7 @@ class MambaComponent(TreeComponent):
                     # on ancestor nodes.
                     lock_result = self.cache.inc_lock_ref(last_node)
                     self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                    dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                     self.cache.dec_lock_ref(last_node, lock_result.to_dec_params())
                     assert dst_index is not None, "Can not alloc mamba cache"
                 req.mamba_pool_idx = dst_index[0]
@@ -172,7 +172,7 @@ class MambaComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            self.cache.req_to_token_pool.mamba_pool.free(cd.value)
+            self.cache.req_to_token_pool.mamba_allocator.free(cd.value)
             freed = len(cd.value)
             self.cache.component_evictable_size_[self.component_type] -= freed
             cd.value = None
@@ -285,10 +285,10 @@ class MambaComponent(TreeComponent):
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
-        slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+        slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-            slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+            slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
 
@@ -365,7 +365,9 @@ class MambaComponent(TreeComponent):
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):
-                self.cache.req_to_token_pool.mamba_pool.free(insert_params.mamba_value)
+                self.cache.req_to_token_pool.mamba_allocator.free(
+                    insert_params.mamba_value
+                )
             req.mamba_last_track_seqlen = None
 
     # ---- HiCache Hooks ----
@@ -414,10 +416,10 @@ class MambaComponent(TreeComponent):
             cd = node.component_data[ct]
             if req is not None and cd.host_value is not None:
                 if req.mamba_pool_idx is None:
-                    dst = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                    dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                     if dst is None:
                         self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                        dst = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                         assert dst is not None, "Cannot alloc mamba for load_back"
                     req.mamba_pool_idx = dst[0]
                 transfers.append(

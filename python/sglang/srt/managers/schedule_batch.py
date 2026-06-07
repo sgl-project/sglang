@@ -2417,10 +2417,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                 new_slot = None
             else:
-                new_slot = pool.mamba_pool.alloc(1)
+                new_slot = pool.mamba_allocator.alloc(1)
                 if new_slot is None:
                     self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    new_slot = pool.mamba_pool.alloc(1)
+                    new_slot = pool.mamba_allocator.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx

@@ -2511,7 +2511,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if ct.is_swa:
                 available_size = self.token_to_kv_pool_allocator.swa_available_size()
             elif ct.is_mamba:
-                available_size = self.req_to_token_pool.mamba_pool.available_size()
+                available_size = self.req_to_token_pool.mamba_allocator.available_size()
             else:
                 continue
 
