@@ -8,12 +8,13 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb200")
+QWEN3_8B_MODEL_PATH = "Qwen/Qwen3-8B"
+
+register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
@@ -22,7 +23,7 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
         super().setUpClass()
         os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "true"
         os.environ["MC_FORCE_MNNVL"] = "true"
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = QWEN3_8B_MODEL_PATH
 
         # Non blocking start servers
         cls.start_prefill()
