@@ -2330,7 +2330,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_chunks.reverse()
             return torch.cat(prefix_chunks)
 
-        if best_match_node.evicted or params.host_hit_length > 0:
+        if (
+            best_match_node.evicted
+            or params.host_hit_length > 0
+            or (
+                req is not None
+                and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
+            )
+        ):
             if self.load_back(best_match_node, mem_quota, req=req):
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
@@ -2511,7 +2518,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if ct.is_swa:
                 available_size = self.token_to_kv_pool_allocator.swa_available_size()
             elif ct.is_mamba:
-                available_size = self.req_to_token_pool.mamba_pool.available_size()
+                available_size = self.req_to_token_pool.mamba_allocator.available_size()
             else:
                 continue
 

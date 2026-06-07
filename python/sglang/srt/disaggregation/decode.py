@@ -241,7 +241,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.mamba_pool.clear()
+        self.mamba_allocator.clear()
 
 
 @dataclass
