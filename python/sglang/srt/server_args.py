@@ -3445,12 +3445,30 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
+        def get_model_arch_or_none():
+            model_config = getattr(self, "model_config", None)
+            if model_config is None and self.model_path == "dummy":
+                return None
+            if model_config is None:
+                model_config = self.get_model_config()
+            return model_config.hf_config.architectures[0]
+
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
-            logger.warning(
-                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-                "Waterfill requires the DeepEP backend."
-            )
-            self.moe_a2a_backend = "deepep"
+            model_arch = get_model_arch_or_none()
+            if (
+                self.moe_a2a_backend == "megamoe"
+                and model_arch == "DeepseekV4ForCausalLM"
+            ):
+                logger.info(
+                    "DeepSeek V4 MegaMoE Waterfill is enabled; keeping "
+                    "--moe-a2a-backend megamoe and enabling shared expert fusion."
+                )
+            else:
+                logger.warning(
+                    "moe_a2a_backend is overridden to 'deepep' because DeepEP "
+                    "Waterfill requires the DeepEP backend."
+                )
+                self.moe_a2a_backend = "deepep"
 
         if (
             envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
@@ -3463,6 +3481,12 @@ class ServerArgs:
             )
 
         if self.moe_a2a_backend == "megamoe":
+            if get_model_arch_or_none() == "DeepseekV3ForCausalLM":
+                raise ValueError(
+                    "DeepSeek V3 does not support the MegaMoE backend. "
+                    "Use --moe-a2a-backend deepep for DeepSeek V3, or use "
+                    "--enable-deepep-waterfill to route waterfill through DeepEP."
+                )
             self.ep_size = self.tp_size
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
@@ -3470,6 +3494,14 @@ class ServerArgs:
                 f"Mega MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            if self.enable_deepep_waterfill:
+                if self.disable_shared_experts_fusion:
+                    logger.warning(
+                        "disable_shared_experts_fusion is overridden to False because "
+                        "MegaMoE Waterfill requires shared expert fusion."
+                    )
+                    self.disable_shared_experts_fusion = False
+                self.enforce_shared_experts_fusion = True
 
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -6134,12 +6166,10 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_deepep_waterfill,
             help="Enable DeepEP Waterfill: dispatch the shared expert as the 9th "
-            "routed expert to the least-loaded EP rank. Automatically sets "
-            "--moe-a2a-backend deepep, implicitly enables shared-expert fusion, "
-            "and supports --deepep-mode auto, normal, or low_latency. Use auto "
-            "or low_latency for production decode so CUDA graph remains enabled. "
-            "Supported on DeepSeek-V3/R1 "
-            "with EP >= 2.",
+            "routed expert to the least-loaded EP rank. Usually routes through "
+            "DeepEP and supports --deepep-mode auto, normal, or low_latency; "
+            "DeepSeek V4 with --moe-a2a-backend megamoe keeps MegaMoE. "
+            "Implicitly enables shared-expert fusion.",
         )
         parser.add_argument(
             "--elastic-ep-rejoin",
@@ -6721,9 +6751,9 @@ class ServerArgs:
             action="store_true",
             help=(
                 "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. "
-                "Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert "
-                "through DeepEP as an extra MoE slot, so shared expert is not separated from the "
-                "MoE path when Waterfill is enabled."
+                "Note: Waterfill (--enable-deepep-waterfill) still routes shared expert "
+                "as an extra MoE slot, so shared expert is not separated from the MoE path "
+                "when Waterfill is enabled."
             ),
         )
         parser.add_argument(
