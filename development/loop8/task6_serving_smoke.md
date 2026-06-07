@@ -39,17 +39,29 @@ standalone backend and no duplicated hooks. Server reached "fired up and ready t
 Decode is coherent on the 32-sample bring-up mask; this confirms the DS read/write hooks (select_topk +
 token-label write) function end-to-end on GLM's 192/256 MLA shapes.
 
-## DeepSeek-V3.2 non-regression (AC-5)
-- **Unit level (committed, green):** the dual-shape synthetic tests (`128/128` V3.2 + `192/256` GLM) and
-  the full DS unit suite (309 passed) cover the V3.2 shapes; `verify_bind_shapes` passes V3.2 dims.
-- **Code-level safety:** every Loop-8 shared-hook change is gated under `if use_double_sparsity` (DSA-off
-  path untouched) and the `_ds_qk_nope_head_dim` default is now `self.qk_nope_head_dim` (=128 for V3.2 →
-  byte-identical to the prior literal 128).
-- **Live V3.2 DS smoke: REMAINING** — the V3.2 mask (`/models/dsv32-fp8-channel-mask.safetensors`) is not
-  currently staged (the V3.2 model IS at `/cluster-storage/models/deepseek-ai/DeepSeek-V3.2`). Regenerate
-  the V3.2 mask (same `calibrate.py` flow, `--label-dim 16`) then boot V3.2 DS for the live bind+decode
-  smoke. Tracked as the open AC-5 hardware item.
+## DeepSeek-V3.2 DS non-regression — LIVE on 8×H200 (AC-5, done R1)
+Do-not-break-userspace confirmed on hardware: the committed V3.2 DS path still boots, binds, and decodes
+coherently after all Loop-8 shared-hook/kernel changes.
+- **V3.2 mask regenerated** (R1): `calibrate.py --model /cluster-storage/models/deepseek-ai/DeepSeek-V3.2
+  --dtype fp8_e4m3 --label-dim 16 --num-samples 16` (deepseek_v32→deepseek_v3 remap, float8_present=True) →
+  `/models/dsv32-fp8-channel-mask.safetensors` (content_sha256=36d8bf573091, L=61 H=128 label_dim=16,
+  head_dim=128, idx∈[0,127]). `load_channel_mask` re-verifies the hash; `verify_bind_shapes` PASS for V3.2
+  dims and REJECTS head_dim=192.
+- **V3.2 DS server booted** (TP=8, page 64, fp8 KV, `mem-fraction-static 0.6` per the V3.2 lesson; KV cache
+  fp8 53056 tokens, ~37.8 GB headroom; log `runs/20260607_glm51_loop8/v32_ds_serve.log`). Bind-time gate
+  PASSED for V3.2: `qk_nope_head_dim=128 qk_rope_head_dim=64 v_head_dim=128 kv_lora_rank=512
+  num_local_heads=16 layers=61 page_size=64 label_dim=16 head_dim=128 kv_dtype=fp8_e4m3` on all ranks —
+  **the same bind gate works for both 128/128 (V3.2) and 192/256 (GLM)**.
+- **V3.2 DS decode coherent:** `"The capital of France is"` → `" Paris. The capital of the United States is
+  Washington, D.C. The capital of Canada is Ottawa. The capital of"` — matches the prior validated V3.2 DS
+  output (BL-20260528-dsv32-ds-decode-degeneration); not degenerate. (A longer ambiguous prompt produced a
+  structured-but-off-task JSON completion — a V3.2 base-model greedy quirk, varied tokens, NOT a
+  repeated-token DS collapse.)
+- **Unit-level (committed, green):** dual-shape synthetic tests (`128/128` + `192/256`) + the 309-test DS
+  suite; code-safety: every shared-hook change is DS-gated and the `_ds_qk_nope_head_dim` default is now
+  `self.qk_nope_head_dim` (=128 for V3.2, byte-identical).
 
 ## Status
-task6 GLM-5.1 DS serving smoke: **DONE** (bind gate + coherent DS decode on hardware). V3.2 live DS smoke:
-remaining (mask not staged). Unblocks task7 (AC-1 DS-off byte-identity) and task9 (DS-vs-DSA gates).
+task6: **DONE** — GLM-5.1 DS serving smoke (bind gate + coherent decode) AND the DeepSeek-V3.2 DS live
+non-regression (bind gate + coherent decode), both on 8×H200. AC-2 serving / AC-3 GLM coherence / AC-5
+non-regression validated live. Unblocks task7 (AC-1 DS-off byte-identity) and task9 (DS-vs-DSA gates).
