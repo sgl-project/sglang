@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # bench_serving sweep — gsp, 4096 ISL / 512 OSL, ~55% prefix cache hit
 #
+# Canonical client workload for zai-org/GLM-5.1 (FP8) per development/CLIENT_SLOS.md
+# (rebased 2026-06-07): 4096 ISL, 512 OSL, max-concurrency 64 / min 16, ~55% prefix
+# cache hit. The model is resolved server-side, so this driver is model-agnostic —
+# point PORT at a GLM-5.1 (FP8) server (DS or native-DSA). bench_serving now emits
+# the new per-request decode-throughput SLO metric `*_decode_throughput_tps`
+# (output_tokens / (e2e - ttft)); the >= 30 tok/s floor is read from that field.
+#
 # MODE=double_sparsity (default) tags output files for the DS column of the
 # two-column comparison report. Pair with development/benchmark_baseline.sh
 # (MODE=native_nsa) on the same hardware and workload to populate both

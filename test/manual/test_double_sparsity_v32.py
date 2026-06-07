@@ -13,6 +13,11 @@ HARD gates are therefore:
     context lengths whose tokenized length is <= ``INDEX_TOPK`` (DS selects
     densely). This is the fair recall measure.
 
+Model-agnostic by construction: requests use ``"model": "default"`` (the served
+model), so this gate also runs unchanged against a GLM-5.1 (FP8) DS server vs its
+native-DSA reference — GLM-5.1's DSA ``index_topk`` is likewise 2048, and a
+different budget can be supplied via ``AC12_INDEX_TOPK`` without code changes.
+
 Beyond the budget, DS needle recall degrades as an inherent top_k sparsity
 tradeoff (and a prompt longer than the DS KV pool is unservable). Those points
 (4K / 16K / 64K) are **CHARACTERIZED** — recorded with the recall-vs-length

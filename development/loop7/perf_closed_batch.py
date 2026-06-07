@@ -133,6 +133,22 @@ def _pct(xs, q):
     return s[lo] * (1 - frac) + s[hi] * frac
 
 
+def _decode_tps(completion_tokens, e2e_s, ttft_s):
+    """Per-request decode throughput in tokens/sec = tokens / (e2e - ttft).
+
+    Decode-only throughput: output tokens over the post-first-token wall-time.
+    Kept dependency-free so this probe stays stdlib-only; it is the same
+    definition as ``sglang.bench_serving.decode_throughput_tps`` (cross-locked
+    by a unit test). Deliberately NOT ``completion_tokens / e2e`` (that bills the
+    decode rate for the prefill/TTFT time). Returns 0.0 for an unmeasurable
+    sample (no decode window or no tokens).
+    """
+    decode_window = e2e_s - ttft_s
+    if decode_window <= 0 or completion_tokens <= 0:
+        return 0.0
+    return completion_tokens / decode_window
+
+
 def _one(base_url: str, osl: int, prompt: str = "The capital of France is"):
     """Non-streaming /generate: returns (e2e_seconds, completion_tokens)."""
     body = json.dumps(
@@ -279,6 +295,16 @@ def main():
         ttfts = [r["ttft"] for r in res]
         decode_tps = [r["decode_tps"] for r in res if r["decode_tps"] > 0]
         cts = [r["completion_tokens"] for r in res]
+        # Canonical client-SLO decode throughput = out_tokens / (e2e - ttft) per
+        # request (the new definition; distinct from the legacy decode_tps that
+        # used the inter-arrival window, and from output_tokens / e2e).
+        slo_tps = [
+            t
+            for t in (
+                _decode_tps(r["completion_tokens"], r["e2e"], r["ttft"]) for r in res
+            )
+            if t > 0
+        ]
         out = {
             "label": args.label,
             "mode": "stream",
@@ -286,6 +312,10 @@ def main():
             "osl": args.osl,
             "prompt_repeat": args.prompt_repeat,
             "completed": len(res),
+            "slo_decode_tps_mean": round(sum(slo_tps) / len(slo_tps), 2) if slo_tps else 0.0,
+            "slo_decode_tps_p50": round(_pct(slo_tps, 0.50), 2) if slo_tps else 0.0,
+            "slo_decode_tps_p10": round(_pct(slo_tps, 0.10), 2) if slo_tps else 0.0,
+            "slo_decode_tps_min": round(min(slo_tps), 2) if slo_tps else 0.0,
             "ttft_ms_mean": round(1000 * sum(ttfts) / len(ttfts), 1),
             "ttft_ms_p50": round(1000 * _pct(ttfts, 0.50), 1),
             "ttft_ms_p99": round(1000 * _pct(ttfts, 0.99), 1),

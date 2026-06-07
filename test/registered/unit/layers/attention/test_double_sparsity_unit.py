@@ -9767,6 +9767,62 @@ class TestBlockedTopKExactness(unittest.TestCase):
         self._assert_eq(sc, K, bw)
 
 
+class TestMlaNopeExtractionDualShape(unittest.TestCase):
+    """`_extract_mla_nope_prefix` must pick the per-head no-PE prefix at the real
+    MLA widths of BOTH the narrower (qk_nope/v = 128/128, rope 64) and the wider
+    (qk_nope/v = 192/256, rope 64) shapes. Sentinel poison values prove the
+    reshape-before-slice picks K_noPE / Q_noPE and never the V (K-side, suffix =
+    v_head_dim) or RoPE (Q-side, suffix = qk_rope_head_dim) columns of an earlier
+    head. Locks the GLM K-side suffix = v_head_dim (256), NOT rope (64).
+    """
+
+    # (qk_nope_head_dim, v_head_dim, qk_rope_head_dim)
+    SHAPES = {
+        "narrow_128": (128, 128, 64),
+        "wide_192": (192, 256, 64),
+    }
+
+    def _extract(self):
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _extract_mla_nope_prefix,
+        )
+
+        return _extract_mla_nope_prefix
+
+    def test_k_side_extracts_nope_not_v(self):
+        extract = self._extract()
+        T, H = 3, 8
+        for name, (nope, v, _rope) in self.SHAPES.items():
+            with self.subTest(shape=name):
+                # Per-head K layout: [K_nope (nope) | V (v)]; K_nope=1.0, V=100.0.
+                per_head = nope + v
+                t = torch.ones(T, H * per_head)
+                blk = t.view(T, H, per_head)
+                blk[:, :, nope:] = 100.0  # poison every head's V columns
+                out = extract(t, H, nope, v)  # suffix_dim = v_head_dim
+                self.assertEqual(tuple(out.shape), (T, H, nope))
+                self.assertLess(
+                    out.max().item(), 10.0,
+                    f"{name}: K extraction leaked V columns (max={out.max():.1f})",
+                )
+                self.assertTrue(torch.allclose(out, torch.ones(T, H, nope)))
+
+    def test_q_side_extracts_nope_not_rope(self):
+        extract = self._extract()
+        T, H = 2, 8
+        for name, (nope, _v, rope) in self.SHAPES.items():
+            with self.subTest(shape=name):
+                # Per-head Q layout: [Q_nope (nope) | Q_rope (rope)]; nope=1.0, rope=100.0.
+                per_head = nope + rope
+                t = torch.ones(T, H * per_head)
+                blk = t.view(T, H, per_head)
+                blk[:, :, nope:] = 100.0
+                out = extract(t, H, nope, rope)  # suffix_dim = qk_rope_head_dim
+                self.assertEqual(tuple(out.shape), (T, H, nope))
+                self.assertLess(out.max().item(), 10.0, f"{name}: Q leaked RoPE columns")
+                self.assertTrue(torch.allclose(out, torch.ones(T, H, nope)))
+
+
 class TestVerifyBindShapes(unittest.TestCase):
     """Bind-time shape gate: a calibrated mask must match the running model's
     no-PE head width / head count / layer count, or DS hard-errors naming the

@@ -936,6 +936,34 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+    # Per-request decode throughput = output_tokens / (e2e_latency - ttft):
+    # output tokens over the post-first-token decode wall-time. Distinct from
+    # output_throughput (a system-wide tok/s over the whole run) and from the
+    # naive output_tokens / e2e (which charges decode for the prefill/TTFT time).
+    mean_decode_throughput_tps: float = 0.0
+    median_decode_throughput_tps: float = 0.0
+    min_decode_throughput_tps: float = 0.0
+    p10_decode_throughput_tps: float = 0.0
+
+
+def decode_throughput_tps(
+    output_tokens: int, e2e_latency_s: float, ttft_s: float
+) -> float:
+    """Per-request decode throughput in tokens/sec.
+
+    ``output_tokens / (e2e_latency - ttft)`` — the decode-only throughput: the
+    generated tokens divided by the wall-time spent decoding after the first
+    token arrives. Returns 0.0 when the decode window is non-positive or no
+    tokens were produced (an unmeasurable sample, not a zero-rate one).
+
+    This is deliberately NOT ``output_tokens / e2e_latency``: that bills the
+    decode rate for the prefill/first-token latency and understates throughput
+    on long prompts.
+    """
+    decode_window = e2e_latency_s - ttft_s
+    if decode_window <= 0 or output_tokens <= 0:
+        return 0.0
+    return output_tokens / decode_window
 
 
 async def get_request(
@@ -997,6 +1025,7 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
+    decode_tps_per_req: List[float] = []
     retokenized_itls: List[float] = []
 
     use_retokenized_itl = (
@@ -1033,6 +1062,12 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
+
+            req_decode_tps = decode_throughput_tps(
+                output_len, outputs[i].latency, outputs[i].ttft
+            )
+            if req_decode_tps > 0:
+                decode_tps_per_req.append(req_decode_tps)
 
             completed += 1
         else:
@@ -1166,6 +1201,10 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        mean_decode_throughput_tps=float(np.mean(decode_tps_per_req or 0)),
+        median_decode_throughput_tps=float(np.median(decode_tps_per_req or 0)),
+        min_decode_throughput_tps=float(np.min(decode_tps_per_req or 0)),
+        p10_decode_throughput_tps=float(np.percentile(decode_tps_per_req or 0, 10)),
     )
 
     return metrics, output_lens
@@ -1709,6 +1748,31 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
         print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
         print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
+        print(
+            "{s:{c}^{n}}".format(
+                s="Per-Request Decode Throughput (out_tok/(e2e-ttft))", n=50, c="-"
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Mean decode tok/s:", metrics.mean_decode_throughput_tps
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Median decode tok/s:", metrics.median_decode_throughput_tps
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "P10 decode tok/s:", metrics.p10_decode_throughput_tps
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Min decode tok/s:", metrics.min_decode_throughput_tps
+            )
+        )
         print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
         print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
@@ -1807,6 +1871,10 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "mean_decode_throughput_tps": metrics.mean_decode_throughput_tps,
+            "median_decode_throughput_tps": metrics.median_decode_throughput_tps,
+            "min_decode_throughput_tps": metrics.min_decode_throughput_tps,
+            "p10_decode_throughput_tps": metrics.p10_decode_throughput_tps,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
