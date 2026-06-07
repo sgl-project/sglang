@@ -546,6 +546,15 @@ class UnifiedRadixCacheSuite:
         req_to_token_pool.alloc([req])
         return req
 
+    def _apply_match_to_req(self, req, match):
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        req.last_host_node = match.last_host_node
+        req.best_match_node = match.best_match_node
+        req.host_hit_length = match.host_hit_length
+        req.swa_host_hit_length = match.swa_host_hit_length
+        req.mamba_host_hit_length = match.mamba_host_hit_length
+
     def _make_seq(self, start: int, num_pages: int) -> list[int]:
         """Page-aligned token sequence of num_pages pages."""
         page_size = self.cfg.page_size
@@ -2205,7 +2214,7 @@ class UnifiedRadixCacheSuite:
         if storage_backend == "file":
             import sglang.srt.managers.cache_controller as cache_controller
 
-            # The file-backend storage config records TP rank/size.  These unit
+            # The file-backend storage config records TP/PP rank/size.  These unit
             # fixtures run without initializing distributed parallel state, so
             # provide the local single-rank values that the fixture represents.
             tp_rank_patcher = mock.patch.object(
@@ -2214,10 +2223,22 @@ class UnifiedRadixCacheSuite:
             tp_size_patcher = mock.patch.object(
                 cache_controller, "get_tensor_model_parallel_world_size", return_value=1
             )
+            pp_rank_patcher = mock.patch.object(
+                cache_controller, "get_pipeline_model_parallel_rank", return_value=0
+            )
+            pp_size_patcher = mock.patch.object(
+                cache_controller,
+                "get_pipeline_model_parallel_world_size",
+                return_value=1,
+            )
             tp_rank_patcher.start()
             tp_size_patcher.start()
+            pp_rank_patcher.start()
+            pp_size_patcher.start()
             self.addCleanup(tp_rank_patcher.stop)
             self.addCleanup(tp_size_patcher.stop)
+            self.addCleanup(pp_rank_patcher.stop)
+            self.addCleanup(pp_size_patcher.stop)
 
             assert storage_dir is not None, "file backend needs a storage_dir"
             # HiCacheFile reads the directory from this env var.
@@ -2845,7 +2866,26 @@ class UnifiedRadixCacheSuite:
         self.assertIs(result.best_match_node, leaf)
         self.assertIs(result.last_device_node, parent)
         self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
-        self.assertEqual(result.host_hit_length, 1)
+        self.assertEqual(result.host_hit_length, len(leaf.key))
+        self.assertEqual(result.swa_host_hit_length, len(leaf.key))
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        parent = chain[-2]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._set_aux_host_tombstone(tree, leaf, ComponentType.SWA)
+
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -2899,10 +2939,7 @@ class UnifiedRadixCacheSuite:
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -2943,10 +2980,7 @@ class UnifiedRadixCacheSuite:
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -2984,10 +3018,7 @@ class UnifiedRadixCacheSuite:
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        req.prefix_indices = match.device_indices
-        req.last_node = match.last_device_node
-        req.best_match_node = match.best_match_node
-        req.host_hit_length = match.host_hit_length
+        self._apply_match_to_req(req, match)
 
         new_indices, new_node = tree.init_load_back(
             InitLoadBackParams(
@@ -3101,14 +3132,10 @@ class UnifiedRadixCacheSuite:
         return tree, allocator, req_to_token_pool, chain, window_pages
 
     def test_hicache_swa_finalize_match_result(self):
-        """finalize_match_result bumps host_hit_length to 1 iff some SWA node
-        within the trailing window is tombstoned (cd.value is None,
-        cd.host_value is not None). Out-of-window tombstones and chains fully
-        on device must leave host_hit_length untouched.
-
-        Sentinel only — never the real SWA token count, since SWA load-back
-        does not grow req.prefix_indices and any non-zero value gets
-        subtracted from extend_input_len in schedule_policy.
+        """finalize_match_result accumulates host_value lengths of SWA tombstones
+        within the trailing sliding window into ``swa_host_hit_length``. Out-of-window
+        tombstones and chains fully on device must leave ``swa_host_hit_length`` at 0.
+        ``host_hit_length`` is Full-KV only and is never written by SWA.
         """
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
@@ -3117,11 +3144,12 @@ class UnifiedRadixCacheSuite:
 
         tree, _, _, chain, window_pages = self._swa_finalize_setup()
         leaf = chain[-1]
+        ps = self.cfg.page_size
         swa_comp = tree.components[ComponentType.SWA]
 
         cases = [
             ("all_on_device", None, 0),
-            ("tombstone_in_window", chain[-window_pages], 1),
+            ("tombstone_in_window", chain[-window_pages], ps),
             ("tombstone_outside_window", chain[-(window_pages + 1)], 0),
         ]
         for name, victim, expected in cases:
@@ -3151,7 +3179,8 @@ class UnifiedRadixCacheSuite:
                     value_chunks=[],
                     best_value_len=0,
                 )
-                self.assertEqual(result.host_hit_length, expected)
+                self.assertEqual(result.host_hit_length, 0)
+                self.assertEqual(result.swa_host_hit_length, expected)
 
     def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
         """LOAD_BACK commit must:
@@ -3300,6 +3329,7 @@ class UnifiedRadixCacheSuite:
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         tree, _, _, y, x, _ = self._swa_anchor_setup()
         swa_comp = tree.components[ComponentType.SWA]
+        ps = self.cfg.page_size
 
         base = MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64, device=tree.device),
@@ -3314,7 +3344,9 @@ class UnifiedRadixCacheSuite:
             value_chunks=[],
             best_value_len=0,
         )
-        self.assertEqual(result.host_hit_length, 1)
+        # SWA host hit goes to swa_host_hit_length; host_hit_length stays at 0.
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, ps)
 
     def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a SWA tombstone must not
@@ -3533,7 +3565,7 @@ class UnifiedRadixCacheSuite:
         xfer = tree.components[ComponentType.MAMBA].build_hicache_transfers(
             node, CacheTransferPhase.LOAD_BACK
         )[0]
-        new_mamba = req_to_token_pool.mamba_pool.alloc(1)
+        new_mamba = req_to_token_pool.mamba_allocator.alloc(1)
         self.assertIsNotNone(new_mamba)
         xfer.device_indices = new_mamba
         tree.components[ComponentType.MAMBA].commit_hicache_transfer(

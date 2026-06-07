@@ -938,7 +938,7 @@ class SchedulerBatchResultProcessor:
         other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool
-            pool.mamba_pool.free(
+            pool.mamba_allocator.free(
                 req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
