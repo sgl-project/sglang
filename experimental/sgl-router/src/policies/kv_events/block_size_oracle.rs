@@ -31,17 +31,32 @@
 //! through `KvEventIndex::add_worker`; that refactor can land later
 //! without changing the oracle's public surface.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
+
+/// Tri-state for the bigram flag: distinguishes "not yet reported" from an
+/// established `false`, so [`BlockSizeOracle::set_bigram`] can be first-wins
+/// (matching `try_set`) rather than last-writer-wins.
+const BIGRAM_UNKNOWN: u8 = 0;
+const BIGRAM_UNIGRAM: u8 = 1;
+const BIGRAM_BIGRAM: u8 = 2;
 
 /// First-wins, idempotent block-size publisher.
 ///
 /// Internally an `AtomicU32` where 0 means "not yet known". Use
 /// [`Self::try_set`] to publish a worker-reported value and
 /// [`Self::get`] to read at routing time.
+///
+/// Also carries a `bigram` flag — EAGLE-family workers hash KV blocks over
+/// token bigrams, so the policy must pick the bigram hasher. Like `value` it
+/// is a per-cluster property (all workers run the same model) and is
+/// established first-wins with a loud warning on disagreement, mirroring
+/// `try_set` — a heterogeneous EAGLE/non-EAGLE cluster would otherwise let the
+/// last registrant silently flip the global hashing mode.
 #[derive(Debug, Default)]
 pub struct BlockSizeOracle {
     value: AtomicU32,
+    bigram: AtomicU8,
 }
 
 /// Returned by [`BlockSizeOracle::try_set`] when the candidate disagrees
@@ -68,6 +83,46 @@ impl BlockSizeOracle {
         } else {
             Some(v)
         }
+    }
+
+    /// Publish whether the cluster's workers use bigram (EAGLE-family) KV-block
+    /// hashing. Called from `KvEventIndex::add_worker` alongside `try_set`.
+    /// First-wins: the first worker establishes the mode; a later worker that
+    /// disagrees is logged (not silently honored), since the query-hashing mode
+    /// is process-wide and one mismatched worker would zero out cache-aware
+    /// routing for the cluster.
+    pub fn set_bigram(&self, is_bigram: bool) {
+        let candidate = if is_bigram {
+            BIGRAM_BIGRAM
+        } else {
+            BIGRAM_UNIGRAM
+        };
+        match self.bigram.compare_exchange(
+            BIGRAM_UNKNOWN,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {}
+            Err(existing) if existing == candidate => {}
+            Err(existing) => {
+                tracing::warn!(
+                    established_bigram = existing == BIGRAM_BIGRAM,
+                    worker_bigram = is_bigram,
+                    "kv-events: worker hashing mode (bigram/EAGLE) disagrees with the \
+                     established cluster value; keeping the first. A heterogeneous \
+                     EAGLE/non-EAGLE cluster will silently never match cache for the \
+                     minority workers — check that all workers run the same model.",
+                );
+            }
+        }
+    }
+
+    /// Whether query hashing should use the bigram variant
+    /// ([`super::hash::compute_block_hashes_bigram`]). Defaults to `false`
+    /// until a worker reports an EAGLE-family `speculative_algorithm`.
+    pub fn is_bigram(&self) -> bool {
+        self.bigram.load(Ordering::Relaxed) == BIGRAM_BIGRAM
     }
 
     /// Publish a candidate block size. Returns the established value on
@@ -121,6 +176,36 @@ mod tests {
         assert_eq!(oracle.try_set(64), Ok(64));
         assert_eq!(oracle.try_set(64), Ok(64));
         assert_eq!(oracle.get(), Some(64));
+    }
+
+    #[test]
+    fn bigram_flag_defaults_false_first_wins_and_is_idempotent() {
+        let oracle = BlockSizeOracle::new();
+        assert!(
+            !oracle.is_bigram(),
+            "unknown (no worker reported yet) reads as non-bigram"
+        );
+        oracle.set_bigram(true);
+        assert!(oracle.is_bigram(), "first worker establishes the mode");
+        oracle.set_bigram(true); // idempotent agreement
+        assert!(oracle.is_bigram());
+        // Independent of block_size establishment.
+        assert_eq!(oracle.get(), None);
+        // First-wins: a conflicting later worker is logged, not honored.
+        oracle.set_bigram(false);
+        assert!(
+            oracle.is_bigram(),
+            "a disagreeing worker must not flip the established mode"
+        );
+    }
+
+    #[test]
+    fn bigram_flag_establishes_false_first_wins() {
+        let oracle = BlockSizeOracle::new();
+        oracle.set_bigram(false);
+        assert!(!oracle.is_bigram(), "established as unigram");
+        oracle.set_bigram(true); // conflicting; first (unigram) wins
+        assert!(!oracle.is_bigram());
     }
 
     #[test]

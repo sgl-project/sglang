@@ -49,6 +49,15 @@ def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
     return num_page_per_block
 
 
+def get_num_kv_index_blocks_flashmla(kv_indices_width: int, page_size: int) -> int:
+    """Grid axis-1 size for create_flashmla_kv_indices_triton: the number of
+    page-blocks spanning the widest sequence (one CTA per block). kv_indices_width
+    is the per-row width of the kv_indices buffer (the kernel's kv_indices_ptr_stride).
+    """
+    npb = get_num_page_per_block_flashmla(page_size)
+    return (kv_indices_width + npb - 1) // npb
+
+
 @triton.jit
 def create_flashmla_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -79,7 +88,10 @@ def create_flashmla_kv_indices_triton(
     num_paged = tl.cdiv(kv_end - kv_start, PAGED_SIZE)
     num_pages_loop = tl.cdiv(kv_end - kv_start, FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON)
 
-    for i in range(num_pages_loop):
+    # One CTA per page-block (grid axis 1) rather than one CTA looping all blocks;
+    # CTAs beyond this sequence's block count are guarded out.
+    i = tl.program_id(axis=1)
+    if i < num_pages_loop:
         # index into req_to_token_ptr needs to be int64
         paged_offset = (
             tl.arange(0, NUM_PAGE_PER_BLOCK).to(tl.int64) + i * NUM_PAGE_PER_BLOCK
