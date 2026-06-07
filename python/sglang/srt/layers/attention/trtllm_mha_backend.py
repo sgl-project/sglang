@@ -155,17 +155,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if isinstance(active_pool, SWAKVPool):
             return active_pool
 
-        if getattr(model_runner, "is_draft_worker", False):
-            spec_algorithm = getattr(model_runner, "spec_algorithm", None)
-            is_frozen_kv_mtp = getattr(
-                spec_algorithm, "is_frozen_kv_mtp", lambda: False
-            )
-            if not is_frozen_kv_mtp():
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
                 return None
 
         allocator = model_runner.token_to_kv_pool_allocator
-        get_kvcache = getattr(allocator, "get_kvcache", None)
-        kvcache = get_kvcache() if get_kvcache is not None else None
+        kvcache = allocator.get_kvcache()
         return kvcache if isinstance(kvcache, SWAKVPool) else None
 
     def _maybe_translate_swa(
