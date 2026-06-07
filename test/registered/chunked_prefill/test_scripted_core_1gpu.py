@@ -77,18 +77,13 @@ class TestScriptedCore(ScriptedTestCase):
         yield
 
         # At the last_decode stage the final decode can complete during the
-        # retract; a finished req may already be removed from the scheduler, so
-        # its output_ids are unobservable (r.req is None) and clean completion is
-        # covered by the run_until_finished tail below. When the req is not
-        # finished, pause(retract) must park it back in the waiting_queue and the
-        # paused engine must not advance it.
-        if r.finished:
-            req = r.req
-            assert req is None or len(req.output_ids) == _LIFECYCLE_MAX_NEW_TOKENS, (
-                f"stage={stage}: finished req has wrong output length "
-                f"{req.output_ids!r}"
-            )
-        else:
+        # retract; a finished req is removed from the scheduler, so its
+        # output_ids are no longer observable through the harness. That case's
+        # only observable consequence — clean completion — is covered by the
+        # run_until_finished tail below. When the req is not finished,
+        # pause(retract) must park it back in the waiting_queue and the paused
+        # engine must not advance it.
+        if not r.finished:
             req = r.req
             assert req is not None and req in t.scheduler.waiting_queue, (
                 f"stage={stage}: pause(retract) should park the req back in "
@@ -142,7 +137,6 @@ class TestScriptedCore(ScriptedTestCase):
         assert r.finished, "single-decode chunked req did not finish"
 
     def test_chunked_prefill_radix_hit_count(self):
-        # prompt > chunk size -> prefilled across several chunks
         self.server.execute_script(self._script_chunked_prefill_radix_hit_count)
 
     @staticmethod
@@ -153,7 +147,6 @@ class TestScriptedCore(ScriptedTestCase):
         _assert_prefill_twice_decode_once(t, prompt_len=_PROMPT_LEN)
 
     def test_nonchunked_prefill_radix_hit_count(self):
-        # prompt < chunk size -> prefilled in a single forward (not chunked)
         self.server.execute_script(self._script_nonchunked_prefill_radix_hit_count)
 
     @staticmethod
@@ -166,14 +159,6 @@ class TestScriptedCore(ScriptedTestCase):
 
 
 def _assert_prefill_twice_decode_once(t: ScriptedContext, *, prompt_len: int) -> None:
-    # Classify each radix node by its cumulative end position (in tokens) from the
-    # root: nodes ending within the prompt are prefill nodes, nodes beyond it are
-    # decode nodes. A prompt prefix is inserted twice -- via cache_unfinished_req
-    # when prefill completes and via cache_finished_req on finish -- so every
-    # prefill node settles at hit_count 2; decode-generated nodes are inserted only
-    # on finish, so every decode node settles at 1. Chunking only splits the prompt
-    # into more nodes, so chunked and non-chunked prefill produce identical
-    # per-role counts.
     root = t.scheduler.tree_cache.root_node
     prefill_hits: list[int] = []
     decode_hits: list[int] = []

@@ -12,8 +12,6 @@ register_cuda_ci(est_time=220, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestPPPerturbSwaSwa(CanaryPPFixture):
-    """Active SWA-group KV perturbation under pp_size=2 must surface a real-KV-hash
-    violation, proving canary verify still fires on every PP rank's forwards."""
 
     kv_canary_mode = CanaryMode.LOG
     target_group: ClassVar[TargetGroupKind] = TargetGroupKind.SWA
@@ -29,7 +27,6 @@ class TestPPPerturbSwaSwa(CanaryPPFixture):
         super().setUpClass()
 
     def test_real_kv_used_perturbation_reports_real_kv_hash_violation(self) -> None:
-        """Verify active real-KV perturbation under PP reports a real-KV-hash violation."""
         for _ in range(self.workload_n_batches):
             self.send_parallel_requests()
         self.assert_per_forward_violation_reported(
