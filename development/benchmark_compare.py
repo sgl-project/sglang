@@ -18,8 +18,10 @@ run-level metadata; missing fields are best-effort matched against the
 filename tags (e.g. ``native_nsa_gsp_isl4096_osl512_c64.jsonl`` implies
 concurrency=64).
 
-SLO gate per AC-8: each row is annotated with `pass` / `fail` against
-``per_request_output_tps_p50 >= 30`` and ``ttft_p99_s <= 22``.
+SLO gate: each row is annotated with `pass` / `fail` against per-request
+decode throughput ``median_decode_throughput_tps >= 30`` (output_tokens /
+(e2e - ttft); from bench_serving, with a legacy-fixture fallback) and the
+strict tail bar ``ttft_p99_s < 22``.
 
 No-op detector per AC-7: a row is flagged if any of
 ``selected_tokens == total_tokens`` or ``dense_fallback_total != 0``.
@@ -212,17 +214,31 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
         v = _float(key)
         return None if v is None else v / 1000.0
 
-    # Per-request output tok/s — derived from bench_serving --output-details
-    # arrays when present; fall back to legacy fields for fixture compat.
-    per_req_p50, per_req_p99 = _per_request_output_tps(summary)
-    if per_req_p50 is None:
-        per_req_p50 = _float("output_throughput_p50") or _float(
-            "per_req_output_tps_p50"
-        )
-    if per_req_p99 is None:
-        per_req_p99 = _float("output_throughput_p99") or _float(
-            "per_req_output_tps_p99"
-        )
+    # Per-request decode throughput = output_tokens / (e2e_latency - ttft), the
+    # canonical client-SLO metric. bench_serving now emits it directly as
+    # `median_decode_throughput_tps`; consume that FIRST so a current task9
+    # artifact gates on the resolved metric. The `output_lens / sum(itls)`
+    # derivation and the legacy `output_throughput_*` / `per_req_output_tps_*`
+    # scalars are kept ONLY as fallback for older fixtures that predate the
+    # decode-throughput emission — a task9 row carrying the new field must not
+    # silently fall through to a differently-derived number.
+    decode_p50 = _float("median_decode_throughput_tps")
+    if decode_p50 is not None:
+        per_req_p50 = decode_p50
+        # The high-tail p99 is reporting-only (the SLO/AC-11 gate uses p50) and
+        # is not emitted as a decode-throughput field; populate it from the
+        # --output-details array derivation when present, else leave it unset.
+        _, per_req_p99 = _per_request_output_tps(summary)
+    else:
+        per_req_p50, per_req_p99 = _per_request_output_tps(summary)
+        if per_req_p50 is None:
+            per_req_p50 = _float("output_throughput_p50") or _float(
+                "per_req_output_tps_p50"
+            )
+        if per_req_p99 is None:
+            per_req_p99 = _float("output_throughput_p99") or _float(
+                "per_req_output_tps_p99"
+            )
 
     metrics = RunMetrics(
         concurrency=int(concurrency or 0),
@@ -986,9 +1002,11 @@ def _render_ac11_markdown(
 
 
 def _slo_verdict(m: RunMetrics) -> str:
+    # output_tps_p50 is the per-request decode throughput (output_tokens /
+    # (e2e - ttft)); the TTFT bar is the plan's strict "P99 TTFT < 22 s".
     if m.output_tps_p50 is None or m.ttft_p99_s is None:
         return "missing-data"
-    if m.output_tps_p50 >= SLO_PER_REQUEST_TPS_P50 and m.ttft_p99_s <= SLO_TTFT_P99_S:
+    if m.output_tps_p50 >= SLO_PER_REQUEST_TPS_P50 and m.ttft_p99_s < SLO_TTFT_P99_S:
         return "pass"
     return "fail"
 
@@ -1039,8 +1057,8 @@ def render_markdown_report(
         return "—" if v is None else (f"{v:.2f}" if isinstance(v, float) else str(v))
 
     pairs = [
-        ("Per-request output tok/s P50", baseline_metrics.output_tps_p50, ds_metrics.output_tps_p50),
-        ("Per-request output tok/s P99", baseline_metrics.output_tps_p99, ds_metrics.output_tps_p99),
+        ("Per-request decode tok/s P50 (out_tok/(e2e-ttft))", baseline_metrics.output_tps_p50, ds_metrics.output_tps_p50),
+        ("Per-request decode tok/s P99", baseline_metrics.output_tps_p99, ds_metrics.output_tps_p99),
         ("TTFT P50 (s)", baseline_metrics.ttft_p50_s, ds_metrics.ttft_p50_s),
         ("TTFT P99 (s)", baseline_metrics.ttft_p99_s, ds_metrics.ttft_p99_s),
         ("TPOT P50 (ms)", baseline_metrics.tpot_p50_ms, ds_metrics.tpot_p50_ms),
