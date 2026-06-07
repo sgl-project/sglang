@@ -419,6 +419,10 @@ class Scheduler(
         # Init mamba backend
         self.init_mamba_backend()
 
+        # Must precede init_model_worker: revert targets like _init_pools run during it,
+        # so patching them afterwards is a no-op.
+        maybe_revert_pr_fix()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -563,8 +567,6 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
-
-        maybe_revert_pr_fix()
 
         self.is_initializing = False
 

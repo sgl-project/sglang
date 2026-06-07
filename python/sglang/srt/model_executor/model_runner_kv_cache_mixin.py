@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -294,11 +295,8 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
-            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
-            extra_max_context_len = 4
-            if max_spec_draft_tokens is not None:
-                extra_max_context_len += max_spec_draft_tokens
+            extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
