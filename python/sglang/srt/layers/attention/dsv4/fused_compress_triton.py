@@ -207,7 +207,9 @@ def _c4_decode_kernel(
     valid_index = index >= 0
     for ch in tl.static_range(4):
         ch_off = ch * HEAD_DIM
-        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0)
+        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
         tl.store(
             buffer_ptr + page_base + ch_off + d_offs,
             val,
@@ -243,12 +245,12 @@ def _c4_decode_kernel(
                 kv_in_ptr + in_base + kv_off + d_offs,
                 mask=d_mask & valid,
                 other=0.0,
-            )
+            ).to(tl.float32)
             score = tl.load(
                 kv_in_ptr + in_base + score_off + d_offs,
                 mask=d_mask & valid,
                 other=NEG_BIG,
-            )
+            ).to(tl.float32)
         else:
             kv = tl.load(
                 buffer_ptr + slot_base + kv_off + d_offs,
@@ -271,7 +273,7 @@ def _c4_decode_kernel(
 
     tl.store(
         out_ptr + bid.to(tl.int64) * out_row_stride + d_offs,
-        weighted / running_sum,
+        (weighted / running_sum).to(out_ptr.dtype.element_ty),
         mask=d_mask,
     )
 
@@ -350,12 +352,12 @@ def _c4_prefill_compress_kernel(
             kv_in_ptr + in_base + kv_off + d_offs,
             mask=d_mask & (~in_state),
             other=0.0,
-        )
+        ).to(tl.float32)
         score_input = tl.load(
             kv_in_ptr + in_base + score_off + d_offs,
             mask=d_mask & (~in_state),
             other=NEG_BIG,
-        )
+        ).to(tl.float32)
         kv = tl.where(in_state, kv_state, kv_input)
         score = tl.where(in_state, score_state, score_input)
         bias = tl.load(ape_ptr + slot * ape_row_stride + d_offs, mask=d_mask, other=0.0)
@@ -370,7 +372,7 @@ def _c4_prefill_compress_kernel(
 
     tl.store(
         out_ptr + ragged_id.to(tl.int64) * out_row_stride + d_offs,
-        weighted / running_sum,
+        (weighted / running_sum).to(out_ptr.dtype.element_ty),
         mask=d_mask,
     )
 
@@ -412,7 +414,9 @@ def _c4_prefill_write_kernel(
     dst_base = page * buffer_page_stride + slot.to(tl.int64) * buffer_slot_stride
     for ch in tl.static_range(4):
         ch_off = ch * HEAD_DIM
-        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0)
+        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
         tl.store(buffer_ptr + dst_base + ch_off + d_offs, val, mask=d_mask)
 
 
@@ -448,7 +452,9 @@ def _c128_decode_kernel(
 
     for ch in tl.static_range(2):
         ch_off = ch * HEAD_DIM
-        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0)
+        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
         tl.store(buffer_ptr + dst_base + ch_off + d_offs, val, mask=d_mask)
 
     NEG_BIG: tl.constexpr = -1.0e9
@@ -481,12 +487,12 @@ def _c128_decode_kernel(
             kv_in_ptr + in_base + d_offs[None, :],
             mask=valid[:, None] & is_input[:, None] & d_mask[None, :],
             other=0.0,
-        )
+        ).to(tl.float32)
         score_input_tile = tl.load(
             kv_in_ptr + in_base + HEAD_DIM + d_offs[None, :],
             mask=valid[:, None] & is_input[:, None] & d_mask[None, :],
             other=NEG_BIG,
-        )
+        ).to(tl.float32)
         kv_tile = tl.where(is_input[:, None], kv_input_tile, kv_tile)
         score_tile = tl.where(is_input[:, None], score_input_tile, score_tile)
         bias_tile = tl.load(
@@ -506,7 +512,7 @@ def _c128_decode_kernel(
 
     tl.store(
         out_ptr + bid.to(tl.int64) * out_row_stride + d_offs,
-        weighted / running_sum,
+        (weighted / running_sum).to(out_ptr.dtype.element_ty),
         mask=d_mask,
     )
 
@@ -574,12 +580,12 @@ def _c128_prefill_compress_kernel(
             kv_in_ptr + in_bases[:, None] + d_offs[None, :],
             mask=(~is_state)[:, None] & d_mask[None, :],
             other=0.0,
-        )
+        ).to(tl.float32)
         score_input = tl.load(
             kv_in_ptr + in_bases[:, None] + HEAD_DIM + d_offs[None, :],
             mask=(~is_state)[:, None] & d_mask[None, :],
             other=NEG_BIG,
-        )
+        ).to(tl.float32)
         kv_tile = tl.where(is_state[:, None], kv_state, kv_input)
         score_tile = tl.where(is_state[:, None], score_state, score_input)
         bias_tile = tl.load(
@@ -602,7 +608,7 @@ def _c128_prefill_compress_kernel(
 
     tl.store(
         out_ptr + ragged_id.to(tl.int64) * out_row_stride + d_offs,
-        weighted / running_sum,
+        (weighted / running_sum).to(out_ptr.dtype.element_ty),
         mask=d_mask,
     )
 
@@ -639,7 +645,9 @@ def _c128_prefill_write_kernel(
 
     for ch in tl.static_range(2):
         ch_off = ch * HEAD_DIM
-        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0)
+        val = tl.load(kv_in_ptr + in_base + ch_off + d_offs, mask=d_mask, other=0.0).to(
+            tl.float32
+        )
         tl.store(buffer_ptr + dst_base + ch_off + d_offs, val, mask=d_mask)
 
 
@@ -842,12 +850,15 @@ def _check_common(
 ) -> None:
     coff = 2 if compress_ratio == 4 else 1
     assert kv_score_input.is_cuda and kv_score_buffer.is_cuda
-    assert kv_score_input.dim() == 2 and kv_score_input.dtype == torch.float32
+    assert kv_score_input.dim() == 2 and kv_score_input.dtype in (
+        torch.float32,
+        torch.bfloat16,
+    )
     assert kv_score_input.shape[1] == 2 * coff * head_dim
     assert kv_score_buffer.dim() == 3 and kv_score_buffer.dtype == torch.float32
     assert kv_score_buffer.shape[1:] == (compress_ratio, 2 * coff * head_dim)
     assert out.shape == (kv_score_input.shape[0], head_dim)
-    assert out.dtype == torch.float32 and out.is_cuda
+    assert out.is_cuda and out.dtype in (torch.float32, torch.bfloat16)
     assert ape.shape == (compress_ratio * coff, head_dim)
     assert ape.dtype == torch.float32 and ape.is_cuda
     assert indices.dtype == torch.int32 and indices.is_cuda

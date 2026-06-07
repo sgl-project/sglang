@@ -85,6 +85,7 @@ class TestQwen3Next(CustomTestCase):
                 "HCCL_ALGO": "level0:NA;level1:ring",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "160",
                 "HCCL_BUFFSIZE": "2048",
+                "GDN_ATTN_BACKEND_TRITON": "1",
                 **os.environ,
             },
         )
