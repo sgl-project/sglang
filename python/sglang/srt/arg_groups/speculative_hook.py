@@ -285,6 +285,8 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
+    # Spec v2 tree drafting supports topk > 1 with page_size == 1 and page_size > 1
+    # (the latter via partial-page duplication; backend-gated below).
     spec_v1_reason = None
     # mamba / linear-attn state models only support topk == 1 on spec v2.
     # mamba2_cache_params exists iff the config carries such state; check the
@@ -294,16 +296,15 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
     if (
         server_args.speculative_eagle_topk is not None
         and server_args.speculative_eagle_topk > 1
-        and (server_args.page_size > 1 or is_mamba_state_model)
+        and is_mamba_state_model
         and not server_args.disable_overlap_schedule
     ):
-        # Spec v2 topk > 1 only supports page_size == 1 on non-mamba models;
-        # page_size > 1 (partial-page dup) isn't ported to v2 yet -> fall back to v1.
+        # Spec v2 topk > 1 is not supported for mamba/linear-attn state models
+        # (only topk == 1); fall back to v1 for those. page_size > 1 is supported
+        # on v2 (partial-page duplication), so it no longer forces v1.
         server_args.disable_overlap_schedule = True
         spec_v1_reason = (
             "spec v2 topk > 1 is not supported for mamba/linear-attn models"
-            if is_mamba_state_model
-            else "spec v2 topk > 1 currently requires page_size == 1"
         )
     elif (
         not envs.SGLANG_ENABLE_SPEC_V2.get()
@@ -389,13 +390,19 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
         )
         server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
+    # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
+    # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
+    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     if (
         server_args.speculative_eagle_topk > 1
         and server_args.page_size > 1
-        and server_args.attention_backend not in ["flashinfer", "fa3"]
+        and server_args.attention_backend not in _PAGE_TREE_SPEC_BACKENDS
     ):
         raise ValueError(
-            "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+            f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
+            f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
+            f"{server_args.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
 
 
