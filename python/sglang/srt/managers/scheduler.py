@@ -734,6 +734,30 @@ class Scheduler(
             "moe_top_k",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+            # bf16 support for the experimental_sgl_trtllm LoRA path: its fused MoE-LoRA kernels are
+            # FP8/NVFP4-only (no bf16 fused kernel exists). For a bf16 (unquantized) checkpoint with
+            # LoRA enabled, route the WHOLE MoE stack to the Triton backend, which supports bf16
+            # virtual-experts MoE-LoRA. This must happen BEFORE initialize_moe_config so the global
+            # backend is consistent across the base FusedMoE weight layout, topk, moe_align, and the
+            # LoRA runner (a per-layer patch is insufficient — the base layer pads/permutes weights for
+            # the trtllm layout at build time). FP8/NVFP4 checkpoints are unaffected.
+            sa = self.server_args
+            lora_on = bool(sa.enable_lora or sa.lora_paths)
+            is_unquant = sa.quantization is None and (
+                getattr(self.model_config.hf_config, "quantization_config", None) is None
+            )
+            if (
+                sa.moe_runner_backend == "experimental_sgl_trtllm"
+                and lora_on
+                and is_unquant
+            ):
+                logger.warning(
+                    "experimental_sgl_trtllm LoRA requires FP8 block / NVFP4 quant, but the base "
+                    "model is bf16 (unquantized). Routing the MoE-LoRA stack to the Triton backend "
+                    "(bf16 virtual-experts MoE-LoRA is supported there). The fused trtllm path is not "
+                    "used for bf16 — a bf16 fused MoE-LoRA kernel would be needed for that."
+                )
+                sa.moe_runner_backend = "triton"
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
