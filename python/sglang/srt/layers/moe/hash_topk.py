@@ -176,7 +176,10 @@ class HashTopK(nn.Module):
             topk_weights = topk_weights.to(torch.float32)
 
         num_fused_shared_experts = self.num_fused_shared_experts
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        uses_per_rank_shared_slots = (
+            num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+        )
+        if uses_per_rank_shared_slots:
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = topk_ids_logical_to_physical(
@@ -188,7 +191,7 @@ class HashTopK(nn.Module):
                 topk_ids, expert_location_dispatch_info
             )
 
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        if uses_per_rank_shared_slots:
             num_physical_routed_experts = (
                 expert_location_dispatch_info.num_physical_experts
                 if expert_location_dispatch_info is not None
