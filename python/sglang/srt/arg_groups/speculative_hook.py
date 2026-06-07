@@ -491,9 +491,7 @@ def _init_adaptive_speculative_params(server_args: "ServerArgs") -> None:
             "Pass one of those values."
         )
 
-    server_args.speculative_num_draft_tokens = (
-        server_args.speculative_num_steps + 1
-    )
+    server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
 
 def _auto_choose_speculative_params(

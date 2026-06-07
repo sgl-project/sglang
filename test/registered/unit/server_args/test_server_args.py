@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
