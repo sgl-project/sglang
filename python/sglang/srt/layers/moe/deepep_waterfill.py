@@ -13,6 +13,7 @@
 # ==============================================================================
 """DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
+import logging
 from typing import NamedTuple, Optional, Tuple
 
 import torch
@@ -26,6 +27,8 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
 _LOCAL_PREF_NUMER = 11  # local-rank preference = 11/10
 _LOCAL_PREF_DENOM = 10
+
+logger = logging.getLogger(__name__)
 
 
 class WaterfillDispatchPlan(NamedTuple):
@@ -123,37 +126,86 @@ def _waterfill_expand_kernel(
         derived_target_total,
     )
 
-    # Step 1: Select destination rank for shared expert (waterfill sampling).
-    source_count = tl.load(rank_load_ptr + source_rank)
-    best_count = tl.where(mask, source_count, 2**30)
-    best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
+    # Step 1: Copy/remap routed experts and select destination rank for the
+    # shared expert. Static Waterfill allows every rank as a shared target, so
+    # keep that path lean: routed TopK only needs to be read once.
     has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
     src_rank_i32 = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
+    best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
 
     if ALLOW_ALL_RANKS:
-        candidate_mask = tl.full([BLOCK_SIZE], (1 << world_size) - 1, dtype=tl.int32)
-        for r in range(world_size):
-            target_count = tl.load(rank_load_ptr + r).to(tl.int64)
-            better = (
-                target_count * local_pref_numer < best_count * local_pref_denom
-            ) & mask
-            best_count = tl.where(better, target_count, best_count)
-            best_rank = tl.where(
-                better, tl.full([BLOCK_SIZE], r, dtype=tl.int64), best_rank
+        for k in range(topk):
+            old_id = tl.load(
+                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+            ).to(tl.int64)
+            valid_id = old_id >= 0
+            has_valid = has_valid | valid_id
+            old_rank = old_id // old_experts_per_rank
+            new_id = tl.where(valid_id, old_id + old_rank, old_id)
+            tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
+
+            val = tl.load(
+                topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0
             )
+            val = tl.where(valid_id, val, 0.0)
+            tl.store(
+                expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask
+            )
+
+        total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+            w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+                tl.int32
+            )
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            total_w += w_vec
+
+        token_seed = token_idx.to(tl.uint32) ^ (
+            src_rank_i32.to(tl.uint32)
+            * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
+        )
+        token_seed = token_seed * tl.full(
+            [BLOCK_SIZE], 1664525, dtype=tl.uint32
+        ) + tl.full([BLOCK_SIZE], 1013904223, dtype=tl.uint32)
+        u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
+
+        chosen = src_rank_i32
+        cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+            w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+                tl.int32
+            )
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            pick = (total_w > 0) & (u >= cum) & (u < (cum + w_vec))
+            chosen = tl.where(pick, r, chosen)
+            cum += w_vec
+
+        best_rank = chosen.to(tl.int64)
     else:
+        source_count = tl.load(rank_load_ptr + source_rank)
+        best_count = tl.where(mask, source_count, 2**30)
         candidate_mask = (tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << src_rank_i32).to(
             tl.int32
         )
 
-    for k in range(topk):
-        expert_id = tl.load(
-            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
-        ).to(tl.int64)
-        valid = expert_id >= 0
-        has_valid = has_valid | valid
-
-        if not ALLOW_ALL_RANKS:
+        for k in range(topk):
+            expert_id = tl.load(
+                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+            ).to(tl.int64)
+            valid = expert_id >= 0
+            has_valid = has_valid | valid
             target_rank = expert_id // old_experts_per_rank
             target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
             target_rank_i32 = target_rank.to(tl.int32)
@@ -175,49 +227,66 @@ def _waterfill_expand_kernel(
             best_count = tl.where(better, target_count, best_count)
             best_rank = tl.where(better, target_rank, best_rank)
 
-    total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    for r in range(world_size):
-        present = ((candidate_mask >> r) & 1) == 1
-        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
-        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
-            tl.int32
-        )
-        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
-        w_vec = tl.where(
-            src_rank_i32 == r,
-            w_vec,
-            (w_vec * local_pref_denom) // local_pref_numer,
-        )
-        total_w += tl.where(present, w_vec, 0)
+        total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+            w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+                tl.int32
+            )
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            total_w += tl.where(present, w_vec, 0)
 
-    token_seed = token_idx.to(tl.uint32) ^ (
-        src_rank_i32.to(tl.uint32) * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
-    )
-    token_seed = token_seed * tl.full([BLOCK_SIZE], 1664525, dtype=tl.uint32) + tl.full(
-        [BLOCK_SIZE], 1013904223, dtype=tl.uint32
-    )
-    u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
-
-    chosen = src_rank_i32
-    cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    for r in range(world_size):
-        present = ((candidate_mask >> r) & 1) == 1
-        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
-        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
-            tl.int32
+        token_seed = token_idx.to(tl.uint32) ^ (
+            src_rank_i32.to(tl.uint32)
+            * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
         )
-        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
-        w_vec = tl.where(
-            src_rank_i32 == r,
-            w_vec,
-            (w_vec * local_pref_denom) // local_pref_numer,
-        )
-        w_vec = tl.where(present, w_vec, 0)
-        pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
-        chosen = tl.where(pick, r, chosen)
-        cum += w_vec
+        token_seed = token_seed * tl.full(
+            [BLOCK_SIZE], 1664525, dtype=tl.uint32
+        ) + tl.full([BLOCK_SIZE], 1013904223, dtype=tl.uint32)
+        u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
 
-    best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
+        chosen = src_rank_i32
+        cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+            w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+                tl.int32
+            )
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            w_vec = tl.where(present, w_vec, 0)
+            pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
+            chosen = tl.where(pick, r, chosen)
+            cum += w_vec
+
+        best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
+
+        for k in range(topk):
+            old_id = tl.load(
+                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+            ).to(tl.int64)
+            valid_id = old_id >= 0
+            new_id = tl.where(valid_id, old_id + (old_id // old_experts_per_rank), old_id)
+            tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
+
+            val = tl.load(
+                topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0
+            )
+            val = tl.where(valid_id, val, 0.0)
+            tl.store(
+                expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask
+            )
 
     # Step 2: Compute shared expert ID and local mask.
     is_local = best_rank == source_rank
@@ -234,24 +303,7 @@ def _waterfill_expand_kernel(
         tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64),
     )
 
-    # Step 3: Copy and remap topk_ids, copy weights.
-    for k in range(topk):
-        old_id = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1).to(
-            tl.int64
-        )
-        valid_id = old_id >= 0
-        new_id = tl.where(valid_id, old_id + (old_id // old_experts_per_rank), old_id)
-        tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
-
-    for k in range(topk):
-        val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
-        expert_id = tl.load(
-            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
-        ).to(tl.int64)
-        val = tl.where(expert_id >= 0, val, 0.0)
-        tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
-
-    # Step 4: Write shared expert column.
+    # Step 3: Write shared expert column.
     tl.store(
         expanded_ids_ptr + token_idx * (topk + 1) + topk,
         shared_expert_id,
@@ -362,6 +414,7 @@ class DeepEPWaterfillBalancer:
     """Waterfill load balancer: shared expert fused as real routed expert (topk 8→9)."""
 
     MIN_BATCH_FOR_BALANCE = 64
+    _stats_calls = 0
 
     def __init__(
         self,
@@ -381,6 +434,53 @@ class DeepEPWaterfillBalancer:
         )
         self._counts_buf: Optional[Tensor] = None
         self.use_static_waterfill = not envs.SGLANG_DISABLE_STATIC_WATERFILL.get()
+
+    def _maybe_log_stats(
+        self,
+        num_tokens: int,
+        dispatch_plan: WaterfillDispatchPlan,
+        expanded_ids: Tensor,
+    ) -> None:
+        interval = envs.SGLANG_WATERFILL_LOG_STATS_INTERVAL.get()
+        if interval <= 0 or self.rank != 0 or num_tokens == 0:
+            return
+
+        DeepEPWaterfillBalancer._stats_calls += 1
+        if DeepEPWaterfillBalancer._stats_calls % interval != 0:
+            return
+
+        valid = expanded_ids >= 0
+        ranks = torch.where(
+            valid,
+            expanded_ids // (self.old_experts_per_rank + 1),
+            torch.zeros_like(expanded_ids),
+        )
+        after_counts = torch.bincount(
+            ranks[valid].reshape(-1),
+            minlength=self.world_size,
+        )[: self.world_size]
+        before_counts = dispatch_plan.rank_load
+        shared_counts = after_counts - before_counts
+        before = before_counts.detach().cpu().tolist()
+        shared = shared_counts.detach().cpu().tolist()
+        after = after_counts.detach().cpu().tolist()
+        logger.info(
+            "WATERFILL_STATS layer=%s tokens=%s static=%s allow_all=%s "
+            "target_total=%s before=%s shared=%s after=%s "
+            "before_max_min=%s/%s after_max_min=%s/%s",
+            self.layer_id,
+            num_tokens,
+            self.use_static_waterfill,
+            dispatch_plan.allow_all_ranks,
+            dispatch_plan.target_total,
+            before,
+            shared,
+            after,
+            max(before) if before else 0,
+            min(before) if before else 0,
+            max(after) if after else 0,
+            min(after) if after else 0,
+        )
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank via Triton kernel (uses original expert IDs)."""
@@ -559,6 +659,9 @@ class DeepEPWaterfillBalancer:
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
+        if envs.SGLANG_WATERFILL_FORCE_LOCAL_SHARED.get():
+            return self._expand_local_shared(topk_output)
+
         if self._can_skip_dispatch_plan_for_low_batch(num_tokens):
             # Static mode can use local expansion without communication for small
             # decode-sized batches. Dynamic mode still all-reduces before local
@@ -581,4 +684,5 @@ class DeepEPWaterfillBalancer:
             topk_output.topk_weights,
             dispatch_plan,
         )
+        self._maybe_log_stats(num_tokens, dispatch_plan, expanded_ids)
         return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)

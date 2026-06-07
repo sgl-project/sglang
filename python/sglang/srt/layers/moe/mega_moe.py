@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -35,8 +36,11 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
+logger = logging.getLogger(__name__)
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_MEGA_MOE_TOPK_STATS_CALLS = 0
+_MEGA_MOE_TIMING_CALLS = 0
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -160,6 +164,17 @@ def _run_mega_routed(
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
+    timing_call = _should_log_mega_moe_timing()
+    timing_events = []
+
+    def mark_timing(name: str) -> None:
+        if not timing_call:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        timing_events.append((name, event))
+
+    mark_timing("start")
 
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
@@ -183,6 +198,8 @@ def _run_mega_routed(
         topk_ids = None
         topk_weights = None
 
+    mark_timing("topk")
+
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
@@ -205,6 +222,7 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
     )
+    mark_timing("buffer")
 
     if num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
@@ -212,6 +230,9 @@ def _run_mega_routed(
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+    mark_timing("cast")
+    _maybe_log_mega_moe_topk_stats(moe, topk_ids_in, num_experts, num_tokens)
 
     use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
     if use_fp4_acts:
@@ -241,6 +262,7 @@ def _run_mega_routed(
             buf.topk_weights,
             quant_group_size=32,
         )
+    mark_timing("pre_dispatch")
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
@@ -260,11 +282,118 @@ def _run_mega_routed(
         activation_clamp=swiglu_limit,
         fast_math=True,
     )
+    mark_timing("fp8_fp4")
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
+    mark_timing("done")
+    _log_mega_moe_timing(moe, topk_ids_in, num_experts, num_tokens, timing_events)
     return y
+
+
+def _should_log_mega_moe_timing() -> bool:
+    interval = envs.SGLANG_MEGA_MOE_LOG_TIMING_INTERVAL.get()
+    if interval <= 0:
+        return False
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    if get_moe_ep_group().rank_in_group != 0:
+        return False
+
+    global _MEGA_MOE_TIMING_CALLS
+    _MEGA_MOE_TIMING_CALLS += 1
+    return _MEGA_MOE_TIMING_CALLS % interval == 0
+
+
+def _rank_count_summary(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
+) -> tuple[list[int], float]:
+    experts_per_rank = max(num_experts // ep_size, 1)
+    valid = topk_ids >= 0
+    ranks = torch.clamp(topk_ids // experts_per_rank, min=0, max=ep_size - 1)
+    counts = torch.bincount(ranks[valid].reshape(-1), minlength=ep_size)[:ep_size]
+    counts_cpu = counts.detach().cpu().tolist()
+    max_count = max(counts_cpu) if counts_cpu else 0
+    min_count = min(counts_cpu) if counts_cpu else 0
+    ratio = float(max_count) / float(min_count) if min_count else float("inf")
+    return counts_cpu, ratio
+
+
+def _log_mega_moe_timing(
+    moe: "DeepseekV2MoE",
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    num_tokens: int,
+    timing_events: list[tuple[str, torch.cuda.Event]],
+) -> None:
+    if not timing_events:
+        return
+    timing_events[-1][1].synchronize()
+    elapsed = {
+        f"{timing_events[i - 1][0]}_to_{timing_events[i][0]}_ms": timing_events[
+            i - 1
+        ][1].elapsed_time(timing_events[i][1])
+        for i in range(1, len(timing_events))
+    }
+    counts_cpu, ratio = _rank_count_summary(topk_ids, num_experts, moe.moe_ep_size)
+    logger.info(
+        "MEGA_MOE_TIMING layer=%s tokens=%s waterfill=%s force_local=%s "
+        "counts=%s ratio=%.4f timing=%s",
+        moe.layer_id,
+        num_tokens,
+        bool(getattr(moe.topk, "enable_deepep_waterfill", False)),
+        envs.SGLANG_WATERFILL_FORCE_LOCAL_SHARED.get(),
+        counts_cpu,
+        ratio,
+        {k: round(v, 4) for k, v in elapsed.items()},
+    )
+
+
+def _maybe_log_mega_moe_topk_stats(
+    moe: "DeepseekV2MoE",
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    num_tokens: int,
+) -> None:
+    interval = envs.SGLANG_MEGA_MOE_LOG_TOPK_STATS_INTERVAL.get()
+    if interval <= 0:
+        return
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    if get_moe_ep_group().rank_in_group != 0:
+        return
+
+    global _MEGA_MOE_TOPK_STATS_CALLS
+    _MEGA_MOE_TOPK_STATS_CALLS += 1
+    if _MEGA_MOE_TOPK_STATS_CALLS % interval != 0:
+        return
+
+    ep_size = moe.moe_ep_size
+    experts_per_rank = max(num_experts // ep_size, 1)
+    counts_cpu, ratio = _rank_count_summary(topk_ids, num_experts, ep_size)
+    max_count = max(counts_cpu) if counts_cpu else 0
+    min_count = min(counts_cpu) if counts_cpu else 0
+    logger.info(
+        "MEGA_MOE_TOPK_STATS layer=%s tokens=%s topk=%s ep_size=%s "
+        "experts_per_rank=%s waterfill=%s force_local=%s counts=%s "
+        "max_min=%s/%s ratio=%.4f",
+        moe.layer_id,
+        num_tokens,
+        topk_ids.shape[1],
+        ep_size,
+        experts_per_rank,
+        bool(getattr(moe.topk, "enable_deepep_waterfill", False)),
+        envs.SGLANG_WATERFILL_FORCE_LOCAL_SHARED.get(),
+        counts_cpu,
+        max_count,
+        min_count,
+        ratio,
+    )
 
 
 def build_mega_moe_experts_weights(experts) -> None:

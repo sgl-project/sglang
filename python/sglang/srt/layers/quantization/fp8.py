@@ -868,6 +868,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_moe_a2a_backend().is_deepep()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
+                or get_moe_a2a_backend().is_megamoe()
             )
         return False
 
@@ -1349,9 +1350,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and will_use_deepgemm
                 and not layer.w13_weight_scale_inv.format_ue8m0
             ):
-                assert isinstance(
-                    layer, DeepEPMoE
-                ), "DeepGemm MoE is only supported with DeepEPMoE"
+                assert isinstance(layer, DeepEPMoE) or get_moe_a2a_backend().is_megamoe(), (
+                    "DeepGemm MoE is only supported with DeepEPMoE or MegaMOE"
+                )
                 weight_block_size = self.quant_config.weight_block_size
                 requant_weight_ue8m0_inplace(
                     layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size

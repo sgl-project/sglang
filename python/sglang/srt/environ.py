@@ -501,6 +501,10 @@ class Envs:
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    SGLANG_WATERFILL_LOG_STATS_INTERVAL = EnvInt(0)
+    SGLANG_WATERFILL_FORCE_LOCAL_SHARED = EnvBool(False)
+    SGLANG_MEGA_MOE_LOG_TOPK_STATS_INTERVAL = EnvInt(0)
+    SGLANG_MEGA_MOE_LOG_TIMING_INTERVAL = EnvInt(0)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)

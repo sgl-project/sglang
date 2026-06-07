@@ -595,7 +595,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             self.moe_ep_size > 1
             and self.num_fused_shared_experts > 0
-            and not _uses_per_rank_shared_slots
+            and not _use_rank_local_shared_slots
         ):
             # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
             # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode
@@ -671,13 +671,13 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
-        # Shared experts: skip when fused into the MoE kernel. In per-rank
-        # shared-slot layouts, the shared expert is a local slot in FusedMoE.
+        # Shared experts: skip when fused into MoE kernel (self.num_fused_shared_experts > 0)
+        # or when rank-local shared slots are used (shared expert lives in FusedMoE, no separate MLP).
         if (
             config.n_shared_experts is not None
             and config.n_shared_experts > 0
             and self.num_fused_shared_experts == 0
-            and not _uses_per_rank_shared_slots
+            and not _use_rank_local_shared_slots
         ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # Disable TP for shared experts for A2A/FP4 allgather paths, or when

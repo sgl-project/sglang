@@ -1394,7 +1394,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             not _use_cp
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_attention_tp_size() > 1
-            and not get_moe_a2a_backend().is_none()
+            and get_moe_a2a_backend().is_deepep()
         )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
@@ -1697,7 +1697,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
 
         # Waterfill and MegaMoE need shared-experts fusion so the shared expert
-        # is represented as an MoE slot instead of a separate MLP.
+        # is represented as a MegaMoE slot. Use --disable-shared-experts-fusion
+        # only when explicitly measuring the non-fused baseline.
         if server_args.enable_deepep_waterfill or get_moe_a2a_backend().is_megamoe():
             if self.config.n_shared_experts != 1:
                 raise ValueError(
