@@ -1994,11 +1994,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
-                if (
-                    recv_obj.pooled_hidden_states is not None
-                    and recv_obj.pooled_hidden_states[i] is not None
-                ):
-                    out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+                if recv_obj.pooled_hidden_states is not None:
+                    # for non-stacked, pooled_hidden_states is a list of tensors
+                    if len(recv_obj.pooled_hidden_states) == len(recv_obj.rids):
+                        if recv_obj.pooled_hidden_states[i] is not None:
+                            out_dict["pooled_hidden_state"] = (
+                                recv_obj.pooled_hidden_states[i]
+                            )
+                    # for stacked, pooled_hidden_states is a single tensor list
+                    elif len(recv_obj.pooled_hidden_states) == 1:
+                        if (
+                            recv_obj.pooled_hidden_states[0] is not None
+                            and recv_obj.pooled_hidden_states[0][i] is not None
+                        ):
+                            out_dict["pooled_hidden_state"] = (
+                                recv_obj.pooled_hidden_states[0][i]
+                            )
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
