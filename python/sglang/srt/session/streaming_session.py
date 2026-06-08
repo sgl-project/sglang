@@ -244,9 +244,9 @@ class StreamingSession(BasePrefixCache):
         req = params.req
         slot.restore_to_req(req)
 
-        # token_ids = fill_ids[:input_len-1] (1-token logit reserve already
-        # applied). min handles retract retry where committed_len can
-        # exceed len(token_ids) by 1.
+        # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
+        # already applied). min handles retract retry where committed_len
+        # can exceed len(token_ids) by 1.
         prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
 
         # Streaming sessions are append-only (session_controller rollback
@@ -353,7 +353,7 @@ class StreamingSession(BasePrefixCache):
             return False
         if chunked:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.fill_len
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
