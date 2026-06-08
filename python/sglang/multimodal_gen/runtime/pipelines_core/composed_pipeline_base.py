@@ -725,7 +725,7 @@ class ComposedPipelineBase(ABC):
         self,
         progressive_stage_cls: type[DenoisingStage],
         transformer_key: str = "transformer",
-        transformer_2_key: str | None = None,
+        transformer_2_key: str | None = "transformer_2",
         scheduler_key: str = "scheduler",
         vae_key: str | None = "vae",
         stage_name: str = "denoising_stage",
