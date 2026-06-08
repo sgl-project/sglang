@@ -7,10 +7,18 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
+def _chunked_req(s) -> Optional["Req"]:
+    """The single in-flight chunked-prefill req (stateless single-flight model), or None.
+
+    The stateless scheduler exposes pending chunked reqs via ``chunked_reqs()``
+    (an iterator yielding 0 or 1 req) rather than the removed ``self.chunked_req``.
+    """
+    return next(iter(s.chunked_reqs()), None)
+
+
 def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
     s = ctx.scheduler
-    if s.chunked_req is not None:
-        yield s.chunked_req
+    yield from s.chunked_reqs()
     yield from s.waiting_queue
     if s.ps.pp_size > 1:
         for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
@@ -29,7 +37,8 @@ def list_active_reqs(ctx: "ScriptedContext") -> List["Req"]:
 
 def batch_composition(ctx: "ScriptedContext") -> Dict[str, List[str]]:
     s = ctx.scheduler
-    chunked_rid = s.chunked_req.rid if s.chunked_req is not None else None
+    cr = _chunked_req(s)
+    chunked_rid = cr.rid if cr is not None else None
     chunked = [chunked_rid] if chunked_rid is not None else []
     running = (
         [r.rid for r in s.running_batch.reqs] if s.running_batch is not None else []
@@ -53,7 +62,7 @@ def batch_composition(ctx: "ScriptedContext") -> Dict[str, List[str]]:
 def is_idle(ctx: "ScriptedContext") -> bool:
     s = ctx.scheduler
     return (
-        s.chunked_req is None
+        _chunked_req(s) is None
         and len(s.waiting_queue) == 0
         and (s.running_batch is None or s.running_batch.is_empty())
     )
@@ -87,7 +96,7 @@ def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
 
 def is_chunking(ctx: "ScriptedContext", rid: str) -> bool:
     s = ctx.scheduler
-    return s.chunked_req is not None and s.chunked_req.rid == rid
+    return any(r.rid == rid for r in s.chunked_reqs())
 
 
 def status(ctx: "ScriptedContext", rid: str) -> str:
