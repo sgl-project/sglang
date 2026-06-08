@@ -8,11 +8,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     build_varlen_mask_meta,
 )
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
+    WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -35,8 +47,50 @@ class Ideogram4RMSNorm(nn.Module):
         return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
 
 
-def _linear(in_features: int, out_features: int, bias: bool = True):
-    return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
+class Ideogram4QuantizedLinear(ReplicatedLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)[0]
+
+
+class Ideogram4ColumnParallelLinear(ColumnParallelLinear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)[0]
+
+
+def _linear(
+    in_features: int,
+    out_features: int,
+    bias: bool = True,
+    quant_config: QuantizationConfig | None = None,
+    prefix: str = "",
+):
+    tp_size = get_tp_world_size() if model_parallel_is_initialized() else 1
+    use_column_parallel = tp_size > 1 and out_features % tp_size == 0
+    if quant_config is None:
+        if use_column_parallel:
+            return WeightOnlyFP8ColumnParallelLinear(
+                in_features,
+                out_features,
+                bias=bias,
+                gather_output=True,
+            )
+        return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
+    if use_column_parallel:
+        return Ideogram4ColumnParallelLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    return Ideogram4QuantizedLinear(
+        in_features,
+        out_features,
+        bias=bias,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
 
 
 class Ideogram4Attention(nn.Module):
@@ -46,12 +100,20 @@ class Ideogram4Attention(nn.Module):
         num_heads: int,
         eps: float,
         supported_attention_backends,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.qkv = _linear(hidden_size, hidden_size * 3, bias=False)
+        self.qkv = _linear(
+            hidden_size,
+            hidden_size * 3,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv",
+        )
         self.norm_q = Ideogram4RMSNorm(self.head_dim, eps=eps)
         self.norm_k = Ideogram4RMSNorm(self.head_dim, eps=eps)
         self.attn = USPAttention(
@@ -62,7 +124,13 @@ class Ideogram4Attention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
         )
-        self.o = _linear(hidden_size, hidden_size, bias=False)
+        self.o = _linear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o",
+        )
 
     def forward(self, x, cos, sin, attn_mask, attn_mask_meta):
         batch_size, seq_len, _ = x.shape
@@ -77,11 +145,35 @@ class Ideogram4Attention(nn.Module):
 
 
 class Ideogram4MLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int) -> None:
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
-        self.w1 = _linear(dim, hidden_dim, bias=False)
-        self.w2 = _linear(hidden_dim, dim, bias=False)
-        self.w3 = _linear(dim, hidden_dim, bias=False)
+        self.w1 = _linear(
+            dim,
+            hidden_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w1",
+        )
+        self.w2 = _linear(
+            hidden_dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
+        )
+        self.w3 = _linear(
+            dim,
+            hidden_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w3",
+        )
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -96,6 +188,8 @@ class Ideogram4TransformerBlock(nn.Module):
         norm_eps,
         adaln_dim,
         supported_attention_backends,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.attention = Ideogram4Attention(
@@ -103,13 +197,26 @@ class Ideogram4TransformerBlock(nn.Module):
             num_heads,
             eps=1e-5,
             supported_attention_backends=supported_attention_backends,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attention",
         )
-        self.feed_forward = Ideogram4MLP(hidden_size, intermediate_size)
+        self.feed_forward = Ideogram4MLP(
+            hidden_size,
+            intermediate_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.feed_forward",
+        )
         self.attention_norm1 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.ffn_norm1 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.attention_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.ffn_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
-        self.adaln_modulation = _linear(adaln_dim, 4 * hidden_size, bias=True)
+        self.adaln_modulation = _linear(
+            adaln_dim,
+            4 * hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.adaln_modulation",
+        )
 
     def forward(self, x, cos, sin, adaln_input, attn_mask, attn_mask_meta):
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaln_modulation(
@@ -144,12 +251,30 @@ def _sinusoidal_embedding(t: torch.Tensor, dim: int, scale: float = 1e4):
 
 
 class Ideogram4EmbedScalar(nn.Module):
-    def __init__(self, dim: int, input_range: tuple[float, float]) -> None:
+    def __init__(
+        self,
+        dim: int,
+        input_range: tuple[float, float],
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.range_min, self.range_max = input_range
-        self.mlp_in = _linear(dim, dim, bias=True)
-        self.mlp_out = _linear(dim, dim, bias=True)
+        self.mlp_in = _linear(
+            dim,
+            dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp_in",
+        )
+        self.mlp_out = _linear(
+            dim,
+            dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp_out",
+        )
 
     def forward(self, x):
         compute_dtype = x.dtype
@@ -160,11 +285,30 @@ class Ideogram4EmbedScalar(nn.Module):
 
 
 class Ideogram4FinalLayer(nn.Module):
-    def __init__(self, hidden_size: int, out_channels: int, adaln_dim: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        out_channels: int,
+        adaln_dim: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.linear = _linear(hidden_size, out_channels, bias=True)
-        self.adaln_modulation = _linear(adaln_dim, hidden_size, bias=True)
+        self.linear = _linear(
+            hidden_size,
+            out_channels,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear",
+        )
+        self.adaln_modulation = _linear(
+            adaln_dim,
+            hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.adaln_modulation",
+        )
 
     def forward(self, x, c):
         scale = 1.0 + self.adaln_modulation(F.silu(c))
@@ -180,12 +324,12 @@ class Ideogram4Transformer2DModel(BaseDiT):
     )
     param_names_mapping = {}
     reverse_param_names_mapping = {}
-    handles_checkpoint_quantization = True
 
     def __init__(
         self,
         config: Ideogram4DiTConfig,
         hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
         **kwargs,
     ) -> None:
         super().__init__(config, hf_config, **kwargs)
@@ -195,11 +339,34 @@ class Ideogram4Transformer2DModel(BaseDiT):
         self.hidden_size = hidden_size
         self.num_attention_heads = cfg.num_attention_heads
         self.num_channels_latents = cfg.in_channels
-        self.input_proj = _linear(cfg.in_channels, hidden_size, bias=True)
+        self.input_proj = _linear(
+            cfg.in_channels,
+            hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix="input_proj",
+        )
         self.llm_cond_norm = Ideogram4RMSNorm(cfg.llm_features_dim, eps=1e-6)
-        self.llm_cond_proj = _linear(cfg.llm_features_dim, hidden_size, bias=True)
-        self.t_embedding = Ideogram4EmbedScalar(hidden_size, input_range=(0.0, 1.0))
-        self.adaln_proj = _linear(hidden_size, cfg.adaln_dim, bias=True)
+        self.llm_cond_proj = _linear(
+            cfg.llm_features_dim,
+            hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix="llm_cond_proj",
+        )
+        self.t_embedding = Ideogram4EmbedScalar(
+            hidden_size,
+            input_range=(0.0, 1.0),
+            quant_config=quant_config,
+            prefix="t_embedding",
+        )
+        self.adaln_proj = _linear(
+            hidden_size,
+            cfg.adaln_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix="adaln_proj",
+        )
         self.embed_image_indicator = nn.Embedding(2, hidden_size)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=cfg.attention_head_dim,
@@ -215,14 +382,18 @@ class Ideogram4Transformer2DModel(BaseDiT):
                     norm_eps=cfg.norm_eps,
                     adaln_dim=cfg.adaln_dim,
                     supported_attention_backends=self._supported_attention_backends,
+                    quant_config=quant_config,
+                    prefix=f"layers.{i}",
                 )
-                for _ in range(cfg.num_layers)
+                for i in range(cfg.num_layers)
             ]
         )
         self.final_layer = Ideogram4FinalLayer(
             hidden_size=hidden_size,
             out_channels=cfg.in_channels,
             adaln_dim=cfg.adaln_dim,
+            quant_config=quant_config,
+            prefix="final_layer",
         )
 
     def post_load_weights(self) -> None:
@@ -253,6 +424,8 @@ class Ideogram4Transformer2DModel(BaseDiT):
         position_ids: torch.Tensor,
         segment_ids: torch.Tensor,
         indicator: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        attn_mask_meta: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         param_dtype = self.embed_image_indicator.weight.dtype
@@ -281,8 +454,10 @@ class Ideogram4Transformer2DModel(BaseDiT):
         cos = cos.unsqueeze(2)
         sin = sin.unsqueeze(2)
         # ideogram uses -1 padding; varlen meta enables fa packed attention
-        attn_mask = segment_ids > 0
-        attn_mask_meta = build_varlen_mask_meta(attn_mask)
+        if attn_mask is None:
+            attn_mask = segment_ids > 0
+        if attn_mask_meta is None:
+            attn_mask_meta = build_varlen_mask_meta(attn_mask)
         for layer in self.layers:
             h = layer(
                 h,

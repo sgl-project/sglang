@@ -246,7 +246,7 @@ def create_bench_cache(
         req = Req(
             rid=_rid[0],
             origin_input_text="",
-            origin_input_ids=[],
+            origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         _rid[0] += 1
