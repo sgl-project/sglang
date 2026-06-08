@@ -14,30 +14,30 @@ class TestK2V3DetectorTokenSelection(CustomTestCase):
 
     def test_high_effort_uses_think_tokens(self):
         detector = K2V3Detector(reasoning_effort="high")
-        self.assertEqual(detector.think_start_token, "<think>")
-        self.assertEqual(detector.think_end_token, "</think>")
+        self.assertEqual(detector.think_start_token, "<ifm|think>")
+        self.assertEqual(detector.think_end_token, "</ifm|think>")
 
     def test_medium_effort_uses_think_fast_tokens(self):
         detector = K2V3Detector(reasoning_effort="medium")
-        self.assertEqual(detector.think_start_token, "<think_fast>")
-        self.assertEqual(detector.think_end_token, "</think_fast>")
+        self.assertEqual(detector.think_start_token, "<ifm|think_fast>")
+        self.assertEqual(detector.think_end_token, "</ifm|think_fast>")
 
     def test_low_effort_uses_think_faster_tokens(self):
         detector = K2V3Detector(reasoning_effort="low")
-        self.assertEqual(detector.think_start_token, "<think_faster>")
-        self.assertEqual(detector.think_end_token, "</think_faster>")
+        self.assertEqual(detector.think_start_token, "<ifm|think_faster>")
+        self.assertEqual(detector.think_end_token, "</ifm|think_faster>")
 
     def test_none_effort_maps_to_high(self):
         detector = K2V3Detector(reasoning_effort="none")
-        self.assertEqual(detector.think_start_token, "<think>")
+        self.assertEqual(detector.think_start_token, "<ifm|think>")
 
     def test_unknown_effort_maps_to_high(self):
         detector = K2V3Detector(reasoning_effort="not-a-thing")
-        self.assertEqual(detector.think_start_token, "<think>")
+        self.assertEqual(detector.think_start_token, "<ifm|think>")
 
     def test_default_effort_is_high(self):
         detector = K2V3Detector()
-        self.assertEqual(detector.think_start_token, "<think>")
+        self.assertEqual(detector.think_start_token, "<ifm|think>")
 
     def test_force_reasoning_false_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "requires force_reasoning=True"):
@@ -73,21 +73,21 @@ class TestK2V3DetectorParsing(CustomTestCase):
 
     def test_medium_effort_parses_end_only_output(self):
         detector = K2V3Detector(reasoning_effort="medium")
-        text = "reasoning here</think_fast>final answer"
+        text = "reasoning here</ifm|think_fast>final answer"
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "reasoning here")
         self.assertEqual(result.normal_text, "final answer")
 
     def test_medium_effort_parses_think_fast_block(self):
         detector = K2V3Detector(reasoning_effort="medium")
-        text = "<think_fast>reasoning here</think_fast>final answer"
+        text = "<ifm|think_fast>reasoning here</ifm|think_fast>final answer"
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "reasoning here")
         self.assertEqual(result.normal_text, "final answer")
 
     def test_low_effort_parses_think_faster_block(self):
         detector = K2V3Detector(reasoning_effort="low")
-        text = "<think_faster>r</think_faster>a"
+        text = "<ifm|think_faster>r</ifm|think_faster>a"
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "r")
         self.assertEqual(result.normal_text, "a")
@@ -96,9 +96,55 @@ class TestK2V3DetectorParsing(CustomTestCase):
         detector = K2V3Detector(reasoning_effort="medium", force_reasoning=True)
         r1 = detector.parse_streaming_increment("partial reason")
         self.assertEqual(r1.reasoning_text, "partial reason")
-        r2 = detector.parse_streaming_increment("ing</think_fast>answer")
+        r2 = detector.parse_streaming_increment("ing</ifm|think_fast>answer")
         self.assertEqual(r2.reasoning_text, "ing")
         self.assertEqual(r2.normal_text, "answer")
+
+
+class TestK2V3DetectorLegacyTokens(CustomTestCase):
+    """Legacy think tokens are still accepted in non-streaming generation."""
+
+    def test_high_effort_parses_legacy_think_block(self):
+        detector = K2V3Detector(reasoning_effort="high")
+        text = "<think>reasoning here</think>final answer"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning here")
+        self.assertEqual(result.normal_text, "final answer")
+
+    def test_high_effort_parses_legacy_end_only_output(self):
+        detector = K2V3Detector(reasoning_effort="high")
+        text = "reasoning here</think>final answer"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning here")
+        self.assertEqual(result.normal_text, "final answer")
+
+    def test_medium_effort_parses_legacy_think_fast_block(self):
+        detector = K2V3Detector(reasoning_effort="medium")
+        text = "<think_fast>reasoning here</think_fast>final answer"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning here")
+        self.assertEqual(result.normal_text, "final answer")
+
+    def test_low_effort_parses_legacy_think_faster_block(self):
+        detector = K2V3Detector(reasoning_effort="low")
+        text = "<think_faster>r</think_faster>a"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "r")
+        self.assertEqual(result.normal_text, "a")
+
+    def test_legacy_and_canonical_end_tokens_are_equivalent(self):
+        for effort in ["high", "medium", "low"]:
+            with self.subTest(effort=effort):
+                legacy = K2V3Detector(reasoning_effort=effort)
+                canonical = K2V3Detector(reasoning_effort=effort)
+                legacy_text = (
+                    "r" + legacy._legacy_end_token + "a"
+                )
+                canonical_text = "r" + canonical.think_end_token + "a"
+                self.assertEqual(
+                    legacy.detect_and_parse(legacy_text).reasoning_text,
+                    canonical.detect_and_parse(canonical_text).reasoning_text,
+                )
 
 
 class TestK2V3ParserIntegration(CustomTestCase):
@@ -107,7 +153,7 @@ class TestK2V3ParserIntegration(CustomTestCase):
     def test_parser_routes_to_k2v3_detector(self):
         parser = ReasoningParser(model_type="k2_v3")
         self.assertIsInstance(parser.detector, K2V3Detector)
-        self.assertEqual(parser.detector.think_start_token, "<think>")
+        self.assertEqual(parser.detector.think_start_token, "<ifm|think>")
 
     def test_parser_rejects_force_reasoning_false(self):
         with self.assertRaisesRegex(ValueError, "requires force_reasoning=True"):
@@ -126,8 +172,8 @@ class TestK2V3ParserIntegration(CustomTestCase):
             chat_template_kwargs={"reasoning_effort": "medium"},
         )
         parser = ReasoningParser(model_type="k2_v3", request=req)
-        self.assertEqual(parser.detector.think_start_token, "<think_fast>")
-        self.assertEqual(parser.detector.think_end_token, "</think_fast>")
+        self.assertEqual(parser.detector.think_start_token, "<ifm|think_fast>")
+        self.assertEqual(parser.detector.think_end_token, "</ifm|think_fast>")
 
     def test_parser_forwards_reasoning_effort_low(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -138,7 +184,7 @@ class TestK2V3ParserIntegration(CustomTestCase):
             chat_template_kwargs={"reasoning_effort": "low"},
         )
         parser = ReasoningParser(model_type="k2_v3", request=req)
-        self.assertEqual(parser.detector.think_start_token, "<think_faster>")
+        self.assertEqual(parser.detector.think_start_token, "<ifm|think_faster>")
 
     def test_parser_reads_top_level_reasoning_effort(self):
         """serving_chat.py pops reasoning_effort out of chat_template_kwargs
@@ -152,8 +198,8 @@ class TestK2V3ParserIntegration(CustomTestCase):
             reasoning_effort="medium",
         )
         parser = ReasoningParser(model_type="k2_v3", request=req)
-        self.assertEqual(parser.detector.think_start_token, "<think_fast>")
-        self.assertEqual(parser.detector.think_end_token, "</think_fast>")
+        self.assertEqual(parser.detector.think_start_token, "<ifm|think_fast>")
+        self.assertEqual(parser.detector.think_end_token, "</ifm|think_fast>")
 
     def test_parser_ignores_reasoning_effort_for_non_k2v3(self):
         """reasoning_effort kwarg must NOT be forwarded to Qwen3Detector.
