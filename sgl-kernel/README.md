@@ -69,30 +69,6 @@ make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
    m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
    ```
 
-### Adapting C++ Native Types for Torch Compatibility
-
-Third-party C++ libraries often use int and float, but PyTorch bindings require int64_t and double due to Python's type mapping.
-
-Use make_pytorch_shim from sgl_kernel_torch_shim.h to handle conversions automatically:
-
-```cpp
-
-// Add type conversion for int -> int64_t
-template <>
-struct pytorch_library_compatible_type<int> {
-  using type = int64_t;
-  static int convert_from_type(int64_t arg) {
-    TORCH_CHECK(arg <= std::numeric_limits<int>::max(), "value too large");
-    TORCH_CHECK(arg >= std::numeric_limits<int>::min(), "value too small");
-    return arg;
-  }
-};
-```
-```cpp
-// Wrap your function
-m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
-```
-
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests), if you need to skip some test, please use `@pytest.mark.skipif`

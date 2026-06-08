@@ -12,13 +12,28 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <torch/all.h>
-#include <torch/library.h>
+#include <Python.h>
+#include <torch/csrc/stable/library.h>
 
-#include "sgl_flash_kernel_ops.h"
+// Boxed entry points defined in sgl-attn's hopper/flash_api_stable.cpp. They
+// follow the stable-ABI boxed calling convention: read inputs from the stack,
+// call the torch::stable::Tensor implementation, write outputs back.
+void boxed_mha_fwd(StableIValue* stack, uint64_t num_args, uint64_t num_outputs);
+void boxed_mha_fwd_get_scheduler_metadata(StableIValue* stack, uint64_t num_args, uint64_t num_outputs);
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+#define _CONCAT(A, B) A##B
+#define CONCAT(A, B) _CONCAT(A, B)
+
+#define _STRINGIFY(A) #A
+#define STRINGIFY(A) _STRINGIFY(A)
+
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
+  }
+
+STABLE_TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From flash-attention
    */
@@ -57,10 +72,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      num_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
-      "    Tensor?  sinks"
+      "    Tensor?  sinks,"                          // (h)
+      "    Tensor?  sparse_mask_fine = None"         // (total_q, max_k_blocks, num_int32_per_block)
       ") -> (Tensor(a!), Tensor, Tensor, Tensor)");  // first return aliases out
-
-  m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
   /*
    * From flash-attention: get_scheduler_metadata
@@ -93,8 +107,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa = None,"
       "    int      sm_margin = 0"
       ") -> Tensor");
+}
 
-  m.impl("get_scheduler_metadata", torch::kCUDA, make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
+STABLE_TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
+  m.impl("fwd", &boxed_mha_fwd);
+  m.impl("get_scheduler_metadata", &boxed_mha_fwd_get_scheduler_metadata);
 }
 
 REGISTER_EXTENSION(flash_ops)

@@ -83,7 +83,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
+    GIT_TAG        5e05ed6b7b7550f5e2491c84bbd4eb4e5ec5c4ac
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -464,9 +464,14 @@ if (SGL_KERNEL_ENABLE_FA3)
     set(FLASH_SOURCES
         "csrc/flash_extension.cc"
         "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
-        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
+        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api_stable.cpp"
         "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
         "${FA3_GEN_SRCS}"
+    )
+
+    set_source_files_properties(
+      ${repo-flash-attention_SOURCE_DIR}/hopper/flash_api_stable.cpp
+      PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations"
     )
 
     Python_add_library(flash_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FLASH_SOURCES})
