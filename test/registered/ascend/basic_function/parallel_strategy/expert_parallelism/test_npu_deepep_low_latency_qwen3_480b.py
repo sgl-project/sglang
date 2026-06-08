@@ -9,7 +9,7 @@ from sglang.test.ascend.test_mmlu import TestMMLU
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=False)
+register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=True)
 
 
 class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
@@ -68,6 +68,7 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
         "HCCL_BUFFSIZE": "2100",
         "HCCL_OP_EXPANSION_MODE": "AIV",
+        "TRANSFORMERS_VERBOSITY": "error",
         **os.environ,
     }
 
