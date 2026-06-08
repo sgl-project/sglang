@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -946,17 +947,15 @@ class FlashInferMLAMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        # Fail fast on an undersized kv_indices row: the kernel would otherwise
-        # write OOB and silently corrupt memory.
         required_kv_indices_len = draft_kv_indices_used_len(
             seq_lens_sum, self.topk, bs, self.speculative_num_steps
         )
-        assert required_kv_indices_len <= kv_indices_buffer.shape[1], (
-            f"EAGLE draft kv_indices row too small: need {required_kv_indices_len} "
-            f"but row width is {kv_indices_buffer.shape[1]} (topk={self.topk}, "
-            f"num_seqs={num_seqs}, seq_lens_sum={seq_lens_sum}, "
-            f"num_steps={self.speculative_num_steps}); the buffer must be sized "
-            f"max_bs * topk * max_context_len."
+        assert_buffer_fits(
+            required_kv_indices_len,
+            kv_indices_buffer.shape[1],
+            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            bs=bs,
+            seq_lens_sum=seq_lens_sum,
         )
 
         self.generate_draft_decode_kv_indices[
