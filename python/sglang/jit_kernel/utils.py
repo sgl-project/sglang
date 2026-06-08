@@ -83,11 +83,8 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
         seen.add(path)
 
         data = path.read_bytes()
-        # Key on the path RELATIVE to the kernel root, not the absolute path:
-        # the cache key must track source *content*, not its install location.
-        # Absolute paths differ across runners, per-job venvs, and concurrent
-        # Actions job dirs (sglang, sglang-1, ...), so an absolute-path key
-        # would force a full recompile of every JIT kernel on any relocation.
+        # Relative to kernel root, not absolute: the key must track source
+        # content, not install location (differs across runners / job dirs).
         try:
             ident = str(path.relative_to(KERNEL_PATH))
         except ValueError:
