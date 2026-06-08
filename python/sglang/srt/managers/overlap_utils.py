@@ -106,8 +106,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
             )
 
-    # spec_v1 (non-overlap spec) doesn't relay extras; only spec_v2 does.
-    if batch.is_spec_v2:
+    # Only the overlap path relays spec extras through the future_map; the
+    # synchronous (non-overlap) V2 path installs next_draft_input directly.
+    if batch.enable_overlap and batch.is_spec_v2:
         future_map._resolve_spec_extras(batch)
 
 
