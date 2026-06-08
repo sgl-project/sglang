@@ -1,21 +1,33 @@
 ---
 title: "Progressive Resolution Generation"
-description: "Speed up FLUX.1 image generation up to 1.63× with spectral progressive resolution growing."
+description: "Speed up FLUX.1 and FLUX.2 image generation up to 1.93× with spectral progressive resolution growing."
 ---
 
-Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× denoising speedup** on FLUX.1 with no perceptible quality loss.
+Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× speedup on FLUX.1** and **1.93× speedup on FLUX.2** with no perceptible quality loss.
 
 Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736).
 
 ## Overview
 
-FLUX.1 at 1024×1024 packs latents into **4096 tokens**. Because DiT attention is O(n²), running the first N steps at half the resolution (1024 tokens) is ~4× cheaper per step.
+FLUX models at 1024×1024 pack latents into **4096 tokens**. Because DiT attention is O(n²), running the first N steps at half the resolution (1024 tokens) is ~4× cheaper per step.
 
 The transition point — how many steps to run at each resolution — is computed from the **Bayes-optimal frequency-activation criterion**: frequencies that cannot yet be resolved at the coarse scale are not denoised there. This makes the speedup lossless by construction.
 
-## Basic Usage
+## Parameters
 
-Add `--progressive-mode dct_rewind` and optionally `--progressive-levels` and `--progressive-delta` to any `sglang generate` command. No other changes are required.
+| Parameter | CLI flag | Default | Description |
+|-----------|----------|---------|-------------|
+| `progressive_mode` | `--progressive-mode` | `"fullres"` | `"fullres"` disables (identical to standard generation). `"dct_rewind"` enables spectral upsample with scheduler rewind (recommended). `"dct"` enables upsample without rewind. |
+| `progressive_levels` | `--progressive-levels` | `1` | Number of resolution halvings. `1` = one coarse stage (64×64 latent → 128×128). `2` = two coarse stages (32×32 → 64×64 → 128×128). |
+| `progressive_delta` | `--progressive-delta` | `0.01` | Noise-dominated tolerance δ. Controls how many steps run at coarse resolution. Higher δ = more coarse steps = more speedup. |
+
+> **Tip:** Add `--dit-cpu-offload false` to keep the transformer GPU-resident. With CPU offload each step pays a fixed PCIe transfer cost regardless of sequence length, which dilutes the speedup.
+
+---
+
+## FLUX.1
+
+### Usage
 
 ```bash
 sglang generate \
@@ -28,16 +40,6 @@ sglang generate \
     --progressive-delta 0.05
 ```
 
-> **Tip:** Add `--dit-cpu-offload false` to keep the transformer GPU-resident. With CPU offload each step pays ~0.4 s for PCIe transfer regardless of sequence length, which dilutes the speedup.
-
-## Parameters
-
-| Parameter | CLI flag | Default | Description |
-|-----------|----------|---------|-------------|
-| `progressive_mode` | `--progressive-mode` | `"fullres"` | `"fullres"` disables (identical to standard generation). `"dct_rewind"` enables spectral upsample with scheduler rewind (recommended). `"dct"` enables upsample without rewind. |
-| `progressive_levels` | `--progressive-levels` | `1` | Number of resolution halvings. `1` = one coarse stage (64×64 latent → 128×128). `2` = two coarse stages (32×32 → 64×64 → 128×128). |
-| `progressive_delta` | `--progressive-delta` | `0.01` | Noise-dominated tolerance δ. Controls how many steps run at the coarse resolution. Higher δ = more coarse steps = faster but less conservative. |
-
 ### Choosing delta
 
 | δ | Coarse steps (50 total) | Denoising speedup |
@@ -47,17 +49,26 @@ sglang generate \
 
 For most prompts `0.05` is recommended — it gives the largest speedup with no visible degradation.
 
-## Python API
+### Benchmark
+
+Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop only.
+
+| Config | Stage split | Denoise | Speedup |
+|--------|-------------|---------|---------|
+| Fullres (baseline) | 50 @ 128² latent | 36.65 s | 1.00× |
+| dct_rewind L1 δ=0.01 | 18@64² + 32@128² | 27.67 s | **1.32×** |
+| dct_rewind L1 δ=0.05 | 28@64² + 22@128² | 22.58 s | **1.62×** |
+| dct_rewind L2 δ=0.01 | 10@32² + 8@64² + 32@128² | 26.48 s | **1.38×** |
+
+### Python API
 
 ```python
 from sglang.multimodal_gen import DiffGenerator
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 gen = DiffGenerator.from_pretrained(
     model_path="black-forest-labs/FLUX.1-dev",
     dit_cpu_offload=False,
 )
-
 result = gen.generate(sampling_params_kwargs={
     "prompt": "A serene mountain lake at golden hour, photorealistic",
     "num_inference_steps": 50,
@@ -69,20 +80,60 @@ result = gen.generate(sampling_params_kwargs={
 })
 ```
 
-## Benchmark
+---
 
-Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop only.
+## FLUX.2
+
+Supports `FLUX.2-dev`, `FLUX.2-klein-4B`, and `FLUX.2-klein-9B`.
+
+### Usage
+
+```bash
+sglang generate \
+    --model-path black-forest-labs/FLUX.2-klein-4B \
+    --prompt "A serene mountain lake at golden hour, photorealistic" \
+    --num-inference-steps 30 \
+    --dit-cpu-offload false \
+    --progressive-mode dct_rewind \
+    --progressive-levels 1 \
+    --progressive-delta 0.10
+```
+
+### Benchmark
+
+Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Model: FLUX.2-klein-4B, 30 steps, 1024×1024.
+Timing = denoising loop only, averaged across 10 diverse prompts.
 
 | Config | Stage split | Denoise | Speedup |
 |--------|-------------|---------|---------|
-| Fullres (baseline) | 50 @ 128² | 36.65 s | 1.00× |
-| dct_rewind L1 δ=0.01 | 18@64² + 32@128² | 27.67 s | **1.32×** |
-| dct_rewind L1 δ=0.05 | 28@64² + 22@128² | 22.58 s | **1.62×** |
-| dct_rewind L2 δ=0.01 | 10@32² + 8@64² + 32@128² | 26.48 s | **1.38×** |
+| Fullres (baseline) | 30 @ 64² latent | 9.72 s | 1.00× |
+| dct_rewind L1 δ=0.05 | 18@32² + 12@64² | 5.50 s | **1.77×** |
+| dct_rewind L1 δ=0.10 | 20@32² + 10@64² | 5.03 s | **1.93×** |
+
+For most prompts **δ=0.10** is recommended — it gives the largest speedup with no visible quality change.
+
+### Python API
+
+```python
+from sglang.multimodal_gen import DiffGenerator
+
+gen = DiffGenerator.from_pretrained(
+    model_path="black-forest-labs/FLUX.2-klein-4B",
+    dit_cpu_offload=False,
+)
+result = gen.generate(sampling_params_kwargs={
+    "prompt": "A serene mountain lake at golden hour, photorealistic",
+    "num_inference_steps": 30,
+    "progressive_mode": "dct_rewind",
+    "progressive_levels": 1,
+    "progressive_delta": 0.10,
+})
+```
+
+---
 
 ## Limitations
 
-- **FLUX.1 only.** Progressive generation is currently implemented for FLUX.1 pipelines.
 - **Sequence parallelism incompatible.** Cannot be combined with `--ulysses-degree` or `--ring-degree`. The stage raises a `RuntimeError` if SP is enabled.
 - **torch.compile incompatible.** Compiled kernels have a fixed sequence length; the resolution transition causes a recompile or error. Use progressive without `--enable-torch-compile`.
 - **Cache-DiT incompatible.** Cache-DiT indexes its step cache by step count; the stage transition resets the index.

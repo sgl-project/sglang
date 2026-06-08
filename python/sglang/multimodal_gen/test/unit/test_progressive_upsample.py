@@ -344,5 +344,332 @@ class TestProgressiveDenoisingStageBase(unittest.TestCase):
         self.assertLess(FLUX_SPECTRUM_BETA, 4.0)
 
 
+# ---------------------------------------------------------------------------
+# FLUX.2 pack / unpack (pure CPU, no mocks)
+# ---------------------------------------------------------------------------
+
+
+class TestFlux2Pack(unittest.TestCase):
+    """Verify _flux2_pack / _flux2_unpack shapes and roundtrip correctness."""
+
+    def setUp(self):
+        from sglang.multimodal_gen.runtime.pipelines.flux_2_progressive import (
+            _flux2_pack,
+            _flux2_unpack,
+        )
+
+        self._pack = _flux2_pack
+        self._unpack = _flux2_unpack
+
+    def test_pack_output_shape(self):
+        """(B, C, H, W) → (B, H*W, C)."""
+        x = torch.randn(2, 64, 8, 16)
+        out = self._pack(x)
+        self.assertEqual(out.shape, (2, 8 * 16, 64))
+
+    def test_unpack_output_shape(self):
+        """(B, H*W, C) → (B, C, H, W)."""
+        packed = torch.randn(2, 128, 64)
+        out = self._unpack(packed, h_lat=8, w_lat=16)
+        self.assertEqual(out.shape, (2, 64, 8, 16))
+
+    def test_pack_unpack_roundtrip(self):
+        """pack followed by unpack reconstructs the original spatial tensor."""
+        x = torch.randn(1, 64, 8, 8)
+        reconstructed = self._unpack(self._pack(x), h_lat=8, w_lat=8)
+        torch.testing.assert_close(reconstructed, x)
+
+    def test_unpack_pack_roundtrip(self):
+        """unpack followed by pack reconstructs the original packed tensor."""
+        packed = torch.randn(1, 64, 64)
+        reconstructed = self._pack(self._unpack(packed, h_lat=8, w_lat=8))
+        torch.testing.assert_close(reconstructed, packed)
+
+    def test_pack_is_row_major(self):
+        """Token (h, w) maps to sequence index h*W + w — pure row-major ordering."""
+        B, C, H, W = 1, 4, 3, 5
+        x = torch.randn(B, C, H, W)
+        packed = self._pack(x)  # (1, H*W, C)
+        for h in range(H):
+            for w in range(W):
+                idx = h * W + w
+                torch.testing.assert_close(packed[0, idx, :], x[0, :, h, w])
+
+    def test_dtype_preserved_through_pack(self):
+        for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+            with self.subTest(dtype=dtype):
+                x = torch.randn(1, 16, 4, 4, dtype=dtype)
+                self.assertEqual(self._pack(x).dtype, dtype)
+
+    def test_dtype_preserved_through_unpack(self):
+        for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+            with self.subTest(dtype=dtype):
+                packed = torch.randn(1, 16, 64, dtype=dtype)
+                self.assertEqual(self._unpack(packed, 4, 4).dtype, dtype)
+
+
+# ---------------------------------------------------------------------------
+# Flux2ProgressiveDenoisingStage — unit tests (CPU, no GPU, no real model)
+# ---------------------------------------------------------------------------
+
+
+class TestFlux2ProgressiveStage(unittest.TestCase):
+    """Unit tests for Flux2ProgressiveDenoisingStage helpers.
+
+    Uses object.__new__ to bypass DenoisingStage.__init__ (which requires a
+    live server_args context), then manually sets the attributes each method
+    under test reads.
+    """
+
+    def _make_stage(self):
+        from sglang.multimodal_gen.runtime.pipelines.flux_2_progressive import (
+            Flux2ProgressiveDenoisingStage,
+        )
+
+        stage = object.__new__(Flux2ProgressiveDenoisingStage)
+        stage._freqs_cis_cache = {}
+        stage._spectrum_A = 203.615097
+        stage._spectrum_beta = 1.915461
+        return stage
+
+    def _make_server_args(self, vae_scale=8, in_channels=64):
+        return SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                vae_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(vae_scale_factor=vae_scale)
+                ),
+                dit_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(in_channels=in_channels)
+                ),
+                get_latent_dtype=lambda dtype: torch.float32,
+                prepare_pos_cond_kwargs=lambda *a, **kw: {},
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Spectrum constants
+    # ------------------------------------------------------------------
+
+    def test_flux2_spectrum_constants_plausible(self):
+        from sglang.multimodal_gen.runtime.pipelines.flux_2_progressive import (
+            FLUX_SPECTRUM_A,
+            FLUX_SPECTRUM_BETA,
+        )
+
+        self.assertGreater(FLUX_SPECTRUM_A, 0.0)
+        self.assertGreater(FLUX_SPECTRUM_BETA, 1.0)
+        self.assertLess(FLUX_SPECTRUM_BETA, 4.0)
+
+    # ------------------------------------------------------------------
+    # _latent_scale_factor
+    # ------------------------------------------------------------------
+
+    def test_latent_scale_factor_is_double_vae_scale(self):
+        stage = self._make_stage()
+        server_args = self._make_server_args(vae_scale=8)
+        self.assertEqual(stage._latent_scale_factor(server_args), 16)
+
+    def test_latent_scale_factor_scales_with_vae_config(self):
+        """If vae_scale_factor were ever different, the 2× factor still applies."""
+        stage = self._make_stage()
+        for vae_scale in [4, 8, 16]:
+            with self.subTest(vae_scale=vae_scale):
+                server_args = self._make_server_args(vae_scale=vae_scale)
+                self.assertEqual(stage._latent_scale_factor(server_args), vae_scale * 2)
+
+    # ------------------------------------------------------------------
+    # _generate_initial_noise
+    # ------------------------------------------------------------------
+
+    def test_generate_initial_noise_packed_shape(self):
+        """Output is packed [1, h_lat*w_lat, C]."""
+        import unittest.mock as mock
+
+        stage = self._make_stage()
+        server_args = self._make_server_args(in_channels=64)
+        batch = SimpleNamespace(
+            prompt_embeds=[torch.zeros(1, 1, dtype=torch.bfloat16)],
+            latent_ids=None,
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.distributed.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            out = stage._generate_initial_noise(
+                batch, server_args, h_lat=4, w_lat=8, seed=42
+            )
+
+        self.assertEqual(out.shape, (1, 4 * 8, 64))
+
+    def test_generate_initial_noise_sets_latent_ids_shape(self):
+        """batch.latent_ids is set to (1, h_lat*w_lat, 4) after the call."""
+        import unittest.mock as mock
+
+        stage = self._make_stage()
+        server_args = self._make_server_args(in_channels=64)
+        batch = SimpleNamespace(
+            prompt_embeds=[torch.zeros(1, 1, dtype=torch.bfloat16)],
+            latent_ids=None,
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.distributed.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            stage._generate_initial_noise(batch, server_args, h_lat=4, w_lat=8, seed=0)
+
+        self.assertIsNotNone(batch.latent_ids)
+        self.assertEqual(batch.latent_ids.shape, (1, 4 * 8, 4))
+
+    def test_generate_initial_noise_latent_ids_not_floating(self):
+        """latent_ids should contain integer position coordinates."""
+        import unittest.mock as mock
+
+        stage = self._make_stage()
+        server_args = self._make_server_args(in_channels=64)
+        batch = SimpleNamespace(
+            prompt_embeds=[torch.zeros(1, 1, dtype=torch.bfloat16)],
+            latent_ids=None,
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.distributed.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            stage._generate_initial_noise(batch, server_args, h_lat=4, w_lat=4, seed=0)
+
+        self.assertFalse(batch.latent_ids.is_floating_point())
+
+    def test_generate_initial_noise_deterministic(self):
+        """Same seed → same packed output."""
+        import unittest.mock as mock
+
+        stage = self._make_stage()
+        server_args = self._make_server_args()
+        batch1 = SimpleNamespace(
+            prompt_embeds=[torch.zeros(1, 1, dtype=torch.bfloat16)], latent_ids=None
+        )
+        batch2 = SimpleNamespace(
+            prompt_embeds=[torch.zeros(1, 1, dtype=torch.bfloat16)], latent_ids=None
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.distributed.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            out1 = stage._generate_initial_noise(batch1, server_args, 4, 4, seed=7)
+            out2 = stage._generate_initial_noise(batch2, server_args, 4, 4, seed=7)
+
+        torch.testing.assert_close(out1, out2)
+
+    def test_generate_initial_noise_different_seeds_differ(self):
+        import unittest.mock as mock
+
+        stage = self._make_stage()
+        server_args = self._make_server_args()
+        batch1 = SimpleNamespace(
+            prompt_embeds=[torch.zeros(1, 1, dtype=torch.bfloat16)], latent_ids=None
+        )
+        batch2 = SimpleNamespace(
+            prompt_embeds=[torch.zeros(1, 1, dtype=torch.bfloat16)], latent_ids=None
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.distributed.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            out1 = stage._generate_initial_noise(batch1, server_args, 4, 4, seed=1)
+            out2 = stage._generate_initial_noise(batch2, server_args, 4, 4, seed=2)
+
+        self.assertFalse(torch.allclose(out1, out2))
+
+    # ------------------------------------------------------------------
+    # _on_resolution_change
+    # ------------------------------------------------------------------
+
+    def _make_ctx(self, latent_h=4, latent_w=4, in_channels=64):
+        """Build a minimal DenoisingContext-like namespace for _on_resolution_change."""
+        dummy_branch = SimpleNamespace(kwargs={"freqs_cis": torch.zeros(1)})
+        cfg_policy = SimpleNamespace(branches=[dummy_branch])
+        latents = torch.zeros(1, latent_h * latent_w, in_channels)
+        return SimpleNamespace(
+            cfg_policy=cfg_policy,
+            latents=latents,
+            target_dtype=torch.float32,
+            pos_cond_kwargs={"freqs_cis": torch.zeros(1)},
+        )
+
+    def test_on_resolution_change_no_cfg_policy_no_crash(self):
+        """cfg_policy=None → early return with no exceptions."""
+        stage = self._make_stage()
+        server_args = self._make_server_args()
+        ctx = SimpleNamespace(cfg_policy=None)
+        batch = SimpleNamespace(latent_ids=None)
+        # Must not raise
+        stage._on_resolution_change(ctx, batch, server_args, 1024, 1024)
+
+    def test_on_resolution_change_updates_latent_ids_shape(self):
+        """batch.latent_ids is updated to the new (upsampled) spatial grid shape."""
+        stage = self._make_stage()
+        server_args = self._make_server_args(vae_scale=8, in_channels=64)
+        # Transition from 32×32 → 64×64 (pixel 1024 → 1024, latent 32→64)
+        new_h_pixel, new_w_pixel = 1024, 1024  # latent = 1024 // 16 = 64
+        ctx = self._make_ctx(latent_h=64, latent_w=64)
+        batch = SimpleNamespace(latent_ids=None)
+
+        # Pre-populate cache so _get_transformer_attr is never called
+        stage._freqs_cis_cache[(64, 64)] = torch.zeros(1)
+
+        stage._on_resolution_change(ctx, batch, server_args, new_h_pixel, new_w_pixel)
+
+        self.assertIsNotNone(batch.latent_ids)
+        expected_seq_len = 64 * 64
+        self.assertEqual(batch.latent_ids.shape, (1, expected_seq_len, 4))
+
+    def test_on_resolution_change_updates_branch_freqs_cis(self):
+        """branch.kwargs['freqs_cis'] is replaced with the cached value."""
+        stage = self._make_stage()
+        server_args = self._make_server_args(vae_scale=8, in_channels=64)
+        ctx = self._make_ctx(latent_h=64, latent_w=64)
+        batch = SimpleNamespace(latent_ids=None)
+
+        sentinel = torch.ones(3, 3)  # recognizable cached value
+        stage._freqs_cis_cache[(64, 64)] = sentinel
+
+        stage._on_resolution_change(ctx, batch, server_args, 1024, 1024)
+
+        # The branch should now reference the cached sentinel
+        self.assertIs(ctx.cfg_policy.branches[0].kwargs["freqs_cis"], sentinel)
+
+    def test_on_resolution_change_updates_pos_cond_kwargs(self):
+        """ctx.pos_cond_kwargs['freqs_cis'] is also updated from the cache."""
+        stage = self._make_stage()
+        server_args = self._make_server_args(vae_scale=8, in_channels=64)
+        ctx = self._make_ctx(latent_h=64, latent_w=64)
+        batch = SimpleNamespace(latent_ids=None)
+
+        sentinel = torch.ones(5)
+        stage._freqs_cis_cache[(64, 64)] = sentinel
+
+        stage._on_resolution_change(ctx, batch, server_args, 1024, 1024)
+
+        self.assertIs(ctx.pos_cond_kwargs["freqs_cis"], sentinel)
+
+    def test_on_resolution_change_latent_ids_correct_coords(self):
+        """latent_ids has correct H and W coordinate ranges for a 2×4 grid."""
+        stage = self._make_stage()
+        server_args = self._make_server_args(vae_scale=8, in_channels=64)
+        # latent 2×4 → pixel 2*16 × 4*16 = 32×64
+        ctx = self._make_ctx(latent_h=2, latent_w=4)
+        batch = SimpleNamespace(latent_ids=None)
+        stage._freqs_cis_cache[(2, 4)] = torch.zeros(1)
+
+        stage._on_resolution_change(
+            ctx, batch, server_args, new_h_pixel=32, new_w_pixel=64
+        )
+
+        ids = batch.latent_ids  # (1, 8, 4): [T, H, W, Layer]
+        h_coords = ids[0, :, 1]
+        w_coords = ids[0, :, 2]
+        self.assertEqual(int(h_coords.max()), 1)  # 0..H-1 = 0..1
+        self.assertEqual(int(w_coords.max()), 3)  # 0..W-1 = 0..3
+
+
 if __name__ == "__main__":
     unittest.main()

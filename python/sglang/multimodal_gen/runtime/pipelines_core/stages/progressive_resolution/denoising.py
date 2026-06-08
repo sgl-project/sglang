@@ -77,6 +77,14 @@ class ProgressiveDenoisingStage(DenoisingStage):
     # Extension hooks (override in model-specific subclasses)
     # ------------------------------------------------------------------
 
+    def _latent_scale_factor(self, server_args: ServerArgs) -> int:
+        """Pixel-to-latent scale factor used for spatial latent dimensions.
+
+        Defaults to vae_scale_factor.  Models that apply an extra patchification
+        step (e.g. FLUX.2 uses vae_scale_factor * 2) should override this.
+        """
+        return server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
+
     def _unpack_latent(
         self, latent: torch.Tensor, h_lat: int, w_lat: int
     ) -> torch.Tensor:
@@ -183,11 +191,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
         delta = float(getattr(batch, "progressive_delta", 0.01))
         seed = self._get_seed(batch)
 
-        vae_scale_factor = (
-            server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-        )
-        H_lat = batch.height // vae_scale_factor
-        W_lat = batch.width // vae_scale_factor
+        latent_scale = self._latent_scale_factor(server_args)
+        H_lat = batch.height // latent_scale
+        W_lat = batch.width // latent_scale
         downsample = 2**levels
         init_h_lat = H_lat // downsample
         init_w_lat = W_lat // downsample
@@ -213,8 +219,8 @@ class ProgressiveDenoisingStage(DenoisingStage):
 
         # Override batch with low-res initial noise; _prepare_denoising_loop
         # reads batch.latents and batch.height/width to build freqs_cis.
-        batch.height = init_h_lat * vae_scale_factor
-        batch.width = init_w_lat * vae_scale_factor
+        batch.height = init_h_lat * latent_scale
+        batch.width = init_w_lat * latent_scale
         batch.latents = self._generate_initial_noise(
             batch, server_args, init_h_lat, init_w_lat, seed
         )
@@ -300,8 +306,8 @@ class ProgressiveDenoisingStage(DenoisingStage):
             )
 
             # Update batch dimensions and model-specific state
-            new_h_pixel = new_h_lat * vae_scale_factor
-            new_w_pixel = new_w_lat * vae_scale_factor
+            new_h_pixel = new_h_lat * latent_scale
+            new_w_pixel = new_w_lat * latent_scale
             batch.height = new_h_pixel
             batch.width = new_w_pixel
             self._on_resolution_change(

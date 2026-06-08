@@ -389,5 +389,69 @@ class TestProgressiveSamplingParams(unittest.TestCase):
             parser.parse_args(["--progressive-mode", "wavelet"])
 
 
+class TestProgressiveSamplingParams(unittest.TestCase):
+    """Tests for progressive resolution growing fields on SamplingParams."""
+
+    def test_defaults(self):
+        p = SamplingParams()
+        self.assertEqual(p.progressive_mode, "fullres")
+        self.assertEqual(p.progressive_levels, 1)
+        self.assertAlmostEqual(p.progressive_delta, 0.01)
+
+    def test_valid_modes_accepted(self):
+        for mode in ("fullres", "dct", "dct_rewind"):
+            with self.subTest(mode=mode):
+                p = SamplingParams(progressive_mode=mode)
+                self.assertEqual(p.progressive_mode, mode)
+
+    def test_batch_sig_exclude_on_all_progressive_fields(self):
+        import dataclasses
+
+        fields = {f.name: f for f in dataclasses.fields(SamplingParams)}
+        for fname in ("progressive_mode", "progressive_levels", "progressive_delta"):
+            with self.subTest(field=fname):
+                self.assertTrue(
+                    fields[fname].metadata.get("batch_sig_exclude"),
+                    f"{fname} must have batch_sig_exclude=True so different requests "
+                    "can mix progressive and fullres modes in the same server",
+                )
+
+    def test_cli_progressive_mode(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args, _ = parser.parse_known_args(["--progressive-mode", "dct_rewind"])
+        self.assertEqual(args.progressive_mode, "dct_rewind")
+
+    def test_cli_progressive_levels(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args, _ = parser.parse_known_args(["--progressive-levels", "2"])
+        self.assertEqual(args.progressive_levels, 2)
+
+    def test_cli_progressive_delta(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args, _ = parser.parse_known_args(["--progressive-delta", "0.05"])
+        self.assertAlmostEqual(args.progressive_delta, 0.05)
+
+    def test_cli_unset_progressive_fields_suppressed(self):
+        """Without --progressive-* flags, progressive fields are absent from get_cli_args
+        (add_cli_args uses argparse.SUPPRESS so unset flags don't appear in the namespace).
+        """
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args([])
+        kwargs = SamplingParams.get_cli_args(args)
+        self.assertNotIn("progressive_mode", kwargs)
+        self.assertNotIn("progressive_levels", kwargs)
+        self.assertNotIn("progressive_delta", kwargs)
+
+    def test_cli_choices_reject_invalid_mode(self):
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--progressive-mode", "wavelet"])
+
+
 if __name__ == "__main__":
     unittest.main()
