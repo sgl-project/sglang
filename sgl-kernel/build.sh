@@ -60,6 +60,9 @@ echo "BUILD_JOBS:     ${BUILD_JOBS:-auto}"
 echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
+echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
+echo "PYTORCH_MIRROR:     ${PYTORCH_MIRROR:-download.pytorch.org}"
+echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
 echo "----------------------------------------"
 
 # Optional build-args (empty string disables)
@@ -70,6 +73,8 @@ BUILD_ARGS=()
 [ -n "${BUILD_JOBS:-}" ]           && BUILD_ARGS+=(--build-arg BUILD_JOBS="${BUILD_JOBS}")
 [ -n "${NVCC_THREADS:-}" ]         && BUILD_ARGS+=(--build-arg NVCC_THREADS="${NVCC_THREADS}")
 [ -n "${GITHUB_ARTIFACTORY:-}" ]   && BUILD_ARGS+=(--build-arg GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY}")
+[ -n "${PYTORCH_MIRROR:-}" ]       && BUILD_ARGS+=(--build-arg PYTORCH_MIRROR="${PYTORCH_MIRROR}")
+[ -n "${PIP_DEFAULT_INDEX:-}" ]    && BUILD_ARGS+=(--build-arg PIP_DEFAULT_INDEX="${PIP_DEFAULT_INDEX}")
 
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
