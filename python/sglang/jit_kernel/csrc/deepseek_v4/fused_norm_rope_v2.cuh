@@ -64,7 +64,7 @@ enum class ForwardMode : bool {
 // Each warp's 32 lanes cover the full 128-elem head_dim (kVecSize = 4 each).
 // Cache layout: 132 bytes/token (128 fp8 nope + 4 fp32 scale).
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+template <typename DType, typename WeightFloat, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
 INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -111,7 +111,9 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
 
   // part 1: norm
   {
-    Storage input_vec, weight_vec;
+    using WeightStorage = AlignedVector<WeightFloat, kVecSize>;
+    Storage input_vec;
+    WeightStorage weight_vec;
     input_vec.load(input, lane_id);
     weight_vec.load(params.weight, lane_id);
     if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
@@ -219,7 +221,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   }
 }
 
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+template <typename DType, typename WeightFloat, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
 INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -264,7 +266,9 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
   Float4 data, freq;
 
   {
-    Storage input_vec, weight_vec;
+    using WeightStorage = AlignedVector<WeightFloat, kVecSize>;
+    Storage input_vec;
+    WeightStorage weight_vec;
     input_vec.load(input, lane_id);
     weight_vec.load(params.weight, lane_id);
     if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
@@ -368,7 +372,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 // Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
 // Cache layout: 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale.
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+template <typename DType, typename WeightFloat, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
 FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -419,7 +423,9 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   {
     __shared__ float partial_sums[kNumWarps];
 
-    Storage input_vec, weight_vec;
+    using WeightStorage = AlignedVector<WeightFloat, kVecSize>;
+    Storage input_vec;
+    WeightStorage weight_vec;
     input_vec.load(input, tx);
     weight_vec.load(params.weight, tx);
     if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
@@ -485,7 +491,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+template <typename DType, typename WeightFloat, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
@@ -500,16 +506,16 @@ struct FusedNormRopeKernel {
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {
     if constexpr (kIsIndexer) {
-      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL>;
+      return fused_norm_rope_indexer<DType, WeightFloat, kMode, kLogPageSize, kUsePDL>;
     } else {
-      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL>;
+      return fused_norm_rope_flashmla<DType, WeightFloat, kMode, kLogPageSize, kUsePDL>;
     }
   }
 
   template <ForwardMode kMode>
   static constexpr auto select_fp4_kernel() {
     static_assert(kIsIndexer, "FP4 fused store is only defined for the indexer");
-    return fused_norm_rope_indexer_fp4<DType, kMode, kLogPageSize, kUsePDL>;
+    return fused_norm_rope_indexer_fp4<DType, WeightFloat, kMode, kLogPageSize, kUsePDL>;
   }
 
   static void forward(
@@ -536,7 +542,7 @@ struct FusedNormRopeKernel {
         .with_device(device_)
         .verify(input);
     TensorMatcher({kHeadDim})  // weight
-        .with_dtype<DType>()
+        .with_dtype<WeightFloat>()
         .with_device(device_)
         .verify(weight);
     TensorMatcher({-1, kRopeDim})  // freqs_cis
@@ -607,7 +613,7 @@ struct FusedNormRopeKernel {
     device_.set_options<kDLCUDA>();
 
     TensorMatcher({N, kHeadDim}).with_dtype<DType>().with_device(device_).verify(input);
-    TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(weight);
+    TensorMatcher({kHeadDim}).with_dtype<WeightFloat>().with_device(device_).verify(weight);
     TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
     TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(out_loc);
     TensorMatcher({-1, -1}).with_strides({kFp4PageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
