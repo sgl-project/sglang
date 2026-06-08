@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ class DummyConfig:
 CompressedTensorsConfig = DummyConfig
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
+from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -27,7 +29,13 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.gptq import (
+    CPUGPTQConfig,
+    GPTQAscendConfig,
+    GPTQConfig,
+    GPTQMarlinConfig,
+)
+from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -43,7 +51,15 @@ from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cuda,
+    is_hip,
+    is_mps,
+    is_npu,
+    mxfp_supported,
+)
 
 _is_mxfp_supported = mxfp_supported()
 
@@ -88,6 +104,32 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
         }
     )
 
+
+if is_npu():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQAscendConfig,
+        }
+    )
+
+
+if is_mps():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "mlx_q4": MlxQuantizationConfig,
+            "mlx_q8": MlxQuantizationConfig,
+        }
+    )
+
+# subset of above quant methods, supported on CPU
+CPU_QUANTIZATION_METHODS = {
+    "fp8": Fp8Config,
+    "w8a8_int8": W8A8Int8Config,
+    "compressed-tensors": CompressedTensorsConfig,
+    "awq": AWQCPUConfig,
+    "gptq": CPUGPTQConfig,
+}
+
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
 
 
@@ -97,6 +139,23 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             f"Invalid quantization method: {quantization}. "
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
+    from sglang.srt.utils import is_cpu
+
+    if is_cpu() and cpu_has_amx_support():
+        if quantization not in CPU_QUANTIZATION_METHODS:
+            raise ValueError(
+                f"Invalid quantization method on CPU: {quantization}. "
+                f"Available methods on CPU: {list(QUANTIZATION_METHODS.keys())}"
+            )
+        else:
+            return CPU_QUANTIZATION_METHODS[quantization]
+
+    if current_platform.is_out_of_tree():
+        config = current_platform.get_quantization_config(quantization)
+
+        # If the platform has a quantization config, use it else use the default
+        if config is not None:
+            return config
 
     return QUANTIZATION_METHODS[quantization]
 

@@ -7,10 +7,11 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
-from transformers import BaseImageProcessorFast
+from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -291,13 +292,17 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         """
         if images:
             kwargs["images"] = images
+            if self.image_config:
+                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
+            if self.video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
 
         processor = self._processor
         if (
             hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
             if not _is_npu:
@@ -383,7 +388,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -423,15 +428,13 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             input_ids.shape[0] == mrope_positions.shape[-1]
         ), "input_ids and mrope_positions should have the same length"
 
-        mm_inputs = {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_start_id": self.image_start_token_id,
-            "im_end_id": self.image_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
-            "mrope_positions": mrope_positions,
-            "mrope_position_delta": mrope_position_delta,
-        }
-
-        return mm_inputs
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_start_id=self.image_start_token_id,
+            im_end_id=self.image_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )

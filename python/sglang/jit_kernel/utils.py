@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
 import pathlib
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -52,7 +54,7 @@ def cache_once(fn: F) -> F:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        key = (args, tuple(sorted(kwargs.items())))
         if key not in result_map:
             result_map[key] = fn(*args, **kwargs)
         return result_map[key]
@@ -63,6 +65,36 @@ def cache_once(fn: F) -> F:
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+
+
+_LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+
+
+def _local_jit_source_hash(source_files: List[str]) -> str:
+    """Hash JIT source contents so TVM-FFI cache keys track included headers."""
+    digest = hashlib.sha256()
+    seen: set[pathlib.Path] = set()
+    stack = [pathlib.Path(path).resolve() for path in source_files]
+
+    while stack:
+        path = stack.pop()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+
+        data = path.read_bytes()
+        digest.update(str(path).encode())
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+
+        text = data.decode("utf-8", errors="ignore")
+        for include in _LOCAL_INCLUDE_RE.findall(text):
+            include_path = (path.parent / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+
+    return digest.hexdigest()[:16]
 
 
 @cache_once
@@ -90,7 +122,7 @@ KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
-CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
+CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
 
 
 class CPPArgList(list[str]):
@@ -115,11 +147,17 @@ def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
 
 
+# MThreads/MUSA note:
+@cache_once
+def is_musa_runtime() -> bool:
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
             return "true" if arg else "false"
-        if isinstance(arg, (int, float)):
+        if isinstance(arg, (int, str, float)):
             return str(arg)
         if isinstance(arg, torch.dtype):
             return CPP_DTYPE_MAP[arg]
@@ -140,6 +178,7 @@ def load_jit(
     extra_include_paths: List[str] | None = None,
     extra_dependencies: List[str] | None = None,
     build_directory: str | None = None,
+    header_only: bool = True,
 ) -> Module:
     """
     Loading a JIT module from C++/CUDA source files.
@@ -169,47 +208,66 @@ def load_jit(
     :type extra_dependencies: List[str] | None
     :param build_directory: The build directory for JIT compilation.
     :type build_directory: str | None
+    :param header_only: Whether the module is header-only.
+                        If true, apply the wrappers to export given class/functions.
+                        Otherwise, we must export from C++/CUDA side.
     :return: A just-in-time(JIT) compiled module.
     :rtype: Module
     """
 
-    from tvm_ffi.cpp import load_inline
+    from tvm_ffi.cpp import load, load_inline
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
-    cpp_wrappers = cpp_wrappers or []
-    cuda_wrappers = cuda_wrappers or []
     extra_cflags = extra_cflags or []
     extra_cuda_cflags = extra_cuda_cflags or []
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
+
+    cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files]
+    cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
 
     for dep in set(extra_dependencies or []):
         if dep not in _REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
-    # include cpp files
-    cpp_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cpp_files]
-    cpp_sources = [f'#include "{path}"' for path in cpp_paths]
-    cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
+    module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    if cpp_files or cuda_files:
+        module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
+    if header_only:
+        cpp_wrappers = cpp_wrappers or []
+        cuda_wrappers = cuda_wrappers or []
+        cpp_sources = [f'#include "{path}"' for path in cpp_files]
+        cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
 
-    # include cuda files
-    cuda_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cuda_files]
-    cuda_sources = [f'#include "{path}"' for path in cuda_paths]
-    cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
-
-    with _jit_compile_context():
-        return load_inline(
-            "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
-            cpp_sources=cpp_sources,
-            cuda_sources=cuda_sources,
-            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
-            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-            build_directory=build_directory,
-        )
+        # include cuda files
+        cuda_sources = [f'#include "{path}"' for path in cuda_files]
+        cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
+        with _jit_compile_context():
+            return load_inline(
+                module_name,
+                cpp_sources=cpp_sources,
+                cuda_sources=cuda_sources,
+                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                build_directory=build_directory,
+            )
+    else:
+        assert cpp_wrappers is None and cuda_wrappers is None
+        with _jit_compile_context():
+            return load(
+                module_name,
+                cpp_files=cpp_files,
+                cuda_files=cuda_files,
+                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                build_directory=build_directory,
+            )
 
 
 @dataclass
@@ -259,7 +317,18 @@ def _jit_compile_context():
 # NOTE: this might also be used in __main__.py for compile flags export
 def _get_default_target_flags() -> List[str]:
     if is_hip_runtime():
-        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        # Detect FP8 type based on GPU architecture
+        try:
+            device = torch.cuda.current_device()
+            gcn_arch = torch.cuda.get_device_properties(device).gcnArchName
+            if "gfx942" in gcn_arch:
+                flags.append("-DHIP_FP8_TYPE_FNUZ=1")
+            else:
+                flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        except Exception:
+            flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        return flags
     else:
         return [
             get_jit_cuda_arch().jit_flag,
@@ -287,8 +356,9 @@ def get_jit_cuda_arch() -> ArchInfo:
     return _CUDA_ARCH
 
 
+@cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime():
+    if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 

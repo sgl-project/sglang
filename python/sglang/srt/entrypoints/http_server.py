@@ -54,11 +54,13 @@ from fastapi import (
     Query,
     Request,
     UploadFile,
+    WebSocket,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -91,7 +93,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -126,7 +127,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    PinPrefixReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -146,15 +146,11 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
-    monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
-)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -168,6 +164,7 @@ from sglang.srt.utils import (
     add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
+    is_mps,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -177,6 +174,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -194,15 +192,6 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
-    # Dict{
-    #   rank: Tuple(
-    #           session_id,
-    #           Dict{
-    #               name: Tuple (d_ptr, numel, element_size)
-    #           }
-    #         )
-    # }
-    remote_instance_transfer_engine_info: Optional[Dict] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -215,6 +204,32 @@ def set_global_state(global_state: _GlobalState):
 
 def get_global_state() -> _GlobalState:
     return _global_state
+
+
+async def _init_granian_worker() -> ServerArgs:
+    main_pid = get_main_process_id()
+    port_args, server_args, scheduler_info = read_from_shared_memory(
+        f"multi_tokenizer_args_{main_pid}"
+    )
+
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_info,
+        )
+    )
+    return server_args
 
 
 async def init_multi_tokenizer() -> ServerArgs:
@@ -274,6 +289,10 @@ async def lifespan(fast_api_app: FastAPI):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
         thread_label = "Tokenizer"
+    elif envs.SGLANG_GRANIAN_PARENT_PID.get() is not None:
+        server_args = await _init_granian_worker()
+        warmup_thread_kwargs = dict(server_args=server_args)
+        thread_label = "Tokenizer"
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
@@ -287,7 +306,11 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
         elif server_args.disaggregation_mode == "decode":
@@ -298,8 +321,10 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
-    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager, _global_state.template_manager
+    fast_api_app.state.openai_serving_chat = (
+        _global_state.tokenizer_manager.serving_chat_class(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -314,7 +339,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -352,7 +377,6 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager,
             _global_state.template_manager,
             enable_prompt_tokens_details=True,
-            enable_force_include_usage=True,
             tool_server=tool_server,
         )
     except Exception:
@@ -509,13 +533,9 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    rid = f"HEALTH_CHECK_{time.time()}"
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
 
-    if _global_state.tokenizer_manager.is_image_gen:
-        gri = _global_state.tokenizer_manager.get_image_gen_health_check_request(
-            rid, sampling_params
-        )
-    elif _global_state.tokenizer_manager.is_generation:
+    if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
             input_ids=[0],
@@ -622,26 +642,46 @@ async def server_info():
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
-    # This field is not serializable.
-    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
-        del _global_state.tokenizer_manager.server_args.model_config
+    server_args = _global_state.tokenizer_manager.server_args
 
+    # server_args.model_config is not serializable but should be excluded by asdict.
     return {
-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
+        **dataclasses.asdict(server_args),
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
+        # Structured KV-event publisher descriptor for KV-aware routers.
+        # `None` when publishing is disabled or misconfigured; see
+        # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+        "kv_events": server_args.describe_kv_events_publisher(),
     }
 
 
 @app.get("/get_load")
 async def get_load():
-    """Get load metrics (deprecated - use /v1/loads instead)."""
+    """Get load metrics (deprecated - use /v1/loads instead).
+
+    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
+    num_pending_tokens, ts_tic) so existing clients keep working.
+    """
     logger.warning(
         "Endpoint '/get_load' is deprecated and will be removed in a future version. "
         "Please use '/v1/loads' instead."
     )
-    return await _global_state.tokenizer_manager.get_load()
+    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
+    ts = time.perf_counter()
+    return [
+        {
+            "dp_rank": r.dp_rank,
+            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
+            "num_waiting_reqs": r.num_waiting_reqs,
+            "num_tokens": r.num_total_tokens,
+            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
+            "ts_tic": ts,
+        }
+        for r in load_results
+    ]
 
 
 # example usage:
@@ -686,7 +726,21 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
-                out = {"error": {"message": str(e)}}
+                # A client disconnect also surfaces here. It's a client-side
+                # cancellation, not a server error or bad input -- log it and
+                # stop (the request was already aborted upstream) instead of
+                # emitting a 400.
+                if request is not None and await request.is_disconnected():
+                    logger.info(f"[http_server] Client disconnected: {e}")
+                    return
+                out = {
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                        "code": 400,
+                        "retryable": False,
+                    }
+                }
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
@@ -746,6 +800,64 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     return Response(
         content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/add_external_corpus")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def add_external_corpus(request: Request):
+    """Add an external corpus for ngram speculative decoding."""
+    from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
+
+    try:
+        obj = AddExternalCorpusReqInput(**(await request.json()))
+    except TypeError as e:
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    result = await _global_state.tokenizer_manager.add_external_corpus(obj)
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "corpus_id": result.corpus_id,
+            "message": result.message,
+            "loaded_token_count": result.loaded_token_count,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/remove_external_corpus")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def remove_external_corpus(request: Request):
+    """Remove an external corpus by ID."""
+    body = await request.json()
+    corpus_id = body.get("corpus_id")
+    if not corpus_id:
+        return ORJSONResponse(
+            {"success": False, "message": "corpus_id is required."},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
+    return ORJSONResponse(
+        {"success": result.success, "message": result.message},
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.get("/list_external_corpora")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_external_corpora():
+    """List all active external corpora."""
+    result = await _global_state.tokenizer_manager.list_external_corpora()
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "corpus_token_counts": result.corpus_token_counts,
+            "message": result.message,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
     )
 
 
@@ -857,25 +969,6 @@ async def hicache_storage_backend_status():
         "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
         "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
     }
-
-
-@app.api_route("/hicache/pin_prefix", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pin_prefix(obj: PinPrefixReqInput):
-    """Pin a prefix by token_ids to resist eviction."""
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
-        return _admin_api_key_missing_response()
-    ret = await _global_state.tokenizer_manager.pin_prefix(
-        obj.token_ids, obj.ttl_seconds
-    )
-    return ORJSONResponse(
-        content={
-            "status": "ok" if ret.success else "error",
-            "nodes_pinned": ret.nodes_pinned,
-            "message": ret.message,
-        },
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
@@ -1032,26 +1125,39 @@ async def send_weights_to_remote_instance(
 @app.get("/get_remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_remote_instance_transfer_engine_info(rank: int = None):
+    """Get the server information (deprecated - use /remote_instance_transfer_engine_info instead)."""
+    logger.warning(
+        "Endpoint '/get_remote_instance_transfer_engine_info' is deprecated and will be removed in a future version. "
+        "Please use '/remote_instance_transfer_engine_info' instead."
+    )
+    return await remote_instance_transfer_engine_info(rank=rank)
+
+
+@app.get("/remote_instance_transfer_engine_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        return ORJSONResponse(
+            {"error": {"message": "Missing or invalid rank parameter"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
-    if (
-        _global_state.remote_instance_transfer_engine_info is None
-        or len(_global_state.remote_instance_transfer_engine_info) == 0
-    ):
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
-
+    server_args = _global_state.tokenizer_manager.server_args
     try:
-        result = {
-            "rank": rank,
-            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
-                rank
-            ],
-        }
-        return result
-    except Exception as e:
-        logger.error(f"Exception: {e}")
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        resp = requests.get(
+            f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
+            params={"rank": rank},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
+
+    return ORJSONResponse(
+        {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.post("/init_weights_update_group")
@@ -1212,14 +1318,22 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.post("/weights_checker")
+@app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=200 if success else HTTPStatus.BAD_REQUEST,
+async def check_weights(
+    obj: Optional[CheckWeightsReqInput] = None, request: Request = None
+):
+    if obj is None:
+        obj = CheckWeightsReqInput()
+    success, message, ranks, per_engine_checksum = (
+        await _global_state.tokenizer_manager.check_weights(obj, request)
     )
+    body = {"success": success, "message": message}
+    if ranks is not None:
+        body["ranks"] = ranks
+    if per_engine_checksum is not None:
+        body["per_engine_checksum"] = per_engine_checksum
+    return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
@@ -1363,13 +1477,24 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
 
     # 2) Call the non-stream parsing method (non-stream)
-    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+    if getattr(obj, "return_blocks", False):
+        blocks = parser.parse_non_stream_blocks(obj.text)
+        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
+        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
+        reasoning_text = "".join(reasoning_blocks)
+        normal_text = "".join(text_blocks)
+    else:
+        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
         "reasoning_text": reasoning_text,
         "text": normal_text,
     }
+    if getattr(obj, "return_blocks", False):
+        response_data["reasoning_blocks"] = reasoning_blocks
+        response_data["text_blocks"] = text_blocks
+        response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
 
@@ -1486,11 +1611,18 @@ async def openai_v1_audio_transcriptions(
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0.0),
     stream: bool = Form(default=False),
+    timestamp_granularities: Optional[List[str]] = Form(
+        default=None, alias="timestamp_granularities[]"
+    ),
 ):
     """OpenAI-compatible audio transcription endpoint."""
-    if response_format not in ["json", "text"]:
+    if response_format not in ["json", "text", "verbose_json"]:
         return ORJSONResponse(
-            content={"error": {"message": "Only 'json' and 'text' formats supported"}},
+            content={
+                "error": {
+                    "message": "Only 'json', 'text', and 'verbose_json' formats supported"
+                }
+            },
             status_code=400,
         )
 
@@ -1504,9 +1636,21 @@ async def openai_v1_audio_transcriptions(
             response_format=response_format,
             temperature=temperature,
             stream=stream,
+            timestamp_granularities=timestamp_granularities,
             raw_request=raw_request,
         )
     )
+
+
+@app.websocket("/v1/realtime")
+async def openai_v1_realtime_transcription(ws: WebSocket):
+    """OpenAI Realtime transcription WebSocket endpoint."""
+    # /v1/realtime is OpenAI's unified Realtime URL covering transcription +
+    # chat modes. This handler implements the transcription subset only;
+    # chat-mode session.update payloads are rejected by the
+    # `Literal["transcription"]` constraint on TranscriptionSessionConfig.type
+    # (see realtime/protocol.py).
+    await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
@@ -1568,7 +1712,7 @@ async def retrieve_model(model: str):
 
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
-    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
     return await raw_request.app.state.openai_serving_score.handle_request(
         request, raw_request
     )
@@ -1795,8 +1939,8 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     model_info = res.json()
 
-    # Construct a warmup request
-    is_vlm = bool(model_info.get("has_image_understanding", False))
+    # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
@@ -1876,6 +2020,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1902,14 +2047,15 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
             if res.status_code == 200:
                 logger.info(
-                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
+                    f"Disaggregation warmup request completed with status {res.status_code}, resp: {res.json()}"
                 )
+                logger.info("End of disaggregation warmup")
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
+                    "Disaggregation warmup failed (mode=%s), status code: %s",
+                    server_args.disaggregation_mode,
+                    res.status_code,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
@@ -1973,12 +2119,60 @@ def _wait_weights_ready():
     )
 
 
+def _close_main_process_sockets():
+    """Close the main process's ZMQ sockets before spawning Granian workers.
+
+    Granian workers create their own TokenizerManager with fresh ZMQ sockets.
+    The main process must release its sockets first to avoid binding conflicts
+    on the same IPC addresses.
+    """
+    if _global_state is None or _global_state.tokenizer_manager is None:
+        return
+    tm = _global_state.tokenizer_manager
+    for attr in ("recv_from_detokenizer", "send_to_scheduler"):
+        sock = getattr(tm, attr, None)
+        if sock is None:
+            continue
+        inner = getattr(sock, "socket", None)
+        if inner is not None:
+            inner.close()
+        elif hasattr(sock, "close"):
+            sock.close()
+        setattr(tm, attr, None)
+
+
+def _run_granian_server(server_args: ServerArgs):
+    """Launch Granian with HTTP/2 support"""
+    from granian import Granian
+    from granian.constants import HTTPModes, Interfaces, Loops
+
+    granian_kwargs = dict(
+        target="sglang.srt.entrypoints.http_server:app",
+        address=server_args.host,
+        port=server_args.port,
+        interface=Interfaces.ASGI,
+        http=HTTPModes.auto,
+        loop=Loops.uvloop,
+        log_level=server_args.log_level_http or server_args.log_level or "info",
+        workers=1,
+    )
+
+    ssl_enabled = server_args.ssl_certfile and server_args.ssl_keyfile
+    if ssl_enabled:
+        granian_kwargs["ssl_cert"] = server_args.ssl_certfile
+        granian_kwargs["ssl_key"] = server_args.ssl_keyfile
+
+    server = Granian(**granian_kwargs)
+    server.serve()
+
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,
     template_manager,
     port_args: PortArgs,
     scheduler_infos: List[Dict],
+    subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
@@ -1986,23 +2180,50 @@ def _setup_and_run_http_server(
 
     Called by launch_server after subprocesses have been launched.
     """
-    # Parse info got from the schedulers
-    remote_instance_transfer_engine_info = (
-        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
-    )
-
     # Set global states
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
-            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
 
+    # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
+    if tokenizer_manager is not None:
+        tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
+
+    # Use Granian for HTTP/2 server
+    if server_args.enable_http2:
+        # Reuse the multi-tokenizer shared memory mechanism to pass
+        # init args (port_args, server_args, scheduler_info) to
+        # Granian workers, which are independent processes.
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args, server_args, scheduler_infos[0]
+        )
+        try:
+            if server_args.ssl_certfile:
+                logger.info(
+                    f"SSL enabled: certfile={server_args.ssl_certfile}, "
+                    f"keyfile={server_args.ssl_keyfile}"
+                )
+            logger.info(
+                f"Starting Granian HTTP/2 server on "
+                f"{server_args.host}:{server_args.port}"
+            )
+            # Propagate the main process PID via os.environ so Granian
+            # workers (forked or spawned) can locate the shared memory
+            # segment created above.
+            envs.SGLANG_GRANIAN_PARENT_PID.set(os.getpid())
+            _close_main_process_sockets()
+            _run_granian_server(server_args)
+        finally:
+            if multi_tokenizer_args_shm is not None:
+                multi_tokenizer_args_shm.unlink()
+        return
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
@@ -2116,7 +2337,6 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
-            monkey_patch_uvicorn_multiprocessing()
 
             if server_args.enable_ssl_refresh:
                 logger.warning(
@@ -2132,6 +2352,7 @@ def _setup_and_run_http_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
                 ssl_keyfile=server_args.ssl_keyfile,
@@ -2171,13 +2392,17 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
-    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
-        Engine._launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
+    (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result,
+        subprocess_watchdog,
+    ) = Engine._launch_subprocesses(
+        server_args=server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
     _setup_and_run_http_server(
@@ -2186,6 +2411,7 @@ def launch_server(
         template_manager,
         port_args,
         scheduler_init_result.scheduler_infos,
+        subprocess_watchdog,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
     )
