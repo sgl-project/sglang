@@ -1875,19 +1875,13 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 block_tables = self.forward_metadata.block_tables
             if self.use_fia:
-                k_cache = (
-                    self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                    .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
-                    .contiguous()
+                k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                    -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
                 )
-                v_cache = (
-                    self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                    .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
-                    .contiguous()
+                v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                    -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
                 )
-                query = q.reshape(
-                    -1, layer.tp_q_head_num, layer.qk_head_dim
-                ).contiguous()
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
@@ -1971,9 +1965,7 @@ class AscendAttnBackend(AttentionBackend):
             if (layer.qk_head_dim != layer.v_head_dim) and (
                 self.is_hybrid_swa and layer.sliding_window_size == -1
             ):
-                query_v2 = q.reshape(
-                    -1, layer.tp_q_head_num, layer.qk_head_dim
-                ).contiguous()
+                query_v2 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 actual_seq_qlen = (
                     torch.tensor([1] * len(actual_seq_len_kv), dtype=torch.int32)
                     .cumsum(dim=0)
@@ -1996,8 +1988,8 @@ class AscendAttnBackend(AttentionBackend):
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
                         query_v2,
-                        k_cache.contiguous(),
-                        v_cache.contiguous(),
+                        k_cache,
+                        v_cache,
                         **common_kwargs,
                     )
                 )
@@ -2013,8 +2005,8 @@ class AscendAttnBackend(AttentionBackend):
                 softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
                 torch_npu.npu_fused_infer_attention_score_v2.out(
                     query_v2,
-                    k_cache.contiguous(),
-                    v_cache.contiguous(),
+                    k_cache,
+                    v_cache,
                     **common_kwargs,
                     workspace=workspace,
                     out=[attn_output, softmax_lse],
