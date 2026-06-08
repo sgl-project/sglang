@@ -113,16 +113,18 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             )
 
             if self.use_fia:
-                # Explicitly compute the flattened page dimension to avoid -1
-                # in view(), which is ambiguous for 0-element tensors during
-                # graph capture (torch.compile / Dynamo tracing).
-                flat_page_dim = (self.size // self.page_size + 1) * self.page_size
-                self.k_buffer = self.k_buffer.view(
-                    self.layer_num, flat_page_dim, 1, self.head_num, self.head_dim
-                )
-                self.v_buffer = self.v_buffer.view(
-                    self.layer_num, flat_page_dim, 1, self.head_num, self.v_head_dim
-                )
+                # Use per-layer Python lists to avoid torch.compile capturing
+                # the entire multi-layer tensor (OOM during graph capture).
+                # Each layer view: [P*ps, 1, H, D], sharing the contiguous
+                # storage allocated above.
+                self.k_buffer = [
+                    self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
+                    for i in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    self.v_buffer[i].view(-1, 1, self.head_num, self.v_head_dim)
+                    for i in range(self.layer_num)
+                ]
 
     # for disagg
     def get_contiguous_buf_infos(self):
