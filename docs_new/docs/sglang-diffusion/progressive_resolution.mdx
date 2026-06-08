@@ -1,17 +1,23 @@
 ---
 title: "Progressive Resolution Generation"
-description: "Speed up FLUX.1 and FLUX.2 image generation up to 1.93× with spectral progressive resolution growing."
+description: "Speed up FLUX.1, FLUX.2, and Wan T2V generation up to 2.78× with spectral progressive resolution growing."
 ---
 
-Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× speedup on FLUX.1** and **1.93× speedup on FLUX.2** with no perceptible quality loss.
+Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, and **2.78× speedup on Wan 2.1 T2V** with no perceptible quality loss.
 
 Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736).
 
 ## Overview
 
-FLUX models at 1024×1024 pack latents into **4096 tokens**. Because DiT attention is O(n²), running the first N steps at half the resolution (1024 tokens) is ~4× cheaper per step.
+DiT attention is O(n²) in sequence length. Running the first N denoising steps at half the spatial resolution cuts the attention cost to ~6% for those steps.
 
-The transition point — how many steps to run at each resolution — is computed from the **Bayes-optimal frequency-activation criterion**: frequencies that cannot yet be resolved at the coarse scale are not denoised there. This makes the speedup lossless by construction.
+The transition point — how many steps to run at each resolution — is computed from the **Bayes-optimal frequency-activation criterion**: frequencies that cannot be resolved at the coarse scale are not denoised there. This makes the speedup lossless by construction.
+
+| Model | Full-res tokens | Half-res tokens | Token-step ratio |
+|-------|----------------|----------------|-----------------|
+| FLUX.1 1024×1024 | 4,096 | 1,024 | 4.0× |
+| FLUX.2 1024×1024 | 4,096 | 1,024 | 4.0× |
+| Wan 2.1 T2V 480×832 (81 frames) | 6,240 | 1,560 | 4.0× |
 
 ## Parameters
 
@@ -110,8 +116,6 @@ Timing = denoising loop only, averaged across 10 diverse prompts.
 | dct_rewind L1 δ=0.05 | 18@32² + 12@64² | 5.50 s | **1.77×** |
 | dct_rewind L1 δ=0.10 | 20@32² + 10@64² | 5.03 s | **1.93×** |
 
-For most prompts **δ=0.10** is recommended — it gives the largest speedup with no visible quality change.
-
 ### Python API
 
 ```python
@@ -127,6 +131,66 @@ result = gen.generate(sampling_params_kwargs={
     "progressive_mode": "dct_rewind",
     "progressive_levels": 1,
     "progressive_delta": 0.10,
+})
+```
+
+---
+
+## Wan 2.1 T2V
+
+Supports `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` and `Wan-AI/Wan2.1-T2V-14B-Diffusers`.
+
+> **Note:** Progressive generation grows only the **spatial** H×W dimensions. The temporal dimension T (number of latent frames) is kept fixed across all stages.
+
+### Usage
+
+```bash
+sglang generate \
+    --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cheetah sprinting across the Serengeti at sunset, slow motion, photorealistic" \
+    --num-inference-steps 50 \
+    --num-frames 81 \
+    --height 480 \
+    --width 832 \
+    --guidance-scale 5.0 \
+    --flow-shift 5.0 \
+    --dit-cpu-offload false \
+    --progressive-mode dct_rewind \
+    --progressive-levels 1 \
+    --progressive-delta 0.05
+```
+
+### Choosing delta
+
+| δ | Coarse steps (50 total) | Denoising speedup |
+|---|------------------------|-------------------|
+| `0.01` | 23 @ 30×52 + 27 @ 60×104 | **1.65×** |
+| `0.02` | 27 @ 30×52 + 23 @ 60×104 | **1.86×** |
+| `0.05` | 33 @ 30×52 + 17 @ 60×104 | **2.32×** |
+| `0.10` | 37 @ 30×52 + 13 @ 60×104 | **2.78×** |
+
+For most prompts `0.05` is recommended. `0.10` provides maximum speedup but should be validated on motion-heavy scenes.
+
+### Python API
+
+```python
+from sglang.multimodal_gen import DiffGenerator
+
+gen = DiffGenerator.from_pretrained(
+    model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    dit_cpu_offload=False,
+    flow_shift=5.0,
+)
+result = gen.generate(sampling_params_kwargs={
+    "prompt": "A cheetah sprinting across the Serengeti at sunset, slow motion, photorealistic",
+    "num_inference_steps": 50,
+    "num_frames": 81,
+    "height": 480,
+    "width": 832,
+    "guidance_scale": 5.0,
+    "progressive_mode": "dct_rewind",
+    "progressive_levels": 1,
+    "progressive_delta": 0.05,
 })
 ```
 

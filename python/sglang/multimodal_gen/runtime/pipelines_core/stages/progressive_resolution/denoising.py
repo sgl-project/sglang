@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.upsample import (
     apply_upsample,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -254,70 +255,77 @@ class ProgressiveDenoisingStage(DenoisingStage):
         cur_w_lat = init_w_lat
 
         # ── Stage loop ────────────────────────────────────────────────────────
-        for stage in range(1, num_stages + 1):
-            stage_end = transition_steps.get(stage + 1, n_steps)
+        # DenoisingStage.forward() wraps its denoising loop in torch.autocast;
+        # we bypass that path, so we must apply the same context here.
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=ctx.target_dtype,
+            enabled=ctx.autocast_enabled,
+        ):
+            for stage in range(1, num_stages + 1):
+                stage_end = transition_steps.get(stage + 1, n_steps)
 
-            logger.info(
-                "Stage %d/%d: %dx%d latent, steps [%d, %d)",
-                stage,
-                num_stages,
-                cur_h_lat,
-                cur_w_lat,
-                stage_start,
-                stage_end,
-            )
-
-            self._run_stage_steps(
-                ctx, batch, server_args, timesteps_cpu, stage_start, stage_end
-            )
-
-            if stage == num_stages:
-                break
-
-            # ── Resolution transition ──────────────────────────────────────
-            sigma_t = float(scheduler.sigmas[stage_end])
-            upsample_seed = seed + stage * 10_000
-
-            # Unpack → spatial, upsample, repack
-            x_spatial = self._unpack_latent(ctx.latents, cur_h_lat, cur_w_lat)
-
-            result = apply_upsample(x_spatial, sigma_t, upsample_seed, mode)
-
-            if rewind:
-                x_spatial_up, t_eff = result
-                # Patch scheduler sigma/timestep at transition point for rewind
-                scheduler.sigmas[stage_end] = t_eff
-                scheduler.timesteps[stage_end] = t_eff * 1000
-                ctx.timesteps[stage_end] = t_eff * 1000
-                timesteps_cpu[stage_end] = t_eff * 1000
                 logger.info(
-                    "  rewind: sigma=%.4f → t_eff=%.4f at step %d",
-                    sigma_t,
-                    t_eff,
+                    "Stage %d/%d: %dx%d latent, steps [%d, %d)",
+                    stage,
+                    num_stages,
+                    cur_h_lat,
+                    cur_w_lat,
+                    stage_start,
                     stage_end,
                 )
-            else:
-                x_spatial_up = result
 
-            new_h_lat = cur_h_lat * 2
-            new_w_lat = cur_w_lat * 2
-            ctx.latents = self._repack_latent(
-                x_spatial_up, new_h_lat, new_w_lat, batch, server_args
-            )
+                self._run_stage_steps(
+                    ctx, batch, server_args, timesteps_cpu, stage_start, stage_end
+                )
 
-            # Update batch dimensions and model-specific state
-            new_h_pixel = new_h_lat * latent_scale
-            new_w_pixel = new_w_lat * latent_scale
-            batch.height = new_h_pixel
-            batch.width = new_w_pixel
-            self._on_resolution_change(
-                ctx, batch, server_args, new_h_pixel, new_w_pixel
-            )
+                if stage == num_stages:
+                    break
 
-            reset_scheduler_at_step(scheduler, stage_end)
-            cur_h_lat = new_h_lat
-            cur_w_lat = new_w_lat
-            stage_start = stage_end
+                # ── Resolution transition ──────────────────────────────────────
+                sigma_t = float(scheduler.sigmas[stage_end])
+                upsample_seed = seed + stage * 10_000
+
+                # Unpack → spatial, upsample, repack
+                x_spatial = self._unpack_latent(ctx.latents, cur_h_lat, cur_w_lat)
+
+                result = apply_upsample(x_spatial, sigma_t, upsample_seed, mode)
+
+                if rewind:
+                    x_spatial_up, t_eff = result
+                    # Patch scheduler sigma/timestep at transition point for rewind
+                    scheduler.sigmas[stage_end] = t_eff
+                    scheduler.timesteps[stage_end] = t_eff * 1000
+                    ctx.timesteps[stage_end] = t_eff * 1000
+                    timesteps_cpu[stage_end] = t_eff * 1000
+                    logger.info(
+                        "  rewind: sigma=%.4f → t_eff=%.4f at step %d",
+                        sigma_t,
+                        t_eff,
+                        stage_end,
+                    )
+                else:
+                    x_spatial_up = result
+
+                new_h_lat = cur_h_lat * 2
+                new_w_lat = cur_w_lat * 2
+                ctx.latents = self._repack_latent(
+                    x_spatial_up, new_h_lat, new_w_lat, batch, server_args
+                )
+
+                # Update batch dimensions and model-specific state
+                new_h_pixel = new_h_lat * latent_scale
+                new_w_pixel = new_w_lat * latent_scale
+                batch.height = new_h_pixel
+                batch.width = new_w_pixel
+                self._on_resolution_change(
+                    ctx, batch, server_args, new_h_pixel, new_w_pixel
+                )
+
+                reset_scheduler_at_step(scheduler, stage_end)
+                cur_h_lat = new_h_lat
+                cur_w_lat = new_w_lat
+                stage_start = stage_end
 
         denoising_end = time.time()
         if not ctx.is_warmup:

@@ -56,6 +56,15 @@ except Exception:
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
+# CuTeDSL fused kernels require cutlass.cute (CUTLASS 3.x Python bindings).
+# Pre-check at import time so the per-forward-pass try/except is zero-cost.
+try:
+    import cutlass.cute as _  # noqa: F401
+
+    _has_cutlass_cute = True
+except Exception:
+    _has_cutlass_cute = False
+
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
@@ -476,6 +485,7 @@ class ZImageTransformerBlock(nn.Module):
             )
             if (
                 _is_cuda
+                and _has_cutlass_cute
                 and attn_out.is_cuda
                 and attn_out.shape[-1] % 256 == 0
                 and attn_out.shape[-1] <= 8192

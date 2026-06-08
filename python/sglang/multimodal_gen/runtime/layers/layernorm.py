@@ -28,6 +28,14 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 _is_cuda = current_platform.is_cuda()
+
+# CuTeDSL fused kernels require cutlass.cute (CUTLASS 3.x Python bindings).
+try:
+    import cutlass.cute as _  # noqa: F401
+
+    _has_cutlass_cute = True
+except Exception:
+    _has_cutlass_cute = False
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
@@ -476,7 +484,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if residual.numel() == 0 or x.numel() == 0:
             return self.forward_native(residual, x, gate, shift, scale)
 
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        if not _has_cutlass_cute or (x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192):
             import warnings
 
             warnings.warn(
@@ -625,7 +633,7 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        if not _has_cutlass_cute or (x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192):
             import warnings
 
             warnings.warn(
@@ -718,7 +726,7 @@ class _NormTanhMulAdd(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        if not _has_cutlass_cute or (x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192):
             import warnings
 
             warnings.warn(
@@ -966,7 +974,13 @@ def apply_rmsnorm_tanh_mul_add(
     if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
         return residual + torch.tanh(gate) * norm(x)
 
-    if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
+    if (
+        _is_cuda
+        and _has_cutlass_cute
+        and x.is_cuda
+        and x.shape[-1] % 256 == 0
+        and x.shape[-1] <= 8192
+    ):
         from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
             fused_norm_tanh_mul_add,
         )
