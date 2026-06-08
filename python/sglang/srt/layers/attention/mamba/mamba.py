@@ -35,10 +35,11 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_npu,
+    is_xpu,
     set_weight_attrs,
 )
 
-if is_cuda():
+if is_cuda() or is_xpu():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn,
         causal_conv1d_update,
