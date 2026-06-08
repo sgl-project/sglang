@@ -1752,6 +1752,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
+        # `nvfp4_online` is not a serialized checkpoint format, but after the
+        # online loader converts each expert it uses the same packed NVFP4
+        # weights, block scales, and per-tensor scales as serialized ModelOpt
+        # NVFP4 checkpoints. Reuse this layout and swap only the weight loader.
         if is_nvfp4_online:
             if not self.enable_flashinfer_trtllm_moe:
                 raise ValueError(
@@ -1973,6 +1977,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale
 
         if self.quant_config.use_per_token_activation:
+            # FlashInfer computes activation scales dynamically per token, so
+            # the static checkpoint activation scale is intentionally neutral.
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 

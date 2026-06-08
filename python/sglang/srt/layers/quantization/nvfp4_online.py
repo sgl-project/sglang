@@ -29,8 +29,16 @@ logger = logging.getLogger(__name__)
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
-    """Online NVFP4 config that quantizes MoE experts."""
+    """Config for `--quantization nvfp4_online`.
 
+    This mode is a load-time conversion path, not a serialized NVFP4 checkpoint
+    format. It reuses the ModelOpt NVFP4 MoE parameter layout and fills those
+    parameters by converting BF16/FP16/FP8 expert tensors as they are loaded.
+    Dense layers stay in the source checkpoint precision or quantization path.
+    """
+
+    # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
+    # NVFP4 checkpoints use ModelOptFp4Config instead.
     is_nvfp4_online = True
     is_checkpoint_nvfp4_serialized = False
     group_size = 16
@@ -72,6 +80,8 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping or {},
         )
         self.fp4_ignored_layers = fp4_ignored_layers
+        # Weights use static NVFP4 scales, while FlashInfer computes activation
+        # FP32 scales dynamically per token at runtime.
         self.use_per_token_activation = True
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
@@ -143,7 +153,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
 
 
 class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
-    """Online NVFP4 per-token activation MoE method for BF16/FP16/FP8 checkpoints."""
+    """MoE method that converts source expert weights to NVFP4 during loading."""
 
     def __init__(self, quant_config: NvFp4OnlineConfig, layer_prefix: str):
         super().__init__(quant_config)
@@ -166,6 +176,12 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         weight: torch.Tensor,
         weight_scale_2: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return packed NVFP4 weight, block scales, and per-tensor decode scale.
+
+        The weight scale is static and per tensor. Callers pass an existing
+        scale when multiple shards must share one global scale, for example the
+        gated w1/w3 pair.
+        """
         from flashinfer import SfLayout, nvfp4_quantize
 
         if weight.ndim != 2:
@@ -302,6 +318,13 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         return f"{weight_name}.weight_scale_2"
 
     def get_online_weight_loader(self, layer, original_weight_loader):
+        """Wrap the normal MoE loader with load-time NVFP4 conversion.
+
+        The wrapper quantizes each eligible expert shard as soon as the loader
+        sees enough source data, which avoids materializing and then converting
+        the full checkpoint. FP8 checkpoints stream weight and scale tensors
+        separately, so those pairs are staged until both sides have arrived.
+        """
         pending_w13_weights = {}
         pending_w13_lock = threading.Lock()
         pending_fp8_weights = {}
@@ -419,6 +442,8 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             loaded_weight = loaded_weight.to(param.device)
             pending_rows = pending_weight.shape[0]
             loaded_rows = loaded_weight.shape[0]
+            # Quantize the gated pair together so w1/w3 share one amax-derived
+            # per-tensor FP32 scale, matching the serialized NVFP4 convention.
             fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
                 torch.cat([pending_weight, loaded_weight], dim=0)
             )
