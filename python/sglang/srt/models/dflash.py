@@ -31,6 +31,7 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
@@ -94,8 +95,7 @@ class DFlashAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
-        rope_theta = float(getattr(config, "rope_theta", 1000000))
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)

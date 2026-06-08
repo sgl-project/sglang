@@ -408,13 +408,17 @@ class MambaMixer2(torch.nn.Module):
         self,
         *,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
         layer_cache: MambaPool.State,
         metadata: Mamba2Metadata,
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
+        # Returns the projected result. When `output` is given it is also
+        # written into that buffer (required by the cuda-graph split ops, which
+        # need a stable buffer); otherwise the caller uses the return value and
+        # avoids a copy.
         # metadata contains metadata necessary for the mamba2 triton
         # kernels to operate in continuous batching and in chunked prefill
         # modes; they are computed at top-level model forward since they
@@ -718,9 +722,11 @@ class MambaMixer2(torch.nn.Module):
         hidden_states = self.norm(preallocated_ssm_out, gate[:num_actual_tokens])
 
         # 5. Final linear projection
-        output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+        mixer_out, _ = self.out_proj(hidden_states)
+        if output is not None:
+            output[:num_actual_tokens].copy_(mixer_out)
 
-        return intermediate_states
+        return mixer_out, intermediate_states
 
     @property
     def mamba_type(self) -> str:
