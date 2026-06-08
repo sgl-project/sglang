@@ -12,6 +12,7 @@ compress + indexer helpers. ``forward()`` routes by ``compress_ratio``:
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -38,10 +39,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.compressor import (
-    _apply_hadamard,
-    _walsh_hadamard_matrix,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -49,6 +46,37 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
+    # bf16 Sylvester matrix with the n**-0.5 norm factor baked in by dividing
+    # by sqrt(2) at each doubling (log2(n) steps total). `dtype` is accepted
+    # for backward-compat with callers; ascend builds in bf16 only.
+    cache = _walsh_hadamard_matrix._cache  # type: ignore[attr-defined]
+    key = (n, str(device))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    if not ((n & (n - 1) == 0) and (n > 0)):
+        raise ValueError(f"n must be a positive power of 2, got {n}")
+    had = torch.ones(1, 1, dtype=torch.bfloat16, device=device)
+    while had.shape[0] != n:
+        had = torch.cat((torch.cat([had, had], 1), torch.cat([had, -had], 1)), 0)
+        had /= math.sqrt(2)
+    had = had.contiguous()
+    cache[key] = had
+    return had
+
+
+_walsh_hadamard_matrix._cache = {}  # type: ignore[attr-defined]
+
+
+def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
+    # The n**-0.5 scale is already baked into `hadamard_matrix` (see
+    # _walsh_hadamard_matrix above), so this is just `inp @ H` then bf16 cast.
+    init_shape = inp.shape
+    flat = inp.view(-1, hadamard_matrix.shape[0])
+    return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
 
 
 class DeepseekV4AscendAttnBackend(
@@ -758,14 +786,11 @@ class DeepseekV4AscendAttnBackend(
         # Prefill is not graph-captured today so we keep it here in the
         # eager-only shim. See cheat sheet B.2.
         #
-        # Gated on the fused-op env flag — the per-req loop below does a
-        # cpu().tolist() host sync we don't want to pay when fused is off.
-        # When fused is off, the per-request Python forward_npu path
-        # consumes its own per-req metadata inline, so positions_cmp_padding
-        # / start_pos / seqused are not needed on fm.
+        # Build only for non-chunked prefill; the fused compressor reads
+        # positions_cmp_padding / start_pos / seqused from fm. target_verify
+        # is excluded — NPU compress is fused-only now.
         if (
-            envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get()
-            and forward_batch.forward_mode.is_prefill()
+            forward_batch.forward_mode.is_prefill()
             and not forward_batch.forward_mode.is_target_verify()
             and self._dsv4_compress_ratios
         ):
@@ -1250,12 +1275,9 @@ class DeepseekV4AscendAttnBackend(
             cache=swa_k,
         )
 
-    # c4/c128 compressor + indexer entry points. ``forward_compress`` is a
-    # no-op on NPU (Compressor.forward_npu writes the pool inline rather than
-    # via the CUDA mixin set_extra_key_buffer chain).
-
-    def forward_compress(self, *args, **kwargs):  # type: ignore[override]
-        return None
+    # c4/c128 compressor + indexer entry points. On NPU ``forward_compress``
+    # runs the fused compressor inline (the CUDA mixin's set_extra_key_buffer
+    # chain has no NPU equivalent).
 
     def forward_core_compressor(  # type: ignore[override]
         self,
@@ -1267,12 +1289,147 @@ class DeepseekV4AscendAttnBackend(
         """Trigger the OUTER attention compressor on NPU.
 
         CUDA's ``forward_core_compressor`` does (compressor → set_extra_key_*).
-        On NPU, ``Compressor.forward_npu`` writes the KV pool inline, so we
-        just call the compressor.
+        On NPU, ``Compressor.forward`` delegates to ``forward_compress``
+        which writes the KV pool inline, so we just call the compressor.
         """
         if forward_batch.forward_mode.is_idle():
             return
         compressor(x, forward_batch)
+
+    def forward_compress(  # type: ignore[override]
+        self,
+        compressor,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Fused-op NPU compressor path, lowered from ``Compressor``.
+
+        A single ``torch.ops.custom.compressor`` call; the compressor's
+        weights / ape / fused caches are read through ``compressor`` (mirrors
+        ``C4Indexer.forward`` -> ``forward_c4_indexer``). State_cache writes
+        happen inside the op, so only the compressed-kv epilog
+        (:meth:`_compressor_epilog_npu`) runs on the returned tensor.
+        """
+        from sglang.srt.models.deepseek_v4 import get_fused_compressor_rope_cos_sin
+
+        ratio = compressor.ratio
+        coff = 1 + int(compressor.overlap)
+        device = x.device
+        self._ensure_compressor_hadamard(compressor, device)
+        self._ensure_fused_caches(compressor)
+
+        fm = forward_batch.attn_backend.forward_metadata
+        positions_cmp = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
+        page_table = getattr(fm, f"c{ratio}_state_page_table", None)
+        start_pos = getattr(fm, "start_pos", None)
+        seqused = getattr(fm, "seqused", None)
+        # cu_seqlens: prefix-sum query lengths with leading 0, [bs+1] int32.
+        cu_seqlens = getattr(fm, "actual_seq_lengths_q_pa", None)
+        assert positions_cmp is not None and page_table is not None, (
+            "fused compressor needs backend metadata "
+            "(positions_cmp_padding / c*_state_page_table) — make sure "
+            "_build_npu_compress_metadata ran before this forward."
+        )
+        assert start_pos is not None, "fused compressor needs start_pos"
+        assert cu_seqlens is not None, "fused compressor needs cu_seqlens"
+
+        # state_cache: fp32 [block_num, page_size, 2*coff*D].
+        pool = forward_batch.token_to_kv_pool
+        state_cache = pool.get_state_cache(compressor.layer_id, compressor.is_in_indexer)
+
+        cos, sin = get_fused_compressor_rope_cos_sin(
+            compressor.freqs_cis, positions_cmp, dtype=torch.float32
+        )
+
+        cmp_kv = torch.ops.custom.compressor(
+            x,
+            compressor._fused_wkv_w,
+            compressor._fused_wgate_w,
+            state_cache,
+            compressor.ape,
+            compressor._fused_norm_weight_fp32,
+            rope_sin=sin,
+            rope_cos=cos,
+            rope_head_dim=compressor.rope_head_dim,
+            cmp_ratio=ratio,
+            state_block_table=page_table,
+            cu_seqlens=cu_seqlens,
+            seqused=seqused,
+            start_pos=start_pos,
+            coff=coff,
+            norm_eps=compressor.norm.variance_epsilon,
+            rotary_mode=2,
+            cache_mode=1,
+        )
+
+        # cmp_kv shape: [min(T, T//ratio + B), head_dim]. For prefill the loc
+        # tensor may be shorter than the padded output; trim to len(loc).
+        loc = getattr(fm, f"c{ratio}_loc", None)
+        if loc is not None and loc.numel() < cmp_kv.shape[0]:
+            cmp_kv = cmp_kv[: loc.numel()]
+
+        if forward_batch.attn_backend.graph_mode or cmp_kv.shape[0] > 0:
+            if compressor.rotate:
+                cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
+            self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
+
+    def _ensure_compressor_hadamard(self, compressor, device: torch.device) -> None:
+        # Register the Walsh-Hadamard matrix on the compressor module (used to
+        # rotate cmp_kv after rope). Built lazily on first NPU forward.
+        if getattr(compressor, "hadamard_matrix", None) is None:
+            H = _walsh_hadamard_matrix(compressor.head_dim, torch.float32, device)
+            compressor.register_buffer("hadamard_matrix", H, persistent=False)
+
+    def _ensure_fused_caches(self, compressor) -> None:
+        """Build the per-instance views the fused compressor op needs.
+
+        Lazy because at __init__ time wkv_gate.weight is uninitialized and
+        norm.weight hasn't been loaded yet; first forward fires after weight
+        loading + device move, when these slices are stable.
+        """
+        if getattr(compressor, "_fused_wkv_w", None) is not None:
+            return
+        coff = 1 + int(compressor.overlap)
+        split = coff * compressor.head_dim
+        # wkv_gate.weight shape: [2*coff*head_dim, hidden_size]. Split row-wise.
+        w = compressor.wkv_gate.weight
+        assert w.shape[0] == 2 * split, (
+            f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2*split}"
+        )
+        compressor._fused_wkv_w = w[:split]
+        compressor._fused_wgate_w = w[split:]
+        compressor._fused_norm_weight_fp32 = compressor.norm.weight.to(torch.float32)
+
+    def _compressor_epilog_npu(
+        self,
+        compressor,
+        kv: torch.Tensor,
+        forward_batch: ForwardBatch,
+        override_loc: Optional[torch.Tensor] = None,
+    ) -> None:
+        # Quant + write — quant only when this is an indexer compressor with
+        # int8 li_kv. For the bf16 indexer / attention compressor branches,
+        # kv_scale is None.
+        kv_scale: Optional[torch.Tensor] = None
+        li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
+        if li_kv_dtype == "int8" and compressor.is_in_indexer:
+            import torch_npu  # local import: only available on NPU
+
+            kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
+            kv_scale = kv_scale.to(torch.float16)
+
+        if override_loc is not None:
+            loc = override_loc
+        else:
+            backend_fm = forward_batch.attn_backend.forward_metadata
+            loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
+        forward_batch.token_to_kv_pool.set_compress_buffer(
+            compressor.layer_id,
+            loc,
+            kv,
+            kv_scale,
+            compressor.is_in_indexer,
+        )
 
     def forward_c4_indexer_npu(
         self,

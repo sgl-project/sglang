@@ -613,7 +613,6 @@ class Envs:
     # DSV4-NPU fused compressor (torch.ops.custom.compressor). Off by default;
     # the per-request Python forward_npu fallback in dsv4/compressor.py
     # remains the verified path until validation closes Task #6.
-    SGLANG_DSV4_NPU_FUSED_COMPRESSOR = EnvBool(False)
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
