@@ -1667,6 +1667,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
     can_run_dp_cuda_graph: bool = False
+    can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
 
     # For processing logprobs
@@ -2457,10 +2458,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @property
     def is_spec_v2(self):
-        # FIXME: finally deprecate is_spec_v2
-        ret = self.enable_overlap and not self.spec_algorithm.is_none()
-        assert not ret or self.spec_algorithm.supports_spec_v2()
-        return ret
+        # Whether the V2 worker/schema is used. Independent of overlap: the
+        # non-overlap path also drives the V2 worker, just synchronously.
+        return self.spec_algorithm.supports_spec_v2()
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
@@ -2750,6 +2750,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
             is_prefill_only=self.is_prefill_only,

@@ -285,22 +285,22 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    spec_v1_reason = None
+    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
+    # path instead of the overlap-scheduled one; both run the V2 worker.
     if (
         not envs.SGLANG_ENABLE_SPEC_V2.get()
         and not server_args.disable_overlap_schedule
     ):
         server_args.disable_overlap_schedule = True
-        spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
 
     if server_args.disable_overlap_schedule:
         logger.warning(
-            "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
-            spec_v1_reason or "overlap schedule is disabled",
+            "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
+            "speculative decoding."
         )
     else:
         logger.warning(
-            "Spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
+            "Overlap spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
         )
 
     if server_args.enable_mixed_chunk:
