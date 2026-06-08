@@ -593,12 +593,28 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 
 ### `quark_mxfp4` online quantization method
 
-SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will quantize BF16 models weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and eventually MXFP4 GEMMs instead of BF16 GEMMs.
+SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 models weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and eventually MXFP4 GEMMs instead of BF16 GEMMs.
 
-Example:
+Example (BF16 to MXFP4 requantization):
 
 ```bash
 sglang serve --model-path Qwen/Qwen3-30B-A3B \
+    --tensor-parallel-size 1 \
+    --quantization quark_mxfp4
+```
+
+The option `--quantization quark_mxfp4` also supports converting FP8 dense and MOE models to MXFP4, following this logic:
+
+1. Load an FP8 weight tensor,
+2. Dequantize it to BF16,
+3. Requantize it to MXFP4
+
+progressively during weight loading.
+
+Example (FP8 to MXFP4 requantization):
+
+```bash
+sglang serve --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
     --tensor-parallel-size 1 \
     --quantization quark_mxfp4
 ```

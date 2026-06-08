@@ -459,10 +459,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     assert quant_config.activation_scheme == "dynamic"
                 elif hasattr(quant_config, "linear_activation_scheme"):
                     assert quant_config.linear_activation_scheme == "dynamic"
+                if use_mxfp8 and not is_checkpoint_fp8_serialized:
+                    raise ValueError(
+                        "MXFP8 requires fp8-serialized checkpoint for linear layers."
+                    )
 
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
-
                 scale = BlockQuantScaleParameter(
                     data=scale_init(
                         (output_size_per_partition + block_n - 1) // block_n,
