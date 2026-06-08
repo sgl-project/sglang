@@ -167,6 +167,10 @@ class SamplingParams:
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
+    progressive_mode: str = "fullres"
+    progressive_levels: int = 1
+    progressive_delta: float = 0.01
+
     # TeaCache parameters
     enable_teacache: bool = False
     teacache_params: Any = (
@@ -378,6 +382,28 @@ class SamplingParams:
                 raise ValueError(
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
+
+        if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
+            raise ValueError(
+                "progressive_mode must be one of 'fullres', 'dct', or "
+                f"'dct_rewind', got {self.progressive_mode!r}"
+            )
+        if (
+            isinstance(self.progressive_levels, bool)
+            or not isinstance(self.progressive_levels, int)
+            or self.progressive_levels <= 0
+        ):
+            raise ValueError(
+                f"progressive_levels must be a positive int, got {self.progressive_levels!r}"
+            )
+        if (
+            isinstance(self.progressive_delta, bool)
+            or not isinstance(self.progressive_delta, (int, float))
+            or not 0 < float(self.progressive_delta) < 1
+        ):
+            raise ValueError(
+                f"progressive_delta must be in (0, 1), got {self.progressive_delta!r}"
+            )
 
         # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
         # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
@@ -736,6 +762,28 @@ class SamplingParams:
             "--debug",
             action="store_true",
             help="",
+        )
+
+        # Progressive resolution growing (DCT spectral upsampling)
+        add_argument(
+            "--progressive-mode",
+            type=str,
+            dest="progressive_mode",
+            choices=["fullres", "dct", "dct_rewind"],
+            help="Progressive resolution mode. 'fullres' disables (default). "
+            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
+        )
+        add_argument(
+            "--progressive-levels",
+            type=int,
+            dest="progressive_levels",
+            help="Number of resolution halvings for progressive generation (default: 1).",
+        )
+        add_argument(
+            "--progressive-delta",
+            type=float,
+            dest="progressive_delta",
+            help="Noise-dominated tolerance δ for stage-transition thresholds (default: 0.01).",
         )
 
         add_argument(
