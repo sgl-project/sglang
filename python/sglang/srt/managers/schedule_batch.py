@@ -1062,9 +1062,9 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def get_full_untruncated_fill_ids(self) -> array:
-        if not self.output_ids and not self.is_dllm():
-            return self.origin_input_ids
-        ids = self.origin_input_ids + self.output_ids
+        ids = self.origin_input_ids
+        if self.output_ids:
+            ids = ids + self.output_ids
         if self.is_dllm():
             ids = ids + array(
                 "q", [self.dllm_config.mask_id] * self.dllm_config.block_size
