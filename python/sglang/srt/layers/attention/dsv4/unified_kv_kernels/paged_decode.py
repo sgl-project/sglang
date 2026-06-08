@@ -261,7 +261,9 @@ def _paged_decode_fused_kernel(
             # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
             # NUM_GROUPS-wide load per row.
             scales_full = tl.load(
-                kv_scales_ptr + slot_clamped[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr
+                + slot_clamped[:, None] * ks_stride_n
+                + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -416,7 +418,9 @@ def _paged_decode_split_kernel(
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr + slot_clamped[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr
+                + slot_clamped[:, None] * ks_stride_n
+                + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
