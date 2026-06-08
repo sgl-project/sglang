@@ -26,9 +26,15 @@ logger = logging.getLogger(__name__)
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+    next_token_ids: Optional[
+        Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
+    ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    # FDFO dLLM batching: per-request accepted block length (block_size when the
+    # block is resolved, else 0) and the algorithm state carried to the next round.
+    accept_length_per_req_cpu: Optional[List[int]] = None
+    dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and

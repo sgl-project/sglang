@@ -103,6 +103,69 @@ class SchedulerDllmMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    def process_batch_result_dllm_fdfo(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        if result.accept_length_per_req_cpu is None:
+            raise RuntimeError("FDFO dLLM result is missing accept lengths.")
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+        block_size = self.dllm_config.block_size
+        algo_states = result.dllm_algo_state
+
+        for idx in range(batch.batch_size()):
+            req = batch.reqs[idx]
+            next_token_ids = result.next_token_ids[idx]
+            assert len(next_token_ids) == block_size
+
+            if result.accept_length_per_req_cpu[idx] == 0:
+                # Incomplete block: carry it to the next round, free its mask KV.
+                req.dllm_incomplete_ids = array("q", next_token_ids)
+                req.dllm_algo_state = (
+                    algo_states[idx] if algo_states is not None else None
+                )
+                old_prefix_len = len(req.prefix_indices)
+                new_fill_len = len(req.fill_ids)
+                if new_fill_len > old_prefix_len:
+                    kv_indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, old_prefix_len:new_fill_len
+                    ]
+                    self.token_to_kv_pool_allocator.free(kv_indices_to_free)
+                continue
+
+            req.dllm_incomplete_ids = array("q")
+            req.dllm_algo_state = None
+            len_input = len(req.origin_input_ids)
+            len_fill = len(req.fill_ids)
+            if len_fill <= len_input:
+                continue
+
+            if len_fill - len(next_token_ids) < len_input:
+                next_token_ids = next_token_ids[len_input - len_fill :]
+
+            self.metrics_reporter.num_generated_tokens += len(next_token_ids)
+            req.output_ids.extend(next_token_ids)
+            req.update_finish_state(new_accepted_len=len(next_token_ids))
+
+            if req.finished():
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.set_completion_time()
+
+        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
+
+        self.metrics_reporter.report_prefill_stats(
+            batch=batch,
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=result.can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
+
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
         max_dllm_capacity = self.dllm_config.max_running_requests - len(
