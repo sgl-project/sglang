@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.triton_ops.metadata import (
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -2050,6 +2051,11 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
 
+                    assert_buffer_fits(
+                        max_seq_pages,
+                        metadata.page_table.shape[1],
+                        "FA3 draft-decode page_table",
+                    )
                     normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
@@ -2107,14 +2113,10 @@ class FlashAttentionBackend(AttentionBackend):
                         # most decode_length of the (decode_length + 1) expand page_table
                         # columns -- without this the extra distinct pages overflow the row.
                         cache_loc = cache_loc[:, :decode_length]
-                        assert (
-                            cache_loc.shape[1] <= metadata_expand.page_table.shape[1]
-                        ), (
-                            f"draft expand page_table too narrow: cache_loc width "
-                            f"{cache_loc.shape[1]} > "
-                            f"{metadata_expand.page_table.shape[1]} columns "
-                            f"(decode_length + 1); page_size={self.page_size}, "
-                            f"topk={self.topk}, num_steps={self.speculative_num_steps}"
+                        assert_buffer_fits(
+                            cache_loc.shape[1],
+                            metadata_expand.page_table.shape[1],
+                            "draft expand page_table (width decode_length + 1)",
                         )
                         draft_decode_set_expand_metadata(
                             cache_seqlens_int32=metadata_expand.cache_seqlens_int32,
@@ -2138,6 +2140,11 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
+                assert_buffer_fits(
+                    max_seq_pages,
+                    metadata.page_table.shape[1],
+                    "FA3 decode page_table",
+                )
                 normal_decode_set_metadata(
                     metadata.cache_seqlens_int32,
                     metadata.cu_seqlens_k,
@@ -2636,6 +2643,11 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if metadata_swa is None
             else metadata_swa.page_table
+        )
+        assert_buffer_fits(
+            metadata.max_seq_len_k + metadata_expand.page_table.shape[1],
+            page_table.shape[1],
+            "FA3 swa-spec page_table",
         )
 
         page_table_a = metadata.page_table
