@@ -769,6 +769,7 @@ class ServerArgs:
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
+    log_pcg_pad_stats: bool = False
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -6675,6 +6676,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.piecewise_cuda_graph_max_tokens,
             help="Set the maximum tokens when using piecewise cuda graph.",
+        )
+        parser.add_argument(
+            "--log-pcg-pad-stats",
+            action="store_true",
+            help="Log piecewise-cuda-graph padding statistics (raw vs padded "
+            "token counts, average and max pad ratio). Useful for tuning "
+            "--piecewise-cuda-graph-tokens to match your workload and avoid "
+            "wasted computation on padded tokens.",
         )
         parser.add_argument(
             "--torchao-config",

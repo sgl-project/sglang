@@ -227,6 +227,9 @@ class PiecewiseCudaGraphRunner:
         self.max_bs = model_runner.req_to_token_pool.size
 
         self.is_multimodal = model_runner.is_multimodal
+        self.num_deepstack_embeddings = int(
+            getattr(model_runner.model, "num_deepstack_embeddings", 0) or 0
+        )
         self.mamba_track_enabled = self.is_mamba_track_enabled()
         # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
         # CUDA graph capture must use the same flag value as replay for those models.
@@ -244,6 +247,7 @@ class PiecewiseCudaGraphRunner:
             is_multimodal=self.is_multimodal,
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
+            num_deepstack_embeddings=self.num_deepstack_embeddings,
             enable_mamba_track=self.mamba_track_enabled,
             share_pool=not is_npu(),
             source=None,
@@ -318,6 +322,25 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
+        # Optional padding statistics for PCG tuning. Enable via
+        # --log-pcg-pad-stats to get a running report of raw vs padded token
+        # counts and pad ratios. This helps tune --piecewise-cuda-graph-tokens
+        # to match the request distribution of a real workload and avoid
+        # wasted computation on padded tokens.
+        self._log_pad_stats: bool = getattr(
+            self.model_runner.server_args, "log_pcg_pad_stats", False
+        )
+        self._pad_stats_log_interval: int = 100
+        if self._log_pad_stats:
+            self._pad_stats = {
+                "total_raw": 0,
+                "total_padded": 0,
+                "count": 0,
+                "max_ratio": 1.0,
+            }
+        else:
+            self._pad_stats = None
+
     _aiter_chip_info_cached = False
 
     @classmethod
@@ -367,6 +390,13 @@ class PiecewiseCudaGraphRunner:
         input_embeds = (
             _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
+        input_deepstack_embeds = (
+            _slot("input_deepstack_embeds")
+            if registry.has_slot("input_deepstack_embeds")
+            else None
+        )
+        if input_deepstack_embeds is not None:
+            input_deepstack_embeds.zero_()
         mrope_positions = (
             _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
         )
@@ -389,6 +419,7 @@ class PiecewiseCudaGraphRunner:
                 batch_size=1,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
                 req_pool_indices=torch.arange(1, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -448,6 +479,36 @@ class PiecewiseCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    def _maybe_record_pad_stats(self, raw_num_tokens: int, padded_num_tokens: int):
+        """Accumulate PCG padding statistics and periodically log them.
+
+        Gated by ``--log-pcg-pad-stats``. Collects ``(raw_tokens, padded_tokens)``
+        pairs across replays so operators can see how much computation is
+        wasted on padded tokens and decide whether to tune
+        ``--piecewise-cuda-graph-tokens`` to better match their real workload.
+        Executed on the Python side (outside any compiled graph), so it is
+        safe w.r.t. dynamo / cudagraph capture.
+        """
+        if not self._log_pad_stats or self._pad_stats is None:
+            return
+        stats = self._pad_stats
+        stats["total_raw"] += raw_num_tokens
+        stats["total_padded"] += padded_num_tokens
+        stats["count"] += 1
+        ratio = padded_num_tokens / max(raw_num_tokens, 1)
+        if ratio > stats["max_ratio"]:
+            stats["max_ratio"] = ratio
+        if stats["count"] % self._pad_stats_log_interval == 0:
+            avg_ratio = stats["total_padded"] / max(stats["total_raw"], 1)
+            log_info_on_rank0(
+                logger,
+                f"[PCG pad stats] count={stats['count']} "
+                f"avg_pad_ratio={avg_ratio:.3f} "
+                f"max_pad_ratio={stats['max_ratio']:.3f} "
+                f"(raw_sum={stats['total_raw']} "
+                f"padded_sum={stats['total_padded']})",
+            )
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
@@ -466,7 +527,22 @@ class PiecewiseCudaGraphRunner:
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+        if (
+            self.num_deepstack_embeddings > 0
+            and not self.buffer_registry.has_slot("input_deepstack_embeds")
+        ):
+            return False
         num_tokens = len(forward_batch.input_ids)
+        if (
+            self.buffer_registry.has_slot("mrope_positions")
+            and forward_batch.mrope_positions is not None
+            and (
+                forward_batch.mrope_positions.ndim != 2
+                or forward_batch.mrope_positions.shape[0] != 3
+                or forward_batch.mrope_positions.shape[1] != num_tokens
+            )
+        ):
+            return False
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
@@ -527,6 +603,13 @@ class PiecewiseCudaGraphRunner:
         input_embeds = (
             _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
+        input_deepstack_embeds = (
+            _slot("input_deepstack_embeds")
+            if registry.has_slot("input_deepstack_embeds")
+            else None
+        )
+        if input_deepstack_embeds is not None:
+            input_deepstack_embeds.zero_()
         mrope_positions = (
             _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
         )
@@ -560,6 +643,7 @@ class PiecewiseCudaGraphRunner:
                 batch_size=bs,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
                 req_pool_indices=torch.arange(bs, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -623,6 +707,7 @@ class PiecewiseCudaGraphRunner:
                 set_is_extend_in_batch(False)
 
                 kwargs = {}
+
                 with set_forward_context(
                     forward_batch,
                     self.attention_layers,
@@ -692,6 +777,14 @@ class PiecewiseCudaGraphRunner:
         input_embeds = (
             _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
+        input_deepstack_embeds = (
+            _slot("input_deepstack_embeds")
+            if registry.has_slot("input_deepstack_embeds")
+            else None
+        )
+        if input_deepstack_embeds is not None:
+            input_deepstack_embeds.zero_()
+
         mrope_positions = (
             _slot("mrope_positions")
             if (
@@ -702,6 +795,8 @@ class PiecewiseCudaGraphRunner:
         )
 
         next_token_logits_buffer = None
+
+        self._maybe_record_pad_stats(num_tokens, static_num_tokens)
 
         # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1) doesn't fail on MIXED=3.
         pcg_forward_mode = (
@@ -720,6 +815,7 @@ class PiecewiseCudaGraphRunner:
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=next_token_logits_buffer,
