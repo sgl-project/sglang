@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -13,11 +12,9 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
-    CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
-    DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -31,11 +28,9 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqOutput,
-    GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
-    InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
@@ -47,11 +42,9 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
-    ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
-    ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
@@ -61,11 +54,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
-    UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -373,67 +363,6 @@ class TokenizerControlMixin:
         req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
         await self.expert_distribution_communicator(req)
 
-    @staticmethod
-    async def init_weights_update_group(
-        self: "WeightUpdaterController",
-        obj: InitWeightsUpdateGroupReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
-
-        results = await self.init_weights_update_group_communicator(obj)
-        return FanOutCommunicator.merge_results(results)
-
-    @staticmethod
-    async def destroy_weights_update_group(
-        self: "WeightUpdaterController",
-        obj: DestroyWeightsUpdateGroupReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
-
-        results = await self.destroy_weights_update_group_communicator(obj)
-        return FanOutCommunicator.merge_results(results)
-
-    @staticmethod
-    async def update_weights_from_distributed(
-        self: "WeightUpdaterController",
-        obj: UpdateWeightsFromDistributedReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
-
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
-        # Hold is_pause_cond while updating to prevent unpause from racing.
-        async with self.is_pause_cond:
-            is_paused = self.is_pause_getter()
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            WeightUpdaterController._update_weight_version_if_provided(
-                self, obj.weight_version
-            )
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
-
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
         obj: InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -461,76 +390,6 @@ class TokenizerControlMixin:
         ), "dp_size must be 1 for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
-
-    @staticmethod
-    async def update_weights_from_tensor(
-        self: "WeightUpdaterController",
-        obj: UpdateWeightsFromTensorReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
-
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
-        async with self.is_pause_cond:
-            is_paused = self.is_pause_getter()
-            if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            WeightUpdaterController._update_weight_version_if_provided(
-                self, obj.weight_version
-            )
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
-
-    @staticmethod
-    async def update_weights_from_ipc(
-        self: "WeightUpdaterController",
-        obj: UpdateWeightsFromIPCReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        """Update weights via IPC for checkpoint-engine integration."""
-        self.auto_create_handle_loop()
-        try:
-            # For now, we only support single data parallel instance
-            assert (
-                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
-            logger.info("Starting IPC weight update")
-
-            async with self.is_pause_cond:
-                is_paused = self.is_pause_getter()
-                if is_paused:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
-
-            if not is_paused:
-                async with self.model_update_lock.writer_lock:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
-        except Exception as e:
-            error_msg = f"IPC weight update failed: {str(e)}"
-            logger.error(error_msg)
-            success, message = False, error_msg
-
-        if success and obj.weight_version is not None:
-            WeightUpdaterController._update_weight_version_if_provided(
-                self, obj.weight_version
-            )
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
@@ -731,62 +590,6 @@ class TokenizerControlMixin:
                 return await self._unload_lora_adapter_locked(obj)
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
-
-    @staticmethod
-    async def get_weights_by_name(
-        self: "WeightUpdaterController",
-        obj: GetWeightsByNameReqInput,
-        request: Optional[fastapi.Request] = None,
-    ):
-        self.auto_create_handle_loop()
-        results = await self.get_weights_by_name_communicator(obj)
-        all_parameters = [r.parameter for r in results]
-        if self.server_args.dp_size == 1:
-            return all_parameters[0]
-        else:
-            return all_parameters
-
-    @staticmethod
-    async def release_memory_occupation(
-        self: "WeightUpdaterController",
-        obj: ReleaseMemoryOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
-    ):
-        self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
-
-    @staticmethod
-    async def resume_memory_occupation(
-        self: "WeightUpdaterController",
-        obj: ResumeMemoryOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
-    ):
-        self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
-
-    @staticmethod
-    async def check_weights(
-        self: "WeightUpdaterController",
-        obj: CheckWeightsReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str, Optional[List[Dict]], Optional[str]]:
-        self.auto_create_handle_loop()
-        results = await self.check_weights_communicator(obj)
-        success, message = FanOutCommunicator.merge_results(results)
-        ranks: Optional[List[Dict]] = None
-        per_engine_checksum: Optional[str] = None
-        if any(r.payload is not None for r in results):
-            ranks = []
-            for r in results:
-                if isinstance(r.payload, list):
-                    ranks.extend(r.payload)
-                else:
-                    ranks.append(r.payload)
-            h = hashlib.sha256()
-            for rank in ranks:
-                h.update(rank["per_gpu_checksum"].encode())
-            per_engine_checksum = h.hexdigest()
-        return success, message, ranks, per_engine_checksum
 
     async def slow_down(
         self: TokenizerManager,
