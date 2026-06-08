@@ -3202,21 +3202,19 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
 
 
 def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
-    """Best-effort deregistration of this encoder from all bootstrap servers.
-
-    Called via ``atexit`` so that graceful shutdown removes stale URLs
-    immediately instead of waiting for health-check eviction.
-    """
-    encoder_url = _encoder_url_for_registration(server_args)
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
     payload = {"url": encoder_url}
-    timeout = 5.0
 
     for bootstrap_url in server_args.encoder_register_urls:
         try:
             resp = http_requests.delete(
                 f"{bootstrap_url}/unregister_encoder_url",
                 json=payload,
-                timeout=timeout,
+                timeout=2.0,
             )
             if resp.status_code == 200:
                 logger.info(
