@@ -184,7 +184,7 @@ class BenchArgs:
             help=(
                 "Progressive resolution mode. 'fullres' disables (default). "
                 "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended). "
-                "Only supported for FLUX.1 models."
+                "Supported for FLUX.1, FLUX.2, Z-Image, Wan T2V, and Qwen-Image."
             ),
         )
         parser.add_argument(
