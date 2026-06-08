@@ -1,9 +1,9 @@
 ---
 title: "Progressive Resolution Generation"
-description: "Speed up FLUX.1, FLUX.2, and Wan T2V generation up to 2.78× with spectral progressive resolution growing."
+description: "Speed up FLUX.1, FLUX.2, Wan T2V, and Qwen-Image generation up to 2.78× with spectral progressive resolution growing."
 ---
 
-Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, and **2.78× speedup on Wan 2.1 T2V** with no perceptible quality loss.
+Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, **2.78× speedup on Wan 2.1 T2V**, and **1.69× speedup on Qwen-Image** with no perceptible quality loss.
 
 Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736).
 
@@ -195,6 +195,31 @@ result = gen.generate(sampling_params_kwargs={
 ```
 
 ---
+
+## Qwen-Image
+
+Qwen-Image uses the same 2×2 patchify convention as FLUX.1 (in_channels=64, C=16), so the same progressive stage wires in with model-specific hooks for RoPE (`freqs_cis`) and spatial metadata (`img_shapes`).
+
+```bash
+# Standard fullres — unchanged behavior
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A serene mountain lake at golden hour"
+
+# Progressive dct_rewind L1 δ=0.20 → 1.69× denoising speedup
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A serene mountain lake at golden hour" \
+    --progressive-mode dct_rewind --progressive-levels 1 --progressive-delta 0.20 \
+    --num-inference-steps 30 --dit-cpu-offload false
+```
+
+Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop only.
+
+| Config | Stage split | Denoise | Speedup |
+|--------|-------------|---------|---------|
+| Fullres (baseline) | 30 @ 128² | 43.00 s | 1.00× |
+| dct_rewind L1 δ=0.05 | 13@64² + 17@128² | 33.25 s | **1.29×** |
+| dct_rewind L1 δ=0.10 | 16@64² + 14@128² | 33.86 s | **1.27×** |
+| dct_rewind L1 δ=0.20 | 19@64² + 11@128² | 25.40 s | **1.69×** |
 
 ## Limitations
 
