@@ -69,6 +69,10 @@ from sglang.srt.managers.tokenizer_manager_components import (
     request_tracing,
     spec_decoding_meta,
 )
+from sglang.srt.managers.tokenizer_manager_components.corpus_controller import (
+    CorpusController,
+    CorpusControllerConfig,
+)
 from sglang.srt.managers.tokenizer_manager_components.lora_controller import (
     LoraController,
 )
@@ -200,6 +204,8 @@ class TokenizerManager(TokenizerControlMixin):
         self.init_tokenized_request_builder()
 
         self.init_request_metrics_recorder()
+
+        self.init_corpus_controller()
 
         self.init_session_controller()
 
@@ -363,6 +369,16 @@ class TokenizerManager(TokenizerControlMixin):
             get_disaggregation_mode=lambda: self.disaggregation_mode,
         )
 
+    def init_corpus_controller(self):
+        self.corpus_controller = CorpusController(
+            tokenizer=self.tokenizer,
+            config=CorpusControllerConfig(
+                speculative_algorithm=self.server_args.speculative_algorithm or "",
+                max_external_corpus_tokens=self.server_args.speculative_ngram_external_corpus_max_tokens,
+            ),
+            auto_create_handle_loop=self.auto_create_handle_loop,
+        )
+
     def init_session_controller(self):
         self.session_controller = SessionController(
             send_to_scheduler=self.send_to_scheduler,
@@ -442,6 +458,15 @@ class TokenizerManager(TokenizerControlMixin):
             ]
         )
         self.init_communicators(self.server_args)
+        self.corpus_controller.add_external_corpus_communicator = (
+            self.add_external_corpus_communicator
+        )
+        self.corpus_controller.remove_external_corpus_communicator = (
+            self.remove_external_corpus_communicator
+        )
+        self.corpus_controller.list_external_corpora_communicator = (
+            self.list_external_corpora_communicator
+        )
         self.lora_controller.update_lora_adapter_communicator = (
             self.update_lora_adapter_communicator
         )
