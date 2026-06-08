@@ -9,25 +9,6 @@ from sglang.srt.environ import envs
 
 _PR_REVERT_YAML_25015 = """
 patches:
-  - target: sglang.srt.speculative.eagle_worker.EAGLEWorker.draft_forward
-    edits:
-      - match: |
-          forward_batch.out_cache_loc = out_cache_loc[i]
-          spec_info.hidden_states = hidden_states
-        replacement: |
-          forward_batch.out_cache_loc = out_cache_loc[i]
-          forward_batch.positions.add_(1)
-          spec_info.hidden_states = hidden_states
-      - match: |
-          hidden_states = logits_output.hidden_states
-          maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
-          maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
-          forward_batch.positions.add_(1)
-        replacement: |
-          hidden_states = logits_output.hidden_states
-          maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
-          maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
-
   - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward
     edits:
       - match: |
