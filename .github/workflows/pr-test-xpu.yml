@@ -77,6 +77,15 @@ jobs:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
     steps:
+      - name: Reset workspace ownership
+        run: |
+          # Prior runs install sglang as root inside the CI container against
+          # the bind-mounted workspace, leaving root-owned egg-info on the host.
+          # actions/checkout's pre-clean step can't unlink those as the runner
+          # user, so reset ownership before checkout runs.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
