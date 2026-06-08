@@ -192,7 +192,7 @@ class DeviceMixin:
     # ---- Distributed ----
 
     def get_torch_distributed_backend_str(self) -> str:
-        """[Planned] Return the torch.distributed backend string (e.g. "nccl", "hccl")."""
+        """Return the torch.distributed backend string (e.g. "nccl", "hccl")."""
         raise NotImplementedError
 
     def get_communicator_class(self) -> type | None:

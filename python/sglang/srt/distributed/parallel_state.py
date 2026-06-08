@@ -46,6 +46,7 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -1692,7 +1693,10 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
 
 
 def get_default_distributed_backend(device: str) -> str:
-    return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
+    if current_platform.is_out_of_tree():
+        return current_platform.get_torch_distributed_backend_str()
+    else:
+        return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
 def _create_global_tcp_store(rank: int, world_size: int) -> None:
