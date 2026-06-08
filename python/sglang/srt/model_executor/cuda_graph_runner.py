@@ -537,6 +537,13 @@ class CudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        # NOTE: SUFFIX (V1 + V2) intentionally captures in NULL hidden mode.
+        # It is model-free and never consumes target hidden states: V1 uses
+        # NgramVerifyInput (no capture_hidden_mode, requests NULL); V2's
+        # prepare_for_v2_verify now requests NULL for is_suffix() too (see
+        # eagle_info_v2). Capturing NULL here lets both hit the cuda graph
+        # without allocating the unused FULL hidden-state buffers.
+
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
