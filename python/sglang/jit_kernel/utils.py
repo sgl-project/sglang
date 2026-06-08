@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
 import pathlib
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -63,6 +65,36 @@ def cache_once(fn: F) -> F:
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+
+
+_LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+
+
+def _local_jit_source_hash(source_files: List[str]) -> str:
+    """Hash JIT source contents so TVM-FFI cache keys track included headers."""
+    digest = hashlib.sha256()
+    seen: set[pathlib.Path] = set()
+    stack = [pathlib.Path(path).resolve() for path in source_files]
+
+    while stack:
+        path = stack.pop()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+
+        data = path.read_bytes()
+        digest.update(str(path).encode())
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+
+        text = data.decode("utf-8", errors="ignore")
+        for include in _LOCAL_INCLUDE_RE.findall(text):
+            include_path = (path.parent / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+
+    return digest.hexdigest()[:16]
 
 
 @cache_once
@@ -201,6 +233,8 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    if cpp_files or cuda_files:
+        module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []

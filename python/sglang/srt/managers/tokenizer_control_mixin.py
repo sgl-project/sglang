@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
@@ -757,14 +758,24 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str, Optional[List[Dict]]]:
+    ) -> Tuple[bool, str, Optional[List[Dict]], Optional[str]]:
         self.auto_create_handle_loop()
         results = await self.check_weights_communicator(obj)
         success, message = FanOutCommunicator.merge_results(results)
         ranks: Optional[List[Dict]] = None
+        per_engine_checksum: Optional[str] = None
         if any(r.payload is not None for r in results):
-            ranks = [r.payload for r in results]
-        return success, message, ranks
+            ranks = []
+            for r in results:
+                if isinstance(r.payload, list):
+                    ranks.extend(r.payload)
+                else:
+                    ranks.append(r.payload)
+            h = hashlib.sha256()
+            for rank in ranks:
+                h.update(rank["per_gpu_checksum"].encode())
+            per_engine_checksum = h.hexdigest()
+        return success, message, ranks, per_engine_checksum
 
     async def slow_down(
         self: TokenizerManager,

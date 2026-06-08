@@ -1227,7 +1227,7 @@ def tensor_hash(tensor_list) -> int:
         hasher = hashlib.sha256()
         for t in tensors:
             t = t.detach().contiguous()
-            hasher.update(memoryview(t.view(torch.uint8).numpy()))
+            hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
@@ -1236,7 +1236,7 @@ def tensor_hash(tensor_list) -> int:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
     hasher = hashlib.sha256()
-    hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
+    hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
