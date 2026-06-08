@@ -671,5 +671,119 @@ class TestFlux2ProgressiveStage(unittest.TestCase):
         self.assertEqual(int(w_coords.max()), 3)  # 0..W-1 = 0..3
 
 
+# ZImageProgressiveDenoisingStage pack/unpack unit tests (no GPU / no model)
+# ---------------------------------------------------------------------------
+
+
+class TestZImagePackUnpack(unittest.TestCase):
+    """Verify Z-Image latent pack/unpack helpers are correct without a live model."""
+
+    def _import_helpers(self):
+        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+            _zimage_repack,
+            _zimage_unpack,
+        )
+
+        return _zimage_unpack, _zimage_repack
+
+    def test_unpack_removes_frame_dim(self):
+        unpack, _ = self._import_helpers()
+        latent = torch.randn(1, 16, 1, 64, 64)
+        out = unpack(latent, 64, 64)
+        self.assertEqual(out.shape, (1, 16, 64, 64))
+
+    def test_repack_adds_frame_dim(self):
+        _, repack = self._import_helpers()
+        x = torch.randn(1, 16, 64, 64)
+        out = repack(x, 64, 64)
+        self.assertEqual(out.shape, (1, 16, 1, 64, 64))
+
+    def test_roundtrip_identity(self):
+        unpack, repack = self._import_helpers()
+        latent = torch.randn(1, 16, 1, 32, 32)
+        reconstructed = repack(unpack(latent, 32, 32), 32, 32)
+        torch.testing.assert_close(reconstructed, latent)
+
+    def test_unpack_preserves_dtype(self):
+        unpack, _ = self._import_helpers()
+        for dtype in [torch.float32, torch.bfloat16]:
+            with self.subTest(dtype=dtype):
+                latent = torch.randn(1, 16, 1, 16, 16, dtype=dtype)
+                out = unpack(latent, 16, 16)
+                self.assertEqual(out.dtype, dtype)
+
+    def test_repack_preserves_dtype(self):
+        _, repack = self._import_helpers()
+        for dtype in [torch.float32, torch.bfloat16]:
+            with self.subTest(dtype=dtype):
+                x = torch.randn(1, 16, 16, 16, dtype=dtype)
+                out = repack(x, 16, 16)
+                self.assertEqual(out.dtype, dtype)
+
+    def test_unpack_is_contiguous_squeeze(self):
+        """squeeze(2) on a (1,16,1,H,W) tensor gives (1,16,H,W) sharing storage."""
+        unpack, _ = self._import_helpers()
+        latent = torch.randn(1, 16, 1, 8, 8)
+        out = unpack(latent, 8, 8)
+        self.assertEqual(out.shape, (1, 16, 8, 8))
+        # values must match the original spatial slice
+        torch.testing.assert_close(out, latent[:, :, 0, :, :])
+
+    def test_zimage_spectrum_constants_match_flux(self):
+        """Z-Image uses the same VAE as FLUX, so spectrum constants must be identical."""
+        from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+            FLUX_SPECTRUM_A,
+            FLUX_SPECTRUM_BETA,
+        )
+        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+            ZIMAGE_SPECTRUM_A,
+            ZIMAGE_SPECTRUM_BETA,
+        )
+
+        self.assertAlmostEqual(ZIMAGE_SPECTRUM_A, FLUX_SPECTRUM_A, places=4)
+        self.assertAlmostEqual(ZIMAGE_SPECTRUM_BETA, FLUX_SPECTRUM_BETA, places=4)
+
+    def test_zimage_spectrum_constants_plausible(self):
+        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+            ZIMAGE_SPECTRUM_A,
+            ZIMAGE_SPECTRUM_BETA,
+        )
+
+        self.assertGreater(ZIMAGE_SPECTRUM_A, 0.0)
+        self.assertGreater(ZIMAGE_SPECTRUM_BETA, 1.0)
+        self.assertLess(ZIMAGE_SPECTRUM_BETA, 4.0)
+
+    def test_stage_transitions_with_zimage_constants(self):
+        """Stage transitions computed with Z-Image constants should match FLUX exactly."""
+        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+            ZIMAGE_SPECTRUM_A,
+            ZIMAGE_SPECTRUM_BETA,
+        )
+
+        zi = compute_stage_transitions(
+            delta=0.01,
+            n_levels=1,
+            A=ZIMAGE_SPECTRUM_A,
+            beta=ZIMAGE_SPECTRUM_BETA,
+            H_lat=128,
+            W_lat=128,
+        )
+        from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+            FLUX_SPECTRUM_A,
+            FLUX_SPECTRUM_BETA,
+        )
+
+        flux = compute_stage_transitions(
+            delta=0.01,
+            n_levels=1,
+            A=FLUX_SPECTRUM_A,
+            beta=FLUX_SPECTRUM_BETA,
+            H_lat=128,
+            W_lat=128,
+        )
+        self.assertAlmostEqual(zi[1], flux[1], places=6)
+        self.assertAlmostEqual(zi[2], flux[2], places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
