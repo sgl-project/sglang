@@ -131,9 +131,13 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        num_padding = torch.count_nonzero(
-            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-        )
+        # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
+        if seq_lens_cpu is None:
+            num_padding = 0
+        else:
+            num_padding = torch.count_nonzero(
+                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+            )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)

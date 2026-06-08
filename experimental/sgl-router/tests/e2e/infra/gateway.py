@@ -1,23 +1,22 @@
-"""Minimal sgl-router Gateway class — adapted from SMG's e2e_test/infra/gateway.py.
+"""Minimal sgl-router Gateway class for e2e tests.
 
-Differences from SMG:
-  - SMG drives a Python launcher (`python3 -m sglang_router.launch_router`)
-    with worker URLs on the CLI.
-  - sgl-router uses a Rust binary (`experimental/sgl-router/target/release/sgl-router`)
-    with a TOML config file. Worker discovery is config-file-based; this
-    Gateway writes a TOML to a tempfile and execs the binary with
-    `--config <tempfile>`.
+sgl-router is a Rust binary
+(`experimental/sgl-router/target/release/sgl-router`) configured entirely
+through CLI flags. This Gateway execs the binary with `--worker-urls <...>`
+(static discovery) plus the model + policy flags.
 
 Supported lifecycles:
   - Regular mode: one model, N worker URLs, single policy.
-  - PD mode: one model, prefill_workers + decode_workers (lists of URLs),
-    discovery emits separate `WorkerMode::Prefill` / `WorkerMode::Decode`
-    entries. The router resolves PD pool isolation at request time.
+  - PD mode: one model; prefill + decode URLs all go into one
+    `--worker-urls` static list. Each worker is seeded as
+    `WorkerMode::Plain` and its actual prefill/decode role + bootstrap
+    port are resolved from `/server_info` introspection, after which the
+    router isolates the PD pools at request time.
 
 Use as a context manager:
 
     with Gateway() as gw:
-        gw.start_regular(model_path="...", worker_urls=[...])
+        gw.start_regular(model_id="...", tokenizer_path="...", worker_urls=[...])
         resp = httpx.post(f"{gw.base_url}/v1/chat/completions", json=...)
 
 or pytest fixture style (see e2e_test/conftest.py).
@@ -30,7 +29,6 @@ import os
 import signal
 import socket
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,8 +91,11 @@ def _resolve_tokenizer_path(tokenizer_path: str) -> str:
         cached = try_to_load_from_cache(tokenizer_path, "tokenizer.json")
         if cached and Path(cached).is_file():
             return str(cached)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # A cache miss is normal; log other failures (corrupt cache,
+        # signature change) so a later tokenizer-load error is traceable
+        # rather than mysterious.
+        logger.debug("HF tokenizer cache lookup failed for %r: %s", tokenizer_path, exc)
     return tokenizer_path
 
 
@@ -150,7 +151,6 @@ class Gateway:
         self.stale_request_timeout_secs = stale_request_timeout_secs
 
         self.process: subprocess.Popen | None = None
-        self._config_path: Path | None = None
         self._started: bool = False
         # Track child workers we spawned so __exit__ can tear them down.
         self._owned_workers: list[subprocess.Popen] = []
@@ -172,7 +172,6 @@ class Gateway:
         tokenizer_path: str,
         worker_urls: list[str],
         policy: str = "round_robin",
-        extra_models: list[dict] | None = None,
         timeout: float = 60.0,
     ) -> None:
         """Start the router in regular (non-PD) mode.
@@ -190,12 +189,11 @@ class Gateway:
             timeout: How long to wait for ``/readyz`` before giving up.
         """
         self._launch(
-            self._build_config(
+            self._build_args(
                 model_id=model_id,
                 tokenizer_path=tokenizer_path,
                 urls=list(worker_urls),
                 policy=policy,
-                extra_models=extra_models or [],
             ),
             timeout=timeout,
         )
@@ -222,12 +220,11 @@ class Gateway:
         assumed.
         """
         self._launch(
-            self._build_config(
+            self._build_args(
                 model_id=model_id,
                 tokenizer_path=tokenizer_path,
                 urls=list(prefill_urls) + list(decode_urls),
                 policy=policy,
-                extra_models=[],
             ),
             timeout=timeout,
         )
@@ -247,9 +244,6 @@ class Gateway:
             except ProcessLookupError:
                 pass
         self.process = None
-        if self._config_path and self._config_path.exists():
-            self._config_path.unlink(missing_ok=True)
-        self._config_path = None
         self._started = False
         # Tear down any owned upstream workers.
         for w in self._owned_workers:
@@ -292,77 +286,53 @@ class Gateway:
 
     # ----- internals ------------------------------------------------------
 
-    def _build_config(
+    def _build_args(
         self,
         *,
         model_id: str,
         tokenizer_path: str,
         urls: list[str],
         policy: str,
-        extra_models: list[dict],
-    ) -> str:
+    ) -> list[str]:
         resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
-        extra_model_toml = ""
-        for em in extra_models:
-            extra_model_toml += (
-                f'\n[[models]]\nid = "{em["id"]}"\n'
-                f'tokenizer_path = "{_resolve_tokenizer_path(em["tokenizer_path"])}"\n'
-                f'policy = "{em.get("policy", policy)}"\n'
-            )
-
-        # Optional tunables — only emit the [proxy] and [active_load]
-        # sections if a test has overridden them, so production defaults
-        # apply otherwise.
-        proxy_section = ""
+        args = [
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--model-id",
+            model_id,
+            "--tokenizer-path",
+            resolved_tokenizer,
+            "--policy",
+            policy,
+        ]
+        # Optional tunables — only pass them if a test overrode them, so
+        # the router's production defaults apply otherwise.
         if self.proxy_request_timeout_secs is not None:
-            proxy_section = (
-                f"\n[proxy]\nrequest_timeout_secs = {self.proxy_request_timeout_secs}\n"
-            )
-        active_load_section = ""
+            args += ["--request-timeout-secs", str(self.proxy_request_timeout_secs)]
         if self.stale_request_timeout_secs is not None:
-            active_load_section = (
-                f"\n[active_load]\nstale_request_timeout_secs = "
-                f"{self.stale_request_timeout_secs}\n"
-            )
+            args += [
+                "--stale-request-timeout-secs",
+                str(self.stale_request_timeout_secs),
+            ]
+        # `--worker-urls` is multi-valued; keep it last so clap doesn't
+        # absorb a following flag as a URL.
+        args += ["--worker-urls", *urls]
+        return args
 
-        urls_toml = ", ".join(f'"{u}"' for u in urls)
-
-        return f"""\
-[server]
-host = "{self.host}"
-port = {self.port}
-
-[[models]]
-id = "{model_id}"
-tokenizer_path = "{resolved_tokenizer}"
-policy = "{policy}"
-{extra_model_toml}
-
-[discovery]
-backend = "static_urls"
-
-[discovery.static_urls]
-urls = [{urls_toml}]
-{proxy_section}{active_load_section}"""
-
-    def _launch(self, config_text: str, *, timeout: float) -> None:
+    def _launch(self, args: list[str], *, timeout: float) -> None:
         if not self.binary.exists():
             raise RuntimeError(
                 f"sgl-router binary not found at {self.binary}. "
                 "Build it first: `cd experimental/sgl-router && cargo build --release` "
                 "or set SGL_ROUTER_BINARY to the binary path."
             )
-        # Write the main config.
-        fd, path = tempfile.mkstemp(suffix=".toml", prefix="sgl-router-")
-        os.close(fd)
-        self._config_path = Path(path)
-        self._config_path.write_text(config_text, encoding="utf-8")
-        logger.info("sgl-router config: %s", self._config_path)
-        logger.debug("sgl-router config text:\n%s", config_text)
+        logger.info("sgl-router args: %s", args)
 
         self.process = subprocess.Popen(
-            [str(self.binary), "--config", str(self._config_path)],
+            [str(self.binary), *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -380,16 +350,19 @@ urls = [{urls_toml}]
         last_exc: Exception | None = None
         while time.time() < deadline:
             if self.process is not None and self.process.poll() is not None:
-                # Process exited early — surface stdout/stderr.
-                out = b""
+                # Process exited early — surface stdout/stderr. This is the
+                # primary startup-failure diagnostic, so if the read itself
+                # fails, report that instead of blanking the output.
                 try:
+                    out = b""
                     if self.process.stdout is not None:
                         out = self.process.stdout.read() or b""
-                except Exception:  # noqa: BLE001
-                    pass
+                    output = out.decode(errors="replace")
+                except Exception as read_exc:  # noqa: BLE001
+                    output = f"<failed to read router stdout: {read_exc}>"
                 raise RuntimeError(
                     f"sgl-router exited during startup with code "
-                    f"{self.process.returncode}. output:\n{out.decode(errors='replace')}",
+                    f"{self.process.returncode}. output:\n{output}",
                 )
             try:
                 resp = httpx.get(f"{self.base_url}/readyz", timeout=2.0)

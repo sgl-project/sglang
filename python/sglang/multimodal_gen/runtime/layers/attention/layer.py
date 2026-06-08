@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     wrap_attention_impl_forward,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
+    async_a2a_communicate,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
@@ -385,6 +388,8 @@ class USPAttention(nn.Module):
     and Ring Attention for fine-grained sequence parallelism within subgroups.
     """
 
+    _usp_a2a_stream = None
+
     def __init__(
         self,
         num_heads: int,
@@ -451,6 +456,11 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+
+    def _get_usp_a2a_stream(self):
+        if USPAttention._usp_a2a_stream is None:
+            USPAttention._usp_a2a_stream = torch.get_device_module().Stream()
+        return USPAttention._usp_a2a_stream
 
     def forward(
         self,
@@ -816,9 +826,21 @@ class USPAttention(nn.Module):
         """split form avoids materializing full K/V before Ulysses all-to-all"""
         sp_rank = get_sp_parallel_rank()
 
-        q = _usp_input_all_to_all(q, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        if q.device.type == "cuda":
+            q, k_shard, v_shard = async_a2a_communicate(
+                [q, k_shard, v_shard],
+                get_ulysses_parallel_world_size(),
+                get_sp_group().ulysses_group,
+                self._get_usp_a2a_stream(),
+                local_seq_2_local_head=True,
+            )
+            q = q.contiguous()
+            k_shard = k_shard.contiguous()
+            v_shard = v_shard.contiguous()
+        else:
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+            v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
         h_kv_local = k_shard.shape[2]
         h_start = sp_rank * h_kv_local
