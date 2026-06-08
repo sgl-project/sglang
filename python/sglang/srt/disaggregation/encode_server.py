@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
-import requests as http_requests
+import requests
 import torch
 import uvicorn
 import zmq
@@ -3141,7 +3141,11 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     instead of serialising sleeps in a single thread.
     """
 
-    encoder_url = server_args.url()
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
     payload = {"url": encoder_url}
     bootstrap_urls = list(server_args.encoder_register_urls)
     if not bootstrap_urls:
@@ -3153,7 +3157,7 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
 
     def _try_register_once(bootstrap_url: str) -> bool:
         try:
-            resp = http_requests.post(
+            resp = requests.post(
                 f"{bootstrap_url}/register_encoder_url",
                 json=payload,
                 timeout=request_timeout,
