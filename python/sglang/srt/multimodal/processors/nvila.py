@@ -55,7 +55,7 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
         request_obj: GenerateReqInput,
         **kwargs,
     ) -> dict[str, Any] | None:
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
             image_data=request_obj.image_data,  # type: ignore

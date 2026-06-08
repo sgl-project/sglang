@@ -118,18 +118,28 @@ def compare_kl_divergence(
 
 
 # Common request helpers
-def _flush_cache(base_url):
-    requests.post(base_url + "/flush_cache")
+def _flush_cache(base_url, timeout_s=30):
+    response = requests.post(
+        base_url + "/flush_cache",
+        params={"timeout": timeout_s},
+        timeout=timeout_s + 10,
+    )
+    response.raise_for_status()
 
 
 def _generate(
-    base_url, input_ids, max_new_tokens, return_logprob=False, logprob_start_len=-1
+    base_url,
+    input_ids,
+    max_new_tokens,
+    return_logprob=False,
+    logprob_start_len=-1,
+    temperature=0.0,
 ):
     """Send generate request and return results."""
     json_data = {
         "input_ids": input_ids,
         "sampling_params": {
-            "temperature": 1,
+            "temperature": temperature,
             "max_new_tokens": max_new_tokens,
             "ignore_eos": True,
         },
@@ -146,7 +156,7 @@ def _generate(
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
+def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.0):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
@@ -155,6 +165,7 @@ def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
         max_new_tokens=0,
         return_logprob=True,
         logprob_start_len=0,
+        temperature=temperature,
     )
     assert len(results) == len(new_input_ids)
 
@@ -242,9 +253,10 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         new_input_ids.append(input_ids[i] + result["output_ids"])
         output_logprobs.append(_extract_output_logprobs(result))
 
-    assert len(new_input_ids) > 0.5 * len(
-        input_ids
-    ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
+    if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
+        assert len(new_input_ids) > 0.5 * len(
+            input_ids
+        ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
@@ -310,9 +322,10 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         new_input_ids.append(second_turn_input_ids[i] + result["output_ids"])
         output_logprobs.append(_extract_output_logprobs(result))
 
-    assert len(new_input_ids) > 0.5 * len(
-        second_turn_input_ids
-    ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
+    if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
+        assert len(new_input_ids) > 0.5 * len(
+            second_turn_input_ids
+        ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)

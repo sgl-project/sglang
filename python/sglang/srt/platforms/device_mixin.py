@@ -26,10 +26,11 @@ Method status annotations:
 """
 
 import enum
-from typing import TYPE_CHECKING, NamedTuple, Optional
+import random
+from typing import NamedTuple, Optional
 
-if TYPE_CHECKING:
-    import torch
+import numpy as np
+import torch
 
 
 class PlatformEnum(enum.Enum):
@@ -154,8 +155,8 @@ class DeviceMixin:
 
     # ---- Device management ----
 
-    def get_device(self, local_rank: int) -> "torch.device":
-        """[Planned] Return ``torch.device`` for the given local rank."""
+    def get_device(self, device_id: int = 0) -> str:
+        """[Planned] Return ``torch.device`` for the given device id."""
         raise NotImplementedError
 
     def set_device(self, device: "torch.device") -> None:
@@ -203,19 +204,12 @@ class DeviceMixin:
     @classmethod
     def inference_mode(cls):
         """[Planned] Return inference mode context manager."""
-        import torch
-
         return torch.inference_mode(mode=True)
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
         """[Planned] Set random seeds for reproducibility across all libraries."""
         if seed is not None:
-            import random
-
-            import numpy as np
-            import torch
-
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)

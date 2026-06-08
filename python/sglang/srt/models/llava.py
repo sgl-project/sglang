@@ -13,8 +13,11 @@
 # ==============================================================================
 """Inference-only LLaVa model compatible with HuggingFace weights."""
 
+from __future__ import annotations
+
 import math
 import re
+from array import array
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple, Type, Union
 
@@ -73,7 +76,9 @@ class LlavaBaseForCausalLM(nn.Module):
             return "pad"
         return "anyres"
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], image_inputs: MultimodalInputs
+    ) -> array[int]:
         image_sizes = flatten_nested_list(
             [item.image_sizes for item in image_inputs.mm_items]
         )
@@ -125,9 +130,10 @@ class LlavaBaseForCausalLM(nn.Module):
             except ValueError:
                 offset = 0
             # old_len + pad_len - 1, because we need to remove image_token_id
+            pad_token = pad_values[image_idx % len(pad_values)]
             input_ids = (
                 input_ids[:offset]
-                + [pad_values[image_idx % len(pad_values)]] * new_image_feature_len
+                + array("q", [pad_token]) * new_image_feature_len
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)
@@ -452,6 +458,15 @@ class LlavaBaseForCausalLM(nn.Module):
             )
         elif forward_batch.forward_mode.is_decode():
             return self.language_model(input_ids, positions, forward_batch)
+
+    def get_embed_and_head(self):
+        # Spec-decode plumbing: expose the LM's embed/head so the EAGLE draft
+        # can share them with the target. self.language_model is a Llama-family
+        # CausalLM that defines this method.
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.language_model.set_embed_and_head(embed, head)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Load clip vision model by cfg['mm_vision_tower']:

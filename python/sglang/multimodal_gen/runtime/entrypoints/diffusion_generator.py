@@ -43,8 +43,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
-from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
+    init_diffusion_tracing,
+    trace_req,
+)
 
 logger = init_logger(__name__)
 
@@ -123,9 +125,7 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
-        if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-            trace_set_thread_info("DiffGenerator")
+        init_diffusion_tracing(server_args, "DiffGenerator")
 
         logger.info(f"Local mode: {local_mode}")
         if local_mode:
@@ -222,6 +222,12 @@ class DiffGenerator:
                 output_file_name=user_output_file_name,
                 image_path=image_paths_per_prompt[i],
             )
+            # `dataclasses.replace` drops non-field attrs; restore
+            # `_explicit_fields` so InputValidationStage honors user-supplied
+            # width/height, and mark the keys overridden above as explicit.
+            sampling_params._explicit_fields = getattr(
+                sampling_params_orig, "_explicit_fields", set()
+            ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
@@ -349,7 +355,12 @@ class DiffGenerator:
                 global_output_index += len(requests)
 
         total_gen_time = time.perf_counter() - total_start_time
-        log_batch_completion(logger, len(results), total_gen_time)
+        if self.server_args.batching_max_size > 1:
+            log_batch_completion(
+                logger,
+                len(results),
+                total_gen_time,
+            )
         self._log_summary(results)
 
         if not results:
@@ -451,6 +462,7 @@ class DiffGenerator:
         lora_path: Union[str, None, List[Union[str, None]]] = None,
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
+        merge_mode: str | None = None,
     ) -> None:
         """
         Set LoRA adapter(s) for the specified transformer(s).
@@ -466,12 +478,14 @@ class DiffGenerator:
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
+            merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
             lora_path=lora_path,
             target=target,
             strength=strength,
+            merge_mode=merge_mode,
         )
         nickname_str, target_str, strength_str = format_lora_message(
             lora_nickname, target, strength

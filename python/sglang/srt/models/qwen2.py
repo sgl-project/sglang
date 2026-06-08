@@ -24,6 +24,7 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_pp_group,
+    get_pp_indices,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -91,13 +92,17 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch = None,
+    ) -> torch.Tensor:
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
 
@@ -196,12 +201,14 @@ class Qwen2DecoderLayer(nn.Module):
         self,
         config: Qwen2Config,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.start_layer = start_layer
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
@@ -291,10 +298,16 @@ class Qwen2Model(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
+                start_layer=pp_start_layer,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,

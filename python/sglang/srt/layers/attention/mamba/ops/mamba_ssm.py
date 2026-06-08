@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 from packaging import version
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
+
 PAD_SLOT_ID = -1
 
 TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
@@ -141,7 +143,11 @@ def _selective_scan_update_kernel(
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -296,6 +302,9 @@ def _selective_scan_update_kernel(
     if not DISABLE_STATE_UPDATE:
         tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def selective_state_update(
     state,
@@ -427,7 +436,9 @@ def selective_state_update(
         else (0, 0)
     )
 
-    with torch.cuda.device(x.device.index):
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
+    with torch.get_device_module(x.device).device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
             x,
@@ -491,4 +502,5 @@ def selective_state_update(
             BLOCK_SIZE_M,
             DISABLE_STATE_UPDATE=disable_state_update,
             num_warps=num_warps,
+            **pdl_kwargs,
         )

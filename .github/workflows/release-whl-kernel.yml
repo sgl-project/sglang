@@ -34,6 +34,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # cu130 is the PyPI-released variant; cu129 wheels are published only to the
+  # sgl-project/whl index (consumed via `pip install ...+cu129` for the legacy
+  # cuda 12.9 path), not to PyPI.
   build-cu129-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
@@ -77,43 +80,6 @@ jobs:
         env:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
-
-      # rename_wheels.sh tags the cu129 wheel's METADATA Version with +cu129
-      # (needed elsewhere — e.g. local install discrimination — see PR #23587),
-      # but PyPI rejects PEP 440 local version labels with HTTP 400. Repack a
-      # PyPI-clean copy with the +cu129 segment stripped into dist-pypi/, and
-      # upload that copy. dist/ is left untouched so the +cu129 wheel still
-      # flows through the upload-artifact -> sgl-project/whl index path below.
-      - name: Strip +cu129 local version for PyPI upload
-        working-directory: sgl-kernel
-        run: |
-          set -eux
-          pip install wheel
-          mkdir -p dist-pypi
-          for w in dist/*.whl; do
-            tmp=$(mktemp -d)
-            python3 -m wheel unpack "$w" --dest "$tmp"
-            unpacked=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
-            info=$(find "$unpacked" -maxdepth 1 -type d -name "*.dist-info" | head -1)
-            meta="$info/METADATA"
-            orig=$(grep '^Version:' "$meta" | head -1 | sed 's/^Version:[[:space:]]*//')
-            new=$(echo "$orig" | sed 's/+cu[0-9]\+$//')
-            if [ "$orig" != "$new" ]; then
-              sed -i "s/^Version:.*/Version: ${new}/" "$meta"
-              old_base=$(basename "$info")
-              new_base="${old_base/${orig}/${new}}"
-              mv "$info" "$(dirname "$info")/${new_base}"
-            fi
-            python3 -m wheel pack "$unpacked" --dest-dir dist-pypi
-            rm -rf "$tmp"
-          done
-          ls -lh dist-pypi/
-
-      - name: Upload to PyPI
-        working-directory: sgl-kernel
-        run: |
-          pip install twine
-          python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.PYPI_TOKEN_SGLANG_KERNEL }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -172,7 +138,6 @@ jobs:
           git commit -m "update whl index"
           git push
 
-  # for now we do not release CUDA 13.0 wheels to pypi
   build-cu130-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
@@ -216,6 +181,37 @@ jobs:
         env:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
+
+      - name: Strip +cu130 local version for PyPI upload
+        working-directory: sgl-kernel
+        run: |
+          set -eux
+          pip install wheel
+          mkdir -p dist-pypi
+          for w in dist/*.whl; do
+            tmp=$(mktemp -d)
+            python3 -m wheel unpack "$w" --dest "$tmp"
+            unpacked=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
+            info=$(find "$unpacked" -maxdepth 1 -type d -name "*.dist-info" | head -1)
+            meta="$info/METADATA"
+            orig=$(grep '^Version:' "$meta" | head -1 | sed 's/^Version:[[:space:]]*//')
+            new=$(echo "$orig" | sed 's/+cu[0-9]\+$//')
+            if [ "$orig" != "$new" ]; then
+              sed -i "s/^Version:.*/Version: ${new}/" "$meta"
+              old_base=$(basename "$info")
+              new_base="${old_base/${orig}/${new}}"
+              mv "$info" "$(dirname "$info")/${new_base}"
+            fi
+            python3 -m wheel pack "$unpacked" --dest-dir dist-pypi
+            rm -rf "$tmp"
+          done
+          ls -lh dist-pypi/
+
+      - name: Upload to PyPI
+        working-directory: sgl-kernel
+        run: |
+          pip install twine
+          python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.PYPI_TOKEN_SGLANG_KERNEL }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

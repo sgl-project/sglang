@@ -19,6 +19,7 @@ import torch.nn as nn
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
     set_default_torch_dtype,
@@ -57,6 +58,21 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         "hy3dshape_conditioner",
         "hy3dshape_image_processor",
     ]
+
+    def validate_disagg_role(self, role: RoleType) -> None:
+        if role == RoleType.MONOLITHIC:
+            return
+        config = self.server_args.pipeline_config
+        if not isinstance(config, Hunyuan3D2PipelineConfig):
+            raise TypeError(
+                "Hunyuan3D2Pipeline requires Hunyuan3D2PipelineConfig, "
+                f"got {type(config)}"
+            )
+        if config.paint_enable:
+            raise ValueError(
+                "Hunyuan3D2Pipeline only supports shape-only disaggregation. "
+                "Disable paint_enable when launching encoder/denoiser/decoder roles."
+            )
 
     def _load_config(self) -> dict[str, Any]:
         return {
@@ -357,6 +373,8 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         config = server_args.pipeline_config
         assert isinstance(config, Hunyuan3D2PipelineConfig)
+        latent_shape = tuple(config.vae_config.arch_config.latent_shape)
+        guidance_embed = bool(config.dit_config.arch_config.guidance_embed)
 
         # Shape: 4 stages
         self.add_stage(
@@ -364,10 +382,10 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             stage=Hunyuan3DShapeBeforeDenoisingStage(
                 image_processor=self.get_module("hy3dshape_image_processor"),
                 conditioner=self.get_module("hy3dshape_conditioner"),
-                vae=self.get_module("hy3dshape_vae"),
-                model=self.get_module("hy3dshape_model"),
                 scheduler=self.get_module("hy3dshape_scheduler"),
                 config=config,
+                latent_shape=latent_shape,
+                guidance_embed=guidance_embed,
             ),
         )
         self.add_stage(

@@ -1,3 +1,4 @@
+import os
 import unittest
 from typing import Dict, List
 
@@ -8,6 +9,8 @@ from prometheus_client.samples import Sample
 from sglang.srt.environ import envs
 from sglang.srt.observability.metrics_collector import (
     ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+    STAT_LOGGER_ROLE_SCHEDULER,
+    SchedulerMetricsCollector,
     compute_routing_key_stats,
 )
 from sglang.srt.utils import kill_process_tree
@@ -20,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=74, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=74, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -62,12 +65,12 @@ class TestEnableMetrics(CustomTestCase):
                     {"mode": "decode"},
                 ),
                 (
-                    "sglang:dp_cooperation_gpu_execution_seconds_total",
-                    {"category": "forward_extend"},
+                    "sglang:dp_cooperation_forward_execution_seconds_total",
+                    {"category": "extend"},
                 ),
                 (
-                    "sglang:dp_cooperation_gpu_execution_seconds_total",
-                    {"category": "forward_decode"},
+                    "sglang:dp_cooperation_forward_execution_seconds_total",
+                    {"category": "decode"},
                 ),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)
@@ -129,15 +132,17 @@ class TestEnableMetrics(CustomTestCase):
             for _ in response.iter_lines(decode_unicode=False):
                 pass
 
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
-                json={
-                    "text": "Hello",
-                    "sampling_params": {"temperature": 0, "max_new_tokens": 5},
-                },
-                headers={"x-smg-routing-key": "test-key"},
-            )
-            self.assertEqual(response.status_code, 200)
+            for i in range(2):
+                # Send the request twice to trigger cached token metrics
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/generate",
+                    json={
+                        "text": "Hello, " * 100,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 5},
+                    },
+                    headers={"x-smg-routing-key": "test-key"},
+                )
+                self.assertEqual(response.status_code, 200)
 
             # Get metrics
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
@@ -209,8 +214,8 @@ class TestEnableMetrics(CustomTestCase):
         metrics_to_check = [
             ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
+            ("sglang:forward_execution_seconds_total", {"category": "extend"}),
+            ("sglang:forward_execution_seconds_total", {"category": "decode"}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
@@ -270,6 +275,66 @@ def _check_metrics_positive(test_case, metrics, metrics_to_check):
     for metric_name, labels in metrics_to_check:
         value = _get_sample_value_by_labels(metrics[metric_name], labels)
         test_case.assertGreater(value, 0, f"{metric_name} {labels}")
+
+
+_DI_MARKER_PATH = "/tmp/sglang_di_test_marker"
+
+
+class _MarkingSchedulerCollector(SchedulerMetricsCollector):
+    """Records its own instantiation to a file so the test can verify the
+    custom subclass was used in the scheduler subprocess.
+
+    Defined at module level so it is picklable into the scheduler process.
+    Cross-process signalling uses a filesystem marker because the scheduler
+    runs in its own subprocess and cannot share in-memory state with the
+    test runner.
+    """
+
+    def __init__(self, *args, **kwargs):
+        with open(_DI_MARKER_PATH, "w") as f:
+            f.write("scheduler_collector_initialized\n")
+        super().__init__(*args, **kwargs)
+
+
+class TestStatLoggersDI(CustomTestCase):
+    """Verify that a custom MetricsCollector subclass passed through
+    ``ServerArgs.stat_loggers`` is the one instantiated inside the
+    scheduler subprocess."""
+
+    def setUp(self) -> None:
+        try:
+            os.unlink(_DI_MARKER_PATH)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self) -> None:
+        try:
+            os.unlink(_DI_MARKER_PATH)
+        except FileNotFoundError:
+            pass
+
+    def test_engine_custom_scheduler_collector(self):
+        import sglang as sgl
+
+        engine = sgl.Engine(
+            model_path=_MODEL_NAME,
+            enable_metrics=True,
+            stat_loggers={
+                STAT_LOGGER_ROLE_SCHEDULER: _MarkingSchedulerCollector,
+            },
+        )
+        try:
+            # One small generation triggers scheduler init, which is where
+            # resolve_collector_class() picks the injected subclass.
+            engine.generate("Hello", {"max_new_tokens": 4})
+        finally:
+            engine.shutdown()
+
+        self.assertTrue(
+            os.path.exists(_DI_MARKER_PATH),
+            "Custom SchedulerMetricsCollector was not instantiated; "
+            "stat_loggers DI did not take effect.",
+        )
 
 
 class TestComputeRoutingKeyStats(unittest.TestCase):
