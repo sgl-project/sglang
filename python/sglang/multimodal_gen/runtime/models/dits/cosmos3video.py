@@ -22,7 +22,11 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm,
+    apply_qk_norm_rope,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -31,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    Qwen3VLTextRotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
@@ -132,122 +139,59 @@ def compute_mrope_position_ids_vision(
 # -----------------------------------------------------------------------------
 
 
-def qwen3_apply_rotary_pos_emb(
+def _apply_qwen3_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    rope_cache_positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Qwen3-style RoPE: (x * cos) + (rotate_half(x) * sin).
+    return apply_qk_norm_rope(
+        q=q.contiguous(),
+        k=k.contiguous(),
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+        positions=rope_cache_positions,
+    )
 
-    Args:
-        q: [B, S, H, D]
-        k: [B, S, H_kv, D]
-        cos: [1, S, 1, D] or broadcastable
-        sin: [1, S, 1, D] or broadcastable
-    """
+
+def _apply_qwen3_rope_from_cache(
+    q: torch.Tensor, k: torch.Tensor, cos_sin_cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seq_len = q.shape[:2]
     half = q.shape[-1] // 2
+    cos = cos_sin_cache[:, :half].view(batch_size, seq_len, 1, half).to(q.dtype)
+    sin = cos_sin_cache[:, half:].view(batch_size, seq_len, 1, half).to(q.dtype)
+
     q1 = q[..., :half]
     q2 = q[..., half:]
-    q_embed = torch.empty_like(q)
-    q_embed[..., :half] = q1 * cos[..., :half] - q2 * sin[..., :half]
-    q_embed[..., half:] = q2 * cos[..., half:] + q1 * sin[..., half:]
+    q_out = torch.empty_like(q)
+    q_out[..., :half] = q1 * cos - q2 * sin
+    q_out[..., half:] = q2 * cos + q1 * sin
 
-    half = k.shape[-1] // 2
     k1 = k[..., :half]
     k2 = k[..., half:]
-    k_embed = torch.empty_like(k)
-    k_embed[..., :half] = k1 * cos[..., :half] - k2 * sin[..., :half]
-    k_embed[..., half:] = k2 * cos[..., half:] + k1 * sin[..., half:]
-    return q_embed, k_embed
+    k_out = torch.empty_like(k)
+    k_out[..., :half] = k1 * cos - k2 * sin
+    k_out[..., half:] = k2 * cos + k1 * sin
+    return q_out, k_out
 
 
-# -----------------------------------------------------------------------------
-# Qwen3VL-style Rotary Embedding
-# -----------------------------------------------------------------------------
-
-
-class Qwen3VLTextRotaryEmbedding(nn.Module):
-    """Qwen3VL-style multi-dimensional rotary embedding."""
-
-    def __init__(
-        self,
-        head_dim: int = 128,
-        rope_theta: float = 5000000.0,
-        mrope_section: tuple[int, int, int] = (24, 20, 20),
-    ):
-        super().__init__()
-        self.rope_type = "default"
-        self.max_seq_len_cached = 262144
-        self.mrope_section = list(mrope_section)
-        self.head_dim = head_dim
-
-        # Compute inverse frequencies
-        dim = head_dim
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.attention_scaling = 1.0
-
-    def apply_interleaved_mrope(
-        self, freqs: torch.Tensor, mrope_section: list[int]
-    ) -> torch.Tensor:
-        """Apply interleaved MRoPE to 3D rotary embeddings.
-
-        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-        interleaved [THTHWHTHW...TT], preserving frequency continuity.
-
-        Args:
-            freqs: (3, bs, seq_len, head_dim // 2)
-            mrope_section: (3,) section sizes
-
-        Returns:
-            freqs_t: (bs, seq_len, head_dim // 2)
-        """
-        freqs_t = freqs[0].clone()
-        for dim, offset in enumerate((1, 2), start=1):  # H, W
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
-
-    @torch.no_grad()
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute cos and sin for rotary embeddings.
-
-        Args:
-            x: dummy tensor for dtype
-            position_ids: [3, B, S] or [B, S] position IDs
-
-        Returns:
-            (cos, sin) each of shape [B, S, D]
-        """
-        if position_ids.ndim == 2:
-            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-
-        # Expand inv_freq: [3, B, D//2, 1]
-        inv_freq_expanded = (
-            self.inv_freq[None, None, :, None]
-            .float()
-            .expand(3, position_ids.shape[1], -1, 1)
-            .to(position_ids.device)
-        )
-        # position_ids_expanded: [3, B, 1, S]
-        position_ids_expanded = position_ids[:, :, None, :].float()
-
-        # freqs: [3, B, D//2, S] -> transpose -> [3, B, S, D//2]
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
-            2, 3
-        )
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * self.attention_scaling
-        sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+def _apply_qwen3_qk_norm_rope_split(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k = apply_qk_norm(q.contiguous(), k.contiguous(), q_norm, k_norm, head_dim)
+    return _apply_qwen3_rope_from_cache(q, k, cos_sin_cache)
 
 
 # -----------------------------------------------------------------------------
@@ -414,15 +358,15 @@ class Cosmos3CausalAttention(nn.Module):
             prefix=add_prefix("to_out", prefix),
         )
 
-        # Per-head QK norm. Modules hold the weights; F.rms_norm in forward.
+        # Per-head QK norm.
         self.norm_q = RMSNorm(head_dim, eps=1e-6)
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        rope_cache_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward with KV cache return.
 
@@ -454,7 +398,7 @@ class Cosmos3CausalAttention(nn.Module):
         k = F.rms_norm(
             k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
         )
-        q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        q, k = _apply_qwen3_rope_from_cache(q, k, cos_sin_cache)
 
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2),
@@ -528,8 +472,9 @@ class Cosmos3CrossAttention(nn.Module):
         hidden_states: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        rope_cache_positions: torch.Tensor,
+        use_fused_qk_norm_rope: bool,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -537,8 +482,8 @@ class Cosmos3CrossAttention(nn.Module):
             hidden_states: [B, S_gen_local, hidden_size] visual tokens (may be sharded)
             k_und: [B, S_und, H_kv, D] pre-computed UND keys (always full/replicated)
             v_und: [B, S_und, H_kv, D] pre-computed UND values (always full/replicated)
-            freqs_cos: [B, S_gen_local, 1, D] cosine part of RoPE (for local shard)
-            freqs_sin: [B, S_gen_local, 1, D] sine part of RoPE (for local shard)
+            cos_sin_cache: [B*S_gen_local, D] local rows of [cos, sin]
+            rope_cache_positions: identity row positions into cos_sin_cache
         """
         batch_size, seq_len_gen = hidden_states.shape[:2]
 
@@ -559,10 +504,20 @@ class Cosmos3CrossAttention(nn.Module):
         ]
         v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
-        q, k = apply_qk_norm(
-            q.contiguous(), k.contiguous(), self.norm_q, self.norm_k, self.head_dim
-        )
-        q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        if use_fused_qk_norm_rope:
+            q, k = _apply_qwen3_qk_norm_rope(
+                q,
+                k,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                cos_sin_cache,
+                rope_cache_positions,
+            )
+        else:
+            q, k = _apply_qwen3_qk_norm_rope_split(
+                q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
+            )
 
         # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
@@ -616,8 +571,8 @@ class Cosmos3UndDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        rope_cache_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -627,7 +582,9 @@ class Cosmos3UndDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_out, k, v = self.self_attn(hidden_states, freqs_cos, freqs_sin)
+        attn_out, k, v = self.self_attn(
+            hidden_states, cos_sin_cache, rope_cache_positions
+        )
         hidden_states = residual + attn_out
 
         residual = hidden_states
@@ -684,8 +641,9 @@ class Cosmos3GenDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        rope_cache_positions: torch.Tensor,
+        use_fused_qk_norm_rope: bool,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
@@ -699,7 +657,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.cross_attention(
-            hidden_states, k_und, v_und, freqs_cos, freqs_sin
+            hidden_states,
+            k_und,
+            v_und,
+            cos_sin_cache,
+            rope_cache_positions,
+            use_fused_qk_norm_rope,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -765,31 +728,28 @@ class Cosmos3LanguageModel(nn.Module):
         self,
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
+        position_ids: torch.Tensor,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Process text tokens and return per-layer K/V cache.
 
         Args:
             text_ids: [B, S] token IDs
             text_mask: [B, S] float mask (1=real, 0=pad)
-            freqs_cos: [B, S, D] RoPE cosines
-            freqs_sin: [B, S, D] RoPE sines
+            position_ids: [3, B, S] mRoPE position IDs
 
         Returns:
             List of (K, V) per layer for GEN cross-attention
         """
         hidden = self.embed_tokens(text_ids)
         mask_3d = text_mask.unsqueeze(-1)
-
-        # Add dimension for per-head broadcast
-        freqs_cos = freqs_cos.unsqueeze(2)  # [B, S, 1, D]
-        freqs_sin = freqs_sin.unsqueeze(2)
+        cos_sin_cache, rope_cache_positions = self.rotary_emb.build_rope_cache_inputs(
+            position_ids, cache_dtype=hidden.dtype
+        )
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:
             hidden = hidden * mask_3d
-            hidden, k, v = layer(hidden, freqs_cos, freqs_sin)
+            hidden, k, v = layer(hidden, cos_sin_cache, rope_cache_positions)
             cached_kv.append((k, v))
 
         return cached_kv
@@ -919,7 +879,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         # This allows maintaining separate caches for conditional and unconditional
         # prompts, avoiding recomputation on every denoising step
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
-        self.cached_freqs_gen: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.__post_init__()
 
@@ -959,7 +919,7 @@ class Cosmos3OmniTransformer(CachableDiT):
             x = x[:, :, :, :H, :W]
         return x
 
-    def _compute_rope_freqs(
+    def _compute_rope_position_ids(
         self,
         text_mask: torch.Tensor,
         T: int,
@@ -967,12 +927,8 @@ class Cosmos3OmniTransformer(CachableDiT):
         Wp: int,
         fps: float | None,
         device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[
-        tuple[torch.Tensor, torch.Tensor],
-        tuple[torch.Tensor, torch.Tensor],
-    ]:
-        """Compute mRoPE cos/sin for UND (text) and GEN (visual) pathways."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute mRoPE position IDs for UND text and GEN visual tokens."""
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
@@ -1011,14 +967,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_text]
         vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)  # [3, B, S_vis]
 
-        rotary_emb = self.language_model.rotary_emb
-        _dummy = torch.tensor([], dtype=dtype, device=device)
-        cos_und, sin_und = rotary_emb(_dummy, position_ids=text_pos_ids)
-        cos_gen, sin_gen = rotary_emb(_dummy, position_ids=vis_pos_ids)
-
-        freqs_und = (cos_und, sin_und)
-        freqs_gen = (cos_gen, sin_gen)
-        return freqs_und, freqs_gen
+        return text_pos_ids, vis_pos_ids
 
     def reset_cache(self, cache_key: str | None = None):
         """Reset cached K/V from UND pathway.
@@ -1030,20 +979,20 @@ class Cosmos3OmniTransformer(CachableDiT):
         if cache_key is None:
             # Reset all caches
             self.cached_kv = {}
-            self.cached_freqs_gen = {}
+            self.cached_gen_rope_inputs = {}
         else:
             # Reset specific cache
             if cache_key in self.cached_kv:
                 del self.cached_kv[cache_key]
-            if cache_key in self.cached_freqs_gen:
-                del self.cached_freqs_gen[cache_key]
+            if cache_key in self.cached_gen_rope_inputs:
+                del self.cached_gen_rope_inputs[cache_key]
 
     def _ensure_cache_dicts(self):
         """Ensure cache dictionaries exist (for backwards compatibility)."""
         if not isinstance(self.cached_kv, dict):
             self.cached_kv = {}
-        if not isinstance(self.cached_freqs_gen, dict):
-            self.cached_freqs_gen = {}
+        if not isinstance(self.cached_gen_rope_inputs, dict):
+            self.cached_gen_rope_inputs = {}
 
     def forward(
         self,
@@ -1154,47 +1103,49 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         # Compute UND K/V cache for this cache_key if not already cached
         # This allows reusing the cache across denoising steps for the same text
-        if cache_key not in self.cached_kv:
-            freqs_und, freqs_gen = self._compute_rope_freqs(
-                text_mask, T, Hp, Wp, fps, hidden_states.device, hidden_states.dtype
+        if (
+            cache_key not in self.cached_kv
+            or cache_key not in self.cached_gen_rope_inputs
+        ):
+            text_pos_ids, vis_pos_ids = self._compute_rope_position_ids(
+                text_mask, T, Hp, Wp, fps, hidden_states.device
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN
             # cross-attention needs the full K/V on every SP rank.
             self.cached_kv[cache_key] = self.language_model(
-                text_ids, text_mask, freqs_und[0], freqs_und[1]
+                text_ids, text_mask, text_pos_ids
             )
-            cos_gen, sin_gen = freqs_gen
             if sequence_shard_enabled:
                 if seq_shard_pad > 0:
-                    pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                    pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                    cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
-                    sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
-                cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-                sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-                cos_gen = cos_gen[:, self.sp_rank, :, :]
-                sin_gen = sin_gen[:, self.sp_rank, :, :]
-            cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
-            sin_gen = sin_gen.unsqueeze(2)
-            self.cached_freqs_gen[cache_key] = (cos_gen, sin_gen)
+                    pad_pos = vis_pos_ids[:, :, -1:].expand(-1, -1, seq_shard_pad)
+                    vis_pos_ids = torch.cat([vis_pos_ids, pad_pos], dim=2)
+                vis_pos_ids = vis_pos_ids.view(
+                    3, batch_size, self.sp_size, local_seq_len
+                )[:, :, self.sp_rank, :]
+            self.cached_gen_rope_inputs[cache_key] = (
+                self.language_model.rotary_emb.build_rope_cache_inputs(
+                    vis_pos_ids, cache_dtype=hidden_gen.dtype
+                )
+            )
 
-        freqs_gen = self.cached_freqs_gen[cache_key]
-        cos_gen, sin_gen = freqs_gen
+        cos_sin_gen, gen_rope_cache_positions = self.cached_gen_rope_inputs[cache_key]
 
         # Run GEN layers. `residual` is threaded so each layer's
         # input_layernorm and post_attention_layernorm can use the
         # fused add+rmsnorm path instead of separate add + norm kernels.
         cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
+        use_fused_qk_norm_rope = T > 1
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
             hidden_gen, residual = layer(
                 hidden_gen,
                 k_und,
                 v_und,
-                cos_gen,
-                sin_gen,
+                cos_sin_gen,
+                gen_rope_cache_positions,
+                use_fused_qk_norm_rope,
                 residual=residual,
             )
 
