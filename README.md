@@ -7,6 +7,7 @@
 [![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
 [![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+[![Launch on AI Badgr](https://img.shields.io/badge/Launch%20on-AI%20Badgr-6C47FF)](https://aibadgr.com/gpu/launch?template=sglang)
 
 </div>
 
