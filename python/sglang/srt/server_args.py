@@ -3139,7 +3139,23 @@ class ServerArgs:
 
     def _handle_page_size(self):
         if self.page_size is None:
-            if not is_musa():
+            # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
+            # is tuned for and prefers page_size=64 — making it the default
+            # when the layout flag is set avoids users having to pass
+            # --page-size 64 explicitly. The env var is only consumed by the
+            # ROCm AITER backend, so the auto-bump is gated on HIP; on other
+            # platforms the SHUFFLE 5D pool has no consumer kernels and the
+            # env var is silently ignored (see MHATokenToKVPool).
+            if (
+                is_hip()
+                and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+            ):
+                self.page_size = 64
+                logger.info(
+                    "Setting page_size=64 as default for "
+                    "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
+                )
+            elif not is_musa():
                 self.page_size = 1
             else:
                 self.page_size = 64
@@ -8017,13 +8033,28 @@ class PortArgs:
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+                derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
+                if derived_port > 65535:
+                    derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
+                na = NetworkAddress("127.0.0.1", derived_port)
             else:
                 na = NetworkAddress.parse(server_args.dist_init_addr)
 
             dist_init_host = na.host
             dist_init_port = na.port
-            port_base = dist_init_port + 1
+
+            # We need 5 consecutive ports from port_base for:
+            # port_base, detokenizer, rpc, metrics, scheduler.
+            # In multi-node, all nodes derive ports independently from
+            # dist_init_port, so the derivation must be deterministic
+            # (no availability-based search). If incrementing would
+            # overflow the valid TCP range, decrement instead.
+            NUM_DERIVED_PORTS = 5
+            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+            else:
+                port_base = dist_init_port + 1
+
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
