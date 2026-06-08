@@ -722,7 +722,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        token_ids = req.get_committed_fill_ids()
+        assert (
+            req.fill_len == req.kv_committed_len
+        ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
+        token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

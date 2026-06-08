@@ -495,7 +495,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = kv_indices
             return
 
-        token_ids = req.get_committed_fill_ids()
+        assert (
+            req.fill_len == req.kv_committed_len
+        ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
+        token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
