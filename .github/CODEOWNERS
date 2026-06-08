@@ -1,12 +1,12 @@
-.github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @bingxche
-/docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211
+.github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @HaiShaw @bingxche
+/docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211 @sogalin
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname @whybeyoung
-/docs @wisclmy0611 @zijiexia
-/docs_new @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323
+/docs @wisclmy0611 @zijiexia @sogalin
+/docs_new @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
-/python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2
+/python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2 @HaiShaw @yichiche
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
@@ -14,10 +14,11 @@
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/compilation @hebiao064 @Oasis-Git
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
-/python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai
+/python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai @HaiShaw @sogalin
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
 /python/sglang/srt/disaggregation/encode_receiver.py @ShangmingCai @liusy58 @ZhengWG @gty111
 /python/sglang/srt/disaggregation/encode_server.py @ShangmingCai @liusy58 @ZhengWG @gty111
+/python/sglang/srt/disaggregation/mori @Duyi-Wang @kkHuang-amd @billishyahao
 /python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
 /python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py @ShangmingCai @stmatengss
 /python/sglang/srt/dllm @ClawSeven @btw616
