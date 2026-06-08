@@ -721,11 +721,17 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                is_propagated = False
                 try:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
-                logger.warning(error_message)
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+                # Mute error message for propagated exceptions to avoid duplicate logging
+                if is_propagated:
+                    logger.debug(error_message)
+                else:
+                    logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 prepare_abort(
@@ -802,11 +808,17 @@ class SchedulerDisaggregationPrefillMixin:
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
+        is_propagated = False
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
             error_message += f" with exception {e}"
-        logger.warning(error_message)
+            is_propagated = getattr(e, "is_from_another_rank", False)
+        # Mute error message for propagated exceptions to avoid duplicate logging
+        if is_propagated:
+            logger.debug(error_message)
+        else:
+            logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
             release_kv_cache(req, self.tree_cache)
