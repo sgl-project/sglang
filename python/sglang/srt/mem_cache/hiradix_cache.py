@@ -1325,6 +1325,13 @@ class HiRadixCache(RadixCache):
         can_terminate = True
 
         if self.prefetch_stop_policy == "best_effort":
+            # Even best_effort must wait for extra pool IO (e.g. INDEXER) to
+            # avoid racing with batch_get_v2 writes to host memory.
+            if (
+                getattr(operation, "pool_transfers", None)
+                and not getattr(operation, "pool_transfers_done", True)
+            ):
+                return False
             return can_terminate
 
         if len(operation.hash_value) == 0:
@@ -1341,6 +1348,16 @@ class HiRadixCache(RadixCache):
         else:
             # unknown prefetch stop policy, just return True
             return True
+
+        # Must also wait for extra pool (e.g. INDEXER) IO to finish before
+        # declaring prefetch complete. Otherwise load_back may race with
+        # ongoing batch_get_v2 writes to the same host memory region.
+        if (
+            can_terminate
+            and getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+        ):
+            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
