@@ -1325,25 +1325,31 @@ class HiRadixCache(RadixCache):
         can_terminate = True
 
         if self.prefetch_stop_policy == "best_effort":
-            # Even best_effort must wait for extra pool IO (e.g. INDEXER) to
-            # avoid racing with batch_get_v2 writes to host memory.
-            if (
-                getattr(operation, "pool_transfers", None)
-                and not getattr(operation, "pool_transfers_done", True)
-            ):
-                return False
-            return can_terminate
-
-        if len(operation.hash_value) == 0:
-            completed = False
-        else:
-            completed = (
-                operation.completed_tokens == len(operation.hash_value) * self.page_size
-            )
-
-        if self.prefetch_stop_policy == "wait_complete":
+            # best_effort: KV data is ready, but still must wait for extra pool
+            # IO (e.g. INDEXER) to avoid racing with batch_get_v2 writes.
+            # Do NOT return early — fall through to _all_reduce so all TP ranks
+            # reach the collective call consistently.
+            if getattr(operation, "pool_transfers_done", True):
+                can_terminate = True
+            else:
+                can_terminate = False
+        elif self.prefetch_stop_policy == "wait_complete":
+            if len(operation.hash_value) == 0:
+                completed = False
+            else:
+                completed = (
+                    operation.completed_tokens
+                    == len(operation.hash_value) * self.page_size
+                )
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
+            if len(operation.hash_value) == 0:
+                completed = False
+            else:
+                completed = (
+                    operation.completed_tokens
+                    == len(operation.hash_value) * self.page_size
+                )
             can_terminate = completed or self.is_prefetch_timeout(operation)
         else:
             # unknown prefetch stop policy, just return True
