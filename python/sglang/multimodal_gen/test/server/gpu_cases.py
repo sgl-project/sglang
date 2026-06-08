@@ -19,6 +19,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionServerArgs,
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
+    JOY_ECHO_T2V_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
@@ -423,6 +424,19 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
             },
         ),
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "joy_echo_t2v",
+        DiffusionServerArgs(
+            model_path="jdopensource/JoyAI-Echo",
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        JOY_ECHO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
