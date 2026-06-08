@@ -141,8 +141,9 @@ def can_fuse_shared_expert(
         # Other backends than quark do not exclude the shared expert here, so they
         # intentionally fall through and remain fusable
         can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
-        if can_fuse_fn is not None and not can_fuse_fn():
-            return False
+        if can_fuse_fn is not None:
+            if not can_fuse_fn():
+                return False
 
     return True
 

@@ -405,6 +405,7 @@ class QuarkConfig(QuantizationConfig):
         return []
 
     def can_fuse_shared_expert(self) -> bool:
+        # Shared-expert body excluded from quant; the gate must not veto fusion.
         if any(
             "shared_expert" in layer
             and "shared_expert_gate" not in layer
@@ -413,10 +414,13 @@ class QuarkConfig(QuantizationConfig):
         ):
             return False
 
+        # No per-layer config -> uniform spec, nothing to compare.
         layer_quant_config = self.quant_config.get("layer_quant_config") or {}
         if not layer_quant_config:
             return True
 
+        # Compare routed vs shared specs at layer 0 (stub module needed by
+        # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
         lookup_stub = torch.nn.Module()
         try:
             for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES:
