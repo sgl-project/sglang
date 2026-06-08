@@ -30,6 +30,54 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
+
+
+class _WanDenoisingStageRouter(PipelineStage):
+    def __init__(
+        self,
+        standard_stage: DenoisingStage,
+        progressive_stage: WanProgressiveDenoisingStage,
+    ) -> None:
+        super().__init__()
+        self.standard_stage = standard_stage
+        self.progressive_stage = progressive_stage
+
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
+
+    @property
+    def parallelism_type(self):
+        return self.standard_stage.parallelism_type
+
+    def set_component_residency_manager(self, manager) -> None:
+        super().set_component_residency_manager(manager)
+        self.standard_stage.set_component_residency_manager(manager)
+        self.progressive_stage.set_component_residency_manager(manager)
+
+    def set_registered_stage_name(self, stage_name: str) -> None:
+        super().set_registered_stage_name(stage_name)
+        self.standard_stage.set_registered_stage_name(stage_name)
+        self.progressive_stage.set_registered_stage_name(stage_name)
+
+    def set_profile_stage_name(self, stage_name: str) -> None:
+        super().set_profile_stage_name(stage_name)
+        self.standard_stage.set_profile_stage_name(stage_name)
+        self.progressive_stage.set_profile_stage_name(stage_name)
+
+    def _active_profile_stage_name(self) -> str:
+        return "DenoisingStage"
+
+    def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
+        return self.standard_stage.component_uses(server_args, stage_name)
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
+        if mode in _PROGRESSIVE_MODES:
+            return self.progressive_stage.forward(batch, server_args)
+        return self.standard_stage.forward(batch, server_args)
+
 
 class WanPipeline(LoRAPipeline, ComposedPipelineBase):
     """
@@ -68,17 +116,10 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
                 pipeline=self,
                 vae=self.get_module("vae", None),
             )
-            standard = DenoisingStage(**kwargs)
-            progressive = WanProgressiveDenoisingStage(**kwargs)
-
-            class _Dispatch(PipelineStage):
-                def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-                    mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
-                    if mode in ("dct", "dct_rewind"):
-                        return progressive.forward(batch, server_args)
-                    return standard.forward(batch, server_args)
-
-            return _Dispatch()
+            return _WanDenoisingStageRouter(
+                standard_stage=DenoisingStage(**kwargs),
+                progressive_stage=WanProgressiveDenoisingStage(**kwargs),
+            )
 
         self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
 
