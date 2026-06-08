@@ -1851,6 +1851,20 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+                if self.enable_two_batch_overlap and (
+                    index_topk_freq > 1
+                    or (index_topk_pattern is not None and "S" in index_topk_pattern)
+                ):
+                    raise ValueError(
+                        "--enable-two-batch-overlap is not supported with DSA "
+                        "index-topk sharing (index_topk_freq > 1 or an "
+                        "index_topk_pattern containing shared layers): the TBO op "
+                        "path does not propagate topk indices across layers, so "
+                        "shared layers would run sparse attention without indices."
+                    )
+
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_dsa_prefill_context_parallel:
                         logger.warning(
@@ -3125,7 +3139,23 @@ class ServerArgs:
 
     def _handle_page_size(self):
         if self.page_size is None:
-            if not is_musa():
+            # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
+            # is tuned for and prefers page_size=64 — making it the default
+            # when the layout flag is set avoids users having to pass
+            # --page-size 64 explicitly. The env var is only consumed by the
+            # ROCm AITER backend, so the auto-bump is gated on HIP; on other
+            # platforms the SHUFFLE 5D pool has no consumer kernels and the
+            # env var is silently ignored (see MHATokenToKVPool).
+            if (
+                is_hip()
+                and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+            ):
+                self.page_size = 64
+                logger.info(
+                    "Setting page_size=64 as default for "
+                    "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
+                )
+            elif not is_musa():
                 self.page_size = 1
             else:
                 self.page_size = 64

@@ -56,6 +56,7 @@ import logging
 import multiprocessing
 import os
 import time
+from array import array
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -367,7 +368,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         req = Req(
             rid=i,
             origin_input_text=prompts[i],
-            origin_input_ids=tmp_input_ids,
+            origin_input_ids=array("q", tmp_input_ids),
             sampling_params=sampling_params,
         )
         req.fill_ids = req.origin_input_ids
@@ -412,7 +413,7 @@ def prepare_synthetic_inputs_for_latency_test(
         req = Req(
             rid=i,
             origin_input_text="",
-            origin_input_ids=list(input_ids[i]),
+            origin_input_ids=array("q", input_ids[i]),
             sampling_params=sampling_params,
         )
         req.fill_ids = req.origin_input_ids
