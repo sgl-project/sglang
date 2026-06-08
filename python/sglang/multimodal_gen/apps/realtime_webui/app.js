@@ -431,10 +431,7 @@ async function decodeFrameBatch(header, data) {
 }
 
 function isWorkerDecodableContentType(contentType) {
-  return (
-    isWorkerDecodableRawContentType(contentType) ||
-    isEncodedPreviewContentType(contentType)
-  );
+  return isWorkerDecodableRawContentType(contentType);
 }
 
 function isWorkerDecodableRawContentType(contentType) {
