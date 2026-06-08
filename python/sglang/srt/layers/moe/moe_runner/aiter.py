@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -57,6 +59,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     hidden_pad: int = 0
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
+    fused_moe_kwargs: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -103,6 +106,19 @@ def _aiter_quant_type(quant_type: AiterQuantType):
     return getattr(QuantType, quant_type.value)
 
 
+@functools.cache
+def _aiter_fused_moe_supports_no_combine() -> bool:
+    """Probe whether the installed aiter.fused_moe accepts a `no_combine` kwarg.
+
+    Older wheels don't expose it, so feature-detect once and forward
+    conditionally, matching the existing `**extra` conditional-kwarg pattern
+    used for `num_local_tokens` / `dtype`.
+    """
+    from aiter.fused_moe import fused_moe
+
+    return "no_combine" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -111,9 +127,22 @@ class AiterRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> AiterRunnerOutput:
-        assert not self.config.no_combine, "no_combine=True is not supported by AITER"
+        if self.config.no_combine and not _aiter_fused_moe_supports_no_combine():
+            raise NotImplementedError(
+                "no_combine=True requested but the installed aiter.fused_moe does "
+                "not accept a `no_combine` kwarg. Install an aiter build that "
+                "supports fused_moe no_combine output."
+            )
 
         if runner_input.hidden_states.shape[0] == 0:
+            if self.config.no_combine:
+                topk = runner_input.topk_ids.shape[-1]
+                hidden_size = runner_input.hidden_states.shape[-1]
+                return AiterRunnerOutput(
+                    hidden_states=runner_input.hidden_states.new_empty(
+                        (0, topk, hidden_size)
+                    )
+                )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
         from aiter.fused_moe import fused_moe
@@ -128,6 +157,8 @@ class AiterRunnerCore(MoeRunnerCore):
         )
 
         extra: dict = {}
+        if quant_info.fused_moe_kwargs:
+            extra.update(quant_info.fused_moe_kwargs)
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
@@ -144,6 +175,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 else GateMode.SEPARATED.value
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
+        if self.config.no_combine:
+            extra["no_combine"] = True
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
