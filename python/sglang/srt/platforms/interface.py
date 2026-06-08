@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Type
 
+import torch
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
@@ -52,29 +54,33 @@ class SRTPlatform(DeviceMixin):
     # Subsystem factory methods
     # ------------------------------------------------------------------
 
-    def get_default_attention_backend(self) -> str:
-        """Return the default attention backend name for this platform."""
-        raise NotImplementedError
+    def get_default_attention_backend(self) -> Optional[str]:
+        """Return the default attention backend name, if platform-managed."""
+        return None
 
-    def get_graph_runner_cls(self) -> type:
-        """Return the graph runner class for this platform."""
-        raise NotImplementedError
+    def get_graph_runner_cls(self) -> Optional[type]:
+        """Return a platform-specific graph runner class, if any."""
+        return None
 
-    def get_mha_kv_pool_cls(self) -> type:
-        """Return the MHA KV pool class for this platform."""
-        raise NotImplementedError
+    def get_mha_kv_pool_cls(self) -> Optional[type]:
+        """Return a platform-specific MHA KV pool class, if any."""
+        return None
 
-    def get_mla_kv_pool_cls(self) -> type:
-        """Return the MLA KV pool class for this platform."""
-        raise NotImplementedError
+    def get_mla_kv_pool_cls(self) -> Optional[type]:
+        """Return a platform-specific MLA KV pool class, if any."""
+        return None
 
-    def get_dsa_kv_pool_cls(self) -> type:
-        """Return the DSA KV pool class for this platform (DeepSeek V3.2)."""
-        raise NotImplementedError
+    def get_dsa_kv_pool_cls(self) -> Optional[type]:
+        """Return a platform-specific DSA KV pool class, if any."""
+        return None
 
-    def get_paged_allocator_cls(self) -> type:
-        """Return the paged allocator class for this platform."""
-        raise NotImplementedError
+    def get_paged_allocator_cls(self) -> Optional[type]:
+        """Return a platform-specific paged allocator class, if any."""
+        return None
+
+    def get_position_dtype(self) -> torch.dtype:
+        """Return the dtype used for token position tensors."""
+        return torch.int64
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.

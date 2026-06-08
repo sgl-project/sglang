@@ -219,6 +219,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "mlu",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -3379,7 +3380,6 @@ class ServerArgs:
         self._handle_mps_backends()
         self._handle_xpu_backends()
 
-        # Allow OOT platform plugins to apply server args defaults.
         current_platform.apply_server_args_defaults(self)
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
@@ -4123,11 +4123,17 @@ class ServerArgs:
             ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),
             (
                 "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-                lambda: is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu(),
+                lambda: is_hip()
+                or is_npu()
+                or is_cpu()
+                or is_mps()
+                or is_xpu(),
             ),
             (
-                "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
+                "platform-managed backend without piecewise support",
+                lambda: (
+                    current_platform.is_out_of_tree() or current_platform.is_mlu()
+                )
                 and not current_platform.support_piecewise_cuda_graph(),
             ),
             (
@@ -5348,9 +5354,9 @@ class ServerArgs:
             2.2 We will use Flashinfer backend on blackwell.
             2.3 Otherwise, we will use triton backend.
         """
-        # OOT platforms provide their own default attention backend.
-        if current_platform.is_out_of_tree():
-            return current_platform.get_default_attention_backend()
+        platform_backend = current_platform.get_default_attention_backend()
+        if platform_backend is not None:
+            return platform_backend
 
         # Whisper requires flashinfer for cross-attention CUDA graph support.
         if "WhisperForConditionalGeneration" in (

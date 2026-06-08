@@ -420,6 +420,22 @@ def get_available_gpu_memory(
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
+    elif device == "mlu":
+        num_gpus = torch.mlu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.mlu.current_device() != gpu_id:
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch MLU context.",
+                gpu_id,
+                torch.mlu.current_device(),
+            )
+
+        if empty_cache:
+            empty_device_cache(torch.mlu)
+        free_gpu_memory, _ = torch.mlu.mem_get_info()
+
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
         assert gpu_id < num_gpus
@@ -793,8 +809,8 @@ def get_mtgpu_memory_capacity():
 
 
 def get_device_memory_capacity(device: str = None):
-    # OOT platforms provide their own memory query via the platform class.
-    if current_platform.is_out_of_tree():
+    # OOT and MLU platforms provide their own memory query via the platform class.
+    if current_platform.is_out_of_tree() or current_platform.is_mlu():
         mem_bytes = current_platform.get_device_total_memory()
         if mem_bytes:
             return mem_bytes / (1 << 20)  # bytes -> MiB
@@ -821,6 +837,9 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if current_platform.is_mlu():
+        return current_platform.get_device_name(device_id)
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
@@ -849,6 +868,11 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "CPU device enabled, using torch native backend, low performance expected."
             )
         return "cpu"
+
+    if current_platform.is_mlu():
+        if device_id is None:
+            return "mlu"
+        return "mlu:{}".format(device_id)
 
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
@@ -898,6 +922,12 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if current_platform.is_mlu():
+        try:
+            return torch.mlu.device_count()
+        except RuntimeError:
+            return 0
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
@@ -1487,6 +1517,8 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
+    if hasattr(torch, "mlu") and torch.mlu.is_available():
+        torch.mlu.manual_seed_all(seed)
 
 
 _mm_http_session = threading.local()

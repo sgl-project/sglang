@@ -218,7 +218,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_out_of_tree():
+else:
     current_platform.init_backend()
 
 # Detect stragger ranks in model loading
