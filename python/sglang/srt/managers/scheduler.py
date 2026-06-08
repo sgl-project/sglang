@@ -1544,10 +1544,6 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
-        # Bounded deferred free of closed radix-native sessions (non-blocking).
-        drain = getattr(self.tree_cache, "drain_pending_release", None)
-        if drain is not None:
-            drain()
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1908,8 +1904,7 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native session: session_id is just a tag on the Req; the radix
-        # cache groups its KV by req.session_id for bulk release on close.
+        # Radix-native session: session_id is just a tag; KV bulk-freed on close.
         radix_native_session = (
             session_id is not None and self.server_args.enable_session_radix_cache
         )
@@ -3830,8 +3825,7 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         if self.server_args.enable_session_radix_cache:
-            # Radix-native sessions need no open: a session is just a per-request
-            # tag, released on close. Accept and no-op for protocol compatibility.
+            # Radix-native: open is implicit (per-req tag); accept + no-op.
             session_id = recv_req.session_id
             output = OpenSessionReqOutput(session_id, session_id is not None)
         else:

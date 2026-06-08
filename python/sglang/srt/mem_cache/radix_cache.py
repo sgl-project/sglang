@@ -290,9 +290,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
-        # Leaf seeds queued by release_session, freed a bounded number per
-        # scheduler iteration by drain_pending_release (close never blocks).
-        self._pending_release: list = []
         self.reset()
 
     @classmethod
@@ -326,8 +323,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
-        if hasattr(self, "_pending_release"):
-            self._pending_release.clear()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -463,8 +458,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
-        # Radix-native session: tag the leaf so release_session can bulk-free
-        # this session's unique chain at close (see release_session).
         self._tag_session_leaf(req, radix_key)
 
         # Remove req slot release the cache lock
@@ -537,8 +530,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         req.last_node = new_last_node
 
-        # Radix-native session tag (reuse the leaf we just matched -- see
-        # release_session).
         self._tag_session_leaf(req, radix_key, node=new_last_node)
 
     def pretty_print(self):
