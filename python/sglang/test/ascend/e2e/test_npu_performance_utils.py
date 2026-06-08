@@ -335,6 +335,7 @@ def run_bench_serving(
     warmup_requests=None,
     seed=None,
     output_file=None,
+    repeat_rate=None,
 ):
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
@@ -346,46 +347,92 @@ def run_bench_serving(
 
     write_pkg_info_to_file(result_file)
 
-    cmd_args = [
-        PYTHON_FOR_TEST_TOOL,
-        "-m",
-        "sglang.bench_serving",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--model",
-        model_path,
-        "--backend",
-        backend,
-    ]
+    if dataset_name == "generated-shared-prefix":
+        cmd_args = [
+            PYTHON_FOR_TEST_TOOL,
+            "-m",
+            "sglang.bench_serving",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--model",
+            model_path,
+            "--backend",
+            backend,
+            "--dataset-name",
+            dataset_name,
+            "--gsp-num-groups",
+            "1",
+            "--gsp-prompts-per-group",
+            str(num_prompts),
+            "--gsp-system-prompt-len",
+            (
+                str(int((repeat_rate if repeat_rate is not None else 0.9) * input_len))
+                if input_len
+                else "0"
+            ),
+            "--gsp-question-len",
+            (
+                str(
+                    int(
+                        (1 - (repeat_rate if repeat_rate is not None else 0.9))
+                        * input_len
+                    )
+                )
+                if input_len
+                else "0"
+            ),
+            "--gsp-output-len",
+            str(output_len) if output_len else "0",
+        ]
+        if max_concurrency:
+            cmd_args.extend(["--max-concurrency", str(max_concurrency)])
+        if num_prompts:
+            cmd_args.extend(["--num-prompts", str(num_prompts)])
+        if request_rate:
+            cmd_args.extend(["--request-rate", str(request_rate)])
+    else:
+        cmd_args = [
+            PYTHON_FOR_TEST_TOOL,
+            "-m",
+            "sglang.bench_serving",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--model",
+            model_path,
+            "--backend",
+            backend,
+        ]
 
-    if dataset_name:
-        cmd_args.extend(["--dataset-name", str(dataset_name)])
-    if dataset_path:
-        cmd_args.extend(["--dataset-path", str(dataset_path)])
-    if request_rate:
-        cmd_args.extend(["--request-rate", str(request_rate)])
-    if max_concurrency:
-        cmd_args.extend(["--max-concurrency", str(max_concurrency)])
-    if num_prompts:
-        cmd_args.extend(["--num-prompts", str(num_prompts)])
-    if input_len:
-        cmd_args.extend(["--random-input-len", str(input_len)])
-    if output_len:
-        cmd_args.extend(["--random-output-len", str(output_len)])
-    if random_range_ratio:
-        cmd_args.extend(["--random-range-ratio", str(random_range_ratio)])
-    if image_resolution:
-        cmd_args.extend(["--image-resolution", str(image_resolution)])
-    if image_count:
-        cmd_args.extend(["--image-count", str(image_count)])
-    if warmup_requests:
-        cmd_args.extend(["--warmup-requests", str(warmup_requests)])
-    if seed:
-        cmd_args.extend(["--seed", str(seed)])
-    if output_file:
-        cmd_args.extend(["--output-file", str(output_file)])
+        if dataset_name:
+            cmd_args.extend(["--dataset-name", str(dataset_name)])
+        if dataset_path:
+            cmd_args.extend(["--dataset-path", str(dataset_path)])
+        if request_rate:
+            cmd_args.extend(["--request-rate", str(request_rate)])
+        if max_concurrency:
+            cmd_args.extend(["--max-concurrency", str(max_concurrency)])
+        if num_prompts:
+            cmd_args.extend(["--num-prompts", str(num_prompts)])
+        if input_len:
+            cmd_args.extend(["--random-input-len", str(input_len)])
+        if output_len:
+            cmd_args.extend(["--random-output-len", str(output_len)])
+        if random_range_ratio:
+            cmd_args.extend(["--random-range-ratio", str(random_range_ratio)])
+        if image_resolution:
+            cmd_args.extend(["--image-resolution", str(image_resolution)])
+        if image_count:
+            cmd_args.extend(["--image-count", str(image_count)])
+        if warmup_requests:
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
+        if seed:
+            cmd_args.extend(["--seed", str(seed)])
+        if output_file:
+            cmd_args.extend(["--output-file", str(output_file)])
     logger.info(f"Command: {' '.join(cmd_args)}")
 
     # Run benchmark command and capture output
@@ -446,9 +493,8 @@ def run_aisbench(
     num_prompts,
     image_resolution=None,
     random_range_ratio=1,
-    prefix_hit_rate=None,
-    aisbench_request_rate=None,
-    aisbench_repeat_rate=None,
+    request_rate=None,
+    repeat_rate=None,
     dp=None,
     generation_kwargs=None,
 ):
@@ -528,12 +574,10 @@ def run_aisbench(
     cmd += f"--num-prompts {str(num_prompts)} "
     cmd += f"--output-path {result_path}"
 
-    if prefix_hit_rate is not None:
-        cmd += f" --prefix-hit-rate {prefix_hit_rate}"
-    if aisbench_request_rate is not None:
-        cmd += f" --request_rate {aisbench_request_rate}"
-    if aisbench_repeat_rate is not None:
-        cmd += f" --repeat_rate {aisbench_repeat_rate}"
+    if request_rate is not None:
+        cmd += f" --request_rate {request_rate}"
+    if repeat_rate is not None:
+        cmd += f" --repeat_rate {repeat_rate}"
     if dp is not None:
         cmd += f" --dp {dp}"
     if generation_kwargs:
@@ -804,13 +848,13 @@ class TestAscendPerformanceTestCaseBase(CustomTestCase):
     backend = "sglang"
     dataset_name = "random"
     dataset_path = SHAREGPT_DATASET_TEST_FILE
-    aisbench_dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
-    aisbench_dataset_path = None  # auto generate dataset if none
+    dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
     other_args = None
     timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     max_attempts = 2
     request_rate = None
+    repeat_rate = None
     max_concurrency = None
     num_prompts = None
     input_len = None
@@ -825,9 +869,6 @@ class TestAscendPerformanceTestCaseBase(CustomTestCase):
     mean_e2e_latency = None
     output_token_throughput = None
 
-    prefix_hit_rate = None
-    aisbench_request_rate = None
-    aisbench_repeat_rate = None
     dp = None
     generation_kwargs = None
 
@@ -870,17 +911,16 @@ class TestAscendPerformanceTestCaseBase(CustomTestCase):
                 host=host,
                 port=port,
                 model_path=self.model,
-                dataset_type=self.aisbench_dataset_type,
-                dataset_path=self.aisbench_dataset_path,
+                dataset_type=self.dataset_type,
+                dataset_path=self.dataset_path,
                 input_len=self.input_len,
                 output_len=self.output_len,
                 max_concurrency=self.max_concurrency,
                 num_prompts=self.num_prompts,
                 image_resolution=self.image_resolution,
                 random_range_ratio=self.random_range_ratio,
-                prefix_hit_rate=self.prefix_hit_rate,
-                aisbench_request_rate=self.aisbench_request_rate,
-                aisbench_repeat_rate=self.aisbench_repeat_rate,
+                request_rate=self.request_rate,
+                repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
             )
@@ -895,6 +935,7 @@ class TestAscendPerformanceTestCaseBase(CustomTestCase):
                 "dataset_name": self.dataset_name,
                 "dataset_path": self.dataset_path,
                 "request_rate": self.request_rate,
+                "repeat_rate": self.repeat_rate,
                 "max_concurrency": self.max_concurrency,
                 "num_prompts": self.num_prompts,
                 "input_len": self.input_len,
@@ -916,10 +957,10 @@ class TestAscendPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     backend = "sglang"
     dataset_name = "random"
     dataset_path = SHAREGPT_DATASET_TEST_FILE
-    aisbench_dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
-    aisbench_dataset_path = None  # auto generate dataset if none
+    dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
     max_attempts = 2
     request_rate = None
+    repeat_rate = None
     max_concurrency = None
     num_prompts = None
     input_len = None
@@ -934,9 +975,6 @@ class TestAscendPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     mean_e2e_latency = None
     output_token_throughput = None
 
-    prefix_hit_rate = None
-    aisbench_request_rate = None
-    aisbench_repeat_rate = None
     dp = None
     generation_kwargs = None
 
@@ -993,17 +1031,16 @@ class TestAscendPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 host=self.host,
                 port=str(self.port),
                 model_path=self.model_config.get("model_path"),
-                dataset_type=self.aisbench_dataset_type,
-                dataset_path=self.aisbench_dataset_path,
+                dataset_type=self.dataset_type,
+                dataset_path=self.dataset_path,
                 input_len=self.input_len,
                 output_len=self.output_len,
                 max_concurrency=self.max_concurrency,
                 num_prompts=self.num_prompts,
                 image_resolution=self.image_resolution,
                 random_range_ratio=self.random_range_ratio,
-                prefix_hit_rate=self.prefix_hit_rate,
-                aisbench_request_rate=self.aisbench_request_rate,
-                aisbench_repeat_rate=self.aisbench_repeat_rate,
+                request_rate=self.request_rate,
+                repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
             )
@@ -1018,6 +1055,7 @@ class TestAscendPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 "dataset_name": self.dataset_name,
                 "dataset_path": self.dataset_path,
                 "request_rate": self.request_rate,
+                "repeat_rate": self.repeat_rate,
                 "max_concurrency": self.max_concurrency,
                 "num_prompts": self.num_prompts,
                 "input_len": self.input_len,
@@ -1039,10 +1077,10 @@ class TestAscendPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     backend = "sglang"
     dataset_name = "random"
     dataset_path = SHAREGPT_DATASET_TEST_FILE
-    aisbench_dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
-    aisbench_dataset_path = None  # auto generate dataset if none
+    dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
     max_attempts = 2
     request_rate = None
+    repeat_rate = None
     max_concurrency = None
     num_prompts = None
     input_len = None
@@ -1057,9 +1095,6 @@ class TestAscendPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     mean_e2e_latency = None
     output_token_throughput = None
 
-    prefix_hit_rate = None
-    aisbench_request_rate = None
-    aisbench_repeat_rate = None
     dp = None
     generation_kwargs = None
 
@@ -1133,17 +1168,16 @@ class TestAscendPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 host=self.host,
                 port=str(self.port),
                 model_path=self.model_config.get("model_path"),
-                dataset_type=self.aisbench_dataset_type,
-                dataset_path=self.aisbench_dataset_path,
+                dataset_type=self.dataset_type,
+                dataset_path=self.dataset_path,
                 input_len=self.input_len,
                 output_len=self.output_len,
                 max_concurrency=self.max_concurrency,
                 num_prompts=self.num_prompts,
                 image_resolution=self.image_resolution,
                 random_range_ratio=self.random_range_ratio,
-                prefix_hit_rate=self.prefix_hit_rate,
-                aisbench_request_rate=self.aisbench_request_rate,
-                aisbench_repeat_rate=self.aisbench_repeat_rate,
+                request_rate=self.request_rate,
+                repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
             )
@@ -1158,6 +1192,7 @@ class TestAscendPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 "dataset_name": self.dataset_name,
                 "dataset_path": self.dataset_path,
                 "request_rate": self.request_rate,
+                "repeat_rate": self.repeat_rate,
                 "max_concurrency": self.max_concurrency,
                 "num_prompts": self.num_prompts,
                 "input_len": self.input_len,
