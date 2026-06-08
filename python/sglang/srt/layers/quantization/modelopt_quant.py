@@ -1746,21 +1746,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        is_nvfp4_per_token_activation = getattr(
-            self.quant_config, "is_nvfp4_per_token_activation", False
-        )
-        if (
-            not self.quant_config.is_checkpoint_nvfp4_serialized
-            and not is_nvfp4_per_token_activation
-        ):
+        is_nvfp4_online = getattr(self.quant_config, "is_nvfp4_online", False)
+        if not self.quant_config.is_checkpoint_nvfp4_serialized and not is_nvfp4_online:
             raise ValueError(
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
-        if is_nvfp4_per_token_activation:
+        if is_nvfp4_online:
             if not self.enable_flashinfer_trtllm_moe:
                 raise ValueError(
-                    "--quantization nvfp4_per_token_activation supports only "
+                    "--quantization nvfp4_online supports only "
                     "--moe-runner-backend flashinfer_trtllm or "
                     "flashinfer_trtllm_routed."
                 )
@@ -1773,7 +1768,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
-        if is_nvfp4_per_token_activation:
+        if is_nvfp4_online:
             weight_loader = self.get_online_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
@@ -1873,10 +1868,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
-        if (
-            is_nvfp4_per_token_activation
-            and self.quant_config.is_checkpoint_fp8_serialized
-        ):
+        if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
             # FP8 checkpoints usually store expert scales as weight_scale_inv.
             # Online NVFP4 consumes them in the loader and writes the generated
             # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.

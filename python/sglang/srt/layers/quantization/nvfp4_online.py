@@ -28,10 +28,10 @@ from sglang.srt.layers.quantization.utils import (
 logger = logging.getLogger(__name__)
 
 
-class NvFp4PerTokenActivationConfig(ModelOptQuantConfig):
+class NvFp4OnlineConfig(ModelOptQuantConfig):
     """Online NVFP4 config that quantizes MoE experts."""
 
-    is_nvfp4_per_token_activation = True
+    is_nvfp4_online = True
     is_checkpoint_nvfp4_serialized = False
     group_size = 16
 
@@ -81,7 +81,7 @@ class NvFp4PerTokenActivationConfig(ModelOptQuantConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "nvfp4_per_token_activation"
+        return "nvfp4_online"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -96,7 +96,7 @@ class NvFp4PerTokenActivationConfig(ModelOptQuantConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> NvFp4PerTokenActivationConfig:
+    def from_config(cls, config: Dict[str, Any]) -> NvFp4OnlineConfig:
         quant_method = str(config.get("quant_method", "")).lower()
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = "fp8" in quant_method or use_mxfp8
@@ -138,14 +138,14 @@ class NvFp4PerTokenActivationConfig(ModelOptQuantConfig):
                 if self.is_checkpoint_fp8_serialized:
                     return Fp8MoEMethod(self)
                 return None
-            return ModelOptNvFp4PerTokenActivationFusedMoEMethod(self, prefix)
+            return ModelOptNvFp4OnlineFusedMoEMethod(self, prefix)
         return None
 
 
-class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
+class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """Online NVFP4 per-token activation MoE method for BF16/FP16/FP8 checkpoints."""
 
-    def __init__(self, quant_config: NvFp4PerTokenActivationConfig, layer_prefix: str):
+    def __init__(self, quant_config: NvFp4OnlineConfig, layer_prefix: str):
         super().__init__(quant_config)
         self.layer_prefix = layer_prefix
         layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_prefix)
@@ -156,7 +156,7 @@ class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod)
         )
         if not self.enable_flashinfer_trtllm_moe:
             raise ValueError(
-                "--quantization nvfp4_per_token_activation supports only "
+                "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
                 "flashinfer_trtllm_routed."
             )
@@ -170,12 +170,12 @@ class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod)
 
         if weight.ndim != 2:
             raise ValueError(
-                "--quantization nvfp4_per_token_activation expects 2D expert weights, "
+                "--quantization nvfp4_online expects 2D expert weights, "
                 f"got shape {tuple(weight.shape)}."
             )
         if weight.shape[-1] % 16 != 0:
             raise ValueError(
-                "--quantization nvfp4_per_token_activation requires expert weight K to be "
+                "--quantization nvfp4_online requires expert weight K to be "
                 f"a multiple of 16, got shape {tuple(weight.shape)}."
             )
 
@@ -242,7 +242,7 @@ class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod)
     ) -> torch.Tensor:
         if self.quant_config.use_mxfp8:
             raise ValueError(
-                "--quantization nvfp4_per_token_activation does not support online "
+                "--quantization nvfp4_online does not support online "
                 "requantization from MXFP8 expert checkpoints."
             )
 
@@ -412,7 +412,7 @@ class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod)
             ) = pending
             if pending_shard_id == shard_id:
                 raise ValueError(
-                    "--quantization nvfp4_per_token_activation expects paired w1/w3 expert "
+                    "--quantization nvfp4_online expects paired w1/w3 expert "
                     f"weights, got two {shard_id} tensors for expert {expert_id}."
                 )
             pending_weight = pending_weight.to(param.device)
@@ -461,7 +461,7 @@ class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod)
                 return
             if not self.quant_config.is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    "--quantization nvfp4_per_token_activation received an FP8 expert "
+                    "--quantization nvfp4_online received an FP8 expert "
                     "weight, but the checkpoint quantization config does not "
                     "declare serialized FP8 weights."
                 )
@@ -518,7 +518,7 @@ class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod)
                 pending_eid,
             )
 
-        def online_nvfp4_per_token_activation_weight_loader(
+        def nvfp4_online_weight_loader(
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
             weight_name: str,
@@ -555,4 +555,4 @@ class ModelOptNvFp4PerTokenActivationFusedMoEMethod(ModelOptNvFp4FusedMoEMethod)
                 expert_id=expert_id,
             )
 
-        return online_nvfp4_per_token_activation_weight_loader
+        return nvfp4_online_weight_loader

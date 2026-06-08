@@ -1109,7 +1109,7 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
-            "nvfp4_per_token_activation",
+            "nvfp4_online",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
@@ -1154,7 +1154,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
-            "nvfp4_per_token_activation",
+            "nvfp4_online",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -1176,7 +1176,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
-            "nvfp4_per_token_activation": ["fp8"],
+            "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],

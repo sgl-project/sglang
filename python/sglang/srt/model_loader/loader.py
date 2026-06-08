@@ -761,11 +761,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         quant_config = getattr(model, "quant_config", None)
-        is_nvfp4_per_token_activation = getattr(
-            quant_config, "is_nvfp4_per_token_activation", False
-        )
+        is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
-        if is_nvfp4_per_token_activation:
+        if is_nvfp4_online:
             with temp_set_env(
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",

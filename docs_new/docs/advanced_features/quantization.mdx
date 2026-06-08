@@ -148,7 +148,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
     </tr>
     <tr>
-      <td><code>nvfp4_per_token_activation</code></td>
+      <td><code>nvfp4_online</code></td>
       <td>Yes (Blackwell/SM100 or SM103)</td>
       <td>No</td>
       <td>No</td>
@@ -805,9 +805,9 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-### `nvfp4_per_token_activation` online quantization method
+### `nvfp4_online` online quantization method
 
-SGLang running on NVIDIA Blackwell SM100 or SM103 GPUs supports `--quantization nvfp4_per_token_activation` for MoE checkpoints stored in BF16, FP16, or FP8. It quantizes MoE expert weights online as each expert weight tensor is loaded, using standard 2D NVFP4 weight quantization with per-tensor amax-derived FP32 scales. If an expert checkpoint weight is FP8, SGLang first dequantizes that tensor to BF16 with the checkpoint scale and then requantizes it to NVFP4. Dense linear layers are kept in the original checkpoint precision. The `per_token_activation` name refers to activation scaling: weights use static per-tensor FP32 scales, while activations get runtime per-token FP32 scales from FlashInfer, so activation FP32 calibration scales are not required.
+SGLang running on NVIDIA Blackwell SM100 or SM103 GPUs supports `--quantization nvfp4_online` for MoE checkpoints stored in BF16, FP16, or FP8. It quantizes MoE expert weights online as each expert weight tensor is loaded, using standard 2D NVFP4 weight quantization with per-tensor amax-derived FP32 scales. If an expert checkpoint weight is FP8, SGLang first dequantizes that tensor to BF16 with the checkpoint scale and then requantizes it to NVFP4. Dense linear layers are kept in the original checkpoint precision. This mode is for online conversion from higher-precision or FP8 checkpoints, not serving already serialized NVFP4 checkpoints. At runtime, weights use static per-tensor FP32 scales while activations get per-token FP32 scales from FlashInfer, so activation FP32 calibration scales are not required.
 
 Only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed` are supported. If `--moe-runner-backend` is omitted, SGLang selects `flashinfer_trtllm`. Tensor parallelism is supported; activation per-token scales are computed locally on each TP rank, while online weight quantization still uses the loaded expert tensor's per-tensor amax-derived FP32 scale.
 
@@ -818,7 +818,7 @@ python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-30B-A3B-Instruct-2507 \
     --tp-size 2 \
     --ep-size 2 \
-    --quantization nvfp4_per_token_activation \
+    --quantization nvfp4_online \
     --port 30000 --host 0.0.0.0
 ```
 
