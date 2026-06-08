@@ -178,9 +178,6 @@ def _forward_with_allreduce_fusion(
                 if fused_result is not None:
                     return fused_result
             else:
-                # The MNNVL-vs-capture guard lives inside
-                # flashinfer_allreduce_residual_rmsnorm (opaque to torch.compile)
-                # so it does not cause a dynamo graph break here.
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,

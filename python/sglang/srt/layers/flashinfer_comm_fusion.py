@@ -182,10 +182,10 @@ if is_flashinfer_available():
 # FlashInfer allreduce fusion backend support matrix for
 # --flashinfer-allreduce-fusion-backend:
 #
-#   Backend   | SM100 | SM90 | Single-Node | Multi-Node |
-#   --------- | ----- | ---- | ----------- | ---------- |
-#   trtllm    | Yes   | Yes  | Yes         | No         |
-#   mnnvl     | Yes   | No   | Yes         | Yes        |
+#   Backend   | SM103 | SM100 | SM90 | Single-Node | Multi-Node |
+#   --------- | ----- | -- -- | ---- | ----------- | ---------- |
+#   trtllm    | Yes   | Yes   | Yes  | Yes         | No         |
+#   mnnvl     | Yes   | Yes   | No   | Yes         | Yes        |
 #
 # auto/mnnvl: only resolves to mnnvl on Blackwell GPUs (SM10x) where it has
 # been validated. On every other platform the selection is forced to trtllm
