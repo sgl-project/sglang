@@ -243,7 +243,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
         self.assertGreater(metrics["score"], 0.89)
 
 
-class FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base:
+class FlashinferTrtllmGenMoeBackendOnlineNvFp4PerTokenActivationBase:
     backend = None
     extra_env = {}
 
@@ -268,7 +268,7 @@ class FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base:
                 "--ep-size",
                 "2",
                 "--quantization",
-                "per_token_nvfp4",
+                "nvfp4_per_token_activation",
                 "--mem-fraction-static",
                 "0.7",
                 "--mamba-ssm-dtype",
@@ -325,15 +325,15 @@ class TestFlashinferTrtllmGenMoeBackendBF16Routed(
     backend = "flashinfer_trtllm_routed"
 
 
-class TestFlashinferTrtllmGenMoeBackendPerTokenNVFP4Routed(
+class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm_routed"
 
 
-class TestFlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4(
-    FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base, CustomTestCase
+class TestFlashinferTrtllmGenMoeBackendOnlineNvFp4PerTokenActivation(
+    FlashinferTrtllmGenMoeBackendOnlineNvFp4PerTokenActivationBase, CustomTestCase
 ):
     extra_env = {
         "FLASHINFER_NVFP4_4OVER6": "1",
