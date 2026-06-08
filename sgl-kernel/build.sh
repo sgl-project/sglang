@@ -61,7 +61,7 @@ echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
 echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
-echo "PYTORCH_MIRROR:     ${PYTORCH_MIRROR:-download.pytorch.org}"
+echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl}"
 echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
 echo "YUM_MIRROR:         ${YUM_MIRROR:-(upstream)}"
 echo "----------------------------------------"
@@ -74,7 +74,7 @@ BUILD_ARGS=()
 [ -n "${BUILD_JOBS:-}" ]           && BUILD_ARGS+=(--build-arg BUILD_JOBS="${BUILD_JOBS}")
 [ -n "${NVCC_THREADS:-}" ]         && BUILD_ARGS+=(--build-arg NVCC_THREADS="${NVCC_THREADS}")
 [ -n "${GITHUB_ARTIFACTORY:-}" ]   && BUILD_ARGS+=(--build-arg GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY}")
-[ -n "${PYTORCH_MIRROR:-}" ]       && BUILD_ARGS+=(--build-arg PYTORCH_MIRROR="${PYTORCH_MIRROR}")
+[ -n "${PYTORCH_INDEX_BASE:-}" ]   && BUILD_ARGS+=(--build-arg PYTORCH_INDEX_BASE="${PYTORCH_INDEX_BASE}")
 [ -n "${PIP_DEFAULT_INDEX:-}" ]    && BUILD_ARGS+=(--build-arg PIP_DEFAULT_INDEX="${PIP_DEFAULT_INDEX}")
 [ -n "${YUM_MIRROR:-}" ]           && BUILD_ARGS+=(--build-arg YUM_MIRROR="${YUM_MIRROR}")
 

@@ -16,7 +16,7 @@ ARG CMAKE_VERSION_MINOR=1
 ARG USE_CCACHE=1
 ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
-ARG PYTORCH_MIRROR=download.pytorch.org
+ARG PYTORCH_INDEX_BASE=https://download.pytorch.org/whl
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
 # Optional mirror for the manylinux base image's yum repos (AlmaLinux 8).
 # Pass scheme + host (and optional path prefix), e.g.
@@ -42,8 +42,12 @@ RUN if [ -n "${YUM_MIRROR}" ]; then \
       sed -i 's|^enabled=1|enabled=0|g' /etc/yum.repos.d/epel*.repo; \
     fi
 
-# Install build dependencies
-RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs -y --nogpgcheck \
+# Install build dependencies. libzstd-devel + xxhash-devel let ccache's
+# FindZstd.cmake / FindXxhash.cmake skip their hardcoded github.com FetchContent
+# fallbacks — critical when github.com is flaky/blocked. xxhash-devel is in
+# PowerTools (disabled by default on AlmaLinux 8); libzstd-devel is in BaseOS.
+RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs libzstd-devel -y --nogpgcheck \
+ && yum --enablerepo=powertools install xxhash-devel -y --nogpgcheck \
  && ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so \
  && yum clean all && rm -rf /var/cache/yum
 
@@ -98,7 +102,7 @@ RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
       12.8) TORCH_VER=2.11.0; CU_TAG=cu128 ;; \
       *)    TORCH_VER=2.11.0; CU_TAG=cu126 ;; \
     esac; \
-    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
+    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url ${PYTORCH_INDEX_BASE}/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
 
 # Build stage: copy source and build wheel
