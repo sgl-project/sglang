@@ -1326,23 +1326,17 @@ class HiRadixCache(RadixCache):
 
         if self.prefetch_stop_policy == "best_effort":
             return can_terminate
-        elif self.prefetch_stop_policy == "wait_complete":
-            if len(operation.hash_value) == 0:
-                completed = False
-            else:
-                completed = (
-                    operation.completed_tokens
-                    == len(operation.hash_value) * self.page_size
-                )
+
+        if len(operation.hash_value) == 0:
+            completed = False
+        else:
+            completed = (
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
+
+        if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
-            if len(operation.hash_value) == 0:
-                completed = False
-            else:
-                completed = (
-                    operation.completed_tokens
-                    == len(operation.hash_value) * self.page_size
-                )
             can_terminate = completed or self.is_prefetch_timeout(operation)
         else:
             # unknown prefetch stop policy, just return True
