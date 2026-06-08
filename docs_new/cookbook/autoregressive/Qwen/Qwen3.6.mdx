@@ -79,6 +79,8 @@ docker pull lmsysorg/sglang:latest
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -140,6 +142,8 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU a
   </tbody>
 </table>
 
+
+- For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
