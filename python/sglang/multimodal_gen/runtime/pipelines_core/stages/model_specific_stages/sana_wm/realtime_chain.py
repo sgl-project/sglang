@@ -19,6 +19,8 @@ causal VAE decode helpers; model-specific chunk planning stays in this module.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -41,6 +43,7 @@ from .base import (
     _SANA_WM_DEFAULT_TRANSLATION_SPEED,
     SanaWMBeforeDenoisingStage,
     configure_sana_wm_ltx2_vae_for_long_video,
+    snap_sana_wm_num_frames,
 )
 from .realtime_stage import (
     DEFAULT_REFINER_BLOCK_SIZE,
@@ -52,7 +55,6 @@ from .realtime_stage import (
 )
 from .streaming import SanaWMStreamCacheState, SanaWMStreamingDenoisingStage
 from .streaming_refiner import RefinerChunkRunner
-from .utils import snap_num_frames
 
 
 # --------------------------------------------------------------------- #
@@ -160,7 +162,7 @@ class SanaWMCondFrameEncodeStage(SanaWMRealtimeStage):
             if st.open_ended:
                 st.latent_t = None
             else:
-                num_frames = snap_num_frames(int(batch.num_frames), stride=8)
+                num_frames = snap_sana_wm_num_frames(int(batch.num_frames), stride=8)
                 batch.num_frames = num_frames
                 st.latent_t = (num_frames - 1) // 8 + 1
             st.num_frame_per_block = int(
@@ -509,8 +511,6 @@ class SanaWMChunkedRefinerChainStage(SanaWMRealtimeStage):
     ) -> RefinerChunkRunner:
         # Reuse the parity-validated builder via a state adapter that exposes
         # prompt/sink/block/kv_max in the legacy state shape it expects.
-        from types import SimpleNamespace
-
         legacy = SimpleNamespace(
             prompt=inputs.prompt,
             sink_size=st.sink_size,

@@ -17,6 +17,8 @@ from __future__ import annotations
 # --- debug parity harness (gated by env; no-op in production) ---
 import os as _os
 import time
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import torch
 
@@ -91,8 +93,6 @@ def self_forcing_denoise_chunk(
     ``forward_ctx`` (optional) maps ``int timestep -> context manager`` (batch
     wraps forward_long in set_forward_context; realtime does not).
     """
-    from contextlib import nullcontext
-
     ctx = forward_ctx if forward_ctx is not None else (lambda _ts: nullcontext())
 
     scheduler.set_timesteps(sigmas=sigmas, device=device)
@@ -451,8 +451,6 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
         iload=None,
     ):
         """Resolve sampler config + text/camera conditioning (shared by the offline loop and realtime path)."""
-        from types import SimpleNamespace
-
         pcfg = server_args.pipeline_config
         sampler_cfg = SanaWMSelfForcingSamplerConfig.from_pipeline_config(pcfg)
         explicit_sigmas = SanaWMSelfForcingSampler.build_per_chunk_sigmas(

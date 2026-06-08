@@ -18,8 +18,16 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .base import (
+    SANA_WM_TARGET_HEIGHT,
+    SANA_WM_TARGET_WIDTH,
     SanaWMBeforeDenoisingStage,
+    normalize_sana_wm_camera_actions,
+    sana_wm_action_to_camera_to_world_array,
+    sana_wm_load_camera,
+    sana_wm_load_intrinsics,
     sana_wm_normalize_vae_latents,
+    sana_wm_pil_to_model_tensor,
+    sana_wm_resize_and_center_crop,
 )
 from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
@@ -30,22 +38,10 @@ from .streaming_refiner import (
     RefinerChunkRunner,
     _RefinerCore,
 )
-from .utils import (
-    TARGET_HEIGHT,
-    TARGET_WIDTH,
-    action_string_to_c2w,
-    load_camera,
-    load_intrinsics,
-    normalize_camera_actions,
-    pil_to_model_tensor,
-    resize_and_center_crop,
-)
-
 logger = init_logger(__name__)
 
-# Local aliases for the SANA-WM pixel resolution (single source: utils.TARGET_HEIGHT/WIDTH).
-SANA_WM_HEIGHT = TARGET_HEIGHT
-SANA_WM_WIDTH = TARGET_WIDTH
+SANA_WM_HEIGHT = SANA_WM_TARGET_HEIGHT
+SANA_WM_WIDTH = SANA_WM_TARGET_WIDTH
 DEFAULT_REFINER_BLOCK_SIZE = 3
 DEFAULT_REFINER_KV_MAX_FRAMES = 11
 
@@ -64,7 +60,7 @@ def _deterministic_vae_encode_context():
 
 
 def _normalize_camera_actions(payload: Any) -> list[list[str]]:
-    return normalize_camera_actions(payload, allow_none=True)
+    return normalize_sana_wm_camera_actions(payload, allow_none=True)
 
 
 def _actions_to_action_string(actions: list[list[str]]) -> str:
@@ -182,7 +178,7 @@ class SanaWMRealtimeStage(RealtimeDiffusionStage):
         else:
             raise ValueError("SANA-WM realtime requires a first-frame image")
         target_h, target_w = self.target_pixel_size(batch)
-        cropped, src_size, resized_size, crop_offset = resize_and_center_crop(
+        cropped, src_size, resized_size, crop_offset = sana_wm_resize_and_center_crop(
             original, target_h, target_w
         )
         return cropped, original, src_size, resized_size, crop_offset
@@ -198,11 +194,11 @@ class SanaWMRealtimeStage(RealtimeDiffusionStage):
         condition_inputs = batch.condition_inputs or {}
         camera_path = condition_inputs.get("camera_path")
         if camera_path is not None:
-            c2w = load_camera(Path(str(camera_path)))
+            c2w = sana_wm_load_camera(Path(str(camera_path)))
         elif condition_inputs.get("camera") is not None:
             c2w = np.asarray(condition_inputs["camera"], dtype=np.float32)
         elif condition_inputs.get("action") is not None:
-            c2w = action_string_to_c2w(
+            c2w = sana_wm_action_to_camera_to_world_array(
                 str(condition_inputs["action"]),
                 translation_speed=translation_speed,
                 rotation_speed_deg=rotation_speed_deg,
@@ -229,7 +225,7 @@ class SanaWMRealtimeStage(RealtimeDiffusionStage):
     ) -> np.ndarray:
         condition_inputs = batch.condition_inputs or {}
         if condition_inputs.get("intrinsics_path") is not None:
-            return load_intrinsics(
+            return sana_wm_load_intrinsics(
                 Path(str(condition_inputs["intrinsics_path"])), num_frames
             )
         if condition_inputs.get("intrinsics") is not None:
@@ -284,7 +280,7 @@ class SanaWMRealtimeStage(RealtimeDiffusionStage):
         actions = list(state.camera_actions[:num_actions])
         if len(actions) < num_actions:
             actions.extend([[] for _ in range(num_actions - len(actions))])
-        return action_string_to_c2w(
+        return sana_wm_action_to_camera_to_world_array(
             _actions_to_action_string(actions),
             translation_speed=translation_speed,
             rotation_speed_deg=rotation_speed_deg,
@@ -301,7 +297,9 @@ class SanaWMRealtimeStage(RealtimeDiffusionStage):
     ) -> torch.Tensor:
         if hasattr(self.vae, "enable_tiling"):
             self.vae.enable_tiling()
-        image_tensor = pil_to_model_tensor(image, device=device, dtype=vae_dtype)
+        image_tensor = sana_wm_pil_to_model_tensor(
+            image, device=device, dtype=vae_dtype
+        )
         with _deterministic_vae_encode_context():
             # Must use the SAME shared core as the batch path's _vae_encode_image:
             # drifting this was a parity root cause.

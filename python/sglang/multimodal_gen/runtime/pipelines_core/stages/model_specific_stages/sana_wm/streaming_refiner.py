@@ -12,6 +12,7 @@ refiner transformer.
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 import torch
@@ -679,8 +680,6 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
             self.kv_max_frames,
             self.seed,
         )
-
-        import time
 
         t0 = time.perf_counter()
         with self.use_declared_component(

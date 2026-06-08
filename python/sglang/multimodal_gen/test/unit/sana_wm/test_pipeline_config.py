@@ -451,34 +451,15 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertAlmostEqual(float(poses[2, 2, 3]), 0.1, places=5)
         self.assertAlmostEqual(float(poses[3, 0, 3]), 0.05, places=5)
 
-    def test_action_rollout_single_sources_official_kinematics(self) -> None:
-        # The batch rollout must be BITWISE-identical to the official-matching
-        # utils.action_string_to_c2w (single kinematics implementation), and the
-        # official strafe->yaw coupling (yaw += 0.4 * (d - a)) must be live.
-        import torch
-
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.utils import (
-            action_string_to_c2w,
-        )
-
-        action = "w-4,wd-4,al-4,ij-2"
-        batch_poses = sana_wm_action_to_camera_to_world(
-            action, translation_speed=0.04, rotation_speed_deg=1.2
-        )
-        official_poses = torch.from_numpy(
-            action_string_to_c2w(action, translation_speed=0.04, rotation_speed_deg=1.2)
-        )
-        self.assertTrue(torch.equal(batch_poses, official_poses))
-
-        # Strafe-only action yaws the camera (forward axis tilts off +Z).
+    def test_action_rollout_uses_upstream_strafe_yaw_coupling(self) -> None:
+        # Strafe-only action yaws the camera (forward axis tilts off +Z), matching
+        # the upstream SANA-WM action convention.
         strafed = sana_wm_action_to_camera_to_world(
             "d-10", translation_speed=0.04, rotation_speed_deg=1.2
         )
         self.assertGreater(abs(float(strafed[-1, 0, 2])), 1e-4)
 
     def test_action_string_rejects_unknown_keys_and_bad_duration(self) -> None:
-        # Error wording comes from the canonical utils.parse_action_string
-        # (parse_sana_wm_action_string is an alias).
         with self.assertRaisesRegex(ValueError, "unknown action keys"):
             parse_sana_wm_action_string("x-1")
         with self.assertRaisesRegex(ValueError, "invalid duration"):
