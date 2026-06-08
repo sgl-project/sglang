@@ -1,5 +1,5 @@
+import copy
 import logging
-from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -16,7 +16,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
@@ -45,6 +44,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -57,11 +57,11 @@ logger = logging.getLogger(__name__)
 
 
 def _draft_runner_of(worker):
-    """Draft model_runner accessor that handles v1 / v2 worker naming.
+    """Draft model_runner accessor across worker shapes.
 
-    v1 (`EAGLEWorker` and subclasses) exposes the draft model_runner as
-    `model_runner` (the worker itself runs the draft model);
-    v2 (`EagleDraftWorker` and subclasses) exposes it as `draft_runner`.
+    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
+    model_runner as `draft_runner`; fall back to `model_runner` for workers
+    that run the draft model directly.
     """
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
@@ -126,6 +126,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             return
 
         batch.input_ids = self.draft_token
+        maybe_detect_oob(
+            batch.input_ids,
+            0,
+            batch.model_config.vocab_size,
+            "eagle prepare_for_verify input_ids",
+        )
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
@@ -252,10 +258,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
+            # hidden_size=None: worker fixup in forward_draft_extend_after_decode
+            # rebuilds via EagleDraftExtendInput.hidden_size_for(worker)
+            # (single source incl. EAGLE-3 aux widening).
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=batch.device,
-                hidden_size=batch.model_config.spec_hidden_size,
-                dtype=batch.model_config.dtype,
+                hidden_size=None,
+                dtype=None,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
@@ -347,18 +356,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after softmax")
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after top_k_renorm")
             if sampling_info.need_top_p_sampling:
                 target_probs = top_p_renorm_prob(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ps, self.draft_token_num, dim=0
                     ),
+                )
+                maybe_detect_nan(
+                    target_probs, "verify: target_probs after top_p_renorm"
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
@@ -416,6 +430,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 spec_steps=self.spec_steps,
             )
 
+        # accept_index values index batch.out_cache_loc (size = bs * draft_token_num);
+        # -1 is the reject sentinel.
+        maybe_detect_oob(
+            accept_index,
+            -1,
+            bs * self.draft_token_num,
+            "eagle verify accept_index post-sampling",
+        )
+        maybe_detect_oob(
+            num_correct_drafts,
+            0,
+            self.draft_token_num + 1,
+            "eagle verify num_correct_drafts post-sampling",
+        )
+
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
@@ -435,7 +464,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
+                req.update_finish_state()
                 if not req.finished() and req.grammar is not None:
                     try:
                         req.grammar.accept_token(id)
@@ -444,7 +473,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                             f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                         )
                         raise e
-                    req.check_finished()
+                    req.update_finish_state()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
@@ -473,6 +502,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
         accept_tokens = predict[accept_index]
+        maybe_detect_oob(
+            accept_tokens,
+            0,
+            batch.model_config.vocab_size,
+            "eagle verify accept_tokens",
+        )
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         num_correct_drafts_cpu = num_correct_drafts.cpu()
@@ -559,7 +594,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
 
             draft_extend_input = EagleDraftExtendInput(
-                hidden_states=batch.spec_info.hidden_states[accept_index],
+                hidden_states=(
+                    batch.spec_info.hidden_states[accept_index]
+                    if batch.spec_info.hidden_states is not None
+                    else None
+                ),
                 num_correct_drafts=num_correct_drafts,
                 num_accept_tokens=num_correct_drafts + 1,
                 num_accept_tokens_cpu=num_accept_tokens_list,
@@ -627,9 +666,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     unfinished_index_device
                 ]
                 draft_extend_input = EagleDraftExtendInput(
-                    hidden_states=batch.spec_info.hidden_states[
-                        unfinished_accept_index
-                    ],
+                    hidden_states=(
+                        batch.spec_info.hidden_states[unfinished_accept_index]
+                        if batch.spec_info.hidden_states is not None
+                        else None
+                    ),
                     num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
                     num_correct_drafts=unfinished_num_correct_drafts,
                     num_accept_tokens=unfinished_num_correct_drafts + 1,
@@ -639,10 +680,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
                 )
             else:
+                # hidden_size=None: worker fixup rebuilds via
+                # EagleDraftExtendInput.hidden_size_for(worker) (single source).
                 draft_extend_input = EagleDraftExtendInput.create_idle_input(
                     device=batch.device,
-                    hidden_size=batch.model_config.spec_hidden_size,
-                    dtype=batch.model_config.dtype,
+                    hidden_size=None,
+                    dtype=None,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
 
@@ -665,7 +708,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
-    hidden_states: torch.Tensor = None
+    # None when the spec algorithm's draft doesn't read hidden_states
+    # (e.g., STANDALONE — vanilla LLM draft).
+    hidden_states: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
@@ -680,10 +725,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
-    # V2 overlap worker only
-    future_indices: Optional[FutureIndices] = None
-    new_seq_lens: Optional[torch.Tensor] = None
-    verify_done: Optional[torch.cuda.Event] = None
+    # V2 overlap worker only: req_pool_indices used as buf slot keys.
+    future_indices: Optional[torch.Tensor] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
@@ -695,54 +738,46 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
-
-        if batch.forward_mode.is_idle():
-            return
-
-        # Prefill only generate 1 token.
-        assert len(self.bonus_tokens) == len(batch.seq_lens)
-
-        pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
-            batch.input_ids[pt : pt + extend_len] = torch.cat(
-                (input_ids[1:], self.bonus_tokens[i].reshape(1))
-            )
-            pt += extend_len
-
     @classmethod
-    def hidden_size_for(cls, worker) -> int:
+    def hidden_size_for(cls, worker) -> Optional[int]:
         """Decode-phase `hidden_states` width: draft self-chain output
         (draft model writes its own last hidden back via `capture_for_decode`
-        and the draft loop)."""
+        and the draft loop). Returns None when the draft architecture doesn't
+        consume the field (e.g., STANDALONE)."""
+        if worker.speculative_algorithm.is_standalone():
+            return None
         return _draft_runner_of(worker).model_config.spec_hidden_size
 
     @classmethod
-    def dtype_for(cls, worker) -> torch.dtype:
+    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+        if worker.speculative_algorithm.is_standalone():
+            return None
         return _draft_runner_of(worker).model_config.dtype
 
     @classmethod
     def create_idle_input(
         cls,
         device: torch.device,
-        hidden_size: int,
-        dtype: torch.dtype,
+        hidden_size: Optional[int],
+        dtype: Optional[torch.dtype],
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
-            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
+            hidden_states=(
+                torch.empty((0, hidden_size), device=device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
-            self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.future_indices = self.future_indices[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -758,36 +793,40 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
-            self.hidden_states = self.hidden_states[: len(new_indices)]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[new_indices]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
-            self.future_indices = FutureIndices(
-                indices=torch.cat(
-                    [self.future_indices.indices, spec_info.future_indices.indices]
-                )
+            self.future_indices = torch.cat(
+                [self.future_indices, spec_info.future_indices]
             )
             return
 
-        if self.hidden_states is None:
+        # Detect idle stub by `topk_index` length (idle inputs have
+        # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
+        # for STANDALONE all non-idle inputs also have None hidden_states.
+        if len(self.topk_index) == 0:
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
-        if spec_info.hidden_states is None:
+        if len(spec_info.topk_index) == 0:
             return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
+        if self.hidden_states is not None and spec_info.hidden_states is not None:
+            self.hidden_states = torch.cat(
+                [self.hidden_states, spec_info.hidden_states], axis=0
+            )
         self.bonus_tokens = torch.cat(
             [self.bonus_tokens, spec_info.bonus_tokens], axis=0
         )
@@ -805,8 +844,9 @@ class EagleDraftExtendInput(SpecInput):
     """
 
     # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
-    # by accept_index; consumed by the draft-extend forward.
-    hidden_states: torch.Tensor = None
+    # by accept_index; consumed by the draft-extend forward. None when the spec
+    # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
+    hidden_states: Optional[torch.Tensor] = None
 
     # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.
     # Both kept for cuda-graph buffer indexing and the
@@ -845,9 +885,13 @@ class EagleDraftExtendInput(SpecInput):
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
-    def hidden_size_for(cls, worker) -> int:
+    def hidden_size_for(cls, worker) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
-        widened to `num_aux * target_hidden` for EAGLE-3 aux mode."""
+        widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
+        None when the draft architecture doesn't consume the field
+        (e.g., STANDALONE)."""
+        if worker.speculative_algorithm.is_standalone():
+            return None
         target_cfg = worker.target_worker.model_runner.model_config
         if not (
             worker.speculative_algorithm.is_eagle3()
@@ -868,19 +912,25 @@ class EagleDraftExtendInput(SpecInput):
         return target_hidden * num_aux
 
     @classmethod
-    def dtype_for(cls, worker) -> torch.dtype:
+    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+        if worker.speculative_algorithm.is_standalone():
+            return None
         return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
         cls,
         device: torch.device,
-        hidden_size: int,
-        dtype: torch.dtype,
+        hidden_size: Optional[int],
+        dtype: Optional[torch.dtype],
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST,
     ) -> "EagleDraftExtendInput":
         return cls(
-            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
+            hidden_states=(
+                torch.empty((0, hidden_size), device=device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            ),
             num_correct_drafts=torch.empty((0,), device=device, dtype=torch.int32),
             num_accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             num_accept_tokens_cpu=[],
@@ -973,6 +1023,10 @@ class EagleVerifyOutput:
     num_correct_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accept_indices: torch.Tensor
+    # Whether the target verify forward ran a captured cuda graph. Set by
+    # the worker after `EagleVerifyInput.sample` returns; default kept so
+    # idle / direct constructions don't have to pass it.
+    can_run_cuda_graph: bool = False
 
     @classmethod
     def create_idle(

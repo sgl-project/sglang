@@ -19,7 +19,10 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    USPAttention,
+    build_varlen_mask_meta,
+)
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
     FusedLayerNormScaleShiftGateSelect01,
@@ -45,7 +48,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -651,10 +656,18 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states_mask = cross_attention_kwargs.get(
             "encoder_hidden_states_mask"
         )
+        # Varlen metadata precomputed in QwenImageTransformer2DModel.forward,
+        # paired with the same ``attn_mask`` for the USPAttention FA fast path.
+        attn_mask_meta = cross_attention_kwargs.get("attn_mask_meta")
 
-        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
-            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
-        )
+        (
+            img_query,
+            img_key,
+            img_value,
+            txt_query,
+            txt_key,
+            txt_value,
+        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -726,6 +739,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_key,
             joint_value,
             attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=seq_len_txt,
         )
 
@@ -1118,7 +1132,7 @@ def to_hashable(obj):
     return obj
 
 
-class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Qwen.
 
@@ -1344,8 +1358,12 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-            block_attention_kwargs["attn_mask"] = torch.cat(
-                [encoder_hidden_states_mask, image_mask], dim=1
+            joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            block_attention_kwargs["attn_mask"] = joint_mask
+            # Precompute varlen metadata once per request so every block reuses
+            # the same cu_seqlens / indices instead of rebuilding.
+            block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
+                joint_mask
             )
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
 import pathlib
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -65,6 +67,36 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
+_LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+
+
+def _local_jit_source_hash(source_files: List[str]) -> str:
+    """Hash JIT source contents so TVM-FFI cache keys track included headers."""
+    digest = hashlib.sha256()
+    seen: set[pathlib.Path] = set()
+    stack = [pathlib.Path(path).resolve() for path in source_files]
+
+    while stack:
+        path = stack.pop()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+
+        data = path.read_bytes()
+        digest.update(str(path).encode())
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+
+        text = data.decode("utf-8", errors="ignore")
+        for include in _LOCAL_INCLUDE_RE.findall(text):
+            include_path = (path.parent / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+
+    return digest.hexdigest()[:16]
+
+
 @cache_once
 def _resolve_kernel_path() -> pathlib.Path:
     cur_dir = pathlib.Path(__file__).parent.resolve()
@@ -113,6 +145,12 @@ CPP_DTYPE_MAP = {
 @cache_once
 def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
+
+
+# MThreads/MUSA note:
+@cache_once
+def is_musa_runtime() -> bool:
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
 
 
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
@@ -195,6 +233,8 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    if cpp_files or cuda_files:
+        module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
@@ -277,7 +317,18 @@ def _jit_compile_context():
 # NOTE: this might also be used in __main__.py for compile flags export
 def _get_default_target_flags() -> List[str]:
     if is_hip_runtime():
-        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        # Detect FP8 type based on GPU architecture
+        try:
+            device = torch.cuda.current_device()
+            gcn_arch = torch.cuda.get_device_properties(device).gcnArchName
+            if "gfx942" in gcn_arch:
+                flags.append("-DHIP_FP8_TYPE_FNUZ=1")
+            else:
+                flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        except Exception:
+            flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        return flags
     else:
         return [
             get_jit_cuda_arch().jit_flag,
@@ -307,7 +358,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime():
+    if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 
