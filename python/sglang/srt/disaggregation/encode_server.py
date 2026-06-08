@@ -3234,6 +3234,7 @@ def launch_server(server_args: ServerArgs):
     # Register this encoder's URL with prefill server(s) if configured.
     if server_args.encoder_register_urls:
         import atexit
+
         _register_encoder_url_with_bootstrap(server_args)
         atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
@@ -3312,6 +3313,7 @@ def _launch_server_dp(server_args: ServerArgs):
     # Register this encoder's URL with prefill server(s) if configured.
     if server_args.encoder_register_urls:
         import atexit
+
         _register_encoder_url_with_bootstrap(server_args)
         atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
