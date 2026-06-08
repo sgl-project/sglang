@@ -32,18 +32,10 @@ This class is NPU-only; CUDA continues to use the unchanged
 from __future__ import annotations
 
 import math
-from contextlib import nullcontext
-from typing import Optional
 
 import torch
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.deepseek_v4_compress_state import (
-    CompressStatePool,
-    KVAndScore,
-)
-from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 
 
 def npu_state_pool_size(
@@ -91,7 +83,7 @@ class NPUCompressStatePool(CompressStatePool):
     Inherits everything from :class:`CompressStatePool` except the size
     formula and the post-init block-0 sentinel fill. The buffer layout
     ``(self._size, 2*coff*head_dim)`` and the ``state_cache_3d`` reshape
-    are unchanged, so :meth:`DeepSeekV4TokenToKVPool.get_attention_compress_state_cache`
+    are unchanged, so :meth:`DeepSeekV4TokenToKVPool.get_state_cache`
     keeps returning the kernel-expected ``(num_blocks, page_size,
     2*coff*head_dim)`` view without further plumbing.
     """
@@ -149,29 +141,14 @@ class NPUCompressStatePool(CompressStatePool):
         # Slot dim = 2 * coff * head_dim = [kv | score] concatenated, where
         # coff = 1 (no overlap) or 2 (overlap). Matches CompressStatePool's
         # non-online layout exactly so KVAndScore.kv / .score halves work.
-        last_dim = 2 * (1 + int(overlap)) * head_dim
-        self.last_dim = last_dim
+        self.last_dim = 2 * (1 + int(overlap)) * head_dim
 
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+        # Reuse the parent's buffer-allocation helper (memory-saver region +
+        # custom mem pool + KVAndScore wrap); only ``self._size`` differs from
+        # the ring-based parent path.
+        self._alloc_kv_score_buffer(
+            dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-            maybe_init_custom_mem_pool(device=device)
-        )
-
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.custom_mem_pool
-                else nullcontext()
-            ):
-                self.kv_score_buffer = KVAndScore(
-                    torch.empty(
-                        (self._size, last_dim),
-                        dtype=dtype,
-                        device=device,
-                    )
-                )
 
         # Reserve block 0 as the kernel's skip-sentinel:
         # kv half zeroed, score half -inf so any softmax over it contributes 0.
