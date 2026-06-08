@@ -254,7 +254,7 @@ class EAGLEWorker(TpModelWorker):
                     cuda_graph_bs=(
                         None
                         if self.server_args.disable_cuda_graph
-                        else self.server_args.cuda_graph_bs
+                        else self.server_args.cuda_graph_bs_decode
                     ),
                 )
 
@@ -449,7 +449,7 @@ class EAGLEWorker(TpModelWorker):
             self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
-            sa.cuda_graph_bs,
+            sa.cuda_graph_bs_decode,
             sa.disable_cuda_graph,
         )
         self.speculative_num_steps = speculative_num_steps
@@ -457,7 +457,7 @@ class EAGLEWorker(TpModelWorker):
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
         if cuda_graph_bs is not None:
-            sa.cuda_graph_bs = cuda_graph_bs
+            sa.cuda_graph_bs_decode = cuda_graph_bs
             # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
             # for steps that no BS range uses (e.g. step=1). Disable graph
             # capture for those steps; restore in finally so subsequent steps
@@ -477,7 +477,7 @@ class EAGLEWorker(TpModelWorker):
                 self.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
-                sa.cuda_graph_bs,
+                sa.cuda_graph_bs_decode,
                 sa.disable_cuda_graph,
             ) = backup
 
