@@ -6,7 +6,6 @@ import os
 import shutil
 import tempfile
 import time
-from dataclasses import fields, is_dataclass
 from typing import Any, Dict, Optional
 
 from fastapi import (
@@ -52,97 +51,8 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
-_EXTRA_PARAM_CONTAINERS = ("extra_body", "extra_json", "extra_args", "extra_params")
-_MULTIPART_EXTRA_SKIP_KEYS = {"extra_body", "extra_params", "input_reference"}
-
-
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
     return (request.model_extra or {}).get(name)
-
-
-# Resolved once on first use and then frozen — server args do not change at runtime.
-_SERVED_SAMPLING_PARAM_FIELD_NAMES: set[str] | None = None
-
-
-def _served_sampling_param_field_names() -> set[str]:
-    """Return dataclass fields for the currently served sampling params class.
-
-    The result is cached after the first call because the server configuration
-    is immutable once the server has started.
-    """
-    global _SERVED_SAMPLING_PARAM_FIELD_NAMES
-    if _SERVED_SAMPLING_PARAM_FIELD_NAMES is not None:
-        return _SERVED_SAMPLING_PARAM_FIELD_NAMES
-
-    server_args = get_global_server_args()
-    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
-    sampling_param_cls = None
-    try:
-        if pipeline_class_name:
-            from sglang.multimodal_gen.registry import get_pipeline_config_classes
-
-            config_classes = get_pipeline_config_classes(pipeline_class_name)
-            if config_classes is not None:
-                _, sampling_param_cls = config_classes
-        if sampling_param_cls is None:
-            from sglang.multimodal_gen.registry import get_model_info
-
-            model_info = get_model_info(
-                server_args.model_path,
-                backend=server_args.backend,
-                model_id=server_args.model_id,
-            )
-            sampling_param_cls = model_info.sampling_param_cls
-    except Exception:
-        logger.debug("Unable to resolve served sampling params class", exc_info=True)
-        # Return an empty set but do NOT cache — the next request may succeed
-        # if the registry is still initialising at startup.
-        return set()
-
-    result = (
-        {field.name for field in fields(sampling_param_cls)}
-        if sampling_param_cls is not None and is_dataclass(sampling_param_cls)
-        else set()
-    )
-    _SERVED_SAMPLING_PARAM_FIELD_NAMES = result
-    return result
-
-
-def _parse_extra_container(value: Any) -> dict[str, Any]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except Exception:
-            return {}
-    if isinstance(value, dict):
-        return flatten_extra_params(dict(value))
-    return {}
-
-
-def _request_extra_fields(request: VideoGenerationsRequest) -> dict[str, Any]:
-    """Return unknown OpenAI request fields, including nested extra containers."""
-    extra = dict(request.model_extra or {})
-    flattened: dict[str, Any] = {}
-    for container_name in _EXTRA_PARAM_CONTAINERS:
-        flattened.update(_parse_extra_container(extra.pop(container_name, None)))
-    flattened.update(flatten_extra_params(extra))
-    return flattened
-
-
-def _model_specific_sampling_kwargs(request: VideoGenerationsRequest) -> dict[str, Any]:
-    field_names = _served_sampling_param_field_names()
-    kwargs: dict[str, Any] = {}
-
-    if request.condition_inputs is not None:
-        kwargs["condition_inputs"] = request.condition_inputs
-
-    request_field_names = set(VideoGenerationsRequest.model_fields)
-    for name, value in _request_extra_fields(request).items():
-        if value is None:
-            continue
-        if name not in request_field_names and name in field_names:
-            kwargs[name] = value
-    return kwargs
 
 
 def _parse_form_extra_value(value: Any) -> Any:
@@ -164,8 +74,6 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
     if num_outputs is None:
         num_outputs = request.n or 1
 
-    model_specific_kwargs = _model_specific_sampling_kwargs(request)
-
     return build_sampling_params(
         request_id,
         prompt=request.prompt,
@@ -182,7 +90,6 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         num_inference_steps=request.num_inference_steps,
         guidance_scale=request.guidance_scale,
         guidance_scale_2=request.guidance_scale_2,
-        true_cfg_scale=request.true_cfg_scale,
         negative_prompt=request.negative_prompt,
         max_sequence_length=request.max_sequence_length,
         flow_shift=request.flow_shift,
@@ -203,7 +110,6 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_quality=request.output_quality,
         perf_dump_path=request.perf_dump_path,
         diffusers_kwargs=request.diffusers_kwargs,
-        **model_specific_kwargs,
     )
 
 
@@ -311,7 +217,7 @@ async def _dispatch_job_async(
         )
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error("Job %s failed during generation", job_id, exc_info=True)
+        logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
@@ -419,14 +325,20 @@ async def create_video(
             return value if value is not None else extra_from_form.get(name)
 
         raw_form = await request.form()
-        for key, value in raw_form.items():
-            if key in _MULTIPART_EXTRA_SKIP_KEYS or key in extra_from_form:
-                continue
-            if isinstance(value, UploadFile) or (
-                hasattr(value, "filename") and hasattr(value, "file")
-            ):
-                continue
-            extra_from_form[key] = _parse_form_extra_value(value)
+        for key in (
+            "use_duration_template",
+            "use_resolution_template",
+            "use_system_prompt",
+            "use_guardrails",
+            "guardrails",
+            "generate_sound",
+            "sound_duration",
+            "action_mode",
+            "condition_frame_indexes_vision",
+            "condition_video_keep",
+        ):
+            if key in raw_form and key not in extra_from_form:
+                extra_from_form[key] = _parse_form_extra_value(raw_form[key])
         flatten_extra_params(extra_from_form)
 
         request_field_names = set(VideoGenerationsRequest.model_fields)
@@ -455,8 +367,6 @@ async def create_video(
             negative_prompt=form_value("negative_prompt", negative_prompt),
             num_inference_steps=form_value("num_inference_steps", num_inference_steps),
             guidance_scale=form_value("guidance_scale", guidance_scale),
-            guidance_scale_2=form_value("guidance_scale_2", None),
-            true_cfg_scale=form_value("true_cfg_scale", None),
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
@@ -481,8 +391,6 @@ async def create_video(
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             diffusers_kwargs=form_value("diffusers_kwargs", None),
-            condition_inputs=form_value("condition_inputs", None),
-            perf_dump_path=form_value("perf_dump_path", None),
             **extra_request_fields,
         )
     else:
