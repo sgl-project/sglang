@@ -34,6 +34,7 @@ class MoeA2ABackend(Enum):
     NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
+    TORCH_NPU = "torch_npu"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
@@ -65,6 +66,9 @@ class MoeA2ABackend(Enum):
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
 
+    def is_torch_npu(self):
+        return self == MoeA2ABackend.TORCH_NPU
+
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
@@ -90,6 +94,7 @@ class MoeRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
+    TORCH_NPU = "torch_npu"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
@@ -108,6 +113,9 @@ class MoeRunnerBackend(Enum):
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
+
+    def is_torch_npu(self):
+        return self == MoeRunnerBackend.TORCH_NPU
 
     def is_triton_kernels(self):
         return self == MoeRunnerBackend.TRITON_KERNELS
@@ -244,6 +252,22 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
 
     # 6. Default → FP8
     return DeepEPOutputDtype.FP8
+
+
+def get_ascend_dispatcher_output_dtype(self):
+    """
+    Automatically choose the dispatch output dtype for Ascend.
+    """
+
+    # 1. Parse quant config to determine the output dtype of dispatcher
+    if self.quant_config is not None:
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return dispatcher_output_dtype
+
+    # 2. Default on NPU → BF16
+    if _is_npu:
+        return DeepEPOutputDtype.BF16
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None

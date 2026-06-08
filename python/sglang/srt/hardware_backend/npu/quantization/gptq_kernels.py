@@ -5,14 +5,32 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch_npu
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    npu_fused_experts,
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
+
+import torch_npu
+
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4MoEMethod,
+)
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
 
 def unpack_from_int32(
@@ -140,6 +158,13 @@ class GPTQMoEAscendKernel:
         **extra_weight_attrs,
     ):
         self.moe_runner_config = moe_runner_config
+        layer.w13_kernel = NPUW4A16Int4MoEMethod()
+        layer.w2_kernel = NPUW4A16Int4MoEMethod()
+        moe_runner_config.layer = layer
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
@@ -278,38 +303,14 @@ class GPTQMoEAscendKernel:
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        assert self.moe_runner_config is not None, (
-            "moe_runner_config is not set. "
-            "Did you forget to call create_weights/create_moe_runner?"
+    ) -> "CombineInput":
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
         )
-
-        assert self.moe_runner_config.activation in ("silu", "swiglu"), (
-            f"Only SiLU/Swiglu activation is supported, "
-            f"got {self.moe_runner_config.activation!r}."
-        )
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        topk_weights, topk_ids, _ = topk_output
-
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_qweight,
-            w13_scale=layer.w13_scales,
-            w13_offset=layer.w13_qzeros,
-            w2=layer.w2_qweight,
-            w2_scale=layer.w2_scales,
-            w2_offset=layer.w2_qzeros,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-            use_wna16=True,
-        )
-
-        return StandardCombineInput(hidden_states=output)
+        return self.runner.run(dispatch_output, quant_info)

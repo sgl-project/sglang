@@ -7,13 +7,27 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4DynamicMoEMethod,
 )
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
 from sglang.srt.layers.quantization.utils import replace_parameter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 import torch_npu
+
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 
 
 class AWQAscendLinearKernel:
@@ -74,7 +88,8 @@ class AWQAscendLinearKernel:
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         self.quant_config = quant_config
-        self.kernel = NPUW4A16Int4DynamicMoEMethod()
+        self.w13_kernel = NPUW4A16Int4DynamicMoEMethod()
+        self.w2_kernel = NPUW4A16Int4DynamicMoEMethod()
 
     @staticmethod
     def _register_or_replace_parameter(
@@ -146,29 +161,36 @@ class AWQAscendMoEKernel:
             ),
         )
 
-        self.kernel.process_weights_after_loading(layer)
+        self.w13_kernel.process_weights_after_loading(layer, "w13")
+        self.w2_kernel.process_weights_after_loading(layer, "w2")
+
+    def create_moe_runner(
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: "MoeRunnerConfig",
+        **extra_weight_attrs,
+    ):
+        self.moe_runner_config = moe_runner_config
+        layer.w13_kernel = self.w13_kernel
+        layer.w2_kernel = self.w2_kernel
+        moe_runner_config.layer = layer
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
-    ) -> torch.Tensor:
-        return self.kernel.apply(layer, dispatch_output)
-
-    def apply_without_routing_weights(
-        self,
-        layer,
-        hidden_states,
-        hidden_states_scale,
-        group_list_type,
-        group_list,
-        output_dtype,
-    ):
-        return self.kernel.apply_without_routing_weights(
-            layer,
-            hidden_states,
-            hidden_states_scale,
-            group_list_type,
-            group_list,
-            output_dtype,
+    ) -> "CombineInput":
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
         )
+        return self.runner.run(dispatch_output, quant_info)

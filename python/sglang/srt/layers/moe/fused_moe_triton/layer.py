@@ -45,6 +45,9 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatch
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.torch_npu import (
+    TorchNpuDispatcher,
+)
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -70,6 +73,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     print_info_once,
     round_up,
 )
@@ -78,12 +82,15 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if (
+    if a2a_backend.is_none() and _is_npu:
+        return TorchNpuDispatcher(moe_runner_config)
+    elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_ascend_fuseep()
@@ -121,6 +128,11 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
+        )
+    elif a2a_backend.is_torch_npu():
+        # Use NPU-optimised dispatcher with native init/finalize ops
+        return TorchNpuDispatcher(
+            moe_runner_config,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")

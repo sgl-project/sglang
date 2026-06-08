@@ -153,4 +153,4 @@ class AWQAscendMoEScheme(AWQMoEScheme):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        self.moe_runner_config = moe_runner_config
+        self.kernel.create_moe_runner(layer, moe_runner_config)
