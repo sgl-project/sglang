@@ -75,13 +75,13 @@ def find_transition_steps(
     Returns {stage: step_index} for stages >= 2.
     """
     transitions: dict[int, int] = {}
-    sigmas_cpu = scheduler_sigmas.cpu()
+    sigmas_list = scheduler_sigmas.cpu().tolist()
     for s, thresh in stage_sigmas.items():
         if s == 1:
             continue
         found = n_steps
         for i in range(n_steps):
-            if sigmas_cpu[i].item() <= thresh:
+            if sigmas_list[i] <= thresh:
                 found = i
                 break
         transitions[s] = found

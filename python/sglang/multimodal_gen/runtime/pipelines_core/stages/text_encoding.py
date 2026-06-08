@@ -261,6 +261,8 @@ class TextEncodingStage(ConditionEncodingStage):
         ) -> torch.Tensor:
             # 2-D: seq × dim with no batch dim — implicitly batch=1.
             if tensor.ndim == 2:
+                if target_batch > 1:
+                    return tensor.unsqueeze(0).repeat(target_batch, 1, 1)
                 return tensor
             if tensor.shape[0] == target_batch:
                 return tensor

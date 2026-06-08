@@ -132,8 +132,8 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         # Each stage halves the spatial dims; Wan needs even dims at every stage.
         # Required: H_lat divisible by 2^L * patch_spatial (= 2^L * 2).
         align_pixels = vae_scale * (2**levels) * 2
-        h_aligned = (batch.height // align_pixels) * align_pixels
-        w_aligned = (batch.width // align_pixels) * align_pixels
+        h_aligned = max((batch.height // align_pixels) * align_pixels, align_pixels)
+        w_aligned = max((batch.width // align_pixels) * align_pixels, align_pixels)
 
         if h_aligned != batch.height or w_aligned != batch.width:
             logger.info(
