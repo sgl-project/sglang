@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=478, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(est_time=600, stage="base-c", runner_config="deepep-4-gpu-h100")
 
 
 class TestPureDP(CustomTestCase):
@@ -225,6 +225,73 @@ class TestTBO(CustomTestCase):
                 "--enable-two-batch-overlap",
                 "--cuda-graph-max-bs",
                 "128",
+                "--max-running-requests",
+                "512",
+            ],
+            env={
+                **os.environ,
+                "SGLANG_TBO_DEBUG": "1",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(metrics)
+
+        self.assertGreater(metrics["score"], 0.60)
+
+
+class TestTBOWithSharedExpertsFusion(CustomTestCase):
+    """TBO + shared-experts fusion on DeepSeek (issue #24690).
+
+    Runs in eager mode (--disable-cuda-graph) on purpose: the bugs this guards
+    (the filter_batch rids assert and the op_gate / DeepEP
+    `x.size(0) == topk_idx.size(0)` mismatch on padded sub-max / idle DP ranks)
+    only surface on the eager forward path. With CUDA graph on, IDLE batches
+    replay through compute_split_indices_for_cuda_graph_replay and never hit
+    these code paths, so a graph-on test would not regression-guard the fix.
+
+    Note: verify the CI model actually engages fusion -- the log should print
+    "Shared experts fusion optimization enabled" at load. --enforce-shared-
+    experts-fusion bypasses the config checks but the weight loader still
+    requires num_fused_shared_experts == 1 (n_shared_experts == 1).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--enable-dp-attention",
+                "--dp",
+                "4",
+                "--moe-dense-tp-size",
+                "1",
+                "--moe-a2a-backend",
+                "deepep",
+                "--enable-two-batch-overlap",
+                "--enforce-shared-experts-fusion",
+                "--disable-cuda-graph",
                 "--max-running-requests",
                 "512",
             ],
