@@ -399,9 +399,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             from sglang.srt.utils.common import is_sm120_supported
 
             if is_sm120_supported():
-                hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                    hidden_states_scale.view(torch.float32)
-                ).view(torch.int32)
+                hidden_states_scale = (
+                    deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                        hidden_states_scale.view(torch.float32)
+                    ).view(torch.int32)
+                )
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
@@ -945,9 +947,11 @@ def _varlen_deep_gemm_silu_mul_quant(
             from sglang.srt.utils.common import is_sm120_supported
 
             if is_sm120_supported():
-                down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                    down_input_scale.view(torch.float32)
-                ).view(torch.int32)
+                down_input_scale = (
+                    deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                        down_input_scale.view(torch.float32)
+                    ).view(torch.int32)
+                )
     return down_input, down_input_scale
 
 
