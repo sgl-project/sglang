@@ -10,6 +10,7 @@ pub mod power_of_two;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
+pub mod sticky;
 
 use crate::discovery::ModelId;
 use crate::server::metrics::MetricsRegistry;
