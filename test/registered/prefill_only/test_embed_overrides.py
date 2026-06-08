@@ -5,7 +5,7 @@ Covers:
 - convert_embeds_to_tensors (utils.py)
 - TokenizerManager._resolve_embed_overrides (tokenizer_manager.py)
 - positional_embed_overrides on GenerateReqInput/EmbeddingReqInput (io_struct.py)
-- Score mixin override resolution (tokenizer_manager_score_mixin.py)
+- ScoreRequestHandler override resolution (score_request_handler.py)
 """
 
 import unittest
@@ -20,9 +20,6 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_components.score_request_handler import (
     ScoreRequestHandler,
     ScoreRequestHandlerConfig,
-)
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
 )
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -227,8 +224,7 @@ class TestResolveOverridesForSequence(CustomTestCase):
         self.handler = _make_handler()
 
     def test_none_embeds_returns_empty(self):
-        embeds, positions = TokenizerManagerScoreMixin._resolve_overrides_for_sequence(
-            self.handler,
+        embeds, positions = self.handler._resolve_overrides_for_sequence(
             token_ids=[10, 50, 20],
             embeds=None,
             embed_override_token_id=50,
@@ -238,8 +234,7 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
     def test_basic_resolution(self):
         e1, e2 = _vec(1), _vec(2)
-        embeds, positions = TokenizerManagerScoreMixin._resolve_overrides_for_sequence(
-            self.handler,
+        embeds, positions = self.handler._resolve_overrides_for_sequence(
             token_ids=[50, 10, 50],
             embeds=[e1, e2],
             embed_override_token_id=50,
@@ -248,8 +243,7 @@ class TestResolveOverridesForSequence(CustomTestCase):
         self.assertEqual(positions, [0, 2])
 
     def test_with_offset(self):
-        embeds, positions = TokenizerManagerScoreMixin._resolve_overrides_for_sequence(
-            self.handler,
+        embeds, positions = self.handler._resolve_overrides_for_sequence(
             token_ids=[10, 50],
             embeds=[_vec()],
             embed_override_token_id=50,
@@ -259,8 +253,7 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
     def test_empty_embeds_list(self):
         """Empty embeds list with no placeholders succeeds."""
-        embeds, positions = TokenizerManagerScoreMixin._resolve_overrides_for_sequence(
-            self.handler,
+        embeds, positions = self.handler._resolve_overrides_for_sequence(
             token_ids=[10, 20],
             embeds=[],
             embed_override_token_id=50,
@@ -270,8 +263,7 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
     def test_count_mismatch_raises(self):
         with self.assertRaises(ValueError):
-            TokenizerManagerScoreMixin._resolve_overrides_for_sequence(
-                self.handler,
+            self.handler._resolve_overrides_for_sequence(
                 token_ids=[50, 50],
                 embeds=[_vec()],
                 embed_override_token_id=50,
@@ -288,8 +280,7 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.handler = _make_handler()
 
     def test_no_overrides_returns_none(self):
-        result = TokenizerManagerScoreMixin._resolve_embed_overrides_for_request(
-            self.handler,
+        result = self.handler._resolve_embed_overrides_for_request(
             query=[10, 20],
             item=[30, 40],
             embed_override_token_id=50,
@@ -301,8 +292,7 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.assertIsNone(result)
 
     def test_query_only_overrides(self):
-        pe = TokenizerManagerScoreMixin._resolve_embed_overrides_for_request(
-            self.handler,
+        pe = self.handler._resolve_embed_overrides_for_request(
             query=[50, 20],
             item=[30, 40],
             embed_override_token_id=50,
@@ -316,8 +306,7 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.assertEqual(pe.embeds.shape, (1, HIDDEN_DIM))
 
     def test_item_only_overrides(self):
-        pe = TokenizerManagerScoreMixin._resolve_embed_overrides_for_request(
-            self.handler,
+        pe = self.handler._resolve_embed_overrides_for_request(
             query=[10, 20],
             item=[50, 40],
             embed_override_token_id=50,
@@ -329,8 +318,7 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.assertEqual(pe.positions, [2])  # offset applied
 
     def test_query_and_item_overrides(self):
-        pe = TokenizerManagerScoreMixin._resolve_embed_overrides_for_request(
-            self.handler,
+        pe = self.handler._resolve_embed_overrides_for_request(
             query=[50, 20],
             item=[30, 50],
             embed_override_token_id=50,
@@ -358,8 +346,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_single_item_no_embeds(self):
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[1, 2],
                 items=[[3, 4], [5, 6]],
                 item_first=False,
@@ -374,8 +361,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_single_item_no_embeds_item_first(self):
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[1, 2],
                 items=[[3, 4]],
                 item_first=True,
@@ -392,8 +378,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_multi_item_no_embeds(self):
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[1, 2],
                 items=[[3, 4], [5, 6]],
                 item_first=False,
@@ -414,8 +399,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
     def test_single_item_query_embeds(self):
         """Query placeholder overrides are resolved per item."""
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[50, 10],
                 items=[[20, 30], [40, 50]],
                 item_first=False,
@@ -435,8 +419,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
     def test_single_item_item_embeds(self):
         """Per-item overrides with correct position offsets."""
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[10, 20],
                 items=[[50, 30]],
                 item_first=False,
@@ -454,8 +437,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
     def test_single_item_no_override_positions_returns_none_injection(self):
         """When no items have placeholders, positional_embed_overrides should be None."""
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[10, 20],
                 items=[[30, 40]],
                 item_first=False,
@@ -470,8 +452,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
     def test_single_item_query_and_item_embeds(self):
         """Single-item mode with both query and item overrides in one request."""
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[50, 10],
                 items=[[20, 50]],
                 item_first=False,
@@ -491,8 +472,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
     def test_single_item_empty_query(self):
         """Empty query with item-only overrides (valid from score_prompts)."""
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[],
                 items=[[50, 10]],
                 item_first=False,
@@ -512,8 +492,7 @@ class TestBuildTokenIdInputs(CustomTestCase):
     def test_multi_item_with_query_and_item_embeds(self):
         """Multi-item mode resolves query overrides once and item overrides per item."""
         _, input_ids, positional_embed_overrides, _ = (
-            TokenizerManagerScoreMixin._build_token_id_inputs(
-                self.handler,
+            self.handler._build_token_id_inputs(
                 query=[50, 10],
                 items=[[20, 50], [30, 40]],
                 item_first=False,
@@ -551,9 +530,7 @@ class TestScoreRequestValidation(CustomTestCase):
         """Wrapper to call score_request synchronously."""
         import asyncio
 
-        return asyncio.run(
-            TokenizerManagerScoreMixin.score_request(self.handler, **kwargs)
-        )
+        return asyncio.run(self.handler.score_request(**kwargs))
 
     def test_generation_requires_label_token_ids(self):
         self.handler = _make_handler(is_generation=True)

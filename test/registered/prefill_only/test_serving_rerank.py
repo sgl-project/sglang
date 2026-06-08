@@ -1,11 +1,10 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import V1RerankReqInput
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
+from sglang.srt.managers.tokenizer_manager_components.score_request_handler import (
     ScoreResult,
-    TokenizerManagerScoreMixin,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -175,12 +174,9 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         adapted, _ = handler._convert_to_internal_request(req)
         raw_request = Mock()
 
-        with patch.object(
-            TokenizerManagerScoreMixin, "score_prompts", _TM.score_prompts
-        ):
-            res = asyncio.run(
-                handler._handle_non_streaming_request(adapted, req, raw_request)
-            )
+        res = asyncio.run(
+            handler._handle_non_streaming_request(adapted, req, raw_request)
+        )
         self.assertEqual([r.document for r in res], ["d1", "d2"])
         self.assertAlmostEqual(res[0].score, 0.9 / (0.9 + 0.1))
         self.assertAlmostEqual(res[1].score, 0.2 / (0.2 + 0.8))
