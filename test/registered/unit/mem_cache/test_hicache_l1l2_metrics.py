@@ -871,13 +871,20 @@ class TestHiCacheL1L2TransferCollectorPrometheusOutput(unittest.TestCase):
             bytes_=1024,
             xfer_us=None,
         )
-        # Count must be 0 — no observation recorded.
-        line = self._find_metric_line(
-            self._exposition(),
-            "hicache_l1_l2_transfer_duration_us_count",
-            direction="offload",
-        )
-        self.assertTrue(line.endswith(" 0.0"), f"Expected count 0.0 in: {line!r}")
+        # No observation was recorded, so prometheus_client never instantiates a
+        # labeled child for the histogram — no _count series is emitted at all.
+        exposition = self._exposition()
+        for line in exposition.splitlines():
+            if line.startswith("#"):
+                continue
+            if (
+                "hicache_l1_l2_transfer_duration_us_count" in line
+                and 'direction="offload"' in line
+            ):
+                self.fail(
+                    "Expected no duration _count series when xfer_us is None, "
+                    f"but found: {line!r}\nin:\n{exposition}"
+                )
 
 
 if __name__ == "__main__":
