@@ -11,22 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Spec-v2 (overlap-capable) worker for Frozen-KV MTP.
+"""Spec-v2 worker for Frozen-KV MTP (two layers, like ``eagle_worker_v2``).
 
-Two layers, mirroring ``eagle_worker_v2``:
-
-- ``FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker)`` -- the assistant. Reads
-  the target KV cache read-only (it owns no KV pool of its own) and runs the
-  seed + recurrent draft loop. The draft-loop bodies are ported verbatim from
-  the former ``FrozenKVMTPWorker``.
-- ``FrozenKVMTPWorkerV2(EAGLEWorkerV2)`` -- the orchestrator. The verify /
-  ``move_accept_tokens`` / forward skeleton is reused from EAGLE unchanged;
-  only the draft worker and the seed-based "draft extend" are frozen-specific.
-
-Unlike EAGLE, the frozen draft writes no KV, so "draft extend" is not a model
-forward: it just selects the last accepted token + its target hidden state and
-stashes them as the next-iter seed. The seed forward runs at the start of the
-next draft (``draft_forward``'s seed iter).
+The frozen draft reads the target KV cache read-only and owns no KV pool, so
+its "draft extend" is not a model forward: it selects the last accepted token +
+target hidden state as the next-iter seed, and the seed forward runs at the
+start of the next draft.
 """
 
 from __future__ import annotations
