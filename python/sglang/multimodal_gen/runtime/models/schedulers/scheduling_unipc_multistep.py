@@ -192,6 +192,15 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             Whether to rescale the betas to have zero terminal SNR. This enables the model to generate very bright and
             dark samples instead of limiting it to samples with medium brightness. Loosely related to
             [`--offset_noise`](https://github.com/huggingface/diffusers/blob/74fd735eb073eb1d774b1ab4154a0876eb82f055/examples/dreambooth/train_dreambooth.py#L506).
+        sigma_min (`float`, *optional*):
+            Override the lower bound of the sigma range when `use_karras_sigmas=True` or
+            `use_exponential_sigmas=True`. If `None`, the bound is derived from the trained beta schedule.
+        sigma_max (`float`, *optional*):
+            Override the upper bound of the sigma range when `use_karras_sigmas=True` or
+            `use_exponential_sigmas=True`. If `None`, the bound is derived from the trained beta schedule.
+        shift_terminal (`float`, *optional*):
+            Forward-compat field accepted from diffusers >=0.38 scheduler configs; consulted only by the
+            dynamic-shift code path, which this scheduler does not yet implement.
     """
 
     _compatibles = [e.name for e in KarrasDiffusionSchedulers]
@@ -226,6 +235,9 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         rescale_betas_zero_snr: bool = False,
         use_dynamic_shifting: bool = False,
         time_shift_type: str = "exponential",
+        sigma_min: float | None = None,
+        sigma_max: float | None = None,
+        shift_terminal: float | None = None,
     ):
         if self.config.use_beta_sigmas and not is_scipy_available():
             raise ImportError(
@@ -410,9 +422,16 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             sigmas = self._convert_to_karras(
                 in_sigmas=sigmas, num_inference_steps=num_inference_steps
             )
-            timesteps = np.array(
-                [self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas]
-            ).round()
+            if self.config.use_flow_sigmas:
+                # Karras builds sigmas in EDM space; flow-matching models expect
+                # sigmas in [0, 1]. Map EDM -> flow with sigma / (sigma + 1) and
+                # derive timesteps from the flow sigmas (matches diffusers >=0.38).
+                sigmas = sigmas / (sigmas + 1)
+                timesteps = (sigmas * self.config.num_train_timesteps).copy()
+            else:
+                timesteps = np.array(
+                    [self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas]
+                ).round()
             if self.config.final_sigmas_type == "sigma_min":
                 sigma_last = sigmas[-1]
             elif self.config.final_sigmas_type == "zero":
@@ -834,8 +853,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones((), dtype=h.dtype, device=h.device))
+        rks = torch.stack(rks).to(device=device)
 
         R = []
         b = []
@@ -860,7 +879,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b).to(device=device)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)  # (B, K)
@@ -972,8 +991,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones((), dtype=h.dtype, device=h.device))
+        rks = torch.stack(rks).to(device=device)
 
         R = []
         b = []
@@ -998,7 +1017,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b).to(device=device)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)

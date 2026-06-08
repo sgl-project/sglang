@@ -47,17 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.evict_policy import (
-    EvictionStrategy,
-    FIFOStrategy,
-    FILOStrategy,
-    LFUStrategy,
-    LRUStrategy,
-    MRUStrategy,
-    PriorityStrategy,
-    SLRUStrategy,
-)
-from sglang.srt.mem_cache.utils import split_node_hash_value
+from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -145,37 +135,40 @@ class RadixKey:
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
-    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        assert type(t0) is type(t1), (type(t0), type(t1))
+        n = min(len(t0), len(t1))
+
+        # Exponential search for the first diverging token: gallop in doubling
+        # windows (one C-level slice compare each), then binary-search the window
+        # holding the divergence -- no per-token Python loop on long shared prefixes.
+        matched_tokens = n
+        lo = 0
+        step = 1
+        while lo < n:
+            hi = lo + step if lo + step < n else n
+            if t0[lo:hi] != t1[lo:hi]:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if t0[lo:mid] == t1[lo:mid]:
+                        lo = mid
+                    else:
+                        hi = mid
+                matched_tokens = lo
+                break
+            lo = hi
+            step *= 2
 
         if self.is_bigram:
-            # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            matched = max(0, min(i - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
         if page_size == 1:
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            return i
-
-        min_len = min(len(self), len(other))
-        i = 0
-        while i < min_len:
-            if t0[i : i + page_size] != t1[i : i + page_size]:
-                break
-            i += page_size
-        return i
+            return matched_tokens
+        return (matched_tokens // page_size) * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -224,6 +217,7 @@ class TreeNode:
         self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+        self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
@@ -292,25 +286,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        if self.eviction_policy == "lru":
-            self.eviction_strategy: EvictionStrategy = LRUStrategy()
-        elif self.eviction_policy == "lfu":
-            self.eviction_strategy: EvictionStrategy = LFUStrategy()
-        elif self.eviction_policy == "fifo":
-            self.eviction_strategy: EvictionStrategy = FIFOStrategy()
-        elif self.eviction_policy == "mru":
-            self.eviction_strategy: EvictionStrategy = MRUStrategy()
-        elif self.eviction_policy == "filo":
-            self.eviction_strategy: EvictionStrategy = FILOStrategy()
-        elif self.eviction_policy == "priority":
-            self.eviction_strategy: EvictionStrategy = PriorityStrategy()
-        elif self.eviction_policy == "slru":
-            self.eviction_strategy: EvictionStrategy = SLRUStrategy()
-
-        else:
-            raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
-            )
+        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
         self.reset()

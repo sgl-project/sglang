@@ -169,30 +169,12 @@ class BreakableCudaGraphRunner:
 
     def _init_buffers(self, model_runner):
         """Initialize input buffers."""
-        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
-            PrefillInputBuffers,
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
         )
         from sglang.srt.utils import is_npu
 
-        with torch.device(self.device):
-            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,),
-                dtype=torch.int64 if not is_npu() else torch.int32,
-            )
-            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            if self.is_multimodal:
-                input_embeds = torch.zeros(
-                    (self.max_num_tokens, model_runner.model_config.hidden_size),
-                    dtype=model_runner.dtype,
-                )
-                mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
-            else:
-                input_embeds = None
-                mrope_positions = None
-
+        cache_loc_dtype = torch.int64 if not is_npu() else torch.int32
         if model_runner.is_draft_worker:
             from sglang.srt.speculative.eagle_utils import get_draft_hidden_dim
 
@@ -203,17 +185,19 @@ class BreakableCudaGraphRunner:
                 device=self.device,
             )
 
-        self.buffers = PrefillInputBuffers(
-            input_ids=input_ids,
-            out_cache_loc=out_cache_loc,
-            mamba_track_indices=None,
-            mamba_track_mask=None,
-            mamba_track_seqlens=None,
-            positions=positions,
-            input_embeds=input_embeds,
-            mrope_positions=mrope_positions,
+        # Registry owns (allocates + pools) the token-axis input buffers.
+        self.buffer_registry = build_prefill_registry(
+            device=self.device,
+            max_bs=1,
+            max_num_token=self.max_num_tokens,
+            cache_loc_dtype=cache_loc_dtype,
+            is_multimodal=self.is_multimodal,
+            hidden_size=model_runner.model_config.hidden_size,
+            embed_dtype=model_runner.dtype,
+            enable_mamba_track=False,
+            share_pool=not is_npu(),
+            source=None,
         )
-        self.buffers.share_buffers()
 
     @torch.no_grad()
     def _run_forward(self, forward_batch, num_tokens):
@@ -271,8 +255,12 @@ class BreakableCudaGraphRunner:
                 hidden_states=self.static_draft_hidden_states[:num_tokens],
             )
 
-        buffers = self.buffers
+        registry = self.buffer_registry
         bs = 1
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
         with torch.device(self.device):
             seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
             extend_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
@@ -284,16 +272,16 @@ class BreakableCudaGraphRunner:
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=bs,
-            input_ids=buffers.input_ids[:num_tokens],
+            input_ids=_slot("input_ids"),
             input_embeds=(
-                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+                _slot("input_embeds") if registry.has_slot("input_embeds") else None
             ),
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             next_token_logits_buffer=None,
             orig_seq_lens=orig_seq_lens,
             seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc=_slot("out_cache_loc"),
             seq_lens_sum=num_tokens,
             mamba_track_indices=None,
             mamba_track_mask=None,
@@ -307,13 +295,15 @@ class BreakableCudaGraphRunner:
             extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
             extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
             extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            positions=buffers.positions[:num_tokens],
+            positions=_slot("positions"),
             global_num_tokens_gpu=None,
             global_num_tokens_for_logprob_gpu=None,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=None,
             mrope_positions=(
-                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+                _slot("mrope_positions")
+                if registry.has_slot("mrope_positions")
+                else None
             ),
             spec_algorithm=None,
             spec_info=spec_info,
@@ -390,9 +380,6 @@ class BreakableCudaGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
-            # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
         with forward_context(
@@ -446,9 +433,9 @@ class BreakableCudaGraphRunner:
             if self.use_input_embeds:
                 if ie is None:
                     raise ValueError("BCG replay expects input_embeds but got None")
-                self.buffers.input_embeds[:static_num_tokens].copy_(
-                    ie[:static_num_tokens]
-                )
+                self.buffer_registry.get_slot("input_embeds").slice_for(
+                    1, static_num_tokens
+                ).copy_(ie[:static_num_tokens])
             else:
                 if ie is not None:
                     raise ValueError(

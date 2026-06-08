@@ -436,7 +436,8 @@ class FlashInferWorkspaceManager:
         backend = getattr(self.workspace, "backend", "unknown")
         logger.info(
             f"FlashInfer workspace initialized for rank {rank}, "
-            f"world_size {world_size}, backend {backend}"
+            f"world_size {world_size}, backend {backend}, "
+            f"max_token_num {max_token_num}, hidden_dim {hidden_dim}"
         )
 
     def is_buffer_size_sufficient(

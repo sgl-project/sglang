@@ -38,6 +38,17 @@ class LatentPreparationFingerprint:
     generator_device: str | None
 
 
+@dataclass(frozen=True)
+class LatentPreparationSpec:
+    """ "dataclass for controlling the LatentPreparationStage runtime semantics"""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device | str
+    prepare_latent_ids: bool = True
+    pack_latents: bool = True
+
+
 class LatentPreparationStage(PipelineStage):
     """
     Stage for preparing initial latent variables for the diffusion process.
@@ -60,6 +71,37 @@ class LatentPreparationStage(PipelineStage):
             batch.prompt_embeds[0].dtype
         )
 
+    def get_forward_latent_num_frames(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> int:
+        """get the number of frames to generate for the current batch"""
+        return self.adjust_video_length(batch, server_args)
+
+    def get_latent_preparation_spec(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        batch_size: int,
+        num_frames: int,
+        device: torch.device | str,
+    ) -> LatentPreparationSpec:
+        shape = server_args.pipeline_config.prepare_latent_shape(
+            batch, batch_size, num_frames
+        )
+        return LatentPreparationSpec(
+            shape=shape,
+            dtype=self._get_latent_dtype(batch, server_args),
+            device=device,
+        )
+
+    def should_scale_initial_noise(self, batch: Req, server_args: ServerArgs) -> bool:
+        return True
+
+    def requires_batch_height_width(self, batch: Req, server_args: ServerArgs) -> bool:
+        return True
+
     def forward(
         self,
         batch: Req,
@@ -75,23 +117,21 @@ class LatentPreparationStage(PipelineStage):
         """
 
         # Adjust video length based on VAE version if needed
-        latent_num_frames = self.adjust_video_length(batch, server_args)
+        latent_num_frames = self.get_forward_latent_num_frames(batch, server_args)
 
         batch_size = batch.batch_size
 
         # Get required parameters
-        dtype = self._get_latent_dtype(batch, server_args)
         device = get_local_torch_device()
         generator = batch.generator
         latents = batch.latents
-        num_frames = (
-            latent_num_frames if latent_num_frames is not None else batch.num_frames
-        )
         height = batch.height
         width = batch.width
 
         # TODO(will): remove this once we add input/output validation for stages
-        if height is None or width is None:
+        if self.requires_batch_height_width(batch, server_args) and (
+            height is None or width is None
+        ):
             raise ValueError("Height and width must be provided")
 
         # Validate generator if it's a list
@@ -103,26 +143,36 @@ class LatentPreparationStage(PipelineStage):
 
         # Generate or use provided latents
         if latents is None:
-            shape = server_args.pipeline_config.prepare_latent_shape(
-                batch, batch_size, num_frames
+            spec = self.get_latent_preparation_spec(
+                batch, server_args, batch_size, latent_num_frames, device
             )
             latents = randn_tensor(
-                shape, generator=generator, device=device, dtype=dtype
+                spec.shape,
+                generator=generator,
+                device=spec.device,
+                dtype=spec.dtype,
             )
 
-            latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+            latent_ids = (
+                server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+                if spec.prepare_latent_ids
+                else None
+            )
 
             if latent_ids is not None:
                 batch.latent_ids = latent_ids.to(device=device)
 
-            latents = server_args.pipeline_config.maybe_pack_latents(
-                latents, batch_size, batch
-            )
+            if spec.pack_latents:
+                latents = server_args.pipeline_config.maybe_pack_latents(
+                    latents, batch_size, batch
+                )
         else:
             latents = latents.to(device)
 
         # Scale the initial noise if needed
-        if hasattr(self.scheduler, "init_noise_sigma"):
+        if self.should_scale_initial_noise(batch, server_args) and hasattr(
+            self.scheduler, "init_noise_sigma"
+        ):
             latents = latents * self.scheduler.init_noise_sigma
         # Update batch with prepared latents
         batch.latents = latents
@@ -175,7 +225,7 @@ class LatentPreparationStage(PipelineStage):
             if isinstance(batch.prompt_embeds, list) and batch.prompt_embeds
             else None
         )
-        latent_num_frames = self.adjust_video_length(batch, server_args)
+        latent_num_frames = self.get_forward_latent_num_frames(batch, server_args)
         return LatentPreparationFingerprint(
             height=batch.height,
             width=batch.width,
@@ -206,51 +256,58 @@ class LatentPreparationStage(PipelineStage):
         deterministic packing/scaling work.
         """
         first_batch = batches[0]
-        latent_num_frames = self.adjust_video_length(first_batch, server_args)
+        latent_num_frames = self.get_forward_latent_num_frames(first_batch, server_args)
         batch_size = len(batches)
 
-        dtype = self._get_latent_dtype(first_batch, server_args)
         device = get_local_torch_device()
-        num_frames = (
-            latent_num_frames
-            if latent_num_frames is not None
-            else first_batch.num_frames
+        first_spec = self.get_latent_preparation_spec(
+            first_batch,
+            server_args,
+            batch_size,
+            latent_num_frames,
+            device,
         )
-        height = first_batch.height
-        width = first_batch.width
-
-        if height is None or width is None:
-            raise ValueError("Height and width must be provided")
 
         raw_latents = []
         for batch in batches:
-            shape = server_args.pipeline_config.prepare_latent_shape(
-                batch, 1, num_frames
+            spec = self.get_latent_preparation_spec(
+                batch,
+                server_args,
+                1,
+                latent_num_frames,
+                device,
             )
             raw_latents.append(
                 randn_tensor(
-                    shape,
+                    spec.shape,
                     generator=self._single_generator(batch),
-                    device=device,
-                    dtype=dtype,
+                    device=spec.device,
+                    dtype=spec.dtype,
                 )
             )
 
         latents = torch.cat(raw_latents, dim=0)
-        latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+        latent_ids = (
+            server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+            if first_spec.prepare_latent_ids
+            else None
+        )
         if latent_ids is not None:
             first_batch.latent_ids = latent_ids.to(device=device)
 
-        original_num_outputs = first_batch.num_outputs_per_prompt
-        try:
-            first_batch.num_outputs_per_prompt = batch_size
-            latents = server_args.pipeline_config.maybe_pack_latents(
-                latents, batch_size, first_batch
-            )
-        finally:
-            first_batch.num_outputs_per_prompt = original_num_outputs
+        if first_spec.pack_latents:
+            original_num_outputs = first_batch.num_outputs_per_prompt
+            try:
+                first_batch.num_outputs_per_prompt = batch_size
+                latents = server_args.pipeline_config.maybe_pack_latents(
+                    latents, batch_size, first_batch
+                )
+            finally:
+                first_batch.num_outputs_per_prompt = original_num_outputs
 
-        if hasattr(self.scheduler, "init_noise_sigma"):
+        if self.should_scale_initial_noise(first_batch, server_args) and hasattr(
+            self.scheduler, "init_noise_sigma"
+        ):
             latents = latents * self.scheduler.init_noise_sigma
 
         first_batch.latents = latents
@@ -319,4 +376,60 @@ class LatentPreparationStage(PipelineStage):
         # disable temporarily for image-generation models
         # result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         result.add_check("raw_latent_shape", batch.raw_latent_shape, V.is_tuple)
+        return result
+
+
+class RealtimeChunkLatentPreparationStage(LatentPreparationStage):
+    """Prepare one realtime causal DiT chunk from the encoded condition shape."""
+
+    def get_forward_latent_num_frames(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> int:
+        return int(
+            batch.realtime_chunk_size
+            or self.transformer.config.arch_config.num_frames_per_block
+        )
+
+    def get_latent_preparation_spec(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        batch_size: int,
+        num_frames: int,
+        device: torch.device | str,
+    ) -> LatentPreparationSpec:
+        condition_latent = batch.image_latent
+        assert condition_latent is not None, (
+            "Realtime chunk latent preparation requires image_latent. "
+            "Ensure the condition VAE encoding stage runs before this stage."
+        )
+        return LatentPreparationSpec(
+            shape=(
+                condition_latent.shape[0],
+                self.transformer.config.arch_config.out_channels,
+                num_frames,
+                condition_latent.shape[3],
+                condition_latent.shape[4],
+            ),
+            dtype=condition_latent.dtype,
+            device=device,
+            prepare_latent_ids=False,
+            pack_latents=False,
+        )
+
+    def should_scale_initial_noise(self, batch: Req, server_args: ServerArgs) -> bool:
+        return False
+
+    def requires_batch_height_width(self, batch: Req, server_args: ServerArgs) -> bool:
+        return False
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check(
+            "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
+        )
+        result.add_check("generator", batch.generator, V.generator_or_list_generators)
+        result.add_check("latents", batch.latents, V.none_or_tensor)
         return result
