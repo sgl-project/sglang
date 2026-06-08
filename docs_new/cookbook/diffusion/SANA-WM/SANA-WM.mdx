@@ -46,11 +46,7 @@ For more details, see the [SANA-WM paper (arXiv)](https://arxiv.org/abs/2605.151
 
 SGLang-diffusion offers multiple installation methods depending on your hardware platform. Please refer to the [official SGLang-diffusion installation guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/install.md).
 
-<Note>
-SANA-WM support — the `SanaWMTransformer3DModel` + GDN kernels, `SanaWMTwoStagePipeline` (dense + streaming), the `SanaWMRealtimePipeline` + `/v1/realtime_video` WebSocket router + realtime adapter, and CI — ships as the stacked SANA-WM PR series on [`AgainstEntropy/sglang`](https://github.com/AgainstEntropy/sglang): [`feat/sana-wm-pr1-bidirectional`](https://github.com/AgainstEntropy/sglang/tree/feat/sana-wm-pr1-bidirectional) (model + dense path), [`feat/sana-wm-pr2-batch-streaming`](https://github.com/AgainstEntropy/sglang/tree/feat/sana-wm-pr2-batch-streaming), [`feat/sana-wm-pr3-realtime-streaming`](https://github.com/AgainstEntropy/sglang/tree/feat/sana-wm-pr3-realtime-streaming), and [`feat/sana-wm-pr4-ci-tests`](https://github.com/AgainstEntropy/sglang/tree/feat/sana-wm-pr4-ci-tests). Install that tree alongside SGLang-diffusion before launching the server.
-</Note>
-
-The diffusion server CLI is invoked as `python -m sglang.multimodal_gen.runtime.entrypoints.cli.main`.
+SANA-WM adds the `SanaWMTransformer3DModel` + GDN kernels, the `SanaWMTwoStagePipeline` (dense bidirectional + chunk-causal streaming), and the `SanaWMRealtimePipeline` with the `/v1/realtime_video` WebSocket router. The diffusion server CLI is invoked as `python -m sglang.multimodal_gen.runtime.entrypoints.cli.main`.
 
 ## 3. Model Setup
 
