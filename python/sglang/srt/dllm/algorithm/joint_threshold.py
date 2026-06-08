@@ -30,7 +30,9 @@ class JointThreshold(DllmAlgorithm):
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        prompt_mask = (input_ids != self.mask_id).tolist()
+        # Built once as a GPU tensor and reused across steps (no per-step
+        # host/device transfer); the FDFO carry keeps it in-process.
+        prompt_mask = input_ids != self.mask_id
         return [
             {
                 "post_edit_steps": 0,
@@ -47,10 +49,6 @@ class JointThreshold(DllmAlgorithm):
         states: List[Any],
     ) -> List[bool]:
         batch_size = forward_batch.batch_size
-        device = forward_batch.input_ids.device
-        prompt_masks = torch.tensor(
-            [state["prompt_mask"] for state in states], device=device, dtype=torch.bool
-        )
         done: List[bool] = []
 
         for i in range(batch_size):
@@ -63,7 +61,7 @@ class JointThreshold(DllmAlgorithm):
             block_end = block_start + self.block_size
             curr_input_ids = forward_batch.input_ids[block_start:block_end]
             curr_logits = full_logits[block_start:block_end]
-            curr_prompt_mask = prompt_masks[i]
+            curr_prompt_mask = state["prompt_mask"]
 
             if self.penalty_lambda > 0:
                 prev_ids = curr_input_ids[:-1]
