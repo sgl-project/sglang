@@ -1,14 +1,4 @@
-"""Regression test: the next-token sampler path must not choke on per-position ids.
-
-OPD per-position scoring folds a ``List[List[int]]`` (one id-list per input position)
-into the per-request ``token_ids_logprob`` slot. That data is consumed by the
-logits_processor INPUT-logprob path; the next-token sampler path
-(``get_token_ids_logprobs_batch_optimized`` / ``Sampler.compute_logprobs_only``) has no
-meaning for it and previously crashed on the nested structure. Callers now filter
-per-position entries out; this guards against a future caller feeding them back in.
-
-Imports the sampler module, so run in a real sglang environment (GPU not required).
-"""
+"""Regression tests for sampler handling of nested token_ids_logprob input."""
 
 import pytest
 import torch

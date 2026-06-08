@@ -303,9 +303,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(len(req.input_ids), 4)  # 2 original * 2 parallel
 
     def test_token_ids_logprob_positions_fold(self):
-        """OPD per-position scoring: token_ids_logprob_positions folds into the single
-        token_ids_logprob slot before the single/batch split (single requests skip
-        _normalize_logprob_params), and is mutually exclusive with the flat field."""
+        """Test token_ids_logprob_positions normalization and validation."""
         per_pos = [[], [], [5, 6], [7, 8]]
         req = GenerateReqInput(
             input_ids=[10, 11, 12, 13],
@@ -317,7 +315,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.token_ids_logprob, per_pos)
         self.assertIsNone(req.token_ids_logprob_positions)
 
-        # Mutually exclusive with the flat id-list.
         req = GenerateReqInput(
             input_ids=[10, 11, 12, 13],
             return_logprob=True,
@@ -327,7 +324,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         with self.assertRaises(ValueError):
             req.normalize_batch_and_arguments()
 
-        # Single-request only: a batch carrying per-position ids is rejected.
         req = GenerateReqInput(
             input_ids=[[10, 11], [12, 13]],
             return_logprob=True,

@@ -123,31 +123,12 @@ def get_top_logprobs(
 
 
 def _is_per_position_token_ids(token_ids) -> bool:
-    """True when a request's ``token_ids_logprob`` entry carries a separate id-list
-    *per input position* (``List[List[int]]``) instead of one flat id-list
-    (``List[int]``) broadcast to every position.
-
-    The per-position form lets OPD top-k scoring request only each position's own
-    ~k ids (sparse ``[R, k]``) instead of the global union applied to all positions
-    (dense ``[R, |union|]``), turning an O(R^2) teacher response into O(R*k).
-    Detection is per-request, so flat and per-position requests can share a batch.
-    """
+    """True for one requested token-id list per input position."""
     return bool(token_ids) and isinstance(token_ids[0], list)
 
 
 def _gather_per_position_prefill(logprobs, pt, pruned_len, pos_ids, no_copy_to_cpu):
-    """Gather logprobs when each pruned position has its own id-list.
-
-    ``pos_ids`` is a ``List[List[int]]`` aligned to the request's pruned positions
-    (positions with no requested ids carry an empty list, e.g. the prompt prefix when
-    only response positions are scored). Returns a list-over-positions of logprob
-    lists, mirroring the flat path's per-position output structure.
-
-    When the non-empty positions all share width ``k`` (the common OPD top-k case),
-    they are gathered in a single rectangular advanced-index op even if interleaved
-    with empty positions -- so a ``[]``-padded prompt prefix stays O(R*k), not a
-    per-position Python loop.
-    """
+    """Gather requested logprobs for per-position token-id lists."""
     pos_ids = pos_ids[:pruned_len]
     out = [[] for _ in range(pruned_len)]
     nonempty = [j for j in range(len(pos_ids)) if len(pos_ids[j]) > 0]
@@ -208,18 +189,8 @@ def get_token_ids_logprobs_raw(
                 idxs.append([])
                 continue
             if _is_per_position_token_ids(token_ids):
-                # Align each pruned row to the absolute input position it scores.
-                # Pruned row r holds the logits that *generated* token
-                # (start_len + r + 1); the response assembler then prepends a None
-                # for position 0 and pops the trailing sample row (see
-                # scheduler_output_processor_mixin._process_input_token_ids_logprobs),
-                # so a per-position list indexed by absolute position lines up 1:1
-                # with the returned input_token_ids_logprobs. start_len is the absolute
-                # position of this request's first pruned row (= len(prefix_indices) +
-                # extend_logprob_start_len); under chunked prefill the pruned region is
-                # only a slice of the full sequence, so it must come from
-                # global_start_pos_cpu rather than len(token_ids) - pruned_len (which is
-                # only correct when the whole sequence is covered in one forward pass).
+                # Row r predicts token start_len + r + 1. Use the absolute
+                # chunk start so per-position ids stay aligned after assembly.
                 start_len = (
                     global_start_pos_cpu[i]
                     if global_start_pos_cpu is not None
@@ -349,7 +320,7 @@ def get_token_ids_logprobs_chunk(
     split_pruned_len: int = 0,
     global_start_pos: Optional[List[int]] = None,
 ):
-    """Get token_ids logprobs for each sequence in the chunk.
+    """Get token_ids logprobs for each sequence in a pruned-logprob chunk.
 
     Args:
         logprobs: Log probabilities tensor of shape [seq_len, vocab_size]
@@ -359,10 +330,7 @@ def get_token_ids_logprobs_chunk(
         input_token_ids_logprobs_val: List to store token logprob values
         input_token_ids_logprobs_idx: List to store token indices
         split_pruned_len: Length of pruned tokens from previous chunk
-        global_start_pos: Absolute position of each sequence's first pruned row
-            (= len(prefix_indices) + extend_logprob_start_len). Required for correct
-            per-position alignment under chunked prefill, where pruned_lens are
-            per-forward-pass while the per-position id-list spans the full sequence.
+        global_start_pos: Absolute first pruned row for per-position alignment.
 
     Returns:
         int: Number of remaining tokens to process in next chunk
@@ -380,9 +348,7 @@ def get_token_ids_logprobs_chunk(
             pruned_lens,
         )
     ):
-        # Full pruned length of this sequence (before subtracting the part already
-        # emitted in a previous chunk); used to recover extend_logprob_start_len for
-        # per-position alignment.
+        # Keep the full length before subtracting rows emitted by a prior chunk.
         orig_pruned_len = pruned_len
         # Adjust pruned length for first sequence
         if n == 0:
@@ -401,15 +367,8 @@ def get_token_ids_logprobs_chunk(
         val = []
         idx = []
         per_position = _is_per_position_token_ids(token_ids)
-        # Per-position lists are indexed by absolute input position, but pruned row r
-        # carries the logits that *generated* token (start_len + r + 1). The response
-        # assembler later prepends a None for position 0 and pops the trailing sample
-        # row, so shifting the lookup by start_len + 1 makes the returned
-        # input_token_ids_logprobs line up 1:1 with the caller's per-position list.
-        # start_len is the absolute position of this sequence's first pruned row; under
-        # chunked prefill this is only a slice of the full sequence, so it must come
-        # from global_start_pos rather than len(token_ids) - orig_pruned_len (correct
-        # only when the whole sequence is covered in one forward pass).
+        # Row r predicts token start_len + r + 1; global_start_pos keeps this
+        # absolute under chunked prefill.
         if per_position:
             start_len = (
                 global_start_pos[n]
@@ -426,9 +385,7 @@ def get_token_ids_logprobs_chunk(
                 break
             if token_ids is not None:
                 if per_position:
-                    # Absolute row across chunks is split_pruned_len + j; the scored
-                    # token is one position ahead (the sample/popped tail row falls off
-                    # the end and is padded empty).
+                    # split_pruned_len carries the absolute row within this sequence.
                     abs_idx = per_position_start + split_pruned_len + j
                     ids = token_ids[abs_idx] if abs_idx < len(token_ids) else []
                     val.append(

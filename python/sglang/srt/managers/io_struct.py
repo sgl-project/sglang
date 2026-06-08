@@ -163,12 +163,8 @@ class GenerateReqInput(BaseReq):
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Per-position token ids to return logprob for (e.g. OPD top-k scoring): one
-    # id-list per scored input position (List[List[int]]), instead of a single flat
-    # id-list broadcast to every position. When set, this is folded into
-    # token_ids_logprob during normalization (single, non-parallel request only) and
-    # the logprob gather returns each position's own ids (sparse [R, k] rather than the
-    # dense [R, |union|] of a flat global union).
+    # Per-position token ids to return logprob for; one id-list per input position.
+    # Folded into token_ids_logprob during normalization.
     token_ids_logprob_positions: Optional[
         Union[List[List[List[int]]], List[List[int]]]
     ] = None
@@ -308,11 +304,8 @@ class GenerateReqInput(BaseReq):
         self._determine_batch_size()
         self._handle_parallel_sampling()
 
-        # OPD per-position scoring: fold the per-position id-lists into the single
-        # token_ids_logprob slot BEFORE the single/batch split, so both paths carry it
-        # (single requests skip _normalize_logprob_params). The logprob gather detects the
-        # nested per-position form. Mutually exclusive with the flat field; single-request
-        # only (is_single is resolved by _handle_parallel_sampling above).
+        # Keep the public per-position field single-request only, then reuse the
+        # existing token_ids_logprob path internally.
         if self.token_ids_logprob_positions is not None:
             if self.token_ids_logprob is not None:
                 raise ValueError(

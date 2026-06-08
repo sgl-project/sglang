@@ -122,11 +122,8 @@ class LogitsMetadata:
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
-    # Absolute position of each request's first pruned (input-logprob) row
-    # (= len(prefix_indices) + extend_logprob_start_len). Used by per-position
-    # token_ids_logprob to align the per-position id-list (indexed by absolute input
-    # position) to the pruned rows under chunked prefill, where pruned lengths are
-    # per-forward-pass but the id-list spans the full sequence.
+    # Absolute position of each request's first pruned input-logprob row.
+    # Used to align per-position token_ids_logprob under chunked prefill.
     extend_logprob_start_pos_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
@@ -180,8 +177,7 @@ class LogitsMetadata:
                 if extend_len - start_len > 0:
                     extend_return_logprob = True
                 extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
-            # Absolute position of each request's first pruned row, for per-position
-            # token_ids_logprob alignment under chunked prefill (see LogitsMetadata).
+            # Track absolute pruned-row starts for chunked per-position logprobs.
             if forward_batch.extend_prefix_lens_cpu is not None:
                 extend_logprob_start_pos_cpu = [
                     prefix_len + start_len
