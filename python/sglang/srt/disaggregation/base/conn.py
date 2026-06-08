@@ -37,6 +37,7 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    kv_data_mem_kinds: List[str]
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -100,7 +101,6 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -156,7 +156,6 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
-
     @abstractmethod
     def __init__(
         self,
