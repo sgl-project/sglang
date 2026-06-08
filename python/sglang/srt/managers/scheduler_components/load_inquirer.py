@@ -82,7 +82,7 @@ class SchedulerLoadInquirer:
         for req in self.get_waiting_queue():
             # if match-in-waiting-queue disabled, this metric returns seq_lens
             num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
-        cr = self.get_chunked_req()
+        cr = next(iter(self.get_chunked_reqs()), None)
         if cr is not None:
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
         return num_tokens
