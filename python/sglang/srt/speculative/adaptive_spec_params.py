@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: add step=0 (nospec fallback) for BS>=8 once supported.
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
         "candidate_steps": [1, 3, 7],
@@ -99,10 +98,11 @@ def _load_adaptive_config(
         if (
             not isinstance(steps, list)
             or not steps
-            or not all(isinstance(s, int) and s > 0 for s in steps)
+            or not all(isinstance(s, int) and s >= 0 for s in steps)
         ):
             raise ValueError(
-                f"BS {key}: candidate_steps must be a list of positive ints, got {steps!r}"
+                f"BS {key}: candidate_steps must be a list of non-negative ints, "
+                f"got {steps!r}"
             )
         bs_entries[int(key)] = entry
 

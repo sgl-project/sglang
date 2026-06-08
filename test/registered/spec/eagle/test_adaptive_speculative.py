@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -18,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=76, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
 
 HIGH_ACCEPT_PROMPT = (
     "Output exactly 128 new lines. "
@@ -201,6 +203,166 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             draft_tokens,
             {2.0, 4.0},
             "spec_num_draft_tokens gauge has unexpected value",
+        )
+
+
+class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
+    """steps=0 (nospec) fallback triggered by batch size.
+
+    Config routes BS>=8 -> steps=0 (drafting disabled) and BS<8 -> steps=3.
+    Verifies (1) a concurrent burst drives the worker to steps=0, and (2) a
+    sequence decoded at steps=0 recovers full draft acceptance once it returns
+    to steps=3 -- i.e. draft_extend keeps the draft KV synced while drafting is
+    off. If it didn't, post-recovery drafts would be rejected (~0 accepts).
+    """
+
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    base_url = DEFAULT_URL_FOR_TEST
+
+    COUNT_PROMPT = "Count from 1 to 400, separated by commas. Output only the numbers."
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [3], "warmup_batches": 0},
+                    "8": {"candidate_steps": [0], "warmup_batches": 0},
+                },
+                f,
+            )
+            cls.adaptive_config_path = f.name
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--attention-backend",
+                    "triton",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    cls.draft_model,
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--speculative-adaptive",
+                    "--speculative-adaptive-config",
+                    cls.adaptive_config_path,
+                    "--max-running-requests",
+                    "32",
+                    "--skip-server-warmup",
+                    "--mem-fraction-static",
+                    "0.7",
+                ],
+            )
+        except Exception:
+            os.unlink(cls.adaptive_config_path)
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process"):
+            kill_process_tree(cls.process.pid)
+        if os.path.exists(cls.adaptive_config_path):
+            os.unlink(cls.adaptive_config_path)
+
+    def _steps(self) -> int:
+        r = requests.get(self.base_url + "/server_info", timeout=30)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["internal_states"][0]["speculative_num_steps"]
+
+    def _generate(self, max_new_tokens: int, hold: dict | None = None) -> dict:
+        r = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": self.COUNT_PROMPT,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+            },
+            timeout=600,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        if hold is not None:
+            hold["meta"] = out["meta_info"]
+            hold["text"] = out["text"]
+        return out["meta_info"]
+
+    def _wait_until_steps(self, target: int, timeout: float = 30.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self._steps() == target:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
+    def test_batch_size_triggers_zero_step(self):
+        """A concurrent burst (BS>=8) routes the worker to steps=0; draining
+        back to BS<8 routes it back to steps=3."""
+        self.assertEqual(self._steps(), 3, "expected initial steps=3")
+
+        burst = [
+            threading.Thread(target=self._generate, args=(400,)) for _ in range(14)
+        ]
+        for t in burst:
+            t.start()
+        reached_zero = self._wait_until_steps(0, timeout=30.0)
+        for t in burst:
+            t.join()
+        self.assertTrue(reached_zero, "batch size did not drive steps to 0")
+
+        # Drain complete: a single small request runs at BS=1 -> steps=3.
+        self._generate(16)
+        self.assertEqual(self._steps(), 3, "did not route back to steps=3 at BS=1")
+
+    def test_zero_step_within_sequence_recovery(self):
+        """A sequence decoded at steps=0 (during a burst) recovers full draft
+        acceptance after the burst drains and it returns to steps=3."""
+        burst = [
+            threading.Thread(target=self._generate, args=(400,)) for _ in range(14)
+        ]
+        for t in burst:
+            t.start()
+        self.assertTrue(
+            self._wait_until_steps(0, timeout=30.0), "burst did not reach steps=0"
+        )
+
+        # Submit a longer probe INTO the steps=0 batch; it outlives the burst,
+        # so its tail decodes at steps=3 after the burst drains.
+        hold: dict = {}
+        probe = threading.Thread(target=self._generate, args=(700, hold))
+        probe.start()
+        for t in burst:
+            t.join()
+        probe.join()
+
+        hist = hold["meta"]["spec_correct_drafts_histogram"]
+        self.assertGreater(
+            hist[0], 0, f"probe was never decoded at steps=0 (hist={hist})"
+        )
+        recovered = sum(hist[1:])
+        self.assertGreater(
+            recovered,
+            5,
+            f"probe saw ~0 draft acceptance after returning to steps=3 -> draft KV "
+            f"likely stale during steps=0 (hist={hist})",
+        )
+        self.assertGreater(
+            len(hold["text"].strip()), 0, "empty output across the excursion"
         )
 
 
