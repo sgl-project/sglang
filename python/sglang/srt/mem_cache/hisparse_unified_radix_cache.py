@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -39,35 +39,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class HiSparseHostInsertResult(NamedTuple):
-    prefix_len: int
-    node: Optional[UnifiedTreeNode]
-    duplicate_host_indices: torch.Tensor
-    canonical_host_indices: Optional[torch.Tensor]
-
-
 class HiSparseUnifiedRadixCache(UnifiedRadixCache):
     """Unified radix variant that indexes HiSparse host KV entries."""
 
     def __init__(self, params: CacheInitParams):
-        self.hisparse_mode = True
         self.hisparse_host_pool = None
         self._hisparse_load_back_supported = False
         self._last_match_host_indices: dict[int, torch.Tensor] = {}
+        self._hisparse_req_to_host_pool = None
+        self._hisparse_req_to_token = None
+        self._req_radix_node: dict[int, Optional[UnifiedTreeNode]] = {}
+        self._req_radix_prefix_len: dict[int, int] = {}
         super().__init__(params)
 
     def _reset_full(self) -> None:
         super()._reset_full()
         self._last_match_host_indices.clear()
-
-    def enable_hisparse_mode(self) -> None:
-        self.hisparse_mode = True
+        self._req_radix_node.clear()
+        self._req_radix_prefix_len.clear()
 
     def init_hisparse_radix_cache(
         self, host_pool, server_args: Optional[ServerArgs] = None
     ) -> bool:
         """Attach the HiSparse coordinator host pool to the unified tree."""
-        self.enable_hisparse_mode()
         self.hisparse_host_pool = host_pool
         self.components[BASE_COMPONENT_TYPE]._full_kv_pool_host = host_pool
 
@@ -203,24 +197,8 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             )
             return True
 
-        from sglang.srt.managers.cache_controller import HiCacheController
-
-        self.load_cache_event = threading.Event()
-        self.cache_controller = HiCacheController(
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            mem_pool_host=host_pool,
-            page_size=self.page_size,
-            tp_group=self.tp_group,
-            load_cache_event=self.load_cache_event,
-            io_backend="kernel",
-        )
-        self.load_back_threshold = 0
-        logger.info(
-            "HiSparse unified radix cache enabled (compress_ratio=%s, host_pool=%s).",
-            compress_ratio,
-            type(host_pool).__name__,
-        )
-        return True
+        logger.warning("HiSparse unified radix cache requires DSA HiCache sidecar.")
+        return False
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         empty = self._empty_match_result.device_indices
@@ -333,38 +311,52 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         value = host_indices[: len(key)].to(dtype=torch.int64, device="cpu")
         return self._host_insert_helper(self.root_node, key, value)
 
-    def host_inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
-        return self.inc_lock_ref(node)
-
-    def host_dec_lock_ref(self, node: UnifiedTreeNode) -> DecLockRefResult:
-        return self.dec_lock_ref(node)
-
-    def host_evictable_size(self) -> int:
-        return sum(
-            len(node.component_data[BASE_COMPONENT_TYPE].host_value)
-            for node in self.evictable_host_leaves
-            if node.component_data[BASE_COMPONENT_TYPE].host_value is not None
-        )
-
-    def host_evict(self, num_tokens: int) -> int:
-        return self.evict_host(num_tokens)
-
     def evict_host_if_needed(self, host_pool, need: int) -> None:
         if need <= 0 or host_pool.available_size() >= need:
             return
 
         deficit = need - host_pool.available_size()
-        if self.host_evictable_size() >= deficit:
-            self.host_evict(deficit)
+        evictable = sum(
+            len(node.component_data[BASE_COMPONENT_TYPE].host_value)
+            for node in self.evictable_host_leaves
+            if node.component_data[BASE_COMPONENT_TYPE].host_value is not None
+        )
+        if evictable >= deficit:
+            self.evict_host(deficit)
 
-    def indexer_pool_transfer_for_range(
+    def bind_hisparse_req_pools(self, req_to_host_pool, req_to_token) -> None:
+        self._hisparse_req_to_host_pool = req_to_host_pool
+        self._hisparse_req_to_token = req_to_token
+
+    def match_and_lock_req_prefix(
         self,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
+        req_idx: int,
+        token_ids: list[int],
+        extra_key: Optional[str],
+        max_len: int,
+    ) -> tuple[torch.Tensor, int]:
+        host_prefix, node, raw_match_len = self.host_match_prefix(token_ids, extra_key)
+        prefix_len = min(raw_match_len, max_len)
+        if prefix_len > 0:
+            self.inc_lock_ref(node)
+        self._req_radix_node[req_idx] = node
+        self._req_radix_prefix_len[req_idx] = prefix_len
+        return host_prefix, prefix_len
+
+    def req_prefix_len(self, req_idx: int) -> int:
+        return self._req_radix_prefix_len.get(req_idx, 0)
+
+    def indexer_pool_transfer(
+        self,
+        req_idx: int,
         start_pos: int,
         end_pos: int,
     ) -> Optional[PoolTransfer]:
-        if self._hisparse_host_pool_group() is None:
+        if (
+            self._hisparse_host_pool_group() is None
+            or self._hisparse_req_to_host_pool is None
+            or self._hisparse_req_to_token is None
+        ):
             return None
 
         aligned_start = (
@@ -374,43 +366,57 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         if aligned_end <= aligned_start:
             return None
 
-        host_indices = host_indices[aligned_start:aligned_end]
+        host_indices = self._hisparse_req_to_host_pool[
+            req_idx, aligned_start:aligned_end
+        ]
         if host_indices.numel() == 0:
             return None
         return PoolTransfer(
             name=PoolName.INDEXER,
             host_indices=host_indices,
-            device_indices=device_indices[aligned_start:aligned_end].to(
-                dtype=torch.int64
-            ),
+            device_indices=self._hisparse_req_to_token[
+                req_idx, aligned_start:aligned_end
+            ].to(dtype=torch.int64),
         )
 
     def indexer_pool_transfer_for_completed_page(
         self,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
+        req_idx: int,
         written_end: int,
     ) -> Optional[PoolTransfer]:
         if written_end <= 0 or written_end % self.page_size != 0:
             return None
-        return self.indexer_pool_transfer_for_range(
-            host_indices,
-            device_indices,
-            written_end - self.page_size,
-            written_end,
+        return self.indexer_pool_transfer(
+            req_idx, written_end - self.page_size, written_end
         )
 
     def backup_from_device_all_layer(
         self,
-        default_host_pool,
         mem_pool_device,
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        indexer_ranges=None,
+        completed_indexer_pages=None,
     ) -> None:
+        if indexer_ranges or completed_indexer_pages:
+            pool_transfers = list(pool_transfers or [])
+            for req_idx, start_pos, end_pos in indexer_ranges or []:
+                transfer = self.indexer_pool_transfer(req_idx, start_pos, end_pos)
+                if transfer is not None:
+                    pool_transfers.append(transfer)
+            for req_idx, written_end in completed_indexer_pages or []:
+                transfer = self.indexer_pool_transfer_for_completed_page(
+                    req_idx, written_end
+                )
+                if transfer is not None:
+                    pool_transfers.append(transfer)
+            if len(pool_transfers) == 0:
+                pool_transfers = None
+
         host_pool_group = self._hisparse_host_pool_group()
         if host_pool_group is None:
-            default_host_pool.backup_from_device_all_layer(
+            self.hisparse_host_pool.backup_from_device_all_layer(
                 mem_pool_device,
                 host_indices,
                 device_indices,
@@ -426,18 +432,6 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             pool_transfers=pool_transfers,
         )
 
-    def match_and_lock_host_prefix(
-        self,
-        token_ids: list[int],
-        extra_key: Optional[str],
-        max_len: int,
-    ) -> tuple[torch.Tensor, UnifiedTreeNode, int]:
-        host_prefix, node, raw_match_len = self.host_match_prefix(token_ids, extra_key)
-        prefix_len = min(raw_match_len, max_len)
-        if prefix_len > 0 and node is not None:
-            self.host_inc_lock_ref(node)
-        return host_prefix, node, prefix_len
-
     def insert_host_indices(
         self,
         token_ids: list[int],
@@ -447,20 +441,20 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         old_node: Optional[UnifiedTreeNode] = None,
         lock_new_node: bool = False,
         return_canonical_indices: bool = False,
-    ) -> HiSparseHostInsertResult:
+    ) -> tuple[int, Optional[UnifiedTreeNode], torch.Tensor, Optional[torch.Tensor]]:
         prefix_len = self.host_insert(token_ids, host_indices, extra_key)
-        duplicate_host_indices = host_indices.new_empty((0,))
+        duplicate_host_indices = (
+            host_indices[protected_len:prefix_len]
+            if prefix_len > protected_len
+            else host_indices[:0]
+        )
         canonical_host_indices = None
-
-        need_match = old_node is not None or lock_new_node
-        if prefix_len > protected_len:
-            duplicate_host_indices = host_indices[protected_len:prefix_len]
-            need_match |= (
-                return_canonical_indices and duplicate_host_indices.numel() > 0
-            )
-
         new_node = None
-        if need_match:
+        if (
+            old_node is not None
+            or lock_new_node
+            or (return_canonical_indices and duplicate_host_indices.numel() > 0)
+        ):
             canonical_host_indices_all, new_node, _ = self.host_match_prefix(
                 token_ids, extra_key
             )
@@ -470,20 +464,51 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
                 ]
 
         if old_node is not None and old_node is not self.root_node:
-            self.host_dec_lock_ref(old_node)
+            self.dec_lock_ref(old_node)
         if lock_new_node and new_node is not None and new_node is not self.root_node:
-            self.host_inc_lock_ref(new_node)
+            self.inc_lock_ref(new_node)
 
-        return HiSparseHostInsertResult(
-            prefix_len=prefix_len,
-            node=new_node,
-            duplicate_host_indices=duplicate_host_indices,
-            canonical_host_indices=canonical_host_indices,
+        return prefix_len, new_node, duplicate_host_indices, canonical_host_indices
+
+    def insert_req_host_indices(
+        self,
+        req_idx: int,
+        token_ids: list[int],
+        host_indices: torch.Tensor,
+        extra_key: Optional[str],
+        new_protected_len: Optional[int] = None,
+        lock_new_node: bool = False,
+        return_canonical_indices: bool = False,
+    ) -> tuple[int, torch.Tensor, Optional[torch.Tensor]]:
+        old_node = (
+            self._req_radix_node.get(req_idx)
+            if new_protected_len is not None
+            else None
         )
+        prefix_len, new_node, duplicate_indices, canonical_indices = (
+            self.insert_host_indices(
+                token_ids,
+                host_indices,
+                extra_key,
+                protected_len=self.req_prefix_len(req_idx),
+                old_node=old_node,
+                lock_new_node=lock_new_node,
+                return_canonical_indices=return_canonical_indices,
+            )
+        )
+        if new_protected_len is not None:
+            if new_node is None:
+                self._req_radix_node.pop(req_idx, None)
+            else:
+                self._req_radix_node[req_idx] = new_node
+            self._req_radix_prefix_len[req_idx] = new_protected_len
+        return prefix_len, duplicate_indices, canonical_indices
 
-    def release_host_node(self, node: Optional[UnifiedTreeNode]) -> None:
+    def release_req_node(self, req_idx: int) -> None:
+        node = self._req_radix_node.pop(req_idx, None)
         if node is not None and node is not self.root_node:
-            self.host_dec_lock_ref(node)
+            self.dec_lock_ref(node)
+        self._req_radix_prefix_len.pop(req_idx, None)
 
     def init_load_back(
         self,
