@@ -221,6 +221,14 @@ class PiecewiseCudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        spec_algo = model_runner.spec_algorithm
+        if (
+            spec_algo.is_eagle()
+            or spec_algo.is_standalone()
+            or spec_algo.is_dflash()
+        ):
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )
@@ -416,7 +424,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -587,7 +595,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
