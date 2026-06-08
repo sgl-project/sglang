@@ -86,6 +86,9 @@ def draft_kv_indices_buffer_width(
     num_seqs * topk branches each attend up to max_context_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
+    assert (
+        num_seqs * topk * max_context_len < 2**31
+    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
     return num_seqs * topk * max_context_len
 
 
