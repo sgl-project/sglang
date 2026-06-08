@@ -162,6 +162,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _is_xpu,
     _use_aiter,
+    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -207,8 +208,6 @@ else:
 
 logger = logging.getLogger(__name__)
 
-
-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
 
 class DeepseekV2MLP(nn.Module):
     def __init__(

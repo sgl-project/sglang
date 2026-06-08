@@ -19,6 +19,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -44,8 +45,6 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
-
-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
     backend = get_attn_backend()

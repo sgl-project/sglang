@@ -98,6 +98,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -120,8 +121,6 @@ logger = logging.getLogger(__name__)
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
-
-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their

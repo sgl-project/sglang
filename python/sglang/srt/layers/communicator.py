@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
 )
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -107,8 +108,6 @@ if _use_aiter:
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
-
-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
 
 def _fused_rmsnorm_fp8_per_token_quant(
     hidden_states: torch.Tensor,
