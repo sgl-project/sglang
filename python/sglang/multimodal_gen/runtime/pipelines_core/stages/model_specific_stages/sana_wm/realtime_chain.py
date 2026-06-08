@@ -378,7 +378,11 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
         from .base import SanaWMBeforeDenoisingStage
         from .realtime_stage import SANA_WM_HEIGHT, SANA_WM_WIDTH
 
-        if inputs.src_size is None or inputs.resized_size is None or inputs.crop_offset is None:
+        if (
+            inputs.src_size is None
+            or inputs.resized_size is None
+            or inputs.crop_offset is None
+        ):
             raise ValueError("SANA-WM crop metadata is not initialized")
         needed = (int(target_latent) - 1) * 8 + 1
         if inputs.open_ended:

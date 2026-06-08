@@ -110,7 +110,9 @@ class SanaWMSelfForcingSampler:
             return kv_cache[0], 0
 
         cur = kv_cache[chunk_idx]
-        start_chunk = max(chunk_idx - num_cached_blocks, 0) if num_cached_blocks > 0 else 0
+        start_chunk = (
+            max(chunk_idx - num_cached_blocks, 0) if num_cached_blocks > 0 else 0
+        )
         valid = list(range(start_chunk, chunk_idx))
         sink_num = 0
         if sink_token and num_cached_blocks > 0:
@@ -150,7 +152,9 @@ class SanaWMSelfForcingSampler:
                     acc[slot] = (
                         prev[slot].clone()
                         if acc[slot] is None
-                        else torch.cat([acc[slot], prev[slot]], dim=1)  # (B,N,H,D) token axis
+                        else torch.cat(
+                            [acc[slot], prev[slot]], dim=1
+                        )  # (B,N,H,D) token axis
                     )
             cur[block_id] = [
                 acc[_SLOT_K],

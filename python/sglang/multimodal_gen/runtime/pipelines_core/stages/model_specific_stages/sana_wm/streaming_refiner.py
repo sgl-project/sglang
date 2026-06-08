@@ -23,6 +23,8 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
     unpack_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
 from . import parity_probe
 from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
@@ -32,7 +34,6 @@ from .refiner import (
     log_sana_wm_tensor_stats,
     sana_wm_skip_refiner_enabled,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 # --------------------------------------------------------------------------- #
@@ -51,7 +52,9 @@ def clear_kv_prefix_on_blocks(transformer: nn.Module) -> None:
         block.attn1._tf_kv_prefix = None
 
 
-def set_capture_flag_on_blocks(transformer: nn.Module, mode: str, *, enable: bool) -> None:
+def set_capture_flag_on_blocks(
+    transformer: nn.Module, mode: str, *, enable: bool
+) -> None:
     if mode == "pre_rope":
         attr, clear_attr = "_kv_cache_capture", "_cached_kv_pre"
     elif mode == "post_rope":
@@ -116,7 +119,9 @@ def build_rotary_emb_for_absolute_positions(
 # --------------------------------------------------------------------------- #
 # Self-attention with KV-prefix injection + capture (port of refiner.py:464-576)
 # --------------------------------------------------------------------------- #
-def streaming_self_attention(*, attn, hidden_states, query_rotary_emb, n_context_tokens):
+def streaming_self_attention(
+    *, attn, hidden_states, query_rotary_emb, n_context_tokens
+):
     sequence_length = hidden_states.shape[1]
     has_streaming_hooks = (
         getattr(attn, "_kv_cache_capture", False)
@@ -139,7 +144,9 @@ def streaming_self_attention(*, attn, hidden_states, query_rotary_emb, n_context
     # diffusers 0.38+ always defines `to_gate_logits`; 0.37 only on gated variants
     # (the SANA-WM refiner is ungated) -> getattr so 0.37 works too.
     _to_gate_logits = getattr(attn, "to_gate_logits", None)
-    gate_logits = _to_gate_logits(hidden_states) if _to_gate_logits is not None else None
+    gate_logits = (
+        _to_gate_logits(hidden_states) if _to_gate_logits is not None else None
+    )
     query = attn.to_q(hidden_states)
     key = attn.to_k(hidden_states)
     value = attn.to_v(hidden_states)
@@ -192,19 +199,35 @@ def streaming_self_attention(*, attn, hidden_states, query_rotary_emb, n_context
     parallel_config = getattr(processor, "_parallel_config", None)
     if n_context_tokens <= 0 or n_context_tokens >= query.shape[1]:
         hidden_states = dispatch_attention_fn(
-            query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
-            backend=backend, parallel_config=parallel_config,
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=backend,
+            parallel_config=parallel_config,
         )
     else:
         context = dispatch_attention_fn(
-            query[:, :n_context_tokens], key[:, :n_context_tokens], value[:, :n_context_tokens],
-            attn_mask=None, dropout_p=0.0, is_causal=False,
-            backend=backend, parallel_config=parallel_config,
+            query[:, :n_context_tokens],
+            key[:, :n_context_tokens],
+            value[:, :n_context_tokens],
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=backend,
+            parallel_config=parallel_config,
         )
         current = dispatch_attention_fn(
-            query[:, n_context_tokens:], key, value,
-            attn_mask=None, dropout_p=0.0, is_causal=False,
-            backend=backend, parallel_config=parallel_config,
+            query[:, n_context_tokens:],
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=backend,
+            parallel_config=parallel_config,
         )
         hidden_states = torch.cat([context, current], dim=1)
     hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
@@ -217,8 +240,14 @@ def streaming_self_attention(*, attn, hidden_states, query_rotary_emb, n_context
 
 
 def forward_video_block(
-    *, block, hidden_states, encoder_hidden_states, temb, video_rotary_emb,
-    encoder_attention_mask, n_context_tokens,
+    *,
+    block,
+    hidden_states,
+    encoder_hidden_states,
+    temb,
+    video_rotary_emb,
+    encoder_attention_mask,
+    n_context_tokens,
 ):
     batch = hidden_states.size(0)
     norm_hidden_states = block.norm1(hidden_states)
@@ -226,17 +255,23 @@ def forward_video_block(
     ada_values = block.scale_shift_table[None, None].to(temb.device) + temb.reshape(
         batch, temb.size(1), num_ada_params, -1
     )
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(
+        dim=2
+    )
     norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
     attn_hidden_states = streaming_self_attention(
-        attn=block.attn1, hidden_states=norm_hidden_states,
-        query_rotary_emb=video_rotary_emb, n_context_tokens=n_context_tokens,
+        attn=block.attn1,
+        hidden_states=norm_hidden_states,
+        query_rotary_emb=video_rotary_emb,
+        n_context_tokens=n_context_tokens,
     )
     hidden_states = hidden_states + attn_hidden_states * gate_msa
     norm_hidden_states = block.norm2(hidden_states)
     attn_hidden_states = block.attn2(
-        norm_hidden_states, encoder_hidden_states=encoder_hidden_states,
-        query_rotary_emb=None, attention_mask=encoder_attention_mask,
+        norm_hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        query_rotary_emb=None,
+        attention_mask=encoder_attention_mask,
     )
     hidden_states = hidden_states + attn_hidden_states
     norm_hidden_states = block.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
@@ -247,14 +282,22 @@ class _RefinerCore:
     """Adapts the unwrapped diffusers refiner transformer to the
     DiffusersLTX2Refiner interface RefinerChunkRunner expects."""
 
-    def __init__(self, transformer: nn.Module, device: torch.device, dtype: torch.dtype):
+    def __init__(
+        self, transformer: nn.Module, device: torch.device, dtype: torch.dtype
+    ):
         self.transformer = transformer
         self.device = device
         self.dtype = dtype
 
     def _forward_video_only_with_rope(
-        self, *, hidden_states, encoder_hidden_states, timestep, encoder_attention_mask,
-        video_rotary_emb, n_context_tokens,
+        self,
+        *,
+        hidden_states,
+        encoder_hidden_states,
+        timestep,
+        encoder_attention_mask,
+        video_rotary_emb,
+        n_context_tokens,
     ):
         transformer = self.transformer
         batch = hidden_states.size(0)
@@ -264,29 +307,46 @@ class _RefinerCore:
             )
         hidden_states = transformer.proj_in(hidden_states)
         temb, embedded_timestep = transformer.time_embed(
-            timestep.flatten(), batch_size=batch, hidden_dtype=hidden_states.dtype,
+            timestep.flatten(),
+            batch_size=batch,
+            hidden_dtype=hidden_states.dtype,
         )
         temb = temb.view(batch, -1, temb.size(-1))
-        embedded_timestep = embedded_timestep.view(batch, -1, embedded_timestep.size(-1))
+        embedded_timestep = embedded_timestep.view(
+            batch, -1, embedded_timestep.size(-1)
+        )
         encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch, -1, hidden_states.size(-1))
+        encoder_hidden_states = encoder_hidden_states.view(
+            batch, -1, hidden_states.size(-1)
+        )
         for block in transformer.transformer_blocks:
             hidden_states = forward_video_block(
-                block=block, hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states, temb=temb,
+                block=block,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
                 video_rotary_emb=video_rotary_emb,
                 encoder_attention_mask=encoder_attention_mask,
                 n_context_tokens=n_context_tokens,
             )
-        scale_shift = transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
+        scale_shift = (
+            transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
+        )
         shift, scale = scale_shift[:, :, 0], scale_shift[:, :, 1]
         hidden_states = transformer.norm_out(hidden_states)
         hidden_states = hidden_states * (1 + scale) + shift
         return transformer.proj_out(hidden_states)
 
     def _predict_x0_active_block(
-        self, *, active, active_positions, sigma_cur, prompt_embeds,
-        prompt_attention_mask, fps, kv_prefix_per_layer,
+        self,
+        *,
+        active,
+        active_positions,
+        sigma_cur,
+        prompt_embeds,
+        prompt_attention_mask,
+        fps,
+        kv_prefix_per_layer,
     ):
         ps = int(self.transformer.config.patch_size)
         pst = int(self.transformer.config.patch_size_t)
@@ -295,31 +355,56 @@ class _RefinerCore:
         timestep = torch.full(
             (batch, seq_len),
             float(sigma_cur) * float(self.transformer.config.timestep_scale_multiplier),
-            dtype=torch.float32, device=self.device,
+            dtype=torch.float32,
+            device=self.device,
         )
         video_rotary_emb = build_rotary_emb_for_absolute_positions(
-            transformer=self.transformer, batch_size=batch, frame_positions=active_positions,
-            height=int(active.shape[3]), width=int(active.shape[4]), device=self.device, fps=float(fps),
+            transformer=self.transformer,
+            batch_size=batch,
+            frame_positions=active_positions,
+            height=int(active.shape[3]),
+            width=int(active.shape[4]),
+            device=self.device,
+            fps=float(fps),
         )
         set_kv_prefix_on_blocks(self.transformer, kv_prefix_per_layer)
         try:
             velocity = self._forward_video_only_with_rope(
-                hidden_states=latent_tokens, encoder_hidden_states=prompt_embeds,
-                timestep=timestep, encoder_attention_mask=prompt_attention_mask,
-                video_rotary_emb=video_rotary_emb, n_context_tokens=0,
+                hidden_states=latent_tokens,
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep,
+                encoder_attention_mask=prompt_attention_mask,
+                video_rotary_emb=video_rotary_emb,
+                n_context_tokens=0,
             )
         finally:
             clear_kv_prefix_on_blocks(self.transformer)
-        raw_sigma = torch.full((batch, seq_len, 1), float(sigma_cur), dtype=torch.float32, device=self.device)
+        raw_sigma = torch.full(
+            (batch, seq_len, 1),
+            float(sigma_cur),
+            dtype=torch.float32,
+            device=self.device,
+        )
         denoised = latent_tokens.float() - velocity.float() * raw_sigma
         return unpack_latents(
-            denoised.to(self.dtype), num_frames=int(active.shape[2]),
-            height=int(active.shape[3]), width=int(active.shape[4]), patch_size=ps, patch_size_t=pst,
+            denoised.to(self.dtype),
+            num_frames=int(active.shape[2]),
+            height=int(active.shape[3]),
+            width=int(active.shape[4]),
+            patch_size=ps,
+            patch_size_t=pst,
         )
 
     def _capture_block_kv(
-        self, *, clean_block, frame_positions, prompt_embeds, prompt_attention_mask,
-        fps, capture_mode, kv_prefix_per_layer,
+        self,
+        *,
+        clean_block,
+        frame_positions,
+        prompt_embeds,
+        prompt_attention_mask,
+        fps,
+        capture_mode,
+        kv_prefix_per_layer,
     ):
         ps = int(self.transformer.config.patch_size)
         pst = int(self.transformer.config.patch_size_t)
@@ -327,16 +412,24 @@ class _RefinerCore:
         batch, seq_len, _ = latent_tokens.shape
         timestep = torch.zeros(batch, seq_len, dtype=torch.float32, device=self.device)
         video_rotary_emb = build_rotary_emb_for_absolute_positions(
-            transformer=self.transformer, batch_size=batch, frame_positions=frame_positions,
-            height=int(clean_block.shape[3]), width=int(clean_block.shape[4]), device=self.device, fps=float(fps),
+            transformer=self.transformer,
+            batch_size=batch,
+            frame_positions=frame_positions,
+            height=int(clean_block.shape[3]),
+            width=int(clean_block.shape[4]),
+            device=self.device,
+            fps=float(fps),
         )
         set_kv_prefix_on_blocks(self.transformer, kv_prefix_per_layer)
         set_capture_flag_on_blocks(self.transformer, capture_mode, enable=True)
         try:
             _ = self._forward_video_only_with_rope(
-                hidden_states=latent_tokens, encoder_hidden_states=prompt_embeds,
-                timestep=timestep, encoder_attention_mask=prompt_attention_mask,
-                video_rotary_emb=video_rotary_emb, n_context_tokens=0,
+                hidden_states=latent_tokens,
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep,
+                encoder_attention_mask=prompt_attention_mask,
+                video_rotary_emb=video_rotary_emb,
+                n_context_tokens=0,
             )
         finally:
             set_capture_flag_on_blocks(self.transformer, capture_mode, enable=False)
@@ -348,8 +441,18 @@ class RefinerChunkRunner:
     """Port of the reference RefinerChunkRunner (refiner.py:579-718)."""
 
     def __init__(
-        self, refiner: _RefinerCore, *, prompt_embeds, prompt_attention_mask, fps,
-        sigmas, source_sink_frames, block_size, kv_max_frames, seed, spatial_shape,
+        self,
+        refiner: _RefinerCore,
+        *,
+        prompt_embeds,
+        prompt_attention_mask,
+        fps,
+        sigmas,
+        source_sink_frames,
+        block_size,
+        kv_max_frames,
+        seed,
+        spatial_shape,
     ):
         self.refiner = refiner
         self.prompt_embeds = prompt_embeds
@@ -375,7 +478,9 @@ class RefinerChunkRunner:
         self.history_frames = 0
 
     @torch.inference_mode()
-    def refine_block(self, *, block_idx, clean_block, block_start, block_end, sink_seed_frames=None):
+    def refine_block(
+        self, *, block_idx, clean_block, block_start, block_end, sink_seed_frames=None
+    ):
         # parity harness (env-gated, no-op in prod): per-block input/config/output
         # checksums; both the batch stage and the realtime stage run through here.
         _probe_dir = parity_probe.probe_dir(
@@ -417,60 +522,99 @@ class RefinerChunkRunner:
                     frame_positions=list(range(self.source_sink_frames)),
                     prompt_embeds=self.prompt_embeds,
                     prompt_attention_mask=self.prompt_attention_mask,
-                    fps=self.fps, capture_mode="pre_rope", kv_prefix_per_layer=None,
+                    fps=self.fps,
+                    capture_mode="pre_rope",
+                    kv_prefix_per_layer=None,
                 )
         batch = int(clean_block.shape[0])
         sink_rope_offset = block_start - self.history_frames - self.source_sink_frames
         sink_pe = None
         if self.source_sink_frames > 0:
             sink_pe = build_rotary_emb_for_absolute_positions(
-                transformer=refiner.transformer, batch_size=batch,
-                frame_positions=list(range(sink_rope_offset, sink_rope_offset + self.source_sink_frames)),
-                height=self.height, width=self.width, device=self.device, fps=self.fps,
+                transformer=refiner.transformer,
+                batch_size=batch,
+                frame_positions=list(
+                    range(sink_rope_offset, sink_rope_offset + self.source_sink_frames)
+                ),
+                height=self.height,
+                width=self.width,
+                device=self.device,
+                fps=self.fps,
             )
         kv_prefix_per_layer = []
         for layer_idx, sink_kv in enumerate(self.sink_kv_pre):
             history = self.history_kv_post[layer_idx]
-            kv_prefix_per_layer.append({
-                "mode": "rf_shifted_sink",
-                "sink_k_pre": sink_kv[0], "sink_v": sink_kv[1], "sink_pe": sink_pe,
-                "history_k": history[0] if history is not None else None,
-                "history_v": history[1] if history is not None else None,
-            })
+            kv_prefix_per_layer.append(
+                {
+                    "mode": "rf_shifted_sink",
+                    "sink_k_pre": sink_kv[0],
+                    "sink_v": sink_kv[1],
+                    "sink_pe": sink_pe,
+                    "history_k": history[0] if history is not None else None,
+                    "history_v": history[1] if history is not None else None,
+                }
+            )
         sigma0 = float(self.sigmas[0].item())
-        eps = torch.randn(clean_block.shape, generator=self.generator, device=self.device, dtype=self.dtype)
-        x_t = ((1.0 - sigma0) * clean_block.float() + sigma0 * eps.float()).to(self.dtype)
+        eps = torch.randn(
+            clean_block.shape,
+            generator=self.generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        x_t = ((1.0 - sigma0) * clean_block.float() + sigma0 * eps.float()).to(
+            self.dtype
+        )
         active_positions = list(range(int(block_start), int(block_end)))
         for level in range(int(self.sigmas.numel()) - 1):
             sigma_cur = float(self.sigmas[level].item())
             sigma_next = float(self.sigmas[level + 1].item())
             pred_x0 = refiner._predict_x0_active_block(
-                active=x_t, active_positions=active_positions, sigma_cur=sigma_cur,
-                prompt_embeds=self.prompt_embeds, prompt_attention_mask=self.prompt_attention_mask,
-                fps=self.fps, kv_prefix_per_layer=kv_prefix_per_layer,
+                active=x_t,
+                active_positions=active_positions,
+                sigma_cur=sigma_cur,
+                prompt_embeds=self.prompt_embeds,
+                prompt_attention_mask=self.prompt_attention_mask,
+                fps=self.fps,
+                kv_prefix_per_layer=kv_prefix_per_layer,
             )
             if sigma_cur <= 1.0e-6:
                 x_t = pred_x0.to(self.dtype)
             else:
                 ratio = sigma_next / sigma_cur
-                x_t = (ratio * x_t.float() + (1.0 - ratio) * pred_x0.float()).to(self.dtype)
+                x_t = (ratio * x_t.float() + (1.0 - ratio) * pred_x0.float()).to(
+                    self.dtype
+                )
         block_kv_post = refiner._capture_block_kv(
-            clean_block=x_t, frame_positions=active_positions,
-            prompt_embeds=self.prompt_embeds, prompt_attention_mask=self.prompt_attention_mask,
-            fps=self.fps, capture_mode="post_rope", kv_prefix_per_layer=kv_prefix_per_layer,
+            clean_block=x_t,
+            frame_positions=active_positions,
+            prompt_embeds=self.prompt_embeds,
+            prompt_attention_mask=self.prompt_attention_mask,
+            fps=self.fps,
+            capture_mode="post_rope",
+            kv_prefix_per_layer=kv_prefix_per_layer,
         )
         for layer_idx, new_kv in enumerate(block_kv_post):
             old = self.history_kv_post[layer_idx]
-            self.history_kv_post[layer_idx] = new_kv if old is None else (
-                torch.cat([old[0], new_kv[0]], dim=1),
-                torch.cat([old[1], new_kv[1]], dim=1),
+            self.history_kv_post[layer_idx] = (
+                new_kv
+                if old is None
+                else (
+                    torch.cat([old[0], new_kv[0]], dim=1),
+                    torch.cat([old[1], new_kv[1]], dim=1),
+                )
             )
         self.history_frames += int(block_end - block_start)
-        if self.max_history_frames > 0 and self.history_frames > self.max_history_frames:
+        if (
+            self.max_history_frames > 0
+            and self.history_frames > self.max_history_frames
+        ):
             keep_tokens = self.max_history_frames * self.tokens_per_frame
             for layer_idx, old in enumerate(self.history_kv_post):
                 if old is not None:
-                    self.history_kv_post[layer_idx] = (old[0][:, -keep_tokens:], old[1][:, -keep_tokens:])
+                    self.history_kv_post[layer_idx] = (
+                        old[0][:, -keep_tokens:],
+                        old[1][:, -keep_tokens:],
+                    )
             self.history_frames = self.max_history_frames
         if _probe is not None:
             _probe["refined"] = parity_probe.checksum(x_t)
@@ -485,8 +629,15 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
     carrying a sink/history KV cache. Inherits loading/encode/residency from
     SanaWMLTX2RefinerStage; only the refine loop changes."""
 
-    def __init__(self, *, block_size: int = 3, kv_max_frames: int = 11,
-                 sink_size: int = 1, seed: int = 42, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        block_size: int = 3,
+        kv_max_frames: int = 11,
+        sink_size: int = 1,
+        seed: int = 42,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.block_size = int(block_size)
         self.kv_max_frames = int(kv_max_frames)
@@ -506,20 +657,31 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
         fps = float((batch.extra or {}).get("fps", getattr(batch, "fps", 16.0)) or 16.0)
 
         prompt_embeds, prompt_mask = self._encode_prompt(prompt, device)
-        sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=device)
+        sigmas = torch.tensor(
+            STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=device
+        )
 
         n_active = T - self.sink_size
         if n_active <= 0:
-            self.log_info("SANA-WM streaming refiner: no active frames (T=%d <= sink=%d); skipping.",
-                          T, self.sink_size)
+            self.log_info(
+                "SANA-WM streaming refiner: no active frames (T=%d <= sink=%d); skipping.",
+                T,
+                self.sink_size,
+            )
             return batch
         n_blocks = math.ceil(n_active / self.block_size)
         self.log_info(
             "SANA-WM streaming refiner: latent=%s, sink=%d, block=%d, blocks=%d, kv_max=%d, seed=%d",
-            tuple(latents.shape), self.sink_size, self.block_size, n_blocks, self.kv_max_frames, self.seed,
+            tuple(latents.shape),
+            self.sink_size,
+            self.block_size,
+            n_blocks,
+            self.kv_max_frames,
+            self.seed,
         )
 
         import time
+
         t0 = time.perf_counter()
         with self.use_declared_component(
             component_name="transformer_2", module=self.transformer
@@ -528,25 +690,35 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
             unwrapped = _unwrap_diffusers_ltx2_refiner(self.transformer)
             core = _RefinerCore(unwrapped, device, self.dtype)
             runner = RefinerChunkRunner(
-                core, prompt_embeds=prompt_embeds, prompt_attention_mask=prompt_mask,
-                fps=fps, sigmas=sigmas, source_sink_frames=self.sink_size,
-                block_size=self.block_size, kv_max_frames=self.kv_max_frames,
-                seed=self.seed, spatial_shape=(H, W),
+                core,
+                prompt_embeds=prompt_embeds,
+                prompt_attention_mask=prompt_mask,
+                fps=fps,
+                sigmas=sigmas,
+                source_sink_frames=self.sink_size,
+                block_size=self.block_size,
+                kv_max_frames=self.kv_max_frames,
+                seed=self.seed,
+                spatial_shape=(H, W),
             )
             for i in range(n_blocks):
                 start_f = self.sink_size + i * self.block_size
                 end_f = min(start_f + self.block_size, T)
                 sink_seed = latents[:, :, : self.sink_size] if i == 0 else None
                 refined = runner.refine_block(
-                    block_idx=i, clean_block=latents[:, :, start_f:end_f].contiguous(),
-                    block_start=start_f, block_end=end_f, sink_seed_frames=sink_seed,
+                    block_idx=i,
+                    clean_block=latents[:, :, start_f:end_f].contiguous(),
+                    block_start=start_f,
+                    block_end=end_f,
+                    sink_seed_frames=sink_seed,
                 )
                 latents[:, :, start_f:end_f] = refined.to(latents.dtype)
 
         log_sana_wm_tensor_stats("stream.refiner.latents", latents)
         self.log_info(
             "SANA-WM streaming refiner applied (%d blocks) in %.4f s.",
-            n_blocks, time.perf_counter() - t0,
+            n_blocks,
+            time.perf_counter() - t0,
         )
         batch.latents = latents
         if batch.extra is None:

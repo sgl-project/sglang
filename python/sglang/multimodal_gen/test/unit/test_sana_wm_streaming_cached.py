@@ -118,20 +118,30 @@ def test_gdn_cached_matches_reference_single_and_chunked():
         return _frame_slice(x, f0, f1)
 
     args0 = (
-        chunk(q, 0, split), chunk(k, 0, split), chunk(v, 0, split),
-        chunk(q_rot, 0, split), chunk(k_rot, 0, split),
-        beta[:, :, :split], decay[:, :, :split],
+        chunk(q, 0, split),
+        chunk(k, 0, split),
+        chunk(v, 0, split),
+        chunk(q_rot, 0, split),
+        chunk(k_rot, 0, split),
+        beta[:, :, :split],
+        decay[:, :, :split],
     )
     args1 = (
-        chunk(q, split, T), chunk(k, split, T), chunk(v, split, T),
-        chunk(q_rot, split, T), chunk(k_rot, split, T),
-        beta[:, :, split:], decay[:, :, split:],
+        chunk(q, split, T),
+        chunk(k, split, T),
+        chunk(v, split, T),
+        chunk(q_rot, split, T),
+        chunk(k_rot, split, T),
+        beta[:, :, split:],
+        decay[:, :, split:],
     )
 
     m0, (mkv, mz) = _gdn_scan_cached(*args0)
     m1, _ = _gdn_scan_cached(*args1, init_state_kv=mkv, init_state_z=mz)
 
-    r0, rkv, rz, _ = ref.recurrent_gdn_cached(*args0, eps=1e-6, kv_state=None, z_state=None)
+    r0, rkv, rz, _ = ref.recurrent_gdn_cached(
+        *args0, eps=1e-6, kv_state=None, z_state=None
+    )
     r1, _, _, _ = ref.recurrent_gdn_cached(*args1, eps=1e-6, kv_state=rkv, z_state=rz)
 
     torch.testing.assert_close(m0, r0, atol=1e-9, rtol=0)
@@ -149,12 +159,18 @@ def test_cam_cached_matches_reference_single_and_chunked():
 
     split = 3
     a0 = (
-        _frame_slice(q_rot, 0, split), _frame_slice(k_rot, 0, split),
-        _frame_slice(v, 0, split), beta[:, :, :split], decay[:, :, :split],
+        _frame_slice(q_rot, 0, split),
+        _frame_slice(k_rot, 0, split),
+        _frame_slice(v, 0, split),
+        beta[:, :, :split],
+        decay[:, :, :split],
     )
     a1 = (
-        _frame_slice(q_rot, split, T), _frame_slice(k_rot, split, T),
-        _frame_slice(v, split, T), beta[:, :, split:], decay[:, :, split:],
+        _frame_slice(q_rot, split, T),
+        _frame_slice(k_rot, split, T),
+        _frame_slice(v, split, T),
+        beta[:, :, split:],
+        decay[:, :, split:],
     )
 
     m0, mkv = _single_path_delta_scan_cached(*a0)
@@ -251,6 +267,9 @@ def test_ffn_cached_final_chunk_matches_whole():
     split = 2
     _, tail0 = m(_nslice(x, 0, split), (split, HFFN, WFFN), save_ffn_tail=True)
     o1, _ = m(
-        _nslice(x, split, T), (T - split, HFFN, WFFN), ffn_tail=tail0, save_ffn_tail=True
+        _nslice(x, split, T),
+        (T - split, HFFN, WFFN),
+        ffn_tail=tail0,
+        save_ffn_tail=True,
     )
     torch.testing.assert_close(whole[:, split * S :, :], o1, atol=1e-9, rtol=0)

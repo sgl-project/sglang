@@ -33,13 +33,18 @@ def _chunks(t, splits):
 
 @pytest.mark.parametrize("splits", [[6], [3, 3], [1, 2, 3], [2, 4]])
 def test_causal_conv_chunked_equals_monolithic(splits):
-    conv = LTX2VideoCausalConv3d(in_channels=4, out_channels=5, kernel_size=3).double().eval()
+    conv = (
+        LTX2VideoCausalConv3d(in_channels=4, out_channels=5, kernel_size=3)
+        .double()
+        .eval()
+    )
     x = torch.randn(1, 4, 6, 3, 3, dtype=torch.float64)
     with torch.no_grad():
         whole = conv(x, causal=True)
         cache = {}
         parts = [
-            conv(c, causal=True, conv_cache=cache, cache_key="c") for c in _chunks(x, splits)
+            conv(c, causal=True, conv_cache=cache, cache_key="c")
+            for c in _chunks(x, splits)
         ]
     chunked = torch.cat(parts, dim=2)
     assert chunked.shape == whole.shape
@@ -49,15 +54,20 @@ def test_causal_conv_chunked_equals_monolithic(splits):
 @pytest.mark.parametrize("splits", [[6], [3, 3], [2, 4], [1, 2, 3]])
 def test_upsampler_chunked_equals_monolithic(splits):
     # residual + temporal upsample (stride[0]=2) -> exercises the trim gating.
-    up = LTXVideoUpsampler3d(
-        in_channels=8, stride=(2, 2, 2), residual=True, upscale_factor=1
-    ).double().eval()
+    up = (
+        LTXVideoUpsampler3d(
+            in_channels=8, stride=(2, 2, 2), residual=True, upscale_factor=1
+        )
+        .double()
+        .eval()
+    )
     x = torch.randn(1, 8, 6, 4, 4, dtype=torch.float64)
     with torch.no_grad():
         whole = up(x, causal=True)
         cache = {}
         parts = [
-            up(c, causal=True, conv_cache=cache, cache_key="u") for c in _chunks(x, splits)
+            up(c, causal=True, conv_cache=cache, cache_key="u")
+            for c in _chunks(x, splits)
         ]
     chunked = torch.cat(parts, dim=2)
     # monolithic trims the anchor frame once; chunked must reproduce that exactly.
@@ -73,7 +83,8 @@ def test_resnet_chunked_equals_monolithic(splits):
         whole = blk(x, causal=True)
         cache = {}
         parts = [
-            blk(c, causal=True, conv_cache=cache, cache_key="r") for c in _chunks(x, splits)
+            blk(c, causal=True, conv_cache=cache, cache_key="r")
+            for c in _chunks(x, splits)
         ]
     chunked = torch.cat(parts, dim=2)
     torch.testing.assert_close(chunked, whole, atol=1e-9, rtol=0)
@@ -81,7 +92,11 @@ def test_resnet_chunked_equals_monolithic(splits):
 
 def test_conv_cache_none_is_unchanged_dense_behavior():
     # Backward-compat: with no conv_cache, output == the original causal forward.
-    conv = LTX2VideoCausalConv3d(in_channels=4, out_channels=4, kernel_size=3).double().eval()
+    conv = (
+        LTX2VideoCausalConv3d(in_channels=4, out_channels=4, kernel_size=3)
+        .double()
+        .eval()
+    )
     x = torch.randn(1, 4, 5, 2, 2, dtype=torch.float64)
     with torch.no_grad():
         a = conv(x, causal=True)

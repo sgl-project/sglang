@@ -60,11 +60,21 @@ def _global_args():
 
 def _tiny_model():
     arch = SanaWMArchConfig(
-        in_channels=MC, out_channels=MC, num_layers=2,  # GDN-only -> CPU-safe main path
-        num_attention_heads=2, attention_head_dim=16, linear_head_dim=16,
-        num_cross_attention_heads=2, cross_attention_head_dim=16, cross_attention_dim=32,
-        caption_channels=32, model_max_length=8, softmax_every_n=4,
-        update_rule="torch_recurrent", cam_update_rule="torch_recurrent", chunk_size=None,
+        in_channels=MC,
+        out_channels=MC,
+        num_layers=2,  # GDN-only -> CPU-safe main path
+        num_attention_heads=2,
+        attention_head_dim=16,
+        linear_head_dim=16,
+        num_cross_attention_heads=2,
+        cross_attention_head_dim=16,
+        cross_attention_dim=32,
+        caption_channels=32,
+        model_max_length=8,
+        softmax_every_n=4,
+        update_rule="torch_recurrent",
+        cam_update_rule="torch_recurrent",
+        chunk_size=None,
     )
     m = SanaWMTransformer3DModel(SanaWMConfig(arch_config=arch)).float().eval()
     for b in m.blocks:
@@ -122,13 +132,17 @@ def test_realtime_path_multi_tick_carries_state(_global_args):
     assert torch.allclose(state.latents[:, :, 0].cpu(), fl[:, :, 0])
 
     # Tick 1: 2 more frames, KV carried.
-    out = stage.forward(_tick(session, 1, _noise(1, MC, 2, 2, 2, seed=2), [2]), server_args)
+    out = stage.forward(
+        _tick(session, 1, _noise(1, MC, 2, 2, 2, seed=2), [2]), server_args
+    )
     assert out.latents.shape[2] == 5
     assert state.chunk_idx == 2 and state.chunk_indices == [0, 3, 5]
     assert torch.isfinite(state.latents).all()
 
     # Boundary-style tick: a TWO-chunk plan in one call.
-    out = stage.forward(_tick(session, 2, _noise(1, MC, 4, 2, 2, seed=3), [2, 2]), server_args)
+    out = stage.forward(
+        _tick(session, 2, _noise(1, MC, 4, 2, 2, seed=3), [2, 2]), server_args
+    )
     assert out.latents.shape[2] == 9
     assert state.chunk_idx == 4 and state.chunk_indices == [0, 3, 5, 7, 9]
 
@@ -137,9 +151,14 @@ def test_realtime_path_evicts_stale_kv(_global_args):
     stage, server_args = _stage_and_args(nfpb=2)
     session = RealtimeSession()
     fl = torch.ones(1, MC, 1, 2, 2, dtype=torch.float32)
-    stage.forward(_tick(session, 0, torch.cat([fl, _noise(1, MC, 2, 2, 2, seed=1)], 2), [3]), server_args)
+    stage.forward(
+        _tick(session, 0, torch.cat([fl, _noise(1, MC, 2, 2, 2, seed=1)], 2), [3]),
+        server_args,
+    )
     for i in range(1, 5):
-        stage.forward(_tick(session, i, _noise(1, MC, 2, 2, 2, seed=10 + i), [2]), server_args)
+        stage.forward(
+            _tick(session, i, _noise(1, MC, 2, 2, 2, seed=10 + i), [2]), server_args
+        )
     state = session.get_or_create_state(SanaWMStreamCacheState)
     assert state.chunk_indices == [0, 3, 5, 7, 9, 11]
 
@@ -157,8 +176,13 @@ def test_realtime_path_is_deterministic(_global_args):
         torch.manual_seed(0)  # tiny-model init inside _stage_and_args uses global RNG
         session = RealtimeSession()
         fl = torch.ones(1, MC, 1, 2, 2, dtype=torch.float32)
-        stage.forward(_tick(session, 0, torch.cat([fl, _noise(1, MC, 2, 2, 2, seed=5)], 2), [3]), server_args)
-        stage.forward(_tick(session, 1, _noise(1, MC, 2, 2, 2, seed=6), [2]), server_args)
+        stage.forward(
+            _tick(session, 0, torch.cat([fl, _noise(1, MC, 2, 2, 2, seed=5)], 2), [3]),
+            server_args,
+        )
+        stage.forward(
+            _tick(session, 1, _noise(1, MC, 2, 2, 2, seed=6), [2]), server_args
+        )
         return session.get_or_create_state(SanaWMStreamCacheState).latents.cpu()
 
     torch.manual_seed(1234)

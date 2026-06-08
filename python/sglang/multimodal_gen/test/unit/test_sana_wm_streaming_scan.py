@@ -31,8 +31,10 @@ def _inputs():
     torch.manual_seed(0)
     q, k, v = _rand(B, H, D, N), _rand(B, H, D, N), _rand(B, H, D, N)
     q_rot, k_rot = _rand(B, H, D, N), _rand(B, H, D, N)
-    beta = torch.rand(B, H, T, S, dtype=torch.float64)        # per-(frame,token) gate
-    decay = torch.rand(B, H, T, dtype=torch.float64) * 0.5 + 0.4  # per-frame decay in (0,1)
+    beta = torch.rand(B, H, T, S, dtype=torch.float64)  # per-(frame,token) gate
+    decay = (
+        torch.rand(B, H, T, dtype=torch.float64) * 0.5 + 0.4
+    )  # per-frame decay in (0,1)
     return q, k, v, q_rot, k_rot, beta, decay
 
 
@@ -54,15 +56,25 @@ def test_main_chunked_state_carry_matches_full(split):
     full = _gdn_scan_forward(q, k, v, q_rot, k_rot, beta, decay)
 
     out0, (kv, z) = _gdn_scan_forward_stateful(
-        _frame_slice(q, 0, split), _frame_slice(k, 0, split), _frame_slice(v, 0, split),
-        _frame_slice(q_rot, 0, split), _frame_slice(k_rot, 0, split),
-        beta[:, :, :split], decay[:, :, :split], return_state=True,
+        _frame_slice(q, 0, split),
+        _frame_slice(k, 0, split),
+        _frame_slice(v, 0, split),
+        _frame_slice(q_rot, 0, split),
+        _frame_slice(k_rot, 0, split),
+        beta[:, :, :split],
+        decay[:, :, :split],
+        return_state=True,
     )
     out1 = _gdn_scan_forward_stateful(
-        _frame_slice(q, split, T), _frame_slice(k, split, T), _frame_slice(v, split, T),
-        _frame_slice(q_rot, split, T), _frame_slice(k_rot, split, T),
-        beta[:, :, split:], decay[:, :, split:],
-        init_state_kv=kv, init_state_z=z,
+        _frame_slice(q, split, T),
+        _frame_slice(k, split, T),
+        _frame_slice(v, split, T),
+        _frame_slice(q_rot, split, T),
+        _frame_slice(k_rot, split, T),
+        beta[:, :, split:],
+        decay[:, :, split:],
+        init_state_kv=kv,
+        init_state_z=z,
     )
     chunked = torch.cat([out0, out1], dim=-1)  # concat along N (frame-major)
     torch.testing.assert_close(chunked, full, atol=1e-9, rtol=0)
@@ -81,12 +93,20 @@ def test_cam_chunked_state_carry_matches_full(split):
     full = _single_path_delta_scan_forward(q_rot, k_rot, v, beta, decay)
 
     out0, kv = _single_path_delta_scan_forward_stateful(
-        _frame_slice(q_rot, 0, split), _frame_slice(k_rot, 0, split), _frame_slice(v, 0, split),
-        beta[:, :, :split], decay[:, :, :split], return_state=True,
+        _frame_slice(q_rot, 0, split),
+        _frame_slice(k_rot, 0, split),
+        _frame_slice(v, 0, split),
+        beta[:, :, :split],
+        decay[:, :, :split],
+        return_state=True,
     )
     out1 = _single_path_delta_scan_forward_stateful(
-        _frame_slice(q_rot, split, T), _frame_slice(k_rot, split, T), _frame_slice(v, split, T),
-        beta[:, :, split:], decay[:, :, split:], init_state_kv=kv,
+        _frame_slice(q_rot, split, T),
+        _frame_slice(k_rot, split, T),
+        _frame_slice(v, split, T),
+        beta[:, :, split:],
+        decay[:, :, split:],
+        init_state_kv=kv,
     )
     chunked = torch.cat([out0, out1], dim=-1)
     torch.testing.assert_close(chunked, full, atol=1e-9, rtol=0)

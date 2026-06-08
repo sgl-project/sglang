@@ -466,9 +466,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             action, translation_speed=0.04, rotation_speed_deg=1.2
         )
         official_poses = torch.from_numpy(
-            action_string_to_c2w(
-                action, translation_speed=0.04, rotation_speed_deg=1.2
-            )
+            action_string_to_c2w(action, translation_speed=0.04, rotation_speed_deg=1.2)
         )
         self.assertTrue(torch.equal(batch_poses, official_poses))
 
@@ -673,9 +671,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         info = batch.extra["sana_wm_condition_image_preprocess"]
         self.assertEqual(len(info), 2)
         self.assertTrue(torch.equal(out[0, :, :1], torch.ones(128, 1, 22, 40)))
-        self.assertTrue(
-            torch.equal(out[1, :, :1], torch.full((128, 1, 22, 40), 2.0))
-        )
+        self.assertTrue(torch.equal(out[1, :, :1], torch.full((128, 1, 22, 40), 2.0)))
 
     def test_default_static_camera_builds_latent_raymap_and_chunk_plucker(self) -> None:
         stage = SanaWMBeforeDenoisingStage(

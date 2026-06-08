@@ -15,7 +15,6 @@ from typing import Any
 
 import requests
 
-
 DEFAULT_ACTIONS = [
     "w-16",
     "s-16",

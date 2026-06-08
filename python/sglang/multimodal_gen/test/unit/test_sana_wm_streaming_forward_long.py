@@ -21,18 +21,17 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm import (
 )
 from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
-    BidirectionalGDNUCPESinglePathLiteLA,
-    SanaWMBlock,
-    SanaWMTransformer3DModel,
-    WanRotaryPosEmbed,
+    _CACHE_TYPE_STATE,
     _SLOT_CAM_K,
     _SLOT_FFN_TCONV,
     _SLOT_K,
     _SLOT_TYPE_FLAG,
     _SLOT_V,
+    BidirectionalGDNUCPESinglePathLiteLA,
+    SanaWMBlock,
+    SanaWMTransformer3DModel,
+    WanRotaryPosEmbed,
     _build_ucpe_apply_fns,
-    _CACHE_TYPE_CONCAT,
-    _CACHE_TYPE_STATE,
     _slice_rope_to_current_chunk,
     process_camera_conditions_ucpe,
 )
@@ -90,7 +89,11 @@ def test_slice_rope_to_current_chunk_is_noop_when_sized():
 # Stage 1 — attention-level forward_long: cached branch methods
 # --------------------------------------------------------------------------- #
 
-AB, AHEADS, ADIM = 1, 2, 16  # head_dim/2 divisible by 4 (UCPE homog. 4-vectors), like 112
+AB, AHEADS, ADIM = (
+    1,
+    2,
+    16,
+)  # head_dim/2 divisible by 4 (UCPE homog. 4-vectors), like 112
 AC = AHEADS * ADIM  # in_dim == heads*head_dim
 AHW = (T, H, W)
 AN = T * S
@@ -102,15 +105,19 @@ def _arope():
 
 
 def _attn(softmax_main=False):
-    m = BidirectionalGDNUCPESinglePathLiteLA(
-        in_dim=AC,
-        heads=AHEADS,
-        head_dim=ADIM,
-        update_rule="torch_recurrent",  # match the cached recurrent scan exactly
-        cam_update_rule="torch_recurrent",
-        softmax_main=softmax_main,
-        use_chunked_softmax_attention=softmax_main,
-    ).double().eval()
+    m = (
+        BidirectionalGDNUCPESinglePathLiteLA(
+            in_dim=AC,
+            heads=AHEADS,
+            head_dim=ADIM,
+            update_rule="torch_recurrent",  # match the cached recurrent scan exactly
+            cam_update_rule="torch_recurrent",
+            softmax_main=softmax_main,
+            use_chunked_softmax_attention=softmax_main,
+        )
+        .double()
+        .eval()
+    )
     return m
 
 
@@ -135,7 +142,9 @@ def _prope(start=0, end=T):
     # Build UCPE apply fns co-windowed with freqs for frames [start, end).
     torch.manual_seed(7)
     cam = torch.randn(AB, T, 20, dtype=torch.float64)[:, start:end]
-    raymats = process_camera_conditions_ucpe(cam, HW=(end - start, H, W), patch_size=(1, 1, 1))
+    raymats = process_camera_conditions_ucpe(
+        cam, HW=(end - start, H, W), patch_size=(1, 1, 1)
+    )
     raymats_flat = raymats.reshape(AB, -1, 4, 4)
     freqs = _arope()(((start, end), H, W), torch.device("cpu"))
     return _build_ucpe_apply_fns(ADIM, raymats_flat, freqs), freqs
@@ -176,7 +185,9 @@ def test_softmax_main_cached_last_chunk_matches_whole():
     attn = _softmax_attn()
     x = _x()
     rope_full = _arope()(((0, T), H, W), torch.device("cpu"))
-    whole, _, _ = attn._main_branch_softmax_cached(x, AHW, rope_full, _empty_cache(), True)
+    whole, _, _ = attn._main_branch_softmax_cached(
+        x, AHW, rope_full, _empty_cache(), True
+    )
 
     split = 2
     rope0 = _arope()(((0, split), H, W), torch.device("cpu"))
@@ -198,7 +209,9 @@ def test_forward_long_gdn_reduces_to_dense_no_camera():
     rope_emb = _arope()((T, H, W), torch.device("cpu"))
     dense = attn(x, AHW, rope_emb, None)
     cache = _empty_cache()
-    cached, ret = attn.forward_long(x, AHW, rope_emb, None, kv_cache=cache, save_kv_cache=True)
+    cached, ret = attn.forward_long(
+        x, AHW, rope_emb, None, kv_cache=cache, save_kv_cache=True
+    )
     torch.testing.assert_close(cached, dense, atol=1e-9, rtol=0)
     assert ret is cache and cache[_SLOT_K] is not None
 
@@ -210,7 +223,9 @@ def test_forward_long_gdn_reduces_to_dense_with_camera():
     prope_fns = (apply_q, apply_kv, apply_o)
     dense = attn(x, AHW, freqs, prope_fns)
     cache = _empty_cache()
-    cached, _ = attn.forward_long(x, AHW, freqs, prope_fns, kv_cache=cache, save_kv_cache=True)
+    cached, _ = attn.forward_long(
+        x, AHW, freqs, prope_fns, kv_cache=cache, save_kv_cache=True
+    )
     torch.testing.assert_close(cached, dense, atol=1e-9, rtol=0)
     assert cache[_SLOT_CAM_K] is not None
 
@@ -244,21 +259,25 @@ class _ZeroCross(torch.nn.Module):
 
 
 def _block():
-    b = SanaWMBlock(
-        hidden_size=AC,
-        num_heads=AHEADS,
-        head_dim=ADIM,
-        mlp_ratio=2.0,
-        t_kernel_size=3,
-        qk_norm=True,
-        cross_norm=True,
-        conv_kernel_size=4,
-        k_conv_only=True,
-        softmax_main=False,
-        use_chunk_plucker_post_attn=False,
-        update_rule="torch_recurrent",
-        cam_update_rule="torch_recurrent",
-    ).double().eval()
+    b = (
+        SanaWMBlock(
+            hidden_size=AC,
+            num_heads=AHEADS,
+            head_dim=ADIM,
+            mlp_ratio=2.0,
+            t_kernel_size=3,
+            qk_norm=True,
+            cross_norm=True,
+            conv_kernel_size=4,
+            k_conv_only=True,
+            softmax_main=False,
+            use_chunk_plucker_post_attn=False,
+            update_rule="torch_recurrent",
+            cam_update_rule="torch_recurrent",
+        )
+        .double()
+        .eval()
+    )
     # Stub cross-attn (unchanged/uncached in forward_long) to avoid the CUDA
     # attention backend; both forward and forward_long add the same zero.
     b.cross_attn = _ZeroCross()
@@ -322,7 +341,9 @@ def _model_inputs():
     return dict(
         hidden_states=torch.randn(MB, MC, MT, MH, MW, dtype=torch.float64),
         encoder_hidden_states=torch.randn(MB, 4, 32, dtype=torch.float64),
-        timestep=torch.randint(1, 1000, (MB, 1, MT)).double(),  # framewise for both paths
+        timestep=torch.randint(
+            1, 1000, (MB, 1, MT)
+        ).double(),  # framewise for both paths
         camera_conditions=torch.randn(MB, MT, 20, dtype=torch.float64),
         chunk_plucker=torch.randn(MB, 48, MT, MH, MW, dtype=torch.float64),
     )

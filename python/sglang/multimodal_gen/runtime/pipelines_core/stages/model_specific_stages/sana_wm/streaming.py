@@ -14,6 +14,8 @@ Gotchas vs the dense ``SanaWMDenoisingStage`` (one-shot bidirectional):
 
 from __future__ import annotations
 
+# --- debug parity harness (gated by env; no-op in production) ---
+import os as _os
 import time
 
 import torch
@@ -26,10 +28,21 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.self_forcing import (
-    SanaWMSelfForcingSamplerConfig,
-    SanaWMSelfForcingSampler,
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
+    CausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.self_forcing import (
+    SanaWMSelfForcingSampler,
+    SanaWMSelfForcingSamplerConfig,
+)
+from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+from . import parity_probe
 from .base import (
     _align_sana_wm_cfg_text_conditions,
     _cat_optional_tensors,
@@ -37,20 +50,6 @@ from .base import (
     _to_device_dtype,
     log_sana_wm_tensor_stats,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
-    CausalDMDDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
-from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-
-# --- debug parity harness (gated by env; no-op in production) ---
-import os as _os
-
-from . import parity_probe
 
 _SANAWM_INJECT_DIR = _os.environ.get(parity_probe.ENV_INJECT)
 
@@ -98,9 +97,9 @@ def self_forcing_denoise_chunk(
         chunk_lat = get_chunk()
         B, C = chunk_lat.shape[0], chunk_lat.shape[1]
         lat_in = torch.cat([chunk_lat, chunk_lat], dim=0) if do_cfg else chunk_lat
-        ts_tensor = (1.0 - cond_mask) * t.to(
-            device=device, dtype=torch.float32
-        ).view(1, 1, 1, 1, 1)
+        ts_tensor = (1.0 - cond_mask) * t.to(device=device, dtype=torch.float32).view(
+            1, 1, 1, 1, 1
+        )
         ts_in = torch.cat([ts_tensor, ts_tensor], dim=0) if do_cfg else ts_tensor
         model_ts = ts_in[:, :1, :, 0, 0]  # (B|2B, chunk_frames)
 
@@ -192,7 +191,9 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
     condition-frame pinning instead of KV warm-up — hence the cache-management overrides.
     """
 
-    def __init__(self, transformer, scheduler=None, *, keep_resident: bool = False) -> None:
+    def __init__(
+        self, transformer, scheduler=None, *, keep_resident: bool = False
+    ) -> None:
         # Skip CausalDMDDenoisingStage.__init__: it reads Wan-specific arch
         # fields (num_frames_per_block / sliding_window_num_frames / sink_size)
         # that SANA-WM defines per-run via the pipeline config instead.
@@ -215,7 +216,9 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
             ComponentUse(
                 stage_name,
                 "transformer",
-                target_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision],
+                target_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.dit_precision
+                ],
                 memory_intensive=True,
                 keep_ready_after_warmup=True,
             ),
@@ -223,7 +226,9 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
 
     # Chunk schedule + KV cache: delegate to SanaWMSelfForcingSampler.
     @staticmethod
-    def _autoregressive_segments(total_frames: int, num_frame_per_block: int) -> list[int]:
+    def _autoregressive_segments(
+        total_frames: int, num_frame_per_block: int
+    ) -> list[int]:
         return SanaWMSelfForcingSampler.create_autoregressive_segments(
             total_frames, num_frame_per_block
         )
@@ -238,12 +243,21 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
         num_blocks: int,
     ) -> tuple[list, int]:
         return SanaWMSelfForcingSampler.accumulate_kv_cache(
-            kv_cache, chunk_idx, chunk_indices, num_cached_blocks, sink_token, num_blocks
+            kv_cache,
+            chunk_idx,
+            chunk_indices,
+            num_cached_blocks,
+            sink_token,
+            num_blocks,
         )
 
     @staticmethod
     def _evict_stale_kv_cache(
-        kv_cache: list, chunk_idx: int, valid: list[int], num_cached_blocks: int, num_blocks: int
+        kv_cache: list,
+        chunk_idx: int,
+        valid: list[int],
+        num_cached_blocks: int,
+        num_blocks: int,
     ) -> None:
         SanaWMSelfForcingSampler.evict_stale_kv_cache(
             kv_cache, chunk_idx, valid, num_cached_blocks, num_blocks
@@ -290,7 +304,9 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
             parity_probe.dump_tensor(_dump_dir, "cond_embeds", sc.embeds)
             parity_probe.dump_tensor(_dump_dir, "cond_mask", sc.mask)
             parity_probe.dump_obj(
-                _dump_dir, "dit_fingerprint", parity_probe.weights_fingerprint(transformer)
+                _dump_dir,
+                "dit_fingerprint",
+                parity_probe.weights_fingerprint(transformer),
             )
 
         offset = 0
@@ -306,8 +322,12 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                 [[None] * _NUM_STREAM_CACHE_SLOTS for _ in range(num_blocks)]
             )
             chunk_kv, sink_num = self._accumulate_kv_cache(
-                state.stream_kv_cache, chunk_idx, state.chunk_indices,
-                sampler_cfg.num_cached_blocks, sampler_cfg.sink_token, num_blocks,
+                state.stream_kv_cache,
+                chunk_idx,
+                state.chunk_indices,
+                sampler_cfg.num_cached_blocks,
+                sampler_cfg.sink_token,
+                num_blocks,
             )
             # Evict entries outside the accumulate window (sink + last
             # num_cached_blocks) — unbounded sessions leak concat K/V otherwise.
@@ -319,12 +339,16 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                     if sink_start > 0:
                         valid = [0] + list(range(sink_start, chunk_idx))
                 self._evict_stale_kv_cache(
-                    state.stream_kv_cache, chunk_idx, valid,
-                    sampler_cfg.num_cached_blocks, num_blocks,
+                    state.stream_kv_cache,
+                    chunk_idx,
+                    valid,
+                    sampler_cfg.num_cached_blocks,
+                    num_blocks,
                 )
             if _dump_dir:  # parity harness
                 parity_probe.dump_obj(
-                    _dump_dir, f"kv_probe_{chunk_idx:03d}",
+                    _dump_dir,
+                    f"kv_probe_{chunk_idx:03d}",
                     parity_probe.kv_cache_checksums(chunk_kv, sink_num),
                 )
                 parity_probe.dump_tensor(
@@ -341,8 +365,12 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
 
             B, C = chunk_lat.shape[0], chunk_lat.shape[1]
             cond_mask = torch.zeros(
-                B, C, end_f - start_f, *chunk_lat.shape[3:],
-                device=device, dtype=torch.float32,
+                B,
+                C,
+                end_f - start_f,
+                *chunk_lat.shape[3:],
+                device=device,
+                dtype=torch.float32,
             )
             cond_local = []
             if chunk_idx == 0:
@@ -354,7 +382,9 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
             def _get_chunk(_local=_local):
                 return _local["lat"]
 
-            def _set_chunk(denoised, _local=_local, init_chunk=init_chunk, cond_local=cond_local):
+            def _set_chunk(
+                denoised, _local=_local, init_chunk=init_chunk, cond_local=cond_local
+            ):
                 lat = denoised.to(target_dtype)
                 for loc in cond_local:
                     lat[:, :, loc] = init_chunk[:, :, loc]
@@ -441,21 +471,33 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
 
         # --- text conditioning ---
         pos_embeds = _to_device_dtype(
-            _first_tensor(pcfg.get_pos_prompt_embeds(batch)), device=device, dtype=target_dtype
+            _first_tensor(pcfg.get_pos_prompt_embeds(batch)),
+            device=device,
+            dtype=target_dtype,
         )
-        pos_mask = _to_device_dtype(_first_tensor(batch.prompt_attention_mask), device=device)
+        pos_mask = _to_device_dtype(
+            _first_tensor(batch.prompt_attention_mask), device=device
+        )
         if pos_embeds is None:
             raise ValueError("SANA-WM streaming requires positive prompt embeds.")
         neg_embeds = neg_mask = None
         if do_cfg:
             neg_embeds = _to_device_dtype(
-                _first_tensor(pcfg.get_neg_prompt_embeds(batch)), device=device, dtype=target_dtype
+                _first_tensor(pcfg.get_neg_prompt_embeds(batch)),
+                device=device,
+                dtype=target_dtype,
             )
-            neg_mask = _to_device_dtype(_first_tensor(batch.negative_attention_mask), device=device)
+            neg_mask = _to_device_dtype(
+                _first_tensor(batch.negative_attention_mask), device=device
+            )
             if neg_embeds is None:
-                raise ValueError("SANA-WM streaming CFG requires negative prompt embeds.")
-            pos_embeds, neg_embeds, pos_mask, neg_mask = _align_sana_wm_cfg_text_conditions(
-                pos_embeds, neg_embeds, pos_mask, neg_mask
+                raise ValueError(
+                    "SANA-WM streaming CFG requires negative prompt embeds."
+                )
+            pos_embeds, neg_embeds, pos_mask, neg_mask = (
+                _align_sana_wm_cfg_text_conditions(
+                    pos_embeds, neg_embeds, pos_mask, neg_mask
+                )
             )
         embeds_in = torch.cat([neg_embeds, pos_embeds], dim=0) if do_cfg else pos_embeds
         mask_in = _cat_optional_tensors(neg_mask, pos_mask) if do_cfg else pos_mask
@@ -519,7 +561,9 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
 
         pcfg = server_args.pipeline_config
         device = get_local_torch_device()
-        target_dtype = PRECISION_TO_TYPE.get(getattr(pcfg, "dit_precision", "bf16"), torch.bfloat16)
+        target_dtype = PRECISION_TO_TYPE.get(
+            getattr(pcfg, "dit_precision", "bf16"), torch.bfloat16
+        )
 
         # .clone() detaches from the loader's InferenceMode tensor so the
         # per-chunk in-place latent updates below are allowed.
@@ -535,12 +579,18 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
         def _fdump(_name, _t):
             parity_probe.dump_tensor(_dump_dir, _name, _t)
 
-        if _SANAWM_INJECT_DIR:  # parity harness: run the OFFICIAL's exact stage-1 inputs
-            latents = _iload("z_full_initial").to(device=device, dtype=target_dtype).clone()
+        if (
+            _SANAWM_INJECT_DIR
+        ):  # parity harness: run the OFFICIAL's exact stage-1 inputs
+            latents = (
+                _iload("z_full_initial").to(device=device, dtype=target_dtype).clone()
+            )
             init_latents = latents.clone()
             B, C, total_frames, H, W = latents.shape
 
-        _fdump("init_noise", init_latents)  # parity harness: seeded pre-noise (cond @ frame 0)
+        _fdump(
+            "init_noise", init_latents
+        )  # parity harness: seeded pre-noise (cond @ frame 0)
 
         sc = self._resolve_stream_conditioning(
             batch, server_args, device=device, target_dtype=target_dtype, iload=_iload
@@ -600,7 +650,12 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
 
             for chunk_idx in self.progress_bar(range(num_chunks)):
                 chunk_kv, sink_num = self._accumulate_kv_cache(
-                    kv_cache, chunk_idx, chunk_indices, num_cached_blocks, sink_token, num_blocks
+                    kv_cache,
+                    chunk_idx,
+                    chunk_indices,
+                    num_cached_blocks,
+                    sink_token,
+                    num_blocks,
                 )
                 if _dump_dir:  # parity harness: accumulated-KV checksums
                     parity_probe.dump_obj(
@@ -636,9 +691,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                 ):
                     latents[:, :, start_f:end_f] = denoised.to(latents.dtype)
                     for loc in cond_local:
-                        latents[:, :, start_f + loc] = init_latents[
-                            :, :, start_f + loc
-                        ]
+                        latents[:, :, start_f + loc] = init_latents[:, :, start_f + loc]
 
                 def _forward_ctx(ts_int):
                     return set_forward_context(
@@ -673,7 +726,10 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                     forward_ctx=_forward_ctx,
                     on_noise_pred=_on_noise_pred,
                 )
-                _fdump(f"stage1_{chunk_idx:03d}_{start_f}_{end_f}", latents[:, :, start_f:end_f])
+                _fdump(
+                    f"stage1_{chunk_idx:03d}_{start_f}_{end_f}",
+                    latents[:, :, start_f:end_f],
+                )
 
         log_sana_wm_tensor_stats("stream.output_latents", latents)
         self.log_info(

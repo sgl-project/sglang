@@ -94,7 +94,9 @@ def _resolve_launch_config() -> tuple:
     return prec, dot_prec, state_fp32, nw
 
 
-def prepare_rope_tables(rotary_emb, N: int, D: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+def prepare_rope_tables(
+    rotary_emb, N: int, D: int, device
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Complex rotary_emb `(1, 1, N, D//2)` → expanded (N, D) cos/sin tables.
 
     Encodes the interleaved-pair rotation
@@ -118,7 +120,9 @@ def prepare_rope_tables(rotary_emb, N: int, D: int, device) -> tuple[torch.Tenso
     return rope_cos.contiguous(), rope_sin.contiguous()
 
 
-def _precompute_inv_rms(qkv: torch.Tensor, idx: int, C: int, eps: float = 1e-5) -> torch.Tensor:
+def _precompute_inv_rms(
+    qkv: torch.Tensor, idx: int, C: int, eps: float = 1e-5
+) -> torch.Tensor:
     """Compute 1/RMS for one component of QKV over the full C = H*D channel dim.
 
     qkv: (B, N, 3, H, D); idx: 0=Q, 1=K, 2=V; C: H*D. Returns (B, N) float32.
@@ -183,7 +187,9 @@ def fused_qk_inv_rms(
     qkv: (B, N, 3, H, D) contiguous. Returns (q_inv_rms, k_inv_rms), each (B, N) float32.
     """
     assert qkv.is_contiguous(), "qkv must be contiguous (B, N, 3, H, D)"
-    assert qkv.dim() == 5 and qkv.shape[2] == 3, f"expected (B, N, 3, H, D), got {tuple(qkv.shape)}"
+    assert (
+        qkv.dim() == 5 and qkv.shape[2] == 3
+    ), f"expected (B, N, 3, H, D), got {tuple(qkv.shape)}"
     B, N, _, H, D = qkv.shape
     C = H * D
     q_inv_rms = torch.empty((B, N), dtype=torch.float32, device=qkv.device)

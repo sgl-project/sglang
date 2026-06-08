@@ -27,14 +27,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.utils import (
+    normalize_camera_actions,
+    parse_action_string,
+)
 from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ControlSignal,
     ControlStateSamplingQueue,
     ControlStateTransition,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.utils import (
-    normalize_camera_actions,
-    parse_action_string,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
@@ -261,11 +261,13 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
                 session.input_temp_dir = tempfile.mkdtemp(prefix="sglang_input_")
             uploads_dir = session.input_temp_dir
 
-        if isinstance(request.first_frame, str) and request.first_frame.lower().startswith(
-            ("http://", "https://")
-        ):
+        if isinstance(
+            request.first_frame, str
+        ) and request.first_frame.lower().startswith(("http://", "https://")):
             suffix = os.path.splitext(request.first_frame.split("?", 1)[0])[1]
-            digest = hashlib.sha256(request.first_frame.encode("utf-8")).hexdigest()[:16]
+            digest = hashlib.sha256(request.first_frame.encode("utf-8")).hexdigest()[
+                :16
+            ]
             target_path = os.path.join(uploads_dir, f"realtime_ref_{digest}{suffix}")
             if os.path.exists(target_path):
                 request.first_frame = target_path
@@ -427,9 +429,7 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
             batch.realtime_preview_max_width = (
                 session.request.realtime_preview_max_width
             )
-            batch.realtime_output_pacing = bool(
-                session.request.realtime_output_pacing
-            )
+            batch.realtime_output_pacing = bool(session.request.realtime_output_pacing)
         return batch
 
     async def send_output(

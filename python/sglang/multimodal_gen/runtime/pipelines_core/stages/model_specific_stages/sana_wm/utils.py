@@ -75,7 +75,9 @@ def resolve_hf_dir(path: str | Path) -> str:
     return str(Path(root) / subdir) if subdir else str(root)
 
 
-def read_state_dict(path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, torch.Tensor]:
+def read_state_dict(
+    path: str | Path, map_location: str | torch.device = "cpu"
+) -> dict[str, torch.Tensor]:
     path = Path(path)
     if path.suffix == ".safetensors":
         from safetensors.torch import load_file
@@ -118,7 +120,9 @@ def load_checkpoint_fail_fast(
         raise RuntimeError(f"checkpoint does not match model: {'; '.join(details)}")
 
 
-def pil_to_model_tensor(image: Image.Image, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def pil_to_model_tensor(
+    image: Image.Image, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
     arr = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(arr).permute(2, 0, 1)
     return (tensor * 2.0 - 1.0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=dtype)
@@ -143,7 +147,9 @@ def _resolve_ffmpeg_binary() -> str:
 
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception as exc:
-        raise RuntimeError("ffmpeg is required for streaming MP4 output; set FFMPEG_BINARY to a valid ffmpeg executable") from exc
+        raise RuntimeError(
+            "ffmpeg is required for streaming MP4 output; set FFMPEG_BINARY to a valid ffmpeg executable"
+        ) from exc
 
 
 class StreamingMp4Writer:
@@ -190,14 +196,26 @@ class StreamingMp4Writer:
             "+faststart",
             str(self.path),
         ]
-        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
         self._closed = False
 
     def write_chunk(self, frames_uint8: np.ndarray) -> None:
         if self._closed:
             raise RuntimeError("writer is closed")
-        if frames_uint8.dtype != np.uint8 or frames_uint8.ndim != 4 or frames_uint8.shape[-1] != 3:
-            raise ValueError(f"expected uint8 frames shaped (T,H,W,3), got {frames_uint8.shape} {frames_uint8.dtype}")
+        if (
+            frames_uint8.dtype != np.uint8
+            or frames_uint8.ndim != 4
+            or frames_uint8.shape[-1] != 3
+        ):
+            raise ValueError(
+                f"expected uint8 frames shaped (T,H,W,3), got {frames_uint8.shape} {frames_uint8.dtype}"
+            )
         if not frames_uint8.flags["C_CONTIGUOUS"]:
             frames_uint8 = np.ascontiguousarray(frames_uint8)
         stdin: IO[bytes] | None = self._proc.stdin
@@ -206,7 +224,11 @@ class StreamingMp4Writer:
         try:
             stdin.write(frames_uint8.tobytes())
         except BrokenPipeError as exc:
-            stderr = self._proc.stderr.read().decode(errors="replace") if self._proc.stderr is not None else ""
+            stderr = (
+                self._proc.stderr.read().decode(errors="replace")
+                if self._proc.stderr is not None
+                else ""
+            )
             raise RuntimeError(f"ffmpeg exited while writing:\n{stderr}") from exc
         self.frames_written += int(frames_uint8.shape[0])
 
@@ -216,7 +238,11 @@ class StreamingMp4Writer:
         self._closed = True
         if self._proc.stdin is not None:
             self._proc.stdin.close()
-        stderr = self._proc.stderr.read().decode(errors="replace") if self._proc.stderr is not None else ""
+        stderr = (
+            self._proc.stderr.read().decode(errors="replace")
+            if self._proc.stderr is not None
+            else ""
+        )
         ret = self._proc.wait()
         if ret != 0:
             raise RuntimeError(f"ffmpeg failed with exit code {ret}:\n{stderr}")
@@ -278,7 +304,9 @@ def parse_action_string(action: str) -> list[list[str]]:
     per_frame: list[list[str]] = []
     for segment in cleaned.split(","):
         if not segment or "-" not in segment:
-            raise ValueError(f"invalid action segment {segment!r}; expected '<keys>-<frames>'")
+            raise ValueError(
+                f"invalid action segment {segment!r}; expected '<keys>-<frames>'"
+            )
         keys_part, duration = segment.rsplit("-", 1)
         if not duration.isdigit() or int(duration) <= 0:
             raise ValueError(f"invalid duration in action segment {segment!r}")
@@ -286,9 +314,13 @@ def parse_action_string(action: str) -> list[list[str]]:
         if keys_part.lower() == "none":
             keys: list[str] = []
         else:
-            bad = sorted({char for char in keys_part.lower() if char not in ALLOWED_ACTION_KEYS})
+            bad = sorted(
+                {char for char in keys_part.lower() if char not in ALLOWED_ACTION_KEYS}
+            )
             if bad:
-                raise ValueError(f"unknown action keys {bad}; allowed keys are {sorted(ALLOWED_ACTION_KEYS)}")
+                raise ValueError(
+                    f"unknown action keys {bad}; allowed keys are {sorted(ALLOWED_ACTION_KEYS)}"
+                )
             keys = sorted(set(keys_part.lower()))
         # Fresh list per frame: repeated frames must NOT alias one list object
         # (callers could mutate a frame and silently edit all its repeats).
@@ -316,15 +348,21 @@ def action_string_to_c2w(
         rotation = current[:3, :3]
         translation = current[:3, 3]
 
-        pitch_delta = (rotate_rad if "i" in held else 0.0) - (rotate_rad if "k" in held else 0.0)
+        pitch_delta = (rotate_rad if "i" in held else 0.0) - (
+            rotate_rad if "k" in held else 0.0
+        )
         next_pitch = current_pitch + pitch_delta
         if -pitch_limit_rad <= next_pitch <= pitch_limit_rad:
             current_pitch = next_pitch
         else:
             pitch_delta = 0.0
 
-        yaw_delta = (rotate_rad if "l" in held else 0.0) - (rotate_rad if "j" in held else 0.0)
-        strafe_yaw = (rotate_rad if "d" in held else 0.0) - (rotate_rad if "a" in held else 0.0)
+        yaw_delta = (rotate_rad if "l" in held else 0.0) - (
+            rotate_rad if "j" in held else 0.0
+        )
+        strafe_yaw = (rotate_rad if "d" in held else 0.0) - (
+            rotate_rad if "a" in held else 0.0
+        )
         yaw_delta += strafe_yaw_coupling * strafe_yaw
         rotation = _rot_y(yaw_delta) @ rotation @ _rot_x(pitch_delta)
 
@@ -360,7 +398,9 @@ def action_string_to_c2w(
 def load_camera(path: Path) -> np.ndarray:
     c2w = np.load(path).astype(np.float32)
     if c2w.ndim != 3 or c2w.shape[1:] != (4, 4):
-        raise ValueError(f"camera trajectory must have shape (F, 4, 4); got {c2w.shape}")
+        raise ValueError(
+            f"camera trajectory must have shape (F, 4, 4); got {c2w.shape}"
+        )
     return c2w
 
 
@@ -374,22 +414,34 @@ def load_intrinsics(path: Path, num_frames: int) -> np.ndarray:
         return np.broadcast_to(vec, (num_frames, 4)).copy()
     if arr.ndim == 3 and arr.shape[1:] == (3, 3) and arr.shape[0] >= num_frames:
         arr = arr[:num_frames]
-        return np.stack([arr[:, 0, 0], arr[:, 1, 1], arr[:, 0, 2], arr[:, 1, 2]], axis=1)
-    raise ValueError(f"unsupported intrinsics shape {arr.shape}; expected (4,), (3,3), or (F,3,3)")
+        return np.stack(
+            [arr[:, 0, 0], arr[:, 1, 1], arr[:, 0, 2], arr[:, 1, 2]], axis=1
+        )
+    raise ValueError(
+        f"unsupported intrinsics shape {arr.shape}; expected (4,), (3,3), or (F,3,3)"
+    )
 
 
-def estimate_intrinsics_with_pi3x(image: Image.Image, device: torch.device | str = "cuda") -> np.ndarray:
+def estimate_intrinsics_with_pi3x(
+    image: Image.Image, device: torch.device | str = "cuda"
+) -> np.ndarray:
     """Estimate ``[fx, fy, cx, cy]`` with Pi3X when --intrinsics is omitted."""
     try:
         from pi3.models.pi3x import Pi3X
         from pi3.utils.geometry import recover_intrinsic_from_rays_d
     except ImportError as exc:
-        raise RuntimeError("intrinsics were omitted, but Pi3X is not installed; pass --intrinsics or install pi3") from exc
+        raise RuntimeError(
+            "intrinsics were omitted, but Pi3X is not installed; pass --intrinsics or install pi3"
+        ) from exc
 
     device = torch.device(device)
     orig_w, orig_h = image.size
     pixel_limit = 255_000
-    scale = math.sqrt(pixel_limit / (orig_w * orig_h)) if orig_w * orig_h > pixel_limit else 1.0
+    scale = (
+        math.sqrt(pixel_limit / (orig_w * orig_h))
+        if orig_w * orig_h > pixel_limit
+        else 1.0
+    )
     target_w, target_h = orig_w * scale, orig_h * scale
     k = max(1, round(target_w / 14))
     m = max(1, round(target_h / 14))
@@ -403,14 +455,22 @@ def estimate_intrinsics_with_pi3x(image: Image.Image, device: torch.device | str
     arr = np.asarray(resized, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device)
 
-    dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+    dtype = (
+        torch.bfloat16
+        if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8
+        else torch.float16
+    )
     model = Pi3X.from_pretrained("yyfz233/Pi3X").to(device).eval()
     model.disable_multimodal()
     model.requires_grad_(False)
-    with torch.no_grad(), torch.amp.autocast(device.type, dtype=dtype, enabled=device.type == "cuda"):
+    with torch.no_grad(), torch.amp.autocast(
+        device.type, dtype=dtype, enabled=device.type == "cuda"
+    ):
         out = model(imgs=tensor)
     rays_d = torch.nn.functional.normalize(out["local_points"], dim=-1)
-    intrinsics = recover_intrinsic_from_rays_d(rays_d, force_center_principal_point=True)[0, 0]
+    intrinsics = recover_intrinsic_from_rays_d(
+        rays_d, force_center_principal_point=True
+    )[0, 0]
     intrinsics = intrinsics.detach().cpu().float().numpy()
 
     sx, sy = orig_w / model_w, orig_h / model_h
@@ -431,7 +491,9 @@ def estimate_intrinsics_with_pi3x(image: Image.Image, device: torch.device | str
     return np.array([fx, fy, cx, cy], dtype=np.float32)
 
 
-def snap_num_frames(num_frames: int, stride: int = 8, upper_bound: int | None = None) -> int:
+def snap_num_frames(
+    num_frames: int, stride: int = 8, upper_bound: int | None = None
+) -> int:
     """Snap to the nearest valid LTX-2 VAE length: ``stride * k + 1``."""
     if num_frames < 1:
         return 1
@@ -440,7 +502,11 @@ def snap_num_frames(num_frames: int, stride: int = 8, upper_bound: int | None = 
 
     floor_candidate = num_frames - ((num_frames - 1) % stride)
     ceil_candidate = floor_candidate + stride
-    snapped = floor_candidate if num_frames - floor_candidate < ceil_candidate - num_frames else ceil_candidate
+    snapped = (
+        floor_candidate
+        if num_frames - floor_candidate < ceil_candidate - num_frames
+        else ceil_candidate
+    )
     if upper_bound is not None and snapped > upper_bound:
         snapped = floor_candidate
     return max(snapped, 1)

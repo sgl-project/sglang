@@ -186,9 +186,7 @@ def _temporal_short_conv_cached(
     else:
         y = y_fwd.to(xt.dtype)
 
-    new_prefix = (
-        xt[:, -pad:].detach().clone() if (save_prefix and pad > 0) else prefix
-    )
+    new_prefix = xt[:, -pad:].detach().clone() if (save_prefix and pad > 0) else prefix
     y = y.reshape(B, S, T, C).permute(0, 2, 1, 3).reshape(B, N, C)
     return y, new_prefix
 
@@ -836,7 +834,6 @@ class PatchEmbedMS3D(nn.Module):
         return x.flatten(2).transpose(1, 2)  # (B, T*H*W, D)
 
 
-
 class _UpstreamMlp(nn.Module):
     """timm-style Mlp used by ``y_embedder.y_proj`` (fc1/fc2 with bias=True)."""
 
@@ -1072,7 +1069,9 @@ class GLUMBConvTemp(nn.Module):
         x_sp = x.reshape(B * T, H, W, C).permute(0, 3, 1, 2).contiguous()
         x_sp = self._apply_spatial_autochunked(x_sp)  # (B*T, C, H, W)
 
-        x_t = x_sp.view(B, T, C, H * W).permute(0, 2, 1, 3).contiguous()  # (B, C, T, S=H*W)
+        x_t = (
+            x_sp.view(B, T, C, H * W).permute(0, 2, 1, 3).contiguous()
+        )  # (B, C, T, S=H*W)
 
         if ffn_tail is None and not save_ffn_tail:
             # Dense (bidirectional / symmetric-padding) path.
@@ -1145,8 +1144,7 @@ def _gdn_scan_forward(
     eps: float = 1e-6,
     return_components: bool = False,
 ) -> torch.Tensor:
-    """Causal recurrent GDN scan over T. Tensors are in (B, H, D, N=T*S) layout.
-    """
+    """Causal recurrent GDN scan over T. Tensors are in (B, H, D, N=T*S) layout."""
     B, H, D, N = q.shape
     T = beta.shape[2]
     S = N // T
@@ -1371,9 +1369,7 @@ def _gdn_chunk_scan_forward(
         decay_c = decay_e[:, :, start:end]
 
         k_rot_beta = k_rot_c * beta_c
-        w_kv = decay_c * (
-            eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2))
-        )
+        w_kv = decay_c * (eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2)))
         u_kv = torch.matmul(v_c * beta_c, k_rot_c.transpose(-1, -2))
 
         k_beta = k_c * beta_c
@@ -1382,9 +1378,7 @@ def _gdn_chunk_scan_forward(
 
         state_kv_frames, state_z_frames = [], []
         for offset in range(end - start):
-            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[
-                :, :, offset
-            ]
+            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[:, :, offset]
             state_z = torch.matmul(w_z[:, :, offset], state_z) + u_z[:, :, offset]
             state_kv_frames.append(state_kv)
             state_z_frames.append(state_z)
@@ -1431,6 +1425,7 @@ def _gdn_scan_bidirectional(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Bidirectional GDN: forward (inclusive) + backward (exclusive) scan, summed in numerator/denominator space."""
+
     def run_scan(
         q_in: torch.Tensor,
         k_in: torch.Tensor,
@@ -1615,16 +1610,12 @@ def _single_path_delta_chunk_scan_forward(
         decay_c = decay_e[:, :, start:end]
 
         k_rot_beta = k_rot_c * beta_c
-        w_kv = decay_c * (
-            eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2))
-        )
+        w_kv = decay_c * (eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2)))
         u_kv = torch.matmul(v_c * beta_c, k_rot_c.transpose(-1, -2))
 
         state_frames = []
         for offset in range(end - start):
-            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[
-                :, :, offset
-            ]
+            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[:, :, offset]
             state_frames.append(state_kv)
 
         state_all = torch.stack(state_frames, dim=2)
@@ -2039,7 +2030,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self._cam_qkv_params_cache = (key, params)
         return params
 
-    def _cam_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _cam_qkv(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv_weight, qkv_bias = self._get_cam_qkv_params()
         return F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
 
@@ -2205,7 +2198,11 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return "requires eval/inference mode"
         if not q.is_cuda:
             return "requires CUDA tensor"
-        if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
+        if (
+            q.dtype != torch.float32
+            or k.dtype != torch.float32
+            or v.dtype != torch.float32
+        ):
             return f"requires fp32 q/k/v, got {q.dtype}/{k.dtype}/{v.dtype}"
         if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
             return "q/k/v must be contiguous"
@@ -2223,8 +2220,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return f"requires beta shape {(B, heads, T)}, got {tuple(beta.shape)}"
         if beta.ndim == 4 and beta.shape != (B, heads, T, S):
             return (
-                f"requires beta shape {(B, heads, T, S)}, "
-                f"got {tuple(beta.shape)}"
+                f"requires beta shape {(B, heads, T, S)}, " f"got {tuple(beta.shape)}"
             )
         if decay.shape != (B, heads, T):
             return f"requires decay shape {(B, heads, T)}, got {tuple(decay.shape)}"
@@ -2970,7 +2966,15 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 )
             else:
                 cam_raw = self._cam_branch_cached(
-                    x, HW, apply_q, apply_kv, apply_o, beta, decay, kv_cache, save_kv_cache
+                    x,
+                    HW,
+                    apply_q,
+                    apply_kv,
+                    apply_o,
+                    beta,
+                    decay,
+                    kv_cache,
+                    save_kv_cache,
                 )
             combined = main_raw + self.out_proj_cam(cam_raw)
         else:
@@ -3031,5 +3035,3 @@ class MultiHeadCrossAttention(nn.Module):
         out = self.attn(q, k, v, attn_mask=attn_mask)  # (B, N, H, D)
         out = out.reshape(B, N, D)
         return self.proj(out)
-
-

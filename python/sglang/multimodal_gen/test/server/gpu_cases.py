@@ -25,9 +25,9 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
-    SANA_WM_TI2V_CI_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )

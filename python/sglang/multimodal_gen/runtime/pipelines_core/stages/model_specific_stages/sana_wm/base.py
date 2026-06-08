@@ -54,7 +54,9 @@ _SANA_WM_DIAGNOSTICS_ENVS = (
 
 _SANA_WM_DEFAULT_VAE_TILE_MIN_FRAMES = 96
 _SANA_WM_DEFAULT_VAE_TILE_STRIDE_FRAMES = 64
-_SANA_WM_DEFAULT_TRANSLATION_SPEED = 0.04  # match official streaming (STREAMING_TRANSLATION_SPEED)
+_SANA_WM_DEFAULT_TRANSLATION_SPEED = (
+    0.04  # match official streaming (STREAMING_TRANSLATION_SPEED)
+)
 _SANA_WM_DEFAULT_ROTATION_SPEED_DEG = 1.2
 _SANA_WM_DEFAULT_PITCH_LIMIT_DEG = 85.0
 _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY = "sana_wm_condition_image_preprocess"
@@ -110,9 +112,7 @@ def sana_wm_normalize_vae_latents(
             and isinstance(latents_std, torch.Tensor),
             scaling_factor,
         )
-    if isinstance(latents_mean, torch.Tensor) and isinstance(
-        latents_std, torch.Tensor
-    ):
+    if isinstance(latents_mean, torch.Tensor) and isinstance(latents_std, torch.Tensor):
         latents_mean = latents_mean.to(device=z.device, dtype=z.dtype).view(
             1, -1, 1, 1, 1
         )
@@ -708,9 +708,7 @@ class SanaWMDenoisingStage(DenoisingStage):
         else:
             model_kwargs = {
                 "encoder_hidden_states": (
-                    torch.cat([neg_embeds, pos_embeds], dim=0)
-                    if do_cfg
-                    else pos_embeds
+                    torch.cat([neg_embeds, pos_embeds], dim=0) if do_cfg else pos_embeds
                 ),
                 "encoder_attention_mask": (
                     _cat_optional_tensors(neg_mask, pos_mask) if do_cfg else pos_mask
@@ -1192,9 +1190,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             if not hasattr(batch, "extra") or batch.extra is None:
                 batch.extra = {}
             batch.extra[_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY] = (
-                preprocess_infos[0]
-                if len(preprocess_infos) == 1
-                else preprocess_infos
+                preprocess_infos[0] if len(preprocess_infos) == 1 else preprocess_infos
             )
         self.log_info(
             "First-frame condition image preprocessed: source=%s, resized=%s, "

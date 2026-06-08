@@ -1,22 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # Re-exported for back-compat: callers import these names from this module path.
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # noqa: F401
+    _CACHE_TYPE_CONCAT,
+    _CACHE_TYPE_STATE,
+    _INT32_SAFE_CONV_ELEMENTS,
+    _NUM_STREAM_CACHE_SLOTS,
+    _SLOT_CAM_K,
+    _SLOT_CAM_V,
+    _SLOT_FFN_TCONV,
+    _SLOT_K,
+    _SLOT_SHORTCONV,
+    _SLOT_TYPE_FLAG,
+    _SLOT_V,
     BidirectionalGDNUCPESinglePathLiteLA,
     CaptionEmbedder,
     GLUMBConvTemp,
@@ -25,21 +32,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     T2IFinalLayer,
     TimestepEmbedder,
     WanRotaryPosEmbed,
-    _CACHE_TYPE_CONCAT,
-    _CACHE_TYPE_STATE,
-    _ConvLayer,
-    _INT32_SAFE_CONV_ELEMENTS,
-    _NUM_STREAM_CACHE_SLOTS,
-    _RMSNorm,
-    _ShortConvolution,
-    _SLOT_CAM_K,
-    _SLOT_CAM_V,
-    _SLOT_FFN_TCONV,
-    _SLOT_K,
-    _SLOT_SHORTCONV,
-    _SLOT_TYPE_FLAG,
-    _SLOT_V,
-    _UpstreamMlp,
     _apply_block_diagonal,
     _apply_complex_rope,
     _apply_ray_projmat,
@@ -49,6 +41,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     _build_ucpe_apply_fns,
     _compute_fov_from_focal,
     _compute_frame_gates,
+    _ConvLayer,
     _downscale_to_reference_rms,
     _flip_and_shift,
     _gdn_chunk_scan_forward,
@@ -59,12 +52,14 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     _invert_SE3,
     _log_sana_wm_triton_cam_gdn_fallback,
     _log_sana_wm_triton_gdn_fallback,
+    _RMSNorm,
     _sana_wm_chunk_boundaries_for_attention,
     _sana_wm_chunk_index_from_chunk_size,
     _sana_wm_chunked_attention,
     _sana_wm_normalize_chunk_index,
     _sana_wm_padded_scale,
     _sana_wm_sdpa,
+    _ShortConvolution,
     _single_path_delta_chunk_scan_forward,
     _single_path_delta_scan_bidirectional,
     _single_path_delta_scan_cached,
@@ -75,9 +70,11 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     _slice_rope_to_current_chunk,
     _temporal_short_conv_cached,
     _tensor_cache_key,
+    _UpstreamMlp,
     compute_chunk_plucker,
     process_camera_conditions_ucpe,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -480,9 +477,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._ucpe_apply_fns_cache: Optional[
             Tuple[Tuple, torch.Tensor, Tuple[Callable, Callable, Callable]]
         ] = None
-        self._plucker_emb_cache: Optional[
-            Tuple[Tuple, torch.Tensor, torch.Tensor]
-        ] = None
+        self._plucker_emb_cache: Optional[Tuple[Tuple, torch.Tensor, torch.Tensor]] = (
+            None
+        )
 
         # FSDP shard targets
         self.layer_names = ["blocks"]
@@ -524,9 +521,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             return self.rope((end - start, H, W), device, frame_index=frame_index)
         key = ("win", int(start), int(end), H, W, str(device))
         if key not in self._freqs_cache:
-            self._freqs_cache[key] = self.rope(
-                ((int(start), int(end)), H, W), device
-            )
+            self._freqs_cache[key] = self.rope(((int(start), int(end)), H, W), device)
         return self._freqs_cache[key]
 
     def _get_ucpe_apply_fns(
@@ -801,7 +796,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             encoder_attention_mask = encoder_attention_mask.expand(B, -1).contiguous()
 
         # RoPE windowed to global frame positions [start, end)
-        freqs = self._get_freqs_window(start, end, H, W, x.device, frame_index=frame_index)
+        freqs = self._get_freqs_window(
+            start, end, H, W, x.device, frame_index=frame_index
+        )
 
         # Camera conditioning: slice to the chunk, co-windowed w/ freqs
         prope_fns = None
@@ -823,7 +820,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # Plücker post-attn / input embedding, sliced to the chunk.
         if chunk_plucker is not None and chunk_plucker.shape[2] != T:
-            chunk_plucker = chunk_plucker[:, :, start:end].contiguous()  # see camera note
+            chunk_plucker = chunk_plucker[
+                :, :, start:end
+            ].contiguous()  # see camera note
         if chunk_plucker is not None and chunk_plucker.shape[0] != B:
             chunk_plucker = chunk_plucker.repeat(
                 B // chunk_plucker.shape[0], 1, 1, 1, 1
@@ -852,12 +851,25 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         _probe_path = __import__("os").environ.get(parity_probe.ENV_BLOCK_PROBE)
         _probe = None
-        if _probe_path and frame_index is not None and not getattr(self, "_block_probe_done", False):
+        if (
+            _probe_path
+            and frame_index is not None
+            and not getattr(self, "_block_probe_done", False)
+        ):
             _ck = parity_probe.checksum
             _probe = {
-                "x_embed": _ck(x), "t6": _ck(t6), "y": _ck(y),
-                "freqs": (tuple(freqs.shape), float(freqs.real.detach().double().sum().item()),
-                          float(freqs.imag.detach().double().sum().item())) if freqs is not None else None,
+                "x_embed": _ck(x),
+                "t6": _ck(t6),
+                "y": _ck(y),
+                "freqs": (
+                    (
+                        tuple(freqs.shape),
+                        float(freqs.real.detach().double().sum().item()),
+                        float(freqs.imag.detach().double().sum().item()),
+                    )
+                    if freqs is not None
+                    else None
+                ),
                 "plucker_emb": _ck(plucker_emb),
                 "frame_index": frame_index.tolist(),
             }

@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     scale_and_shift_latents,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 from .base import (
     SanaWMBeforeDenoisingStage,
@@ -37,18 +40,14 @@ from .streaming_refiner import (
     RefinerChunkRunner,
     _RefinerCore,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-
 from .utils import (
     TARGET_HEIGHT,
     TARGET_WIDTH,
     action_string_to_c2w,
-    normalize_camera_actions,
     estimate_intrinsics_with_pi3x,
     load_camera,
     load_intrinsics,
+    normalize_camera_actions,
     pil_to_model_tensor,
     resize_and_center_crop,
 )
@@ -117,7 +116,9 @@ def _normalize_intrinsics_array(arr: Any, num_frames: int) -> np.ndarray:
         return np.broadcast_to(vec, (num_frames, 4)).copy()
     if intrinsics.ndim == 2 and intrinsics.shape[1] == 4:
         if intrinsics.shape[0] < num_frames:
-            pad = np.broadcast_to(intrinsics[-1:], (num_frames - intrinsics.shape[0], 4))
+            pad = np.broadcast_to(
+                intrinsics[-1:], (num_frames - intrinsics.shape[0], 4)
+            )
             intrinsics = np.concatenate([intrinsics, pad], axis=0)
         return intrinsics[:num_frames].copy()
     if intrinsics.ndim == 3 and intrinsics.shape[1:] == (3, 3):
@@ -184,21 +185,31 @@ class SanaWMRealtimeStage(PipelineStage):
             ComponentUse(
                 stage_name,
                 "transformer",
-                target_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision],
+                target_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.dit_precision
+                ],
                 memory_intensive=True,
                 keep_ready_after_warmup=True,
             ),
             ComponentUse(
                 stage_name,
                 "vae",
-                target_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
+                target_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.vae_precision
+                ],
                 keep_ready_after_warmup=True,
             ),
         ]
 
     def _empty_output(self, batch: Req) -> OutputBatch:
         output = torch.empty(
-            (1, 3, 0, int(batch.height or SANA_WM_HEIGHT), int(batch.width or SANA_WM_WIDTH)),
+            (
+                1,
+                3,
+                0,
+                int(batch.height or SANA_WM_HEIGHT),
+                int(batch.width or SANA_WM_WIDTH),
+            ),
             dtype=torch.float32,
             device=get_local_torch_device(),
         )
@@ -206,7 +217,9 @@ class SanaWMRealtimeStage(PipelineStage):
 
     def _prepare_image(
         self, batch: Req
-    ) -> tuple[Image.Image, Image.Image, tuple[int, int], tuple[int, int], tuple[int, int]]:
+    ) -> tuple[
+        Image.Image, Image.Image, tuple[int, int], tuple[int, int], tuple[int, int]
+    ]:
         if isinstance(batch.condition_image, Image.Image):
             original = batch.condition_image.convert("RGB")
         elif batch.image_path is not None and isinstance(batch.image_path, str):
@@ -242,7 +255,9 @@ class SanaWMRealtimeStage(PipelineStage):
             return None
 
         if c2w.ndim != 3 or c2w.shape[1:] != (4, 4):
-            raise ValueError(f"camera trajectory must have shape (F,4,4), got {c2w.shape}")
+            raise ValueError(
+                f"camera trajectory must have shape (F,4,4), got {c2w.shape}"
+            )
         if c2w.shape[0] < num_frames:
             pad = np.broadcast_to(c2w[-1:], (num_frames - c2w.shape[0], 4, 4))
             c2w = np.concatenate([c2w, pad], axis=0)
@@ -258,9 +273,13 @@ class SanaWMRealtimeStage(PipelineStage):
     ) -> np.ndarray:
         condition_inputs = batch.condition_inputs or {}
         if condition_inputs.get("intrinsics_path") is not None:
-            return load_intrinsics(Path(str(condition_inputs["intrinsics_path"])), num_frames)
+            return load_intrinsics(
+                Path(str(condition_inputs["intrinsics_path"])), num_frames
+            )
         if condition_inputs.get("intrinsics") is not None:
-            return _normalize_intrinsics_array(condition_inputs["intrinsics"], num_frames)
+            return _normalize_intrinsics_array(
+                condition_inputs["intrinsics"], num_frames
+            )
         if state.intrinsics_raw is not None:
             cached = state.intrinsics_raw
             if cached.shape[0] < num_frames:
@@ -276,9 +295,7 @@ class SanaWMRealtimeStage(PipelineStage):
         estimated = estimate_intrinsics_with_pi3x(state.intrinsics_image, device)
         return np.broadcast_to(estimated, (num_frames, 4)).copy()
 
-    def _append_realtime_camera_actions(
-        self, batch: Req, state
-    ) -> None:
+    def _append_realtime_camera_actions(self, batch: Req, state) -> None:
         actions = _normalize_camera_actions(
             (batch.condition_inputs or {}).get("camera_actions")
         )
@@ -303,9 +320,7 @@ class SanaWMRealtimeStage(PipelineStage):
             if c2w.shape[0] < num_frames:
                 # Open-ended growth: hold the last pose (fixed-horizon sessions
                 # always precompute the full trajectory, so this never triggers).
-                pad = np.broadcast_to(
-                    c2w[-1:], (num_frames - c2w.shape[0], 4, 4)
-                )
+                pad = np.broadcast_to(c2w[-1:], (num_frames - c2w.shape[0], 4, 4))
                 c2w = np.concatenate([c2w, pad], axis=0)
             return c2w[:num_frames]
 
@@ -480,4 +495,3 @@ class SanaWMRealtimeStage(PipelineStage):
             return True
         num_frames = getattr(batch, "num_frames", None)
         return num_frames is None or int(num_frames) <= 0
-

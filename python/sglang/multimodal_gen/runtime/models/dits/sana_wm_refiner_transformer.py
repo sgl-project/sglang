@@ -34,9 +34,7 @@ def pack_latents(
     pT = T // patch_size_t
     pH = H // patch_size
     pW = W // patch_size
-    latents = latents.reshape(
-        B, -1, pT, patch_size_t, pH, patch_size, pW, patch_size
-    )
+    latents = latents.reshape(B, -1, pT, patch_size_t, pH, patch_size, pW, patch_size)
     return latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
 
 
@@ -61,10 +59,7 @@ def unpack_latents(
         patch_size,
     )
     return (
-        tokens.permute(0, 4, 1, 5, 2, 6, 3, 7)
-        .flatten(6, 7)
-        .flatten(4, 5)
-        .flatten(2, 3)
+        tokens.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
     )
 
 
@@ -163,9 +158,7 @@ class SanaWMRefinerBlock(nn.Module):
         self.norm3 = nn.RMSNorm(self.dim, eps=norm_eps, elementwise_affine=False)
         self.ff = LTX2FeedForward(self.dim, dim_out=self.dim, quant_config=quant_config)
 
-        self.scale_shift_table = nn.Parameter(
-            torch.randn(6, self.dim) / self.dim**0.5
-        )
+        self.scale_shift_table = nn.Parameter(torch.randn(6, self.dim) / self.dim**0.5)
 
     def forward(
         self,
@@ -396,9 +389,7 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
         else:
             temb = temb.view(B, 1, temb.size(-1))
-            embedded_timestep = embedded_timestep.view(
-                B, 1, embedded_timestep.size(-1)
-            )
+            embedded_timestep = embedded_timestep.view(B, 1, embedded_timestep.size(-1))
 
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states.view(B, -1, self.hidden_size)

@@ -24,7 +24,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_downloa
 DEFAULT_SANA_WM_TEXT_ENCODER = "Efficient-Large-Model/gemma-2-2b-it"
 
 
-class SanaWMRealtimeTextEncodingStage(RealtimeTextEncodingStage, SanaWMTextEncodingStage):
+class SanaWMRealtimeTextEncodingStage(
+    RealtimeTextEncodingStage, SanaWMTextEncodingStage
+):
     """Realtime text encoding using SANA-WM's prompt processing (NOT the bare base).
 
     MRO contract: ``RealtimeTextEncodingStage.forward`` (per-session cache) calls

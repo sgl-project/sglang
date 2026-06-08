@@ -2,11 +2,6 @@
 
 import os
 
-# Stage-2 refiner sub-modules live under `<model_path>/refiner/...`, not at the
-# model root. They're loaded manually in `initialize_pipeline` rather than via
-# `_required_config_modules`, because the framework verifier resolves every
-# required module key as a literal top-level subdir of the materialized model.
-
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
@@ -33,6 +28,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+# Stage-2 refiner sub-modules live under `<model_path>/refiner/...`, not at the
+# model root. They're loaded manually in `initialize_pipeline` rather than via
+# `_required_config_modules`, because the framework verifier resolves every
+# required module key as a literal top-level subdir of the materialized model.
+
 
 logger = init_logger(__name__)
 

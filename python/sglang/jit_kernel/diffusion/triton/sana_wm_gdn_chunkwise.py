@@ -109,7 +109,9 @@ _CHUNKWISE_TUNING: dict[tuple[str, str], _ChunkwiseCfg] = {
         # nw=8 across all F; Phase A was the A100 sink/rolling bottleneck.
         A=_PhaseCfg(nw=16, BS=32),
         B=_PhaseCfg(nw=32, use_acc=False, ns=2),  # ns=2 fills pipe (no acc-fusion)
-        C=_PhaseCfg(nw=16, BS=32, ns=1),  # 2026-04-30 retune: nw=16 BS=32 is 2.8x faster (was nw=8 BS=16)
+        C=_PhaseCfg(
+            nw=16, BS=32, ns=1
+        ),  # 2026-04-30 retune: nw=16 BS=32 is 2.8x faster (was nw=8 BS=16)
     ),
     # Hopper (H100): WGMMA + 228 KB SRAM → big tiles win at bf16.
     # Phase B fp32 uses acc-fusion (MMA accumulator folds A_f in one op, +12%).
@@ -123,7 +125,9 @@ _CHUNKWISE_TUNING: dict[tuple[str, str], _ChunkwiseCfg] = {
         B=_PhaseCfg(
             nw=32, use_acc=False, ns=1
         ),  # 2026-04-29 retune: acc_fusion=False is 3x faster post precision-gate fix
-        C=_PhaseCfg(nw=16, BS=32, ns=1),  # 2026-04-30 retune: nw=16 BS=32 is 1.7x faster (was nw=8 BS=16)
+        C=_PhaseCfg(
+            nw=16, BS=32, ns=1
+        ),  # 2026-04-30 retune: nw=16 BS=32 is 1.7x faster (was nw=8 BS=16)
     ),
     # Blackwell-DC (B200 / GB200): 228 KB SRAM + improved WGMMA codegen.
     # bf16 likes small CTAs (nw=4); fp32 stays at nw=8 (nw=4 + BS=64 fp32 = 92× regression).
@@ -150,7 +154,9 @@ _CHUNKWISE_TUNING: dict[tuple[str, str], _ChunkwiseCfg] = {
     # 1.84×/2.65× (GB10/5090) over prior nw=8 (sweep 2026-04-24, F=11 S=920).
     ("blackwell_spark", "bf16"): _ChunkwiseCfg(
         A=_PhaseCfg(nw=8, BS=32),
-        B=_PhaseCfg(nw=8, use_acc=False, ns=1),  # nw=8 (not 4) at bf16: ~5% across F=3,6,11
+        B=_PhaseCfg(
+            nw=8, use_acc=False, ns=1
+        ),  # nw=8 (not 4) at bf16: ~5% across F=3,6,11
         # C.nw=4 BS=32: ~3.5% faster than nw=8 (Phase C is bandwidth-bound, fewer
         # warps schedule better on small SRAM). BS=64 bf16 OOMs Spark SRAM.
         C=_PhaseCfg(nw=4, BS=32, ns=1),
@@ -242,7 +248,11 @@ def _get_arch_config(
         elif isinstance(device, int):
             dev_idx = device
         else:
-            dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+            dev_idx = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
         cap = torch.cuda.get_device_capability(dev_idx)
     key = (cap, dot_precision)
     if key in _ARCH_OVERRIDES:
@@ -297,7 +307,9 @@ def _phase_a_kv_kernel(
 
     qkv_bh = qkv_ptr + pid_b * stride_b + pid_h * stride_h
     beta_bhf = beta_ptr + bh * (F * S) + pid_f * S
-    I_P_kv_bhf = I_minus_P_kv_ptr + bh * F * BLOCK_D * BLOCK_D + pid_f * BLOCK_D * BLOCK_D
+    I_P_kv_bhf = (
+        I_minus_P_kv_ptr + bh * F * BLOCK_D * BLOCK_D + pid_f * BLOCK_D * BLOCK_D
+    )
     A_bhf = A_ptr + bh * F * BLOCK_D * BLOCK_D + pid_f * BLOCK_D * BLOCK_D
 
     offs_d = tl.arange(0, BLOCK_D)
@@ -306,8 +318,12 @@ def _phase_a_kv_kernel(
     mask_d_pair = offs_d_pair < D
 
     nw_offset = pid_h * D
-    k_nw = tl.load(k_norm_w_ptr + nw_offset + offs_d, mask=mask_d, other=0.0).to(tl.float32)
-    k_nw_pair = tl.load(k_norm_w_ptr + nw_offset + offs_d_pair, mask=mask_d_pair, other=0.0).to(tl.float32)
+    k_nw = tl.load(k_norm_w_ptr + nw_offset + offs_d, mask=mask_d, other=0.0).to(
+        tl.float32
+    )
+    k_nw_pair = tl.load(
+        k_norm_w_ptr + nw_offset + offs_d_pair, mask=mask_d_pair, other=0.0
+    ).to(tl.float32)
 
     # fp32 accumulators avoid bf16 round-off compounding across the loop.
     P_kv_acc = tl.zeros([BLOCK_D, BLOCK_D], dtype=tl.float32)
@@ -322,13 +338,25 @@ def _phase_a_kv_kernel(
         mask_sd = mask_s[:, None] & mask_d[None, :]
         n_idx = n_base + offs_s
 
-        k_ptrs = qkv_bh + n_idx[:, None] * stride_n + 1 * stride_3 + offs_d[None, :] * stride_d
-        v_ptrs = qkv_bh + n_idx[:, None] * stride_n + 2 * stride_3 + offs_d[None, :] * stride_d
+        k_ptrs = (
+            qkv_bh
+            + n_idx[:, None] * stride_n
+            + 1 * stride_3
+            + offs_d[None, :] * stride_d
+        )
+        v_ptrs = (
+            qkv_bh
+            + n_idx[:, None] * stride_n
+            + 2 * stride_3
+            + offs_d[None, :] * stride_d
+        )
         K_raw = tl.load(k_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
         V_raw = tl.load(v_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
         beta_t = tl.load(beta_bhf + offs_s, mask=mask_s, other=0.0).to(tl.float32)
 
-        k_inv_rms = tl.load(k_inv_rms_ptr + pid_b * N + n_idx, mask=mask_s, other=1.0).to(tl.float32)
+        k_inv_rms = tl.load(
+            k_inv_rms_ptr + pid_b * N + n_idx, mask=mask_s, other=1.0
+        ).to(tl.float32)
         K_normed = K_raw * k_inv_rms[:, None] * k_nw[None, :]
         if SKIP_RELU:
             K = K_normed * k_scale
@@ -354,12 +382,24 @@ def _phase_a_kv_kernel(
         beta_V = beta_t[:, None] * V_raw
 
         K_rot_T = tl.trans(K_rot)
-        P_kv_acc += tl.dot(K_rot_T.to(dot_dtype), beta_Krot.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
-        A_acc += tl.dot(K_rot_T.to(dot_dtype), beta_V.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
+        P_kv_acc += tl.dot(
+            K_rot_T.to(dot_dtype),
+            beta_Krot.to(dot_dtype),
+            out_dtype=tl.float32,
+            input_precision=dot_ip,
+        )
+        A_acc += tl.dot(
+            K_rot_T.to(dot_dtype),
+            beta_V.to(dot_dtype),
+            out_dtype=tl.float32,
+            input_precision=dot_ip,
+        )
 
     # Padded positions are 0 by construction (K_rot is 0 outside D).
     offs_dd = offs_d[:, None] * BLOCK_D + offs_d[None, :]
-    diag_in_range = (offs_d[:, None] == offs_d[None, :]) & mask_d[:, None] & mask_d[None, :]
+    diag_in_range = (
+        (offs_d[:, None] == offs_d[None, :]) & mask_d[:, None] & mask_d[None, :]
+    )
     I_minus_P_kv = tl.where(diag_in_range, 1.0 - P_kv_acc, -P_kv_acc)
     if DOT_PRECISION >= 1:
         tl.store(I_P_kv_bhf + offs_dd, I_minus_P_kv)
@@ -416,7 +456,9 @@ def _phase_a_z_kernel(
     mask_d = offs_d < D
 
     nw_offset = pid_h * D
-    k_nw = tl.load(k_norm_w_ptr + nw_offset + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+    k_nw = tl.load(k_norm_w_ptr + nw_offset + offs_d, mask=mask_d, other=0.0).to(
+        tl.float32
+    )
 
     P_z_acc = tl.zeros([BLOCK_D, BLOCK_D], dtype=tl.float32)
     B_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
@@ -430,22 +472,36 @@ def _phase_a_z_kernel(
         mask_sd = mask_s[:, None] & mask_d[None, :]
         n_idx = n_base + offs_s
 
-        k_ptrs = qkv_bh + n_idx[:, None] * stride_n + 1 * stride_3 + offs_d[None, :] * stride_d
+        k_ptrs = (
+            qkv_bh
+            + n_idx[:, None] * stride_n
+            + 1 * stride_3
+            + offs_d[None, :] * stride_d
+        )
         K_raw = tl.load(k_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
         beta_t = tl.load(beta_bhf + offs_s, mask=mask_s, other=0.0).to(tl.float32)
 
-        k_inv_rms = tl.load(k_inv_rms_ptr + pid_b * N + n_idx, mask=mask_s, other=1.0).to(tl.float32)
+        k_inv_rms = tl.load(
+            k_inv_rms_ptr + pid_b * N + n_idx, mask=mask_s, other=1.0
+        ).to(tl.float32)
         K_normed = K_raw * k_inv_rms[:, None] * k_nw[None, :]
         K = tl.where(K_normed > 0, K_normed, 0.0) * k_scale
 
         beta_K = beta_t[:, None] * K
 
         K_T = tl.trans(K)
-        P_z_acc += tl.dot(K_T.to(dot_dtype), beta_K.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
+        P_z_acc += tl.dot(
+            K_T.to(dot_dtype),
+            beta_K.to(dot_dtype),
+            out_dtype=tl.float32,
+            input_precision=dot_ip,
+        )
         B_acc += tl.sum(beta_K, axis=0)
 
     offs_dd = offs_d[:, None] * BLOCK_D + offs_d[None, :]
-    diag_in_range = (offs_d[:, None] == offs_d[None, :]) & mask_d[:, None] & mask_d[None, :]
+    diag_in_range = (
+        (offs_d[:, None] == offs_d[None, :]) & mask_d[:, None] & mask_d[None, :]
+    )
     I_minus_P_z = tl.where(diag_in_range, 1.0 - P_z_acc, -P_z_acc)
 
     if DOT_PRECISION >= 1:
@@ -618,7 +674,9 @@ def _phase_b_kernel(
     # ── Forward scan (skip when DIRECTION=2 i.e. rev-only) ──
     if DIRECTION != 2:
         if LOAD_INIT_STATE:
-            M = tl.load(init_state_kv_ptr + bh * BLOCK_D * BLOCK_D + offs_dd).to(tl.float32)
+            M = tl.load(init_state_kv_ptr + bh * BLOCK_D * BLOCK_D + offs_dd).to(
+                tl.float32
+            )
             if not SKIP_Z:
                 z = tl.load(init_state_z_ptr + bh * BLOCK_D + offs_d).to(tl.float32)
         else:
@@ -626,8 +684,15 @@ def _phase_b_kernel(
             if not SKIP_Z:
                 z = tl.zeros([BLOCK_D], dtype=tl.float32)
         for f in range(F):
-            I_P_kv_f = tl.load(I_P_kv_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd)
-            A_f = tl.load(A_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd)
+            I_P_kv_f = tl.load(
+                I_P_kv_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f * BLOCK_D * BLOCK_D
+                + offs_dd
+            )
+            A_f = tl.load(
+                A_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd
+            )
             g_f = tl.load(decay_ptr + bh * F + f).to(tl.float32)
 
             # M = g · (I - P_kv) M + A_f
@@ -643,12 +708,28 @@ def _phase_b_kernel(
                     input_precision=dot_ip,
                 )
             else:
-                M_temp = tl.dot(I_P_kv_f.to(dot_dtype), M.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
+                M_temp = tl.dot(
+                    I_P_kv_f.to(dot_dtype),
+                    M.to(dot_dtype),
+                    out_dtype=tl.float32,
+                    input_precision=dot_ip,
+                )
                 M = g_f * M_temp + A_f
 
-            tl.store(M_fwd_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd, M)
+            tl.store(
+                M_fwd_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f * BLOCK_D * BLOCK_D
+                + offs_dd,
+                M,
+            )
             if not SKIP_Z:
-                I_P_z_f = tl.load(I_P_z_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd)
+                I_P_z_f = tl.load(
+                    I_P_z_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f * BLOCK_D * BLOCK_D
+                    + offs_dd
+                )
                 B_f = tl.load(B_ptr + bh * F * BLOCK_D + f * BLOCK_D + offs_d)
                 # z = g · (I - P_z) z + B_f
                 z_temp = tl.sum(I_P_z_f * z[None, :], axis=1)
@@ -669,14 +750,27 @@ def _phase_b_kernel(
         # COMBINED_HISTORY: skip the F-1 zero-write so M_hist[F-1] keeps the fwd
         # value (rev value there is zero by construction).
         if not COMBINED_HISTORY:
-            tl.store(M_rev_ptr + bh * F * BLOCK_D * BLOCK_D + (F - 1) * BLOCK_D * BLOCK_D + offs_dd, M)
+            tl.store(
+                M_rev_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + (F - 1) * BLOCK_D * BLOCK_D
+                + offs_dd,
+                M,
+            )
             if not SKIP_Z:
                 tl.store(z_rev_ptr + bh * F * BLOCK_D + (F - 1) * BLOCK_D + offs_d, z)
         for f_iter in range(F - 1):
             f_src = F - 1 - f_iter
             f_dst = f_src - 1
-            I_P_kv_f = tl.load(I_P_kv_ptr + bh * F * BLOCK_D * BLOCK_D + f_src * BLOCK_D * BLOCK_D + offs_dd)
-            A_f = tl.load(A_ptr + bh * F * BLOCK_D * BLOCK_D + f_src * BLOCK_D * BLOCK_D + offs_dd)
+            I_P_kv_f = tl.load(
+                I_P_kv_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f_src * BLOCK_D * BLOCK_D
+                + offs_dd
+            )
+            A_f = tl.load(
+                A_ptr + bh * F * BLOCK_D * BLOCK_D + f_src * BLOCK_D * BLOCK_D + offs_dd
+            )
             g_f = tl.load(decay_ptr + bh * F + f_src).to(tl.float32)
 
             if USE_ACC_FUSION:
@@ -689,11 +783,21 @@ def _phase_b_kernel(
                     input_precision=dot_ip,
                 )
             else:
-                M_temp = tl.dot(I_P_kv_f.to(dot_dtype), M.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
+                M_temp = tl.dot(
+                    I_P_kv_f.to(dot_dtype),
+                    M.to(dot_dtype),
+                    out_dtype=tl.float32,
+                    input_precision=dot_ip,
+                )
                 M = g_f * M_temp + A_f
 
             if not SKIP_Z:
-                I_P_z_f = tl.load(I_P_z_ptr + bh * F * BLOCK_D * BLOCK_D + f_src * BLOCK_D * BLOCK_D + offs_dd)
+                I_P_z_f = tl.load(
+                    I_P_z_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f_src * BLOCK_D * BLOCK_D
+                    + offs_dd
+                )
                 B_f = tl.load(B_ptr + bh * F * BLOCK_D + f_src * BLOCK_D + offs_d)
                 z_temp = tl.sum(I_P_z_f * z[None, :], axis=1)
                 z = g_f * z_temp + B_f
@@ -701,13 +805,24 @@ def _phase_b_kernel(
             if COMBINED_HISTORY:
                 # Read-add-store the rev contribution into the fwd buffer slot
                 # (fwd just wrote M_fwd[f_dst]; stays in L1/L2).
-                M_addr = M_fwd_ptr + bh * F * BLOCK_D * BLOCK_D + f_dst * BLOCK_D * BLOCK_D + offs_dd
+                M_addr = (
+                    M_fwd_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f_dst * BLOCK_D * BLOCK_D
+                    + offs_dd
+                )
                 tl.store(M_addr, tl.load(M_addr) + M)
                 if not SKIP_Z:
                     z_addr = z_fwd_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d
                     tl.store(z_addr, tl.load(z_addr) + z)
             else:
-                tl.store(M_rev_ptr + bh * F * BLOCK_D * BLOCK_D + f_dst * BLOCK_D * BLOCK_D + offs_dd, M)
+                tl.store(
+                    M_rev_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f_dst * BLOCK_D * BLOCK_D
+                    + offs_dd,
+                    M,
+                )
                 if not SKIP_Z:
                     tl.store(z_rev_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d, z)
 
@@ -787,12 +902,16 @@ def phase_b_triton(
 
     if return_final_state:
         final_kv = torch.empty(BH, BLOCK_D, BLOCK_D, device=device, dtype=fdtype)
-        final_z = dummy if skip_z else torch.empty(BH, BLOCK_D, device=device, dtype=fdtype)
+        final_z = (
+            dummy if skip_z else torch.empty(BH, BLOCK_D, device=device, dtype=fdtype)
+        )
     else:
         final_kv = dummy
         final_z = dummy
 
-    d_splits, nw_override, ns_override, acc_override = _pick_phase_b_d_splits(BLOCK_D, dot_precision=dot_precision)
+    d_splits, nw_override, ns_override, acc_override = _pick_phase_b_d_splits(
+        BLOCK_D, dot_precision=dot_precision
+    )
     if d_splits > 1:
         D_TILE = BLOCK_D // d_splits
         # D-tile-specific tuning if available, else baseline.
@@ -911,17 +1030,31 @@ def _phase_b_dtile_kernel(
 
     if DIRECTION != 2:
         if LOAD_INIT_STATE:
-            M = tl.load(init_state_kv_ptr + bh * BLOCK_D * BLOCK_D + offs_dd_tile).to(tl.float32)
+            M = tl.load(init_state_kv_ptr + bh * BLOCK_D * BLOCK_D + offs_dd_tile).to(
+                tl.float32
+            )
         else:
             M = tl.zeros([BLOCK_D, D_TILE], dtype=tl.float32)
         if not SKIP_Z:
             z = tl.zeros([BLOCK_D], dtype=tl.float32)
             if is_lead and LOAD_INIT_STATE:
-                z = tl.load(init_state_z_ptr + bh * BLOCK_D + offs_d_full).to(tl.float32)
+                z = tl.load(init_state_z_ptr + bh * BLOCK_D + offs_d_full).to(
+                    tl.float32
+                )
 
         for f in range(F):
-            I_P_kv_f = tl.load(I_P_kv_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd_full)
-            A_f = tl.load(A_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd_tile)
+            I_P_kv_f = tl.load(
+                I_P_kv_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f * BLOCK_D * BLOCK_D
+                + offs_dd_full
+            )
+            A_f = tl.load(
+                A_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f * BLOCK_D * BLOCK_D
+                + offs_dd_tile
+            )
             g_f = tl.load(decay_ptr + bh * F + f).to(tl.float32)
 
             if USE_ACC_FUSION:
@@ -934,13 +1067,29 @@ def _phase_b_dtile_kernel(
                     input_precision=dot_ip,
                 )
             else:
-                M_temp = tl.dot(I_P_kv_f.to(dot_dtype), M.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
+                M_temp = tl.dot(
+                    I_P_kv_f.to(dot_dtype),
+                    M.to(dot_dtype),
+                    out_dtype=tl.float32,
+                    input_precision=dot_ip,
+                )
                 M = g_f * M_temp + A_f
 
-            tl.store(M_fwd_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd_tile, M)
+            tl.store(
+                M_fwd_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f * BLOCK_D * BLOCK_D
+                + offs_dd_tile,
+                M,
+            )
 
             if is_lead and not SKIP_Z:
-                I_P_z_f = tl.load(I_P_z_ptr + bh * F * BLOCK_D * BLOCK_D + f * BLOCK_D * BLOCK_D + offs_dd_full)
+                I_P_z_f = tl.load(
+                    I_P_z_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f * BLOCK_D * BLOCK_D
+                    + offs_dd_full
+                )
                 B_f = tl.load(B_ptr + bh * F * BLOCK_D + f * BLOCK_D + offs_d_full)
                 z_temp = tl.sum(I_P_z_f * z[None, :], axis=1)
                 z = g_f * z_temp + B_f
@@ -957,15 +1106,33 @@ def _phase_b_dtile_kernel(
             z = tl.zeros([BLOCK_D], dtype=tl.float32)
 
         if not COMBINED_HISTORY:
-            tl.store(M_rev_ptr + bh * F * BLOCK_D * BLOCK_D + (F - 1) * BLOCK_D * BLOCK_D + offs_dd_tile, M)
+            tl.store(
+                M_rev_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + (F - 1) * BLOCK_D * BLOCK_D
+                + offs_dd_tile,
+                M,
+            )
             if is_lead and not SKIP_Z:
-                tl.store(z_rev_ptr + bh * F * BLOCK_D + (F - 1) * BLOCK_D + offs_d_full, z)
+                tl.store(
+                    z_rev_ptr + bh * F * BLOCK_D + (F - 1) * BLOCK_D + offs_d_full, z
+                )
 
         for f_iter in range(F - 1):
             f_src = F - 1 - f_iter
             f_dst = f_src - 1
-            I_P_kv_f = tl.load(I_P_kv_ptr + bh * F * BLOCK_D * BLOCK_D + f_src * BLOCK_D * BLOCK_D + offs_dd_full)
-            A_f = tl.load(A_ptr + bh * F * BLOCK_D * BLOCK_D + f_src * BLOCK_D * BLOCK_D + offs_dd_tile)
+            I_P_kv_f = tl.load(
+                I_P_kv_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f_src * BLOCK_D * BLOCK_D
+                + offs_dd_full
+            )
+            A_f = tl.load(
+                A_ptr
+                + bh * F * BLOCK_D * BLOCK_D
+                + f_src * BLOCK_D * BLOCK_D
+                + offs_dd_tile
+            )
             g_f = tl.load(decay_ptr + bh * F + f_src).to(tl.float32)
 
             if USE_ACC_FUSION:
@@ -978,25 +1145,50 @@ def _phase_b_dtile_kernel(
                     input_precision=dot_ip,
                 )
             else:
-                M_temp = tl.dot(I_P_kv_f.to(dot_dtype), M.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
+                M_temp = tl.dot(
+                    I_P_kv_f.to(dot_dtype),
+                    M.to(dot_dtype),
+                    out_dtype=tl.float32,
+                    input_precision=dot_ip,
+                )
                 M = g_f * M_temp + A_f
 
             if is_lead and not SKIP_Z:
-                I_P_z_f = tl.load(I_P_z_ptr + bh * F * BLOCK_D * BLOCK_D + f_src * BLOCK_D * BLOCK_D + offs_dd_full)
+                I_P_z_f = tl.load(
+                    I_P_z_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f_src * BLOCK_D * BLOCK_D
+                    + offs_dd_full
+                )
                 B_f = tl.load(B_ptr + bh * F * BLOCK_D + f_src * BLOCK_D + offs_d_full)
                 z_temp = tl.sum(I_P_z_f * z[None, :], axis=1)
                 z = g_f * z_temp + B_f
 
             if COMBINED_HISTORY:
-                M_addr = M_fwd_ptr + bh * F * BLOCK_D * BLOCK_D + f_dst * BLOCK_D * BLOCK_D + offs_dd_tile
+                M_addr = (
+                    M_fwd_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f_dst * BLOCK_D * BLOCK_D
+                    + offs_dd_tile
+                )
                 tl.store(M_addr, tl.load(M_addr) + M)
                 if is_lead and not SKIP_Z:
-                    z_addr = z_fwd_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d_full
+                    z_addr = (
+                        z_fwd_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d_full
+                    )
                     tl.store(z_addr, tl.load(z_addr) + z)
             else:
-                tl.store(M_rev_ptr + bh * F * BLOCK_D * BLOCK_D + f_dst * BLOCK_D * BLOCK_D + offs_dd_tile, M)
+                tl.store(
+                    M_rev_ptr
+                    + bh * F * BLOCK_D * BLOCK_D
+                    + f_dst * BLOCK_D * BLOCK_D
+                    + offs_dd_tile,
+                    M,
+                )
                 if is_lead and not SKIP_Z:
-                    tl.store(z_rev_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d_full, z)
+                    tl.store(
+                        z_rev_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d_full, z
+                    )
 
 
 _PHASE_B_DTILE_ARCH_CACHE: dict = {}  # (dev, dot_prec) -> (d_splits, nw, ns, acc)
@@ -1137,8 +1329,12 @@ def _phase_c_kernel(
     mask_dd = mask_d[:, None] & mask_d[None, :]
 
     nw_offset = pid_h * D
-    q_nw = tl.load(q_norm_w_ptr + nw_offset + offs_d, mask=mask_d, other=0.0).to(tl.float32)
-    q_nw_pair = tl.load(q_norm_w_ptr + nw_offset + offs_d_pair, mask=mask_d_pair, other=0.0).to(tl.float32)
+    q_nw = tl.load(q_norm_w_ptr + nw_offset + offs_d, mask=mask_d, other=0.0).to(
+        tl.float32
+    )
+    q_nw_pair = tl.load(
+        q_norm_w_ptr + nw_offset + offs_d_pair, mask=mask_d_pair, other=0.0
+    ).to(tl.float32)
 
     M_f = tl.load(M_bhf + offs_dd, mask=mask_dd, other=0.0)
     z_f = tl.load(z_bhf + offs_d, mask=mask_d, other=0.0)
@@ -1150,14 +1346,21 @@ def _phase_c_kernel(
         mask_sd = mask_s[:, None] & mask_d[None, :]
         n_idx = n_base + offs_s
 
-        q_ptrs = qkv_bh + n_idx[:, None] * stride_n + 0 * stride_3 + offs_d[None, :] * stride_d
+        q_ptrs = (
+            qkv_bh
+            + n_idx[:, None] * stride_n
+            + 0 * stride_3
+            + offs_d[None, :] * stride_d
+        )
         Q_raw = tl.load(q_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
         Q_pair_raw = tl.reshape(
             tl.flip(tl.reshape(Q_raw, (BLOCK_S, BLOCK_D // 2, 2)), dim=2),
             (BLOCK_S, BLOCK_D),
         )
 
-        q_inv_rms = tl.load(q_inv_rms_ptr + pid_b * N + n_idx, mask=mask_s, other=1.0).to(tl.float32)
+        q_inv_rms = tl.load(
+            q_inv_rms_ptr + pid_b * N + n_idx, mask=mask_s, other=1.0
+        ).to(tl.float32)
         Q_normed = Q_raw * q_inv_rms[:, None] * q_nw[None, :]
         Q_pair_normed = Q_pair_raw * q_inv_rms[:, None] * q_nw_pair[None, :]
         if SKIP_RELU:
@@ -1172,7 +1375,12 @@ def _phase_c_kernel(
         Sin = tl.load(rope_sin_ptr + rope_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
         Q_rot = Q * Cos + Q_pair * Sin
 
-        num = tl.dot(Q_rot.to(dot_dtype), M_f.to(dot_dtype), out_dtype=tl.float32, input_precision=dot_ip)
+        num = tl.dot(
+            Q_rot.to(dot_dtype),
+            M_f.to(dot_dtype),
+            out_dtype=tl.float32,
+            input_precision=dot_ip,
+        )
         if not NUM_ONLY:
             den = tl.sum(Q * z_f[None, :], axis=1)
 
@@ -1241,15 +1449,28 @@ def phase_c(
     BLOCK_D = triton.next_power_of_2(D)
     if num_out is None:
         num_out = torch.empty(
-            B, N, H, D, device=qkv.device, dtype=(torch.float32 if dot_precision >= 1 else torch.bfloat16)
+            B,
+            N,
+            H,
+            D,
+            device=qkv.device,
+            dtype=(torch.float32 if dot_precision >= 1 else torch.bfloat16),
         )
     if den_out is None and not num_only:
         den_out = torch.empty(
-            B, H, N, device=qkv.device, dtype=(torch.float32 if dot_precision >= 1 else torch.bfloat16)
+            B,
+            H,
+            N,
+            device=qkv.device,
+            dtype=(torch.float32 if dot_precision >= 1 else torch.bfloat16),
         )
     elif num_only and den_out is None:
         # 1-element placeholder; kernel guards den loads/stores under NUM_ONLY.
-        den_out = torch.empty(1, device=qkv.device, dtype=(torch.float32 if dot_precision >= 1 else torch.bfloat16))
+        den_out = torch.empty(
+            1,
+            device=qkv.device,
+            dtype=(torch.float32 if dot_precision >= 1 else torch.bfloat16),
+        )
 
     _phase_c_kernel[(B * H * F,)](
         qkv,
@@ -1381,7 +1602,11 @@ def fused_bigdn_bidi_chunkwise(
         H = qkv.shape[3]
         D = qkv.shape[4]
         BLOCK_D = final_kv.shape[1]
-        state_kv = final_kv.view(B, H, BLOCK_D, BLOCK_D)[:, :, :D, :D].transpose(-1, -2).contiguous()
+        state_kv = (
+            final_kv.view(B, H, BLOCK_D, BLOCK_D)[:, :, :D, :D]
+            .transpose(-1, -2)
+            .contiguous()
+        )
         state_z = final_z.view(B, H, BLOCK_D)[:, :, :D].unsqueeze(-1).contiguous()
         return out, state_kv, state_z
     return out
@@ -1436,14 +1661,14 @@ def cam_scan_bidi_chunkwise(
     q, k, v: camera-prepared ``(B, H, D, N)`` fp32; beta: ``(B, H, F, S)`` fp32;
     decay: ``(B, H, F)`` fp32. Returns ``(B, H, D, N)`` fp32.
     """
-    assert q.shape == k.shape == v.shape, (
-        f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
-    )
+    assert (
+        q.shape == k.shape == v.shape
+    ), f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert beta.is_contiguous() and decay.is_contiguous()
-    assert q.dtype == torch.float32, (
-        f"cam_scan_bidi_chunkwise requires fp32 q/k/v, got {q.dtype}"
-    )
+    assert (
+        q.dtype == torch.float32
+    ), f"cam_scan_bidi_chunkwise requires fp32 q/k/v, got {q.dtype}"
 
     B, H, D, N = q.shape
     F = beta.shape[2]

@@ -8,11 +8,13 @@ from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_transformer_b
 
 @dataclass
 class SanaWMArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks_or_transformer_blocks])
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [is_blocks_or_transformer_blocks]
+    )
 
     # --- Core dims (upstream: depth=20, hidden=2240, heads=20, linear_head_dim=112) ---
     patch_size: int = 1
-    in_channels: int = 128         # LTX-2 VAE latent channels
+    in_channels: int = 128  # LTX-2 VAE latent channels
     out_channels: int = 128
     num_layers: int = 20
 
@@ -27,7 +29,7 @@ class SanaWMArchConfig(DiTArchConfig):
     # In upstream, cross-attn uses num_heads (=20) with head_dim = hidden/num_heads = 112.
     num_cross_attention_heads: int = 20
     cross_attention_head_dim: int = 112
-    cross_attention_dim: int = 2240   # query dim used inside MultiHeadCrossAttention
+    cross_attention_dim: int = 2240  # query dim used inside MultiHeadCrossAttention
     cross_norm: bool = True
 
     # Gemma-2-2b-it hidden size (input to y_embedder.y_proj).
@@ -51,14 +53,14 @@ class SanaWMArchConfig(DiTArchConfig):
     conv_kernel_size: int = 4
     k_conv_only: bool = True
     chunk_gdn_chunk_size: int = 21
-    update_rule: str = "torch_chunk"   # main branch update rule
+    update_rule: str = "torch_chunk"  # main branch update rule
     cam_update_rule: str = "torch_chunk"  # camera branch update rule
     # main GDN scan backend: "auto" uses the SANA-WM Triton fast path on
     # supported CUDA inference runs, otherwise falls back to the torch scan.
     gdn_backend: str = "auto"
 
     # --- Camera conditioning ---
-    cam_attn_compress: int = 1        # cam_dim == in_dim
+    cam_attn_compress: int = 1  # cam_dim == in_dim
     init_cam_from_base: bool = True
     use_chunk_plucker_post_attn: bool = True
     use_chunk_plucker_input: bool = False
@@ -81,10 +83,10 @@ class SanaWMArchConfig(DiTArchConfig):
     pos_embed_type: str = "wan_rope"
 
     # --- VAE coupling (LTX-2) ---
-    vae_temporal_stride: int = 8       # original-frames per latent frame
-    vae_spatial_stride: int = 32       # pixels per latent token (per spatial axis)
+    vae_temporal_stride: int = 8  # original-frames per latent frame
+    vae_spatial_stride: int = 32  # pixels per latent token (per spatial axis)
 
-    sample_size: int = 32              # legacy, unused
+    sample_size: int = 32  # legacy, unused
     guidance_embeds: bool = False
     class_dropout_prob: float = 0.0
 

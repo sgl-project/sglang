@@ -52,7 +52,9 @@ class SanaWMSamplingParams(SamplingParams):
     camera_to_world: Optional[CameraTensorLike] = None
     intrinsics: Optional[CameraTensorLike] = None
     action: Optional[str] = None
-    translation_speed: float = 0.04  # match official streaming (STREAMING_TRANSLATION_SPEED)
+    translation_speed: float = (
+        0.04  # match official streaming (STREAMING_TRANSLATION_SPEED)
+    )
     rotation_speed_deg: float = 1.2
     pitch_limit_deg: float = 85.0
 
