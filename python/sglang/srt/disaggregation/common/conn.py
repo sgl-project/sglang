@@ -49,6 +49,22 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+class KVTransferError(Exception):
+    def __init__(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        is_from_another_rank: bool = False,
+    ):
+        super().__init__(failure_reason)
+        self.bootstrap_room = bootstrap_room
+        self.failure_reason = failure_reason
+        self.is_from_another_rank = is_from_another_rank
+
+    def __str__(self):
+        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
