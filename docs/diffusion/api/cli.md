@@ -83,7 +83,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
-- `--acceleration-config {CONFIG}`: experimental diffusion acceleration policy. cuDNN SDPA auto mode and warmup-time dense LocalAttention autotune are enabled by default on eligible CUDA fp16/bf16 inference paths. With `--enable-torch-compile`, DiT forward uses warmup-time eager-vs-compiled autotune by default and warmup is enabled automatically unless explicitly disabled; real-request cache misses fall back to eager unless `torch_compile_live_miss=true` is set.
+- `--acceleration-config {CONFIG}`: experimental diffusion acceleration policy. cuDNN SDPA auto mode and warmup-time dense LocalAttention autotune are enabled by default on eligible CUDA fp16/bf16 inference paths. With `--enable-torch-compile`, DiT forward uses warmup-time eager-vs-compiled autotune by default and warmup is enabled automatically unless explicitly disabled; real-request cache misses fall back to eager unless `torch_compile_live_miss=true` is set. Kernel-wise fused-vs-compiled autotune is enabled by default for a validated allowlist including ScaleShift, MulAdd, RotaryEmbedding, and GeluAndMul; use `kernel_compile_policy=force_fused` to disable it.
 
 ### Sampling and output
 

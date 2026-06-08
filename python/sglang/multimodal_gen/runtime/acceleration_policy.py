@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,9 +13,14 @@ import addict
 KERNEL_COMPILE_POLICY_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_POLICY"
 KERNEL_COMPILE_OPS_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_OPS"
 KERNEL_COMPILE_MODE_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_MODE"
+KERNEL_COMPILE_WARMUP_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_WARMUP"
+KERNEL_COMPILE_ITERS_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_ITERS"
+KERNEL_COMPILE_MIN_SPEEDUP_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_MIN_SPEEDUP"
+KERNEL_COMPILE_LIVE_MISS_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_LIVE_MISS"
 TORCH_COMPILE_MODE_ENV = "SGLANG_TORCH_COMPILE_MODE"
+_KERNEL_COMPILE_SUPPRESSION_DEPTH = 0
 
-SUPPORTED_KERNEL_COMPILE_OPS = frozenset(
+DEFAULT_KERNEL_COMPILE_OPS = frozenset(
     {
         "mul_add",
         "fuse_layernorm_scale_shift_gate_select01",
@@ -23,6 +29,20 @@ SUPPORTED_KERNEL_COMPILE_OPS = frozenset(
         "RMSNormScaleShift",
         "ScaleResidualLayerNormScaleShift",
         "ScaleResidualRMSNormScaleShift",
+        "rotary_embedding",
+        "RotaryEmbedding",
+        "gelu_and_mul",
+        "GeluAndMul",
+    }
+)
+
+SUPPORTED_KERNEL_COMPILE_OPS = frozenset(
+    {
+        *DEFAULT_KERNEL_COMPILE_OPS,
+        "silu_and_mul",
+        "SiluAndMul",
+        "LayerNormTanhMulAdd",
+        "RMSNormTanhMulAdd",
     }
 )
 
@@ -46,6 +66,15 @@ def _get_nested(config: Mapping[str, Any], *keys: str) -> Any:
 
 @dataclass(frozen=True)
 class TorchCompileAutotuneConfig:
+    policy: str
+    warmup: int
+    iters: int
+    min_speedup: float
+    live_miss: bool
+
+
+@dataclass(frozen=True)
+class KernelCompileAutotuneConfig:
     policy: str
     warmup: int
     iters: int
@@ -93,6 +122,42 @@ def configure_acceleration_policy(config: Mapping[str, Any]) -> None:
     elif kernel_ops is not None:
         os.environ[KERNEL_COMPILE_OPS_ENV] = ",".join(str(op) for op in kernel_ops)
 
+    kernel_compile_warmup = _first_present(
+        config,
+        "kernel_compile_warmup",
+        ("kernel", "compile_warmup"),
+        ("kernel_compile", "warmup"),
+    )
+    if kernel_compile_warmup is not None:
+        os.environ[KERNEL_COMPILE_WARMUP_ENV] = str(kernel_compile_warmup)
+
+    kernel_compile_iters = _first_present(
+        config,
+        "kernel_compile_iters",
+        ("kernel", "compile_iters"),
+        ("kernel_compile", "iters"),
+    )
+    if kernel_compile_iters is not None:
+        os.environ[KERNEL_COMPILE_ITERS_ENV] = str(kernel_compile_iters)
+
+    kernel_compile_min_speedup = _first_present(
+        config,
+        "kernel_compile_min_speedup",
+        ("kernel", "compile_min_speedup"),
+        ("kernel_compile", "min_speedup"),
+    )
+    if kernel_compile_min_speedup is not None:
+        os.environ[KERNEL_COMPILE_MIN_SPEEDUP_ENV] = str(kernel_compile_min_speedup)
+
+    kernel_compile_live_miss = _first_present(
+        config,
+        "kernel_compile_live_miss",
+        ("kernel", "compile_live_miss"),
+        ("kernel_compile", "live_miss"),
+    )
+    if kernel_compile_live_miss is not None:
+        os.environ[KERNEL_COMPILE_LIVE_MISS_ENV] = str(kernel_compile_live_miss)
+
     torch_compile_mode = None
     for candidate in (
         config.get("torch_compile_mode"),
@@ -105,25 +170,145 @@ def configure_acceleration_policy(config: Mapping[str, Any]) -> None:
         os.environ[TORCH_COMPILE_MODE_ENV] = str(torch_compile_mode)
 
 
-def should_torch_compile_custom_op(op_name: str | None, class_name: str) -> bool:
-    policy = _normalize_policy(os.environ.get(KERNEL_COMPILE_POLICY_ENV))
-    if policy in {"off", "false", "0", "none", "force_fused"}:
-        return False
-    if policy == "force_torch_compile":
-        return True
-    if policy != "auto":
-        return False
+def _first_present(config: Mapping[str, Any], *keys: str | tuple[str, ...]) -> Any:
+    for key in keys:
+        if isinstance(key, tuple):
+            value = _get_nested(config, *key)
+        else:
+            value = config.get(key)
+        if value is not None:
+            return value
+    return None
 
+
+def _env_or_config(
+    env_name: str, acceleration_cfg: Mapping[str, Any], *keys: str | tuple[str, ...]
+) -> Any:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value
+    return _first_present(acceleration_cfg, *keys)
+
+
+def _is_kernel_compile_op_allowed(op_name: str | None, class_name: str) -> bool:
     configured_ops = os.environ.get(KERNEL_COMPILE_OPS_ENV)
-    if configured_ops:
-        allowed_ops = {
+    allowed_ops = (
+        {
             op.strip()
             for op in configured_ops.split(",")
             if op.strip() in SUPPORTED_KERNEL_COMPILE_OPS
         }
-    else:
-        allowed_ops = set()
+        if configured_ops
+        else set(DEFAULT_KERNEL_COMPILE_OPS)
+    )
     return class_name in allowed_ops or (op_name is not None and op_name in allowed_ops)
+
+
+@contextmanager
+def suppress_kernel_compile_autotune():
+    global _KERNEL_COMPILE_SUPPRESSION_DEPTH
+    _KERNEL_COMPILE_SUPPRESSION_DEPTH += 1
+    try:
+        yield
+    finally:
+        _KERNEL_COMPILE_SUPPRESSION_DEPTH -= 1
+
+
+def kernel_compile_autotune_suppressed() -> bool:
+    return _KERNEL_COMPILE_SUPPRESSION_DEPTH > 0
+
+
+def kernel_compile_autotune_config(
+    acceleration_cfg: Mapping[str, Any] | None = None,
+) -> KernelCompileAutotuneConfig:
+    if acceleration_cfg is None:
+        _, acceleration_cfg = _get_server_policy_configs()
+    else:
+        acceleration_cfg = acceleration_cfg or addict.Dict()
+
+    policy = _normalize_policy(
+        _env_or_config(
+            KERNEL_COMPILE_POLICY_ENV,
+            acceleration_cfg,
+            "kernel_compile_policy",
+            ("kernel", "compile_policy"),
+            ("kernel_compile", "policy"),
+        ),
+        default="auto",
+    )
+    if policy in {"true", "on", "1"}:
+        policy = "auto"
+    elif policy in {"false", "0", "none", "off", "eager", "native"}:
+        policy = "force_fused"
+    elif policy in {"force", "compile", "compiled"}:
+        policy = "force_torch_compile"
+    elif policy not in {"auto", "force_torch_compile", "force_fused"}:
+        policy = "auto"
+
+    warmup = int(
+        _env_or_config(
+            KERNEL_COMPILE_WARMUP_ENV,
+            acceleration_cfg,
+            "kernel_compile_warmup",
+            ("kernel", "compile_warmup"),
+            ("kernel_compile", "warmup"),
+        )
+        or 3
+    )
+    iters = int(
+        _env_or_config(
+            KERNEL_COMPILE_ITERS_ENV,
+            acceleration_cfg,
+            "kernel_compile_iters",
+            ("kernel", "compile_iters"),
+            ("kernel_compile", "iters"),
+        )
+        or 10
+    )
+    min_speedup = float(
+        _env_or_config(
+            KERNEL_COMPILE_MIN_SPEEDUP_ENV,
+            acceleration_cfg,
+            "kernel_compile_min_speedup",
+            ("kernel", "compile_min_speedup"),
+            ("kernel_compile", "min_speedup"),
+        )
+        or 1.03
+    )
+    live_miss_policy = _env_or_config(
+        KERNEL_COMPILE_LIVE_MISS_ENV,
+        acceleration_cfg,
+        "kernel_compile_live_miss",
+        ("kernel", "compile_live_miss"),
+        ("kernel_compile", "live_miss"),
+    )
+    live_miss = _normalize_policy(live_miss_policy) in {
+        "auto",
+        "on",
+        "true",
+        "1",
+        "force",
+    }
+    return KernelCompileAutotuneConfig(
+        policy=policy,
+        warmup=max(warmup, 0),
+        iters=max(iters, 1),
+        min_speedup=max(min_speedup, 1.0),
+        live_miss=live_miss,
+    )
+
+
+def custom_op_kernel_compile_policy(op_name: str | None, class_name: str) -> str:
+    if kernel_compile_autotune_suppressed():
+        return "force_fused"
+    config = kernel_compile_autotune_config()
+    if config.policy != "auto":
+        return config.policy
+    return "auto" if _is_kernel_compile_op_allowed(op_name, class_name) else "force_fused"
+
+
+def should_torch_compile_custom_op(op_name: str | None, class_name: str) -> bool:
+    return custom_op_kernel_compile_policy(op_name, class_name) == "force_torch_compile"
 
 
 def kernel_compile_kwargs() -> dict[str, Any]:

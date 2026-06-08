@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.acceleration_policy import (
     TorchCompileAutotuneConfig,
+    suppress_kernel_compile_autotune,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
@@ -93,30 +94,38 @@ class _TorchCompileAutotuner:
         *,
         commit: bool,
     ) -> TorchCompileDecision:
-        eager_ms = self._time_candidate(lambda: self._eager_forward(*args, **kwargs))
-        try:
-            compiled_forward = self._get_compiled_forward()
-            compiled_ms = self._time_candidate(
-                lambda: compiled_forward(*args, **kwargs)
+        # transformer compile must see stable fused custom ops; nested kernel
+        # compile decisions can make the outer graph fail or benchmark the wrong path
+        with suppress_kernel_compile_autotune():
+            eager_ms = self._time_candidate(
+                lambda: self._eager_forward(*args, **kwargs)
             )
-        except Exception as e:
-            torch.cuda.synchronize()
-            decision = TorchCompileDecision(
-                selected="eager",
-                eager_ms=eager_ms,
-                compiled_ms=None,
-                reason=f"compile_failed:{type(e).__name__}",
-            )
-            self._decisions[key] = decision
-            self._commit_if_ready(decision, commit)
-            if not self._compile_failure_logged:
-                logger.warning(
-                    "torch.compile autotune failed for %s, falling back to eager: %s",
-                    self._module_name,
-                    e,
+            try:
+                compiled_forward = self._get_compiled_forward()
+                compiled_ms = self._time_candidate(
+                    lambda: compiled_forward(*args, **kwargs)
                 )
-                self._compile_failure_logged = True
-            return decision
+            except Exception as e:
+                torch.cuda.synchronize()
+                decision = TorchCompileDecision(
+                    selected="eager",
+                    eager_ms=eager_ms,
+                    compiled_ms=None,
+                    reason=f"compile_failed:{type(e).__name__}",
+                )
+                self._decisions[key] = decision
+                self._commit_if_ready(decision, commit)
+                self._run_kernel_autotune_for_eager_fallback(
+                    decision, args, kwargs, commit
+                )
+                if not self._compile_failure_logged:
+                    logger.warning(
+                        "torch.compile autotune failed for %s, falling back to eager: %s",
+                        self._module_name,
+                        e,
+                    )
+                    self._compile_failure_logged = True
+                return decision
 
         speedup = eager_ms / compiled_ms if compiled_ms > 0 else math.inf
         if speedup >= self._config.min_speedup:
@@ -145,7 +154,24 @@ class _TorchCompileAutotuner:
             self._config.min_speedup,
         )
         self._commit_if_ready(decision, commit)
+        self._run_kernel_autotune_for_eager_fallback(decision, args, kwargs, commit)
         return decision
+
+    def _run_kernel_autotune_for_eager_fallback(
+        self,
+        decision: TorchCompileDecision,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        commit: bool,
+    ) -> None:
+        if not commit:
+            return
+        if decision.selected != "eager":
+            return
+        # if the outer transformer stays eager, give kernel-wise autotune one
+        # warmup forward to commit decisions for the eager path
+        self._eager_forward(*args, **kwargs)
+        torch.cuda.synchronize()
 
     def _commit_if_ready(self, decision: TorchCompileDecision, commit: bool) -> None:
         if not commit or self._config.live_miss:

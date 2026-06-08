@@ -33,9 +33,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.acceleration_policy import (
+    KERNEL_COMPILE_ITERS_ENV,
+    KERNEL_COMPILE_LIVE_MISS_ENV,
+    KERNEL_COMPILE_MIN_SPEEDUP_ENV,
+    KERNEL_COMPILE_OPS_ENV,
     KERNEL_COMPILE_POLICY_ENV,
+    KERNEL_COMPILE_WARMUP_ENV,
     attention_allows_cudnn_sdp,
     attention_autotune_config,
+    custom_op_kernel_compile_policy,
+    kernel_compile_autotune_config,
     torch_compile_autotune_config,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
@@ -168,13 +175,33 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args = self._from_dict_without_model_resolution(
                 {
                     "model_path": "/data/my-model",
-                    "acceleration_config": "kernel_compile_policy=auto,allow_cudnn_sdp=true",
+                    "acceleration_config": "kernel_compile_policy=auto,kernel_compile_ops=rotary_embedding,kernel_compile_warmup=4,kernel_compile_iters=8,kernel_compile_min_speedup=1.04,kernel_compile_live_miss=true,allow_cudnn_sdp=true",
                 }
             )
 
             self.assertEqual(args.acceleration_config.kernel_compile_policy, "auto")
             self.assertTrue(args.acceleration_config.allow_cudnn_sdp)
             self.assertEqual(os.environ[KERNEL_COMPILE_POLICY_ENV], "auto")
+            self.assertEqual(os.environ[KERNEL_COMPILE_OPS_ENV], "rotary_embedding")
+            self.assertEqual(os.environ[KERNEL_COMPILE_WARMUP_ENV], "4")
+            self.assertEqual(os.environ[KERNEL_COMPILE_ITERS_ENV], "8")
+            self.assertEqual(os.environ[KERNEL_COMPILE_MIN_SPEEDUP_ENV], "1.04")
+            self.assertEqual(os.environ[KERNEL_COMPILE_LIVE_MISS_ENV], "True")
+
+            config = kernel_compile_autotune_config(args.acceleration_config)
+            self.assertEqual(config.policy, "auto")
+            self.assertEqual(config.warmup, 4)
+            self.assertEqual(config.iters, 8)
+            self.assertEqual(config.min_speedup, 1.04)
+            self.assertTrue(config.live_miss)
+            self.assertEqual(
+                custom_op_kernel_compile_policy("rotary_embedding", "RotaryEmbedding"),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("mul_add", "MulAdd"),
+                "force_fused",
+            )
 
     def test_acceleration_config_accepts_attention_autotune(self):
         args = self._from_dict_without_model_resolution(
@@ -218,6 +245,24 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(compile_config.iters, 3)
         self.assertEqual(compile_config.min_speedup, 1.05)
         self.assertFalse(compile_config.live_miss)
+        with patch.dict(os.environ, {}, clear=True):
+            kernel_config = kernel_compile_autotune_config({})
+            self.assertEqual(kernel_config.policy, "auto")
+            self.assertEqual(kernel_config.warmup, 3)
+            self.assertEqual(kernel_config.iters, 10)
+            self.assertEqual(kernel_config.min_speedup, 1.03)
+            self.assertFalse(kernel_config.live_miss)
+            self.assertEqual(
+                custom_op_kernel_compile_policy("mul_add", "MulAdd"), "auto"
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("rotary_embedding", "RotaryEmbedding"),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("gelu_and_mul", "GeluAndMul"),
+                "auto",
+            )
 
     def test_attention_acceleration_can_be_disabled(self):
         self.assertFalse(attention_allows_cudnn_sdp({"allow_cudnn_sdp": False}))
