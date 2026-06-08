@@ -692,6 +692,7 @@ class CommonKVSender(BaseKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -710,7 +711,7 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if self.kv_mgr.server_args.dp_size > 1:
+        if self.kv_mgr.server_args.dp_size > 1 and not req_has_disagg_prefill_dp_rank:
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
