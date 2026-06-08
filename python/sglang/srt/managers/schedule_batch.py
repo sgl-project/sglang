@@ -1115,9 +1115,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = full_fill_ids[
-            : self._compute_max_prefix_len(input_len)
-        ]
+        token_ids_to_match = full_fill_ids[: self._compute_max_prefix_len(input_len)]
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
