@@ -255,21 +255,6 @@ class TestTBO(CustomTestCase):
 
 
 class TestTBOWithSharedExpertsFusion(CustomTestCase):
-    """TBO + shared-experts fusion on DeepSeek (issue #24690).
-
-    Runs in eager mode (--disable-cuda-graph) on purpose: the bugs this guards
-    (the filter_batch rids assert and the op_gate / DeepEP
-    `x.size(0) == topk_idx.size(0)` mismatch on padded sub-max / idle DP ranks)
-    only surface on the eager forward path. With CUDA graph on, IDLE batches
-    replay through compute_split_indices_for_cuda_graph_replay and never hit
-    these code paths, so a graph-on test would not regression-guard the fix.
-
-    Note: verify the CI model actually engages fusion -- the log should print
-    "Shared experts fusion optimization enabled" at load. --enforce-shared-
-    experts-fusion bypasses the config checks but the weight loader still
-    requires num_fused_shared_experts == 1 (n_shared_experts == 1).
-    """
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
