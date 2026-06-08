@@ -2505,10 +2505,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
-        # fill_len is an extend-phase cursor and is meaningless during decode.
-        # Invalidate it here (before the spec early-return below, so spec paths
-        # are covered too) so any stray decode-time read fails fast instead of
-        # silently using a stale extend value.
         for req in self.reqs:
             req.fill_len = None
         # Decode embeds the last output token via embed_tokens; clear the stale
