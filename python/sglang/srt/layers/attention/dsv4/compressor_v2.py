@@ -558,11 +558,6 @@ class CompressorBackendMixin:
         kv_score_buffer = state_pool.kv_score_buffer.kv_score
         kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
-        # Plan A: the compress JIT kernel now handles per-tensor input dtypes
-        # internally (buffer fp32 / input bf16 / ape fp32 -> each cast to fp32 at
-        # load time), so feed every tensor as-is. No host-side `.to()` bridging,
-        # which previously spawned extra elementwise kernels (worst of all,
-        # casting the whole fp32 state buffer to bf16 every step).
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
