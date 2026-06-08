@@ -23,6 +23,9 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
     get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
 )
 from sglang.srt.layers.attention.triton_ops.pad import (
@@ -272,3 +275,14 @@ def cp_lse_ag_out_rs(
     if return_lse:
         return out, global_lse[:, head_start:head_end].contiguous()
     return out
+def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
+    """Safety guard: a preallocated cuda-graph buffer must hold the runtime write.
+
+    The kv_indices / page_table scatter kernels bound writes only per-row, not
+    against the destination buffer, so an undersized buffer silently overflows
+    into the adjacent row. Fail fast on the host-known extent instead. All args
+    are host ints, so this is always-on (no device sync, unlike async probes).
+    """
+    assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
+        f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
+    )
