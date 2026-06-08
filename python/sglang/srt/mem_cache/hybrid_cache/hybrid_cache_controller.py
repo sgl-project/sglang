@@ -409,8 +409,10 @@ class HybridCacheController(BaseHiCacheController):
                 self.move_hybrid_indices(op)
             )
         self.write_queue.clear()
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        # enable_timing so record_l1_l2_transfer_complete can use elapsed_time()
+        # for the real device transfer duration (host fallback returns None).
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
 
         token_count = int(host_indices.numel())
         start_event.record()

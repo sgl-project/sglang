@@ -59,8 +59,17 @@ device_module = get_device_module()
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        # The last layer's event doubles as finish_event; together with
+        # start_event it feeds elapsed_time() in record_l1_l2_transfer_complete,
+        # which requires both events to be created with enable_timing=True.
+        # Other per-layer events stay timing-free (only used for stream waits).
+        self.load_events = [
+            device_module.Event(enable_timing=(i == num_layers - 1))
+            for i in range(num_layers)
+        ]
+        self.start_event = device_module.Event(
+            enable_timing=True
+        )  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -282,6 +291,11 @@ class HiCacheController:
         }
 
         if self.enable_l1_l2_transfer_metrics:
+            # pp_rank/pp_size are otherwise only set in _generate_storage_config,
+            # which runs only when a storage backend is attached. Derive them here
+            # so the transfer-metrics labels are available without L3 storage.
+            self.pp_rank = get_pipeline_model_parallel_rank()
+            self.pp_size = get_pipeline_model_parallel_world_size()
             self._init_l1_l2_transfer_metrics(extra_metric_labels)
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
@@ -726,8 +740,10 @@ class HiCacheController:
             )
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        # enable_timing so record_l1_l2_transfer_complete can use elapsed_time()
+        # for the real device transfer duration (host fallback returns None).
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
 
         token_count = int(host_indices.numel())
         start_event.record()
