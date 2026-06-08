@@ -34,7 +34,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.jit_kernel.ngram_embedding import update_token_table_decode
+from sglang.jit_kernel.ngram_embedding import (
+    update_token_table_decode,
+)
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -2851,15 +2853,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
-        ngram_embedding_info.out_column_starts[: forward_batch.batch_size] = (
-            forward_batch.seq_lens
-        )
-        ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
-        update_token_table_decode(
-            ne_token_table=ngram_embedding_info.token_table,
-            tokens=next_token_ids.to(torch.int32),
-            row_indices=forward_batch.req_pool_indices,
-            column_starts=ngram_embedding_info.out_column_starts,
+        if not _is_npu:
+            ngram_embedding_info.out_column_starts[: forward_batch.batch_size] = (
+                forward_batch.seq_lens
+            )
+            ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
+            update_token_table_decode(
+                ne_token_table=ngram_embedding_info.token_table,
+                tokens=next_token_ids.to(torch.int32),
+                row_indices=forward_batch.req_pool_indices,
+                column_starts=ngram_embedding_info.out_column_starts,
+            )
+            return
+
+        raw_bs = next_token_ids.shape[0]
+        if raw_bs <= 0:
+            return
+        row_indices = forward_batch.req_pool_indices[:raw_bs]
+        out_column_starts = ngram_embedding_info.out_column_starts[:raw_bs]
+        out_req_lens = ngram_embedding_info.out_req_lens[:raw_bs]
+
+        out_column_starts.copy_(forward_batch.seq_lens[:raw_bs])
+        out_req_lens.fill_(1)
+        if ngram_embedding_info.token_table.dtype != torch.int32:
+            raise ValueError("ne_token_table must be int32 for NPU update_oe_token_table")
+        if not ngram_embedding_info.token_table.is_contiguous():
+            raise ValueError(
+                "ne_token_table must be contiguous for NPU update_oe_token_table"
+            )
+        ignore_tokens = next_token_ids.new_empty(0, dtype=next_token_ids.dtype)
+        torch.ops.npu.update_oe_token_table(
+            next_token_ids[:raw_bs].to(torch.int32).contiguous(),
+            out_req_lens.to(torch.int32).contiguous(),
+            row_indices.to(torch.int64).contiguous(),
+            out_column_starts.to(torch.int32).contiguous(),
+            ignore_tokens.to(torch.int32).contiguous(),
+            row_indices.numel(),
+            ngram_embedding_info.token_table.shape[1],
+            ngram_embedding_info.token_table,
         )
 
     def init_device_graphs(self):

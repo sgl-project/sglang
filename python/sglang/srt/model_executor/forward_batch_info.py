@@ -236,6 +236,20 @@ def compute_local_num_token_non_padded(
     )
 
 
+def compute_local_num_token_non_padded_cpu(
+    global_num_token_non_padded: int,
+    num_tokens_per_dp: int,
+) -> int:
+    """CPU helper mirroring compute_local_num_token_non_padded()."""
+    attn_tp_rank = get_attention_tp_rank()
+    attn_tp_size = get_attention_tp_size()
+    tokens_per_rank = num_tokens_per_dp // attn_tp_size
+    return max(
+        0,
+        min(global_num_token_non_padded - tokens_per_rank * attn_tp_rank, tokens_per_rank),
+    )
+
+
 @dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
@@ -863,6 +877,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
         )
+        if self.num_token_non_padded_cpu is not None:
+            self.num_token_non_padded_cpu = compute_local_num_token_non_padded_cpu(
+                global_num_token_non_padded=self.num_token_non_padded_cpu,
+                num_tokens_per_dp=num_tokens_per_dp,
+            )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
@@ -1073,7 +1092,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
-
         # Local import: a module-level cp_utils import here is circular (#27014).
         from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
 
@@ -1173,6 +1191,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 child._pad_inputs_to_size(
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
+
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding

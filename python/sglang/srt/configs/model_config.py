@@ -114,6 +114,14 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_longcat_dsa(config) -> bool:
+    return (
+        _hf_arch(config) in ("LongcatFlashProForCausalLM", "LongcatCausalLM")
+        and _hf_attr(config, "index_topk") is not None
+        and _hf_attr(config, "use_longcat_dsa") is not False
+    )
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
@@ -122,19 +130,18 @@ def is_deepseek_v4(config) -> bool:
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
+    assert is_deepseek_dsa(config) or is_longcat_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
 
 
 def get_dsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config)
+    assert is_deepseek_dsa(config) or is_longcat_dsa(config)
     return config.index_topk
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config)
+    assert is_deepseek_dsa(config) or is_longcat_dsa(config)
     return config.index_n_heads
-
 
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
@@ -147,6 +154,8 @@ def get_num_indexer_layers(config) -> int:
     """
     if is_deepseek_dsa(config):
         return config.num_hidden_layers
+    if is_longcat_dsa(config):
+        return config.num_hidden_layers * 2
     if is_deepseek_v4(config):
         compress_ratios = getattr(config, "compress_ratios", None) or []
         return sum(1 for r in compress_ratios if r == 4)
@@ -620,6 +629,7 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
+            or "LongcatFlashProForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
@@ -640,6 +650,7 @@ class ModelConfig:
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)
+                or is_longcat_dsa(self.hf_text_config)
                 else None
             )
             # Handle rope scaling
@@ -787,7 +798,10 @@ class ModelConfig:
         self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
-        if "LongcatFlashForCausalLM" in self.hf_config.architectures:
+        if (
+            "LongcatFlashForCausalLM" in self.hf_config.architectures
+            or "LongcatFlashProForCausalLM" in self.hf_config.architectures
+        ):
             self.num_attention_layers = self.num_hidden_layers * 2
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)

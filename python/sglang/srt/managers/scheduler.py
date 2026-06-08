@@ -738,7 +738,9 @@ class Scheduler(
             "num_experts_per_token",
             "top_k_experts",
             "moe_top_k",
+            "moe_topk",
         )
+
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
 
@@ -1252,18 +1254,48 @@ class Scheduler(
                 request_lengths.append(len(tokens))
             dtype = self.token_table.dtype
             device = self.token_table.device
-            update_token_table(
-                ne_token_table=self.token_table,
-                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
-                row_indices=batch.req_pool_indices,
-                column_starts=torch.tensor(
+            if device.type == "npu":
+                tokens = torch.tensor(all_tokens, dtype=dtype, device=device)
+                column_starts_t = torch.tensor(
                     column_starts, dtype=torch.int32, device=device
-                ),
-                req_lens=torch.tensor(
+                )
+                req_lens_t = torch.tensor(
                     request_lengths, dtype=torch.int32, device=device
-                ),
-                ignore_tokens=None,
-            )
+                )
+                if batch.req_pool_indices.numel() == 0:
+                    return batch
+                if self.token_table.dtype != torch.int32:
+                    raise ValueError(
+                        "ne_token_table must be int32 for NPU update_oe_token_table"
+                    )
+                if not self.token_table.is_contiguous():
+                    raise ValueError(
+                        "ne_token_table must be contiguous for NPU update_oe_token_table"
+                    )
+                ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
+                torch.ops.npu.update_oe_token_table(
+                    tokens.to(torch.int32).contiguous(),
+                    req_lens_t.to(torch.int32).contiguous(),
+                    batch.req_pool_indices.to(torch.int64).contiguous(),
+                    column_starts_t.to(torch.int32).contiguous(),
+                    ignore_tokens.to(torch.int32).contiguous(),
+                    batch.req_pool_indices.numel(),
+                    self.token_table.shape[1],
+                    self.token_table,
+                )
+            else:
+                update_token_table(
+                    ne_token_table=self.token_table,
+                    tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+                    row_indices=batch.req_pool_indices,
+                    column_starts=torch.tensor(
+                        column_starts, dtype=torch.int32, device=device
+                    ),
+                    req_lens=torch.tensor(
+                        request_lengths, dtype=torch.int32, device=device
+                    ),
+                    ignore_tokens=None,
+                )
         return batch
 
     def init_deterministic_inference_config(self):

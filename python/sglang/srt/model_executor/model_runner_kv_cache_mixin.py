@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_longcat_dsa,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
@@ -184,7 +185,9 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(
+            self.model_config.hf_config
+        ) or is_longcat_dsa(self.model_config.hf_config)
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
@@ -378,7 +381,9 @@ class ModelRunnerKVCacheMixin:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(
+            self.model_config.hf_config
+        ) or is_longcat_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
         self._validate_prefill_only_disable_kv_cache_pool_family(

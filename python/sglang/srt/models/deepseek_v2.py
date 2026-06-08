@@ -44,6 +44,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
+    is_longcat_dsa,
 )
 from sglang.srt.distributed import (
     divide,
@@ -59,6 +60,9 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.nsa.longcatpro_npu_indexer import (
+    LongcatProNPUIndexer,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
@@ -1472,11 +1476,21 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        self.use_dsa = is_deepseek_dsa(config)
+        self.use_deepseek_dsa = is_deepseek_dsa(config)
+        self.use_longcat_dsa = is_longcat_dsa(config)
+        self.use_dsa = self.use_deepseek_dsa or self.use_longcat_dsa
+
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
+
         if self.dsa_enable_prefill_cp:
             assert self.use_dsa, "CP currently only supports deepseek v3.2 model"
+
+        if self.use_longcat_dsa:
+            assert (
+                not self.dsa_enable_prefill_cp
+            ), "LongCatPro NPU baseline does not support DSA prefill CP"
+
         # cp reuses the attn_tp comm group but needs to duplicate the weights;
         # store cp_size whenever either CP flavor is active so rebuild_cp_kv_cache
         # and the FA3 MLA wrapper can reach it on the dense MLA path too.
@@ -1533,26 +1547,9 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
+        self.indexer = None
         if self.use_dsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_dsa_index_n_heads(config),
-                index_head_dim=get_dsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_dsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-            )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1594,6 +1591,53 @@ class DeepseekV2AttentionMLA(
                         )
                     else:
                         self.next_skip_topk = False
+
+            # Longcat Pro's shared-topk layers reuse the previous attention's
+            # indices and do not ship standalone indexer weights.
+            if not self.skip_topk:
+                if self.use_longcat_dsa:
+                    indexer_is_neox_style = not getattr(
+                        config, "rope_interleave", True
+                    )
+                    self.indexer = LongcatProNPUIndexer(
+                        hidden_size=hidden_size,
+                        index_n_heads=get_dsa_index_n_heads(config),
+                        index_head_dim=get_dsa_index_head_dim(config),
+                        rope_head_dim=qk_rope_head_dim,
+                        index_topk=get_dsa_index_topk(config),
+                        index_k_norm_type=getattr(config, "index_k_norm_type", "rms"),
+                        q_lora_rank=q_lora_rank,
+                        max_position_embeddings=max_position_embeddings,
+                        rope_theta=rope_theta,
+                        scale_fmt="ue8m0",
+                        block_size=128,
+                        rope_scaling=rope_scaling,
+                        is_neox_style=indexer_is_neox_style,
+                        prefix=add_prefix("indexer", prefix),
+                        config=config,
+                        quant_config=quant_config,
+                        layer_id=layer_id,
+                        alt_stream=alt_stream,
+                    )
+                else:
+                    self.indexer = Indexer(
+                        hidden_size=hidden_size,
+                        index_n_heads=get_dsa_index_n_heads(config),
+                        index_head_dim=get_dsa_index_head_dim(config),
+                        rope_head_dim=qk_rope_head_dim,
+                        index_topk=get_dsa_index_topk(config),
+                        q_lora_rank=q_lora_rank,
+                        max_position_embeddings=max_position_embeddings,
+                        rope_theta=rope_theta,
+                        scale_fmt="ue8m0",
+                        block_size=128,
+                        rope_scaling=rope_scaling,
+                        is_neox_style=is_neox_style,
+                        prefix=add_prefix("indexer", prefix),
+                        quant_config=quant_config,
+                        layer_id=layer_id,
+                        alt_stream=alt_stream,
+                    )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -2540,7 +2584,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
-        self.use_dsa = is_deepseek_dsa(config)
+        self.use_dsa = is_deepseek_dsa(config) or is_longcat_dsa(config)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -2581,7 +2625,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.cp_rank = self.cp_size = None
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-        get_attn_tp_context().init_context(q_lora_rank, is_deepseek_dsa(config))
+        get_attn_tp_context().init_context(q_lora_rank, is_deepseek_dsa(config)  or is_longcat_dsa(config))
 
     @property
     def routed_experts_weights_of_layer(self):

@@ -358,9 +358,13 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
-                forward_batch
-            ):
+            can_use_fused_split_qk_norm = (
+                fused_qkv_a_proj_out.shape[0] < 65535
+                and not dsa_use_prefill_cp(forward_batch)
+                and getattr(m.q_a_layernorm, "bias", None) is not None
+                and getattr(m.kv_a_layernorm, "bias", None) is not None
+            )
+            if can_use_fused_split_qk_norm:
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
                     m.q_a_layernorm,
