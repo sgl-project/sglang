@@ -263,8 +263,10 @@ class ModelRunnerKVCacheMixin:
         unsupported_pool_family = None
         if is_dsv4_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
-            unsupported_pool_family = "out-of-tree platform KV pool"
+        elif (
+            current_platform.is_out_of_tree() or current_platform.is_mlu()
+        ) and not self.mambaish_config:
+            unsupported_pool_family = "platform KV pool"
         elif (
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
@@ -422,7 +424,14 @@ class ModelRunnerKVCacheMixin:
                 end_layer=self.end_layer,
                 enable_hisparse=self.enable_hisparse,
             )
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+        elif (
+            current_platform.is_out_of_tree() or current_platform.is_mlu()
+        ) and not self.mambaish_config:
+            if current_platform.is_mlu() and self.use_mla_backend:
+                raise RuntimeError(
+                    "MLU backend currently supports MHA/GQA models only; "
+                    "MLA models are not supported."
+                )
             if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
@@ -719,7 +728,7 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if current_platform.is_out_of_tree():
+            if current_platform.is_out_of_tree() or current_platform.is_mlu():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 self.token_to_kv_pool_allocator = AllocatorCls(
                     self.max_total_num_tokens,
