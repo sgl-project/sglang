@@ -1342,9 +1342,6 @@ class HiRadixCache(RadixCache):
             # unknown prefetch stop policy, just return True
             return True
 
-        # Must also wait for extra pool (e.g. INDEXER) IO to finish before
-        # declaring prefetch complete. Otherwise load_back may race with
-        # ongoing batch_get_v2 writes to the same host memory region.
         if (
             can_terminate
             and getattr(operation, "pool_transfers", None)
