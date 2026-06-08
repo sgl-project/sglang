@@ -97,7 +97,11 @@ class LTX2VideoCausalConv3d(nn.Module):
         time_kernel_size = self.kernel_size[0]
 
         if causal:
-            if conv_cache is not None and cache_key is not None and time_kernel_size > 1:
+            if (
+                conv_cache is not None
+                and cache_key is not None
+                and time_kernel_size > 1
+            ):
                 # Streaming: prepend the previous chunk's last (k-1) frames of the
                 # PADDED conv input (first chunk: replicate frame 0, the "sink"),
                 # then store the last (k-1) frames of THIS padded input for the next
@@ -881,7 +885,9 @@ class LTX2VideoUpBlock3d(nn.Module):
                     hidden_states,
                     causal=causal,
                     conv_cache=conv_cache,
-                    cache_key=None if cache_key is None else f"{cache_key}.upsamplers.{j}",
+                    cache_key=(
+                        None if cache_key is None else f"{cache_key}.upsamplers.{j}"
+                    ),
                 )
 
         for i, resnet in enumerate(self.resnets):
@@ -1213,7 +1219,10 @@ class LTX2VideoDecoder3d(nn.Module):
         _ck = (lambda k: k) if conv_cache is not None else (lambda k: None)
 
         hidden_states = self.conv_in(
-            hidden_states, causal=causal, conv_cache=conv_cache, cache_key=_ck("conv_in")
+            hidden_states,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=_ck("conv_in"),
         )
 
         if self.timestep_scale_multiplier is not None:
@@ -1230,13 +1239,19 @@ class LTX2VideoDecoder3d(nn.Module):
                 )
         else:
             hidden_states = self.mid_block(
-                hidden_states, temb, causal=causal, conv_cache=conv_cache,
+                hidden_states,
+                temb,
+                causal=causal,
+                conv_cache=conv_cache,
                 cache_key=_ck("mid_block"),
             )
 
             for i, up_block in enumerate(self.up_blocks):
                 hidden_states = up_block(
-                    hidden_states, temb, causal=causal, conv_cache=conv_cache,
+                    hidden_states,
+                    temb,
+                    causal=causal,
+                    conv_cache=conv_cache,
                     cache_key=_ck(f"up_blocks.{i}"),
                 )
 
@@ -1257,7 +1272,10 @@ class LTX2VideoDecoder3d(nn.Module):
 
         hidden_states = self.conv_act(hidden_states)
         hidden_states = self.conv_out(
-            hidden_states, causal=causal, conv_cache=conv_cache, cache_key=_ck("conv_out")
+            hidden_states,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=_ck("conv_out"),
         )
 
         p = self.patch_size
