@@ -373,8 +373,9 @@ class TokenizerControlMixin:
         req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
         await self.expert_distribution_communicator(req)
 
+    @staticmethod
     async def init_weights_update_group(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: InitWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -386,8 +387,9 @@ class TokenizerControlMixin:
         results = await self.init_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
 
+    @staticmethod
     async def destroy_weights_update_group(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: DestroyWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -399,8 +401,9 @@ class TokenizerControlMixin:
         results = await self.destroy_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
 
+    @staticmethod
     async def update_weights_from_distributed(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: UpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -414,7 +417,7 @@ class TokenizerControlMixin:
 
         # Hold is_pause_cond while updating to prevent unpause from racing.
         async with self.is_pause_cond:
-            is_paused = self.is_pause
+            is_paused = self.is_pause_getter()
             if is_paused:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
@@ -424,8 +427,8 @@ class TokenizerControlMixin:
 
         success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
-            self.weight_updater_controller._update_weight_version_if_provided(
-                obj.weight_version
+            WeightUpdaterController._update_weight_version_if_provided(
+                self, obj.weight_version
             )
             message += f" Weight version updated to {obj.weight_version}."
 
@@ -459,8 +462,9 @@ class TokenizerControlMixin:
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
 
+    @staticmethod
     async def update_weights_from_tensor(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: UpdateWeightsFromTensorReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -473,7 +477,7 @@ class TokenizerControlMixin:
             self.abort_request(abort_all=True)
 
         async with self.is_pause_cond:
-            is_paused = self.is_pause
+            is_paused = self.is_pause_getter()
             if is_paused:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
@@ -483,15 +487,16 @@ class TokenizerControlMixin:
 
         success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
-            self.weight_updater_controller._update_weight_version_if_provided(
-                obj.weight_version
+            WeightUpdaterController._update_weight_version_if_provided(
+                self, obj.weight_version
             )
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
 
+    @staticmethod
     async def update_weights_from_ipc(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: UpdateWeightsFromIPCReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -505,7 +510,7 @@ class TokenizerControlMixin:
             logger.info("Starting IPC weight update")
 
             async with self.is_pause_cond:
-                is_paused = self.is_pause
+                is_paused = self.is_pause_getter()
                 if is_paused:
                     result = (await self.update_weights_from_ipc_communicator(obj))[0]
                     success, message = result.success, result.message
@@ -520,8 +525,8 @@ class TokenizerControlMixin:
             success, message = False, error_msg
 
         if success and obj.weight_version is not None:
-            self.weight_updater_controller._update_weight_version_if_provided(
-                obj.weight_version
+            WeightUpdaterController._update_weight_version_if_provided(
+                self, obj.weight_version
             )
             message += f" Weight version updated to {obj.weight_version}."
 
@@ -727,8 +732,9 @@ class TokenizerControlMixin:
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
+    @staticmethod
     async def get_weights_by_name(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: GetWeightsByNameReqInput,
         request: Optional[fastapi.Request] = None,
     ):
@@ -740,24 +746,27 @@ class TokenizerControlMixin:
         else:
             return all_parameters
 
+    @staticmethod
     async def release_memory_occupation(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: ReleaseMemoryOccupationReqInput,
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.release_memory_occupation_communicator(obj)
 
+    @staticmethod
     async def resume_memory_occupation(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: ResumeMemoryOccupationReqInput,
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
+    @staticmethod
     async def check_weights(
-        self: TokenizerManager,
+        self: "WeightUpdaterController",
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str, Optional[List[Dict]], Optional[str]]:

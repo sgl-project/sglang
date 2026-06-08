@@ -28,6 +28,29 @@ class WeightUpdaterController:
     initial_weights_loaded: bool = True
     model_update_result: Optional[Awaitable[Any]] = None
     model_update_tmp: List[Any] = field(default_factory=list)
+    init_weights_update_group_communicator: Any = (
+        None  # set after facade.init_communicators
+    )
+    destroy_weights_update_group_communicator: Any = (
+        None  # set after facade.init_communicators
+    )
+    update_weights_from_distributed_communicator: Any = (
+        None  # set after facade.init_communicators
+    )
+    update_weights_from_tensor_communicator: Any = (
+        None  # set after facade.init_communicators
+    )
+    update_weights_from_ipc_communicator: Any = (
+        None  # set after facade.init_communicators
+    )
+    get_weights_by_name_communicator: Any = None  # set after facade.init_communicators
+    release_memory_occupation_communicator: Any = (
+        None  # set after facade.init_communicators
+    )
+    resume_memory_occupation_communicator: Any = (
+        None  # set after facade.init_communicators
+    )
+    check_weights_communicator: Any = None  # set after facade.init_communicators
 
     def __post_init__(self) -> None:
         if self.server_args.checkpoint_engine_wait_weights_before_ready:

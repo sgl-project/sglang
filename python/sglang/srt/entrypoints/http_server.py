@@ -1168,8 +1168,8 @@ async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    success, message = await _global_state.tokenizer_manager.init_weights_update_group(
-        obj, request
+    success, message = await TokenizerManager.init_weights_update_group(
+        _global_state.tokenizer_manager.weight_updater_controller, obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1184,8 +1184,8 @@ async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
     """Destroy the parameter update group."""
-    success, message = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    success, message = await TokenizerManager.destroy_weights_update_group(
+        _global_state.tokenizer_manager.weight_updater_controller, obj, request
     )
     content = {"success": success, "message": message}
     return ORJSONResponse(
@@ -1205,8 +1205,8 @@ async def update_weights_from_tensor(
     3. Any binary data in the named tensors should be base64 encoded.
     """
 
-    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
-        obj, request
+    success, message = await TokenizerManager.update_weights_from_tensor(
+        _global_state.tokenizer_manager.weight_updater_controller, obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1221,10 +1221,8 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
+    success, message = await TokenizerManager.update_weights_from_distributed(
+        _global_state.tokenizer_manager.weight_updater_controller, obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1238,8 +1236,8 @@ async def update_weights_from_distributed(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
-    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
-        obj, request
+    success, message = await TokenizerManager.update_weights_from_ipc(
+        _global_state.tokenizer_manager.weight_updater_controller, obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1292,7 +1290,9 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
+        ret = await TokenizerManager.get_weights_by_name(
+            _global_state.tokenizer_manager.weight_updater_controller, obj, request
+        )
         if ret is None:
             return _create_error_response("Get parameter by name failed")
         else:
@@ -1308,7 +1308,9 @@ async def release_memory_occupation(
 ):
     """Release GPU memory occupation temporarily."""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        await TokenizerManager.release_memory_occupation(
+            _global_state.tokenizer_manager.weight_updater_controller, obj, request
+        )
     except Exception as e:
         return _create_error_response(e)
 
@@ -1320,7 +1322,9 @@ async def resume_memory_occupation(
 ):
     """Resume GPU memory occupation."""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        await TokenizerManager.resume_memory_occupation(
+            _global_state.tokenizer_manager.weight_updater_controller, obj, request
+        )
     except Exception as e:
         return _create_error_response(e)
 
@@ -1332,8 +1336,8 @@ async def check_weights(
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
+    success, message, ranks, per_engine_checksum = await TokenizerManager.check_weights(
+        _global_state.tokenizer_manager.weight_updater_controller, obj, request
     )
     body = {"success": success, "message": message}
     if ranks is not None:

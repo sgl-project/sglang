@@ -454,6 +454,33 @@ class TokenizerManager(TokenizerControlMixin):
             ]
         )
         self.init_communicators(self.server_args)
+        self.weight_updater_controller.init_weights_update_group_communicator = (
+            self.init_weights_update_group_communicator
+        )
+        self.weight_updater_controller.destroy_weights_update_group_communicator = (
+            self.destroy_weights_update_group_communicator
+        )
+        self.weight_updater_controller.update_weights_from_distributed_communicator = (
+            self.update_weights_from_distributed_communicator
+        )
+        self.weight_updater_controller.update_weights_from_tensor_communicator = (
+            self.update_weights_from_tensor_communicator
+        )
+        self.weight_updater_controller.update_weights_from_ipc_communicator = (
+            self.update_weights_from_ipc_communicator
+        )
+        self.weight_updater_controller.get_weights_by_name_communicator = (
+            self.get_weights_by_name_communicator
+        )
+        self.weight_updater_controller.release_memory_occupation_communicator = (
+            self.release_memory_occupation_communicator
+        )
+        self.weight_updater_controller.resume_memory_occupation_communicator = (
+            self.resume_memory_occupation_communicator
+        )
+        self.weight_updater_controller.check_weights_communicator = (
+            self.check_weights_communicator
+        )
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
