@@ -12,7 +12,6 @@ from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ControlStateTransition,
 )
 
-
 CameraActionNormalizer = Callable[[list[Any]], list[str]]
 CameraActionValidator = Callable[[Any], list[list[str]]]
 
@@ -22,6 +21,24 @@ def _identity_actions(actions: list[Any]) -> list[str]:
 
 
 class RealtimeCameraControlState:
+    """Session-local camera-control buffer shared by realtime model adapters.
+
+    Camera controls arrive in two shapes:
+
+    1. Script mode: ``list[list[str]]`` where each item is one output-frame's
+       held actions. The script is consumed once from a FIFO and padded with
+       neutral ``[]`` frames after it runs out.
+    2. State mode: timestamped transitions such as "W is currently held".
+       ``ControlStateSamplingQueue`` expands that continuous state into the next
+       chunk and can pulse a short key press for a minimum number of frames.
+
+    The two modes are intentionally exclusive. A new script clears state mode,
+    and new state transitions clear script mode, so adapters never merge two
+    camera timelines accidentally. ``sample_camera_actions`` returns ``None``
+    only when no control should be sent; otherwise it returns exactly
+    ``chunk_size`` frames, with ``[]`` meaning neutral/no-op for that frame.
+    """
+
     def __init__(
         self,
         *,
@@ -40,6 +57,7 @@ class RealtimeCameraControlState:
         self._normalize_state_actions = normalize_state_actions
 
     def clear(self) -> None:
+        """Reset all camera controls owned by this realtime session."""
         self.camera_state.clear()
         self.camera_script_queue.clear()
         self.latest_sampled_event_id = None
@@ -50,6 +68,7 @@ class RealtimeCameraControlState:
         *,
         event_id: int | None = None,
     ) -> None:
+        """Replace active controls with a finite per-frame script."""
         self.camera_script_queue.clear()
         self.camera_state.clear()
         for actions in camera_actions:
@@ -65,6 +84,7 @@ class RealtimeCameraControlState:
         self,
         transitions: list[ControlStateTransition],
     ) -> None:
+        """Replace the script with continuous state transitions."""
         self.camera_script_queue.clear()
         self.camera_state.push_many(transitions)
 
@@ -100,6 +120,7 @@ class RealtimeCameraControlState:
         event_id: int | None,
         validate_camera_actions: CameraActionValidator,
     ) -> str:
+        """Parse an external camera event and install it as script or state."""
         if isinstance(payload, dict) and payload.get("mode") == "state":
             transitions = self._camera_transitions_from_event_payload(
                 payload,
@@ -113,6 +134,11 @@ class RealtimeCameraControlState:
         return f"kind=camera_actions, mode=script, frames={len(camera_actions)}"
 
     def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
+        """Return the next chunk-sized camera action window.
+
+        Script mode has priority because it represents an explicit finite
+        timeline. State mode is sampled only when no script is pending.
+        """
         if self.camera_script_queue:
             return self._sample_camera_script(chunk_size)
         action_list = self.camera_state.sample_chunk(chunk_size)

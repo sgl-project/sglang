@@ -26,13 +26,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.base import (
+    normalize_sana_wm_camera_actions,
+    parse_sana_wm_action_string,
+    snap_sana_wm_num_frames,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.self_forcing import (
     SanaWMSelfForcingSampler,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.utils import (
-    normalize_camera_actions,
-    parse_action_string,
-    snap_num_frames,
 )
 from sglang.multimodal_gen.runtime.realtime.camera_controls import (
     RealtimeCameraControlState,
@@ -107,7 +107,7 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
 
     @staticmethod
     def _validate_camera_actions(payload: Any) -> list[list[str]]:
-        return normalize_camera_actions(
+        return normalize_sana_wm_camera_actions(
             payload, error_label="camera_actions event payload"
         )
 
@@ -161,7 +161,9 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
         if action is not None:
             if not isinstance(action, str) or not action:
                 raise ValueError("action condition input must be a non-empty string")
-            state.receive_camera_script(parse_action_string(action), event_id=None)
+            state.receive_camera_script(
+                parse_sana_wm_action_string(action), event_id=None
+            )
         state.base_condition_inputs = condition_inputs
 
         server_args = get_global_server_args()
@@ -206,7 +208,7 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
         if event.kind == "action":
             if not isinstance(event.payload, str) or not event.payload:
                 raise ValueError("action event payload must be a non-empty string")
-            camera_actions = parse_action_string(event.payload)
+            camera_actions = parse_sana_wm_action_string(event.payload)
             state.receive_camera_script(camera_actions, event_id=event.event_id)
             return f"kind=action, frames={len(camera_actions)}"
         raise ValueError(f"unsupported event kind: {event.kind}")
@@ -296,7 +298,9 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
             session.request.num_frames if session.request is not None else None
         )
         if req_num_frames is not None:
-            snapped = snap_num_frames(int(req_num_frames), stride=temporal_compression)
+            snapped = snap_sana_wm_num_frames(
+                int(req_num_frames), stride=temporal_compression
+            )
             latent_t = (snapped - 1) // temporal_compression + 1
             segments = SanaWMSelfForcingSampler.create_autoregressive_segments(
                 latent_t, chunk_size

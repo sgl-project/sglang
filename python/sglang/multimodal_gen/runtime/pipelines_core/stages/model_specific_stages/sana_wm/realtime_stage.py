@@ -38,6 +38,7 @@ from .streaming_refiner import (
     RefinerChunkRunner,
     _RefinerCore,
 )
+
 logger = init_logger(__name__)
 
 SANA_WM_HEIGHT = SANA_WM_TARGET_HEIGHT
