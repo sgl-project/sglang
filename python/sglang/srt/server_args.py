@@ -871,6 +871,10 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    # Port of the standalone EncoderBootstrapServer started by the language-only
+    # tokenizer manager.  Encoder workers register here.
+    encoder_bootstrap_port: int = 8997
+    encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
@@ -4123,8 +4127,10 @@ class ServerArgs:
             )
 
         if self.language_only and len(self.encoder_urls) == 0:
-            raise ValueError(
-                "requires at least one encoder urls to be set via --encoder-urls"
+            logger.info(
+                "--language-only is set without --encoder-urls. Encoders are "
+                "expected to register dynamically via the "
+                "EncoderBootstrapServer."
             )
 
         # Validate IB devices when mooncake backend is used
@@ -7319,6 +7325,24 @@ class ServerArgs:
             help="List of encoder server urls.",
         )
         parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port for the EncoderBootstrapServer that runs in the "
+            "language-only tokenizer manager process. Encoders register here, "
+            "and language-only receivers fetch the current URL list from here.",
+        )
+        parser.add_argument(
+            "--encoder-register-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="One or more EncoderBootstrapServer URLs to register this encoder "
+            "with on startup, for dynamic encoder discovery. "
+            "Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. "
+            "Used with --encoder-only servers.",
+        )
+        parser.add_argument(
             "--enable-adaptive-dispatch-to-encoder",
             default=ServerArgs.enable_adaptive_dispatch_to_encoder,
             action="store_true",
@@ -8315,13 +8339,28 @@ class PortArgs:
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+                derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
+                if derived_port > 65535:
+                    derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
+                na = NetworkAddress("127.0.0.1", derived_port)
             else:
                 na = NetworkAddress.parse(server_args.dist_init_addr)
 
             dist_init_host = na.host
             dist_init_port = na.port
-            port_base = dist_init_port + 1
+
+            # We need 5 consecutive ports from port_base for:
+            # port_base, detokenizer, rpc, metrics, scheduler.
+            # In multi-node, all nodes derive ports independently from
+            # dist_init_port, so the derivation must be deterministic
+            # (no availability-based search). If incrementing would
+            # overflow the valid TCP range, decrement instead.
+            NUM_DERIVED_PORTS = 5
+            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+            else:
+                port_base = dist_init_port + 1
+
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
