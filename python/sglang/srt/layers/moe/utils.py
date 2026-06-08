@@ -515,8 +515,14 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK only (no softmax)
     TopK = (5,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize
+    SigmoidRenorm = (6,)
+    # MiniMax2
+    MiniMax2 = (7,)
+    # Sigmoid: Sigmoid -> TopK (no renormalize)
+    Sigmoid = (8,)
     # Unspecified
-    Unspecified = 6
+    Unspecified = 9
 
 
 AITER_PADDING_SIZE = 128
