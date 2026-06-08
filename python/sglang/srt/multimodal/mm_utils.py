@@ -518,6 +518,16 @@ def run_dp_sharded_mrope_vision_model(
     # GPU_1 tp_rank_local = 1
     tp_rank_local = get_attention_tp_rank()
 
+    import sys as _sys
+
+    def _dpdbg(_tag, **_kw):
+        _m = " ".join(f"{_k}={_v}" for _k, _v in _kw.items())
+        print(
+            f"[DPDBG r{tp_rank_local}/{tp_size}] {_tag} {_m}",
+            flush=True,
+            file=_sys.stderr,
+        )
+
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
     # print(f"{patches_per_image = }")
@@ -573,6 +583,17 @@ def run_dp_sharded_mrope_vision_model(
     max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
+    _dpdbg(
+        "ASSIGN",
+        rope_type=rope_type,
+        patches_per_image=patches_per_image,
+        grouped_pixel_values_len=grouped_pixel_values_len,
+        max_len_per_rank=max_len_per_rank,
+        image_idxs_local=image_idxs_local,
+        reduction=embed_dim_reduction_factor,
+        pixel_local=tuple(pixel_values_local.shape),
+    )
+
     # Run the vision model on the local pixel_values_local
     if rope_type == "rope_2d":
         if pixel_values_local.shape[0] > 0:
@@ -602,6 +623,13 @@ def run_dp_sharded_mrope_vision_model(
                 dtype=pixel_values.dtype,
             )
 
+    _dpdbg(
+        "POST_VIT",
+        image_embeds_local=tuple(image_embeds_local.shape),
+        dtype=image_embeds_local.dtype,
+        contig=image_embeds_local.is_contiguous(),
+    )
+
     # Pad the output based on max_len_per_rank
     # for tensor_model_parallel_all_gather to work
     current_len = image_embeds_local.shape[0]
@@ -628,9 +656,16 @@ def run_dp_sharded_mrope_vision_model(
         image_embeds_local_padded = image_embeds_local
 
     # Do all_gather to collect embeddings from all ranks
+    _dpdbg(
+        "PRE_ALLGATHER",
+        padded=tuple(image_embeds_local_padded.shape),
+        dtype=image_embeds_local_padded.dtype,
+        contig=image_embeds_local_padded.is_contiguous(),
+    )
     gathered_embeds = get_attention_tp_group().all_gather(
         image_embeds_local_padded, dim=0
     )
+    _dpdbg("POST_ALLGATHER", gathered=tuple(gathered_embeds.shape))
 
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()

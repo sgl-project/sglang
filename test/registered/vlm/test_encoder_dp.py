@@ -1,7 +1,12 @@
+import os
 import random
 import tempfile
 import unittest
 from types import SimpleNamespace
+
+# DEBUG (Track B): make HIP kernels synchronous so a GPU memory fault is
+# reported at the faulting kernel (propagates to the server subprocess).
+os.environ.setdefault("HIP_LAUNCH_BLOCKING", "1")
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import MMMUMultiModelTestBase
@@ -31,7 +36,10 @@ class TestVLMEncoderDP(MMMUMultiModelTestBase):
         models_to_test = MODELS
 
         if is_in_ci():
-            models_to_test = [random.choice(MODELS)]
+            # DEBUG (Track B): pin to a failing model to reproduce the fault.
+            models_to_test = [
+                next(m for m in MODELS if m.model == "Qwen/Qwen2.5-VL-72B-Instruct")
+            ]
 
         for model in models_to_test:
             # Per-model temp dir avoids cross-test cached results.
