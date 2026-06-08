@@ -21,6 +21,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
     lingbot_world_realtime_adapter as lingbot_realtime,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
     sana_wm_realtime_adapter as sana_wm_realtime,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (

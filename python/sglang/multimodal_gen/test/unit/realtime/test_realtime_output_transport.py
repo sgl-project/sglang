@@ -562,9 +562,7 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
-        frame_count = (
-            realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE + 1
-        )
+        frame_count = realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE + 1
         batch = SimpleNamespace(
             block_idx=0,
             request_id="req-webp-offload",

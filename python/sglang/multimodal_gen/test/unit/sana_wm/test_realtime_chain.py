@@ -114,9 +114,7 @@ def test_realtime_first_frame_uses_requested_size():
         width=832,
     )
 
-    cropped, original, src_size, resized_size, crop_offset = stage._prepare_image(
-        batch
-    )
+    cropped, original, src_size, resized_size, crop_offset = stage._prepare_image(batch)
 
     assert cropped.size == (832, 480)
     assert original.size == (640, 360)

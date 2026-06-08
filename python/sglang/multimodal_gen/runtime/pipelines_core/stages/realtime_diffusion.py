@@ -39,9 +39,7 @@ class RealtimeDiffusionStage(PipelineStage):
     """
 
     component_specs: tuple[RealtimeStageComponent, ...] = (
-        RealtimeStageComponent(
-            "transformer", "dit_precision", memory_intensive=True
-        ),
+        RealtimeStageComponent("transformer", "dit_precision", memory_intensive=True),
         RealtimeStageComponent("vae", "vae_precision"),
     )
 
