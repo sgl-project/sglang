@@ -541,7 +541,9 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
+        self.model_worker.on_verify_complete_cpu(
+            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+        )
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
@@ -936,7 +938,7 @@ class SchedulerBatchResultProcessor:
         other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool
-            pool.mamba_pool.free(
+            pool.mamba_allocator.free(
                 req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)

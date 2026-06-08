@@ -44,6 +44,7 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.triton_ops.cache_move import (
     copy_all_layer_kv_cache_tiled,
 )
@@ -360,10 +361,6 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.free_slots = torch.arange(
-                1, self.size + 1, dtype=torch.int64, device=self.device
-            )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
@@ -373,17 +370,6 @@ class MambaPool:
 
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
-
-    def available_size(self):
-        return len(self.free_slots)
-
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if need_size > len(self.free_slots):
-            return None
-
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_index
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
@@ -399,16 +385,6 @@ class MambaPool:
             t.shape[0], need_size, *t.shape[2:]
         )
         t[:, indices] = z
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-        self.free_slots = torch.cat((self.free_slots, free_index))
-
-    def clear(self):
-        self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
-        )
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
@@ -560,6 +536,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
+        self.mamba_allocator = MambaSlotAllocator(
+            size=mamba_size,
+            device=device,
+        )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
@@ -594,10 +574,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
                 pass
             else:
-                mid = self.mamba_pool.alloc(1)
+                mid = self.mamba_allocator.alloc(1)
                 assert (
                     mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
+                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
             mamba_indices.append(req.mamba_pool_idx)
@@ -666,7 +646,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if self.enable_mamba_extra_buffer_lazy
             else self.mamba_ping_pong_track_buffer_size
         )
-        slots = self.mamba_pool.alloc(n)
+        slots = self.mamba_allocator.alloc(n)
         assert slots is not None, (
             "Not enough space for mamba ping pong idx, "
             "try to increase --mamba-full-memory-ratio."
@@ -721,7 +701,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.mamba_pool.free(mamba_index.unsqueeze(0))
+        self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.mamba_pool_idx = None
 
         if self.enable_mamba_extra_buffer:
@@ -761,12 +741,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         mamba_ping_pong_track_buffer_to_free != -1
                     ]
                 )
-            self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+            self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
+            # Match the req.mamba_pool_idx=None clear above so the next
+            # alloc() doesn't see a stale ping-pong reference on the req
+            # and skip allocation (which would silently reuse a freed
+            # tensor on the req side while the new pool slot leaks).
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
-        self.mamba_pool.clear()
+        self.mamba_allocator.clear()
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
@@ -1140,6 +1126,9 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        # Catch stale slot ids here instead of as illegal-addr / silent KV
+        # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -1436,6 +1425,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-FP4)")
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if layer_id_override is not None:
@@ -1495,6 +1485,7 @@ class HybridLinearKVPool(KVCache):
         device: str,
         mamba_pool: MambaPool,
         enable_memory_saver: bool = False,
+        enable_kv_cache_copy: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
@@ -1535,6 +1526,7 @@ class HybridLinearKVPool(KVCache):
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                enable_kv_cache_copy=enable_kv_cache_copy,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -1826,6 +1818,7 @@ class MLATokenToKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
@@ -1845,6 +1838,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
 
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
@@ -2018,6 +2012,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
@@ -2042,6 +2037,9 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA-FP4)"
+        )
         layer_id = layer.layer_id
 
         if self.dsa_kv_cache_store_fp8:

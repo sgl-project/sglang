@@ -20,6 +20,9 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
     get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
 )
 from sglang.srt.layers.attention.triton_ops.pad import (
@@ -171,3 +174,16 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
         return concat_mla_absorb_q(q_nope, q_rope)
     else:
         return torch.cat([q_nope, q_rope], dim=-1)
+
+
+def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
+    """Safety guard: a preallocated cuda-graph buffer must hold the runtime write.
+
+    The kv_indices / page_table scatter kernels bound writes only per-row, not
+    against the destination buffer, so an undersized buffer silently overflows
+    into the adjacent row. Fail fast on the host-known extent instead. All args
+    are host ints, so this is always-on (no device sync, unlike async probes).
+    """
+    assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
+        f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
+    )

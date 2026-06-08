@@ -18,6 +18,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
+    IDEOGRAM4_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
@@ -430,7 +431,9 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path="robbyant/lingbot-world-fast-diffusers",
             modality="video",
             num_gpus=1,
-            extras=["--pipeline-class-name LingBotWorldCausalDMDPipeline"],
+            extras=[
+                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup false"
+            ],
             text_encoder_cpu_offload=True,
         ),
         LINGBOT_WORLD_REALTIME_sampling_params,
@@ -541,6 +544,15 @@ else:
             run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
+            "ideogram4_nvfp4_t2i",
+            model_path="Comfy-Org/Ideogram-4",
+            modality="image",
+            sampling_params=IDEOGRAM4_CI_sampling_params,
+            extras=[],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
             model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",
@@ -554,6 +566,21 @@ else:
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "ideogram4_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path="ideogram-ai/ideogram-4-fp8",
+            tp_size=2,
+            extras=[
+                "--attention-backend",
+                "fa",
+            ],
+        ),
+        IDEOGRAM4_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
