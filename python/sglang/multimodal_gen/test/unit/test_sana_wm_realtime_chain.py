@@ -34,6 +34,11 @@ from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 MC = 8
 
 
+class _TestRealtimeStage(SanaWMRealtimeStage):
+    def forward(self, batch, server_args):
+        raise NotImplementedError
+
+
 @pytest.fixture
 def _global_args():
     prev = _sa_mod._global_server_args
@@ -58,11 +63,11 @@ def _prep_stage():
 
 
 def _realtime_stage():
-    return SanaWMRealtimeStage(transformer=None, vae=None, model_path="")
+    return object.__new__(_TestRealtimeStage)
 
 
 def _camera_stage():
-    return SanaWMCameraCondStage(transformer=None, vae=None, model_path="")
+    return object.__new__(SanaWMCameraCondStage)
 
 
 def _batch(session, block_idx, image_latent):
