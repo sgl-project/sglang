@@ -95,7 +95,7 @@ MI35X_GPT_OSS_MODELS = [
         env_vars={
             "SGLANG_USE_AITER": "1",
             "SGLANG_AITER_KV_CACHE_LAYOUT": "vectorized_5d",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "False",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "True",
         },
     ),
 ]
