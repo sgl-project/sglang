@@ -697,6 +697,13 @@ class ServerArgs(DisaggServerArgsMixin):
             self.warmup = True
             self.server_warmup = False
 
+        if (
+            self.enable_torch_compile
+            and not self.warmup
+            and not self.is_arg_explicitly_set("warmup")
+        ):
+            self.warmup = True
+
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
 
@@ -1117,7 +1124,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "default cuDNN SDPA auto mode, attention_autotune=false to disable "
                 "default warmup-time dense LocalAttention autotune, "
                 "attention_autotune_live_miss=true to autotune cache misses on "
-                "real requests, and attention_autotune_min_speedup=1.10."
+                "real requests, attention_autotune_min_speedup=1.10, "
+                "torch_compile_policy=auto|force_compile|force_eager|off, "
+                "torch_compile_live_miss=true, and torch_compile_min_speedup=1.05."
             ),
         )
 
@@ -1265,8 +1274,13 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
-            help="Use torch.compile to speed up DiT inference."
-            + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+            help=(
+                "Use torch.compile to speed up DiT inference. Native denoising "
+                "pipelines autotune eager vs compiled DiT forward during warmup "
+                "by default; warmup is enabled automatically unless explicitly "
+                "disabled. However, this may cause precision drifts. See "
+                "(https://github.com/pytorch/pytorch/issues/145213)"
+            ),
         )
 
         parser.add_argument(

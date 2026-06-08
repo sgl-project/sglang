@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.acceleration_policy import (
     KERNEL_COMPILE_POLICY_ENV,
     attention_allows_cudnn_sdp,
     attention_autotune_config,
+    torch_compile_autotune_config,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -188,6 +189,21 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(args.acceleration_config.attention_autotune_min_speedup, 1.03)
         self.assertTrue(args.acceleration_config.attention_autotune_live_miss)
 
+    def test_acceleration_config_accepts_torch_compile_autotune(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "acceleration_config": "torch_compile_policy=force_eager,torch_compile_warmup=2,torch_compile_iters=4,torch_compile_min_speedup=1.02,torch_compile_live_miss=true",
+            }
+        )
+
+        config = torch_compile_autotune_config(args.acceleration_config)
+        self.assertEqual(config.policy, "force_eager")
+        self.assertEqual(config.warmup, 2)
+        self.assertEqual(config.iters, 4)
+        self.assertEqual(config.min_speedup, 1.02)
+        self.assertTrue(config.live_miss)
+
     def test_attention_acceleration_defaults_to_auto(self):
         self.assertTrue(attention_allows_cudnn_sdp({}))
         enabled, warmup, iters, min_speedup, live_miss = attention_autotune_config({})
@@ -196,6 +212,12 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(iters, 20)
         self.assertEqual(min_speedup, 1.10)
         self.assertFalse(live_miss)
+        compile_config = torch_compile_autotune_config({})
+        self.assertEqual(compile_config.policy, "auto")
+        self.assertEqual(compile_config.warmup, 1)
+        self.assertEqual(compile_config.iters, 3)
+        self.assertEqual(compile_config.min_speedup, 1.05)
+        self.assertFalse(compile_config.live_miss)
 
     def test_attention_acceleration_can_be_disabled(self):
         self.assertFalse(attention_allows_cudnn_sdp({"allow_cudnn_sdp": False}))
@@ -205,6 +227,31 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             {"attention_autotune_live_miss": "false"}
         )
         self.assertFalse(live_miss)
+
+    def test_torch_compile_enables_implicit_warmup(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "enable_torch_compile": True,
+            }
+        )
+
+        self.assertTrue(args.warmup)
+        self.assertFalse(args.server_warmup)
+        self.assertFalse(args.is_arg_explicitly_set("warmup"))
+
+    def test_torch_compile_preserves_explicit_warmup_false(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "enable_torch_compile": True,
+                "warmup": False,
+            }
+        )
+
+        self.assertFalse(args.warmup)
+        self.assertFalse(args.server_warmup)
+        self.assertTrue(args.is_arg_explicitly_set("warmup"))
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):

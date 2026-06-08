@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import addict
@@ -11,6 +12,7 @@ import addict
 KERNEL_COMPILE_POLICY_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_POLICY"
 KERNEL_COMPILE_OPS_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_OPS"
 KERNEL_COMPILE_MODE_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_MODE"
+TORCH_COMPILE_MODE_ENV = "SGLANG_TORCH_COMPILE_MODE"
 
 SUPPORTED_KERNEL_COMPILE_OPS = frozenset(
     {
@@ -40,6 +42,15 @@ def _get_nested(config: Mapping[str, Any], *keys: str) -> Any:
             return None
         value = value.get(key)
     return value
+
+
+@dataclass(frozen=True)
+class TorchCompileAutotuneConfig:
+    policy: str
+    warmup: int
+    iters: int
+    min_speedup: float
+    live_miss: bool
 
 
 def _get_server_policy_configs() -> tuple[Mapping[str, Any], Mapping[str, Any]]:
@@ -82,6 +93,17 @@ def configure_acceleration_policy(config: Mapping[str, Any]) -> None:
     elif kernel_ops is not None:
         os.environ[KERNEL_COMPILE_OPS_ENV] = ",".join(str(op) for op in kernel_ops)
 
+    torch_compile_mode = None
+    for candidate in (
+        config.get("torch_compile_mode"),
+        _get_nested(config, "torch_compile", "mode"),
+    ):
+        if candidate is not None:
+            torch_compile_mode = candidate
+            break
+    if torch_compile_mode is not None:
+        os.environ[TORCH_COMPILE_MODE_ENV] = str(torch_compile_mode)
+
 
 def should_torch_compile_custom_op(op_name: str | None, class_name: str) -> bool:
     policy = _normalize_policy(os.environ.get(KERNEL_COMPILE_POLICY_ENV))
@@ -107,9 +129,83 @@ def should_torch_compile_custom_op(op_name: str | None, class_name: str) -> bool
 def kernel_compile_kwargs() -> dict[str, Any]:
     mode = os.environ.get(
         KERNEL_COMPILE_MODE_ENV,
-        os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"),
+        os.environ.get(TORCH_COMPILE_MODE_ENV, "max-autotune-no-cudagraphs"),
     )
     return {"fullgraph": False, "dynamic": None, "mode": mode}
+
+
+def torch_compile_kwargs() -> dict[str, Any]:
+    mode = os.environ.get(TORCH_COMPILE_MODE_ENV, "max-autotune-no-cudagraphs")
+    return {"fullgraph": False, "dynamic": None, "mode": mode}
+
+
+def torch_compile_autotune_config(
+    acceleration_cfg: Mapping[str, Any] | None = None,
+) -> TorchCompileAutotuneConfig:
+    if acceleration_cfg is None:
+        _, acceleration_cfg = _get_server_policy_configs()
+    else:
+        acceleration_cfg = acceleration_cfg or addict.Dict()
+
+    policy_value = None
+    for candidate in (
+        acceleration_cfg.get("torch_compile_policy"),
+        acceleration_cfg.get("torch_compile_autotune"),
+        acceleration_cfg.get("compile_autotune"),
+        _get_nested(acceleration_cfg, "torch_compile", "policy"),
+    ):
+        if candidate is not None:
+            policy_value = candidate
+            break
+
+    policy = _normalize_policy(policy_value, default="auto")
+    if policy in {"true", "on", "1"}:
+        policy = "auto"
+    elif policy in {"false", "0", "none"}:
+        policy = "off"
+    elif policy in {"force", "compile", "compiled", "force_torch_compile"}:
+        policy = "force_compile"
+    elif policy in {"eager", "native"}:
+        policy = "force_eager"
+    elif policy not in {"auto", "off", "force_compile", "force_eager"}:
+        policy = "auto"
+
+    warmup = int(
+        acceleration_cfg.get(
+            "torch_compile_warmup",
+            _get_nested(acceleration_cfg, "torch_compile", "warmup") or 1,
+        )
+    )
+    iters = int(
+        acceleration_cfg.get(
+            "torch_compile_iters",
+            _get_nested(acceleration_cfg, "torch_compile", "iters") or 3,
+        )
+    )
+    min_speedup = float(
+        acceleration_cfg.get(
+            "torch_compile_min_speedup",
+            _get_nested(acceleration_cfg, "torch_compile", "min_speedup") or 1.05,
+        )
+    )
+    live_miss_policy = acceleration_cfg.get(
+        "torch_compile_live_miss",
+        _get_nested(acceleration_cfg, "torch_compile", "live_miss"),
+    )
+    live_miss = _normalize_policy(live_miss_policy) in {
+        "auto",
+        "on",
+        "true",
+        "1",
+        "force",
+    }
+    return TorchCompileAutotuneConfig(
+        policy=policy,
+        warmup=max(warmup, 0),
+        iters=max(iters, 1),
+        min_speedup=max(min_speedup, 1.0),
+        live_miss=live_miss,
+    )
 
 
 def attention_allows_cudnn_sdp(extra_impl_args: Mapping[str, Any]) -> bool:

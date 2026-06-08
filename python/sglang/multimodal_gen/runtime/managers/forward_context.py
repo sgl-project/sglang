@@ -61,6 +61,10 @@ def get_forward_context() -> "ForwardContext":
     return _forward_context
 
 
+def get_forward_context_or_none() -> Optional["ForwardContext"]:
+    return _forward_context
+
+
 # TODO(will): finalize the interface
 @contextmanager
 def set_forward_context(
