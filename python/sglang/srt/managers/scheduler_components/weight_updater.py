@@ -142,7 +142,9 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
-            return UpdateWeightsFromDistributedReqOutput(success=success, message=message)
+            return UpdateWeightsFromDistributedReqOutput(
+                success=success, message=message
+            )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
