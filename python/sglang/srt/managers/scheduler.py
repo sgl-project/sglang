@@ -1012,6 +1012,8 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            cache_hit_ratio_waiting_bonus=server_args.cache_hit_ratio_waiting_bonus,
+            cache_hit_ratio_waiting_bonus_cap=server_args.cache_hit_ratio_waiting_bonus_cap,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0

@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -135,6 +136,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    CACHE_HIT_RATIO = "cache-hit-ratio"  # sort by cache hit ratio (high to low)
 
 
 class CacheAgnosticPolicy(Enum):
@@ -156,12 +158,16 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        cache_hit_ratio_waiting_bonus: float = 0.0,
+        cache_hit_ratio_waiting_bonus_cap: Optional[float] = None,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+        self.cache_hit_ratio_waiting_bonus = cache_hit_ratio_waiting_bonus
+        self.cache_hit_ratio_waiting_bonus_cap = cache_hit_ratio_waiting_bonus_cap
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
 
         # It is used to find the matching prefix for in-batch prefix caching.
@@ -190,6 +196,19 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
             return
+
+        # CACHE_HIT_RATIO uses lightweight sorting without expensive prefix matching.
+        # It reuses prefix_indices from the previous init_next_round_input() call.
+        if self.policy == CacheAwarePolicy.CACHE_HIT_RATIO:
+            if len(waiting_queue) >= 1:
+                SchedulePolicy._sort_by_cache_hit_ratio(
+                    waiting_queue,
+                    self.cache_hit_ratio_waiting_bonus,
+                    self.cache_hit_ratio_waiting_bonus_cap,
+                )
+            return
+
+        policy = self._determine_active_policy(waiting_queue)
 
         if isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
@@ -304,6 +323,45 @@ class SchedulePolicy:
                 else float("inf")
             )
         )
+
+    @staticmethod
+    def _sort_by_cache_hit_ratio(
+        waiting_queue: List[Req],
+        waiting_bonus_alpha: float = 0.0,
+        waiting_bonus_cap: Optional[float] = None,
+    ) -> None:
+        """Sorts the waiting queue by estimated tokens to compute (ascending).
+
+        Uses prefix_indices from the previous scheduling round. For new requests
+        whose fill_ids have not been set yet, falls back to origin_input_ids length.
+        This avoids the expensive tree_cache.match_prefix call in the sorting phase.
+
+        When ``waiting_bonus_alpha > 0``, the sort key is
+        ``remaining - alpha * waited`` (tokens/sec units). The waited value is
+        clipped to ``waiting_bonus_cap`` if provided, and is treated as 0 when
+        ``wait_queue_entry_time`` was never set (defaults to 0.0) to avoid
+        pathologically huge bonuses.
+        ``alpha == 0 and cap is None`` keeps the original key bit-exactly.
+        """
+        # Snapshot the current time once so the sort comparator is deterministic.
+        now = time.perf_counter()
+
+        def _key(r: Req):
+            remaining = (
+                (len(r.fill_ids) - len(r.prefix_indices))
+                if r.fill_ids
+                else len(r.origin_input_ids)
+            )
+            if waiting_bonus_alpha == 0.0 and waiting_bonus_cap is None:
+                # Fast path: preserve the exact pre-refactor int key.
+                return remaining
+            entry = r.time_stats.wait_queue_entry_time
+            waited = (now - entry) if entry > 0 else 0.0
+            if waiting_bonus_cap is not None:
+                waited = min(waited, waiting_bonus_cap)
+            return remaining - waiting_bonus_alpha * waited
+
+        waiting_queue.sort(key=_key)
 
     @staticmethod
     def _sort_by_dfs_weight(

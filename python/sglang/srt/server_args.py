@@ -447,6 +447,8 @@ class ServerArgs:
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
+    cache_hit_ratio_waiting_bonus: float = 0.0
+    cache_hit_ratio_waiting_bonus_cap: Optional[float] = None
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
@@ -5069,7 +5071,8 @@ class ServerArgs:
                 "fcfs",
                 "dfs-weight",
                 "lof",
-                "priority",
+                "priority", 
+                "cache-hit-ratio",
                 "routing-key",
             ],
             help="The scheduling policy of the requests.",
@@ -5115,6 +5118,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
+        )
+        parser.add_argument(
+            "--cache-hit-ratio-waiting-bonus",
+            type=float,
+            default=ServerArgs.cache_hit_ratio_waiting_bonus,
+            help="Waiting-time bonus (tokens/second) added into the cache-hit-ratio sort key as '- alpha * waited'. 0.0 preserves the original sort key bit-exactly.",
+        )
+        parser.add_argument(
+            "--cache-hit-ratio-waiting-bonus-cap",
+            type=float,
+            default=ServerArgs.cache_hit_ratio_waiting_bonus_cap,
+            help="Upper bound (in seconds) on the waited value fed into the bonus. Guards against pathologically large waited values (e.g., when wait_queue_entry_time was never set). None disables the cap.",
         )
         parser.add_argument(
             "--page-size",
