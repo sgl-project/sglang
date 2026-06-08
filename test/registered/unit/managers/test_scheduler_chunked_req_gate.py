@@ -49,6 +49,9 @@ def _make_req(
     req.extra_key = None
     req.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
+    # cache_unfinished_req keys its slice on kv_committed_len and sanity-checks
+    # it against the fill end, so the fake req must expose it too.
+    req.kv_committed_len = fill_len
     return req
 
 
