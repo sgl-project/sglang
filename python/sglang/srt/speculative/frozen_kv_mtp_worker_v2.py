@@ -15,7 +15,7 @@
 
 Two layers, mirroring ``eagle_worker_v2``:
 
-- ``FrozenDraftWorker(BaseDraftWorker, TpModelWorker)`` -- the assistant. Reads
+- ``FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker)`` -- the assistant. Reads
   the target KV cache read-only (it owns no KV pool of its own) and runs the
   seed + recurrent draft loop. The draft-loop bodies are ported verbatim from
   the former ``FrozenKVMTPWorker``.
@@ -85,7 +85,7 @@ from sglang.srt.utils.async_probe import (
 logger = logging.getLogger(__name__)
 
 
-class FrozenDraftWorker(BaseDraftWorker, TpModelWorker):
+class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
     """Frozen-KV MTP draft worker.
 
     The assistant reads target KV only. It reuses EAGLE's verify input/output
@@ -117,7 +117,7 @@ class FrozenDraftWorker(BaseDraftWorker, TpModelWorker):
             server_args.speculative_algorithm
         )
         assert self.speculative_algorithm.is_frozen_kv_mtp(), (
-            "FrozenDraftWorker should only be instantiated for "
+            "FrozenKVMTPDraftWorker should only be instantiated for "
             "SpeculativeAlgorithm.FROZEN_KV_MTP, got "
             f"{self.speculative_algorithm.name}."
         )
@@ -647,7 +647,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
     ):
         # NOTE: intentionally does NOT call EAGLEWorkerV2.__init__ -- that builds
         # an EagleDraftWorker (with its own draft KV pool). The frozen draft owns
-        # no KV, so we mirror the relevant setup and build a FrozenDraftWorker.
+        # no KV, so we mirror the relevant setup and build a FrozenKVMTPDraftWorker.
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -667,7 +667,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         # Match the draft context length to the target (assistant reads target KV).
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        self._draft_worker = FrozenDraftWorker(
+        self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,
             gpu_id,
             tp_rank,
@@ -701,7 +701,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
-        # size). The draft / seed-based draft-extend hooks are FrozenDraftWorker's.
+        # size). The draft / seed-based draft-extend hooks are FrozenKVMTPDraftWorker's.
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill (frozen is never standalone -> capture FULL hidden).
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
