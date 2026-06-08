@@ -2296,7 +2296,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for idx in range(len(self.reqs)):
             self.release_req(idx, len(self.reqs) - idx, server_args)
 
-        self.filter_batch(retracted_reqs)
+        self.reqs = []
         return retracted_reqs
 
     def retract_decode(
