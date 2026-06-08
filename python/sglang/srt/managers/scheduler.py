@@ -1915,9 +1915,6 @@ class Scheduler(
         )
         if radix_native_session:
             sp = recv_req.session_params
-            # Full context is sent each turn here, so the reconstruct params
-            # (rid/offset/replace/drop_previous_output) don't apply -- warn
-            # instead of silently dropping them.
             if sp.rid or sp.offset or sp.replace or sp.drop_previous_output:
                 logger.warning(
                     "Radix-native session %s ignores session_params "
