@@ -564,15 +564,20 @@ class Gemma4DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # force_fp32: gemma-4's deep layers grow massive-activation outlier dims; the
+        # fused bf16 rmsnorm loses precision there and the per-layer error compounds,
+        # collapsing deep hidden states vs HF (cos≈0.51 by L58). fp32 RMSNorm matches HF.
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
         )
         self.pre_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
         )
         self.post_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
         )
 
         # Per-Layer Embedding (PLE) components — present in each decoder layer
@@ -618,13 +623,13 @@ class Gemma4DecoderLayer(nn.Module):
             )
 
             self.post_feedforward_layernorm_1 = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
             )
             self.post_feedforward_layernorm_2 = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
             )
             self.pre_feedforward_layernorm_2 = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
             )
         else:
             self.router = None
@@ -834,6 +839,7 @@ class Gemma4TextModel(PreTrainedModel):
             self.per_layer_projection_norm = RMSNorm(
                 self.hidden_size_per_layer_input,
                 config.rms_norm_eps,
+                force_fp32=True,
             )
             self.per_layer_input_scale = torch.rsqrt(torch.tensor(2.0))
             self.per_layer_projection_scale = torch.tensor(
@@ -860,7 +866,9 @@ class Gemma4TextModel(PreTrainedModel):
         )
 
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, force_fp32=True
+            )
         else:
             self.norm = PPMissingLayer()
         self.layers_to_capture = []

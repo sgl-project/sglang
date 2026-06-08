@@ -209,6 +209,7 @@ class RMSNorm(MultiPlatformOp):
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
         x_pad_to_multiple: int = 0,
+        force_fp32: bool = False,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -244,6 +245,16 @@ class RMSNorm(MultiPlatformOp):
                 except ImportError:
                     self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
+
+        # Accuracy: force the fp32 PyTorch path. The fused CUDA rmsnorm reduces the
+        # variance in the input (bf16) dtype; when a few outlier "massive-activation"
+        # dims dominate the sum-of-squares this loses precision, and the per-layer
+        # error compounds across deep layers. forward_native upcasts to fp32 and
+        # matches HF. (See gemma-4-31B: deep hidden states collapse to cos≈0.51 vs HF
+        # with the fused kernel, but stay ≥0.998 with forward_native.)
+        self.force_fp32 = force_fp32
+        if force_fp32:
+            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,
