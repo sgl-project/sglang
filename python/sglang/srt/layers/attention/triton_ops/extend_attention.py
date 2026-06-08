@@ -232,6 +232,7 @@ def _fwd_kernel(
     K_Extend,
     V_Extend,
     O_Extend,
+    LSE_Extend,
     K_Buffer,
     V_Buffer,
     qo_indptr,
@@ -253,6 +254,8 @@ def _fwd_kernel(
     stride_vh,
     stride_obs,
     stride_oh,
+    stride_lse_bs,
+    stride_lse_h,
     stride_buf_kbs,
     stride_buf_kh,
     stride_buf_vbs,
@@ -270,6 +273,9 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+    SKIP_PREFIX: tl.constexpr,
+    SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
@@ -336,99 +342,103 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_seq_len_prefix
+    if not SKIP_PREFIX:
+        for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
-        final_mask = mask_m[:, None] & mask_n[None, :]
-        if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
-            custom_mask = tl.load(
-                mask_ptr
-                + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None])
-                * (cur_seq_len + window_kv_offset)
-                + window_kv_offset
-                + start_n
-                + offs_n[None, :],
-                mask=(mask_m[:, None] & mask_n[None, :]),
-                other=0,
-            )
-            final_mask &= custom_mask
-        if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            # q_id = prefix_len + cur_m, kv_id = cur_n
-            window_mask = (
-                cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
-            ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
-            final_mask &= window_mask
+            final_mask = mask_m[:, None] & mask_n[None, :]
+            if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
+                custom_mask = tl.load(
+                    mask_ptr
+                    + cur_seq_mask_start_idx
+                    + (cur_block_m * BLOCK_M + offs_m[:, None])
+                    * (cur_seq_len + window_kv_offset)
+                    + window_kv_offset
+                    + start_n
+                    + offs_n[None, :],
+                    mask=(mask_m[:, None] & mask_n[None, :]),
+                    other=0,
+                )
+                final_mask &= custom_mask
+            if SLIDING_WINDOW_SIZE > 0:
+                # Add mask where q_id <= kv_id + sliding_window_size
+                # q_id = prefix_len + cur_m, kv_id = cur_n
+                window_mask = (
+                    cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
+                ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+                final_mask &= window_mask
 
-        SKIP_TILE = False
-        if (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK) or SLIDING_WINDOW_SIZE > 0:
-            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
+            SKIP_TILE = False
+            if (
+                USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK
+            ) or SLIDING_WINDOW_SIZE > 0:
+                SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
-        if not SKIP_TILE:
-            offs_kv_loc = tl.load(
-                kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
-                mask=mask_n,
-                other=0,
-            )
+            if not SKIP_TILE:
+                offs_kv_loc = tl.load(
+                    kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
+                    mask=mask_n,
+                    other=0,
+                )
 
-            # load k in transposed way
-            offs_buf_k = (
-                offs_kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(mask_n[None, :]) & (mask_d[:, None]),
-                other=0.0,
-            )
-            qk = tl.dot(q.to(k.dtype), k)
-            if BLOCK_DPE > 0:
-                offs_kpe = (
+                # load k in transposed way
+                offs_buf_k = (
                     offs_kv_loc[None, :] * stride_buf_kbs
                     + cur_kv_head * stride_buf_kh
-                    + offs_dpe[:, None]
+                    + offs_d[:, None]
                 )
-                kpe = tl.load(
-                    K_Buffer + offs_kpe,
-                    mask=mask_n[None, :],
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
-            qk *= sm_scale * k_scale
 
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
+                qk = tl.dot(q.to(k.dtype), k)
+                if BLOCK_DPE > 0:
+                    offs_kpe = (
+                        offs_kv_loc[None, :] * stride_buf_kbs
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
+                    kpe = tl.load(
+                        K_Buffer + offs_kpe,
+                        mask=mask_n[None, :],
+                        other=0.0,
+                    )
+                    qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk *= sm_scale * k_scale
 
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
 
-            qk = tl.where(final_mask, qk, float("-inf"))
+                if xai_temperature_len > 0:
+                    qk *= xai_temperature_reg[:, None]
 
-            row_max = tl.max(qk, 1)
-            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
-            n_e_max = tl.maximum(row_max_fixed, e_max)
+                qk = tl.where(final_mask, qk, float("-inf"))
 
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            deno = deno * re_scale + tl.sum(p, 1)
+                row_max = tl.max(qk, 1)
+                row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+                n_e_max = tl.maximum(row_max_fixed, e_max)
 
-            offs_buf_v = (
-                offs_kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                deno = deno * re_scale + tl.sum(p, 1)
 
-            e_max = n_e_max
+                offs_buf_v = (
+                    offs_kv_loc[:, None] * stride_buf_vbs
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                p = p.to(v.dtype)
+                acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+
+                e_max = n_e_max
 
     # stage 2: compute the triangle part
 
@@ -437,106 +447,119 @@ def _fwd_kernel(
         if not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
-    for start_n in range(0, cur_block_m_end, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_block_m_end
+    if not SKIP_EXTEND:
+        for start_n in range(0, cur_block_m_end, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            mask_n = (start_n + offs_n) < cur_block_m_end
 
-        final_mask = mask_m[:, None] & mask_n[None, :]
-        if USE_CUSTOM_MASK:
-            custom_mask = tl.load(
-                mask_ptr
-                + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None])
-                * (cur_seq_len + window_kv_offset)
-                + window_kv_offset
-                + cur_seq_len_prefix
-                + start_n
-                + offs_n[None, :],
-                mask=(mask_m[:, None] & mask_n[None, :]),
-                other=0,
-            )
-            custom_mask &= mask_m[:, None] & mask_n[None, :]
-            final_mask &= custom_mask
-        elif IS_CAUSAL:
-            mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
-                start_n + offs_n[None, :]
-            )
-            mask_causual &= mask_m[:, None] & mask_n[None, :]
-            final_mask &= mask_causual
-        else:
-            mask_non_causal = mask_m[:, None] & mask_n[None, :]
-            final_mask &= mask_non_causal
+            final_mask = mask_m[:, None] & mask_n[None, :]
+            if USE_CUSTOM_MASK:
+                custom_mask = tl.load(
+                    mask_ptr
+                    + cur_seq_mask_start_idx
+                    + (cur_block_m * BLOCK_M + offs_m[:, None])
+                    * (cur_seq_len + window_kv_offset)
+                    + window_kv_offset
+                    + cur_seq_len_prefix
+                    + start_n
+                    + offs_n[None, :],
+                    mask=(mask_m[:, None] & mask_n[None, :]),
+                    other=0,
+                )
+                custom_mask &= mask_m[:, None] & mask_n[None, :]
+                final_mask &= custom_mask
+            elif IS_CAUSAL:
+                mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
+                    start_n + offs_n[None, :]
+                )
+                mask_causual &= mask_m[:, None] & mask_n[None, :]
+                final_mask &= mask_causual
+            else:
+                mask_non_causal = mask_m[:, None] & mask_n[None, :]
+                final_mask &= mask_non_causal
 
-        if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
-                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
-            )
-            final_mask &= window_mask
+            if SLIDING_WINDOW_SIZE > 0:
+                # Add mask where q_id <= kv_id + sliding_window_size
+                window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+                    start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
+                )
+                final_mask &= window_mask
 
-        SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
-            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
+            SKIP_TILE = False
+            if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+                SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
-        if not SKIP_TILE:
-            # load k in transposed way
-            offs_k = (
-                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                + cur_kv_head * stride_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-            )
-
-            qk = tl.dot(q, k, out_dtype=tl.float32)
-            if BLOCK_DPE > 0:
-                offs_kpe = (
+            if not SKIP_TILE:
+                # load k in transposed way
+                offs_k = (
                     (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
                     + cur_kv_head * stride_kh
-                    + offs_dpe[:, None]
+                    + offs_d[:, None]
                 )
-                kpe = tl.load(
-                    K_Extend + offs_kpe,
-                    mask=mask_n[None, :],
+                k = tl.load(
+                    K_Extend + offs_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe)
 
-            qk *= sm_scale
+                qk = tl.dot(q, k, out_dtype=tl.float32)
+                if BLOCK_DPE > 0:
+                    offs_kpe = (
+                        (cur_seq_extend_start_idx + start_n + offs_n[None, :])
+                        * stride_kbs
+                        + cur_kv_head * stride_kh
+                        + offs_dpe[:, None]
+                    )
+                    kpe = tl.load(
+                        K_Extend + offs_kpe,
+                        mask=mask_n[None, :],
+                        other=0.0,
+                    )
+                    qk += tl.dot(qpe, kpe)
 
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
+                qk *= sm_scale
 
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
 
-            qk = tl.where(final_mask, qk, float("-inf"))
+                if xai_temperature_len > 0:
+                    qk *= xai_temperature_reg[:, None]
 
-            row_max = tl.max(qk, 1)
-            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
-            n_e_max = tl.maximum(row_max_fixed, e_max)
+                qk = tl.where(final_mask, qk, float("-inf"))
 
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            deno = deno * re_scale + tl.sum(p, 1)
+                row_max = tl.max(qk, 1)
+                row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+                n_e_max = tl.maximum(row_max_fixed, e_max)
 
-            offs_v = (
-                (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
-                + cur_kv_head * stride_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-            )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                deno = deno * re_scale + tl.sum(p, 1)
 
-            e_max = n_e_max
+                offs_v = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                    + cur_kv_head * stride_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Extend + offs_v,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                p = p.to(v.dtype)
+                acc = acc * re_scale[:, None] + tl.dot(p, v)
+
+                e_max = n_e_max
 
     if HAS_SINK:
         cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
+
+    if STORE_LSE:
+        offs_lse = (
+            cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
+        ) * stride_lse_bs + cur_head * stride_lse_h
+        lse = tl.log(deno) + e_max
+        tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
@@ -620,6 +643,7 @@ def extend_attention_fwd(
         k_extend,
         v_extend,
         o_extend,
+        None,
         k_buffer,
         v_buffer,
         qo_indptr,
@@ -641,6 +665,8 @@ def extend_attention_fwd(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
+        0,
+        0,
         k_buffer.stride(0),
         k_buffer.stride(1),
         v_buffer.stride(0),
@@ -658,10 +684,120 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        STORE_LSE=False,
+        SKIP_PREFIX=False,
+        SKIP_EXTEND=False,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
+        **extra_kargs,
+    )
+
+
+def extend_attention_fwd_with_lse(
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    lse_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    custom_mask,
+    is_causal,
+    mask_indptr,
+    max_len_extend,
+    k_scale,
+    v_scale,
+    sm_scale=None,
+    logit_cap=0.0,
+    skip_prefix_custom_mask=True,
+    sliding_window_size=-1,
+    sinks=None,
+    window_kv_offsets=None,
+    xai_temperature_len=-1,
+    skip_prefix=False,
+    skip_extend=False,
+):
+    """Triton extend attention that also returns per-query/head natural-log LSE."""
+    Lq, Lk, Lv = (
+        q_extend.shape[-1],
+        k_extend.shape[-1],
+        v_extend.shape[-1],
+    )
+
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+        _get_block_sizes_for_extend_attention(Lq, Lv)
+    )
+
+    sm_scale = sm_scale or 1.0 / (Lq**0.5)
+    batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
+    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
+    USE_CUSTOM_MASK = custom_mask is not None
+    SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
+    HAS_SINK = sinks is not None
+
+    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    extra_kargs = {}
+    if _is_hip:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+
+    _fwd_kernel[grid](
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        lse_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        custom_mask,
+        mask_indptr,
+        sinks,
+        window_kv_offsets,
+        sm_scale,
+        k_scale,
+        v_scale,
+        kv_group_num,
+        q_extend.stride(0),
+        q_extend.stride(1),
+        k_extend.stride(0),
+        k_extend.stride(1),
+        v_extend.stride(0),
+        v_extend.stride(1),
+        o_extend.stride(0),
+        o_extend.stride(1),
+        lse_extend.stride(0),
+        lse_extend.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        SLIDING_WINDOW_SIZE=sliding_window_size,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        Lq=Lq,
+        Lv=Lv,
+        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=is_causal,
+        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        STORE_LSE=True,
+        SKIP_PREFIX=skip_prefix,
+        SKIP_EXTEND=skip_extend,
+        HAS_SINK=HAS_SINK,
+        STORE_TRANSPOSE=_is_hip,
+        num_warps=num_warps,
+        num_stages=1,
         **extra_kargs,
     )
 
