@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -46,6 +46,43 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         kvcache = _mock_kvcache(DeepSeekV4TokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL, SWA})
         self.assertIsInstance(strategy, _DeepSeekV4Strategy)
+
+    def test_deepseek_v4_skips_c128_state_sidecar(self):
+        entry_names = (
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        )
+        host_pool_group = MagicMock()
+        host_pool_group.entry_map = {name: MagicMock() for name in entry_names}
+        host_pool_group.get_pool.return_value = MagicMock()
+
+        cache = MagicMock(page_size=256)
+        params = MagicMock()
+        params.pp_rank = 0
+        params.pp_size = 1
+        kvcache = MagicMock(start_layer=0, end_layer=31)
+
+        with patch.object(
+            hybrid_pool_assembler,
+            "build_deepseek_v4_hicache_stack",
+            return_value=(host_pool_group, MagicMock()),
+        ):
+            result = _DeepSeekV4Strategy().build(
+                cache=cache,
+                kvcache=kvcache,
+                params=params,
+                server_args=MagicMock(),
+                load_cache_event=MagicMock(),
+            )
+
+        sidecar_names = {sidecar.pool_name for sidecar in result.sidecars}
+        self.assertIn(PoolName.DEEPSEEK_V4_C128, sidecar_names)
+        self.assertIn(PoolName.DEEPSEEK_V4_C4_STATE, sidecar_names)
+        self.assertNotIn(PoolName.DEEPSEEK_V4_C128_STATE, sidecar_names)
 
     def test_mamba(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool

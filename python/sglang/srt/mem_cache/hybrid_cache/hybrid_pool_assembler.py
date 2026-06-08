@@ -294,7 +294,6 @@ def build_deepseek_v4_hicache_stack(
     c4_layer_mapping = {}
     c128_layer_mapping = {}
     c4_state_global_layers = []
-    c128_state_global_layers = []
     for layer_id, layer_item in enumerate(
         kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
     ):
@@ -303,13 +302,9 @@ def build_deepseek_v4_hicache_stack(
             c4_state_global_layers.append(layer_id)
         elif layer_item.compress_ratio == 128:
             c128_layer_mapping[layer_id] = layer_item.compress_layer_id
-            c128_state_global_layers.append(layer_id)
 
     c4_state_mapping = {
         layer_id: local_id for local_id, layer_id in enumerate(c4_state_global_layers)
-    }
-    c128_state_mapping = {
-        layer_id: local_id for local_id, layer_id in enumerate(c128_state_global_layers)
     }
     num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
         params=params,
@@ -439,17 +434,9 @@ def build_deepseek_v4_hicache_stack(
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
-        c128_state_host_pool = DeepSeekV4StateHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
-            state_pools=[
-                kvcache.compress_state_pools[layer_id]
-                for layer_id in c128_state_global_layers
-            ],
-            num_host_pages=swa_num_host_pages,
-            swa_page_size=kvcache.swa_page_size,
-            layout=server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
-        )
+        # C128 offline state only represents an in-progress 128-token chunk.
+        # DeepSeek V4 HiCache nodes are 256-token page aligned, so matched
+        # prefixes always end at a C128 boundary and only need C128 KV pages.
         entries.extend(
             [
                 build_pool_entry(
@@ -457,13 +444,6 @@ def build_deepseek_v4_hicache_stack(
                     host_pool=c128_host_pool,
                     device_pool=kvcache.c128_kv_pool,
                     layer_mapping=c128_layer_mapping,
-                    transfer_layer_num=transfer_layer_num,
-                ),
-                build_pool_entry(
-                    name=PoolName.DEEPSEEK_V4_C128_STATE,
-                    host_pool=c128_state_host_pool,
-                    device_pool=None,
-                    layer_mapping=c128_state_mapping,
                     transfer_layer_num=transfer_layer_num,
                 ),
             ]
@@ -748,7 +728,6 @@ class _DeepSeekV4Strategy(StackStrategy):
                 (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
-                (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
             )
             if name in host_pool_group.entry_map
         ]
