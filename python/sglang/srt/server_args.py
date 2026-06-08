@@ -842,6 +842,10 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    # Port of the standalone EncoderBootstrapServer started by the language-only
+    # tokenizer manager.  Encoder workers register here.
+    encoder_bootstrap_port: int = 8997
+    encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
@@ -3960,8 +3964,10 @@ class ServerArgs:
             )
 
         if self.language_only and len(self.encoder_urls) == 0:
-            raise ValueError(
-                "requires at least one encoder urls to be set via --encoder-urls"
+            logger.info(
+                "--language-only is set without --encoder-urls. Encoders are "
+                "expected to register dynamically via the "
+                "EncoderBootstrapServer."
             )
 
         # Validate IB devices when mooncake backend is used
@@ -7035,6 +7041,24 @@ class ServerArgs:
             type=str,
             default=[],
             help="List of encoder server urls.",
+        )
+        parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port for the EncoderBootstrapServer that runs in the "
+            "language-only tokenizer manager process. Encoders register here, "
+            "and language-only receivers fetch the current URL list from here.",
+        )
+        parser.add_argument(
+            "--encoder-register-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="One or more EncoderBootstrapServer URLs to register this encoder "
+            "with on startup, for dynamic encoder discovery. "
+            "Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. "
+            "Used with --encoder-only servers.",
         )
         parser.add_argument(
             "--enable-adaptive-dispatch-to-encoder",
