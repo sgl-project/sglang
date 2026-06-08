@@ -2,7 +2,8 @@
 
 Variant of ``test_gpt_oss_eval_mi35x.py`` that exercises GPT-OSS (openai/gpt-oss-120b)
 with the AITER ``vectorized_5d`` KV cache layout and the SEPARATED (non-interleaved)
-gate/up fused-MoE tile layout.
+gate/up fused-MoE tile layout. Runs with tp=8 using the AITER prefill/decode
+attention backend, fp8_e4m3 KV cache, and page size 64 on the MI35x 8-GPU runner.
 
 Env vars under test:
   SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d
@@ -64,7 +65,8 @@ class ModelConfig:
         return self.model_path
 
 
-# GPT-OSS-120b on MI35x with vectorized_5d KV cache layout + separated MoE gate/up.
+# GPT-OSS-120b on MI35x: vectorized_5d KV layout + separated MoE gate/up, AITER
+# prefill/decode attention backend, fp8_e4m3 KV cache, tp=8.
 MI35X_GPT_OSS_MODELS = [
     ModelConfig(
         model_path="openai/gpt-oss-120b",
@@ -73,15 +75,20 @@ MI35X_GPT_OSS_MODELS = [
         timeout=900,
         variant="vectorized_5d",
         other_args=[
-            "--chunked-prefill-size",
-            "130172",
-            "--max-running-requests",
-            "128",
+            "--trust-remote-code",
             "--mem-fraction-static",
             "0.85",
-            "--attention-backend",
-            "triton",
-            "--trust-remote-code",
+            "--prefill-attention-backend",
+            "aiter",
+            "--decode-attention-backend",
+            "aiter",
+            "--page-size",
+            "64",
+            "--disable-radix-cache",
+            "--max-running-requests",
+            "256",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
         ],
         # vectorized_5d AITER KV cache layout, paired with the SEPARATED
         # gate/up fused-MoE tile layout (SGLANG_USE_AITER_MOE_GU_ITLV=False).
