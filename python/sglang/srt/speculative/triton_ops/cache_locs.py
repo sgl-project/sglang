@@ -94,7 +94,7 @@ def assign_req_to_token_pool_func(
 
 
 @triton.jit
-def assign_draft_cache_locs_page_size_1(
+def assign_draft_cache_locs_contiguous(
     req_pool_indices,
     req_to_token,
     seq_lens,
