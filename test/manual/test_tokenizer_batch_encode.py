@@ -64,8 +64,8 @@ class TestTokenizerBatchEncode(unittest.TestCase):
         self.tokenizer_manager.is_generation = True
 
         with self.assertRaises(ValueError) as cm:
-            self.tokenizer_manager._validate_batch_tokenization_constraints(
-                1, batch_obj
+            TokenizerManager._validate_batch_tokenization_constraints(
+                self.tokenizer_manager.request_validator, 1, batch_obj
             )
 
         self.assertIn("multimodal", str(cm.exception))
@@ -78,8 +78,8 @@ class TestTokenizerBatchEncode(unittest.TestCase):
         batch_obj.__getitem__ = lambda self, i: req
 
         with self.assertRaises(ValueError) as cm:
-            self.tokenizer_manager._validate_batch_tokenization_constraints(
-                1, batch_obj
+            TokenizerManager._validate_batch_tokenization_constraints(
+                self.tokenizer_manager.request_validator, 1, batch_obj
             )
 
         self.assertIn("pre-tokenized", str(cm.exception))
@@ -92,8 +92,8 @@ class TestTokenizerBatchEncode(unittest.TestCase):
         batch_obj.__getitem__ = lambda self, i: req
 
         with self.assertRaises(ValueError) as cm:
-            self.tokenizer_manager._validate_batch_tokenization_constraints(
-                1, batch_obj
+            TokenizerManager._validate_batch_tokenization_constraints(
+                self.tokenizer_manager.request_validator, 1, batch_obj
             )
 
         self.assertIn("input_embeds", str(cm.exception))
@@ -112,8 +112,8 @@ class TestTokenizerBatchEncode(unittest.TestCase):
 
         # Should not raise any exception
         try:
-            self.tokenizer_manager._validate_batch_tokenization_constraints(
-                3, batch_obj
+            TokenizerManager._validate_batch_tokenization_constraints(
+                self.tokenizer_manager.request_validator, 3, batch_obj
             )
         except Exception as e:
             self.fail(f"Validation failed for valid text-only requests: {e}")
