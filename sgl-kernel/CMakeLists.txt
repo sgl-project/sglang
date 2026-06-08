@@ -94,6 +94,16 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-mscclpp)
 
+# mscclpp's own CMakeLists.txt hardcodes a github.com FetchContent for nlohmann/json.
+# Patch it to route through GITHUB_ARTIFACTORY so it follows the same mirror as our deps.
+file(READ "${repo-mscclpp_SOURCE_DIR}/CMakeLists.txt" _mscclpp_cmakelists)
+string(REPLACE
+    "https://github.com/nlohmann/json"
+    "https://${GITHUB_ARTIFACTORY}/nlohmann/json"
+    _mscclpp_cmakelists "${_mscclpp_cmakelists}")
+file(WRITE "${repo-mscclpp_SOURCE_DIR}/CMakeLists.txt" "${_mscclpp_cmakelists}")
+unset(_mscclpp_cmakelists)
+
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
 find_program(CCACHE_FOUND ccache)
@@ -373,6 +383,8 @@ endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
+set(MSCCLPP_BUILD_PYTHON_BINDINGS OFF)
+set(MSCCLPP_BUILD_APPS_NCCL OFF)
 add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
