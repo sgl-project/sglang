@@ -38,6 +38,12 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
         "down_hysteresis": 0.0,
         "ceiling_coeff": 0,
     },
+    "64": {
+        "candidate_steps": [0],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
 }
 
 

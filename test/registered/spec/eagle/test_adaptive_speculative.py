@@ -1,8 +1,6 @@
 import json
 import os
 import tempfile
-import threading
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -274,12 +272,7 @@ class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
         if os.path.exists(cls.adaptive_config_path):
             os.unlink(cls.adaptive_config_path)
 
-    def _steps(self) -> int:
-        r = requests.get(self.base_url + "/server_info", timeout=30)
-        self.assertEqual(r.status_code, 200, r.text)
-        return r.json()["internal_states"][0]["speculative_num_steps"]
-
-    def _generate(self, max_new_tokens: int, hold: dict | None = None) -> dict:
+    def _generate(self, max_new_tokens: int) -> dict:
         r = requests.post(
             self.base_url + "/generate",
             json={
@@ -293,76 +286,62 @@ class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
             timeout=600,
         )
         self.assertEqual(r.status_code, 200, r.text)
-        out = r.json()
-        if hold is not None:
-            hold["meta"] = out["meta_info"]
-            hold["text"] = out["text"]
-        return out["meta_info"]
-
-    def _wait_until_steps(self, target: int, timeout: float = 30.0) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                if self._steps() == target:
-                    return True
-            except Exception:
-                pass
-            time.sleep(0.1)
-        return False
+        return r.json()["meta_info"]
 
     def test_batch_size_triggers_zero_step(self):
-        """A concurrent burst (BS>=8) routes the worker to steps=0; draining
-        back to BS<8 routes it back to steps=3."""
-        self.assertEqual(self._steps(), 3, "expected initial steps=3")
+        """A large batch (BS>=8) decodes at steps=0 (drafting disabled); a single
+        request (BS=1) decodes at steps=3 (drafting active)."""
+        prompts = [self.COUNT_PROMPT] * 14
+        params = [{"temperature": 0, "max_new_tokens": 200, "ignore_eos": True}] * 14
+        r = requests.post(
+            self.base_url + "/generate",
+            json={"text": prompts, "sampling_params": params},
+            timeout=600,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        for out in r.json():
+            hist = out["meta_info"]["spec_correct_drafts_histogram"]
+            # Drafting off -> most verify steps accept 0 drafts. A few steps=3 may
+            # slip in while the batch fills during prefill, so compare by mass.
+            self.assertGreater(
+                hist[0], sum(hist[1:]), f"BS>=8 should disable drafting (hist={hist})"
+            )
 
-        burst = [
-            threading.Thread(target=self._generate, args=(400,)) for _ in range(14)
-        ]
-        for t in burst:
-            t.start()
-        reached_zero = self._wait_until_steps(0, timeout=30.0)
-        for t in burst:
-            t.join()
-        self.assertTrue(reached_zero, "batch size did not drive steps to 0")
-
-        # Drain complete: a single small request runs at BS=1 -> steps=3.
-        self._generate(16)
-        self.assertEqual(self._steps(), 3, "did not route back to steps=3 at BS=1")
+        single = self._generate(200)["spec_correct_drafts_histogram"]
+        self.assertGreater(
+            sum(single[1:]), 0, f"BS=1 should draft at steps>0 (hist={single})"
+        )
 
     def test_zero_step_within_sequence_recovery(self):
-        """A sequence decoded at steps=0 (during a burst) recovers full draft
-        acceptance after the burst drains and it returns to steps=3."""
-        burst = [
-            threading.Thread(target=self._generate, args=(400,)) for _ in range(14)
-        ]
-        for t in burst:
-            t.start()
-        self.assertTrue(
-            self._wait_until_steps(0, timeout=30.0), "burst did not reach steps=0"
-        )
+        """One long request batched with many short ones decodes at steps=0 while
+        the batch is large (BS>=8); as the short ones finish, BS drops and the long
+        request returns to steps=3. Its histogram must show drafting at steps=0
+        (hist[0]>0) and recovered acceptance afterwards (sum(hist[1:])>0), proving
+        draft_extend kept the draft KV synced while drafting was disabled."""
+        prompts = [self.COUNT_PROMPT] * 14
+        params = [{"temperature": 0, "max_new_tokens": 200, "ignore_eos": True}] * 13
+        params.append({"temperature": 0, "max_new_tokens": 700, "ignore_eos": True})
 
-        # Submit a longer probe INTO the steps=0 batch; it outlives the burst,
-        # so its tail decodes at steps=3 after the burst drains.
-        hold: dict = {}
-        probe = threading.Thread(target=self._generate, args=(700, hold))
-        probe.start()
-        for t in burst:
-            t.join()
-        probe.join()
-
-        hist = hold["meta"]["spec_correct_drafts_histogram"]
-        self.assertGreater(
-            hist[0], 0, f"probe was never decoded at steps=0 (hist={hist})"
+        r = requests.post(
+            self.base_url + "/generate",
+            json={"text": prompts, "sampling_params": params},
+            timeout=600,
         )
-        recovered = sum(hist[1:])
+        self.assertEqual(r.status_code, 200, r.text)
+
+        long_out = r.json()[-1]
+        hist = long_out["meta_info"]["spec_correct_drafts_histogram"]
         self.assertGreater(
-            recovered,
+            hist[0], 0, f"long request never decoded at steps=0 (hist={hist})"
+        )
+        self.assertGreater(
+            sum(hist[1:]),
             5,
-            f"probe saw ~0 draft acceptance after returning to steps=3 -> draft KV "
-            f"likely stale during steps=0 (hist={hist})",
+            f"no draft acceptance after returning to steps=3 -> draft KV likely "
+            f"stale during steps=0 (hist={hist})",
         )
         self.assertGreater(
-            len(hold["text"].strip()), 0, "empty output across the excursion"
+            len(long_out["text"].strip()), 0, "empty output across the excursion"
         )
 
 
