@@ -63,6 +63,7 @@ echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
 echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
 echo "PYTORCH_MIRROR:     ${PYTORCH_MIRROR:-download.pytorch.org}"
 echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
+echo "YUM_MIRROR:         ${YUM_MIRROR:-(upstream)}"
 echo "----------------------------------------"
 
 # Optional build-args (empty string disables)
@@ -75,6 +76,7 @@ BUILD_ARGS=()
 [ -n "${GITHUB_ARTIFACTORY:-}" ]   && BUILD_ARGS+=(--build-arg GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY}")
 [ -n "${PYTORCH_MIRROR:-}" ]       && BUILD_ARGS+=(--build-arg PYTORCH_MIRROR="${PYTORCH_MIRROR}")
 [ -n "${PIP_DEFAULT_INDEX:-}" ]    && BUILD_ARGS+=(--build-arg PIP_DEFAULT_INDEX="${PIP_DEFAULT_INDEX}")
+[ -n "${YUM_MIRROR:-}" ]           && BUILD_ARGS+=(--build-arg YUM_MIRROR="${YUM_MIRROR}")
 
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"

@@ -18,6 +18,11 @@ ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
 ARG PYTORCH_MIRROR=download.pytorch.org
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
+# Optional mirror for the manylinux base image's yum repos (AlmaLinux 8).
+# Pass scheme + host (and optional path prefix), e.g.
+#   --build-arg YUM_MIRROR=https://mirrors.aliyun.com
+# Empty (default) keeps upstream repo.almalinux.org.
+ARG YUM_MIRROR=
 
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
 ENV PATH=/opt/cmake/bin:${PATH}
@@ -27,6 +32,15 @@ ENV FLASHINFER_CUDA_ARCH_LIST="8.0 8.9 9.0a 10.0a 12.0a"
 # CUDA headers path
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
 ENV C_INCLUDE_PATH=/usr/local/cuda/include/cccl${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
+
+RUN if [ -n "${YUM_MIRROR}" ]; then \
+      set -eux; \
+      sed -i \
+        -e 's|^mirrorlist=|#mirrorlist=|g' \
+        -e 's|^# *baseurl=https://repo.almalinux.org|baseurl='"${YUM_MIRROR}"'|g' \
+        /etc/yum.repos.d/almalinux*.repo; \
+      sed -i 's|^enabled=1|enabled=0|g' /etc/yum.repos.d/epel*.repo; \
+    fi
 
 # Install build dependencies
 RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs -y --nogpgcheck \
