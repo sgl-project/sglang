@@ -52,9 +52,6 @@ class SanaWMArchConfig(DiTArchConfig):
     # --- GDN ShortConvolution params ---
     conv_kernel_size: int = 4
     k_conv_only: bool = True
-    chunk_gdn_chunk_size: int = 21
-    update_rule: str = "torch_chunk"  # main branch update rule
-    cam_update_rule: str = "torch_chunk"  # camera branch update rule
 
     # --- Camera conditioning ---
     cam_attn_compress: int = 1  # cam_dim == in_dim
@@ -70,12 +67,6 @@ class SanaWMArchConfig(DiTArchConfig):
     # FlashAttention backends do not accept. Pad to 128 inside SANA-WM attention
     # by default; users can still disable this with the top-level DiT option.
     pad_attention_head_dim_to_flash: bool = True
-    # SGLang-owned Triton kernels for SANA-WM hot-path tensor preprocessing.
-    # Enabled by default; users can explicitly disable them for parity checks.
-    use_triton_kernels: bool = True
-    # Keep CUDA inference honest by default: if a requested Triton fast path is
-    # missing or fails, raise instead of silently running the slow torch scan.
-    allow_triton_fallback: bool = False
     # Request-local caches for static text/camera conditioning inside one denoise.
     request_runtime_cache: bool = True
     cross_attn_kv_cache_max_bytes: int = 64 * 1024 * 1024
@@ -92,7 +83,6 @@ class SanaWMArchConfig(DiTArchConfig):
     vae_temporal_stride: int = 8  # original-frames per latent frame
     vae_spatial_stride: int = 32  # pixels per latent token (per spatial axis)
 
-    sample_size: int = 32  # legacy, unused
     guidance_embeds: bool = False
     class_dropout_prob: float = 0.0
 
@@ -118,8 +108,6 @@ class SanaWMConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=SanaWMArchConfig)
     prefix: str = "SanaWM"
     pad_attention_head_dim_to_flash: bool | None = None
-    use_triton_kernels: bool | None = None
-    allow_triton_fallback: bool | None = None
     request_runtime_cache: bool | None = None
     cross_attn_kv_cache_max_bytes: int | None = None
 
@@ -128,10 +116,6 @@ class SanaWMConfig(DiTConfig):
             self.arch_config.pad_attention_head_dim_to_flash = (
                 self.pad_attention_head_dim_to_flash
             )
-        if self.use_triton_kernels is not None:
-            self.arch_config.use_triton_kernels = self.use_triton_kernels
-        if self.allow_triton_fallback is not None:
-            self.arch_config.allow_triton_fallback = self.allow_triton_fallback
         if self.request_runtime_cache is not None:
             self.arch_config.request_runtime_cache = self.request_runtime_cache
         if self.cross_attn_kv_cache_max_bytes is not None:

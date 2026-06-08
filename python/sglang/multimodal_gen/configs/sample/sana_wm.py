@@ -21,7 +21,7 @@ class SanaWMSamplingParams(SamplingParams):
     width: int = 1280
 
     # Frame count: 49 = (49-1)/8 = 6 latent frames, about 3 seconds at 16 fps.
-    # NOTE: NVlabs' official script uses 161-321 frames for production quality.
+    # NOTE: NVlabs' reference script uses 161-321 frames for production quality.
     # 49 is a CI/speed-friendly default. For best quality use num_frames=161,
     # num_inference_steps=60, guidance_scale=5.0.
     num_frames: int = 49
@@ -29,10 +29,10 @@ class SanaWMSamplingParams(SamplingParams):
     # SANA-WM is trained at 16 fps (override base default of 24).
     fps: int = 16
 
-    # 20 steps is a CI-friendly default. NVlabs' official script uses 60 steps.
+    # 20 steps is a CI-friendly default. NVlabs' reference script uses 60 steps.
     num_inference_steps: int = 20
 
-    # Classifier-free guidance scale. NVlabs' official default is 5.0.
+    # Classifier-free guidance scale. NVlabs' reference default is 5.0.
     guidance_scale: float = 4.5
 
     # NVlabs' SANA-WM inference defaults to an empty negative prompt.

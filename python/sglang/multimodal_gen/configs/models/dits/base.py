@@ -89,26 +89,4 @@ class DiTConfig(ModelConfig):
                 "Ignored by models that do not expose this DiT option."
             ),
         )
-        parser.add_argument(
-            f"--{prefix}.use-triton-kernels",
-            action=StoreBoolean,
-            dest=f"{prefix.replace('-', '_')}.use_triton_kernels",
-            default=None,
-            help=(
-                "Enable or disable SANA-WM Triton kernels. Ignored by "
-                "models that do not expose this DiT option."
-            ),
-        )
-        parser.add_argument(
-            f"--{prefix}.allow-triton-fallback",
-            action=StoreBoolean,
-            dest=f"{prefix.replace('-', '_')}.allow_triton_fallback",
-            default=None,
-            help=(
-                "Allow SANA-WM CUDA inference to fall back to the slower torch "
-                "path when a Triton fast path is unavailable. Ignored by "
-                "models that do not expose this DiT option."
-            ),
-        )
-
         return parser

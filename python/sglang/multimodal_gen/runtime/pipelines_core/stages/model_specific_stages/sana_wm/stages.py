@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -63,7 +64,7 @@ logger = init_logger(__name__)
 # SANA-WM stage-local helpers
 # ---------------------------------------------------------------------------
 
-SANA_WM_REQUEST_RUNTIME_CACHE_KEY = "_sana_wm_runtime_cache"
+SANA_WM_REQUEST_RUNTIME_CACHE_NAMESPACE = "sana_wm"
 SANA_WM_DEFAULT_TRANSLATION_SPEED = 0.05
 SANA_WM_DEFAULT_ROTATION_SPEED_DEG = 1.2
 SANA_WM_DEFAULT_PITCH_LIMIT_DEG = 85.0
@@ -74,23 +75,22 @@ SANA_WM_ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
 SANA_WM_CAMERA_SOURCE_KEYS: frozenset[str] = frozenset(
     ("action", "camera_to_world", "camera_conditions")
 )
-SANA_WM_CAMERA_AUXILIARY_KEYS: frozenset[str] = frozenset(
-    ("chunk_plucker", "intrinsics")
-)
 SANA_WM_CAMERA_MOTION_KEYS: frozenset[str] = frozenset(
     ("translation_speed", "rotation_speed_deg", "pitch_limit_deg")
 )
-SANA_WM_CONDITION_INPUT_KEYS: frozenset[str] = (
-    SANA_WM_CAMERA_SOURCE_KEYS
-    | SANA_WM_CAMERA_AUXILIARY_KEYS
-    | SANA_WM_CAMERA_MOTION_KEYS
-)
 
 
-def clear_sana_wm_request_runtime_cache(batch: Any) -> None:
+def _clear_sana_wm_request_runtime_cache(batch: Any) -> None:
+    session = getattr(batch, "session", None)
+    if session is not None:
+        get_state = getattr(session, "get_state", None)
+        state = get_state(RealtimeCausalDiTState) if callable(get_state) else None
+        if state is not None:
+            state.runtime_cache.pop(SANA_WM_REQUEST_RUNTIME_CACHE_NAMESPACE, None)
+
     extra = getattr(batch, "extra", None)
     if extra is not None:
-        extra.pop(SANA_WM_REQUEST_RUNTIME_CACHE_KEY, None)
+        extra.pop(SANA_WM_REQUEST_RUNTIME_CACHE_NAMESPACE, None)
 
 
 def sana_wm_default_horizontal_fov_deg(value=None) -> float:
@@ -184,6 +184,11 @@ def validate_sana_wm_motion_params(
 
 
 def normalize_sana_wm_condition_inputs(condition_inputs: Any = None) -> dict[str, Any]:
+    allowed_keys = (
+        SANA_WM_CAMERA_SOURCE_KEYS
+        | SANA_WM_CAMERA_MOTION_KEYS
+        | frozenset(("chunk_plucker", "intrinsics"))
+    )
     if condition_inputs is None:
         normalized: dict[str, Any] = {}
     elif not isinstance(condition_inputs, dict):
@@ -196,12 +201,11 @@ def normalize_sana_wm_condition_inputs(condition_inputs: Any = None) -> dict[str
             key: value for key, value in condition_inputs.items() if value is not None
         }
 
-    unknown_keys = sorted(set(normalized) - SANA_WM_CONDITION_INPUT_KEYS)
+    unknown_keys = sorted(set(normalized) - allowed_keys)
     if unknown_keys:
         raise ValueError(
             "SANA-WM condition_inputs contains unknown keys "
-            f"{unknown_keys}; allowed keys are "
-            f"{sorted(SANA_WM_CONDITION_INPUT_KEYS)}."
+            f"{unknown_keys}; allowed keys are {sorted(allowed_keys)}."
         )
 
     present = {key for key, value in normalized.items() if value is not None}
@@ -731,7 +735,7 @@ def resize_center_crop_sana_wm_pil_image(
     target_h: int,
     target_w: int,
 ) -> tuple[torch.Tensor, SanaWMConditionImagePreprocessInfo]:
-    """Match official SANA-WM resize-then-center-crop preprocessing."""
+    """Resize then center-crop SANA-WM first-frame conditioning images."""
     import PIL.Image
     import torchvision.transforms.functional as TF
 
@@ -757,7 +761,7 @@ def resize_center_crop_sana_wm_pil_image(
 
 
 def sana_wm_condition_tensor_to_pil_images(image: torch.Tensor) -> list[Any]:
-    """Convert tensor inputs to RGB PIL images before official preprocessing."""
+    """Convert tensor inputs to RGB PIL images before preprocessing."""
     import PIL.Image
 
     image = canonical_sana_wm_condition_image_tensor(image)
@@ -946,22 +950,6 @@ def sana_wm_action_num_frames_for_request(batch: Any) -> int | None:
     if action is None:
         return None
     return sana_wm_action_num_frames(action)
-
-
-def sana_wm_has_explicit_camera_request(batch: Any) -> bool:
-    condition_inputs = normalize_sana_wm_condition_inputs(
-        getattr(batch, "condition_inputs", None)
-    )
-    return any(
-        condition_inputs.get(key) is not None
-        for key in (
-            "camera_conditions",
-            "chunk_plucker",
-            "camera_to_world",
-            "intrinsics",
-            "action",
-        )
-    )
 
 
 class SanaWMCameraConditioningBuilder:
@@ -1798,14 +1786,6 @@ def _pad_text_sequence(
     return torch.cat([tensor, padding], dim=seq_dim)
 
 
-def _default_attention_mask_for_embeds(embeds: torch.Tensor) -> torch.Tensor:
-    return torch.ones(
-        (embeds.shape[0], embeds.shape[-2]),
-        device=embeds.device,
-        dtype=torch.long,
-    )
-
-
 def _align_sana_wm_cfg_text_conditions(
     pos_embeds: torch.Tensor,
     neg_embeds: torch.Tensor | None,
@@ -1825,9 +1805,17 @@ def _align_sana_wm_cfg_text_conditions(
     neg_embeds = _pad_text_sequence(neg_embeds, target_length)
 
     if pos_mask is None:
-        pos_mask = _default_attention_mask_for_embeds(pos_embeds)
+        pos_mask = torch.ones(
+            (pos_embeds.shape[0], pos_embeds.shape[-2]),
+            device=pos_embeds.device,
+            dtype=torch.long,
+        )
     if neg_mask is None:
-        neg_mask = _default_attention_mask_for_embeds(neg_embeds)
+        neg_mask = torch.ones(
+            (neg_embeds.shape[0], neg_embeds.shape[-2]),
+            device=neg_embeds.device,
+            dtype=torch.long,
+        )
     pos_mask = _pad_text_sequence(pos_mask, target_length)
     neg_mask = _pad_text_sequence(neg_mask, target_length)
     return pos_embeds, neg_embeds, pos_mask, neg_mask
@@ -1994,7 +1982,7 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         return "\n".join(parts)
 
     @staticmethod
-    def _select_official_prompt_window(
+    def _select_prompt_window(
         tensor: torch.Tensor | None,
         max_length: int,
     ) -> torch.Tensor | None:
@@ -2090,15 +2078,15 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         )
 
         prompt_embeds_list = [
-            self._select_official_prompt_window(tensor, max_length)
+            self._select_prompt_window(tensor, max_length)
             for tensor in prompt_embeds_list
         ]
         prompt_masks_list = [
-            self._select_official_prompt_window(tensor, max_length)
+            self._select_prompt_window(tensor, max_length)
             for tensor in prompt_masks_list
         ]
         prompt_embeds_masks_list = [
-            self._select_official_prompt_window(tensor, max_length)
+            self._select_prompt_window(tensor, max_length)
             for tensor in prompt_embeds_masks_list
         ]
         prompt_seq_lens_list = self._seq_lens_from_masks(prompt_masks_list)
@@ -2340,7 +2328,7 @@ class SanaWMDenoisingStage(DenoisingStage):
         try:
             return super().forward(batch, server_args)
         except BaseException:
-            clear_sana_wm_request_runtime_cache(batch)
+            _clear_sana_wm_request_runtime_cache(batch)
             raise
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -2494,7 +2482,7 @@ class SanaWMDenoisingStage(DenoisingStage):
 
         num_inference_steps = batch.num_inference_steps
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
-        clear_sana_wm_request_runtime_cache(batch)
+        _clear_sana_wm_request_runtime_cache(batch)
         self._maybe_enable_cache_dit_and_torch_compile(num_inference_steps, batch)
 
         latents = batch.latents.to(device=device, dtype=target_dtype)
@@ -2774,7 +2762,7 @@ class SanaWMDenoisingStage(DenoisingStage):
     def _finalize_denoising_loop(
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
-        clear_sana_wm_request_runtime_cache(batch)
+        _clear_sana_wm_request_runtime_cache(batch)
 
         log_sana_wm_tensor_stats(
             "denoise.output_latents",
@@ -3078,72 +3066,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         return torch.Generator(device=device).manual_seed(int(seed))
 
     @staticmethod
-    def _canonical_condition_image_tensor(image: torch.Tensor) -> torch.Tensor:
-        return canonical_sana_wm_condition_image_tensor(image)
-
-    @staticmethod
-    def _resize_center_crop_pil_image(
-        image: Any,
-        *,
-        target_h: int,
-        target_w: int,
-    ) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
-        return resize_center_crop_sana_wm_pil_image(
-            image,
-            target_h=target_h,
-            target_w=target_w,
-        )
-
-    @staticmethod
-    def _condition_tensor_to_pil_images(image: torch.Tensor) -> list[Any]:
-        return sana_wm_condition_tensor_to_pil_images(image)
-
-    @staticmethod
-    def _resize_center_crop_tensor(
-        image: torch.Tensor,
-        *,
-        target_h: int,
-        target_w: int,
-    ) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
-        return resize_center_crop_sana_wm_tensor(
-            image,
-            target_h=target_h,
-            target_w=target_w,
-        )
-
-    @staticmethod
-    def _preprocess_condition_image(
-        condition_image: Any,
-        *,
-        target_h: int,
-        target_w: int,
-    ) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
-        return preprocess_sana_wm_condition_image(
-            condition_image,
-            target_h=target_h,
-            target_w=target_w,
-        )
-
-    @staticmethod
-    def _transform_intrinsics_for_condition_image(
-        intrinsics_vec4: torch.Tensor,
-        preprocess_info: (
-            dict[str, tuple[int, int]] | list[dict[str, tuple[int, int]]] | None
-        ),
-    ) -> torch.Tensor:
-        return transform_sana_wm_intrinsics_for_condition_image(
-            intrinsics_vec4,
-            preprocess_info,
-        )
-
-    @staticmethod
-    def _set_condition_image_preprocess_info(
-        batch: Req | None,
-        preprocess_info: Any,
-    ) -> None:
-        set_sana_wm_condition_image_preprocess_info(batch, preprocess_info)
-
-    @staticmethod
     def _splice_first_frame_latent(
         latents: torch.Tensor,
         first_frame_z: torch.Tensor,
@@ -3191,7 +3113,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             target_h=target_h,
             target_w=target_w,
         )
-        self._set_condition_image_preprocess_info(batch, preprocess_info_for_batch)
+        set_sana_wm_condition_image_preprocess_info(batch, preprocess_info_for_batch)
         self.log_info(
             "First-frame condition image preprocessed: source=%s, resized=%s, "
             "crop_offset=%s, target=%s.",
@@ -3210,46 +3132,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             latents,
             first_frame_z,
             self.pipeline_config,
-        )
-
-    @staticmethod
-    def _condition_images_for_batch(condition_image: Any, batch_size: int) -> list[Any]:
-        return sana_wm_condition_images_for_batch(condition_image, batch_size)
-
-    @staticmethod
-    def _condition_inputs(batch: Req) -> dict[str, Any]:
-        return normalize_sana_wm_condition_inputs(
-            getattr(batch, "condition_inputs", None)
-        )
-
-    @staticmethod
-    def _action_num_frames_for_request(batch: Req) -> int | None:
-        return sana_wm_action_num_frames_for_request(batch)
-
-    @staticmethod
-    def _has_explicit_camera_request(batch: Req) -> bool:
-        return sana_wm_has_explicit_camera_request(batch)
-
-    def _build_camera_conditioning(
-        self,
-        batch: Req,
-        *,
-        batch_size: int,
-        num_frames: int,
-        latent_shape: tuple,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, str]:
-        return SanaWMCameraConditioningBuilder(
-            self.pipeline_config,
-            log_info=self.log_info,
-        ).build(
-            batch,
-            batch_size=batch_size,
-            num_frames=num_frames,
-            latent_shape=latent_shape,
-            device=device,
-            dtype=dtype,
         )
 
     def _prepare_timesteps(
@@ -3306,7 +3188,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
     def _adjust_num_frames_for_request(self, batch: Req) -> int:
         requested_num_frames = batch.num_frames or 49
-        action_num_frames = self._action_num_frames_for_request(batch)
+        action_num_frames = sana_wm_action_num_frames_for_request(batch)
         if action_num_frames is not None and action_num_frames != requested_num_frames:
             self.log_info(
                 "SANA-WM action trajectory has %d frames; keeping requested "
@@ -3406,13 +3288,16 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         batch.latents = latents
 
         # --- 4. Camera conditioning ---
-        # The released SANA-WM checkpoint is camera-conditioned. Official
+        # The released SANA-WM checkpoint is camera-conditioned. Native
         # inference requires a camera trajectory or action DSL. If the SGLang
         # request omits one, use a static identity trajectory so the UCPE path
         # remains active instead of silently dropping all camera conditioning.
         try:
             camera_conditions, chunk_plucker, camera_source = (
-                self._build_camera_conditioning(
+                SanaWMCameraConditioningBuilder(
+                    self.pipeline_config,
+                    log_info=self.log_info,
+                ).build(
                     batch,
                     batch_size=batch_size,
                     num_frames=num_frames,

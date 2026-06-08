@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,13 +12,11 @@ from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     VanillaD2HStrategy,
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
@@ -43,20 +40,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
+    _sana_wm_skip_refiner_enabled,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
-
-_SANA_WM_NATIVE_REFINER_CLASS = "SanaWMLTX2VideoRefiner"
-_SANA_WM_REFINER_BACKENDS: tuple[str, ...] = ("auto", "official", "native")
-_SANA_WM_TWO_STAGE_RESIDENCY_MODES: tuple[str, ...] = (
-    "auto",
-    "resident",
-    "sequential",
-)
 
 
 @dataclass(frozen=True)
@@ -65,210 +55,9 @@ class _SanaWMRefinerSubmodule:
     subpath: str
 
 
-_SANA_WM_REFINER_SUB_MODULES: tuple[_SanaWMRefinerSubmodule, ...] = (
-    _SanaWMRefinerSubmodule("transformer_2", "refiner/transformer"),
-    _SanaWMRefinerSubmodule("connectors", "refiner/connectors"),
-    _SanaWMRefinerSubmodule("text_encoder_2", "refiner/text_encoder"),
-    _SanaWMRefinerSubmodule("tokenizer_2", "refiner/text_encoder"),
-)
-
-_SANA_WM_SEQUENTIAL_RESIDENCY_COMPONENTS: tuple[str, ...] = (
-    "text_encoder",
-    "transformer",
-    "text_encoder_2",
-    "connectors",
-    "transformer_2",
-)
-
-
-class _OfficialLayerwiseModule(nn.Module, LayerwiseOffloadableModuleMixin):
-    def __init__(self, module: nn.Module) -> None:
-        super().__init__()
-        self.module = module
-        self.layerwise_offload_managers = []
-
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError as exc:
-            wrapped = self.__dict__.get("module")
-            if wrapped is not None:
-                return getattr(wrapped, name)
-            modules = self.__dict__.get("_modules", {})
-            wrapped = modules.get("module")
-            if wrapped is not None:
-                return getattr(wrapped, name)
-            raise exc
-
-
-class _OfficialDiffusersLTX2RefinerModule(_OfficialLayerwiseModule):
-    """Thin offload wrapper around Diffusers' official LTX-2 refiner module."""
-
-    layer_names = ["module.transformer_blocks"]
-
-
-class _OfficialGemma3TextEncoderModule(_OfficialLayerwiseModule):
-    layer_names = [
-        "module.language_model.layers",
-        "module.model.language_model.layers",
-    ]
-
-
-def _truthy_flag(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return False
-
-
-def _sana_wm_skip_refiner_enabled(
-    batch: Any | None = None,
-    pipeline_config: Any | None = None,
-) -> bool:
-    if _truthy_flag(getattr(pipeline_config, "sana_wm_skip_refiner", False)):
-        return True
-    if batch is None:
-        return False
-    extra = getattr(batch, "extra", None) or {}
-    return any(
-        _truthy_flag(value)
-        for value in (
-            extra.get("skip_refiner"),
-            extra.get("sana_wm_skip_refiner"),
-        )
-    )
-
-
 def _default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
     precision = getattr(server_args.pipeline_config, "dit_precision", "bf16")
     return PRECISION_TO_TYPE.get(precision, torch.bfloat16)
-
-
-def _normalize_sana_wm_choice(
-    value,
-    *,
-    default: str,
-    valid_values: tuple[str, ...],
-    name: str,
-    strict: bool,
-) -> str:
-    mode = default if value is None else str(value).strip().lower()
-    if not mode:
-        mode = default
-    if mode in valid_values:
-        return mode
-
-    if strict:
-        raise ValueError(
-            f"{name} must be one of {sorted(valid_values)}, got {value!r}."
-        )
-
-    logger.warning(
-        "Ignoring invalid %s=%r. Expected one of %s; using %r.",
-        name,
-        value,
-        sorted(valid_values),
-        default,
-    )
-    return default
-
-
-def _normalize_sana_wm_refiner_backend(
-    value,
-    *,
-    strict: bool = True,
-    name: str = "sana_wm_refiner_backend",
-) -> str:
-    return _normalize_sana_wm_choice(
-        value,
-        default="auto",
-        valid_values=_SANA_WM_REFINER_BACKENDS,
-        name=name,
-        strict=strict,
-    )
-
-
-def _normalize_sana_wm_two_stage_residency(
-    value,
-    *,
-    strict: bool = True,
-    name: str = "sana_wm_two_stage_residency",
-) -> str:
-    return _normalize_sana_wm_choice(
-        value,
-        default="auto",
-        valid_values=_SANA_WM_TWO_STAGE_RESIDENCY_MODES,
-        name=name,
-        strict=strict,
-    )
-
-
-def _nonempty_config_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
-
-
-def _resolve_sana_wm_startup_choice(
-    server_args: ServerArgs,
-    *,
-    field_name: str,
-    normalizer: Callable[..., str],
-) -> str:
-    mode = _nonempty_config_string(getattr(server_args, field_name, None))
-    if mode is not None:
-        return normalizer(mode, strict=True, name=f"server_args.{field_name}")
-
-    pipeline_config = getattr(server_args, "pipeline_config", None)
-    pipeline_mode = _nonempty_config_string(getattr(pipeline_config, field_name, None))
-    if pipeline_mode is not None and pipeline_mode.lower() != "auto":
-        return normalizer(
-            pipeline_mode,
-            strict=True,
-            name=f"pipeline_config.{field_name}",
-        )
-
-    if pipeline_mode is not None:
-        return normalizer(
-            pipeline_mode,
-            strict=True,
-            name=f"pipeline_config.{field_name}",
-        )
-
-    return normalizer("auto", strict=True, name=field_name)
-
-
-def _configured_sana_wm_refiner_backend(server_args: ServerArgs) -> str:
-    mode = _resolve_sana_wm_startup_choice(
-        server_args,
-        field_name="sana_wm_refiner_backend",
-        normalizer=_normalize_sana_wm_refiner_backend,
-    )
-    if mode != "auto":
-        return mode
-
-    try:
-        tp_size = max(int(getattr(server_args, "tp_size", 1) or 1), 1)
-    except (TypeError, ValueError):
-        tp_size = 1
-    if tp_size > 1 and getattr(server_args, "enable_cfg_parallel", False):
-        return "official"
-    return "native"
-
-
-def _configured_sana_wm_two_stage_residency(server_args: ServerArgs) -> str:
-    return _resolve_sana_wm_startup_choice(
-        server_args,
-        field_name="sana_wm_two_stage_residency",
-        normalizer=_normalize_sana_wm_two_stage_residency,
-    )
 
 
 def _sana_wm_dit_num_attention_heads(dit_config: Any) -> int | None:
@@ -353,9 +142,6 @@ def _validate_sana_wm_native_refiner_tp_args(server_args: ServerArgs) -> None:
     pipeline_config = getattr(server_args, "pipeline_config", None)
     if _sana_wm_skip_refiner_enabled(pipeline_config=pipeline_config):
         return
-    refiner_backend = _configured_sana_wm_refiner_backend(server_args)
-    if refiner_backend != "native":
-        return
 
     if getattr(server_args, "enable_cfg_parallel", False):
         raise ValueError(
@@ -363,8 +149,7 @@ def _validate_sana_wm_native_refiner_tp_args(server_args: ServerArgs) -> None:
             "enable_cfg_parallel with tp_size > 1. The native refiner is "
             "tensor-parallel and must run on all TP ranks, while CFG "
             "parallel refiner execution currently runs only one branch/rank. "
-            "Use sana_wm_refiner_backend=official, disable CFG parallelism, "
-            "or set sana_wm_skip_refiner=true."
+            "Disable CFG parallelism or set sana_wm_skip_refiner=true."
         )
 
     stage1_heads = _sana_wm_dit_num_attention_heads(
@@ -384,8 +169,7 @@ def _validate_sana_wm_native_refiner_tp_args(server_args: ServerArgs) -> None:
         "tp_size to divide both stage-1 num_attention_heads "
         f"({stage1_heads}) and refiner num_attention_heads ({refiner_heads}). "
         f"Valid common tp_size values: {valid_tp_sizes}; got tp_size={tp_size}. "
-        "Use tp_size=2 or tp_size=4 for the two-stage native refiner path, "
-        "or set sana_wm_refiner_backend=official / sana_wm_skip_refiner=true."
+        "Use tp_size=2 or tp_size=4, or set sana_wm_skip_refiner=true."
     )
 
 
@@ -426,19 +210,29 @@ def _resolve_sana_wm_refiner_component_paths(
 
 
 class _SanaWMRefinerModuleLoader:
+    NATIVE_REFINER_CLASS = "SanaWMLTX2VideoRefiner"
+    SUBMODULES: tuple[_SanaWMRefinerSubmodule, ...] = (
+        _SanaWMRefinerSubmodule("transformer_2", "refiner/transformer"),
+        _SanaWMRefinerSubmodule("connectors", "refiner/connectors"),
+        _SanaWMRefinerSubmodule("text_encoder_2", "refiner/text_encoder"),
+        _SanaWMRefinerSubmodule("tokenizer_2", "refiner/text_encoder"),
+    )
+
+    @staticmethod
+    def _component_library(component_name: str) -> str:
+        if component_name in {"transformer_2", "connectors"}:
+            return "diffusers"
+        if component_name in {"text_encoder_2", "tokenizer_2"}:
+            return "transformers"
+        raise ValueError(f"Unsupported SANA-WM refiner component: {component_name}")
+
     def load_modules(
         self,
         server_args: ServerArgs,
-        *,
-        native_loader: Callable[[str, ServerArgs], tuple[Any, float]],
-        official_loader: Callable[[str, str, ServerArgs], tuple[Any, float]],
     ) -> dict[str, tuple[Any, float]]:
-        backend = _configured_sana_wm_refiner_backend(server_args)
-        logger.info("SANA-WM refiner backend resolved to %s.", backend)
-
         loaded: dict[str, tuple[Any, float]] = {}
         component_paths = getattr(server_args, "component_paths", {}) or {}
-        for spec in _SANA_WM_REFINER_SUB_MODULES:
+        for spec in self.SUBMODULES:
             component_path = component_paths.get(spec.component_name)
             if component_path is None:
                 raise ValueError(
@@ -452,105 +246,129 @@ class _SanaWMRefinerModuleLoader:
                 spec.component_name,
                 component_path,
             )
-            if spec.component_name == "transformer_2" and backend == "native":
-                loaded[spec.component_name] = native_loader(
-                    component_path,
-                    server_args,
-                )
-            else:
-                loaded[spec.component_name] = official_loader(
-                    spec.component_name,
-                    component_path,
-                    server_args,
-                )
+            loaded[spec.component_name] = self.load_refiner_component(
+                spec.component_name,
+                component_path,
+                server_args,
+            )
         return loaded
 
     @staticmethod
-    def load_native_refiner_transformer(
+    def load_refiner_component(
+        component_name: str,
         component_path: str,
         server_args: ServerArgs,
     ) -> tuple[Any, float]:
         module, memory_usage = PipelineComponentLoader.load_component(
-            component_name="transformer_2",
+            component_name=component_name,
             component_model_path=component_path,
-            transformers_or_diffusers="diffusers",
+            transformers_or_diffusers=_SanaWMRefinerModuleLoader._component_library(
+                component_name
+            ),
             server_args=server_args,
-            component_architecture=_SANA_WM_NATIVE_REFINER_CLASS,
+            component_architecture=(
+                _SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS
+                if component_name == "transformer_2"
+                else None
+            ),
         )
-        if module.__class__.__name__ != _SANA_WM_NATIVE_REFINER_CLASS:
+        if (
+            component_name == "transformer_2"
+            and module.__class__.__name__
+            != _SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS
+        ):
             raise RuntimeError(
                 "SANA-WM native refiner backend expected "
-                f"{_SANA_WM_NATIVE_REFINER_CLASS}, got {module.__class__.__name__}."
+                f"{_SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS}, "
+                f"got {module.__class__.__name__}."
             )
         return module, memory_usage
 
-    @staticmethod
-    def load_official_refiner_component(
-        module_name: str,
-        component_path: str,
-        server_args: ServerArgs,
-    ) -> tuple[Any, float]:
-        dtype = _default_sana_wm_refiner_dtype(server_args)
-        if module_name == "transformer_2":
-            from diffusers.models.transformers.transformer_ltx2 import (
-                LTX2VideoTransformer3DModel,
-            )
-
-            module = LTX2VideoTransformer3DModel.from_pretrained(
-                component_path,
-                torch_dtype=dtype,
-            ).eval()
-            module = _OfficialDiffusersLTX2RefinerModule(module)
-        elif module_name == "connectors":
-            from diffusers.pipelines.ltx2 import LTX2TextConnectors
-
-            module = LTX2TextConnectors.from_pretrained(
-                component_path,
-                torch_dtype=dtype,
-            ).eval()
-        elif module_name == "text_encoder_2":
-            from transformers import Gemma3ForConditionalGeneration
-
-            module = Gemma3ForConditionalGeneration.from_pretrained(
-                component_path,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            ).eval()
-            module = _OfficialGemma3TextEncoderModule(module)
-        elif module_name == "tokenizer_2":
-            from transformers import AutoTokenizer
-
-            module = AutoTokenizer.from_pretrained(component_path)
-        else:
-            raise ValueError(f"Unsupported SANA-WM refiner component: {module_name}")
-
-        memory_usage = get_memory_usage_of_component(module)
-        logger.info(
-            "Loaded %s: %s (official diffusers version). model size: %s GB",
-            module_name,
-            module.__class__.__name__,
-            memory_usage if memory_usage is not None else "NA",
-        )
-        return module, memory_usage or 0.0
-
 
 class _SanaWMTwoStageResidencyPlanner:
+    VALID_MODES = ("auto", "resident", "sequential")
+    SEQUENTIAL_COMPONENTS = (
+        "text_encoder",
+        "transformer",
+        "text_encoder_2",
+        "connectors",
+        "transformer_2",
+    )
+
     def __init__(
         self,
         *,
         modules: dict[str, Any],
         component_residency_strategies: dict[str, Any],
-        component_names: tuple[str, ...] = _SANA_WM_SEQUENTIAL_RESIDENCY_COMPONENTS,
+        component_names: tuple[str, ...] | None = None,
     ) -> None:
         self.modules = modules
         self.component_residency_strategies = component_residency_strategies
-        self.component_names = component_names
+        self.component_names = component_names or self.SEQUENTIAL_COMPONENTS
+
+    @classmethod
+    def normalize_mode(
+        cls,
+        value,
+        *,
+        strict: bool = True,
+        name: str = "sana_wm_two_stage_residency",
+    ) -> str:
+        mode = "auto" if value is None else str(value).strip().lower()
+        if not mode:
+            mode = "auto"
+        if mode in cls.VALID_MODES:
+            return mode
+
+        if strict:
+            raise ValueError(
+                f"{name} must be one of {sorted(cls.VALID_MODES)}, got {value!r}."
+            )
+
+        logger.warning(
+            "Ignoring invalid %s=%r. Expected one of %s; using 'auto'.",
+            name,
+            value,
+            sorted(cls.VALID_MODES),
+        )
+        return "auto"
 
     @staticmethod
-    def residency_mode(server_args: ServerArgs | None = None) -> str:
+    def _nonempty_config_string(value: Any) -> str | None:
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    @classmethod
+    def configured_mode(cls, server_args: ServerArgs) -> str:
+        field_name = "sana_wm_two_stage_residency"
+        mode = cls._nonempty_config_string(getattr(server_args, field_name, None))
+        if mode is not None:
+            return cls.normalize_mode(
+                mode,
+                strict=True,
+                name=f"server_args.{field_name}",
+            )
+
+        pipeline_config = getattr(server_args, "pipeline_config", None)
+        pipeline_mode = cls._nonempty_config_string(
+            getattr(pipeline_config, field_name, None)
+        )
+        if pipeline_mode is not None:
+            return cls.normalize_mode(
+                pipeline_mode,
+                strict=True,
+                name=f"pipeline_config.{field_name}",
+            )
+
+        return cls.normalize_mode("auto", strict=True, name=field_name)
+
+    @classmethod
+    def residency_mode(cls, server_args: ServerArgs | None = None) -> str:
         if server_args is not None:
-            return _configured_sana_wm_two_stage_residency(server_args)
-        return _normalize_sana_wm_two_stage_residency(
+            return cls.configured_mode(server_args)
+        return cls.normalize_mode(
             "auto",
             strict=False,
             name="sana_wm_two_stage_residency",
@@ -641,7 +459,6 @@ class _SanaWMTwoStageResidencyPlanner:
             )
         return configured
 
-
 class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
     """SANA-WM TI2V pipeline (single-stage)."""
 
@@ -720,23 +537,18 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
     pipeline_name = "SanaWMTwoStagePipeline"
 
-    # Stage-2 refiner sub-modules and their on-disk layout. These are loaded
-    # through the official Diffusers/Transformers classes because NVlabs'
-    # reference refiner is a narrow video-only wrapper around those modules.
+    # Stage-2 refiner sub-modules and their on-disk layout.
     _REFINER_SUB_MODULES: tuple[tuple[str, str], ...] = tuple(
-        (spec.component_name, spec.subpath) for spec in _SANA_WM_REFINER_SUB_MODULES
+        (spec.component_name, spec.subpath)
+        for spec in _SanaWMRefinerModuleLoader.SUBMODULES
     )
 
     @staticmethod
     def _validate_parallelism_args(server_args: ServerArgs) -> None:
         _validate_sana_wm_two_stage_parallelism(server_args)
 
-    @staticmethod
-    def _validate_native_refiner_tp_args(server_args: ServerArgs) -> None:
-        _validate_sana_wm_native_refiner_tp_args(server_args)
-
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
-        self._validate_native_refiner_tp_args(server_args)
+        _validate_sana_wm_native_refiner_tp_args(server_args)
         super().initialize_pipeline(server_args)
         if _sana_wm_skip_refiner_enabled(
             pipeline_config=getattr(server_args, "pipeline_config", None)
@@ -749,19 +561,12 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         self._load_refiner_modules(server_args)
         self._configure_two_stage_component_residency(server_args)
 
-    def _refiner_loader(self) -> _SanaWMRefinerModuleLoader:
-        return _SanaWMRefinerModuleLoader()
-
     def _load_refiner_modules(self, server_args: ServerArgs) -> None:
         server_args.component_paths = _resolve_sana_wm_refiner_component_paths(
             self.model_path,
             getattr(server_args, "component_paths", {}) or {},
         )
-        loaded = self._refiner_loader().load_modules(
-            server_args,
-            native_loader=_SanaWMRefinerModuleLoader.load_native_refiner_transformer,
-            official_loader=_SanaWMRefinerModuleLoader.load_official_refiner_component,
-        )
+        loaded = _SanaWMRefinerModuleLoader().load_modules(server_args)
         for module_name, (module, memory_usage) in loaded.items():
             self.modules[module_name] = module
             self.memory_usages[module_name] = memory_usage

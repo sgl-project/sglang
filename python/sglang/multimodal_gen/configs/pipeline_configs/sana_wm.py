@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm_refiner import (
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
+from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -29,12 +30,6 @@ logger = init_logger(__name__)
 _SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG = 70.0
 _SANA_WM_MIN_DEFAULT_FOV_DEG = 25.0
 _SANA_WM_MAX_DEFAULT_FOV_DEG = 120.0
-_SANA_WM_REFINER_BACKENDS: tuple[str, ...] = ("auto", "official", "native")
-_SANA_WM_TWO_STAGE_RESIDENCY_MODES: tuple[str, ...] = (
-    "auto",
-    "resident",
-    "sequential",
-)
 _SANA_WM_TORCH_COMPILE_SCOPES: tuple[str, ...] = ("regional", "full", "off")
 
 
@@ -86,21 +81,6 @@ def _normalize_sana_wm_choice(
     return default
 
 
-def _normalize_sana_wm_refiner_backend(
-    value,
-    *,
-    strict: bool = True,
-    name: str = "sana_wm_refiner_backend",
-) -> str:
-    return _normalize_sana_wm_choice(
-        value,
-        default="auto",
-        valid_values=_SANA_WM_REFINER_BACKENDS,
-        name=name,
-        strict=strict,
-    )
-
-
 def _normalize_sana_wm_two_stage_residency(
     value,
     *,
@@ -110,7 +90,7 @@ def _normalize_sana_wm_two_stage_residency(
     return _normalize_sana_wm_choice(
         value,
         default="auto",
-        valid_values=_SANA_WM_TWO_STAGE_RESIDENCY_MODES,
+        valid_values=("auto", "resident", "sequential"),
         name=name,
         strict=strict,
     )
@@ -209,7 +189,6 @@ class SanaWMPipelineConfig(PipelineConfig):
     refiner_dit_config: DiTConfig = field(default_factory=SanaWMRefinerConfig)
 
     # --- SANA-WM runtime controls ---
-    sana_wm_refiner_backend: str = "auto"
     sana_wm_two_stage_residency: str = "auto"
     sana_wm_skip_refiner: bool = False
     sana_wm_diagnostics: bool = False
@@ -231,9 +210,6 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # Load both encoder and decoder (need encoder for first-frame conditioning)
     def __post_init__(self):
-        self.sana_wm_refiner_backend = _normalize_sana_wm_refiner_backend(
-            self.sana_wm_refiner_backend
-        )
         self.sana_wm_two_stage_residency = _normalize_sana_wm_two_stage_residency(
             self.sana_wm_two_stage_residency
         )
@@ -285,11 +261,13 @@ class SanaWMPipelineConfig(PipelineConfig):
         super().update_config_from_dict(args, prefix)
         self.__post_init__()
 
-    # --- Text encoder: Gemma-2-2b-it (single encoder, same as SANA T2I) ---
+    # --- Text encoders: stage-1 Gemma-2 and native refiner Gemma-3 ---
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (Gemma2Config(),)
+        default_factory=lambda: (Gemma2Config(), Gemma3Config())
     )
-    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    text_encoder_precisions: tuple[str, ...] = field(
+        default_factory=lambda: ("bf16", "bf16")
+    )
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             {
@@ -297,22 +275,23 @@ class SanaWMPipelineConfig(PipelineConfig):
                 # branches must have the same token dimension for CFG concat.
                 "padding": "max_length",
                 "return_attention_mask": True,
-            }
+            },
+            {},
         ]
     )
     chi_prompt: tuple[str, ...] = _SANA_WM_CHI_PROMPT
     preprocess_text_funcs: tuple[Callable | None, ...] = field(
-        default_factory=lambda: (None,)
+        default_factory=lambda: (None, None)
     )
     postprocess_text_funcs: tuple[Callable, ...] = field(
-        default_factory=lambda: (_sana_wm_postprocess_text,)
+        default_factory=lambda: (_sana_wm_postprocess_text, _sana_wm_postprocess_text)
     )
 
     # --- Scheduler ---
     # linear_flow training schedule from the released config.yaml.
     flow_shift: float = 9.95
-    # Official NVlabs/Sana inference resolves inference_flow_shift first and
-    # falls back to flow_shift only when it is absent.
+    # SANA-WM inference resolves inference_flow_shift first and falls back to
+    # flow_shift only when it is absent.
     inference_flow_shift: float | None = 9.8
 
     # --- Video shape ---
