@@ -611,14 +611,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.fill_len
+                req.req_pool_idx, : req.kv_committed_len
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        token_ids = req.get_fill_ids()
+        token_ids = req.get_committed_fill_ids()
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
