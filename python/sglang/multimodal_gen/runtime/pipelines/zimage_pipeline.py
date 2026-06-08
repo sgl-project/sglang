@@ -5,9 +5,6 @@ from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    InputValidationStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
     ZImageProgressiveDenoisingStage,
 )
@@ -60,12 +57,10 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stage(InputValidationStage())
-        self.add_standard_text_encoding_stage()
-        self.add_standard_latent_preparation_stage()
-        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
-        self.add_progressive_denoising_stage(ZImageProgressiveDenoisingStage)
-        self.add_standard_decoding_stage()
+        self.add_standard_t2i_stages(
+            prepare_extra_timestep_kwargs=[prepare_mu],
+            progressive_denoising_stage_cls=ZImageProgressiveDenoisingStage,
+        )
 
 
 EntryClass = ZImagePipeline

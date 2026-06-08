@@ -26,16 +26,21 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -56,6 +61,21 @@ PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
 
 def is_progressive_resolution_mode(mode: str | None) -> bool:
     return (mode or "fullres") in PROGRESSIVE_MODES
+
+
+def unpack_2x2_latent(latent: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
+    batch_size, _seq_len, packed_channels = latent.shape
+    spatial_channels = packed_channels // 4
+    x = latent.view(batch_size, h_lat // 2, w_lat // 2, spatial_channels, 2, 2)
+    x = x.permute(0, 3, 1, 4, 2, 5)
+    return x.reshape(batch_size, spatial_channels, h_lat, w_lat)
+
+
+def pack_2x2_latent(x: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
+    batch_size, spatial_channels = x.shape[:2]
+    x = x.view(batch_size, spatial_channels, h_lat // 2, 2, w_lat // 2, 2)
+    x = x.permute(0, 2, 4, 1, 3, 5)
+    return x.reshape(batch_size, (h_lat // 2) * (w_lat // 2), spatial_channels * 4)
 
 
 def _P_omega(w: float, A: float, beta: float) -> float:
@@ -198,8 +218,6 @@ class ProgressiveDenoisingStageRouter(PipelineStage):
 
 
 def _get_scm_preset() -> str | None:
-    from sglang.multimodal_gen import envs
-
     preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
     return None if (preset is None or preset == "none") else preset
 
@@ -272,6 +290,35 @@ class ProgressiveDenoisingStage(DenoisingStage):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _prepare_resolution_pos_cond_kwargs(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> dict[str, Any]:
+        rotary_emb = self._get_transformer_attr("rotary_emb")
+        return server_args.pipeline_config.prepare_pos_cond_kwargs(
+            batch,
+            self.device,
+            rotary_emb,
+            dtype=ctx.target_dtype,
+        )
+
+    @staticmethod
+    def _update_cfg_branch_kwargs(
+        ctx: DenoisingContext,
+        updates: dict[str, Any | None],
+    ) -> None:
+        assert ctx.cfg_policy is not None
+        for branch in ctx.cfg_policy.branches:
+            for name, value in updates.items():
+                if value is not None and name in branch.kwargs:
+                    branch.kwargs[name] = value
+
+        for name, value in updates.items():
+            if value is not None and name in ctx.pos_cond_kwargs:
+                ctx.pos_cond_kwargs[name] = value
+
     @staticmethod
     def _get_seed(batch: Req) -> int:
         seeds = getattr(batch, "seeds", None)
@@ -331,8 +378,6 @@ class ProgressiveDenoisingStage(DenoisingStage):
         seed: int | Sequence[int],
     ) -> torch.Tensor:
         """Generate low-res initial noise and return in model-native format."""
-        from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-
         device = get_local_torch_device()
         C = server_args.pipeline_config.dit_config.arch_config.in_channels // 4
         dtype = server_args.pipeline_config.get_latent_dtype(

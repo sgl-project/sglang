@@ -19,6 +19,8 @@ from __future__ import annotations
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.pipeline_configs.flux import _prepare_latent_ids
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
@@ -117,11 +119,6 @@ class Flux2ProgressiveDenoisingStage(ProgressiveDenoisingStage):
         FLUX.2 uses in_channels directly (no //4) because the spatial latent
         already incorporates the patchification channel expansion.
         """
-        from sglang.multimodal_gen.configs.pipeline_configs.flux import (
-            _prepare_latent_ids,
-        )
-        from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-
         device = get_local_torch_device()
         C = server_args.pipeline_config.dit_config.arch_config.in_channels
         dtype = server_args.pipeline_config.get_latent_dtype(
@@ -168,22 +165,14 @@ class Flux2ProgressiveDenoisingStage(ProgressiveDenoisingStage):
 
         # Update batch.latent_ids so that prepare_pos_cond_kwargs sees the
         # correct grid coordinates for the upsampled resolution.
-        from sglang.multimodal_gen.configs.pipeline_configs.flux import (
-            _prepare_latent_ids,
-        )
-
         C = server_args.pipeline_config.dit_config.arch_config.in_channels
         dummy = ctx.latents.new_zeros(1, C, new_h_lat, new_w_lat)
         latent_ids = _prepare_latent_ids(dummy)
         batch.latent_ids = latent_ids.to(ctx.latents.device)
 
         if key not in self._freqs_cis_cache:
-            rotary_emb = self._get_transformer_attr("rotary_emb")
-            new_pos_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
-                batch,
-                self.device,
-                rotary_emb,
-                dtype=ctx.target_dtype,
+            new_pos_kwargs = self._prepare_resolution_pos_cond_kwargs(
+                ctx, batch, server_args
             )
             freqs_cis = new_pos_kwargs.get("freqs_cis")
             if freqs_cis is not None:
@@ -198,12 +187,7 @@ class Flux2ProgressiveDenoisingStage(ProgressiveDenoisingStage):
             )
             return
 
-        for branch in ctx.cfg_policy.branches:
-            if "freqs_cis" in branch.kwargs:
-                branch.kwargs["freqs_cis"] = cached
-
-        if "freqs_cis" in ctx.pos_cond_kwargs:
-            ctx.pos_cond_kwargs["freqs_cis"] = cached
+        self._update_cfg_branch_kwargs(ctx, {"freqs_cis": cached})
 
         logger.info(
             "Updated latent_ids and freqs_cis for %dx%d latent (pixel %dx%d) "

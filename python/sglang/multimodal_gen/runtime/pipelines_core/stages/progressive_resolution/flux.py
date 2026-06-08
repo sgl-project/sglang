@@ -17,6 +17,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
+    pack_2x2_latent,
+    unpack_2x2_latent,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -27,22 +29,6 @@ logger = init_logger(__name__)
 # Fitted on Aesthetics-Train-V2 (105k images)
 FLUX_SPECTRUM_A: float = 203.615097
 FLUX_SPECTRUM_BETA: float = 1.915461
-
-
-def _flux_unpack(latent: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
-    """Packed [B, S, 64] → spatial [B, 16, H_lat, W_lat]."""
-    B = latent.shape[0]
-    x = latent.view(B, h_lat // 2, w_lat // 2, 16, 2, 2)
-    x = x.permute(0, 3, 1, 4, 2, 5)
-    return x.reshape(B, 16, h_lat, w_lat)
-
-
-def _flux_pack(x: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
-    """Spatial [B, 16, H_lat, W_lat] → packed [B, S, 64]."""
-    B = x.shape[0]
-    x = x.view(B, 16, h_lat // 2, 2, w_lat // 2, 2)
-    x = x.permute(0, 2, 4, 1, 3, 5)
-    return x.reshape(B, (h_lat // 2) * (w_lat // 2), 64)
 
 
 class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
@@ -76,7 +62,7 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
     def _unpack_latent(
         self, latent: torch.Tensor, h_lat: int, w_lat: int
     ) -> torch.Tensor:
-        return _flux_unpack(latent, h_lat, w_lat)
+        return unpack_2x2_latent(latent, h_lat, w_lat)
 
     def _repack_latent(
         self,
@@ -86,7 +72,7 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> torch.Tensor:
-        return _flux_pack(x_spatial, h_lat, w_lat)
+        return pack_2x2_latent(x_spatial, h_lat, w_lat)
 
     # ------------------------------------------------------------------
     # Resolution-change hook
@@ -117,12 +103,8 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
         key = (new_h_lat, new_w_lat)
 
         if key not in self._freqs_cis_cache:
-            rotary_emb = self._get_transformer_attr("rotary_emb")
-            new_pos_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
-                batch,
-                self.device,
-                rotary_emb,
-                dtype=ctx.target_dtype,
+            new_pos_kwargs = self._prepare_resolution_pos_cond_kwargs(
+                ctx, batch, server_args
             )
             freqs_cis = new_pos_kwargs.get("freqs_cis")
             if freqs_cis is not None:
@@ -137,14 +119,7 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
             )
             return
 
-        # Update every CFG branch — this is what _predict_noise_with_cfg reads.
-        for branch in ctx.cfg_policy.branches:
-            if "freqs_cis" in branch.kwargs:
-                branch.kwargs["freqs_cis"] = cached
-
-        # Keep ctx.pos_cond_kwargs in sync (used for neg branch rebuild if needed).
-        if "freqs_cis" in ctx.pos_cond_kwargs:
-            ctx.pos_cond_kwargs["freqs_cis"] = cached
+        self._update_cfg_branch_kwargs(ctx, {"freqs_cis": cached})
 
         logger.info(
             "Updated freqs_cis for %dx%d latent (pixel %dx%d) across %d branch(es)",

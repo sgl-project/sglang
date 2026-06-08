@@ -139,12 +139,8 @@ class ZImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         if ctx.cfg_policy is None:
             return
 
-        rotary_emb = self._get_transformer_attr("rotary_emb")
-        new_pos_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
-            batch,
-            self.device,
-            rotary_emb,
-            dtype=ctx.target_dtype,
+        new_pos_kwargs = self._prepare_resolution_pos_cond_kwargs(
+            ctx, batch, server_args
         )
         freqs_cis = new_pos_kwargs.get("freqs_cis")
         if freqs_cis is None:
@@ -161,12 +157,7 @@ class ZImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         new_h_lat = new_h_pixel // vae_scale_factor
         new_w_lat = new_w_pixel // vae_scale_factor
 
-        for branch in ctx.cfg_policy.branches:
-            if "freqs_cis" in branch.kwargs:
-                branch.kwargs["freqs_cis"] = freqs_cis
-
-        if "freqs_cis" in ctx.pos_cond_kwargs:
-            ctx.pos_cond_kwargs["freqs_cis"] = freqs_cis
+        self._update_cfg_branch_kwargs(ctx, {"freqs_cis": freqs_cis})
 
         logger.info(
             "Updated freqs_cis for %dx%d latent (pixel %dx%d) across %d branch(es)",

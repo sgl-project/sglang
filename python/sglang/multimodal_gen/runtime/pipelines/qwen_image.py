@@ -67,16 +67,10 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-            InputValidationStage,
+        self.add_standard_t2i_stages(
+            prepare_extra_timestep_kwargs=[prepare_mu],
+            progressive_denoising_stage_cls=QwenImageProgressiveDenoisingStage,
         )
-
-        self.add_stage(InputValidationStage())
-        self.add_standard_text_encoding_stage()
-        self.add_standard_latent_preparation_stage()
-        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
-        self.add_progressive_denoising_stage(QwenImageProgressiveDenoisingStage)
-        self.add_standard_decoding_stage()
 
 
 class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):

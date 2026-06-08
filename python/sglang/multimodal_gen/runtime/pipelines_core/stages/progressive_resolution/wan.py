@@ -19,6 +19,7 @@ from __future__ import annotations
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
@@ -169,8 +170,6 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
           - Preserve T_lat from the original full-res latent in batch.latents,
             since progressive upsample only grows spatial H×W.
         """
-        from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-
         device = get_local_torch_device()
         C = server_args.pipeline_config.vae_config.arch_config.z_dim
         # batch.latents still holds the full-res latent from LatentPreparationStage

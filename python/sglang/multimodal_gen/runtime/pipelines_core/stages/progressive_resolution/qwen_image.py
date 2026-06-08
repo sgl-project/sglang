@@ -29,6 +29,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
+    pack_2x2_latent,
+    unpack_2x2_latent,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -42,30 +44,6 @@ logger = init_logger(__name__)
 #       16-channel spatial latent with similar frequency roll-off.
 QWEN_IMAGE_SPECTRUM_A: float = 203.615097
 QWEN_IMAGE_SPECTRUM_BETA: float = 1.915461
-
-
-def _qwen_image_unpack(latent: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
-    """Packed [B, S, 64] → spatial [B, 16, H_lat, W_lat].
-
-    Inverse of _pack_latents() in QwenImagePipelineConfig.
-    Identical to FLUX unpack: in_channels=64, C=16, 2×2 patches.
-    """
-    B = latent.shape[0]
-    x = latent.view(B, h_lat // 2, w_lat // 2, 16, 2, 2)
-    x = x.permute(0, 3, 1, 4, 2, 5)
-    return x.reshape(B, 16, h_lat, w_lat)
-
-
-def _qwen_image_pack(x: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
-    """Spatial [B, 16, H_lat, W_lat] → packed [B, S, 64].
-
-    Matches _pack_latents() in QwenImagePipelineConfig with
-    num_channels_latents=16 and 2×2 patchification.
-    """
-    B = x.shape[0]
-    x = x.view(B, 16, h_lat // 2, 2, w_lat // 2, 2)
-    x = x.permute(0, 2, 4, 1, 3, 5)
-    return x.reshape(B, (h_lat // 2) * (w_lat // 2), 64)
 
 
 class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
@@ -108,7 +86,7 @@ class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
     def _unpack_latent(
         self, latent: torch.Tensor, h_lat: int, w_lat: int
     ) -> torch.Tensor:
-        return _qwen_image_unpack(latent, h_lat, w_lat)
+        return unpack_2x2_latent(latent, h_lat, w_lat)
 
     def _repack_latent(
         self,
@@ -118,7 +96,7 @@ class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> torch.Tensor:
-        return _qwen_image_pack(x_spatial, h_lat, w_lat)
+        return pack_2x2_latent(x_spatial, h_lat, w_lat)
 
     # ------------------------------------------------------------------
     # Resolution-change hook
@@ -146,12 +124,8 @@ class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         if ctx.cfg_policy is None:
             return
 
-        rotary_emb = self._get_transformer_attr("rotary_emb")
-        new_pos_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
-            batch,
-            self.device,
-            rotary_emb,
-            dtype=ctx.target_dtype,
+        new_pos_kwargs = self._prepare_resolution_pos_cond_kwargs(
+            ctx, batch, server_args
         )
         freqs_cis = new_pos_kwargs.get("freqs_cis")
         img_shapes = new_pos_kwargs.get("img_shapes")
@@ -164,16 +138,13 @@ class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
             )
             return
 
-        for branch in ctx.cfg_policy.branches:
-            if "freqs_cis" in branch.kwargs:
-                branch.kwargs["freqs_cis"] = freqs_cis
-            if img_shapes is not None and "img_shapes" in branch.kwargs:
-                branch.kwargs["img_shapes"] = img_shapes
-
-        if "freqs_cis" in ctx.pos_cond_kwargs:
-            ctx.pos_cond_kwargs["freqs_cis"] = freqs_cis
-        if img_shapes is not None and "img_shapes" in ctx.pos_cond_kwargs:
-            ctx.pos_cond_kwargs["img_shapes"] = img_shapes
+        self._update_cfg_branch_kwargs(
+            ctx,
+            {
+                "freqs_cis": freqs_cis,
+                "img_shapes": img_shapes,
+            },
+        )
 
         vae_scale_factor = (
             server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
