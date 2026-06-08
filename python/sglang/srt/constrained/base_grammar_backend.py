@@ -69,6 +69,14 @@ class BaseGrammarObject:
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         raise NotImplementedError()
 
+    def is_vocab_mask_allowed_token(
+        self,
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        raise NotImplementedError()
+
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         raise NotImplementedError()
@@ -156,6 +164,26 @@ class BaseGrammarBackend:
     def init_strict_reasoning_grammar(self, reasoning: bool):
         """Create a grammar object for strict token filtering only. Returns None by default."""
         return None
+
+    @staticmethod
+    def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @staticmethod
+    def is_vocab_mask_allowed_token(
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        raise NotImplementedError()
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        raise NotImplementedError()
 
     def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """
