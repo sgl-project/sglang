@@ -1065,8 +1065,25 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_full_untruncated_fill_ids(self) -> array:
+        # The full untruncated sequence: origin + output (+ DLLM mask block).
+        # Computed on demand from origin_input_ids/output_ids; admission only
+        # advances fill_len, which get_fill_ids applies as the truncation cursor.
+        ids = self.origin_input_ids + self.output_ids
+        if self.is_dllm():
+            ids = ids + array(
+                "q", [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
+        return ids
+
+    def get_full_untruncated_fill_len(self) -> int:
+        length = len(self.origin_input_ids) + len(self.output_ids)
+        if self.is_dllm():
+            length += self.dllm_config.block_size
+        return length
+
     def get_fill_ids(self) -> array:
-        return self.full_untruncated_fill_ids[: self.fill_len]
+        return self.get_full_untruncated_fill_ids()[: self.fill_len]
 
     def init_next_round_input(
         self,
