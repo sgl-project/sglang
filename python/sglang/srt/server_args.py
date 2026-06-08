@@ -4524,7 +4524,7 @@ class ServerArgs:
             "--tokenizer-only",
             action="store_true",
             help="If set, start a tokenizer-only server (no GPU, no KV cache, no scheduler). "
-            "Enables the /v1/preprocess/* endpoints for chat-template + tokenization.",
+            "Enables the /v1/tokenize endpoints for chat-template + tokenization.",
         )
         parser.add_argument(
             "--load-format",
