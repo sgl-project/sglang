@@ -93,15 +93,7 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 # Cache for the contiguous real/imag halves of each freqs_cis tensor used in
 # v4_rope_inplace_npu. complex freqs_cis.real / freqs_cis.imag are strided
-# views (stride=2 on the underlying interleaved real layout); on NPU,
-# `cos_half = freqs_cis.real[positions]` triggers an aclnnIndex over the
-# strided source and CANN materializes it via StridedSlice (1 of the
-# `aclnnIndex_StridedSliceAiCore_StridedSlice` ops dominant in V4 profiling).
-# Cache the contig versions keyed by id(freqs_cis); 43 layers each register
-# their own freqs_cis buffer, so this caches at most 43 (real, imag) pairs.
-# Memory cost: ≈ the same as the original complex freqs_cis (complex64 stores
-# real + imag in interleaved layout), so net memory is ~2× the original
-# but contiguity removes the per-call materialization on NPU.
+# views (stride=2 on the underlying interleaved real layout); 
 _NPU_ROPE_CONTIG_CACHE: dict[int, tuple] = {}
 
 
@@ -180,76 +172,44 @@ def v4_rope_inplace_npu(
     accumulates in fp32; 43 layers × (Q + K) = 86 rope calls compound that
     drift enough to flip argmax on marginal prompts.
     """
-    if (
-        _is_npu
-        and hasattr(torch.ops, "custom")
-        and hasattr(torch.ops.custom, "inplace_partial_rotary_mul")
-    ):
-        # Build cos/sin caches in the layout the kernel expects:
-        # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
-        # the interleaved pairing convention. Use contig real/imag views
-        # cached by id(freqs_cis); see _get_contig_freqs_real_imag.
-        freqs_real_contig, freqs_imag_contig = _get_contig_freqs_real_imag(freqs_cis)
-        cos_half = freqs_real_contig[positions]  # (T, rope_dim/2)
-        sin_half = freqs_imag_contig[positions]
-        if inverse:
-            sin_half = -sin_half
-        cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-        sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-        rope_dim = cos_full.shape[-1]
-        # repeat_interleave produces a contiguous tensor, so the .view()
-        # below already returns a contiguous result — no .contiguous() needed.
-        cos4 = cos_full.view(-1, 1, 1, rope_dim)
-        sin4 = sin_full.view(-1, 1, 1, rope_dim)
-        # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
-        # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
-        q_view = q_rope.unsqueeze(1)
+    # Build cos/sin caches in the layout the kernel expects:
+    # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
+    # the interleaved pairing convention. Use contig real/imag views
+    # cached by id(freqs_cis); see _get_contig_freqs_real_imag.
+    freqs_real_contig, freqs_imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+    cos_half = freqs_real_contig[positions]  # (T, rope_dim/2)
+    sin_half = freqs_imag_contig[positions]
+    if inverse:
+        sin_half = -sin_half
+    cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+    sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+    rope_dim = cos_full.shape[-1]
+    # repeat_interleave produces a contiguous tensor, so the .view()
+    # below already returns a contiguous result — no .contiguous() needed.
+    cos4 = cos_full.view(-1, 1, 1, rope_dim)
+    sin4 = sin_full.view(-1, 1, 1, rope_dim)
+    # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
+    # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
+    q_view = q_rope.unsqueeze(1)
+    torch.ops.custom.inplace_partial_rotary_mul(
+        q_view,
+        cos4,
+        sin4,
+        rotary_mode="interleave",
+        partial_slice=[0, rope_dim],
+    )
+    if kv_rope is not None:
+        if kv_rope.dim() == 3:
+            kv_view = kv_rope.unsqueeze(1)
+        else:
+            kv_view = kv_rope.view(-1, 1, 1, rope_dim)
         torch.ops.custom.inplace_partial_rotary_mul(
-            q_view,
+            kv_view,
             cos4,
             sin4,
             rotary_mode="interleave",
             partial_slice=[0, rope_dim],
         )
-        if kv_rope is not None:
-            if kv_rope.dim() == 3:
-                kv_view = kv_rope.unsqueeze(1)
-            else:
-                kv_view = kv_rope.view(-1, 1, 1, rope_dim)
-            torch.ops.custom.inplace_partial_rotary_mul(
-                kv_view,
-                cos4,
-                sin4,
-                rotary_mode="interleave",
-                partial_slice=[0, rope_dim],
-            )
-        return
-
-    # Torch fallback (CUDA tests, or NPU images without the custom op).
-    cos_full = freqs_cis.real
-    sin_full = freqs_cis.imag
-    cos = cos_full[positions].to(q_rope.dtype)
-    sin = sin_full[positions].to(q_rope.dtype)
-
-    def _apply(x: torch.Tensor) -> None:
-        pair = x.view(*x.shape[:-1], -1, 2)
-        re = pair[..., 0].clone()
-        im = pair[..., 1].clone()
-        c = cos
-        s = sin
-        while c.ndim < pair.ndim - 1:
-            c = c.unsqueeze(-2)
-            s = s.unsqueeze(-2)
-        if inverse:
-            pair[..., 0] = re * c + im * s
-            pair[..., 1] = im * c - re * s
-        else:
-            pair[..., 0] = re * c - im * s
-            pair[..., 1] = re * s + im * c
-
-    _apply(q_rope)
-    if kv_rope is not None:
-        _apply(kv_rope)
 
 
 if TYPE_CHECKING:
@@ -312,44 +272,6 @@ def rms_normalize_triton(
         HAS_WEIGHT=(weight is not None),
     )
     return x
-
-
-def hc_split_sinkhorn_torch(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-):
-    # Pure-torch sinkhorn used by the NPU native hc_pre path. Mirrors the
-    # tilelang `hc_split_sinkhorn` kernel output (same pre/post/comb shapes)
-    # so callers are drop-in compatible. NPU can't run the tilelang kernel,
-    # so this is the path that gets used in practice on Ascend.
-    pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
-    comb = comb.unflatten(-1, (hc_mult, hc_mult))
-
-    pre = (
-        F.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0))
-        + eps
-    )
-    post = 2 * F.sigmoid(
-        post * hc_scale[1]
-        + hc_base[hc_mult : 2 * hc_mult].unsqueeze(0).unsqueeze(0)
-    )
-    comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(
-        hc_mult, hc_mult
-    ).unsqueeze(0).unsqueeze(0)
-
-    comb = comb.softmax(-1) + eps
-    col_sum = comb.sum(-2, keepdim=True)
-    comb = comb / (col_sum + eps)
-    for _ in range(sinkhorn_iters - 1):
-        row_sum = comb.sum(-1, keepdim=True)
-        comb = comb / (row_sum + eps)
-        col_sum = comb.sum(-2, keepdim=True)
-        comb = comb / (col_sum + eps)
-    return pre, post, comb
 
 
 class MQALayer(nn.Module):
@@ -918,7 +840,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
 
-        # @compile_in_capture_mode
+        @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
             x_flat = x.flatten(1).float()
             rsqrt = torch.rsqrt(
@@ -929,12 +851,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         shape, dtype = x.size(), x.dtype
 
-        # NPU ascendc fused path: the cann8.5.0-a3 image ships a `custom_ops`
-        # wheel that registers torch.ops.custom.npu_hc_pre — a fused RMS-norm
-        # + linear projection + sinkhorn iteration kernel. Opt-in via
-        # USE_FUSED_HC_PRE_ASCENDC=1; by default NPU runs the native torch
-        # path below (matches the dsv4-flash source's default).
-        if _is_npu and get_bool_env_var("USE_FUSED_HC_PRE_ASCENDC"):
+        if _is_npu:
             # IDLE / empty short-circuit, mirroring the dsv4-flash source.
             # The kernel emits post/comb in fp32 (sinkhorn iterates in fp32),
             # so the dummies must too — otherwise downstream comb/post-aware
@@ -962,31 +879,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
             # cast back to the input dtype before the downstream
             # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-            _hc_pre_inputs = {
-                "x": x,
-                "hc_fn": hc_fn,
-                "hc_scale": hc_scale,
-                "hc_base": hc_base,
-                "hc_mult": self.hc_mult,
-                "hc_sinkhorn_iters": self.hc_sinkhorn_iters,
-                "norm_eps": self.rms_norm_eps,
-                "hc_eps": self.hc_eps,
-            }
-            # import os as _os, time as _time, uuid as _uuid
-            # try:
-            #     from sglang.srt.layers.dp_attention import get_attention_dp_rank as _get_dp_rank
-            #     _dp_rank = _get_dp_rank()
-            # except Exception:
-            #     _dp_rank = 0
-            # _dump_dir = _os.path.join(
-            #     "/home/t00937989/logs/npu_hc_pre_input", f"dp_rank_{_dp_rank}"
-            # )
-            # _os.makedirs(_dump_dir, exist_ok=True)
-            # _dump_path = _os.path.join(
-            #     _dump_dir,
-            #     f"hc_pre_{_time.time_ns()}_{_uuid.uuid4().hex[:8]}.pt",
-            # )
-            # torch.save(_hc_pre_inputs, _dump_path)
             y, post, comb = torch.ops.custom.npu_hc_pre(
                 x,
                 hc_fn,
@@ -1009,23 +901,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
             )
             return y, post, comb, False
-
-        # NPU native torch path. tilelang `hc_split_sinkhorn` and `deep_gemm`
-        # below are CUDA-only, so on Ascend we go straight to the pure-torch
-        # rmsnorm + linear + sinkhorn — same algorithm the source's
-        # `use_fused_hc_pre_ascendc=False` branch runs.
-        if _is_npu:
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
-            pre, post, comb = hc_split_sinkhorn_torch(
-                mixes,
-                hc_scale,
-                hc_base,
-                self.hc_mult,
-                self.hc_sinkhorn_iters,
-                self.hc_eps,
-            )
-            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-            return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
@@ -1092,9 +967,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        # NPU fast path mirroring hc_pre: torch.ops.custom.npu_hc_post is
-        # the fused output replication + mixing kernel shipped in the
-        # cann8.5.0-a3 image's custom_ops wheel.
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
@@ -1141,16 +1013,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
         )
-        if self.layer_id <= 5:
-            # sub-layer seed bisection: RAW self_attn output (attn kernel, before
-            # hc/norm). vs khalil same point: attnout matches but layer output
-            # (post-mlp) diverges -> seed op is MoE side; attnout already diverges
-            # -> seed is attn side (input_norm / hc_pre / self_attn kernel).
-            from sglang.srt.hardware_backend.npu.attention._dsv4_dump import (
-                dump_hidden_state,
-            )
-
-            dump_hidden_state("attnout", hidden_states, forward_batch, self.layer_id)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
@@ -1309,12 +1171,6 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        # [debug] per-layer hidden_state dump (HS_DUMP=1), eager numerical-diff bisect
-        from sglang.srt.hardware_backend.npu.attention._dsv4_dump import (
-            dump_hidden_state,
-        )
-
-        dump_hidden_state("embed", hidden_states, forward_batch, -1)
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(

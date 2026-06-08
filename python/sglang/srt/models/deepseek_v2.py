@@ -963,21 +963,6 @@ class DeepseekV2MoE(nn.Module):
                 ),
                 **topk_kwargs,
             )
-            if getattr(self, "layer_id", 99) <= 5:
-                try:
-                    from sglang.srt.hardware_backend.npu.attention._dsv4_dump import (
-                        dump_moe_gate,
-                    )
-
-                    dump_moe_gate(
-                        self.layer_id,
-                        forward_batch,
-                        router_logits,
-                        topk_output.topk_ids,
-                        topk_output.topk_weights,
-                    )
-                except Exception:
-                    pass
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
