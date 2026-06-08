@@ -15,6 +15,23 @@ from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 FP8_WEIGHT_DTYPE = torch.float8_e4m3fn
 
 
+def _can_apply_fused_w8a8_fp8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    compute_dtype: torch.dtype,
+) -> bool:
+    return (
+        x.device.type == "cuda"
+        and weight.device.type == "cuda"
+        and weight_scale.device.type == "cuda"
+        and not x.is_meta
+        and not weight.is_meta
+        and not weight_scale.is_meta
+        and compute_dtype in (torch.float16, torch.bfloat16)
+    )
+
+
 def dequantize_rowwise_fp8_weight(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -30,8 +47,51 @@ def dequantize_rowwise_fp8_weight(
     return weight.to(dtype) * weight_scale.to(dtype).unsqueeze(1)
 
 
+def _apply_srt_w8a8_fp8_linear(*args, **kwargs) -> torch.Tensor:
+    from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+    return apply_fp8_linear(*args, **kwargs)
+
+
+def _is_cutlass_fp8_supported() -> bool:
+    from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+
+    return cutlass_fp8_supported()
+
+
+def _apply_weight_only_fp8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    compute_dtype: torch.dtype,
+    enable_fused_w8a8: bool,
+) -> torch.Tensor:
+    x = x.to(compute_dtype)
+    bias = bias.to(compute_dtype) if bias is not None else None
+    if enable_fused_w8a8 and _can_apply_fused_w8a8_fp8_linear(
+        x, weight, weight_scale, compute_dtype
+    ):
+        try:
+            # The fused kernel uses W8A8 compute; fallback keeps BF16/FP16
+            # activations after dequantizing the FP8 weights.
+            return _apply_srt_w8a8_fp8_linear(
+                input=x,
+                weight=weight.t(),
+                weight_scale=weight_scale,
+                input_scale=None,
+                bias=bias,
+                cutlass_fp8_supported=_is_cutlass_fp8_supported(),
+            )
+        except (ImportError, NotImplementedError):
+            pass
+
+    dequant_weight = dequantize_rowwise_fp8_weight(weight, weight_scale, compute_dtype)
+    return F.linear(x, dequant_weight, bias)
+
+
 class WeightOnlyFP8Linear(nn.Module):
-    """Storage-only e4m3 FP8 linear with row-wise dequantization before matmul."""
+    """Storage-only e4m3 FP8 linear with row-wise weight scales."""
 
     def __init__(
         self,
@@ -39,11 +99,13 @@ class WeightOnlyFP8Linear(nn.Module):
         out_features: int,
         bias: bool = True,
         compute_dtype: torch.dtype | None = None,
+        enable_fused_w8a8: bool = True,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = compute_dtype
+        self.enable_fused_w8a8 = enable_fused_w8a8
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=FP8_WEIGHT_DTYPE),
             requires_grad=False,
@@ -65,15 +127,18 @@ class WeightOnlyFP8Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         compute_dtype = self.compute_dtype or x.dtype
-        weight = dequantize_rowwise_fp8_weight(
-            self.weight, self.weight_scale, compute_dtype
+        return _apply_weight_only_fp8_linear(
+            x,
+            self.weight,
+            self.weight_scale,
+            self.bias,
+            compute_dtype,
+            self.enable_fused_w8a8,
         )
-        bias = self.bias.to(compute_dtype) if self.bias is not None else None
-        return F.linear(x.to(compute_dtype), weight, bias)
 
 
 class WeightOnlyFP8ColumnParallelLinear(nn.Module):
-    """Column-parallel e4m3 FP8 linear with row-wise dequantization."""
+    """Column-parallel storage-only e4m3 FP8 linear."""
 
     def __init__(
         self,
@@ -83,12 +148,14 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         compute_dtype: torch.dtype | None = None,
         gather_output: bool = True,
         tp_group=None,
+        enable_fused_w8a8: bool = True,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = compute_dtype
         self.gather_output = gather_output
+        self.enable_fused_w8a8 = enable_fused_w8a8
         self.tp_group = tp_group or get_tp_group()
         self.tp_size = get_group_size(self.tp_group)
         self.tp_rank = get_group_rank(self.tp_group)
@@ -154,11 +221,14 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         compute_dtype = self.compute_dtype or x.dtype
-        weight = dequantize_rowwise_fp8_weight(
-            self.weight, self.weight_scale, compute_dtype
+        output_parallel = _apply_weight_only_fp8_linear(
+            x,
+            self.weight,
+            self.weight_scale,
+            self.bias,
+            compute_dtype,
+            self.enable_fused_w8a8,
         )
-        bias = self.bias.to(compute_dtype) if self.bias is not None else None
-        output_parallel = F.linear(x.to(compute_dtype), weight, bias)
         if self.gather_output:
             return tensor_model_parallel_all_gather(
                 output_parallel, tp_group=self.tp_group
