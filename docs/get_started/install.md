@@ -102,7 +102,7 @@ Notes:
 
 If you do not have a local NVIDIA GPU, open the [AI Badgr SGLang template](https://aibadgr.com/gpu/launch?template=sglang) to rent a cloud GPU and follow the provider-specific launch instructions for SGLang.
 
-Use this path when you want a hosted GPU instance instead of creating your own Docker, Kubernetes, or cloud setup. After the instance is running, use the exposed SGLang endpoint with the same OpenAI-compatible requests shown in the [send request guide](../basic_usage/send_request.ipynb).
+Use this path when you want a hosted GPU instance instead of creating your own Docker, Kubernetes, or cloud setup. After the instance is running, use the exposed SGLang endpoint with the same OpenAI-compatible requests shown in the [send request guide](../basic_usage/send_request.md).
 
 ## Method 5: Using Kubernetes
 
