@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    KVTransferError,
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
@@ -1539,10 +1540,13 @@ class MoriKVSender(CommonKVSender):
             self._finalize_failure()
         self.clear()
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "KV transfer failed"
-            )
-        raise RuntimeError(failure_reason)
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "KV transfer failed"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
     def abort(self):
         self._finalize_failure("Aborted by AbortReq.")
@@ -1675,10 +1679,13 @@ class MoriKVReceiver(CommonKVReceiver):
 
         self.clear()
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "KV transfer failed"
-            )
-        raise RuntimeError(failure_reason)
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "KV transfer failed"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
     def abort(self):
         if self.bootstrap_room is None:
