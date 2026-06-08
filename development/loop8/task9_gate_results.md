@@ -18,14 +18,17 @@ Accuracy + client-SLO gates for the opt-in Double-Sparsity path on GLM-5.1-FP8, 
   gate PASS all 78 layers/8 ranks) and serves. This is the production landing artifact (supersedes the
   32-sample bring-up mask `e7dbf4c9308f` used for R0 smoke).
 
-## Op-point (both columns, same node — launch-arg parity verified, R5)
+## Op-point (both columns, same node — R5 preliminary, parity caveat)
 Both columns booted via the **paired locked-op-point launchers** (`serve_native_nsa.sh` DSA-native /
 `serve_double_sparsity.sh` DS) with the GLM model + 256 mask. From each JSONL's `server_info`, the columns
 match on **TP=8, page 64, kv_cache_dtype fp8_e4m3, disable_radix_cache=True, disable_piecewise_cuda_graph=
-True, disable_overlap_schedule=True, dsa_prefill/decode_backend=flashmla_kv**, differing **only** by
-`enable_double_sparsity` (False/True) and `mem_fraction_static` (DSA 0.8 / DS 0.7 — the inherent DS
-TokenLabelTable reservation; the comparator ignores this asymmetry per BL-20260529). This **fixes the R4
-op-point mismatch** (R4's DSA had `disable_piecewise_cuda_graph=False`). Workload: gsp 4096 ISL (sys 2253 +
+True, disable_overlap_schedule=True, dsa_prefill/decode_backend=flashmla_kv** (this **fixes the R4
+op-point mismatch** — R4's DSA had `disable_piecewise_cuda_graph=False`). **Caveat (R6 review):** the
+recorded R5 artifacts still differ on `server_info.random_seed` (DSA 515248618 / DS 689475326) because the
+launchers did not yet pin a seed; the intended config diffs are `enable_double_sparsity` (False/True) and
+`mem_fraction_static` (DSA 0.8 / DS 0.7 — the inherent DS TokenLabelTable reservation). **R6 added a fixed
+`RANDOM_SEED` (20260607, `--random-seed`) to BOTH launchers**, so the **final locked sweep** will be
+seed-matched; this R5 curve is **preliminary** and not seed-matched. Workload: gsp 4096 ISL (sys 2253 +
 q 1843, ~55% prefix cache) / 512 OSL, seed 431.
 
 ## SLO gates (iii) decode TPS + (iv) P99 TTFT — parity conc curve (R5, PRELIMINARY window)
