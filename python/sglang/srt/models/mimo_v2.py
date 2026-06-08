@@ -733,11 +733,22 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        if captured_last_layer_outputs is not None:
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                )
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -883,6 +894,9 @@ class MiMoV2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        # For EAGLE3 / DFLASH aux hidden state capture.
+        self.layers_to_capture: List[int] = []
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
             return self.get_input_embeddings()(input_ids) * self.config.scale_emb
@@ -910,6 +924,9 @@ class MiMoV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        # TBO path skips per-layer capture; DFLASH+TBO is unsupported.
+        aux_hidden_states: List[torch.Tensor] = []
 
         if forward_batch.can_run_tbo:
             tbo_start_layer = self.start_layer
@@ -941,11 +958,29 @@ class MiMoV2Model(nn.Module):
         else:
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
+                # Capture the residual stream entering this layer (= output of the
+                # previous target layer) via the layer communicator, which records
+                # it at the attention scatter mode (TP_ATTN_FULL). This keeps every
+                # captured tensor in one consistent layout under DP attention, where
+                # the per-layer residual stream alternates scattered/gathered.
+                capture_buf = aux_hidden_states if i in self.layers_to_capture else None
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
                     forward_batch,
                     residual,
+                    captured_last_layer_outputs=capture_buf,
+                )
+            # DFLASH may also request capture *after* the final layer (e.g.
+            # target_layer_ids ends at num_hidden_layers-1, so layers_to_capture
+            # contains end_layer). The final residual stream is already at the
+            # model-output scatter mode (TP_ATTN_FULL), matching the in-loop
+            # captures; clone to avoid the post-loop norm mutating it in place.
+            if self.end_layer in self.layers_to_capture:
+                aux_hidden_states.append(
+                    (hidden_states + residual).clone()
+                    if residual is not None
+                    else hidden_states.clone()
                 )
 
         hidden_states_before_norm = None
@@ -967,7 +1002,10 @@ class MiMoV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states, hidden_states_before_norm
+        if len(aux_hidden_states) == 0:
+            return hidden_states, hidden_states_before_norm
+
+        return hidden_states, hidden_states_before_norm, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -1052,6 +1090,9 @@ class MiMoV2ForCausalLM(nn.Module):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
+
+        # For DFLASH aux hidden state capture (target model side).
+        self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
@@ -1214,7 +1255,7 @@ class MiMoV2ForCausalLM(nn.Module):
         ), "forward() should not be called in encoder_only mode"
 
         if self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            model_out = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1223,7 +1264,7 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            model_out = self.model(
                 input_ids,
                 positions,
                 forward_batch,
@@ -1231,12 +1272,19 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
 
+        aux_hidden_states = None
+        if isinstance(model_out, tuple) and len(model_out) == 3:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = model_out
+        else:
+            hidden_states, hidden_states_before_norm = model_out
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states=aux_hidden_states,
                 hidden_states_before_norm=hidden_states_before_norm,
             )
         else:
@@ -1508,6 +1556,20 @@ class MiMoV2ForCausalLM(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is not None:
             self.model.load_kv_cache_scales(quantization_param_path)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # SGLang captures "before layer i". To capture the hidden state after target
+        # layer `k` (HF-style), we capture before layer `k + 1`.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

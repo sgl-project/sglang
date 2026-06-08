@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -267,6 +268,11 @@ class DFlashDraftConfig:
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    attention_sink_bias: bool = False
+    attention_value_scale: Optional[float] = None
+    use_swa: bool = False
+    swa_window_size: Optional[int] = None
+    backbone_rotary_base: Optional[float] = None
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -385,6 +391,66 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    raw_attention_sink_bias = dflash_cfg.get("attention_sink_bias", False)
+    if not isinstance(raw_attention_sink_bias, bool):
+        raise ValueError(
+            "DFLASH dflash_config.attention_sink_bias must be a bool, "
+            f"got {raw_attention_sink_bias!r} (type={type(raw_attention_sink_bias).__name__})."
+        )
+    attention_sink_bias = bool(raw_attention_sink_bias)
+
+    raw_attention_value_scale = dflash_cfg.get("attention_value_scale", None)
+    if raw_attention_value_scale is None:
+        attention_value_scale: Optional[float] = None
+    else:
+        if isinstance(raw_attention_value_scale, bool) or not isinstance(
+            raw_attention_value_scale, (int, float)
+        ):
+            raise ValueError(
+                "DFLASH dflash_config.attention_value_scale must be int|float|None, "
+                f"got {raw_attention_value_scale!r} "
+                f"(type={type(raw_attention_value_scale).__name__})."
+            )
+        attention_value_scale = float(raw_attention_value_scale)
+        if not math.isfinite(attention_value_scale):
+            raise ValueError(
+                "DFLASH dflash_config.attention_value_scale must be finite, "
+                f"got {attention_value_scale}."
+            )
+
+    raw_use_swa = dflash_cfg.get("use_swa", False)
+    if not isinstance(raw_use_swa, bool):
+        raise ValueError(
+            "DFLASH dflash_config.use_swa must be a bool, "
+            f"got {raw_use_swa!r} (type={type(raw_use_swa).__name__})."
+        )
+    use_swa = bool(raw_use_swa)
+
+    swa_window_size = _parse_optional_int(
+        dflash_cfg.get("swa_window_size", None),
+        field_name="DFLASH swa_window_size",
+        min_value=1,
+    )
+
+    raw_backbone_rotary_base = dflash_cfg.get("backbone_rotary_base", None)
+    if raw_backbone_rotary_base is None:
+        backbone_rotary_base: Optional[float] = None
+    else:
+        if isinstance(raw_backbone_rotary_base, bool) or not isinstance(
+            raw_backbone_rotary_base, (int, float)
+        ):
+            raise ValueError(
+                "DFLASH dflash_config.backbone_rotary_base must be int|float|None, "
+                f"got {raw_backbone_rotary_base!r} "
+                f"(type={type(raw_backbone_rotary_base).__name__})."
+            )
+        backbone_rotary_base = float(raw_backbone_rotary_base)
+        if not math.isfinite(backbone_rotary_base) or backbone_rotary_base <= 0:
+            raise ValueError(
+                "DFLASH dflash_config.backbone_rotary_base must be a positive finite number, "
+                f"got {backbone_rotary_base}."
+            )
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -392,6 +458,11 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        attention_sink_bias=attention_sink_bias,
+        attention_value_scale=attention_value_scale,
+        use_swa=use_swa,
+        swa_window_size=swa_window_size,
+        backbone_rotary_base=backbone_rotary_base,
     )
 
 
