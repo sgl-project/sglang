@@ -418,6 +418,24 @@ impl ActiveLoadRegistry {
 /// `Arc<ActiveLoadRegistry>` (cloned from the shared one held in
 /// `AppContext`).
 pub fn spawn_janitor(registry: Arc<ActiveLoadRegistry>, interval: Duration) -> JanitorHandle {
+    spawn_sweeper(move || registry.sweep_stale(), interval, "active-load")
+}
+
+/// Spawn a background task that calls `sweep` on a fixed cadence until its
+/// [`JanitorHandle`] is cancelled or dropped.
+///
+/// `sweep` returns the number of entries it removed; a non-zero count is
+/// logged at info under `{label} janitor`. This is the shared engine
+/// behind [`spawn_janitor`] (active-load stale-request reaping) and the
+/// sticky policy's idle-assignment eviction — both want the same
+/// cancel-aware ticker loop, differing only in what they sweep.
+///
+/// `interval` is the wall-clock cadence. Missed ticks are skipped (a long
+/// sweep does not cause a catch-up burst).
+pub fn spawn_sweeper<F>(mut sweep: F, interval: Duration, label: &'static str) -> JanitorHandle
+where
+    F: FnMut() -> usize + Send + 'static,
+{
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let join = tokio::spawn(async move {
@@ -427,16 +445,13 @@ pub fn spawn_janitor(registry: Arc<ActiveLoadRegistry>, interval: Duration) -> J
             tokio::select! {
                 biased;
                 _ = cancel_for_task.cancelled() => {
-                    tracing::debug!("active-load janitor: shutdown requested");
+                    tracing::debug!("{label} janitor: shutdown requested");
                     return;
                 }
                 _ = ticker.tick() => {
-                    let n = registry.sweep_stale();
+                    let n = sweep();
                     if n > 0 {
-                        tracing::info!(
-                            swept = n,
-                            "active-load janitor: removed stale requests",
-                        );
+                        tracing::info!(swept = n, "{label} janitor: removed entries");
                     }
                 }
             }

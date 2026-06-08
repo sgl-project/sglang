@@ -221,7 +221,9 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
-    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
+    # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
+    # else /tmp); see debug_utils/cuda_coredump.py.
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -337,6 +339,11 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
 
+    SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
+    SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
+
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
@@ -400,6 +407,26 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
+    # before the MoE block for models whose MoE input hidden_size must be
+    # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
+    # 256). When False (default) the pad runs as a separate
+    # torch.nn.functional.pad call inside the MoE method. When True, the
+    # aiter Triton kernel `fused_add_rmsnorm_pad` produces a padded
+    # post-attention layernorm output in one launch and the MoE method
+    # skips the explicit pad. Currently only takes effect on the
+    # post_attention_layernorm path with aiter backend and TP=1.
+    SGLANG_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
+    # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
+    # (size, head_num, head_dim) per-token storage that
+    # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.
+    # "vectorized_5d" allocates K as (num_blocks, H_kv, head_dim/x, page_size, x)
+    # and V as (num_blocks, H_kv, page_size/x, head_dim, x) (x = 16 / dtype_size),
+    # matching the SHUFFLE layout that aiter's CK FmhaBatchPrefill kernel and
+    # `aiter.ops.triton.gluon.pa_decode_gluon` both consume natively. This is
+    # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
+    # decode without runtime permutes.
+    SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -421,6 +448,9 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
+    # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
+    SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -752,6 +782,10 @@ class Envs:
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
+
+    # Eager forward wraps the ForwardBatch's own tensors instead of copying them
+    # into the CUDA graph buffer registry (no per-iter device-to-device copy).
+    SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
 
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
