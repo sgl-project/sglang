@@ -152,7 +152,8 @@ def _fill_compress_tail_kernel(
     for off in tl.range(0, Wc, BLOCK):
         j = off + tl.arange(0, BLOCK)
         m = j < nc
-        pi = tl.load(page_idx_ptr + t * Wc + j, mask=m, other=-1).to(tl.int32)
+        j_clamped = tl.minimum(j, Wc - 1)
+        pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=-1).to(tl.int32)
         slot = tl.where(pi >= 0, pi + swa_pages, -1)
         tl.store(indices_ptr + cbase + j, slot, mask=m)
 
@@ -270,7 +271,8 @@ def _prefill_lengths_kernel(
         for off in tl.range(0, Wc, BLOCK):
             j = off + tl.arange(0, BLOCK)
             m = j < Wc
-            pi = tl.load(page_idx_ptr + t * Wc + j, mask=m, other=-1)
+            j_clamped = tl.minimum(j, Wc - 1)
+            pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=-1)
             nc += tl.sum(tl.where(m & (pi >= 0), 1, 0))
         tl.store(prefix_len_ptr + t, prefix_swa_count + nc)
     else:
@@ -331,7 +333,8 @@ def _build_prefill_indices_kernel(
         for off in tl.range(0, Wc, BLOCK):
             j = off + tl.arange(0, BLOCK)
             m = j < nc
-            pi = tl.load(page_idx_ptr + t * Wc + j, mask=m, other=0).to(tl.int32)
+            j_clamped = tl.minimum(j, Wc - 1)
+            pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=0).to(tl.int32)
             tl.store(pre_out_ptr + cbase + j, pi + swa_pages, mask=m)
 
 

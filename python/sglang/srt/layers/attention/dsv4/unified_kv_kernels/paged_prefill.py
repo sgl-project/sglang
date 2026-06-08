@@ -123,10 +123,11 @@ def _sparse_attn_v4_paged_prefill_kernel(
             other=-1,
         )
         valid = in_range & (slot >= 0)
+        slot_clamped = tl.maximum(slot, 0)
 
         kv = tl.load(
             unified_kv_ptr
-            + slot[:, None] * pkv_stride_n
+            + slot_clamped[:, None] * pkv_stride_n
             + d_offs[None, :] * pkv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
@@ -160,9 +161,10 @@ def _sparse_attn_v4_paged_prefill_kernel(
             other=-1,
         )
         valid = in_range & (slot >= 0)
+        slot_clamped = tl.maximum(slot, 0)
 
         kv = tl.load(
-            kv_ptr + slot[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d,
+            kv_ptr + slot_clamped[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
