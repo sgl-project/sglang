@@ -377,7 +377,7 @@ def build_deepseek_v4_hicache_stack(
         c4_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
             state_pools=[
-                kvcache.compress_state_pools[layer_id]
+                kvcache.compress_state_pools[kvcache.start_layer + layer_id]
                 for layer_id in c4_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
@@ -388,7 +388,7 @@ def build_deepseek_v4_hicache_stack(
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
             state_pools=[
-                kvcache.indexer_compress_state_pools[layer_id]
+                kvcache.indexer_compress_state_pools[kvcache.start_layer + layer_id]
                 for layer_id in c4_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
@@ -442,7 +442,7 @@ def build_deepseek_v4_hicache_stack(
         c128_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
             state_pools=[
-                kvcache.compress_state_pools[layer_id]
+                kvcache.compress_state_pools[kvcache.start_layer + layer_id]
                 for layer_id in c128_state_global_layers
             ],
             num_host_pages=swa_num_host_pages,
