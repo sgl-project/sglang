@@ -3101,9 +3101,15 @@ class Scheduler(
                     return_hidden_states=batch.return_hidden_states,
                 )
             else:
+                # PP+SUFFIX needs pp_proxy_tensors threaded into the worker
+                # even when spec is on (the PP-aware SuffixWorker forwards it
+                # to target_worker.forward_batch_generation). Other spec
+                # algorithms don't read pp_proxy_tensors at the worker level
+                # but ignore the kwarg, so threading it unconditionally is
+                # safe.
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
+                    if self.spec_algorithm.is_none() or self.spec_algorithm.is_suffix()
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
