@@ -2,10 +2,11 @@
 # Run the sgl-project/DeepGEMM test suite against an installed sgl-deep-gemm
 # wheel, as a pre-release gate for release-whl-deepgemm.yml.
 #
-# Tests must run from <DEEPGEMM_SRC>/tests so `import deep_gemm` resolves to the
-# installed wheel (which ships the pre-compiled tvm-ffi _C.so) rather than the
-# source tree's deep_gemm/ package, which differs and JIT-rebuilds _C. The guard
-# below aborts if that resolution is wrong, to avoid a false-positive gate.
+# Tests live in <DEEPGEMM_SRC>/sgl_deep_gemm/tests and must run from there so
+# `import deep_gemm` resolves to the installed wheel (which ships the pre-compiled
+# tvm-ffi _C.so) rather than the source tree's deep_gemm/ package, which differs
+# and JIT-rebuilds _C. The guard below aborts if that resolution is wrong, to
+# avoid a false-positive gate.
 #
 # Usage: test_sgl_deep_gemm.sh <DEEPGEMM_SRC> [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
 set -uo pipefail
@@ -28,12 +29,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-TESTS_DIR="${DEEPGEMM_SRC}/tests"
-SGL_TESTS_DIR="${DEEPGEMM_SRC}/sgl_deep_gemm/tests"
+TESTS_DIR="${DEEPGEMM_SRC}/sgl_deep_gemm/tests"
 PYTHON="${PYTHON:-python3}"
 
 if [ ! -d "${TESTS_DIR}" ]; then
-  echo "No tests/ directory under ${DEEPGEMM_SRC}" >&2
+  echo "No sgl_deep_gemm/tests/ directory under ${DEEPGEMM_SRC}" >&2
   exit 1
 fi
 
@@ -77,11 +77,10 @@ SKIPPED=()
 
 run_test() {
   local name="$1"; shift
-  local dir="${RUN_DIR:-${TESTS_DIR}}"
   echo ""
   echo "----- RUN ${name} $* -----"
   local log; log=$(mktemp)
-  (cd "${dir}" && "${PYTHON}" "${name}" "$@") 2>&1 | tee "${log}"
+  (cd "${TESTS_DIR}" && "${PYTHON}" "${name}" "$@") 2>&1 | tee "${log}"
   local rc=${PIPESTATUS[0]}
   # Fork-based multiprocessing tests can crash in child processes while the
   # launcher still exits 0; treat an unhandled traceback as a failure too.
@@ -144,7 +143,7 @@ MEGA_MOE_L1=(
 )
 if [ "${SKIP_MEGA_MOE}" -eq 1 ]; then
   for t in "${MEGA_MOE_ALL[@]}"; do
-    { [ -f "${TESTS_DIR}/${t}" ] || [ -f "${SGL_TESTS_DIR}/${t}" ]; } && skip_test "${t}" "--skip-mega-moe"
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "--skip-mega-moe"
   done
 elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   if [ -f "${TESTS_DIR}/test_mega_moe.py" ]; then
@@ -159,12 +158,12 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   # (TMA stride at >=8 ranks, rel-RMSE). sglang's real path is covered by
   # test_mega_moe_pre_dispatch + test_mega_moe. Confirm on B200 before re-enabling.
   for t in "${MEGA_MOE_L1[@]}"; do
-    [ -f "${SGL_TESTS_DIR}/${t}" ] && skip_test "${t}" "fp4 kernel failures, see comment (confirm on B200)"
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "fp4 kernel failures, see comment (confirm on B200)"
   done
-  [ -f "${SGL_TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && RUN_DIR="${SGL_TESTS_DIR}" run_test test_mega_moe_pre_dispatch.py
+  [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
 else
   for t in "${MEGA_MOE_ALL[@]}"; do
-    { [ -f "${TESTS_DIR}/${t}" ] || [ -f "${SGL_TESTS_DIR}/${t}" ]; } && skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
   done
 fi
 
