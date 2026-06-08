@@ -153,9 +153,9 @@ class EncoderBootstrapServer:
     def register(self, url: str) -> bool:
         """Add *url* if not already present.  Returns True if added."""
         with self._lock:
+            self._consecutive_failures.pop(url, None)
             if url not in self._urls:
                 self._urls.append(url)
-                self._consecutive_failures.pop(url, None)
                 logger.info(f"Registered encoder URL: {url}")
                 return True
             logger.debug(f"Encoder URL already registered: {url}")
@@ -166,6 +166,7 @@ class EncoderBootstrapServer:
         with self._lock:
             if url in self._urls:
                 self._urls.remove(url)
+                self._consecutive_failures.pop(url, None)
                 logger.info(f"Unregistered encoder URL: {url}")
                 return True
             return False
