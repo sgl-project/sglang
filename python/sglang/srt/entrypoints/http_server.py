@@ -2342,6 +2342,31 @@ def _setup_and_run_http_server(
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
+def launch_tokenizer_server(
+    server_args: ServerArgs,
+    init_tokenizer_manager_func: Callable = init_tokenizer_manager,
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """
+    Launch a headless tokenizer-only server.
+
+    Loads only the tokenizer (no model weights, no GPU, no scheduler subprocesses).
+    Serves /v1/tokenize and /v1/detokenize.
+    """
+    tokenizer_manager, template_manager = init_tokenizer_manager_func(server_args, None)
+    _setup_and_run_http_server(
+        server_args,
+        tokenizer_manager,
+        template_manager,
+        port_args=None,
+        scheduler_infos=[{"max_req_input_len": tokenizer_manager.max_req_input_len}],
+        subprocess_watchdog=None,
+        execute_warmup_func=execute_warmup_func,
+        launch_callback=launch_callback,
+    )
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
