@@ -1002,6 +1002,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def model_specific_adjustment(self):
         server_args = self.server_args
 
+        # HRM-Text (and any prefix-LM recurrent model) needs bidirectional
+        # attention over the prompt during prefill. That is only honored by the
+        # Triton backend, and only when CUDA graphs and chunked prefill are off
+        # (see TritonAttnBackend.allow_bidirectional_attention_in_extend). Cross-
+        # request prefix (radix) caching is also unsafe because the recurrent
+        # forward writes direction-dependent KV into many slots. Force the
+        # required settings here rather than rely on the user passing flags.
+        hf_config = self.model_config.hf_config
+        is_prefix_lm_recurrent = (
+            getattr(hf_config, "model_type", None) == "hrm_text"
+            or "HrmTextForCausalLM" in getattr(hf_config, "architectures", [])
+        ) and getattr(hf_config, "prefix_lm", False)
+        if is_prefix_lm_recurrent:
+            if server_args.attention_backend not in (None, "triton"):
+                logger.warning(
+                    f"Overriding --attention-backend "
+                    f"{server_args.attention_backend!r} -> 'triton': only the "
+                    "Triton backend supports HRM-Text's bidirectional prefix "
+                    "attention."
+                )
+            server_args.attention_backend = "triton"
+            server_args.chunked_prefill_size = -1
+            server_args.disable_radix_cache = True
+            server_args.disable_cuda_graph = True
+            logger.warning(
+                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
+                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "prompt attention."
+            )
+
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1

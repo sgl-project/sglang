@@ -792,6 +792,23 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "HrmTextForCausalLM" in self.hf_config.architectures:
+            # HRM-Text unrolls two transformer stacks across nested H/L cycles;
+            # each recurrence step occupies its own KV cache slot. The total is
+            # num_layers_per_stack * H_cycles * (L_cycles + 1). A native
+            # transformers >= 5.9.0 config already inflates num_hidden_layers to
+            # this value in __post_init__, but compute it explicitly so KV
+            # allocation is correct even if num_hidden_layers carries the raw
+            # per-stack count.
+            H_cycles = self.hf_text_config.H_cycles
+            L_cycles = self.hf_text_config.L_cycles
+            num_layers_per_stack = (
+                getattr(self.hf_text_config, "num_layers_per_stack", None)
+                or self.num_hidden_layers
+            )
+            self.num_attention_layers = (
+                int(num_layers_per_stack) * H_cycles * (L_cycles + 1)
+            )
         if "WhisperForConditionalGeneration" in self.hf_config.architectures:
             # Whisper has unique layer ID scheme:
             # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
