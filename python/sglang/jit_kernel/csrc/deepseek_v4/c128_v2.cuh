@@ -358,7 +358,6 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   // each warp will handle a contiguous region
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
-
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
   PDLWaitPrimary<kUsePDL>();

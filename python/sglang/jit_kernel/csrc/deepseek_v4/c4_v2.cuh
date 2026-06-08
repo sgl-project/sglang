@@ -178,6 +178,7 @@ SGL_DEVICE void c4_forward(
   const auto gmem_out = tile::Memory<StorageOut>::warp();
   StorageOut result;
 
+  // consume 32 fp registers
   float score_fp32[kTileElements][8];
 
   // convert to fp32 and apply bias first
@@ -338,7 +339,6 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   // each warp will handle a contiguous region
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
-
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
   PDLWaitPrimary<kUsePDL>();
