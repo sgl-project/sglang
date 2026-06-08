@@ -527,9 +527,8 @@ class PiecewiseCudaGraphRunner:
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
-        if (
-            self.num_deepstack_embeddings > 0
-            and not self.buffer_registry.has_slot("input_deepstack_embeds")
+        if self.num_deepstack_embeddings > 0 and not self.buffer_registry.has_slot(
+            "input_deepstack_embeds"
         ):
             return False
         num_tokens = len(forward_batch.input_ids)
