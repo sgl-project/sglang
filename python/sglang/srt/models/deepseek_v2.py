@@ -1333,9 +1333,14 @@ class DeepseekV2MoE(nn.Module):
             return None
 
     def op_gate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
+        # Gate on `shape[0] > 0` (not is_non_idle_and_non_empty) to match the
+        # non-TBO `forward_deepep` path: a padded IDLE batch (dummy rows added
+        # by prepare_mlp_sync_batch under MAX_LEN DP-padding) still carries
+        # N>0 rows that must be routed, or topk_output stays 0-row while
+        # hidden_states is N-row and DeepEP dispatch asserts
+        # `x.size(0) == topk_idx.size(0)`. num_token_non_padded masks the dummy
+        # rows' expert ids to -1 downstream, so the routing is a no-op.
+        if state.hidden_states_mlp_input.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             state.router_logits = self.gate(state.hidden_states_mlp_input)
         else:
