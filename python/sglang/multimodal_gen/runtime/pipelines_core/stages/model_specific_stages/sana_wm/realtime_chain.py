@@ -38,6 +38,8 @@ from .base import (
 from .realtime_stage import (
     DEFAULT_REFINER_BLOCK_SIZE,
     DEFAULT_REFINER_KV_MAX_FRAMES,
+    SANA_WM_HEIGHT,
+    SANA_WM_WIDTH,
     SanaWMRealtimeStage,
     _motion_param,
 )
@@ -60,6 +62,8 @@ class SanaWMSessionInputsState(BaseRealtimeState):
         self.src_size = None
         self.resized_size = None
         self.crop_offset = None
+        self.target_height: int | None = None
+        self.target_width: int | None = None
         self.prompt: str = ""
         self.open_ended = False
         self.latent_t: int | None = None  # None => open-ended
@@ -161,6 +165,7 @@ class SanaWMCondFrameEncodeStage(SanaWMRealtimeStage):
                 st.resized_size,
                 st.crop_offset,
             ) = self._prepare_image(batch)
+            st.target_width, st.target_height = st.image.size
             st.prompt = str(batch.prompt)
             st.open_ended = self._is_open_ended(batch)
             if st.open_ended:
@@ -376,7 +381,6 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
         )
 
         from .base import SanaWMBeforeDenoisingStage
-        from .realtime_stage import SANA_WM_HEIGHT, SANA_WM_WIDTH
 
         if (
             inputs.src_size is None
@@ -405,8 +409,10 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
         )
         inputs.intrinsics_raw = intrinsics_raw
         vae_time_stride = 8
-        latent_h = SANA_WM_HEIGHT // 32
-        latent_w = SANA_WM_WIDTH // 32
+        pixel_h = int(inputs.target_height or batch.height or SANA_WM_HEIGHT)
+        pixel_w = int(inputs.target_width or batch.width or SANA_WM_WIDTH)
+        latent_h = pixel_h // 32
+        latent_w = pixel_w // 32
         latent_t = (num_frames - 1) // vae_time_stride + 1
         camera_to_world = (
             torch.from_numpy(np.asarray(c2w, dtype=np.float32))
@@ -431,8 +437,8 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
         rel_poses = SanaWMBeforeDenoisingStage._relative_camera_poses(camera_to_world)
         intrinsics_latent = SanaWMBeforeDenoisingStage._scale_intrinsics_to_latent(
             intrinsics_vec4,
-            pixel_h=SANA_WM_HEIGHT,
-            pixel_w=SANA_WM_WIDTH,
+            pixel_h=pixel_h,
+            pixel_w=pixel_w,
             latent_h=latent_h,
             latent_w=latent_w,
         )

@@ -167,6 +167,35 @@ def test_sana_wm_realtime_camera_state_uses_sana_normalizer():
     assert state.latest_sampled_event_id == 11
 
 
+def test_sana_wm_realtime_adapter_preserves_requested_size():
+    async def fake_save_image_to_path(image, target_path):
+        return target_path
+
+    old_save_image_to_path = sana_wm_realtime.save_image_to_path
+    old_get_global_server_args = sana_wm_realtime.get_global_server_args
+    sana_wm_realtime.save_image_to_path = fake_save_image_to_path
+    sana_wm_realtime.get_global_server_args = lambda: SimpleNamespace(
+        input_save_path=None
+    )
+    try:
+        adapter = sana_wm_realtime.SanaWMRealtimeAdapter()
+        session = GenerateSession()
+        session.set_adapter(adapter)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+            first_frame=b"fake-image",
+            size="832x480",
+        )
+
+        asyncio.run(adapter.on_init(session, request))
+
+        assert request.size == "832x480"
+    finally:
+        sana_wm_realtime.save_image_to_path = old_save_image_to_path
+        sana_wm_realtime.get_global_server_args = old_get_global_server_args
+
+
 def test_lingbot_realtime_adapter_ingests_generic_events():
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()

@@ -211,18 +211,23 @@ class SanaWMRealtimeStage(PipelineStage):
         ]
 
     def _empty_output(self, batch: Req) -> OutputBatch:
+        target_h, target_w = self._target_pixel_size(batch)
         output = torch.empty(
             (
                 1,
                 3,
                 0,
-                int(batch.height or SANA_WM_HEIGHT),
-                int(batch.width or SANA_WM_WIDTH),
+                target_h,
+                target_w,
             ),
             dtype=torch.float32,
             device=get_local_torch_device(),
         )
         return OutputBatch(output=output, metrics=batch.metrics)
+
+    @staticmethod
+    def _target_pixel_size(batch: Req) -> tuple[int, int]:
+        return int(batch.height or SANA_WM_HEIGHT), int(batch.width or SANA_WM_WIDTH)
 
     def _prepare_image(
         self, batch: Req
@@ -235,8 +240,9 @@ class SanaWMRealtimeStage(PipelineStage):
             original = Image.open(batch.image_path).convert("RGB")
         else:
             raise ValueError("SANA-WM realtime requires a first-frame image")
+        target_h, target_w = self._target_pixel_size(batch)
         cropped, src_size, resized_size, crop_offset = resize_and_center_crop(
-            original, SANA_WM_HEIGHT, SANA_WM_WIDTH
+            original, target_h, target_w
         )
         return cropped, original, src_size, resized_size, crop_offset
 
@@ -377,10 +383,13 @@ class SanaWMRealtimeStage(PipelineStage):
         if batch.image_path is None or not isinstance(batch.image_path, str):
             return None
         stat = os.stat(batch.image_path)
+        target_h, target_w = self._target_pixel_size(batch)
         return (
             batch.image_path,
             stat.st_mtime_ns,
             stat.st_size,
+            target_h,
+            target_w,
             device.type,
             device.index,
             vae_dtype,
@@ -444,8 +453,15 @@ class SanaWMRealtimeStage(PipelineStage):
         vae_dtype: torch.dtype,
     ) -> torch.Tensor:
         if latents.shape[2] == 0:
+            vae_stride = getattr(server_args.pipeline_config, "vae_stride", (8, 32, 32))
             return torch.empty(
-                (latents.shape[0], 3, 0, SANA_WM_HEIGHT, SANA_WM_WIDTH),
+                (
+                    latents.shape[0],
+                    3,
+                    0,
+                    int(latents.shape[3]) * int(vae_stride[1]),
+                    int(latents.shape[4]) * int(vae_stride[2]),
+                ),
                 dtype=torch.float32,
                 device=latents.device,
             )

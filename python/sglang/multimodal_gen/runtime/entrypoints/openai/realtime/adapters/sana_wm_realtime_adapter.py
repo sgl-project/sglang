@@ -121,7 +121,7 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
         if request.first_frame is None:
             raise ValueError("SANA-WM realtime requires first_frame")
 
-        request.size = SANA_WM_DEFAULT_SIZE
+        request.size = request.size or SANA_WM_DEFAULT_SIZE
         if request.num_frames is not None:
             request.num_frames = int(request.num_frames)
         else:

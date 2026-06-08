@@ -17,6 +17,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_chain import (
+    SanaWMCameraCondStage,
     SanaWMNoiseState,
     SanaWMRealtimeLatentPrepStage,
     SanaWMSessionInputsState,
@@ -60,6 +61,10 @@ def _realtime_stage():
     return SanaWMRealtimeStage(transformer=None, vae=None, model_path="")
 
 
+def _camera_stage():
+    return SanaWMCameraCondStage(transformer=None, vae=None, model_path="")
+
+
 def _batch(session, block_idx, image_latent):
     return SimpleNamespace(
         session=session,
@@ -93,6 +98,56 @@ def test_realtime_intrinsics_default_to_centered_heuristic():
     assert intrinsics.shape == (3, 4)
     assert intrinsics[0].tolist() == pytest.approx([665.6, 665.6, 416.0, 240.0])
     assert intrinsics[2].tolist() == pytest.approx([665.6, 665.6, 416.0, 240.0])
+
+
+def test_realtime_first_frame_uses_requested_size():
+    stage = _realtime_stage()
+    batch = SimpleNamespace(
+        condition_image=Image.new("RGB", (640, 360)),
+        image_path=None,
+        height=480,
+        width=832,
+    )
+
+    cropped, original, src_size, resized_size, crop_offset = stage._prepare_image(
+        batch
+    )
+
+    assert cropped.size == (832, 480)
+    assert original.size == (640, 360)
+    assert src_size == (640, 360)
+    assert resized_size == (853, 480)
+    assert crop_offset == (10, 0)
+
+
+def test_realtime_camera_conditioning_uses_requested_size():
+    stage = _camera_stage()
+    inputs = SanaWMSessionInputsState()
+    inputs.src_size = (640, 360)
+    inputs.resized_size = (853, 480)
+    inputs.crop_offset = (10, 0)
+    inputs.target_height = 480
+    inputs.target_width = 832
+    inputs.intrinsics_image = Image.new("RGB", (640, 360))
+    inputs.open_ended = True
+    batch = SimpleNamespace(
+        condition_inputs={},
+        extra={},
+        height=480,
+        width=832,
+        num_frames=17,
+    )
+
+    camera, plucker = stage._build_camera_windows(
+        batch,
+        inputs,
+        target_latent=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert camera.shape == (1, 3, 20)
+    assert plucker.shape == (1, 48, 3, 15, 26)
 
 
 def test_latent_prep_plan_and_noise_discipline(_global_args):
