@@ -364,6 +364,7 @@ class ServerArgs:
     tokenizer_worker_num: int = 1
     detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
+    tokenizer_only: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -4428,6 +4429,12 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--tokenizer-only",
+            action="store_true",
+            help="If set, start a tokenizer-only server (no GPU, no KV cache, no scheduler). "
+            "Enables the /v1/preprocess/* endpoints for chat-template + tokenization.",
         )
         parser.add_argument(
             "--load-format",

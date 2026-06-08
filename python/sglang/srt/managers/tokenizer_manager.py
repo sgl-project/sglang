@@ -234,7 +234,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        port_args: Optional[PortArgs],
     ):
         # Parse args
         self.server_args = server_args
@@ -249,29 +249,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
-        # Init inter-process communication
-        self.init_ipc_channels(port_args)
-
         # Init running status
         self.init_running_status()
 
-        # Init logging and dumping
-        self.init_request_logging_and_dumping()
+        if not server_args.tokenizer_only:
+            # Init inter-process communication
+            self.init_ipc_channels(port_args)
 
-        # Init weight update
-        self.init_weight_update()
+            # Init logging and dumping
+            self.init_request_logging_and_dumping()
 
-        # Init LoRA status
-        self.init_lora()
+            # Init weight update
+            self.init_weight_update()
 
-        # Init PD disaggregation and encoder disaggregation
-        self.init_disaggregation()
+            # Init LoRA status
+            self.init_lora()
 
-        # Init metric collector and watchdog
-        self.init_metric_collector_watchdog()
+            # Init PD disaggregation and encoder disaggregation
+            self.init_disaggregation()
 
-        # Init request dispatcher
-        self.init_request_dispatcher()
+            # Init metric collector and watchdog
+            self.init_metric_collector_watchdog()
+
+            # Init request dispatcher
+            self.init_request_dispatcher()
 
     def init_model_config(self):
         server_args = self.server_args
