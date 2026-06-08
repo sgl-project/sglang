@@ -265,6 +265,10 @@ class NgramVerifyInput(SpecInput):
         target_predict = target_predict.reshape(bs, self.draft_token_num)
 
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        # _PATCH_PAD_CAND: SUFFIX padding slots (token 0) must never match a
+        # target prediction -> mark them unmatchable so they're never accepted.
+        candidates = candidates.clone()
+        candidates[candidates == 0] = -1
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
@@ -295,6 +299,10 @@ class NgramVerifyInput(SpecInput):
     ):
         bs = batch.batch_size()
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        # _PATCH_PAD_CAND: SUFFIX padding slots (token 0) must never match a
+        # target prediction -> mark them unmatchable so they're never accepted.
+        candidates = candidates.clone()
+        candidates[candidates == 0] = -1
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
@@ -364,6 +372,7 @@ class NgramVerifyInput(SpecInput):
         logits_output: LogitsProcessorOutput,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        defer_apply: bool = False,  # _PATCH_PP_DEFER_APPLY
     ) -> torch.Tensor:
         bs = self.retrieve_index.shape[0]
         sampling_info = batch.sampling_info
@@ -432,10 +441,12 @@ class NgramVerifyInput(SpecInput):
         num_accept_tokens_cpu = num_correct_drafts_cpu + 1
         num_correct_drafts = num_correct_drafts_cpu.sum().item()
 
-        self._free_cache(batch, page_size, num_correct_drafts_cpu)
-
-        batch.seq_lens.add_(self.num_accept_tokens)
-        batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
+        # _PATCH_PP_DEFER_APPLY: on a PP last rank the caller defers the free +
+        # seq_lens advance so KV occupancy stays symmetric with non-last ranks.
+        if not defer_apply:
+            self._free_cache(batch, page_size, num_correct_drafts_cpu)
+            batch.seq_lens.add_(self.num_accept_tokens)
+            batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
         # Keep seq_lens_sum in sync; attn backends size kv_indices from it.
         batch.seq_lens_sum += int(num_accept_tokens_cpu.sum())
 
