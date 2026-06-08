@@ -83,6 +83,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    get_alloc_reserve_per_decode,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -687,9 +688,9 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids = array("q", origin_input_ids)
+        self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
-            array("q", origin_input_ids_unpadded)
+            origin_input_ids_unpadded
             if origin_input_ids_unpadded
             else self.origin_input_ids
         )  # Before image padding
@@ -818,7 +819,10 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
+        # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1004,6 +1008,14 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    def needs_host_load_back(self) -> bool:
+        """Whether any cache layer has a host hit that needs L2 H2D load_back."""
+        return (
+            self.host_hit_length > 0
+            or self.swa_host_hit_length > 0
+            or self.mamba_host_hit_length > 0
+        )
+
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
@@ -1114,6 +1126,8 @@ class Req(ReqDllmMixin):
                 self.last_host_node,
                 self.best_match_node,
                 self.host_hit_length,
+                self.swa_host_hit_length,
+                self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
@@ -1121,6 +1135,8 @@ class Req(ReqDllmMixin):
                 match_result.last_host_node,
                 match_result.best_match_node,
                 match_result.host_hit_length,
+                match_result.swa_host_hit_length,
+                match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:
@@ -2318,12 +2334,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
-        from sglang.srt.managers.utils import get_alloc_len_per_decode
-
-        alloc_len = get_alloc_len_per_decode()
+        reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
+            x = max(0, r.kv_committed_len + reserve - r.kv_allocated_len)
             cur = r.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
@@ -2472,10 +2486,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                 new_slot = None
             else:
-                new_slot = pool.mamba_pool.alloc(1)
+                new_slot = pool.mamba_allocator.alloc(1)
                 if new_slot is None:
                     self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    new_slot = pool.mamba_pool.alloc(1)
+                    new_slot = pool.mamba_allocator.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx

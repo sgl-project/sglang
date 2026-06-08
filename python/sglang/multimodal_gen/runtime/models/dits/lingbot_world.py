@@ -52,7 +52,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all,
     _usp_input_all_to_all_varlen,
+    _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
@@ -87,6 +89,18 @@ from sglang.srt.utils import add_prefix
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
+
+def _safe_tensor_version(tensor: torch.Tensor) -> int:
+    """Return ``tensor._version``, or ``0`` for inference-mode tensors.
+
+    Tensors created under ``torch.inference_mode`` do not track a version
+    counter, so reading ``tensor._version`` raises ``RuntimeError``. The value
+    is only used as a cache-invalidation hint for the camera conditioner, so a
+    constant fallback is safe for such tensors.
+    """
+    return 0 if tensor.is_inference() else tensor._version
+
+
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
@@ -95,6 +109,12 @@ def _compute_sequence_splits(total_len: int, world_size: int) -> list[int]:
     base = total_len // world_size
     remainder = total_len % world_size
     return [base + (1 if rank < remainder else 0) for rank in range(world_size)]
+
+
+def _sequence_splits_are_uniform(seq_splits: list[int]) -> bool:
+    return len(seq_splits) <= 1 or all(
+        seq_len == seq_splits[0] for seq_len in seq_splits
+    )
 
 
 def _sequence_shard_tensor(
@@ -111,6 +131,9 @@ def _sequence_all_gather_varlen(
     group: dist.ProcessGroup,
 ) -> torch.Tensor:
     rank = get_sp_parallel_rank()
+    if _sequence_splits_are_uniform(seq_splits):
+        return sequence_model_parallel_all_gather(x.contiguous(), dim=1)
+
     max_seq = max(seq_splits)
     local_seq = seq_splits[rank]
     if local_seq < max_seq:
@@ -215,6 +238,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
         forward_batch = get_forward_context().forward_batch
         seq_splits = None
+        uniform_seq_splits = False
         sequence_shard_enabled = (
             kv_cache is not None
             and forward_batch is not None
@@ -245,9 +269,14 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                     "LingBot causal sequence sharding requires forward_batch.sequence_shard_splits."
                 )
             seq_splits = list(seq_splits)
+            uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
             # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
-            qkv = _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
+            qkv = (
+                _usp_input_all_to_all(qkv, head_dim=2)
+                if uniform_seq_splits
+                else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
+            )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
         cache_view = kv_cache.update_and_get_attention_kv(
@@ -266,7 +295,11 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         if sequence_shard_enabled:
             assert seq_splits is not None
-            x = _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
+            x = (
+                _usp_output_all_to_all(x, head_dim=2)
+                if uniform_seq_splits
+                else _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
+            )
         return x
 
 
@@ -937,9 +970,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             return None
 
         forward_context = get_forward_context()
-        if forward_context.current_timestep < 0:
-            return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
-
         forward_batch = forward_context.forward_batch
         if not CausalLingBotWorldTransformer3DModel._should_cache_cam_conditioner(
             forward_batch
@@ -959,7 +989,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             c2ws_plucker_emb.dtype,
             c2ws_plucker_emb.device.type,
             c2ws_plucker_emb.device.index,
-            c2ws_plucker_emb._version,
+            _safe_tensor_version(c2ws_plucker_emb),
         )
         if cache.get("source_key") != source_key:
             cache.clear()
@@ -1382,7 +1412,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             c2ws_plucker_emb.dtype,
             c2ws_plucker_emb.device.type,
             c2ws_plucker_emb.device.index,
-            c2ws_plucker_emb._version,
+            _safe_tensor_version(c2ws_plucker_emb),
         )
         if cache.get("source_key") != source_key:
             cache.clear()

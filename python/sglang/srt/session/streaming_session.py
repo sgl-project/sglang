@@ -500,14 +500,14 @@ class StreamingSession(BasePrefixCache):
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""
-        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
-        if mamba_pool is None:
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is None:
             return
         if slot.mamba_pool_idx is not None:
-            mamba_pool.free(slot.mamba_pool_idx.unsqueeze(0))
+            mamba_allocator.free(slot.mamba_pool_idx.unsqueeze(0))
             slot.mamba_pool_idx = None
         if slot.mamba_ping_pong_track_buffer is not None:
-            mamba_pool.free(slot.mamba_ping_pong_track_buffer)
+            mamba_allocator.free(slot.mamba_ping_pong_track_buffer)
             slot.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
