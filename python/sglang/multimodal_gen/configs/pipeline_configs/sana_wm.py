@@ -119,7 +119,7 @@ def _normalize_sana_wm_torch_compile_scope(
         value = aliases.get(value, value)
     return _normalize_sana_wm_choice(
         value,
-        default="regional",
+        default="off",
         valid_values=_SANA_WM_TORCH_COMPILE_SCOPES,
         name=name,
         strict=strict,
@@ -192,7 +192,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     sana_wm_two_stage_residency: str = "auto"
     sana_wm_skip_refiner: bool = False
     sana_wm_diagnostics: bool = False
-    sana_wm_torch_compile_scope: str = "regional"
+    # SANA-WM torch.compile is opt-in until its graph-break/recompile behavior
+    # is validated across request shapes and camera-conditioning modes.
+    sana_wm_torch_compile_scope: str = "off"
     sana_wm_torch_compile_mode: str | None = None
     sana_wm_torch_compile_cache_size_limit: int = 128
 

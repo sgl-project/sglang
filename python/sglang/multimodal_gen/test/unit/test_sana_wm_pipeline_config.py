@@ -152,7 +152,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertEqual(self.config.sana_wm_two_stage_residency, "auto")
         self.assertFalse(self.config.sana_wm_skip_refiner)
         self.assertFalse(self.config.sana_wm_diagnostics)
-        self.assertEqual(self.config.sana_wm_torch_compile_scope, "regional")
+        self.assertEqual(self.config.sana_wm_torch_compile_scope, "off")
         self.assertIsNone(self.config.sana_wm_torch_compile_mode)
         self.assertEqual(self.config.sana_wm_torch_compile_cache_size_limit, 128)
 
@@ -2912,10 +2912,12 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         kwargs.update(overrides)
         return Req(**kwargs)
 
-    def test_torch_compile_regionally_compiles_repeated_blocks_by_default(
+    def test_torch_compile_regionally_compiles_repeated_blocks_when_requested(
         self,
     ) -> None:
-        stage = self._make_compile_stage()
+        stage = self._make_compile_stage(
+            SanaWMPipelineConfig(sana_wm_torch_compile_scope="regional")
+        )
         transformer = self._FakeRegionalCompileTransformer()
 
         with patch.dict(os.environ, {"SGLANG_TORCH_COMPILE_MODE": ""}):
@@ -2935,7 +2937,10 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
 
     def test_torch_compile_sana_wm_config_mode_overrides_global_default(self) -> None:
         stage = self._make_compile_stage(
-            SanaWMPipelineConfig(sana_wm_torch_compile_mode="reduce-overhead")
+            SanaWMPipelineConfig(
+                sana_wm_torch_compile_scope="regional",
+                sana_wm_torch_compile_mode="reduce-overhead",
+            )
         )
         transformer = self._FakeRegionalCompileTransformer()
 
@@ -2949,10 +2954,8 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         self.assertEqual(kwargs["dynamic"], True)
         self.assertEqual(kwargs["mode"], "reduce-overhead")
 
-    def test_torch_compile_scope_config_can_disable_regional_compile(self) -> None:
-        stage = self._make_compile_stage(
-            SanaWMPipelineConfig(sana_wm_torch_compile_scope="off")
-        )
+    def test_torch_compile_scope_defaults_to_off(self) -> None:
+        stage = self._make_compile_stage()
         transformer = self._FakeRegionalCompileTransformer()
 
         stage._maybe_enable_torch_compile(transformer)

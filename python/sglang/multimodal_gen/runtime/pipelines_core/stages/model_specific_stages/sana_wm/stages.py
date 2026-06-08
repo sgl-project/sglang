@@ -1846,7 +1846,7 @@ _sana_wm_optional_tensor_or_tensor_list_allow_empty = (
 
 
 _SANA_WM_TORCH_COMPILE_DEFAULT_CACHE_SIZE_LIMIT = 128
-_SANA_WM_TORCH_COMPILE_DEFAULT_SCOPE = "regional"
+_SANA_WM_TORCH_COMPILE_DEFAULT_SCOPE = "off"
 _SANA_WM_TORCH_COMPILE_SCOPES = ("regional", "full", "off")
 
 
@@ -2186,7 +2186,7 @@ class SanaWMDenoisingStage(DenoisingStage):
         return StageParallelismType.REPLICATED
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
-        """Regionally compile SANA-WM blocks while keeping GDN/UCPE attention eager."""
+        """Optionally compile SANA-WM blocks while keeping GDN/UCPE attention eager."""
         if not self.server_args.enable_torch_compile or not isinstance(
             module, nn.Module
         ):
@@ -2209,7 +2209,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             )
         )
         if compile_scope == "off":
-            logger.info(
+            logger.debug(
                 "SANA-WM torch.compile disabled by "
                 "pipeline_config.sana_wm_torch_compile_scope=off."
             )
@@ -2218,7 +2218,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             logger.warning(
                 "SANA-WM full-module torch.compile requested by "
                 "pipeline_config.sana_wm_torch_compile_scope=full. "
-                "The default regional scope is safer because GDN/UCPE attention "
+                "Regional scope is safer because GDN/UCPE attention "
                 "contains Triton launch-shape logic that should remain eager."
             )
             super()._maybe_enable_torch_compile(module)
