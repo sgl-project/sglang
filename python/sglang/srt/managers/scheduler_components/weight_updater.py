@@ -77,6 +77,7 @@ class SchedulerWeightUpdaterManager:
     is_fully_idle: Callable[..., bool]
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    cuda_graphs_need_recapture: bool = False
 
     def flush_cache_after_weight_update(self, recv_req) -> None:
         if recv_req.flush_cache:
@@ -84,6 +85,39 @@ class SchedulerWeightUpdaterManager:
                 empty_cache=recv_req.torch_empty_cache
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
+
+    def recapture_cuda_graphs_after_weight_update(self) -> None:
+        # Recapture TP worker CUDA graphs
+        tp_model_runner = self.tp_worker.model_runner
+        if tp_model_runner.graph_runner is not None:
+            logger.info("Recapturing TP worker CUDA graphs after weight update")
+            tp_model_runner.graph_runner.capture()
+        if getattr(tp_model_runner, "piecewise_cuda_graph_runner", None) is not None:
+            logger.info(
+                "Recapturing TP worker piecewise CUDA graphs after weight update"
+            )
+            tp_model_runner.init_piecewise_cuda_graphs()
+
+        # Recapture draft worker CUDA graphs if present
+        if self.draft_worker is not None:
+            draft_model_runner = _get_draft_model_runner(self.draft_worker)
+            if draft_model_runner is not None:
+                if draft_model_runner.graph_runner is not None:
+                    logger.info(
+                        "Recapturing draft worker CUDA graphs after weight update"
+                    )
+                    draft_model_runner.graph_runner.capture()
+                if (
+                    getattr(draft_model_runner, "piecewise_cuda_graph_runner", None)
+                    is not None
+                ):
+                    logger.info(
+                        "Recapturing draft worker piecewise CUDA graphs after weight update"
+                    )
+                    draft_model_runner.init_piecewise_cuda_graphs()
+
+    def mark_cuda_graphs_stale(self) -> None:
+        self.cuda_graphs_need_recapture = True
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
@@ -93,6 +127,7 @@ class SchedulerWeightUpdaterManager:
             success, message = self.draft_worker.update_weights_from_disk(recv_req)
         if tp_success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         if not success:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
@@ -118,6 +153,7 @@ class SchedulerWeightUpdaterManager:
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
@@ -131,6 +167,7 @@ class SchedulerWeightUpdaterManager:
         success, message = worker.update_weights_from_tensor(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -144,6 +181,7 @@ class SchedulerWeightUpdaterManager:
             success, message = self.draft_worker.update_weights_from_ipc(recv_req)
         if tp_success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         if not success:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -207,6 +245,10 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+        if self.cuda_graphs_need_recapture:
+            self.recapture_cuda_graphs_after_weight_update()
+            self.cuda_graphs_need_recapture = False
 
         return ResumeMemoryOccupationReqOutput()
 
