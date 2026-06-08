@@ -85,6 +85,9 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        assert (
+            req.fill_len == req.kv_committed_len
+        ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_committed_len
         ]

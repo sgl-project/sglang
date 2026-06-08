@@ -487,6 +487,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
+            assert (
+                req.fill_len == req.kv_committed_len
+            ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.kv_committed_len
             ]

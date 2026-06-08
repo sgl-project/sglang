@@ -610,6 +610,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it is unfinished."""
 
         def _skip_cache_unfinished_req(req: Req) -> None:
+            assert (
+                req.fill_len == req.kv_committed_len
+            ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.kv_committed_len
             ]
