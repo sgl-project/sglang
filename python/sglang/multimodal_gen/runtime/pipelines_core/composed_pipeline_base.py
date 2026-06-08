@@ -48,6 +48,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution import (
+    ProgressiveDenoisingStageRouter,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -711,6 +714,42 @@ class ComposedPipelineBase(ABC):
                     kwargs["pipeline"] = self
 
             return DenoisingStage(**kwargs)
+
+        return self.add_stage_factory(
+            RoleType.DENOISER,
+            create_stage,
+            stage_name,
+        )
+
+    def add_progressive_denoising_stage(
+        self,
+        progressive_stage_cls: type[DenoisingStage],
+        transformer_key: str = "transformer",
+        transformer_2_key: str | None = None,
+        scheduler_key: str = "scheduler",
+        vae_key: str | None = "vae",
+        stage_name: str = "denoising_stage",
+    ) -> "ComposedPipelineBase":
+
+        def create_stage() -> PipelineStage:
+            kwargs = {
+                "transformer": self.get_module(transformer_key),
+                "scheduler": self.get_module(scheduler_key),
+                "pipeline": self,
+            }
+
+            if transformer_2_key:
+                transformer_2 = self.get_module(transformer_2_key, None)
+                if transformer_2 is not None:
+                    kwargs["transformer_2"] = transformer_2
+
+            if vae_key:
+                kwargs["vae"] = self.get_module(vae_key, None)
+
+            return ProgressiveDenoisingStageRouter(
+                standard_stage=DenoisingStage(**kwargs),
+                progressive_stage_factory=lambda: progressive_stage_cls(**kwargs),
+            )
 
         return self.add_stage_factory(
             RoleType.DENOISER,

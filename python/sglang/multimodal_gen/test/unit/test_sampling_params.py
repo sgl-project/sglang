@@ -340,17 +340,32 @@ class TestProgressiveSamplingParams(unittest.TestCase):
                 p = SamplingParams(progressive_mode=mode)
                 self.assertEqual(p.progressive_mode, mode)
 
-    def test_batch_sig_exclude_on_all_progressive_fields(self):
+    def test_progressive_fields_affect_batch_signature(self):
         import dataclasses
 
         fields = {f.name: f for f in dataclasses.fields(SamplingParams)}
         for fname in ("progressive_mode", "progressive_levels", "progressive_delta"):
             with self.subTest(field=fname):
-                self.assertTrue(
+                self.assertFalse(
                     fields[fname].metadata.get("batch_sig_exclude"),
-                    f"{fname} must have batch_sig_exclude=True so different requests "
-                    "can mix progressive and fullres modes in the same server",
+                    f"{fname} changes denoising behavior and must stay in the batch signature",
                 )
+
+    def test_invalid_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            SamplingParams(progressive_mode="wavelet")
+
+    def test_invalid_levels_rejected(self):
+        for levels in (0, -1, True):
+            with self.subTest(levels=levels):
+                with self.assertRaises(ValueError):
+                    SamplingParams(progressive_levels=levels)
+
+    def test_invalid_delta_rejected(self):
+        for delta in (0, 1, -0.1):
+            with self.subTest(delta=delta):
+                with self.assertRaises(ValueError):
+                    SamplingParams(progressive_delta=delta)
 
     def test_cli_progressive_mode(self):
         parser = argparse.ArgumentParser()

@@ -29,7 +29,7 @@ except ImportError:
 _skip_no_scipy = unittest.skipUnless(HAS_SCIPY, "scipy not installed")
 
 from sglang.multimodal_gen.runtime.pipelines.qwen_image import QwenImagePipeline
-from sglang.multimodal_gen.runtime.pipelines.qwen_image_progressive import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
     QWEN_IMAGE_SPECTRUM_A,
     QWEN_IMAGE_SPECTRUM_BETA,
     QwenImageProgressiveDenoisingStage,
@@ -38,8 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines.qwen_image_progressive import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.scheduler_utils import (
+    ProgressiveDenoisingStageRouter,
     compute_stage_transitions,
     find_transition_steps,
     reset_scheduler_at_step,
@@ -54,6 +53,79 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     apply_upsample,
     dct_upsample_2d,
 )
+
+
+class _DummyDenoisingStage:
+    parallelism_type = None
+
+    def __init__(self, route_name: str):
+        self.route_name = route_name
+
+    def set_component_residency_manager(self, manager):
+        self.manager = manager
+
+    def set_registered_stage_name(self, stage_name: str):
+        self.registered_stage_name = stage_name
+
+    def set_profile_stage_name(self, stage_name: str):
+        self.profile_stage_name = stage_name
+
+    def component_uses(self, server_args, stage_name=None):
+        return []
+
+    def forward(self, batch, server_args):
+        batch.route_name = self.route_name
+        return batch
+
+
+class TestProgressiveDenoisingStageRouter(unittest.TestCase):
+    def test_fullres_does_not_construct_progressive_stage(self):
+        calls = []
+
+        def create_progressive_stage():
+            calls.append(1)
+            return _DummyDenoisingStage("progressive")
+
+        router = ProgressiveDenoisingStageRouter(
+            standard_stage=_DummyDenoisingStage("standard"),
+            progressive_stage_factory=create_progressive_stage,
+        )
+        batch = SimpleNamespace(progressive_mode="fullres")
+
+        out = router.forward(batch, SimpleNamespace())
+
+        self.assertEqual(out.route_name, "standard")
+        self.assertEqual(calls, [])
+
+    def test_progressive_stage_is_constructed_once(self):
+        calls = []
+
+        def create_progressive_stage():
+            calls.append(1)
+            return _DummyDenoisingStage("progressive")
+
+        router = ProgressiveDenoisingStageRouter(
+            standard_stage=_DummyDenoisingStage("standard"),
+            progressive_stage_factory=create_progressive_stage,
+        )
+        batch = SimpleNamespace(progressive_mode="dct_rewind")
+
+        router.forward(batch, SimpleNamespace())
+        router.forward(batch, SimpleNamespace())
+
+        self.assertEqual(batch.route_name, "progressive")
+        self.assertEqual(len(calls), 1)
+
+    def test_invalid_mode_raises(self):
+        router = ProgressiveDenoisingStageRouter(
+            standard_stage=_DummyDenoisingStage("standard"),
+            progressive_stage_factory=lambda: _DummyDenoisingStage("progressive"),
+        )
+        batch = SimpleNamespace(progressive_mode="wavelet")
+
+        with self.assertRaises(ValueError):
+            router.forward(batch, SimpleNamespace())
+
 
 # ---------------------------------------------------------------------------
 # DCT-II / IDCT-II correctness
@@ -347,7 +419,7 @@ class TestProgressiveDenoisingStageBase(unittest.TestCase):
 
     def test_flux_spectrum_constants_plausible(self):
         """FLUX VAE spectrum constants A and beta must be in physically meaningful ranges."""
-        from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
             FLUX_SPECTRUM_A,
             FLUX_SPECTRUM_BETA,
         )
@@ -366,7 +438,7 @@ class TestFlux2Pack(unittest.TestCase):
     """Verify _flux2_pack / _flux2_unpack shapes and roundtrip correctness."""
 
     def setUp(self):
-        from sglang.multimodal_gen.runtime.pipelines.flux_2_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
             _flux2_pack,
             _flux2_unpack,
         )
@@ -435,7 +507,7 @@ class TestFlux2ProgressiveStage(unittest.TestCase):
     """
 
     def _make_stage(self):
-        from sglang.multimodal_gen.runtime.pipelines.flux_2_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
             Flux2ProgressiveDenoisingStage,
         )
 
@@ -464,7 +536,7 @@ class TestFlux2ProgressiveStage(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_flux2_spectrum_constants_plausible(self):
-        from sglang.multimodal_gen.runtime.pipelines.flux_2_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
             FLUX_SPECTRUM_A,
             FLUX_SPECTRUM_BETA,
         )
@@ -692,7 +764,7 @@ class TestZImagePackUnpack(unittest.TestCase):
     """Verify Z-Image latent pack/unpack helpers are correct without a live model."""
 
     def _import_helpers(self):
-        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
             _zimage_repack,
             _zimage_unpack,
         )
@@ -744,11 +816,11 @@ class TestZImagePackUnpack(unittest.TestCase):
 
     def test_zimage_spectrum_constants_match_flux(self):
         """Z-Image uses the same VAE as FLUX, so spectrum constants must be identical."""
-        from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
             FLUX_SPECTRUM_A,
             FLUX_SPECTRUM_BETA,
         )
-        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
             ZIMAGE_SPECTRUM_A,
             ZIMAGE_SPECTRUM_BETA,
         )
@@ -757,7 +829,7 @@ class TestZImagePackUnpack(unittest.TestCase):
         self.assertAlmostEqual(ZIMAGE_SPECTRUM_BETA, FLUX_SPECTRUM_BETA, places=4)
 
     def test_zimage_spectrum_constants_plausible(self):
-        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
             ZIMAGE_SPECTRUM_A,
             ZIMAGE_SPECTRUM_BETA,
         )
@@ -768,7 +840,7 @@ class TestZImagePackUnpack(unittest.TestCase):
 
     def test_stage_transitions_with_zimage_constants(self):
         """Stage transitions computed with Z-Image constants should match FLUX exactly."""
-        from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
             ZIMAGE_SPECTRUM_A,
             ZIMAGE_SPECTRUM_BETA,
         )
@@ -781,7 +853,7 @@ class TestZImagePackUnpack(unittest.TestCase):
             H_lat=128,
             W_lat=128,
         )
-        from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
             FLUX_SPECTRUM_A,
             FLUX_SPECTRUM_BETA,
         )
@@ -805,7 +877,7 @@ class TestZImagePackUnpack(unittest.TestCase):
 
 class TestWanSpectrumConstants(unittest.TestCase):
     def _import_constants(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WAN_SPECTRUM_A,
             WAN_SPECTRUM_BETA,
         )
@@ -825,10 +897,10 @@ class TestWanSpectrumConstants(unittest.TestCase):
 
     def test_wan_beta_greater_than_flux(self):
         """WAN video spectrum decays faster than FLUX image spectrum (steeper roll-off)."""
-        from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
             FLUX_SPECTRUM_BETA,
         )
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WAN_SPECTRUM_BETA,
         )
 
@@ -836,7 +908,7 @@ class TestWanSpectrumConstants(unittest.TestCase):
 
     def test_stage_transitions_with_wan_constants(self):
         """Stage transition sigmas computed with WAN constants should be in (0, 1)."""
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WAN_SPECTRUM_A,
             WAN_SPECTRUM_BETA,
         )
@@ -857,11 +929,11 @@ class TestWanSpectrumConstants(unittest.TestCase):
 
     def test_flux_transition_sigma_earlier_than_wan(self):
         """FLUX has higher Nyquist power (lower beta) => stage transition fires earlier (higher sigma threshold)."""
-        from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
             FLUX_SPECTRUM_A,
             FLUX_SPECTRUM_BETA,
         )
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WAN_SPECTRUM_A,
             WAN_SPECTRUM_BETA,
         )
@@ -884,7 +956,7 @@ class TestWanSpectrumConstants(unittest.TestCase):
 
 class TestWanProgressiveStageHooks(unittest.TestCase):
     def _make_stage(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -900,7 +972,7 @@ class TestWanProgressiveStageHooks(unittest.TestCase):
         return stage
 
     def test_unpack_is_identity(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -910,7 +982,7 @@ class TestWanProgressiveStageHooks(unittest.TestCase):
         self.assertIs(result, x)
 
     def test_repack_is_identity(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -922,7 +994,7 @@ class TestWanProgressiveStageHooks(unittest.TestCase):
         self.assertIs(result, x)
 
     def test_on_resolution_change_is_noop(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -958,7 +1030,7 @@ class TestWanGenerateInitialNoise(unittest.TestCase):
 
     def test_noise_shape_video(self):
         """Initial noise should be [1, C, T_lat, h_lat, w_lat]."""
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -979,7 +1051,7 @@ class TestWanGenerateInitialNoise(unittest.TestCase):
         self.assertEqual(noise.shape, (1, 16, 21, 30, 52))
 
     def test_noise_dtype(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -998,7 +1070,7 @@ class TestWanGenerateInitialNoise(unittest.TestCase):
         self.assertEqual(noise.dtype, torch.bfloat16)
 
     def test_noise_is_deterministic_with_same_seed(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -1016,7 +1088,7 @@ class TestWanGenerateInitialNoise(unittest.TestCase):
         torch.testing.assert_close(a, b)
 
     def test_different_seeds_produce_different_noise(self):
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -1035,7 +1107,7 @@ class TestWanGenerateInitialNoise(unittest.TestCase):
 
     def test_t_lat_is_preserved_from_original_latent(self):
         """T_lat must equal original latent's shape[2], not h_lat or w_lat."""
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WanProgressiveDenoisingStage,
         )
 
@@ -1207,7 +1279,7 @@ class TestWanStageTransitions(unittest.TestCase):
 class TestWanProgressiveDenoisingStageInit(unittest.TestCase):
     def test_spectrum_constants_passed_to_super(self):
         """WanProgressiveDenoisingStage must expose WAN_SPECTRUM_A/BETA via _spectrum_A/B."""
-        from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
             WAN_SPECTRUM_A,
             WAN_SPECTRUM_BETA,
             WanProgressiveDenoisingStage,
@@ -1610,21 +1682,19 @@ class TestQwenImageProgressiveStage(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# QwenImagePipeline now carries QwenImageProgressiveDenoisingStage
+# QwenImagePipeline uses the shared progressive denoising helper
 # ---------------------------------------------------------------------------
 
 
 class TestQwenImagePipelineUsesProgressiveStage(unittest.TestCase):
-    """QwenImagePipeline is modified to always use QwenImageProgressiveDenoisingStage
-    (following the same pattern as FluxPipeline and ZImagePipeline).
-    """
+    """QwenImagePipeline should not carry a model-local router helper."""
 
     def test_pipeline_name(self):
         self.assertEqual(QwenImagePipeline.pipeline_name, "QwenImagePipeline")
 
-    def test_has_add_qwen_denoising_stage_method(self):
-        """QwenImagePipeline must expose _add_qwen_denoising_stage."""
-        self.assertTrue(hasattr(QwenImagePipeline, "_add_qwen_denoising_stage"))
+    def test_uses_shared_progressive_helper(self):
+        self.assertTrue(hasattr(QwenImagePipeline, "add_progressive_denoising_stage"))
+        self.assertFalse(hasattr(QwenImagePipeline, "_add_qwen_denoising_stage"))
 
     def test_required_config_modules(self):
         self.assertIn("transformer", QwenImagePipeline._required_config_modules)

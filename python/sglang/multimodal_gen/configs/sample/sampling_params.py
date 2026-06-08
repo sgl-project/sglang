@@ -167,15 +167,9 @@ class SamplingParams:
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
-    # Progressive resolution growing (DCT spectral upsampling)
-    # "fullres" disables progressive mode (default, identical to standard generation).
-    # "dct_rewind" uses DCT-II upsample + scheduler sigma rewind (recommended).
-    # "dct" uses DCT-II upsample without rewind.
-    progressive_mode: str = field(
-        default="fullres", metadata={"batch_sig_exclude": True}
-    )
-    progressive_levels: int = field(default=1, metadata={"batch_sig_exclude": True})
-    progressive_delta: float = field(default=0.01, metadata={"batch_sig_exclude": True})
+    progressive_mode: str = "fullres"
+    progressive_levels: int = 1
+    progressive_delta: float = 0.01
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -388,6 +382,28 @@ class SamplingParams:
                 raise ValueError(
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
+
+        if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
+            raise ValueError(
+                "progressive_mode must be one of 'fullres', 'dct', or "
+                f"'dct_rewind', got {self.progressive_mode!r}"
+            )
+        if (
+            isinstance(self.progressive_levels, bool)
+            or not isinstance(self.progressive_levels, int)
+            or self.progressive_levels <= 0
+        ):
+            raise ValueError(
+                f"progressive_levels must be a positive int, got {self.progressive_levels!r}"
+            )
+        if (
+            isinstance(self.progressive_delta, bool)
+            or not isinstance(self.progressive_delta, (int, float))
+            or not 0 < float(self.progressive_delta) < 1
+        ):
+            raise ValueError(
+                f"progressive_delta must be in (0, 1), got {self.progressive_delta!r}"
+            )
 
         # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
         # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
