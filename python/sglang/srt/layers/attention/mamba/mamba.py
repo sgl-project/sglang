@@ -56,6 +56,16 @@ elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_update_npu as causal_conv1d_update,
     )
+else:
+    # XPU and other devices: use triton implementations
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
+    )
+    causal_conv1d_fn = causal_conv1d_fn_triton
+    causal_conv1d_update = causal_conv1d_update_triton
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
