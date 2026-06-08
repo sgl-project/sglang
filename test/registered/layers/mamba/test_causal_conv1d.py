@@ -378,8 +378,10 @@ def test_causal_conv1d_varlen(
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
 
 
+# seqlen=4 with batch_size=4 gives per-sequence length 1 < state_len (width-1),
+# exercising the state_len > seqlen branch with mixed dtypes as well.
 @pytest.mark.parametrize("width", [4])
-@pytest.mark.parametrize("seqlen", [8, 249])
+@pytest.mark.parametrize("seqlen", [4, 8, 249])
 @pytest.mark.parametrize("dim", [64, 4096])
 def test_causal_conv1d_varlen_mixed_conv_state_dtype(dim, seqlen, width):
     """Regression test for a Triton compile error in causal_conv1d_fn when the
@@ -458,6 +460,45 @@ def test_causal_conv1d_varlen_mixed_conv_state_dtype(dim, seqlen, width):
 
     assert out.dtype == x_dtype
     assert torch.allclose(out[:, : out_ref.shape[-1]], out_ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("dim", [64, 2048])
+@pytest.mark.parametrize("width", [4])
+def test_causal_conv1d_update_mixed_conv_state_dtype(dim, width):
+    """Decode-path coverage for the conv_states/activation dtype mismatch.
+
+    `causal_conv1d_update` (used during decoding) reads the conv_state cache
+    (bf16) and the activations x (fp16 under AWQ). Its `tl.where` performs type
+    promotion rather than a strict branch merge, so it does not raise the
+    compile error the prefill kernel did; this asserts it still computes the
+    correct result with mismatched dtypes.
+    """
+    x_dtype = torch.float16
+    conv_state_dtype = torch.bfloat16
+    device = get_device()
+    empty_gpu_cache()
+    torch.manual_seed(0)
+
+    batch, seqlen = 2, 1
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=x_dtype)
+    conv_state = torch.randn(
+        batch, dim, width - 1, device=device, dtype=conv_state_dtype
+    )
+    weight = torch.randn(dim, width, device=device, dtype=x_dtype)
+    bias = torch.randn(dim, device=device, dtype=x_dtype)
+    activation = "silu"
+
+    # reference sees the bf16 cache as the kernel does: values cast to x dtype
+    conv_state_ref = conv_state.to(x_dtype).clone()
+
+    out = causal_conv1d_update(x, conv_state, weight, bias, activation=activation)
+    out_ref = causal_conv1d_update_ref(
+        x.clone(), conv_state_ref, weight, bias, activation=activation
+    )
+
+    assert out.dtype == x_dtype
+    assert torch.allclose(conv_state.to(x_dtype), conv_state_ref, rtol=1e-2, atol=5e-2)
+    assert torch.allclose(out, out_ref, rtol=1e-2, atol=5e-2)
 
 
 if __name__ == "__main__":
