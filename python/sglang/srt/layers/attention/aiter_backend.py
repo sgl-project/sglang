@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.utils import (
+    assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
@@ -59,6 +60,10 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.aiter_utils import (
+    forward_decode_vectorized_5d,
+    forward_extend_vectorized_5d,
+)
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
@@ -220,6 +225,21 @@ class AiterAttnBackend(AttentionBackend):
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
+
+        # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
+        # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
+        # through `set_kv_buffer` (which dispatches to the 5D Triton writer),
+        # and (b) route the decode attention through pa_decode_gluon (see the
+        # corresponding branch in forward_decode), since unified_attention's
+        # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
+        def _pool_is_vec5d(pool):
+            if isinstance(pool, SWAKVPool):
+                return getattr(pool.full_kv_pool, "kv_cache_layout", "nhd") == (
+                    "vectorized_5d"
+                )
+            return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
+
+        self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
 
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
@@ -1450,7 +1470,13 @@ class AiterAttnBackend(AttentionBackend):
             # metadata sites + paged_attention_ragged call site + FP8 KV
             # coordination, after which this allocation can revert to
             # per-page (gated on use_mla).
-            buffer_numel = max_bs * max_num_blocks_per_seq * self.page_size
+            # Reserve draft slack: MLA target_verify writes seq_len +
+            # num_draft_tokens per row; without it a near-full sequence
+            # overflows the buffer. Mirrors dsa / flashmla.
+            draft_slack = self.num_draft_tokens or 0
+            buffer_numel = max_bs * (
+                max_num_blocks_per_seq * self.page_size + draft_slack
+            )
             self.cuda_graph_kv_indices = torch.zeros(
                 (buffer_numel,),
                 dtype=torch.int32,
@@ -1691,6 +1717,18 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
+            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
+            if seq_lens_sum is not None:
+                kv_indices_used = seq_lens_sum + (
+                    self.num_draft_tokens * bs if self.use_mla else 0
+                )
+                assert_buffer_fits(
+                    kv_indices_used,
+                    kv_indices.numel(),
+                    "aiter target_verify kv_indices",
+                    bs=bs,
+                    seq_lens_sum=seq_lens_sum,
+                )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
@@ -1978,12 +2016,19 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                # 5D pool cannot be reshaped to the 4D paged view used by
+                # launch_reshape_and_cache_flash; always route through
+                # set_kv_buffer which dispatches to the SHUFFLE 5D writer.
+                if self.kv_cache_is_vectorized_5d:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, k_descale, v_descale
+                    )
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
                 # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
                 # use standard set_kv_buffer, as they lack SWA-specific attributes
                 # like full_to_swa_index_mapping.
-                if (
+                elif (
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
                 ):
@@ -2353,26 +2398,43 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
             bs0 = forward_batch.batch_size + 1
-
-            # To keep the mha_batch_prefill_func function parameters
-            # declare the necessary parameter and assign None as default value
             q_descale = None
 
+            window_size = (-1, -1)
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                window_size = (layer.sliding_window_size, -1)
+
+            if self.kv_cache_is_vectorized_5d:
+                return forward_extend_vectorized_5d(
+                    self,
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    bs0,
+                    window_size,
+                    sinks,
+                )
+
+            # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 q = q.to(fp8_dtype)
                 q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
 
-            window_size = (-1, -1)
-            page_table = self.forward_metadata.kv_indices
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                window_size = (layer.sliding_window_size, -1)
-                if self.forward_metadata.swa_page_table is not None:
-                    page_table = self.forward_metadata.swa_page_table
+            page_table = self.forward_metadata.kv_indices
+            if (
+                layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
+                and self.forward_metadata.swa_page_table is not None
+            ):
+                page_table = self.forward_metadata.swa_page_table
+
+            extra_kwargs = {}
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -2393,6 +2455,7 @@ class AiterAttnBackend(AttentionBackend):
                 q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                **extra_kwargs,
             )
 
             # The fp8bf16 aiter prefill kernel returns bf16 even when the
@@ -2422,12 +2485,17 @@ class AiterAttnBackend(AttentionBackend):
             v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
 
         if save_kv_cache:
+            # SHUFFLE 5D pool path — see forward_extend for rationale.
+            if self.kv_cache_is_vectorized_5d:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v, k_descale, v_descale
+                )
             # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
             # both unified attention and sliding window kv pool are active.
             # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
             # use standard set_kv_buffer, as they lack SWA-specific attributes
             # like full_to_swa_index_mapping.
-            if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
+            elif self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
@@ -2516,7 +2584,14 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 o = torch.empty_like(q, dtype=self.input_dtype)
 
-            if self.use_triton_unified_attention:
+            if self.kv_cache_is_vectorized_5d:
+                # SHUFFLE 5D pool: pa_decode_gluon for full + SWA layers
+                # (see :func:`aiter_utils.forward_decode_vectorized_5d`
+                # for the dispatch rationale).
+                forward_decode_vectorized_5d(
+                    self, q, layer, forward_batch, k_cache, v_cache, o, sinks
+                )
+            elif self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)
                 page_table = self.forward_metadata.kv_indices
