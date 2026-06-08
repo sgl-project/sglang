@@ -10,22 +10,12 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    PipelineStage,
-    StageParallelismType,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
-    scale_and_shift_latents,
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+    RealtimeDiffusionStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 from .base import (
     SanaWMBeforeDenoisingStage,
@@ -159,7 +149,7 @@ def _default_source_intrinsics(image: Image.Image, num_frames: int) -> np.ndarra
     return np.broadcast_to(intrinsics, (num_frames, 4)).copy()
 
 
-class SanaWMRealtimeStage(PipelineStage):
+class SanaWMRealtimeStage(RealtimeDiffusionStage):
     def __init__(
         self,
         *,
@@ -168,66 +158,17 @@ class SanaWMRealtimeStage(PipelineStage):
         model_path: str,
         refiner_stage: SanaWMLTX2RefinerStage | None = None,
     ) -> None:
-        super().__init__()
-        self.transformer = transformer
-        self.vae = vae
-        self.model_path = model_path
+        super().__init__(
+            transformer=transformer,
+            vae=vae,
+            model_path=model_path,
+            default_height=SANA_WM_HEIGHT,
+            default_width=SANA_WM_WIDTH,
+        )
         # Injected by the pipeline; we reuse its transformer / text encoder to
         # drive the RefinerChunkRunner. None -> stage-1-only output.
         self.refiner_stage = refiner_stage
         self.first_frame_latent_cache = None
-
-    @property
-    def role_affinity(self):
-        return RoleType.MONOLITHIC
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        # realtime session state contains runtime-only iterators and runners
-        return StageParallelismType.REPLICATED
-
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        stage_name = self._component_stage_name(stage_name)
-        return [
-            ComponentUse(
-                stage_name,
-                "transformer",
-                target_dtype=PRECISION_TO_TYPE[
-                    server_args.pipeline_config.dit_precision
-                ],
-                memory_intensive=True,
-                keep_ready_after_warmup=True,
-            ),
-            ComponentUse(
-                stage_name,
-                "vae",
-                target_dtype=PRECISION_TO_TYPE[
-                    server_args.pipeline_config.vae_precision
-                ],
-                keep_ready_after_warmup=True,
-            ),
-        ]
-
-    def _empty_output(self, batch: Req) -> OutputBatch:
-        target_h, target_w = self._target_pixel_size(batch)
-        output = torch.empty(
-            (
-                1,
-                3,
-                0,
-                target_h,
-                target_w,
-            ),
-            dtype=torch.float32,
-            device=get_local_torch_device(),
-        )
-        return OutputBatch(output=output, metrics=batch.metrics)
-
-    @staticmethod
-    def _target_pixel_size(batch: Req) -> tuple[int, int]:
-        return int(batch.height or SANA_WM_HEIGHT), int(batch.width or SANA_WM_WIDTH)
 
     def _prepare_image(
         self, batch: Req
@@ -240,7 +181,7 @@ class SanaWMRealtimeStage(PipelineStage):
             original = Image.open(batch.image_path).convert("RGB")
         else:
             raise ValueError("SANA-WM realtime requires a first-frame image")
-        target_h, target_w = self._target_pixel_size(batch)
+        target_h, target_w = self.target_pixel_size(batch)
         cropped, src_size, resized_size, crop_offset = resize_and_center_crop(
             original, target_h, target_w
         )
@@ -383,7 +324,7 @@ class SanaWMRealtimeStage(PipelineStage):
         if batch.image_path is None or not isinstance(batch.image_path, str):
             return None
         stat = os.stat(batch.image_path)
-        target_h, target_w = self._target_pixel_size(batch)
+        target_h, target_w = self.target_pixel_size(batch)
         return (
             batch.image_path,
             stat.st_mtime_ns,
@@ -429,20 +370,6 @@ class SanaWMRealtimeStage(PipelineStage):
             self.first_frame_latent_cache = (cache_key, first_latent.detach())
         return first_latent
 
-    def _ensure_conv_cache(self, state) -> dict:
-        """Lazily allocate the per-conv decoder cache threaded across chunks."""
-        if state.conv_cache is None:
-            state.conv_cache = self.vae.reset_decoder_cache()
-        return state.conv_cache
-
-    def _scale_and_shift(
-        self,
-        latents: torch.Tensor,
-        server_args: ServerArgs,
-    ) -> torch.Tensor:
-        """De-normalize latents before VAE decode (shared implementation)."""
-        return scale_and_shift_latents(latents, server_args, self.vae)
-
     @torch.inference_mode()
     def _decode_chunk(
         self,
@@ -465,8 +392,8 @@ class SanaWMRealtimeStage(PipelineStage):
                 dtype=torch.float32,
                 device=latents.device,
             )
-        conv_cache = self._ensure_conv_cache(state)
-        z = self._scale_and_shift(latents.to(vae_dtype), server_args)
+        conv_cache = self.ensure_causal_vae_conv_cache(state)
+        z = self.scale_and_shift_latents(latents.to(vae_dtype), server_args)
         decoded = self.vae.decode_chunk(z, conv_cache)
         return (decoded / 2 + 0.5).clamp(0, 1)
 

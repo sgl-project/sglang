@@ -36,9 +36,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+    RealtimeDiffusionStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
     RealtimeInputValidationStage,
     RealtimeInputValidationState,
+)
+from sglang.multimodal_gen.runtime.realtime.causal_state import (
+    RealtimeCausalDecodeState,
 )
 from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ControlStateTransition,
@@ -64,6 +70,51 @@ class _State(BaseRealtimeState):
 
     def dispose(self) -> None:
         self.disposed = True
+
+
+def test_realtime_diffusion_stage_declares_long_lived_components():
+    stage = RealtimeDiffusionStage()
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(dit_precision="bf16", vae_precision="fp32")
+    )
+
+    uses = stage.component_uses(server_args, stage_name="realtime")
+
+    assert [use.component_name for use in uses] == ["transformer", "vae"]
+    assert [use.stage_name for use in uses] == ["realtime", "realtime"]
+    assert uses[0].target_dtype == torch.bfloat16
+    assert uses[0].memory_intensive
+    assert uses[0].keep_ready_after_warmup
+    assert uses[1].target_dtype == torch.float32
+    assert not uses[1].memory_intensive
+    assert uses[1].keep_ready_after_warmup
+
+
+def test_realtime_diffusion_stage_requires_session():
+    stage = RealtimeDiffusionStage(default_height=480, default_width=832)
+    req = _Req(session=None)
+
+    try:
+        stage.require_session(req, context="test realtime")
+    except ValueError as exc:
+        assert "test realtime requires a realtime session" in str(exc)
+    else:
+        raise AssertionError("expected missing realtime session to fail")
+
+    session = object()
+    req.session = session
+    assert stage.require_session(req) is session
+
+
+def test_realtime_causal_decode_state_dispose_resets_frontier():
+    state = RealtimeCausalDecodeState()
+    state.conv_cache = {"cache": object()}
+    state.next_dec_idx = 7
+
+    state.dispose()
+
+    assert state.conv_cache is None
+    assert state.next_dec_idx == 0
 
 
 def test_realtime_session_cache_reuses_and_releases_state():

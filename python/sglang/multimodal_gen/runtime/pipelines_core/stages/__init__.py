@@ -68,6 +68,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
     RealtimeInputValidationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+    RealtimeDiffusionStage,
+    RealtimeStageComponent,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_text_encoding import (
     RealtimeTextEncodingStage,
 )
@@ -95,6 +99,8 @@ __all__ = [
     "PipelineStage",
     "InputValidationStage",
     "RealtimeInputValidationStage",
+    "RealtimeDiffusionStage",
+    "RealtimeStageComponent",
     "TimestepPreparationStage",
     "DMDTimestepPreparationStage",
     "LatentPreparationStage",

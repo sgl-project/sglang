@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     compute_chunk_plucker,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.realtime.causal_state import (
+    RealtimeCausalDecodeState,
+)
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -122,18 +125,6 @@ class SanaWMRefinerChainState(BaseRealtimeState):
         self.sink_size = 1
 
 
-class SanaWMDecodeChainState(BaseRealtimeState):
-    def __init__(self):
-        super().__init__()
-        self.conv_cache: dict | None = None
-        self.next_dec_idx = 0
-
-    def dispose(self):
-        super().dispose()
-        self.conv_cache = None
-        self.next_dec_idx = 0
-
-
 # --------------------------------------------------------------------- #
 # Chain stages
 # --------------------------------------------------------------------- #
@@ -143,8 +134,7 @@ class SanaWMCondFrameEncodeStage(SanaWMRealtimeStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if batch.session is None:
-            raise ValueError("SANA-WM realtime chain requires a realtime session")
+        session = self.require_session(batch, context="SANA-WM realtime chain")
         self._pipeline_config = server_args.pipeline_config
         device = get_local_torch_device()
         weight_dtype = PRECISION_TO_TYPE.get(
@@ -156,7 +146,7 @@ class SanaWMCondFrameEncodeStage(SanaWMRealtimeStage):
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
         configure_sana_wm_ltx2_vae_for_long_video(self.vae, server_args.pipeline_config)
 
-        st = batch.session.get_or_create_state(SanaWMSessionInputsState)
+        st = session.get_or_create_state(SanaWMSessionInputsState)
         if batch.block_idx == 0 or st.image is None:
             st.dispose()
             (
@@ -226,9 +216,10 @@ class SanaWMRealtimeLatentPrepStage(SanaWMRealtimeStage):
             getattr(server_args.pipeline_config, "dit_precision", "bf16"),
             torch.bfloat16,
         )
-        inputs = batch.session.get_or_create_state(SanaWMSessionInputsState)
-        noise = batch.session.get_or_create_state(SanaWMNoiseState)
-        cache = batch.session.get_or_create_state(SanaWMStreamCacheState)
+        session = self.require_session(batch, context="SANA-WM realtime chain")
+        inputs = session.get_or_create_state(SanaWMSessionInputsState)
+        noise = session.get_or_create_state(SanaWMNoiseState)
+        cache = session.get_or_create_state(SanaWMStreamCacheState)
         first_latent = batch.image_latent
         if first_latent is None:
             raise ValueError("cond-frame latent missing (run the encode stage first)")
@@ -343,8 +334,9 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
             getattr(server_args.pipeline_config, "dit_precision", "bf16"),
             torch.bfloat16,
         )
-        inputs = batch.session.get_or_create_state(SanaWMSessionInputsState)
-        cache = batch.session.get_or_create_state(SanaWMStreamCacheState)
+        session = self.require_session(batch, context="SANA-WM realtime chain")
+        inputs = session.get_or_create_state(SanaWMSessionInputsState)
+        cache = session.get_or_create_state(SanaWMStreamCacheState)
         plan = list(batch.extra.get("sana_wm_chunk_plan") or [])
         target_latent = cache.chunk_indices[-1] + sum(plan)
         if cache.chunk_idx == 0 and plan:
@@ -460,8 +452,9 @@ class SanaWMChunkedRefinerChainStage(SanaWMRealtimeStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        inputs = batch.session.get_or_create_state(SanaWMSessionInputsState)
-        st = batch.session.get_or_create_state(SanaWMRefinerChainState)
+        session = self.require_session(batch, context="SANA-WM realtime chain")
+        inputs = session.get_or_create_state(SanaWMSessionInputsState)
+        st = session.get_or_create_state(SanaWMRefinerChainState)
         stage1 = batch.latents  # growing stage-1 buffer from the denoise stage
         if stage1 is None:
             raise ValueError("refiner stage expects the stage-1 latent buffer")
@@ -550,7 +543,8 @@ class SanaWMCausalDecodeChainStage(SanaWMRealtimeStage):
 
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
         configure_sana_wm_ltx2_vae_for_long_video(self.vae, server_args.pipeline_config)
-        st = batch.session.get_or_create_state(SanaWMDecodeChainState)
+        session = self.require_session(batch, context="SANA-WM realtime chain")
+        st = session.get_or_create_state(RealtimeCausalDecodeState)
         src = batch.latents
         if src is None or src.shape[2] <= st.next_dec_idx:
             return self._empty_output(batch)
