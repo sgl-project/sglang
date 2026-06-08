@@ -627,6 +627,11 @@ class ServerArgs:
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
+    # SUFFIX speculative decoding (arctic_inference SuffixDecodingCache)
+    speculative_suffix_max_tree_depth: int = 24
+    speculative_suffix_max_cached_requests: int = 10000
+    speculative_suffix_max_spec_factor: float = 1.0
+    speculative_suffix_min_token_prob: float = 0.1
     enable_multi_layer_eagle: bool = False
 
     # Adaptive speculative decoding
@@ -5987,6 +5992,30 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
             help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-max-tree-depth",
+            type=int,
+            default=ServerArgs.speculative_suffix_max_tree_depth,
+            help="Max depth of the per-request suffix tree for SUFFIX speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-max-cached-requests",
+            type=int,
+            default=ServerArgs.speculative_suffix_max_cached_requests,
+            help="Max number of finished requests cached in the shared suffix tree for SUFFIX speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-max-spec-factor",
+            type=float,
+            default=ServerArgs.speculative_suffix_max_spec_factor,
+            help="SUFFIX max speculation factor: caps draft length relative to the matched suffix score.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-min-token-prob",
+            type=float,
+            default=ServerArgs.speculative_suffix_min_token_prob,
+            help="SUFFIX minimum per-token probability for a draft token to be proposed.",
         )
         parser.add_argument(
             "--speculative-adaptive",
