@@ -55,6 +55,16 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         )
 
     # ------------------------------------------------------------------
+    # Latent scale factor  (WanVAEArchConfig uses spatial_compression_ratio)
+    # ------------------------------------------------------------------
+
+    def _latent_scale_factor(self, server_args: ServerArgs) -> int:
+        arch = server_args.pipeline_config.vae_config.arch_config
+        return getattr(arch, "vae_scale_factor", None) or getattr(
+            arch, "spatial_compression_ratio", 8
+        )
+
+    # ------------------------------------------------------------------
     # Pack / Unpack overrides  (Wan latent is already [B, C, T, H, W])
     # ------------------------------------------------------------------
 

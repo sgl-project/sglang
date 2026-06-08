@@ -84,7 +84,7 @@ class BenchArgs:
     random_request_config: str = None
     random_request_seed: int = 42
 
-    # Progressive resolution growing (FLUX.1 and future models)
+    # Progressive resolution growing (FLUX.1, FLUX.2, Z-Image, Wan T2V, Qwen-Image)
     progressive_mode: str = "fullres"
     progressive_levels: int = 1
     progressive_delta: float = 0.01
