@@ -1419,9 +1419,12 @@ def _post_process_topk_ids(
         if (
             expert_location_dispatch_info is not None
             and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
-            and expert_location_dispatch_info.lplb_solver is not None
         ):
-            log2phy_prob = expert_location_dispatch_info.lplb_solver.solve(topk_ids)
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                log2phy_prob = lplb_solver.solve(topk_ids)
 
         if log2phy_prob is not None:
             topk_ids = topk_ids_logical_to_physical(

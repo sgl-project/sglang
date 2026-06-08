@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
@@ -31,7 +31,6 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
-    lplb_solver: object = field(default=None, repr=False)
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -41,12 +40,6 @@ class ExpertLocationDispatchInfo:
 
         if ep_dispatch_algorithm is None:
             return None
-
-        lplb_solver = None
-        if ep_dispatch_algorithm == "lp":
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -65,7 +58,6 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
-            lplb_solver=lplb_solver,
         )
 
 
@@ -97,8 +89,7 @@ def topk_ids_logical_to_physical(
         if log2phy_prob is None:
             raise RuntimeError(
                 "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
-                f"time (info.lplb_solver={info.lplb_solver!r}, "
-                f"topk_ids.shape={tuple(topk_ids.shape)})."
+                f"time (topk_ids.shape={tuple(topk_ids.shape)})."
             )
         return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
