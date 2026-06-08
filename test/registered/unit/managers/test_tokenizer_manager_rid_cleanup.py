@@ -24,6 +24,10 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.managers.tokenizer_manager_components.output_processor import (
+    OutputProcessor,
+    OutputProcessorConfig,
+)
 from sglang.srt.managers.tokenizer_manager_components.request_state import (
     init_req,
 )
@@ -115,6 +119,29 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    request_log_manager = MagicMock()
+    request_log_manager.dump_requests_folder = ""
+    request_log_manager.crash_dump_folder = ""
+    tm.output_processor = OutputProcessor(
+        rid_to_state=tm.rid_to_state,
+        tokenizer=MagicMock(),
+        request_metrics_recorder=MagicMock(),
+        request_log_manager=request_log_manager,
+        lora_controller=MagicMock(),
+        send_to_scheduler=tm.send_to_scheduler,
+        get_weight_version=lambda: "1",
+        get_served_model_name=lambda: "",
+        config=OutputProcessorConfig(
+            batch_notify_size=1,
+            incremental_streaming_output=False,
+            enable_metrics=False,
+            skip_tokenizer_init=False,
+            speculative_algorithm="",
+            speculative_num_draft_tokens=0,
+            dp_size=1,
+            enable_lora=False,
+        ),
+    )
     return tm
 
 
@@ -263,7 +290,7 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         tm.rid_to_state[rid] = state
 
         batch_output = _make_batch_str_output(rid)
-        asyncio.run(tm._handle_batch_output(batch_output))
+        asyncio.run(tm.output_processor.handle_batch_output(batch_output))
 
         self.assertNotIn(rid, tm.rid_to_state)
 
@@ -275,7 +302,7 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         tm.rid_to_state[rid] = state
 
         batch_output = _make_batch_str_output(rid)
-        asyncio.run(tm._handle_batch_output(batch_output))
+        asyncio.run(tm.output_processor.handle_batch_output(batch_output))
 
         # Resubmit with the same rid — should not raise
         obj = Mock(spec=GenerateReqInput)
@@ -302,7 +329,7 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
         # finished_reason=_NOT_FINISHED means the request is still ongoing
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        asyncio.run(tm._handle_batch_output(batch_output))
+        asyncio.run(tm.output_processor.handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
 
@@ -367,7 +394,7 @@ class TestResubmitAfterCompletion(CustomTestCase):
         tm.rid_to_state[rid] = state
 
         batch_output = _make_batch_str_output(rid, finished_reason={"type": "length"})
-        asyncio.run(tm._handle_batch_output(batch_output))
+        asyncio.run(tm.output_processor.handle_batch_output(batch_output))
 
         # rid should be cleaned up
         self.assertNotIn(rid, tm.rid_to_state)
