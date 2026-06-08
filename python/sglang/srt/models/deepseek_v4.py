@@ -67,7 +67,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.mhc import mhc_fused_post_pre, npu_hc_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -1328,6 +1327,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
 
             if self.use_fused_mhc_post_pre:
+                from sglang.srt.layers.mhc import mhc_fused_post_pre
+
                 for num_tokens in token_counts:
                     for path_name, hc_fn, hc_scale, hc_base, norm in paths:
                         tic = time.perf_counter()
@@ -1421,6 +1422,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
+            from sglang.srt.layers.mhc import npu_hc_pre
             return npu_hc_pre(
                 x,
                 hc_fn,
@@ -1581,6 +1583,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
+            from sglang.srt.layers.mhc import mhc_fused_post_pre
+
             residual, post, comb, hidden_states = mhc_fused_post_pre(
                 hidden_states,
                 prev_residual,
@@ -1651,6 +1655,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
             else:
+                from sglang.srt.layers.mhc import mhc_fused_post_pre
+
                 residual, post, comb, hidden_states = mhc_fused_post_pre(
                     hidden_states,
                     residual,
