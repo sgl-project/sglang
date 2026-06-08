@@ -6,6 +6,15 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
+# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
+FetchContent_Declare(
+    repo-flashmla-cutlass
+    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
+    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
+    SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
+)
+FetchContent_Populate(repo-flashmla-cutlass)
+
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
