@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     parse_sana_wm_action_string,
     sana_wm_action_to_camera_to_world,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_stage import (
+    SanaWMRealtimeStage,
+)
 
 __all__ = [
     "SanaWMBeforeDenoisingStage",
@@ -28,16 +31,3 @@ __all__ = [
     "sana_wm_action_to_camera_to_world",
     "SanaWMRealtimeStage",
 ]
-
-
-def __getattr__(name):
-    # Lazy: ``realtime_stage`` imports from this package, so an eager import
-    # here would hit a partially-initialized package. Defer to stay cycle-free.
-    if name == "SanaWMRealtimeStage":
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_stage import (
-            SanaWMRealtimeStage,
-        )
-
-        globals()["SanaWMRealtimeStage"] = SanaWMRealtimeStage
-        return SanaWMRealtimeStage
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

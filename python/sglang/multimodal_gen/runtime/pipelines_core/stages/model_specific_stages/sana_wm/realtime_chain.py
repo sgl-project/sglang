@@ -25,6 +25,9 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
+    compute_chunk_plucker,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -34,6 +37,8 @@ from . import parity_probe
 from .base import (
     _SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
     _SANA_WM_DEFAULT_TRANSLATION_SPEED,
+    SanaWMBeforeDenoisingStage,
+    configure_sana_wm_ltx2_vae_for_long_video,
 )
 from .realtime_stage import (
     DEFAULT_REFINER_BLOCK_SIZE,
@@ -43,7 +48,7 @@ from .realtime_stage import (
     SanaWMRealtimeStage,
     _motion_param,
 )
-from .streaming import SanaWMStreamCacheState
+from .streaming import SanaWMStreamCacheState, SanaWMStreamingDenoisingStage
 from .streaming_refiner import RefinerChunkRunner
 from .utils import snap_num_frames
 
@@ -148,10 +153,6 @@ class SanaWMCondFrameEncodeStage(SanaWMRealtimeStage):
         )
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
 
-        # Same per-tick VAE residency + LTX-2 long-video knobs as the batch path:
-        # cond-frame encode must match bitwise (parity root cause #2).
-        from .base import configure_sana_wm_ltx2_vae_for_long_video
-
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
         configure_sana_wm_ltx2_vae_for_long_video(self.vae, server_args.pipeline_config)
 
@@ -241,8 +242,6 @@ class SanaWMRealtimeLatentPrepStage(SanaWMRealtimeStage):
             if seed is not None:
                 noise.generator = torch.Generator(device=device).manual_seed(int(seed))
             if inputs.latent_t is not None:
-                from .streaming import SanaWMStreamingDenoisingStage
-
                 noise.segments = SanaWMStreamingDenoisingStage._autoregressive_segments(
                     int(inputs.latent_t), nfpb
                 )
@@ -376,12 +375,6 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
         ops; returns instead of writing legacy state). Coverage runs through the
         END of the planned chunks; within a fixed horizon ``max()`` keeps it
         EXACTLY at num_frames — bitwise-identical camera tensors."""
-        from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
-            compute_chunk_plucker,
-        )
-
-        from .base import SanaWMBeforeDenoisingStage
-
         if (
             inputs.src_size is None
             or inputs.resized_size is None
@@ -554,7 +547,6 @@ class SanaWMCausalDecodeChainStage(SanaWMRealtimeStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         device = get_local_torch_device()
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        from .base import configure_sana_wm_ltx2_vae_for_long_video
 
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
         configure_sana_wm_ltx2_vae_for_long_video(self.vae, server_args.pipeline_config)

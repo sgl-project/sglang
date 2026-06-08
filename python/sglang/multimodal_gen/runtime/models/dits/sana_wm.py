@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -73,6 +74,9 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     _UpstreamMlp,
     compute_chunk_plucker,
     process_camera_conditions_ucpe,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+    parity_probe,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -845,11 +849,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # parity harness (env-gated, no-op in prod): on the FIRST sink-path call
         # (frame_index not None), checksum the pre-block tensors and x after every
         # block to localize where the two execution paths first diverge.
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
-            parity_probe,
-        )
-
-        _probe_path = __import__("os").environ.get(parity_probe.ENV_BLOCK_PROBE)
+        _probe_path = os.environ.get(parity_probe.ENV_BLOCK_PROBE)
         _probe = None
         if (
             _probe_path

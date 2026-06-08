@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
+    compute_chunk_plucker,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
@@ -1698,10 +1701,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                     vae_temporal_stride=vae_temporal_stride,
                 )
                 if chunk_plucker is None:
-                    from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
-                        compute_chunk_plucker,
-                    )
-
                     chunk_plucker = compute_chunk_plucker(
                         camera_conditions=original_camera_conditions,
                         HW=(T_lat, sp_h, sp_w),
@@ -1899,10 +1898,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 vae_temporal_stride=vae_temporal_stride,
             )
             if chunk_plucker is None:
-                from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
-                    compute_chunk_plucker,
-                )
-
                 chunk_plucker = compute_chunk_plucker(
                     camera_conditions=original_camera_conditions,
                     HW=(T_lat, sp_h, sp_w),

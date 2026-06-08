@@ -22,6 +22,9 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _NUM_STREAM_CACHE_SLOTS,
 )
@@ -207,9 +210,6 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
     def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
         if not self._keep_resident:
             return super().component_uses(server_args, stage_name)
-        from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-            ComponentUse,
-        )
 
         stage_name = self._component_stage_name(stage_name)
         return [
