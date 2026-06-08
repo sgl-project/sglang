@@ -395,13 +395,8 @@ class Compressor(nn.Module):
     def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        if self.is_in_indexer:
-            ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
-        else:
-            ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
-
+        ret = token_to_kv_pool.get_state_pool(self.layer_id, self.is_in_indexer)
         assert isinstance(ret, CompressStatePool)
-
         return ret
 
     def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -522,7 +517,7 @@ class Compressor(nn.Module):
              ``cmp_kv`` of shape ``[min(T, T//ratio + B), head_dim]``.
 
         State_cache writes happen inside the op, so we do NOT also call
-        ``set_compress_state_buffer`` afterwards — only the compressed-kv
+        ``set_state_buffer`` afterwards — only the compressed-kv
         epilog (:meth:`_compressor_epilog_npu`) runs on the returned tensor.
 
         Requires ``state_dtype=fp32`` (already the case for DSV4), the new
@@ -557,10 +552,7 @@ class Compressor(nn.Module):
         pool = forward_batch.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(pool, DeepSeekV4TokenToKVPool)
-        if self.is_in_indexer:
-            state_cache = pool.get_indexer_compress_state_cache(self.layer_id)
-        else:
-            state_cache = pool.get_attention_compress_state_cache(self.layer_id)
+        state_cache = pool.get_state_cache(self.layer_id, self.is_in_indexer)
 
         cos, sin = get_fused_compressor_rope_cos_sin(
             self.freqs_cis, positions_cmp, dtype=torch.float32
@@ -613,7 +605,7 @@ class Compressor(nn.Module):
         * Prefill: split the seq into ``cutoff = seqlen - seqlen % ratio``
           tokens to compress + ``remainder`` to stash as state. For overlap
           (ratio=4), additionally stash the last ``ratio`` of the cutoff as
-          overlap state. State writes happen via ``set_compress_state_buffer``;
+          overlap state. State writes happen via ``set_state_buffer``;
           the cutoff portion gets ape-weighted softmax over the ratio dim,
           summed, then norm + rope + (optional) hadamard, then written via
           ``set_compress_buffer`` (in ``_compressor_epilog_npu``).
@@ -623,8 +615,8 @@ class Compressor(nn.Module):
           softmax + sum, and write the compressed token via
           ``set_compress_buffer``.
 
-        Relies on the pool's ``set_compress_state_buffer`` /
-        ``get_compress_state_buffer`` / ``set_compress_buffer`` API.
+        Relies on the pool's ``set_state_buffer`` /
+        ``get_state_buffer`` / ``set_compress_buffer`` API.
         """
         import torch_npu  # local: NPU-only, used for npu_rotary_mul below
 
@@ -824,7 +816,7 @@ class Compressor(nn.Module):
                     state_loc_decode = backend_fm.c4_state_loc
                 else:
                     state_loc_decode = backend_fm.c128_state_loc
-                token_to_kv_pool.set_compress_state_buffer(
+                token_to_kv_pool.set_state_buffer(
                     self.layer_id,
                     state_loc_decode[idx : idx + 1],
                     kv.view(1, 1, -1),
@@ -838,7 +830,7 @@ class Compressor(nn.Module):
                             forward_batch, 2 * ratio, page_table, idx, seqlen
                         )
                         kv_state, score_state = (
-                            token_to_kv_pool.get_compress_state_buffer(
+                            token_to_kv_pool.get_state_buffer(
                                 self.layer_id, self.is_in_indexer, kv_indices
                             )
                         )
@@ -860,7 +852,7 @@ class Compressor(nn.Module):
                             forward_batch, ratio, page_table, idx, seqlen
                         )
                         kv_state, score_state = (
-                            token_to_kv_pool.get_compress_state_buffer(
+                            token_to_kv_pool.get_state_buffer(
                                 self.layer_id, self.is_in_indexer, kv_indices
                             )
                         )
@@ -883,7 +875,7 @@ class Compressor(nn.Module):
             kv_state_cat = torch.cat(kv_state_to_be_cached, dim=0).unsqueeze(1)
             score_state_cat = torch.cat(score_state_to_be_cached, dim=0).unsqueeze(1)
             state_loc_cat = torch.cat(state_loc_list, dim=0)
-            token_to_kv_pool.set_compress_state_buffer(
+            token_to_kv_pool.set_state_buffer(
                 self.layer_id,
                 state_loc_cat,
                 kv_state_cat,

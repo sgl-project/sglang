@@ -83,7 +83,7 @@ class NPUCompressStatePool(CompressStatePool):
     Inherits everything from :class:`CompressStatePool` except the size
     formula and the post-init block-0 sentinel fill. The buffer layout
     ``(self._size, 2*coff*head_dim)`` and the ``state_cache_3d`` reshape
-    are unchanged, so :meth:`DeepSeekV4TokenToKVPool.get_attention_compress_state_cache`
+    are unchanged, so :meth:`DeepSeekV4TokenToKVPool.get_state_cache`
     keeps returning the kernel-expected ``(num_blocks, page_size,
     2*coff*head_dim)`` view without further plumbing.
     """

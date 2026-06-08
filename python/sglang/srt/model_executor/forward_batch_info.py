@@ -263,6 +263,36 @@ class DSV4OutCacheLoc:
 
 
 @dataclass
+class DSV4StateLens:
+    """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
+
+    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
+    threaded through ``mem_cache/common.py`` to
+    ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
+
+      * ``c{4,128}_prefix_lens`` / ``..._cpu`` — per-req prev cumulative
+        state-slot count (the paged allocator's ``prefix`` contract).
+      * ``c{4,128}_seq_lens`` / ``..._cpu`` — per-req new cumulative count.
+      * ``c{4,128}_extend_num_tokens`` — total new state slots this step.
+
+    Replaces the 10 loose ``c{4,128}_state_*`` kwargs the allocator used to
+    take: scheduler only produces this object, common only forwards it, the
+    allocator only consumes it.
+    """
+
+    c4_prefix_lens: torch.Tensor
+    c4_prefix_lens_cpu: torch.Tensor
+    c4_seq_lens: torch.Tensor
+    c4_seq_lens_cpu: torch.Tensor
+    c4_extend_num_tokens: int
+    c128_prefix_lens: torch.Tensor
+    c128_prefix_lens_cpu: torch.Tensor
+    c128_seq_lens: torch.Tensor
+    c128_seq_lens_cpu: torch.Tensor
+    c128_extend_num_tokens: int
+
+
+@dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
 

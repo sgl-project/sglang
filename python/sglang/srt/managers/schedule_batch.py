@@ -77,6 +77,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    DSV4StateLens,
     ForwardBatch,
     ForwardMode,
 )
@@ -1438,6 +1439,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # DSV4-NPU: bundled per-pool slots (full/swa/c4/c128/c4_state/c128_state)
     # produced by DSV4NPUTokenToKVPoolAllocator. None on non-DSV4 paths.
     out_cache_loc_dsv4: Optional[Any] = None
+    # DSV4-NPU: per-extend/decode c4/c128 compress-state pool alloc lens
+    # (DSV4StateLens), produced by _compute_dsv4_state_lens_*. None otherwise.
+    dsv4_state_lens: Optional[Any] = None
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -2819,33 +2823,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.c4_state_alloc_offset = seq_len - c4_alloc_len
             req.c128_state_alloc_offset = seq_len - c128_alloc_len
 
-        self.c4_state_prefix_lens_cpu = torch.tensor(
-            c4_prefix_list, dtype=torch.int64
-        )
-        self.c4_state_seq_lens_cpu = torch.tensor(c4_seq_list, dtype=torch.int64)
-        self.c128_state_prefix_lens_cpu = torch.tensor(
-            c128_prefix_list, dtype=torch.int64
-        )
-        self.c128_state_seq_lens_cpu = torch.tensor(
-            c128_seq_list, dtype=torch.int64
-        )
-        self.c4_state_prefix_lens = self.c4_state_prefix_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c4_state_seq_lens = self.c4_state_seq_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c128_state_prefix_lens = self.c128_state_prefix_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c128_state_seq_lens = self.c128_state_seq_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c4_state_extend_num_tokens = int(
-            sum(s - p for s, p in zip(c4_seq_list, c4_prefix_list))
-        )
-        self.c128_state_extend_num_tokens = int(
-            sum(s - p for s, p in zip(c128_seq_list, c128_prefix_list))
+        c4_prefix_lens_cpu = torch.tensor(c4_prefix_list, dtype=torch.int64)
+        c4_seq_lens_cpu = torch.tensor(c4_seq_list, dtype=torch.int64)
+        c128_prefix_lens_cpu = torch.tensor(c128_prefix_list, dtype=torch.int64)
+        c128_seq_lens_cpu = torch.tensor(c128_seq_list, dtype=torch.int64)
+        self.dsv4_state_lens = DSV4StateLens(
+            c4_prefix_lens=c4_prefix_lens_cpu.to(self.device, non_blocking=True),
+            c4_prefix_lens_cpu=c4_prefix_lens_cpu,
+            c4_seq_lens=c4_seq_lens_cpu.to(self.device, non_blocking=True),
+            c4_seq_lens_cpu=c4_seq_lens_cpu,
+            c4_extend_num_tokens=int(
+                sum(s - p for s, p in zip(c4_seq_list, c4_prefix_list))
+            ),
+            c128_prefix_lens=c128_prefix_lens_cpu.to(self.device, non_blocking=True),
+            c128_prefix_lens_cpu=c128_prefix_lens_cpu,
+            c128_seq_lens=c128_seq_lens_cpu.to(self.device, non_blocking=True),
+            c128_seq_lens_cpu=c128_seq_lens_cpu,
+            c128_extend_num_tokens=int(
+                sum(s - p for s, p in zip(c128_seq_list, c128_prefix_list))
+            ),
         )
 
     def _compute_dsv4_state_lens_decode(self, bs: int) -> None:
@@ -2880,30 +2876,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.c4_state_kv_len = new_c4
             req.c128_state_kv_len = new_c128
 
-        self.c4_state_prefix_lens_cpu = torch.tensor(
-            c4_prefix_list, dtype=torch.int64
+        c4_prefix_lens_cpu = torch.tensor(c4_prefix_list, dtype=torch.int64)
+        c4_seq_lens_cpu = torch.tensor(c4_seq_list, dtype=torch.int64)
+        c128_prefix_lens_cpu = torch.tensor(c128_prefix_list, dtype=torch.int64)
+        c128_seq_lens_cpu = torch.tensor(c128_seq_list, dtype=torch.int64)
+        self.dsv4_state_lens = DSV4StateLens(
+            c4_prefix_lens=c4_prefix_lens_cpu.to(self.device, non_blocking=True),
+            c4_prefix_lens_cpu=c4_prefix_lens_cpu,
+            c4_seq_lens=c4_seq_lens_cpu.to(self.device, non_blocking=True),
+            c4_seq_lens_cpu=c4_seq_lens_cpu,
+            c4_extend_num_tokens=bs,
+            c128_prefix_lens=c128_prefix_lens_cpu.to(self.device, non_blocking=True),
+            c128_prefix_lens_cpu=c128_prefix_lens_cpu,
+            c128_seq_lens=c128_seq_lens_cpu.to(self.device, non_blocking=True),
+            c128_seq_lens_cpu=c128_seq_lens_cpu,
+            c128_extend_num_tokens=bs,
         )
-        self.c4_state_seq_lens_cpu = torch.tensor(c4_seq_list, dtype=torch.int64)
-        self.c128_state_prefix_lens_cpu = torch.tensor(
-            c128_prefix_list, dtype=torch.int64
-        )
-        self.c128_state_seq_lens_cpu = torch.tensor(
-            c128_seq_list, dtype=torch.int64
-        )
-        self.c4_state_prefix_lens = self.c4_state_prefix_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c4_state_seq_lens = self.c4_state_seq_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c128_state_prefix_lens = self.c128_state_prefix_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c128_state_seq_lens = self.c128_state_seq_lens_cpu.to(
-            self.device, non_blocking=True
-        )
-        self.c4_state_extend_num_tokens = bs
-        self.c128_state_extend_num_tokens = bs
 
     def _maybe_evict_dsv4_state(self, req: Req, pre_len: int) -> None:
         """Per-decode evict for the DSV4-NPU compress-state pools.
