@@ -274,29 +274,32 @@ class ModelConfig:
                 self.hf_config.topk_group = n_group
 
         # Hybrid FP8 (linear/attn) + NVFP4 (MoE) checkpoints
-        # (e.g. nvidia/DeepSeek-V4-Pro-NVFP4): config.json declares
-        # quant_method=fp8 + moe_quant_algo=NVFP4, and the NVFP4 details
-        # (group_size, exclude_modules) live in a sibling
-        # `hf_quant_config.json`. Detect here and stash the meta; the
-        # model loader copies it into the constructed Fp8Config the same
-        # way it does with `is_fp4_experts`.
+        # (e.g. nvidia/DeepSeek-V4-Pro-NVFP4) declare
+        # `quant_algo=MIXED_PRECISION` + `moe_quant_algo=NVFP4` in
+        # `config.json:quantization_config`, alongside the NVFP4 MoE
+        # `group_size` and `ignore` glob list. Stash for
+        # `_get_quantization_config` to consume the same way it carries
+        # `is_fp4_experts`.
         self.nvfp4_moe_meta: Optional[dict] = None
         hybrid_quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if hybrid_quant_cfg is not None and not isinstance(hybrid_quant_cfg, dict):
             hybrid_quant_cfg = hybrid_quant_cfg.to_dict()
         if (
             hybrid_quant_cfg is not None
-            and hybrid_quant_cfg.get("quant_method") == "fp8"
+            and str(hybrid_quant_cfg.get("quant_algo", "")).upper() == "MIXED_PRECISION"
             and str(hybrid_quant_cfg.get("moe_quant_algo", "")).upper() == "NVFP4"
+            and hybrid_quant_cfg.get("group_size") is not None
         ):
-            self.nvfp4_moe_meta = self._extract_nvfp4_moe_meta()
-            if self.nvfp4_moe_meta is not None:
-                logger.info(
-                    "Auto-detected hybrid FP8+NVFP4 checkpoint "
-                    "(NVFP4 MoE group_size=%d, %d exclude_modules)",
-                    self.nvfp4_moe_meta["group_size"],
-                    len(self.nvfp4_moe_meta.get("exclude_modules") or []),
-                )
+            self.nvfp4_moe_meta = {
+                "group_size": int(hybrid_quant_cfg["group_size"]),
+                "exclude_modules": list(hybrid_quant_cfg.get("ignore") or []),
+            }
+            logger.info(
+                "Auto-detected hybrid FP8+NVFP4 checkpoint "
+                "(NVFP4 MoE group_size=%d, %d exclude_modules)",
+                self.nvfp4_moe_meta["group_size"],
+                len(self.nvfp4_moe_meta["exclude_modules"]),
+            )
 
         # Check model type
         self.attention_chunk_size = getattr(
@@ -962,118 +965,79 @@ class ModelConfig:
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
-            quant_config_dict = self._load_hf_quant_config_dict()
-            if quant_config_dict is not None:
+            is_local = os.path.exists(self.model_path)
+            if not is_local:
+                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+                if envs.SGLANG_USE_MODELSCOPE.get():
+
+                    from modelscope import HubApi, model_file_download
+
+                    hf_api = HubApi()
+                else:
+                    import huggingface_hub
+                    from huggingface_hub import HfApi, hf_hub_download
+
+                    hf_api = HfApi()
+                try:
+                    # In offline mode, skip file_exists check to avoid OfflineModeIsEnabled error
+                    # Instead, directly try to download/read from cache with local_files_only
+                    file_exists = False  # Initialize to avoid UnboundLocalError
+                    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+                        # Online mode: check if file exists before attempting download (optimization)
+                        file_exists = retry(
+                            lambda: hf_api.file_exists(
+                                self.model_path, "hf_quant_config.json"
+                            ),
+                            max_retry=2,
+                            initial_delay=1.0,
+                            max_delay=5.0,
+                        )
+                        if not file_exists:
+                            # File doesn't exist on hub, no need to try downloading
+                            return quant_cfg  # None
+
+                    # Download (online mode) or read from cache (offline mode)
+                    if envs.SGLANG_USE_MODELSCOPE.get():
+                        quant_config_file = model_file_download(
+                            model_id=self.model_path,
+                            file_path="hf_quant_config.json",
+                            revision=self.revision,
+                        )
+                    else:
+                        quant_config_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename="hf_quant_config.json",
+                            revision=self.revision,
+                            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                        )
+                    with open(quant_config_file) as f:
+                        quant_config_dict = json.load(f)
+                    quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                except huggingface_hub.errors.LocalEntryNotFoundError:
+                    # Offline mode and file not in cache - this is normal for non-quantized models
+                    logger.debug(
+                        f"hf_quant_config.json not found in cache for {self.model_path} "
+                        "(offline mode, normal for non-quantized models)"
+                    )
+                except huggingface_hub.errors.OfflineModeIsEnabled:
+                    # Should not reach here after our changes, but keep for safety
+                    logger.warning(
+                        "Offline mode is enabled, skipping hf_quant_config.json check"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to load hf_quant_config.json for model %s: %s",
+                        self.model_path,
+                        e,
+                    )
+            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+                quant_config_file = os.path.join(
+                    self.model_path, "hf_quant_config.json"
+                )
+                with open(quant_config_file) as f:
+                    quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
-
-    def _load_hf_quant_config_dict(self) -> Optional[dict]:
-        """Load `hf_quant_config.json` as a raw dict.
-
-        Returns None when the file is unavailable, which is the normal case
-        for non-quantized models.
-        """
-        is_local = os.path.exists(self.model_path)
-        if not is_local:
-            # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-            if envs.SGLANG_USE_MODELSCOPE.get():
-
-                from modelscope import HubApi, model_file_download
-
-                hf_api = HubApi()
-            else:
-                import huggingface_hub
-                from huggingface_hub import HfApi, hf_hub_download
-
-                hf_api = HfApi()
-            try:
-                # In offline mode, skip file_exists check to avoid OfflineModeIsEnabled error
-                # Instead, directly try to download/read from cache with local_files_only
-                file_exists = False  # Initialize to avoid UnboundLocalError
-                if not huggingface_hub.constants.HF_HUB_OFFLINE:
-                    # Online mode: check if file exists before attempting download (optimization)
-                    file_exists = retry(
-                        lambda: hf_api.file_exists(
-                            self.model_path, "hf_quant_config.json"
-                        ),
-                        max_retry=2,
-                        initial_delay=1.0,
-                        max_delay=5.0,
-                    )
-                    if not file_exists:
-                        # File doesn't exist on hub, no need to try downloading
-                        return None
-
-                # Download (online mode) or read from cache (offline mode)
-                if envs.SGLANG_USE_MODELSCOPE.get():
-                    quant_config_file = model_file_download(
-                        model_id=self.model_path,
-                        file_path="hf_quant_config.json",
-                        revision=self.revision,
-                    )
-                else:
-                    quant_config_file = hf_hub_download(
-                        repo_id=self.model_path,
-                        filename="hf_quant_config.json",
-                        revision=self.revision,
-                        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                    )
-                with open(quant_config_file) as f:
-                    return json.load(f)
-            except huggingface_hub.errors.LocalEntryNotFoundError:
-                # Offline mode and file not in cache - this is normal for non-quantized models
-                logger.debug(
-                    f"hf_quant_config.json not found in cache for {self.model_path} "
-                    "(offline mode, normal for non-quantized models)"
-                )
-            except huggingface_hub.errors.OfflineModeIsEnabled:
-                # Should not reach here after our changes, but keep for safety
-                logger.warning(
-                    "Offline mode is enabled, skipping hf_quant_config.json check"
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to load hf_quant_config.json for model %s: %s",
-                    self.model_path,
-                    e,
-                )
-            return None
-        elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-            quant_config_file = os.path.join(self.model_path, "hf_quant_config.json")
-            with open(quant_config_file) as f:
-                return json.load(f)
-        return None
-
-    def _extract_nvfp4_moe_meta(self) -> Optional[dict]:
-        """Extract NVFP4 MoE group_size and exclude_modules from hf_quant_config.json.
-
-        Used for hybrid checkpoints where `config.json:quantization_config`
-        declares FP8 linear + NVFP4 MoE but only the sibling
-        `hf_quant_config.json` carries the NVFP4 details.
-        This is for nvidia/DeepSeek-V4-Pro-NVFP4 only, other modelopt checkpoints use the standard config.json.
-
-        Returns {"group_size": int, "exclude_modules": list[str]} on success,
-        or None when the file is missing or has no NVFP4 entries.
-        """
-        d = self._load_hf_quant_config_dict()
-        if not d:
-            return None
-        q = d.get("quantization") or {}
-        quantized_layers = q.get("quantized_layers") or {}
-        if not quantized_layers:
-            return None
-        group_size = None
-        for info in quantized_layers.values():
-            if str(info.get("quant_algo", "")).upper() == "NVFP4":
-                group_size = info.get("awq_block_size") or info.get("group_size")
-                if group_size:
-                    break
-        if group_size is None:
-            return None
-        return {
-            "group_size": int(group_size),
-            "exclude_modules": list(q.get("exclude_modules") or []),
-        }
 
     def _find_quant_modelslim_config(self):
         if self.is_draft_model:
