@@ -34,6 +34,23 @@ def _server_args_for_transformer_component(
     if component_name not in ("transformer_2", "unconditional_transformer"):
         return server_args
 
+    # Some pipelines have secondary DiT components with their own quantized
+    # weight file. Keep the mapping model-owned and the loader generic.
+    component_weights_paths = getattr(
+        server_args, "component_transformer_weights_paths", {}
+    )
+    component_weights_path = component_weights_paths.get(component_name)
+    if component_weights_path is not None:
+        component_server_args = copy.copy(server_args)
+        component_server_args.transformer_weights_path = component_weights_path
+        component_server_args.nunchaku_config = None
+        logger.info(
+            "Using transformer_weights_path override for %s: %s",
+            component_name,
+            component_weights_path,
+        )
+        return component_server_args
+
     if (
         server_args.transformer_weights_path is None
         and server_args.nunchaku_config is None
