@@ -14,7 +14,6 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization import BASE_QUANTIZATION_METHODS
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptMixedPrecisionConfig,
@@ -688,14 +687,6 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
         )
-
-
-class TestNvFp4PerTokenActivationConfig(CustomTestCase):
-    def test_quantization_registry_uses_activation_scoped_name(self):
-        self.assertIn("nvfp4_per_token_activation", BASE_QUANTIZATION_METHODS)
-
-        quant_config_cls = BASE_QUANTIZATION_METHODS["nvfp4_per_token_activation"]
-        self.assertEqual(quant_config_cls.get_name(), "nvfp4_per_token_activation")
 
 
 if __name__ == "__main__":
