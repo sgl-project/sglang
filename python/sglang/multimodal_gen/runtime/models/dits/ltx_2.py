@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -601,8 +601,8 @@ class LTX2Attention(nn.Module):
         self.k_norm: nn.Module | None = None
         if self.qk_norm:
             if tp_size == 1:
-                self.q_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
-                self.k_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                self.q_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
+                self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
             else:
                 self.q_norm = LTX2TPRMSNormAcrossHeads(
                     full_hidden_size=self.inner_dim,
