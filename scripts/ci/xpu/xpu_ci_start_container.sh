@@ -4,9 +4,8 @@ set -euo pipefail
 # Start the Intel XPU CI container (ci_sglang_xpu) using the latest nightly
 # intel/sglang-dev image published by .github/workflows/release-docker-intel-xpu-nightly.yml.
 #
-# Mirrors the AMD pattern in scripts/ci/amd/amd_ci_start_container.sh: walk
-# back N days through nightly date-stamped tags, pull the first match, then
-# start a long-running container that subsequent steps `docker exec` into.
+# Walks back N days through nightly date-stamped tags, pulls the first match,
+# then starts a long-running container that subsequent steps `docker exec` into.
 
 CONTAINER_NAME="ci_sglang_xpu"
 IMAGE_REPO="intel/sglang-dev"
@@ -155,7 +154,6 @@ docker run -dt \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"
 
-# Mirror what amd_ci_start_container.sh does: mark the workspace mount as a
-# safe directory so git operations as root inside the container don't trip
-# the cross-user repo guard.
+# Mark the workspace mount as a safe directory so git operations as root
+# inside the container don't trip the cross-user repo guard.
 docker exec "${CONTAINER_NAME}" git config --global --add safe.directory /sglang-checkout || true
