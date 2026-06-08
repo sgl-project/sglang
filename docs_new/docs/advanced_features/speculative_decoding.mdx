@@ -556,6 +556,8 @@ Relevant parameters:
 
 > **Note:** Standalone speculative decoding currently **does not support** `--enable-dp-attention`.
 
+> **Note:** The draft model must share the **same vocabulary** as the target model (identical `vocab_size` and token-to-ID mappings). SGLang validates this at startup and raises an error if a mismatch is detected. If you want to use a draft model from a different model family (e.g., a Qwen draft with a Llama target), use `--speculative-algorithm TLI` instead (see [PR #22883](https://github.com/sgl-project/sglang/pull/22883)).
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model Qwen/Qwen2.5-7B-Instruct \

@@ -1613,8 +1613,8 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
-                    # standalonedraft model and cuda graphs
+                if self.speculative_algorithm in ("STANDALONE", "TLI"):
+                    # standalone / TLI draft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
@@ -5796,7 +5796,7 @@ class ServerArgs:
             type=str,
             help=(
                 "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
-                "NGRAM, DFLASH. Or any name registered via "
+                "TLI, NGRAM, DFLASH. Or any name registered via "
                 "`SpeculativeAlgorithm.register`."
             ),
         )
@@ -8098,8 +8098,8 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_model_config().hf_config
     arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
-        # The default value for standalone speculative decoding
+    if self.speculative_algorithm in ("STANDALONE", "TLI"):
+        # The default value for standalone / TLI speculative decoding
         return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama

@@ -210,9 +210,11 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
-        )
+        # Always disable draft model CUDA graph capture: the draft CUDA graph runner
+        # (Device2DraftCudaGraphRunner / EAGLEDraftExtendCudaGraphRunner) triggers
+        # cudaErrorStreamCaptureInvalidated / cudaErrorStreamCaptureUnsupported on
+        # certain GPU/driver combinations. The target model's CUDA graphs are unaffected.
+        self.draft_model_runner.server_args.disable_cuda_graph = True
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )

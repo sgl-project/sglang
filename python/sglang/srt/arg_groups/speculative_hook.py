@@ -114,6 +114,8 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
         _handle_frozen_kv_mtp(server_args)
     elif server_args.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
         _handle_eagle_family(server_args)
+    elif server_args.speculative_algorithm == "TLI":
+        _handle_tli(server_args)
     elif server_args.speculative_algorithm == "NGRAM":
         _handle_ngram(server_args)
 
@@ -384,6 +386,70 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
             f"{server_args.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
+
+
+def _handle_tli(server_args: "ServerArgs") -> None:
+    if server_args.enable_dp_attention:
+        raise ValueError("TLI speculative decoding does not support dp attention.")
+
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError(
+            "TLI speculative decoding requires setting "
+            "--speculative-draft-model-path to a model with a different "
+            "but overlapping vocabulary."
+        )
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for TLI speculative decoding. "
+            "You can override this by explicitly setting --max-running-requests."
+        )
+
+    server_args.disable_overlap_schedule = True
+    logger.warning(
+        "Overlap scheduler is disabled when using TLI speculative decoding "
+        "(spec v2 is not supported yet)."
+    )
+
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using "
+            "TLI speculative decoding."
+        )
+
+    if server_args.speculative_num_steps is None:
+        assert (
+            server_args.speculative_eagle_topk is None
+            and server_args.speculative_num_draft_tokens is None
+        )
+        from sglang.srt.server_args import auto_choose_speculative_params
+
+        (
+            server_args.speculative_num_steps,
+            server_args.speculative_eagle_topk,
+            server_args.speculative_num_draft_tokens,
+        ) = auto_choose_speculative_params(server_args)
+
+    if (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk != 1
+    ):
+        raise ValueError(
+            "TLI speculative decoding only supports speculative_eagle_topk == 1."
+        )
+    server_args.speculative_eagle_topk = 1
+
+    if (
+        server_args.speculative_num_draft_tokens
+        != server_args.speculative_num_steps + 1
+    ):
+        logger.warning(
+            "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+            "for TLI speculative decoding."
+        )
+        server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
 
 def _handle_ngram(server_args: "ServerArgs") -> None:
