@@ -34,6 +34,9 @@ import triton.language as tl
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
 )
+from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
+    write_v4_paged_decode_indices,
+)
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
@@ -50,7 +53,7 @@ def _swa_scatter_kernel(
     final_pos_ptr,  # [T] int
     unified_ptr,  # [pages, D] bf16
     n_rows,
-    cs,  # SWA ring per-slot stride
+    ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
     D: tl.constexpr,
     HAS_FINAL: tl.constexpr,
@@ -65,7 +68,7 @@ def _swa_scatter_kernel(
         if pos <= fp - win:
             return
     s = tl.load(state_slot_ptr + row)
-    loc = s * cs + (pos % cs)
+    loc = s * ring_stride + (pos % ring_stride)
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
@@ -79,7 +82,7 @@ def store_swa_into_unified(
     positions: torch.Tensor,  # [T] int
     unified_kv: torch.Tensor,  # [pages, head_dim] bf16
     win: int,  # SWA attention window length
-    cs: int,  # SWA ring stride
+    ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
 ) -> None:
     n_rows, D = kv.shape
@@ -98,7 +101,7 @@ def store_swa_into_unified(
         fp_arg,
         unified_kv,
         n_rows,
-        cs,
+        ring_stride,
         win=win,
         D=D,
         HAS_FINAL=has_final,
@@ -127,11 +130,6 @@ def decode(
     return sparse_attn_v4_paged_decode(
         q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
     )
-
-
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
-    write_v4_paged_decode_indices,
-)
 
 
 @triton.jit
@@ -192,10 +190,10 @@ def build_decode_streams(
     swa_len: torch.Tensor,  # [N] int
     hca_len: torch.Tensor,  # [N] int
     csa_len: torch.Tensor,  # [N] int
-    c128_page_indices: torch.Tensor,  # [N, Wc128] int32
+    hca_page_indices: torch.Tensor,  # [N, hca_width] int32
     csa_width: int,
     win: int,  # SWA attention window length
-    cs: int,  # SWA ring per-slot stride
+    ring_stride: int,  # SWA ring per-slot stride
     swa_pages: int,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
@@ -205,14 +203,14 @@ def build_decode_streams(
     assert state_slot.is_contiguous() and positions.is_contiguous()
     state_slot = state_slot.to(torch.int32)
     positions = positions.to(torch.int32)
-    Wc128 = c128_page_indices.shape[1]
+    hca_width = hca_page_indices.shape[1]
 
     swa_p = _lengths_to_indptr(swa_len)
     hca_p = _lengths_to_indptr(swa_len + hca_len)
     csa_p = _lengths_to_indptr(swa_len + csa_len)
 
     swa_i = torch.empty(N * win, dtype=torch.int32, device=device)
-    hca_i = torch.empty(N * (win + Wc128), dtype=torch.int32, device=device)
+    hca_i = torch.empty(N * (win + hca_width), dtype=torch.int32, device=device)
     csa_i = torch.empty(N * (win + csa_width), dtype=torch.int32, device=device)
 
     if N > 0:
@@ -229,13 +227,13 @@ def build_decode_streams(
             hca_indices=hca_i,
             T=N,
             win=win,
-            cs=cs,
+            ring_stride=ring_stride,
         )
         fill_compress_tail(
             indices=hca_i,
             indptr=hca_p,
             prefix_len=swa_len,
-            page_indices=c128_page_indices[:N],
+            page_indices=hca_page_indices[:N],
             valid_len=hca_len,
             swa_pages=swa_pages,
         )
@@ -260,11 +258,11 @@ def _prefill_lengths_kernel(
     """Per token: write extend/prefix segment lengths"""
     t = tl.program_id(0)
     pos = tl.load(positions_ptr + t).to(tl.int32)
-    cs = tl.load(chunk_start_ptr + t).to(tl.int32)
-    tpic = pos - cs
+    cstart = tl.load(chunk_start_ptr + t).to(tl.int32)
+    tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
     extend_count = tl.minimum(tpic + 1, win)
-    prefix_swa_count = tl.minimum(tl.maximum(cs - swa_low, 0), win)
+    prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
     tl.store(extend_len_ptr + t, extend_count)
     if HAS_COMPRESS:
         nc = 0
@@ -300,14 +298,14 @@ def _build_prefill_indices_kernel(
     """Per token: write extend rows + prefix (SWA ring slots ++ swa_pages+compressed slots) as two ragged segments"""
     t = tl.program_id(0)
     pos = tl.load(positions_ptr + t).to(tl.int32)
-    cs = tl.load(chunk_start_ptr + t).to(tl.int32)
+    cstart = tl.load(chunk_start_ptr + t).to(tl.int32)
     cuq = tl.load(cu_q_ptr + t).to(tl.int32)
     s = tl.load(state_slot_ptr + t).to(tl.int32)
 
-    tpic = pos - cs
+    tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
     extend_count = tl.minimum(tpic + 1, win)
-    prefix_swa_count = tl.minimum(tl.maximum(cs - swa_low, 0), win)
+    prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
 
     ebase = tl.load(ext_indptr_ptr + t)
     pbase = tl.load(pre_indptr_ptr + t)
@@ -334,7 +332,9 @@ def _build_prefill_indices_kernel(
             j = off + tl.arange(0, BLOCK)
             m = j < nc
             j_clamped = tl.minimum(j, Wc - 1)
-            pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=0).to(tl.int32)
+            pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=0).to(
+                tl.int32
+            )
             tl.store(pre_out_ptr + cbase + j, pi + swa_pages, mask=m)
 
 
@@ -346,7 +346,7 @@ def build_prefill_indices(
     chunk_start: torch.Tensor,  # [T] int (absolute start of this chunk for token's seq)
     cu_q: torch.Tensor,  # [T] int (row in extend `kv` of the seq's first chunk token)
     win: int,  # SWA attention window length
-    cs: int,  # SWA ring per-slot stride / modulo (win_with_spec)
+    ring_stride: int,  # SWA ring per-slot stride / modulo (win_with_spec)
     swa_pages: int,
     c128_page_indices: Optional[torch.Tensor],
     c4_sparse_page_indices: Optional[torch.Tensor],
@@ -405,7 +405,7 @@ def build_prefill_indices(
         kv_indices_prefix,
         kv_indices_extend,
         swa_pages,
-        cs,
+        ring_stride,
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,

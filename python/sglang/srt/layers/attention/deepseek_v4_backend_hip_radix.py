@@ -1012,10 +1012,10 @@ class DeepseekV4HipRadixBackend(
             swa_len=core.swa_topk_lengths,
             hca_len=core.c128_topk_lengths_clamp1,
             csa_len=core.c4_sparse_topk_lengths,
-            c128_page_indices=core.c128_page_indices,
+            hca_page_indices=core.c128_page_indices,
             csa_width=core.c4_sparse_page_indices.shape[1],
             win=pool.unified_swa_window,
-            cs=pool.unified_swa_ring_size,
+            ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
         )
 
@@ -1065,7 +1065,7 @@ class DeepseekV4HipRadixBackend(
         layer_id = layer.layer_id
         unified = pool.get_unified_kv(layer_id)
         win = pool.unified_swa_window
-        cs = pool.unified_swa_ring_size
+        ring_stride = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
 
         if q.ndim == 4:
@@ -1089,7 +1089,7 @@ class DeepseekV4HipRadixBackend(
                     positions=positions,
                     unified_kv=unified,
                     win=win,
-                    cs=cs,
+                    ring_stride=ring_stride,
                     final_pos=positions,
                 )
             if compress_ratio == 0:
@@ -1133,7 +1133,7 @@ class DeepseekV4HipRadixBackend(
             chunk_start=chunk_start,
             cu_q=cu_q,
             win=win,
-            cs=cs,
+            ring_stride=ring_stride,
             swa_pages=swa_pages,
             c128_page_indices=c128_pi,
             c4_sparse_page_indices=c4_pi,
@@ -1165,7 +1165,7 @@ class DeepseekV4HipRadixBackend(
                 positions=positions[:n_real],
                 unified_kv=unified,
                 win=win,
-                cs=cs,
+                ring_stride=ring_stride,
                 final_pos=final_pos,
             )
         return o
