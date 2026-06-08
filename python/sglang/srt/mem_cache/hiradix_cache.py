@@ -1325,14 +1325,7 @@ class HiRadixCache(RadixCache):
         can_terminate = True
 
         if self.prefetch_stop_policy == "best_effort":
-            # best_effort: KV data is ready, but still must wait for extra pool
-            # IO (e.g. INDEXER) to avoid racing with batch_get_v2 writes.
-            # Do NOT return early — fall through to _all_reduce so all TP ranks
-            # reach the collective call consistently.
-            if getattr(operation, "pool_transfers_done", True):
-                can_terminate = True
-            else:
-                can_terminate = False
+            return can_terminate
         elif self.prefetch_stop_policy == "wait_complete":
             if len(operation.hash_value) == 0:
                 completed = False
