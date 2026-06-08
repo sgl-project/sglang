@@ -282,44 +282,18 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        # `hidden_states` may arrive pre-padded along the last dim when the
-        # preceding RMSNorm fused the MoE input pad (gated by
-        # SGLANG_AITER_FUSE_RMSNORM_PAD). Router/topk are computed on the
-        # unpadded slice so the small bf16 router GEMM dimensions stay
-        # untouched, while the experts call gets to keep the padded view
-        # and skip the duplicate pad inside the MXFP4 method. The output
-        # is then trimmed back to the unpadded width so postprocess_layer
-        # can pair it with the (M, hidden_dim_unpadded) residual.
-        num_tokens = hidden_states.shape[0]
-        hidden_dim_unpadded = self.experts.hidden_size
-        is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
-        if is_prepadded:
-            router_input = hidden_states[..., :hidden_dim_unpadded]
-        else:
-            router_input = hidden_states
-
+        num_tokens, hidden_dim = hidden_states.shape
         if is_in_tc_piecewise_cuda_graph():
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
-            router_logits, _ = self.router(router_input)
-            topk_output = self.topk(router_input, router_logits)
+            router_logits, _ = self.router(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        # When input was pre-padded, FusedMoE.forward_impl captured the
-        # padded width as `origin_hidden_states_dim` and skipped its own
-        # output-trim contiguous() — so the experts output is still
-        # (M, hidden_dim_padded). Drop the pad columns here. When input
-        # was unpadded (default code path), FusedMoE.forward_impl already
-        # produced a contiguous (M, hidden_dim_unpadded) tensor, so the
-        # view is a no-op and matches the pre-fusion behavior bit-for-bit.
-        if is_prepadded:
-            ans = final_hidden_states[..., :hidden_dim_unpadded].contiguous()
-            ans = ans.view(num_tokens, hidden_dim_unpadded)
-        else:
-            ans = final_hidden_states.view(num_tokens, hidden_dim_unpadded)
+        ans = final_hidden_states.view(num_tokens, hidden_dim)
         return ans
 
 
