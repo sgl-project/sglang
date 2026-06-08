@@ -127,13 +127,14 @@ class TestGemma4E2BXPU(CustomTestCase):
         )
 
 
-from sglang.test.ci.ci_register import register_xpu_ci  # noqa: F401
+from sglang.test.ci.ci_register import register_xpu_ci
 
 # Single e2e test: boot + a short Q&A.
-# Temporarily disabled in CI: server launch OOMs on the stage-b XPU runner
-# (RuntimeError: Not enough memory. Please try to increase --mem-fraction-static).
-# See run 27118941818 / job 80032995567.
-# register_xpu_ci(est_time=240, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(
+    est_time=240,
+    suite="stage-b-test-1-gpu-xpu",
+    disabled="OOM on stage-b XPU runner (server launch fails with --mem-fraction-static)",
+)
 
 if __name__ == "__main__":
     unittest.main()
