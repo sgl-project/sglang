@@ -1,9 +1,12 @@
 import asyncio
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.entrypoints.openai.protocol import V1RerankReqInput
-from sglang.srt.managers.tokenizer_manager_score_mixin import ScoreResult
+from sglang.srt.managers.tokenizer_manager_score_mixin import (
+    ScoreResult,
+    TokenizerManagerScoreMixin,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Keep consistent with other openai_server/basic unit tests.
@@ -152,6 +155,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self.model_config = Mock()
                 self.model_config.is_generation = True
                 self.model_config.model_path = "qwen/qwen3"
+                self.score_request_handler = self
                 self.tokenizer = Mock()
                 self.tokenizer.chat_template = (
                     'Note that the answer can only be "yes" or "no". '
@@ -171,9 +175,12 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         adapted, _ = handler._convert_to_internal_request(req)
         raw_request = Mock()
 
-        res = asyncio.run(
-            handler._handle_non_streaming_request(adapted, req, raw_request)
-        )
+        with patch.object(
+            TokenizerManagerScoreMixin, "score_prompts", _TM.score_prompts
+        ):
+            res = asyncio.run(
+                handler._handle_non_streaming_request(adapted, req, raw_request)
+            )
         self.assertEqual([r.document for r in res], ["d1", "d2"])
         self.assertAlmostEqual(res[0].score, 0.9 / (0.9 + 0.1))
         self.assertAlmostEqual(res[1].score, 0.2 / (0.2 + 0.8))

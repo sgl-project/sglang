@@ -12,6 +12,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.managers.tokenizer_manager_score_mixin import (
+    TokenizerManagerScoreMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +70,8 @@ class OpenAIServingScore(OpenAIServingBase):
                 else None
             )
 
-            result = await self.tokenizer_manager.score_request(
+            result = await TokenizerManagerScoreMixin.score_request(
+                self.tokenizer_manager.score_request_handler,
                 query=request.query,
                 items=request.items,
                 label_token_ids=request.label_token_ids,

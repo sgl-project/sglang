@@ -17,6 +17,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.tokenizer_manager_score_mixin import (
+    TokenizerManagerScoreMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +382,8 @@ class OpenAIServingRerank(OpenAIServingBase):
                 for doc in request.documents
             ]
 
-            result = await self.tokenizer_manager.score_prompts(
+            result = await TokenizerManagerScoreMixin.score_prompts(
+                self.tokenizer_manager.score_request_handler,
                 prompts,
                 label_token_ids=[self._yes_token_id, self._no_token_id],
                 apply_softmax=False,

@@ -88,6 +88,10 @@ from sglang.srt.managers.tokenizer_manager_components.request_state import (
     ReqState,
     init_req,
 )
+from sglang.srt.managers.tokenizer_manager_components.score_request_handler import (
+    ScoreRequestHandler,
+    ScoreRequestHandlerConfig,
+)
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -200,6 +204,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+
+        self.init_score_request_handler()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -449,6 +455,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             watchdog_timeout=self.server_args.soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
+        )
+
+    def init_score_request_handler(self):
+        self.score_request_handler = ScoreRequestHandler(
+            tokenizer=self.tokenizer,
+            rid_to_state=self.rid_to_state,
+            generate_request=lambda obj, request=None: self.generate_request(
+                obj, request
+            ),
+            config=ScoreRequestHandlerConfig(
+                is_generation=self.is_generation,
+                enable_mis=self.server_args.enable_mis,
+                model_config=self.model_config,
+            ),
         )
 
     def init_request_dispatcher(self):
