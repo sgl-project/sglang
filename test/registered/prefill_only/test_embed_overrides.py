@@ -3,7 +3,7 @@
 Covers:
 - PositionalEmbeds dataclass (embed_types.py)
 - convert_embeds_to_tensors (utils.py)
-- TokenizerManager._resolve_embed_overrides (tokenizer_manager.py)
+- TokenizedRequestBuilder._resolve_embed_overrides (tokenized_request_builder.py)
 - positional_embed_overrides on GenerateReqInput/EmbeddingReqInput (io_struct.py)
 - ScoreRequestHandler override resolution (score_request_handler.py)
 """
@@ -16,10 +16,12 @@ import torch
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_components.score_request_handler import (
     ScoreRequestHandler,
     ScoreRequestHandlerConfig,
+)
+from sglang.srt.managers.tokenizer_manager_components.tokenized_request_builder import (
+    TokenizedRequestBuilder,
 )
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -107,14 +109,14 @@ class TestConvertEmbedsToTensors(CustomTestCase):
 
 
 # ========================================================================
-# TokenizerManager._resolve_embed_overrides
+# TokenizedRequestBuilder._resolve_embed_overrides
 # ========================================================================
 
 
 class TestResolveEmbedOverrides(CustomTestCase):
     def test_basic_resolution(self):
         embeds = [_vec(1), _vec(2)]
-        pe = TokenizerManager._resolve_embed_overrides(
+        pe = TokenizedRequestBuilder._resolve_embed_overrides(
             input_ids=[10, 50, 20, 50, 30],
             token_id=50,
             embeds=embeds,
@@ -125,7 +127,7 @@ class TestResolveEmbedOverrides(CustomTestCase):
 
     def test_no_placeholders_raises(self):
         with self.assertRaises(ValueError):
-            TokenizerManager._resolve_embed_overrides(
+            TokenizedRequestBuilder._resolve_embed_overrides(
                 input_ids=[10, 20, 30],
                 token_id=50,
                 embeds=[_vec()],
@@ -133,7 +135,7 @@ class TestResolveEmbedOverrides(CustomTestCase):
 
     def test_count_mismatch_raises(self):
         with self.assertRaises(ValueError):
-            TokenizerManager._resolve_embed_overrides(
+            TokenizedRequestBuilder._resolve_embed_overrides(
                 input_ids=[10, 50, 20],
                 token_id=50,
                 embeds=[_vec(1), _vec(2)],
