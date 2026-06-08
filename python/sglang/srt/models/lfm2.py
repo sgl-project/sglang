@@ -40,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -124,13 +125,13 @@ class Lfm2Attention(nn.Module):
         if rope_parameters is not None and "rope_theta" in rope_parameters:
             rope_theta = rope_parameters["rope_theta"]
         else:
-            rope_theta = config.rope_parameters["rope_theta"]
+            rope_theta = getattr(config, "rope_theta", 1000000.0)
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=getattr(config, "max_position_embeddings", 8192),
-            rope_scaling=config.rope_parameters,
+            rope_scaling=rope_parameters or getattr(config, "rope_scaling", None),
             base=rope_theta,
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
@@ -263,12 +264,10 @@ class Lfm2ShortConv(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
+        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
-        mamba_indices = forward_batch.req_to_token_pool.get_mamba_indices(
-            req_pool_indices
-        )
+        mamba_indices = get_req_to_token_pool().get_mamba_indices(req_pool_indices)
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj, _ = self.in_proj(hidden_states)

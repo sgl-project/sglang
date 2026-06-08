@@ -450,11 +450,8 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
-        skip_attn_backend_init=False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
-        # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
-        #               which requires preparing replay to always be in this function
-
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch
@@ -465,6 +462,9 @@ class TpModelWorker(BaseTpWorker):
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
 
+        # Deprecated kwarg: pre-planners mark the batch themselves now.
+        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
@@ -472,7 +472,6 @@ class TpModelWorker(BaseTpWorker):
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
@@ -484,7 +483,7 @@ class TpModelWorker(BaseTpWorker):
             )
 
             if is_verify:
-                # Skip sampling and return logits for target forward
+                # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
             if (
@@ -529,7 +528,6 @@ class TpModelWorker(BaseTpWorker):
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(

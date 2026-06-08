@@ -95,7 +95,6 @@ class WanT2V480PConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
-            auto_dit_layerwise_offload_high_memory_disable_gb=130,
         )
 
 
@@ -146,7 +145,6 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
-            auto_dit_layerwise_offload_high_memory_disable_gb=130,
         )
 
 

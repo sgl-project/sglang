@@ -14,16 +14,14 @@ from __future__ import annotations
 import functools
 import inspect
 import os
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
-from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_world_group,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
@@ -188,6 +186,10 @@ class MOVADenoisingStage(PipelineStage):
         return uses
 
     @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
+    @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
             return StageParallelismType.CFG_PARALLEL
@@ -239,6 +241,13 @@ class MOVADenoisingStage(PipelineStage):
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
         if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
+            return
+        if current_platform.is_hip():
+            logger.warning(
+                "Skipping torch.compile for %s on ROCm because the current "
+                "HIPRTC/Inductor path can emit invalid bf16 kernels.",
+                module.__class__.__name__,
+            )
             return
         compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
 
@@ -306,16 +315,6 @@ class MOVADenoisingStage(PipelineStage):
         result.add_check("latents", batch.latents, V.is_tensor)
         result.add_check("audio_latents", batch.audio_latents, V.is_tensor)
         return result
-
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
-        """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
@@ -953,6 +952,10 @@ class MOVADecodingStage(PipelineStage):
             ComponentUse(stage_name, "video_vae", target_dtype=vae_dtype),
             ComponentUse(stage_name, "audio_vae"),
         ]
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DECODER
 
     @property
     def parallelism_type(self) -> StageParallelismType:
