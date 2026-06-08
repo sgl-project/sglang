@@ -654,9 +654,9 @@ class SchedulerDisaggregationPrefillMixin:
                         logprob_pt += num_input_logprobs
 
                 if self.enable_overlap:
-                    assert req.metadata_buffer_index >= 0, (
-                        f"Req {req.rid} does not have metadata buffer allocated"
-                    )
+                    assert (
+                        req.metadata_buffer_index >= 0
+                    ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 

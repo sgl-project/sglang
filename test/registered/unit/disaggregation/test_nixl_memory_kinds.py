@@ -9,9 +9,9 @@ from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
     TransferStatus,
-    _KVXferPreparedSegment,
-    _kv_xfer_mem_segments,
     _homogeneous_kv_mem_kind,
+    _kv_xfer_mem_segments,
+    _KVXferPreparedSegment,
     _pack_kv_mem_kinds,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
