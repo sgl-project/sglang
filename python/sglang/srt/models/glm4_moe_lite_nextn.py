@@ -50,7 +50,11 @@ class Glm4MoeLiteModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and getattr(quant_config, "is_checkpoint_nvfp4_serialized", False)
+        ):
             logger.warning(
                 "Overriding Glm4MoeLiteForCausalLMNextN quant config for modelopt_fp4 "
                 "GLM-4.7-Flash model."

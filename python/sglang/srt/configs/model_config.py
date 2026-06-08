@@ -1109,7 +1109,6 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
-            "per_token_nvfp4",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
@@ -1154,7 +1153,6 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
-            "per_token_nvfp4",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -1174,9 +1172,8 @@ class ModelConfig:
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
-            "modelopt_fp4": ["modelopt"],
+            "modelopt_fp4": ["modelopt", "fp8", "modelopt_fp8"],
             "modelopt_mixed": ["modelopt"],
-            "per_token_nvfp4": ["fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -1213,7 +1210,8 @@ class ModelConfig:
                 )
                 if quantization_override:
                     quant_method = quantization_override
-                    self.quantization = quantization_override
+                    if self.quantization is None or self.quantization == "modelopt":
+                        self.quantization = quantization_override
                     break
 
             # Verify quantization configurations.

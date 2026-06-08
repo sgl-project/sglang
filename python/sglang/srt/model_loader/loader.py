@@ -761,11 +761,12 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         quant_config = getattr(model, "quant_config", None)
-        is_online_nvfp4_weight_quantization = getattr(
-            quant_config, "is_online_per_token_nvfp4", False
-        )
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 
-        if is_online_nvfp4_weight_quantization:
+        if (
+            isinstance(quant_config, ModelOptFp4Config)
+            and not quant_config.is_checkpoint_nvfp4_serialized
+        ):
             with temp_set_env(
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",

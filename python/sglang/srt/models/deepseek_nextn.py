@@ -88,7 +88,11 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and getattr(quant_config, "is_checkpoint_nvfp4_serialized", False)
+        ):
             logger.warning(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )

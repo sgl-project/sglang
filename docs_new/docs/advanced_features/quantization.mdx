@@ -145,14 +145,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes (SM80-SM90 via Marlin; SM100+ native FP4)</td>
       <td>No</td>
       <td>No</td>
-      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
-    </tr>
-    <tr>
-      <td><code>per_token_nvfp4</code></td>
-      <td>Yes (Blackwell/SM100 or SM103)</td>
-      <td>No</td>
-      <td>No</td>
-      <td>Online MoE-only NVFP4 quantization for BF16/FP16/FP8 checkpoints; requires <code>flashinfer_trtllm</code> or <code>flashinfer_trtllm_routed</code></td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell; supports online MoE-only NVFP4 quantization from BF16/FP16/FP8 checkpoints on Blackwell FlashInfer TRTLLM MoE backends</td>
     </tr>
     <tr>
       <td><code>petit_nvfp4</code></td>
@@ -805,11 +798,11 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-### `per_token_nvfp4` online quantization method
+### `modelopt_fp4` online MoE quantization
 
-SGLang running on NVIDIA Blackwell SM100 or SM103 GPUs supports `--quantization per_token_nvfp4` for MoE checkpoints stored in BF16, FP16, or FP8. It quantizes MoE expert weights online as each expert weight tensor is loaded, using standard 2D NVFP4 weight quantization with per-tensor amax-derived FP32 scales. If an expert checkpoint weight is FP8, SGLang first dequantizes that tensor to BF16 with the checkpoint scale and then requantizes it to NVFP4. Dense linear layers are kept in the original checkpoint precision. The `per_token` name refers to activation scaling: weights use static per-tensor FP32 scales, while activations get runtime per-token FP32 scales from FlashInfer, so activation FP32 calibration scales are not required.
+SGLang running on NVIDIA Blackwell SM100 or SM103 GPUs supports `--quantization modelopt_fp4` for MoE checkpoints stored in BF16, FP16, FP8, or NVFP4. Existing NVFP4 checkpoints keep their serialized NVFP4 weights and scales. For BF16, FP16, and FP8 checkpoints, SGLang quantizes MoE expert weights online as each expert tensor is loaded, using standard 2D NVFP4 weight quantization with per-tensor amax-derived FP32 scales. If an expert checkpoint weight is FP8, SGLang first dequantizes that tensor to BF16 with the checkpoint scale and then requantizes it to NVFP4. Dense linear layers are kept in the original checkpoint precision. Online-converted weights use static per-tensor FP32 scales, while activations use FlashInfer runtime per-token FP32 scales, so activation FP32 calibration scales are not required.
 
-Only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed` are supported. If `--moe-runner-backend` is omitted, SGLang selects `flashinfer_trtllm`. Tensor parallelism is supported; activation per-token scales are computed locally on each TP rank, while online weight quantization still uses the loaded expert tensor's per-tensor amax-derived FP32 scale.
+The online conversion path for BF16, FP16, and FP8 source checkpoints supports only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed`. If `--moe-runner-backend` is omitted on NVIDIA Blackwell SM100 or SM103 GPUs, SGLang selects `flashinfer_trtllm`. Tensor parallelism is supported; activation per-token scales are computed locally on each TP rank. When online weight quantization is used, each loaded expert tensor uses its own per-tensor amax-derived FP32 scale. Existing serialized NVFP4 checkpoints keep the normal `modelopt_fp4` backend support.
 
 FlashInfer TRTLLM MoE backends disable shared-expert fusion, so online quantization applies to routed MoE experts while shared experts stay in the checkpoint precision. To keep specific routed MoE layers out of online FP4 conversion, include their module path in `SGLANG_FP4_IGNORED_LAYERS`; FP8 checkpoints keep those ignored experts in FP8 checkpoint precision.
 
@@ -818,7 +811,7 @@ python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-30B-A3B-Instruct-2507 \
     --tp-size 2 \
     --ep-size 2 \
-    --quantization per_token_nvfp4 \
+    --quantization modelopt_fp4 \
     --port 30000 --host 0.0.0.0
 ```
 

@@ -65,7 +65,11 @@ class BailingMoEModelNextN(nn.Module):
         self.vocab_size = config.vocab_size
         config.for_nextn_model = True
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and getattr(quant_config, "is_checkpoint_nvfp4_serialized", False)
+        ):
             logger.warning(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )

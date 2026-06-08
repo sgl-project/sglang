@@ -314,9 +314,13 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # Match deepseek_nextn behavior: modelopt_fp4 is target-only and the
+        # Match deepseek_nextn behavior for serialized NVFP4 checkpoints: the
         # bf16 draft must not inherit the FP4 quant method.
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and getattr(quant_config, "is_checkpoint_nvfp4_serialized", False)
+        ):
             logger.warning(
                 "Overriding Eagle3DeepseekV2ForCausalLM quant config for "
                 "modelopt_fp4 target; draft weights are bf16."
