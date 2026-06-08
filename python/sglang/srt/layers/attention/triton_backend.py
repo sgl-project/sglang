@@ -434,7 +434,13 @@ class TritonAttnBackend(AttentionBackend):
         Returns ``(qo_indptr, kv_indptr, num_tokens_per_bs)``.
         """
         seq_lens = seq_lens[:bs]
-        num_tokens_per_bs = self.speculative_num_steps + 1
+        # V2 draft-extend fills num_draft_tokens per req (the cuda-graph runner's
+        # token layout); num_steps+1 only equals that when topk == 1.
+        num_tokens_per_bs = (
+            self.num_draft_tokens
+            if forward_mode.is_draft_extend_v2()
+            else self.speculative_num_steps + 1
+        )
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -894,7 +900,15 @@ class TritonAttnBackend(AttentionBackend):
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
-                max_extend_len=self.speculative_num_steps + 1,
+                # Must match the per-req query count (num_tokens_per_bs) used to
+                # build qo_indptr above, else the extend kernel grid is too small
+                # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
+                # blocks.
+                max_extend_len=(
+                    self.num_draft_tokens
+                    if forward_mode.is_draft_extend_v2()
+                    else self.speculative_num_steps + 1
+                ),
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
                 kv_indices=self.cuda_graph_kv_indices,
