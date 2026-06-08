@@ -16,7 +16,6 @@ class VisionLanguageEncoderLoader(ComponentLoader):
 
     component_names = ["vision_language_encoder"]
     expected_library = "transformers"
-    engine = None
 
     def load_customized(
         self,
@@ -27,6 +26,10 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         if transformers_or_diffusers == "vision_language_encoder":
 
             if server_args.srt_encoder_url is not None:
+                logger.info(
+                    f"Use {server_args.srt_encoder_url} as a backend for AR model"
+                    "make sure that a server with the appropriate model is running at this address."
+                )
                 return server_args.srt_encoder_url
 
             from transformers import GlmImageForConditionalGeneration
@@ -43,7 +46,6 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                 revision=server_args.revision,
             ).to(get_local_torch_device())
             return model
-
         else:
             raise ValueError(
                 f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
