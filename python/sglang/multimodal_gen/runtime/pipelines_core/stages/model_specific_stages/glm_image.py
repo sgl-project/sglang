@@ -276,14 +276,14 @@ class GlmImageAR(PipelineStage):
             )
             data = response.json()
             generated_ids = data.get("output_ids")
-        # else:
-        # SGLang Engine call
-        # output = self.ar_engine.generate(
-        #     input_ids=inputs["input_ids"][0].tolist(),
-        #     image_data=[{"image_grid_thw": image_grid_thw}],
-        #     sampling_params={"temperature": 1.0, "max_new_tokens": max_new_tokens},
-        # )
-        # generated_ids = output["output_ids"]
+        else:
+            outputs = self.vision_language_encoder.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+            )
+            input_len = inputs["input_ids"].shape[-1]
+            generated_ids = outputs[0][input_len:]
 
         # Extract large image tokens + upsample D32→D16
         prior_token_ids_d32 = torch.tensor(
