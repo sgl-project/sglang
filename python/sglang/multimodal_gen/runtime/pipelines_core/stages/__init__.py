@@ -65,9 +65,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av i
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution import (
-    ProgressiveDenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
     RealtimeInputValidationStage,
 )
@@ -105,7 +102,6 @@ __all__ = [
     "ComfyUILatentPreparationStage",
     "LTX2AVLatentPreparationStage",
     "DenoisingStage",
-    "ProgressiveDenoisingStage",
     "DmdDenoisingStage",
     "LTX2DenoisingStage",
     "LTX2AVDenoisingStage",

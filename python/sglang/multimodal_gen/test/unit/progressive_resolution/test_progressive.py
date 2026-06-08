@@ -338,10 +338,10 @@ class TestLatentAdapters(unittest.TestCase):
     def test_zimage_adds_and_removes_frame_dim(self):
         latent = torch.randn(2, 16, 1, 8, 8)
 
-        spatial = _zimage_unpack(latent, 8, 8)
+        spatial = _zimage_unpack(latent)
 
         self.assertEqual(spatial.shape, (2, 16, 8, 8))
-        torch.testing.assert_close(_zimage_repack(spatial, 8, 8), latent)
+        torch.testing.assert_close(_zimage_repack(spatial), latent)
 
     def test_wan_latent_adapter_is_identity(self):
         stage = object.__new__(WanProgressiveDenoisingStage)

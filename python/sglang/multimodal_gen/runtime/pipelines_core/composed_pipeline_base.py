@@ -48,7 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStageRouter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform

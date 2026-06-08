@@ -32,12 +32,12 @@ ZIMAGE_SPECTRUM_A: float = 203.615097
 ZIMAGE_SPECTRUM_BETA: float = 1.915461
 
 
-def _zimage_unpack(latent: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
+def _zimage_unpack(latent: torch.Tensor) -> torch.Tensor:
     """5-D latent [B, C, 1, H_lat, W_lat] → spatial [B, C, H_lat, W_lat]."""
     return latent.squeeze(2)
 
 
-def _zimage_repack(x: torch.Tensor, h_lat: int, w_lat: int) -> torch.Tensor:
+def _zimage_repack(x: torch.Tensor) -> torch.Tensor:
     """Spatial [B, C, H_lat, W_lat] → 5-D latent [B, C, 1, H_lat, W_lat]."""
     return x.unsqueeze(2)
 
@@ -98,7 +98,7 @@ class ZImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
     def _unpack_latent(
         self, latent: torch.Tensor, h_lat: int, w_lat: int
     ) -> torch.Tensor:
-        return _zimage_unpack(latent, h_lat, w_lat)
+        return _zimage_unpack(latent)
 
     def _repack_latent(
         self,
@@ -108,7 +108,7 @@ class ZImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> torch.Tensor:
-        return _zimage_repack(x_spatial, h_lat, w_lat)
+        return _zimage_repack(x_spatial)
 
     # ------------------------------------------------------------------
     # Resolution-change hook
