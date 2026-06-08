@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 RESET_DRAIN_MAX_STEPS: int = 200
+# Below the test-side LISTENER_ACCEPT_TIMEOUT_S so a stuck warmup surfaces as
+# this specific error instead of a generic handshake timeout.
+WARMUP_DRIVE_TIMEOUT_S: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +51,47 @@ class ScriptedBatchRecord:
     chunked_rid: Optional[str]
 
 
+def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
+    """Run the engine until the server warmup request has been received and
+    fully processed, so scripts never observe foreign warmup traffic."""
+    scheduler = ctx.scheduler
+    server_args = scheduler.server_args
+    if server_args.skip_server_warmup:
+        logger.info("scripted_runtime: skip_server_warmup set, not driving warmup")
+        return
+
+    logger.info("scripted_runtime: driving engine until server warmup completes")
+    start_time = time.monotonic()
+
+    # is_fully_idle() can transiently report idle while a PP microbatch result
+    # is still in flight, so require it to hold for two full microbatch
+    # rotations after the warmup request was observed on the recv socket.
+    quiesce_iters = 2 * (server_args.pp_size + server_args.pp_async_batch_depth)
+    proxy = ctx._tokenizer_recv_proxy
+    deadline = start_time + WARMUP_DRIVE_TIMEOUT_S
+
+    idle_streak = 0
+    while idle_streak < quiesce_iters:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "scripted_runtime: server warmup did not complete within "
+                f"{WARMUP_DRIVE_TIMEOUT_S}s "
+                f"(work_reqs_seen={proxy.work_reqs_seen}, "
+                f"idle_streak={idle_streak})"
+            )
+        yield
+        if proxy.work_reqs_seen > 0 and scheduler.is_fully_idle():
+            idle_streak += 1
+        else:
+            idle_streak = 0
+
+    logger.info(
+        "scripted_runtime: server warmup drained in %.1fs (work_reqs_seen=%d)",
+        time.monotonic() - start_time,
+        proxy.work_reqs_seen,
+    )
+
+
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
@@ -54,16 +99,13 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
-        if (
-            scheduler.chunked_req is None
-            and len(scheduler.waiting_queue) == 0
-            and scheduler.running_batch.is_empty()
-        ):
+        if scheduler.is_fully_idle():
             break
-
-    server_args = scheduler.server_args
-    for _ in range(2 * (server_args.pp_size + server_args.pp_async_batch_depth)):
-        yield
+    else:
+        raise RuntimeError(
+            "scripted_runtime reset: scheduler did not become fully idle "
+            f"within {RESET_DRAIN_MAX_STEPS} steps"
+        )
 
     ctx.flush_cache()
     yield
@@ -106,6 +148,7 @@ class ScriptedSchedulerHook:
         ctx_zmq = zmq.Context()
         socket = get_zmq_socket(ctx_zmq, zmq.PAIR, endpoint, bind=False)
         try:
+            yield from _drive_engine_through_warmup(self._context)
             socket.send_pyobj(HookReady())
             while True:
                 msg = socket.recv_pyobj()
