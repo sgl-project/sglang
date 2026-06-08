@@ -509,7 +509,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
-        self._init_req_state(obj, request)
+        TokenizerManager._init_req_state(
+            self.rid_to_state,
+            obj=obj,
+            request=request,
+            enable_trace=self.server_args.enable_trace,
+            disagg_mode=self.disaggregation_mode,
+        )
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
 
@@ -1478,7 +1484,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
+                TokenizerManager._init_req_state(
+                    self.rid_to_state,
+                    obj=tmp_obj,
+                    enable_trace=self.server_args.enable_trace,
+                    disagg_mode=self.disaggregation_mode,
+                )
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
@@ -1494,7 +1505,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._init_req_state(tmp_obj)
+                    TokenizerManager._init_req_state(
+                        self.rid_to_state,
+                        obj=tmp_obj,
+                        enable_trace=self.server_args.enable_trace,
+                        disagg_mode=self.disaggregation_mode,
+                    )
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
@@ -2673,15 +2689,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
+    @staticmethod
     def _init_req_state(
-        self,
+        rid_to_state: Dict[str, ReqState],
+        *,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-    ):
+        enable_trace: bool,
+        disagg_mode: DisaggregationMode,
+    ) -> None:
         created_time = obj.received_time
 
         external_trace_header = None
-        if self.server_args.enable_trace:
+        if enable_trace:
             if obj.external_trace_header:
                 # When the request comes from the rust grpc server or Engine there isn't a
                 # real request object but we still need to propagate the trace context from
@@ -2709,12 +2729,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ]
 
         for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+            if rid in rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
-            time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+            time_stats = APIServerReqTimeStats(disagg_mode=disagg_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            self.rid_to_state[rid] = state
-            if self.server_args.enable_trace:
+            rid_to_state[rid] = state
+            if enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
