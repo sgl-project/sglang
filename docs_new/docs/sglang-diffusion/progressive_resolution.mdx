@@ -1,9 +1,9 @@
 ---
 title: "Progressive Resolution Generation"
-description: "Speed up FLUX.1, FLUX.2, Wan T2V, and Qwen-Image generation up to 2.78× with spectral progressive resolution growing."
+description: "Speed up FLUX.1, FLUX.2, Z-Image, Wan T2V, and Qwen-Image generation up to 2.78× with spectral progressive resolution growing."
 ---
 
-Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, **2.78× speedup on Wan 2.1 T2V**, and **1.69× speedup on Qwen-Image** with no perceptible quality loss.
+Progressive resolution growing runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. This reduces the quadratic attention cost of the DiT transformer, yielding up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, **2.33× speedup on Z-Image**, **2.78× speedup on Wan 2.1 T2V**, and **1.69× speedup on Qwen-Image** with no perceptible quality loss.
 
 Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736).
 
@@ -17,6 +17,7 @@ The transition point — how many steps to run at each resolution — is compute
 |-------|----------------|----------------|-----------------|
 | FLUX.1 1024×1024 | 4,096 | 1,024 | 4.0× |
 | FLUX.2 1024×1024 | 4,096 | 1,024 | 4.0× |
+| Z-Image 1024×1024 | 4,096 | 1,024 | 4.0× |
 | Wan 2.1 T2V 480×832 (81 frames) | 6,240 | 1,560 | 4.0× |
 
 ## Parameters
@@ -191,6 +192,63 @@ result = gen.generate(sampling_params_kwargs={
     "progressive_mode": "dct_rewind",
     "progressive_levels": 1,
     "progressive_delta": 0.05,
+})
+```
+
+---
+
+## Z-Image
+
+Supports `Tongyi-MAI/Z-Image`. Z-Image uses the same VAE as FLUX.1 (`FluxVAEConfig`), so the power-law spectrum constants are identical. The progressive stage handles Z-Image's 5-D latent format `[B, C, 1, H, W]` with squeeze/unsqueeze hooks and recomputes caption+image RoPE positional embeddings on each stage transition.
+
+> **Note:** Always specify `--height 1024 --width 1024` (or another resolution where H_lat and W_lat are both divisible by 2). Z-Image's default resolution (360×640) produces a 45×80 latent where H=45 is not divisible by the patch size.
+
+### Usage
+
+```bash
+# Standard fullres — unchanged behavior
+sglang generate --model-path Tongyi-MAI/Z-Image \
+    --prompt "A serene mountain lake at golden hour, photorealistic" \
+    --height 1024 --width 1024
+
+# Progressive dct_rewind L1 δ=0.10 → 2.33× denoising speedup
+sglang generate --model-path Tongyi-MAI/Z-Image \
+    --prompt "A serene mountain lake at golden hour, photorealistic" \
+    --height 1024 --width 1024 \
+    --num-inference-steps 50 \
+    --dit-cpu-offload false \
+    --progressive-mode dct_rewind \
+    --progressive-levels 1 \
+    --progressive-delta 0.10
+```
+
+### Choosing delta
+
+| δ | Coarse steps (50 total) | Denoising speedup |
+|---|------------------------|-------------------|
+| `0.01` | 26 @ 64² + 24 @ 128² | **1.53×** |
+| `0.05` | 35 @ 64² + 15 @ 128² | **2.03×** |
+| `0.10` | 42 @ 64² + 8 @ 128² | **2.33×** |
+
+Z-Image achieves higher progressive speedups than FLUX.1 at the same δ because it uses dual CFG (two forward passes per step), doubling the absolute attention savings at coarse resolution. `0.10` is the recommended tradeoff.
+
+### Python API
+
+```python
+from sglang.multimodal_gen import DiffGenerator
+
+gen = DiffGenerator.from_pretrained(
+    model_path="Tongyi-MAI/Z-Image",
+    dit_cpu_offload=False,
+)
+result = gen.generate(sampling_params_kwargs={
+    "prompt": "A serene mountain lake at golden hour, photorealistic",
+    "num_inference_steps": 50,
+    "height": 1024,
+    "width": 1024,
+    "progressive_mode": "dct_rewind",
+    "progressive_levels": 1,
+    "progressive_delta": 0.10,
 })
 ```
 
