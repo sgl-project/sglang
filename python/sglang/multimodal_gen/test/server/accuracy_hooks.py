@@ -62,11 +62,6 @@ def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
             normalize_reference_timestep=True,
             omit_reference_guidance=True,
         )
-    if "sana-wm" in model_path or "sana_wm" in model_path:
-        return TransformerHookCompat(
-            omit_reference_guidance=True,
-            use_2d_hidden_states=False,
-        )
     if "sana" in model_path:
         return TransformerHookCompat(
             omit_reference_guidance=True,
@@ -622,12 +617,7 @@ def _build_vae_hook_inputs(
     modality = getattr(getattr(case, "server_args", None), "modality", None)
     use_wan_video_latent = (
         modality == "video"
-        and (
-            "wan" in model_path
-            or "ltx" in model_path
-            or "sana-wm" in model_path
-            or "sana_wm" in model_path
-        )
+        and "wan" in model_path
         and any(isinstance(module, nn.Conv3d) for module in model.modules())
     )
     shape = (
