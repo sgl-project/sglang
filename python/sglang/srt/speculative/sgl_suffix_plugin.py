@@ -43,6 +43,13 @@ class _SuffixLike(CustomSpecAlgo):
 
 
 def _suffix_factory(server_args: "ServerArgs") -> Type:
+    # With overlap scheduling enabled, dispatch the V2 worker (BaseSpecWorker
+    # contract — takes the per-step batch and runs alongside the scheduler's
+    # plan/predict streams). Otherwise stay on the V1 NGRAMWorker subclass.
+    if not server_args.disable_overlap_schedule:
+        from sglang.srt.speculative.suffix_worker_v2 import SuffixWorkerV2
+
+        return SuffixWorkerV2
     from sglang.srt.speculative.suffix_worker import SuffixWorker
 
     return SuffixWorker
@@ -62,7 +69,7 @@ def _validate_suffix_args(server_args: "ServerArgs") -> None:
 
 SpeculativeAlgorithm.register(
     "SUFFIX",
-    supports_overlap=False,
+    supports_overlap=True,
     validate_server_args=_validate_suffix_args,
     spec_class=_SuffixLike,
 )(_suffix_factory)

@@ -151,9 +151,13 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_global_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
+    # SUFFIX is model-free (arctic suffix-tree draft) and likewise never
+    # produces or consumes target hidden states, so the overlap FutureMap must
+    # not try to allocate/read a hidden_states buffer for it. (HYBRID_SUFFIX_MTP
+    # is NOT exempt: its MTP keep-up path needs hidden states.)
     # multi_layer_eagle handles hidden_states internally, not via FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm == "STANDALONE":
+    if server_args.speculative_algorithm in ("STANDALONE", "SUFFIX"):
         return False
     return not server_args.enable_multi_layer_eagle
 
