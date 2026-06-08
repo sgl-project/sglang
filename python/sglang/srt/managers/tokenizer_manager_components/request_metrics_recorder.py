@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import (
+    BatchStrOutput,
+    GenerateReqInput,
+)
+from sglang.srt.managers.tokenizer_manager_components.request_state import ReqState
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -51,3 +56,79 @@ class RequestMetricsRecorder:
             bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
         )
         start_cpu_monitor_thread("tokenizer")
+
+    def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
+        return (
+            obj.sampling_params.get("json_schema", None)
+            or obj.sampling_params.get("regex", None)
+            or obj.sampling_params.get("ebnf", None)
+            or obj.sampling_params.get("structural_tag", None)
+        )
+
+    def collect_metrics(
+        self,
+        state: ReqState,
+        recv_obj: BatchStrOutput,
+        i: int,
+    ):
+        completion_tokens = (
+            recv_obj.completion_tokens[i]
+            if getattr(recv_obj, "completion_tokens", None)
+            else 0
+        )
+
+        custom_labels = getattr(state.obj, "custom_labels", None)
+        labels = dict(self.metrics_collector.labels)
+        if custom_labels:
+            labels.update(custom_labels)
+        if self.enable_priority_scheduling:
+            priority = getattr(state.obj, "priority", None)
+            if priority is not None:
+                labels["priority"] = str(priority)
+        if (
+            not state.ttft_observed
+            and self.get_disaggregation_mode() != DisaggregationMode.PREFILL
+        ):
+            state.ttft_observed = True
+            state.last_completion_tokens = completion_tokens
+            self.metrics_collector.observe_time_to_first_token(
+                labels, state.time_stats.get_first_token_latency()
+            )
+        else:
+            num_new_tokens = completion_tokens - state.last_completion_tokens
+            if num_new_tokens:
+                self.metrics_collector.observe_inter_token_latency(
+                    labels,
+                    state.time_stats.get_interval(),
+                    num_new_tokens,
+                )
+                state.time_stats.set_last_time()
+                state.last_completion_tokens = completion_tokens
+
+        if state.finished:
+            # Get detailed cache breakdown if available
+            cached_tokens_details = None
+            if (
+                hasattr(recv_obj, "cached_tokens_details")
+                and recv_obj.cached_tokens_details
+            ):
+                cached_tokens_details = recv_obj.cached_tokens_details[i]
+
+            spec_verify_ct = (
+                recv_obj.spec_verify_ct[i]
+                if hasattr(recv_obj, "spec_verify_ct")
+                and recv_obj.spec_verify_ct
+                and len(recv_obj.spec_verify_ct) > i
+                else 0
+            )
+
+            self.metrics_collector.observe_one_finished_request(
+                labels,
+                recv_obj.prompt_tokens[i],
+                completion_tokens,
+                recv_obj.cached_tokens[i],
+                state.time_stats.get_e2e_latency(),
+                self._request_has_grammar(state.obj),
+                cached_tokens_details,
+                spec_verify_ct=spec_verify_ct,
+            )
