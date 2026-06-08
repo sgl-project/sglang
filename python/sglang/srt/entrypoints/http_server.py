@@ -748,7 +748,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
-            background=_global_state.tokenizer_manager.create_abort_task(obj),
+            background=_global_state.tokenizer_manager.create_abort_task(
+                _global_state.tokenizer_manager.response_emitter, obj
+            ),
         )
     else:
         try:
