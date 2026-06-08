@@ -129,12 +129,21 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if pp_size > 1:
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
+                # PP hidden states carry one row per *token*
+                # (max_num_token = max_bs * num_tokens_per_bs), not per
+                # request. Normal decode has num_tokens_per_bs == 1 so
+                # max_num_token == max_bs and a (max_bs, hs) buffer happens
+                # to be right-sized; for SUFFIX/NGRAM verify
+                # (num_tokens_per_bs == draft_token_num, e.g. 32) the buffer
+                # must be max_num_token-wide or stage-1 attention sees a
+                # max_bs-token hidden against a max_num_token-token positions
+                # tensor and rotary's view(num_tokens, -1, head_size) crashes.
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
                 }
                 if not is_mhc:
                     pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_bs, hidden_size), dtype=dtype
+                        (max_num_token, hidden_size), dtype=dtype
                     )
             else:
                 pp_proxy_tensors = None

@@ -966,6 +966,25 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        # PP+SUFFIX: ship the suffix verify result (accept_indices,
+        # num_accept_tokens) up the existing last->first ring so the non-last
+        # rank can replay the CPU side of verify (append output_ids, free
+        # rejected KV) inside _pp_prep_batch_result. Only the last rank
+        # produces accept; non-last ranks see batch.spec_info populated but
+        # without accept tensors. Skipped for spec-v2 (overlap path).
+        if (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and batch.spec_info is not None
+            and getattr(batch.spec_info, "accept_indices", None) is not None
+            and getattr(batch.spec_info, "num_accept_tokens", None) is not None
+        ):
+            tensor_dict["suffix_accept_indices"] = batch.spec_info.accept_indices.to(
+                torch.int64
+            )
+            tensor_dict["suffix_num_accept"] = batch.spec_info.num_accept_tokens.to(
+                torch.int64
+            )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1102,7 +1121,21 @@ class SchedulerPPMixin:
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(batch.req_pool_indices, batch.input_ids)
+        if "suffix_accept_indices" in pp_outputs.tensors:
+            # PP+SUFFIX: next_token_ids is the flat variable-length accept
+            # stream (sum(num_accept) tokens, not one per req). Relay one
+            # token per req — its LAST accepted token — which matches the
+            # non-spec semantic (the req's current newest token).
+            # batch.input_ids keeps the full stream for the spec bookkeeping
+            # below; the next decode iter rebuilds input_ids from the draft
+            # chain anyway.
+            _num_accept = pp_outputs["suffix_num_accept"].to(torch.int64)
+            _last_per_req = torch.cumsum(_num_accept, dim=0) - 1
+            self.future_map.stash(
+                batch.req_pool_indices, batch.input_ids[_last_per_req]
+            )
+        else:
+            self.future_map.stash(batch.req_pool_indices, batch.input_ids)
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1111,11 +1144,39 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        # PP+SUFFIX deferred verify propagation. The last rank ran the
+        # verify and shipped its accept tensors up the ring; here on the
+        # receiving rank we (a) replay the CPU side of verify so KV/output
+        # stay in lockstep, and (b) feed the accept count into spec metrics.
+        if "suffix_accept_indices" in pp_outputs.tensors:
+            if (
+                not self.pp_group.is_last_rank
+                and getattr(self, "draft_worker", None) is not None
+                and hasattr(self.draft_worker, "apply_deferred_accept")
+            ):
+                self.draft_worker.apply_deferred_accept(
+                    batch,
+                    pp_outputs["suffix_accept_indices"],
+                    pp_outputs["next_token_ids"],
+                    pp_outputs["suffix_num_accept"],
+                    self.page_size,
+                )
+            _na = pp_outputs["suffix_num_accept"]
+            output_result.num_correct_drafts = int(_na.sum().item()) - int(_na.numel())
         return output_result
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        # _PATCH_PP_DEFER_FREE: run the SUFFIX last-rank deferred spec free before
+        # post-processing, so KV-full retraction stays symmetric across PP ranks.
+        if (
+            self.pp_group.is_last_rank
+            and getattr(batch, "_pp_pending_spec_free", False)
+            and getattr(self, "draft_worker", None) is not None
+            and hasattr(self.draft_worker, "apply_deferred_free")
+        ):
+            self.draft_worker.apply_deferred_free(batch, self.page_size)
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
