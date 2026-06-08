@@ -38,6 +38,10 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.compressor import (
+    _apply_hadamard,
+    _walsh_hadamard_matrix,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1090,23 +1094,6 @@ class DeepseekV4AscendAttnBackend(
         # extra to do here. Return None to satisfy the mixin contract.
         return None
 
-    def _seed_c4_topk_indices(self, forward_batch: "ForwardBatch") -> torch.Tensor:
-        """Allocate a [T, index_topk] int32 tensor on the compute device,
-        filled with -1 (= "no valid sparse index" sentinel that npu_sparse_
-        attn_sharedkv accepts). Real ``forward_c4_indexer`` will overwrite the
-        contents via ``npu_quant_lightning_indexer``; until then this lets the
-        c4 path of ``_forward_compressed`` consume a well-shaped tensor."""
-        if forward_batch.input_ids is not None:
-            T = forward_batch.input_ids.shape[0]
-        else:
-            T = int(forward_batch.seq_lens.sum().item())
-        return torch.full(
-            (T, self._dsv4_index_topk),
-            -1,
-            dtype=torch.int32,
-            device=forward_batch.seq_lens.device,
-        )
-
     def forward(
         self,
         q: torch.Tensor,
@@ -1311,6 +1298,214 @@ class DeepseekV4AscendAttnBackend(
             return
         compressor(x, forward_batch)
 
+    def forward_c4_indexer_npu(
+        self,
+        c4_indexer,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Compute c4 top-k sparse indices on NPU; returns a [T, index_topk]
+        int32 tensor.
+
+        Steps:
+          1. Materialize q via wq_b + rope + hadamard.
+          2. Run the inner c4_indexer.compressor (which on NPU writes the
+             indexer c4 compress kv + state to the pool).
+          3. Project x through weights_proj and apply softmax/head scale.
+          4. Either `npu_quant_lightning_indexer` (int8 li_kv) or per-request
+             einsum + topk (bf16 li_kv) to produce the top-k indices.
+        """
+        from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+        ratio = c4_indexer.compressor.ratio  # = 4 for the c4 indexer
+        device = x.device
+        self._ensure_npu_c4_indexer(c4_indexer, device)
+        bs = x.shape[0]
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
+
+        # q path
+        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+
+        # weights path — keep the bf16 → bf16 projection and apply the
+        # combined softmax + n_heads scaling here so the int8 indexer kernel
+        # receives `weights * scale`.
+        weights, _ = c4_indexer.weights_proj(x)
+        weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
+
+        # compressor path — writes c4 indexer compress kv + state on NPU.
+        c4_indexer.compressor(x, forward_batch)
+
+        # Prefer the fused int8 lightning indexer when the indexer KV is
+        # quantized.
+        li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
+        if li_kv_dtype == "int8":
+            # Skip the indexer kernel call when this rank's batch is empty
+            # (no tokens to score). DP attention can leave some ranks with
+            # an empty batch in flight; calling npu_quant_lightning_indexer
+            # with T=0 / kv_len=0 deadlocks async on an internal collective.
+            # Return the sentinel topk so downstream _forward_compressed
+            # sees a well-shaped tensor without entering the indexer kernel.
+            # Use forward_mode.is_idle() instead of kv_lens.sum().item() to
+            # stay graph-capture-safe (.item() forces a host sync that ACL
+            # graph capture rejects with error 107027).
+            if bs == 0 or forward_batch.forward_mode.is_idle():
+                return torch.full(
+                    (bs, c4_indexer.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            li_cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
+                c4_indexer.layer_id, True
+            )
+            li_kv_scale = (
+                forward_batch.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                    c4_indexer.layer_id, True
+                )
+            )
+            return self._forward_npu_fused(
+                c4_indexer, q, li_cmp_kv, li_kv_scale, weights, forward_batch
+            )
+
+        # bf16 li_kv path: per-request einsum + topk against the indexer
+        # compress buffer — slow but architecture-faithful fallback.
+        seqlens_cpu = forward_batch.seq_lens_cpu
+        end_pos = forward_batch.seq_lens.cumsum(dim=0)
+        page_table = forward_batch.attn_backend.forward_metadata.c4_page_table
+        attn_tp_size = get_attention_tp_size()
+        topk_idxs: list[torch.Tensor] = []
+        for i, _end_token in enumerate(end_pos):
+            seq_i = int(seqlens_cpu[i])
+            kv_indices = _get_kv_indices(
+                forward_batch, seq_i // ratio, page_table, i, seq_i // ratio
+            )
+            kv_cache_value = (
+                forward_batch.token_to_kv_pool.get_compress_buffer(
+                    c4_indexer.layer_id, True, kv_indices
+                )
+            )
+            if is_prefill:
+                start = 0 if i == 0 else int(end_pos[i - 1])
+                end = int(end_pos[i])
+                index_score = torch.einsum(
+                    "shd,td->sht",
+                    q[start:end, ...],
+                    kv_cache_value.squeeze(1),
+                )  # [s, n_heads, seq_i//ratio]
+                index_score = (
+                    index_score.relu_() * weights.unsqueeze(-1)[start:end, ...]
+                ).sum(dim=1)
+                if attn_tp_size > 1 and getattr(c4_indexer, "enable_indexer_tp", False):
+                    get_attention_tp_group().all_reduce(index_score)
+                # Causal mask in compressed-token coordinates.
+                arange_kv = torch.arange(seq_i // ratio, device=device)
+                arange_q = torch.arange(1, seq_i + 1, device=device).unsqueeze(1)
+                causal = arange_kv.repeat(seq_i, 1) >= (arange_q // ratio)
+                index_score += torch.where(
+                    causal, float("-inf"), torch.zeros((), device=device)
+                )
+                topk_idx = index_score.topk(
+                    min(c4_indexer.index_topk, seq_i // ratio), dim=-1
+                )[1]
+                # Drop the diagonal token (position seq_i % ratio == 0
+                # leaves a self-loop after the // ratio division).
+                drop = topk_idx >= (
+                    torch.arange(1, seq_i + 1, device=device).unsqueeze(1) // ratio
+                )
+                topk_idx = torch.where(drop, -1, topk_idx)
+            else:
+                index_score = torch.einsum(
+                    "shd,td->sht",
+                    q[i : i + 1, ...],
+                    kv_cache_value.squeeze(1),
+                )
+                index_score = (
+                    index_score.relu_() * weights.unsqueeze(-1)[i]
+                ).sum(dim=1)
+                topk_idx = index_score.topk(
+                    min(c4_indexer.index_topk, seq_i // ratio), dim=-1
+                )[1]
+            topk_idx = F.pad(
+                topk_idx,
+                (0, c4_indexer.index_topk - topk_idx.shape[-1]),
+                mode="constant",
+                value=-1,
+            )
+            topk_idxs.append(topk_idx)
+        return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
+
+    def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
+        # One-time NPU setup for the c4 indexer module (CUDA does the
+        # equivalent inside C4Indexer via triton). Tag the inner compressor
+        # as int8 li_kv so its epilog quantizes through npu_dynamic_quant,
+        # and register the Walsh-Hadamard matrix used for the q rotation
+        # (keyed off the buffer's existence so registration runs once).
+        c4_indexer.compressor.li_kv_dtype = "int8"
+        if getattr(c4_indexer, "hadamard_matrix", None) is None:
+            H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
+            c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
+
+    def _compute_q_npu(
+        self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        # wq_b → reshape to (T, n_heads, head_dim) → in-place rope on the
+        # rope-slice → hadamard rotation (Walsh-Hadamard matmul). The CUDA
+        # `compute_q` uses tvm_ffi `fused_rope` + triton `rotate_activation`;
+        # both are absent on NPU.
+        from sglang.srt.models.deepseek_v4 import v4_rope_inplace_npu
+
+        bs = q_lora.shape[0]
+        q, _ = c4_indexer.wq_b(q_lora)
+        q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
+        v4_rope_inplace_npu(
+            q[..., -c4_indexer.rope_head_dim :],
+            None,
+            c4_indexer.freqs_cis,
+            positions,
+        )
+        return _apply_hadamard(q, c4_indexer.hadamard_matrix)
+
+    def _forward_npu_fused(
+        self,
+        c4_indexer,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # Single fused `npu_quant_lightning_indexer` call. Reads c4_page_table
+        # and li_quant_metadata from the backend's forward_metadata.
+        import torch_npu  # local import: NPU only
+
+        q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
+        fm = forward_batch.attn_backend.forward_metadata
+        li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
+        kwargs = dict(
+            query=q_int8,
+            key=k,
+            key_dequant_scale=k_scale.squeeze(-2),
+            actual_seq_lengths_query=fm.actual_seq_lengths_q,
+            actual_seq_lengths_key=fm.actual_seq_lengths_kv,
+            block_table=fm.c4_page_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            weights=weights.to(torch.float16),
+            query_dequant_scale=q_scale.to(torch.float16),
+            cmp_ratio=4,
+            query_quant_mode=0,
+            key_quant_mode=0,
+            sparse_mode=3,
+            sparse_count=c4_indexer.index_topk,
+            metadata=li_quant_metadata,
+        )
+        topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**kwargs)
+        return topk_idxs.view(-1, c4_indexer.index_topk)
+
     def forward_c4_indexer(  # type: ignore[override]
         self,
         *,
@@ -1324,13 +1519,33 @@ class DeepseekV4AscendAttnBackend(
     ) -> None:
         """Populate ``forward_metadata.c4_topk_indices`` for c4 sparse attention.
 
-        ``C4Indexer.forward_npu`` runs the npu_quant_lightning_indexer and
-        writes the real top-k indices itself; we seed the -1 sentinel here
-        so ``_forward_compressed`` reads a well-shaped tensor on idle ranks
-        (where forward_npu is short-circuited).
+        Mirrors the CUDA ``C4IndexerBackendMixin.forward_c4_indexer``: the
+        compute lives on the backend but reads the indexer's weights /
+        compressor through ``c4_indexer``. ``forward_c4_indexer_npu`` runs the
+        npu_quant_lightning_indexer (or the bf16 einsum fallback) and returns
+        the real top-k indices; idle / empty ranks are short-circuited inside it.
         """
         if forward_batch.forward_mode.is_idle():
             return
-        self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
-            forward_batch
-        )
+        topk_idxs = self.forward_c4_indexer_npu(c4_indexer, x, q_lora, forward_batch)
+        self.forward_metadata.c4_topk_indices = topk_idxs
+
+
+def _get_kv_indices(
+    forward_batch: ForwardBatch,
+    kv_len: int,
+    page_table: torch.Tensor,
+    req_idx: int,
+    seqlen: int,
+) -> torch.Tensor:
+    # Duplicated in compressor.py — kept private here so indexer doesn't
+    # re-import a private symbol from compressor.
+    logic_start = max(0, seqlen - kv_len)
+    logic_end = seqlen
+    page_size = forward_batch.attn_backend.page_size
+    if page_size == 1:
+        return page_table[req_idx, logic_start:logic_end]
+    logic_pos = torch.arange(logic_start, logic_end, device=page_table.device)
+    block_id = logic_pos // page_size
+    offset_in_block = logic_pos % page_size
+    return page_table[req_idx, block_id] * page_size + offset_in_block

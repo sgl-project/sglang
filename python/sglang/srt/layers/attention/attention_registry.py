@@ -85,7 +85,7 @@ def create_ascend_backend(runner):
         # AscendAttnBackend doesn't expose. Route to a subclass that mixes
         # those in, keeping all the NPU-side ascend metadata & forward
         # plumbing intact.
-        from sglang.srt.hardware_backend.npu.attention.deepseek_v4_ascend_backend import (
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,
         )
 
