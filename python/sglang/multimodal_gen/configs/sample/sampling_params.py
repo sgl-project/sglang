@@ -702,7 +702,7 @@ class SamplingParams:
                 raise
 
         user_kwargs = dict(kwargs)
-        user_kwargs.pop("diffusers_kwargs", None)
+        diffusers_kwargs = user_kwargs.pop("diffusers_kwargs", None)
 
         user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor
@@ -710,6 +710,8 @@ class SamplingParams:
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
         sampling_params._explicit_fields = set(user_kwargs.keys())
+        if diffusers_kwargs is not None:
+            sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -944,6 +946,36 @@ class SamplingParams:
                 "values, e.g.: "
                 '--image-path "img1.png" "img2.png"'
             ),
+        )
+        add_argument(
+            "--action",
+            type=str,
+            help=(
+                "SANA-WM WASD/IJKL action DSL, e.g. "
+                "'w-80,jw-40,w-40,lw-60,w-100'. Model-specific fields are "
+                "ignored by other pipelines."
+            ),
+        )
+        add_argument(
+            "--translation-speed",
+            "--translation_speed",
+            type=float,
+            dest="translation_speed",
+            help="SANA-WM action DSL per-frame translation speed.",
+        )
+        add_argument(
+            "--rotation-speed-deg",
+            "--rotation_speed_deg",
+            type=float,
+            dest="rotation_speed_deg",
+            help="SANA-WM action DSL per-frame rotation speed in degrees.",
+        )
+        add_argument(
+            "--pitch-limit-deg",
+            "--pitch_limit_deg",
+            type=float,
+            dest="pitch_limit_deg",
+            help="SANA-WM action DSL absolute pitch clamp in degrees.",
         )
         add_argument(
             "--moba-config-path",
