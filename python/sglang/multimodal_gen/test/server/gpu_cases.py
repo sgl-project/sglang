@@ -26,6 +26,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    OMNIDREAMS_I2V_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
     _make_modelopt_ci_case,
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+    DEFAULT_OMNIDREAMS_2B_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
@@ -796,6 +798,19 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
         ),
         run_component_accuracy_check=False,
+    ),
+    # === OmniDreams (NVIDIA autoregressive video world model) ===
+    DiffusionTestCase(
+        "omnidreams_2b_i2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_OMNIDREAMS_2B_MODEL_NAME_FOR_TEST,
+            modality="video",
+        ),
+        OMNIDREAMS_I2V_sampling_params,
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
     ),
 ]
 

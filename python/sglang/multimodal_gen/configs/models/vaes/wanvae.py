@@ -94,3 +94,30 @@ class WanVAEConfig(VAEConfig):
         # Wan VAE does not expose block_out_channels like SD-style VAEs.
         # Its spatial downsample factor is explicitly defined by scale_factor_spatial.
         return self.arch_config.scale_factor_spatial
+
+
+# ---- OmniDreams (Cosmos-Predict2.5-based) VAE config ----
+
+
+@dataclass
+class OmniDreamsVAEArchConfig(WanVAEArchConfig):
+    """VAE arch config for OmniDreams (Cosmos-Predict2.5 latent space).
+
+    Inherits the Wan 2.1 VAE architecture (same encoder/decoder/z_dim=16), but
+    the Cosmos-Predict2.5 latent distribution may differ from Wan's training
+    distribution. Override ``latents_mean`` / ``latents_std`` if GPU validation
+    shows a mismatch; otherwise the Wan defaults are a safe fallback (the
+    encode/decode scaling is self-consistent).
+
+    TODO(gpu): numerically validate latent mean/std against a FlashDreams dump;
+    if they diverge from Wan 2.1, replace these tuples with the
+    OmniDreams-specific values. Current values = Wan 2.1 (same-behavior
+    fallback).
+    """
+
+
+@dataclass
+class OmniDreamsVAEConfig(WanVAEConfig):
+    arch_config: OmniDreamsVAEArchConfig = field(
+        default_factory=OmniDreamsVAEArchConfig
+    )

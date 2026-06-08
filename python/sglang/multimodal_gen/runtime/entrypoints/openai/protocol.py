@@ -127,6 +127,9 @@ class VideoGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # OmniDreams / HDMap conditioning (Phase 4)
+    hdmap_path: Optional[Union[str, List[str]]] = None
+    num_views: Optional[int] = Field(default=None, ge=1, le=64)
 
 
 class VideoListResponse(BaseModel):

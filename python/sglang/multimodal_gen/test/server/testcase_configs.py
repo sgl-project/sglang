@@ -482,6 +482,19 @@ IDEOGRAM4_CI_sampling_params = replace(
     extras={"preset": "V4_QUALITY_48", "seed": 0},
 )
 
+OMNIDREAMS_I2V_sampling_params = DiffusionSamplingParams(
+    prompt="A car drives down a sunny city street.",
+    image_path=(
+        "https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/"
+        "5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg"
+    ),
+    output_size="1280x704",
+    direct_url_test=True,
+    num_frames=13,
+    fps=30,
+    extras={"seed": 42},
+)
+
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",

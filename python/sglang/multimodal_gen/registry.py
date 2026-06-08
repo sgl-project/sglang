@@ -69,6 +69,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+    OmniDreamsPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -124,6 +127,7 @@ from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.omnidreams import OmniDreamsSamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -393,8 +397,38 @@ def _get_config_info(
             model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)
 
-    # 3. Use detectors
-    config = maybe_download_model_index(model_path)
+    # 3. Use detectors.
+    # 3a. Path-based detection for NON-diffusers local checkpoints only (those
+    #     without a model_index.json, e.g. the flat OmniDreams .pt). This is
+    #     gated on the absence of model_index.json so that a substring detector
+    #     (e.g. "sana") cannot hijack a legitimate diffusers model whose path
+    #     happens to contain that substring — diffusers models still go through
+    #     3b where the pipeline _class_name disambiguates.
+    is_local_non_diffusers = os.path.isdir(model_path) and not os.path.isfile(
+        os.path.join(model_path, "model_index.json")
+    )
+    if is_local_non_diffusers:
+        path_matched = [
+            model_id
+            for model_id, detector in _MODEL_NAME_DETECTORS
+            if detector(model_path.lower())
+        ]
+        if path_matched:
+            if len(path_matched) > 1:
+                logger.warning(
+                    "More than one model name matched by path, using the first"
+                )
+            return _CONFIG_REGISTRY.get(path_matched[0])
+
+    # 3b. Fall back to diffusers model_index.json + pipeline-class-name detection.
+    try:
+        config = maybe_download_model_index(model_path)
+    except ValueError:
+        logger.debug(
+            "diffusers model_index.json resolution failed for '%s'; no match.",
+            model_path,
+        )
+        return None
     pipeline_name = config.get("_class_name", "").lower()
 
     matched_model_names = []
@@ -633,6 +667,15 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # OmniDreams (NVIDIA autoregressive video world model, flat .pt DiT)
+    register_configs(
+        sampling_param_cls=OmniDreamsSamplingParams,
+        pipeline_config_cls=OmniDreamsPipelineConfig,
+        hf_model_paths=["nvidia/omni-dreams-models"],
+        model_detectors=[
+            lambda path: "omnidreams" in path.lower() or "omni-dreams" in path.lower()
+        ],
+    )
     # LTX-2
     register_configs(
         sampling_param_cls=LTX2SamplingParams,

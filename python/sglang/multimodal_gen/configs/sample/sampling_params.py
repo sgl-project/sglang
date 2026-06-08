@@ -898,6 +898,17 @@ class SamplingParams:
             ),
         )
         add_argument(
+            "--hdmap-path",
+            type=str,
+            nargs="+",
+            help=(
+                "Path(s) to HD-map / trajectory conditioning input(s) for "
+                "OmniDreams autoregressive video generation. Pass a single path "
+                "(broadcast to every chunk) or one per autoregressive chunk, e.g.: "
+                '--hdmap-path "chunk0.png" "chunk1.png"'
+            ),
+        )
+        add_argument(
             "--moba-config-path",
             type=str,
             help="Path to a JSON file containing V-MoBA specific configurations.",
