@@ -33,27 +33,21 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 # TODO: remove duplicated code
 if current_platform.is_npu():
     from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
-        _UPDATE_WEIGHTS_MODEL_PAIR_ENV,
-        _UPDATE_WEIGHTS_MODEL_PAIR_IDS,
-        _UPDATE_WEIGHTS_TEST_FILES,
+        _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
         COMPONENT_ACCURACY_SUITES,
         DEFAULT_EST_TIME_SECONDS,
         DEFAULT_STANDALONE_EST_TIME_SECONDS,
         FILE_SUITES,
         PARAMETRIZED_CASE_GROUPS,
-        STANDALONE_FILE_EST_TIMES,
         STANDALONE_FILES,
         STARTUP_OVERHEAD_SECONDS,
-        STRICT_SUITES,
         SUITES,
     )
 else:
     from sglang.multimodal_gen.test.server.gpu_cases import (  # noqa: F401 It is used by ci scripts
         _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
-        _UPDATE_WEIGHTS_FROM_TENSOR_TEST_FILE,
         _UPDATE_WEIGHTS_MODEL_PAIR_ENV,
         _UPDATE_WEIGHTS_MODEL_PAIR_IDS,
-        _UPDATE_WEIGHTS_TEST_FILES,
         COMPONENT_ACCURACY_FILE_NUM_GPUS,
         COMPONENT_ACCURACY_SUITES,
         DEFAULT_EST_TIME_SECONDS,
@@ -233,7 +227,7 @@ def _run_standalone_file(
     target_dir: Path,
     extra_filter: str | None = None,
 ) -> tuple[int, list[str], dict[str, str], dict]:
-    if standalone_rel in _UPDATE_WEIGHTS_TEST_FILES:
+    if standalone_rel == _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE:
         _maybe_pin_update_weights_model_pair([standalone_rel])
 
     est_time, used_fallback_estimate = get_standalone_file_est_time(
@@ -754,9 +748,7 @@ def _is_in_ci() -> bool:
 def _maybe_pin_update_weights_model_pair(suite_files_rel: list[str]) -> None:
     if not _is_in_ci():
         return
-    if not any(
-        test_file in suite_files_rel for test_file in _UPDATE_WEIGHTS_TEST_FILES
-    ):
+    if _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE not in suite_files_rel:
         return
     if os.environ.get(_UPDATE_WEIGHTS_MODEL_PAIR_ENV):
         print(

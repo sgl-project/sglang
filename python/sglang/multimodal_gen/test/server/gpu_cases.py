@@ -851,20 +851,12 @@ PARAMETRIZED_CASE_GROUPS = {
     ],
 }
 
-_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
-_UPDATE_WEIGHTS_FROM_TENSOR_TEST_FILE = "test_update_weights_from_tensor.py"
-_UPDATE_WEIGHTS_TEST_FILES = {
-    _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
-    _UPDATE_WEIGHTS_FROM_TENSOR_TEST_FILE,
-}
-
 STANDALONE_FILES = {
     "1-gpu": [
         "../cli/test_generate_t2i_perf.py",
         # Temporarily disabled: 24 timeout failures since 2026-04-09 across
         # multimodal-gen-test-1-gpu. Re-enable after the flakiness is fixed.
         # "test_update_weights_from_disk.py",
-        _UPDATE_WEIGHTS_FROM_TENSOR_TEST_FILE,
     ],
     "2-gpu": [
         "test_disagg_server.py",
@@ -879,7 +871,6 @@ STANDALONE_FILE_EST_TIMES = {
         "../cli/test_generate_t2i_perf.py": 240.0,
         # See STANDALONE_FILES note above — temporarily disabled.
         # "test_update_weights_from_disk.py": 480.0,
-        _UPDATE_WEIGHTS_FROM_TENSOR_TEST_FILE: 360.0,
     },
     "2-gpu": {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
@@ -913,6 +904,7 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
 _UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
 _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "FLUX.2-klein-base-4B",
