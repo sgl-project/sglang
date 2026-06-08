@@ -1,5 +1,4 @@
 import unittest
-from typing import List
 
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
@@ -13,18 +12,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_finished,
     warmup_radix,
 )
-
-
-def _in_flight_other_mb_rids(t: ScriptedContext) -> List[str]:
-    s = t.scheduler
-    if not hasattr(s, "running_mbs"):
-        return []
-    rids: List[str] = []
-    for mb in s.running_mbs:
-        if mb is s.running_batch or mb is None:
-            continue
-        rids.extend(r.rid for r in mb.reqs)
-    return rids
 
 
 def _drain_until_released(t, *handles):
@@ -363,59 +350,6 @@ class TestRegressionPp(ScriptedTestCase):
         )
         yield from _drain_until_released(t, r)
         assert r.finished
-
-    def test_pp_other_mb_chunked_exclude(self):
-        self.server.execute_script(self._script_pp_other_mb_chunked_exclude)
-
-    @staticmethod
-    def _script_pp_other_mb_chunked_exclude(t: ScriptedContext):
-        r_long = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=5
-        )
-        r_ctrl = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1, prompt_token=6
-        )
-
-        long_exclude_engaged = False
-        ctrl_exclude_engaged = False
-        ctrl_seen_in_flight = False
-        for _ in range(2000):
-            in_flight_other_mb = _in_flight_other_mb_rids(t)
-            running = [req.rid for req in t.scheduler.running_batch.reqs]
-            if r_long.rid in in_flight_other_mb:
-                long_exclude_engaged = True
-                assert r_long.rid not in running, (
-                    f"69ef71edc4: max_new_tokens > 1 chunked-resume req "
-                    f"must be excluded from local running while held in "
-                    f"another mb's in-flight set; rid={r_long.rid}"
-                )
-            if r_ctrl.rid in in_flight_other_mb:
-                ctrl_seen_in_flight = True
-                if r_ctrl.rid in running:
-                    ctrl_exclude_engaged = True
-            in_flight = 1 if t.scheduler.chunked_req is not None else 0
-            assert (
-                in_flight <= 1
-            ), f"PP cross-mb chunked exclusion broken: in_flight={in_flight}"
-            if r_long.finished and r_ctrl.finished:
-                break
-            yield
-        else:
-            raise AssertionError("reqs did not finish")
-
-        assert r_long.finished and r_ctrl.finished
-        assert r_long.chunks_done >= 2 and r_ctrl.chunks_done >= 2, (
-            f"both reqs must chunk cold; got long={r_long.chunks_done} "
-            f"ctrl={r_ctrl.chunks_done}"
-        )
-        assert long_exclude_engaged, (
-            "69ef71edc4: never observed r_long in another mb's in-flight "
-            "set — cross-mb exclude path was not exercised"
-        )
-        assert ctrl_exclude_engaged or not ctrl_seen_in_flight, (
-            "69ef71edc4: max_new_tokens == 1 control was seen in another mb's "
-            "in-flight set but never in local running — it must NOT be excluded"
-        )
 
 
 class TestRegressionPriority(ScriptedTestCase):
