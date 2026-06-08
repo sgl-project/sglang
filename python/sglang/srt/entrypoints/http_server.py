@@ -1377,8 +1377,8 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await TokenizerManager.load_lora_adapter(
-        _global_state.tokenizer_manager.lora_controller, obj, request
+    result = await _global_state.tokenizer_manager.lora_controller.load_lora_adapter(
+        obj, request
     )
 
     if result.success:
@@ -1398,8 +1398,8 @@ async def load_lora_adapter_from_tensors(
     obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
-    result = await TokenizerManager.load_lora_adapter_from_tensors(
-        _global_state.tokenizer_manager.lora_controller, obj, request
+    result = await _global_state.tokenizer_manager.lora_controller.load_lora_adapter_from_tensors(
+        obj, request
     )
 
     if result.success:
@@ -1412,8 +1412,8 @@ async def load_lora_adapter_from_tensors(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await TokenizerManager.unload_lora_adapter(
-        _global_state.tokenizer_manager.lora_controller, obj, request
+    result = await _global_state.tokenizer_manager.lora_controller.unload_lora_adapter(
+        obj, request
     )
 
     if result.success:
