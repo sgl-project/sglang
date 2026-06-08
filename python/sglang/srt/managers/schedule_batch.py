@@ -1062,6 +1062,8 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def get_full_untruncated_fill_ids(self) -> array:
+        if not self.output_ids and not self.is_dllm():
+            return self.origin_input_ids
         ids = self.origin_input_ids + self.output_ids
         if self.is_dllm():
             ids = ids + array(
@@ -1088,7 +1090,7 @@ class Req(ReqDllmMixin):
             self.determine_dllm_phase()
 
         full_fill_ids = self.get_full_untruncated_fill_ids()
-        input_len = len(full_fill_ids)
+        input_len = self.get_full_untruncated_fill_len()
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
