@@ -89,36 +89,34 @@ struct C128Trait {
   static_assert(kHeadDim % kTileDim == 0);
 };
 
-template <typename Trait, bool kUsePDL, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat>
+template <typename Trait, bool kUsePDL, typename BufFloat, typename InFloat, typename OutFloat>
 SGL_DEVICE void c128_forward(
     const BufFloat* kv_buf,  // [128n, 128n + 127]
     const InFloat* kv_src,   // ragged pointer at position = 128n + 127
     OutFloat* kv_out,
-    const ApeFloat* score_bias,
+    const InFloat* score_bias,
     const int32_t buffer_len) {
   using namespace device;
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
 
-  /// NOTE: part 1: load kv + score. buffer/input/ape may each carry their own
-  /// dtype; every value is converted to fp32 right after load, so no host-side
-  /// dtype bridging (extra elementwise `.to()` kernels) is needed.
+  /// NOTE: part 1: load kv + score. kv_score_buffer (fp32, runtime state pool)
+  /// keeps its own BufFloat dtype; input/ape share InFloat (ape is cast to bf16
+  /// at load). Every value is converted to fp32 right after load.
   using StorageBuf = AlignedVector<BufFloat, kTileElements>;
   using StorageIn = AlignedVector<InFloat, kTileElements>;
-  using StorageApe = AlignedVector<ApeFloat, kTileElements>;
   const auto gmem_buf = tile::Memory<StorageBuf>{lane_id, kWarpThreads};
   const auto gmem_in = tile::Memory<StorageIn>{lane_id, kWarpThreads};
-  const auto gmem_ape = tile::Memory<StorageApe>{lane_id, kWarpThreads};
   float kv[kElementsPerWarp][kTileElements];
   float score[kElementsPerWarp][kTileElements];
-  StorageApe bias[kElementsPerWarp];
+  StorageIn bias[kElementsPerWarp];
   const int32_t warp_offset = warp_id * kElementsPerWarp;
 
 #pragma unroll
   for (int32_t i = 0; i < 8; ++i) {
     const int32_t j = i + warp_offset;
-    bias[i] = gmem_ape.load(score_bias + j * Trait::kHeadDim);
+    bias[i] = gmem_in.load(score_bias + j * Trait::kHeadDim);
   }
 
   const auto kv_start = kv_src - 127 * Trait::kElementSize;  // point to start
@@ -255,7 +253,7 @@ SGL_DEVICE void c128_write_decode(BufFloat* kv_buf, const InFloat* kv_src) {
   }
 }
 
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodeParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
@@ -270,7 +268,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
   const auto kv_input = static_cast<const InFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufFloat*>(params.kv_buffer) + split_offset;
-  const auto score_bias = static_cast<const ApeFloat*>(params.score_bias) + split_offset;
+  const auto score_bias = static_cast<const InFloat*>(params.score_bias) + split_offset;
 
   const auto kv_src = kv_input + global_bid * Trait::kElementSize;
   const auto kv_out = kv_output + global_bid * Trait::kHeadDim;
@@ -283,12 +281,12 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
     c128_write_decode<Trait, BufFloat, InFloat>(kv_dst, kv_src);
   }
   if (plan.write_loc % 128 == 127) {
-    c128_forward<Trait, kUsePDL, BufFloat, InFloat, ApeFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, 128);
+    c128_forward<Trait, kUsePDL, BufFloat, InFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, 128);
   }
 }
 
 // compress kernel
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
@@ -302,7 +300,7 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   const auto kv_input = static_cast<const InFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufFloat*>(params.kv_buffer) + split_offset;
-  const auto score_bias = static_cast<const ApeFloat*>(params.score_bias) + split_offset;
+  const auto score_bias = static_cast<const InFloat*>(params.score_bias) + split_offset;
   if (plan.is_invalid()) return;
 
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
@@ -310,11 +308,10 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   PDLWaitPrimary<kUsePDL>();
-  c128_forward<Trait, kUsePDL, BufFloat, InFloat, ApeFloat, OutFloat>(
-      kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
+  c128_forward<Trait, kUsePDL, BufFloat, InFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
 }
 
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
@@ -358,11 +355,11 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   }
 }
 
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress128Kernel {
-  static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, BufFloat, InFloat, ApeFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel = flash_c128_prefill<kHeadDim, BufFloat, InFloat, ApeFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel = write_c128_prefill<kHeadDim, BufFloat, InFloat, ApeFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, BufFloat, InFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel = flash_c128_prefill<kHeadDim, BufFloat, InFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_w_kernel = write_c128_prefill<kHeadDim, BufFloat, InFloat, OutFloat, kUsePDL>;
   static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 64
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
   using Trait = C128Trait<kHeadDim>;
@@ -392,7 +389,7 @@ struct FlashCompress128Kernel {
         .with_device(device_)
         .verify(kv_output);
     TensorMatcher({128, kHeadDim})  // ape
-        .with_dtype<ApeFloat>()
+        .with_dtype<InFloat>()
         .with_device(device_)
         .verify(ape);
 
@@ -439,7 +436,7 @@ struct FlashCompress128Kernel {
         .with_device(device_)
         .verify(kv_output);
     TensorMatcher({128, kHeadDim})  // ape
-        .with_dtype<ApeFloat>()
+        .with_dtype<InFloat>()
         .with_device(device_)
         .verify(ape);
 

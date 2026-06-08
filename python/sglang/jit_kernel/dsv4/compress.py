@@ -20,14 +20,11 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_compress_norm_rope_module(
     dtype: torch.dtype,
-    weight_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
 ) -> Module:
-    args = make_cpp_args(
-        dtype, weight_dtype, head_dim, rope_dim, page_size, is_arch_support_pdl()
-    )
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
         cuda_wrappers.append(
@@ -46,12 +43,11 @@ def _jit_compress_module(
     head_dim: int,
     dtype_buf: torch.dtype,
     dtype_in: torch.dtype,
-    dtype_ape: torch.dtype,
     dtype_out: torch.dtype,
     ratio: Literal[4, 128],
 ) -> Module:
     args = make_cpp_args(
-        head_dim, dtype_buf, dtype_in, dtype_ape, dtype_out, is_arch_support_pdl()
+        head_dim, dtype_buf, dtype_in, dtype_out, is_arch_support_pdl()
     )
     kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
     return load_jit(
@@ -328,13 +324,14 @@ def compress_forward(
         assert compress_ratio == 128 and head_dim == 512
         module = _jit_compress_128_online_module(512)
     else:
-        # Per-tensor dtypes: buffer/input/ape may differ; the kernel casts each
-        # to fp32 at load time, so no host-side `.to()` bridging is required.
+        # kv_score_buffer (fp32 runtime state pool) may differ from input/ape, so
+        # the kernel keeps a BufFloat template and casts the buffer to fp32 at
+        # load. ape/weight are cast to bf16 at load (apply_ape_hotfix), matching
+        # kv_score_input's dtype, so they need no extra template params.
         module = _jit_compress_module(
             head_dim,
             kv_score_buffer.dtype,
             kv_score_input.dtype,
-            ape.dtype,
             out.dtype,
             compress_ratio,
         )
@@ -359,7 +356,7 @@ def compress_norm_rope_store(
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, norm_weight.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
     )
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(
