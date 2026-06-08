@@ -84,6 +84,9 @@ from sglang.srt.managers.tokenizer_manager_components import (
     request_tracing,
     spec_decoding_meta,
 )
+from sglang.srt.managers.tokenizer_manager_components.raw_tokenizer_wrapper import (
+    RawTokenizerWrapper,
+)
 from sglang.srt.managers.tokenizer_manager_components.request_state import (
     ReqState,
     init_req,
@@ -181,7 +184,7 @@ class TokenizerManager(TokenizerControlMixin):
         self.init_model_config()
 
         # Initialize tokenizer and multimodalprocessor
-        self.init_tokenizer_and_processor()
+        self.init_raw_tokenizer_wrapper()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -237,26 +240,29 @@ class TokenizerManager(TokenizerControlMixin):
             self.num_reserved_tokens = 0
         self.validate_total_tokens = True
 
-    def init_tokenizer_and_processor(self):
-        server_args = self.server_args
-
+    @staticmethod
+    def init_tokenizer_and_processor(
+        self: "RawTokenizerWrapper",
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+    ) -> None:
         # Initialize tokenizer and processor
-        if self.model_config.is_multimodal:
+        if model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = _get_processor_wrapper(server_args)
-            transport_mode = _determine_tensor_transport_mode(self.server_args)
+            transport_mode = _determine_tensor_transport_mode(server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
             self.mm_processor = get_mm_processor(
-                self.model_config.hf_config,
+                model_config.hf_config,
                 server_args,
                 _processor,
                 transport_mode,
-                model_config=self.model_config,
+                model_config=model_config,
             )
 
             if server_args.skip_tokenizer_init:
@@ -291,6 +297,14 @@ class TokenizerManager(TokenizerControlMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def init_raw_tokenizer_wrapper(self):
+        self.raw_tokenizer_wrapper = RawTokenizerWrapper()
+        TokenizerManager.init_tokenizer_and_processor(
+            self.raw_tokenizer_wrapper,
+            server_args=self.server_args,
+            model_config=self.model_config,
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -2526,6 +2540,22 @@ class TokenizerManager(TokenizerControlMixin):
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+
+    @property
+    def tokenizer(self):
+        return self.raw_tokenizer_wrapper.tokenizer
+
+    @property
+    def processor(self):
+        return self.raw_tokenizer_wrapper.processor
+
+    @property
+    def mm_processor(self):
+        return self.raw_tokenizer_wrapper.mm_processor
+
+    @property
+    def async_dynamic_batch_tokenizer(self):
+        return self.raw_tokenizer_wrapper.async_dynamic_batch_tokenizer
 
 
 class ServerStatus(Enum):
