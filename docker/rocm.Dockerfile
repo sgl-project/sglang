@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm7_13 -t v0.5.10.post1-rocm713-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm7_14 -t v0.5.10.post1-rocm714-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
@@ -10,14 +10,14 @@
 # Keep the build-arg for user to select the desired nic support, current choice: [ainic, bxnt]
 # if no set this arg, it will support nic auto detection. On a target with more than 1 type of
 # RDMA NICs installed (rare), overwrite w. runtime env MORI_DEVICE_NIC = "bnxt"|"ionic"|"mlx5"
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm7_13 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm713-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm7_14 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm714-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
-ARG BASE_IMAGE_950_ROCM7_13="ubuntu:24.04"
+ARG BASE_IMAGE_950_ROCM7_14="ubuntu:24.04"
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
@@ -27,8 +27,8 @@ ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_rele
 ARG GPU_ARCH=gfx950
 
 # ===============================
-# Base image 950 with rocm7_13 and args
-FROM $BASE_IMAGE_950_ROCM7_13 AS gfx950-rocm7_13
+# Base image 950 with rocm7_14 and args
+FROM $BASE_IMAGE_950_ROCM7_14 AS gfx950-rocm7_14
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -58,7 +58,7 @@ RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
 # ROCm SDK and PyTorch dependencies
 ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/v2/gfx950-dcgpu/"
-# Pin to a specific ROCm SDK version (e.g. 7.13.0a20260415). Leave empty for latest.
+# Pin to a specific ROCm SDK version (e.g. 7.14.0a20260604). Leave empty for latest.
 ARG ROCM_SDK_VERSION="7.14.0a20260604"
 ARG TORCH_VERSION="2.10.0"
 ARG TORCHVISION_VERSION="0.25.0"
@@ -213,7 +213,7 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm7_13*) \
+      *rocm7_14*) \
         ;; \
       *rocm720*) \
         echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
@@ -270,15 +270,21 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 # -----------------------
 # FlyDSL
-RUN apt-get update && apt-get install -y ninja-build patchelf cmake \
-    && git clone https://github.com/ROCm/FlyDSL.git --branch v0.1.8
-RUN cd FlyDSL \
-    && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
-    && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
-    && bash -lc 'unset LLVM_COMMIT && source /opt/venv/bin/activate \
-      && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
-      && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
-      && FLYDSL_RELEASE_TYPE=release pip install -e .;'
+# XXX: The double-sed patch is to workaround TheRock#2484. Once TheRock is fixed,
+#      this whold section can be removed.
+RUN if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
+      apt-get update && apt-get install -y ninja-build patchelf cmake \
+      && git clone https://github.com/ROCm/FlyDSL.git --branch v0.1.8; \
+    fi
+RUN if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
+      cd FlyDSL \
+      && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
+      && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
+      && bash -lc 'unset LLVM_COMMIT && source /opt/venv/bin/activate \
+        && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
+        && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
+        && FLYDSL_RELEASE_TYPE=release pip install -e .;'; \
+    fi
 
 # -----------------------
 # AITER
@@ -305,7 +311,7 @@ RUN git clone ${AITER_REPO} \
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
-     && if [ "${GPU_ARCH}" = "gfx950-rocm7_13" ]; then \
+     && if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
          PATH=$PATH:$ROCM_HOME/llvm/bin GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
         elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
@@ -468,7 +474,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
   git checkout -f "${TILELANG_COMMIT}" && \
   git submodule update --init --recursive && \
-  if [ "${GPU_ARCH}" = "gfx950-rocm7_13" ]; then \
+  if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
     export ROCM_PATH=/opt/rocm; \
