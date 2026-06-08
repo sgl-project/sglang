@@ -5978,6 +5978,14 @@ class ServerArgs:
             help="Skip the extra MLP sync that the scheduler performs before merging a new batch "
             "when speculative decoding + DP attention are both enabled.",
         )
+        parser.add_argument(
+            "--peagle-dsl-threshold",
+            type=float,
+            default=ServerArgs.peagle_dsl_threshold,
+            help="P-EAGLE DSL confidence threshold (logit-gap) for sync-free early exit. "
+            "Lower values exit earlier with fewer draft tokens. "
+            "Only used when --speculative-algorithm PEAGLE_DSL.",
+        )
 
         # Multi-layer Eagle speculative decoding
         parser.add_argument(

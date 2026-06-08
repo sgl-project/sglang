@@ -264,44 +264,37 @@ def test_positions_gt0_are_shared():
 
 
 @pytest.mark.skipif(not _is_cuda_available(), reason="CUDA required")
-def test_fused_kernel_no_item_call(monkeypatch):
+def test_dsl_kernel_no_item_call(monkeypatch):
     """
-    fused_parallel_draft_input must not call .item() (which causes CPU-GPU sync).
+    The DSL sampling kernel must not call .item() (which causes CPU-GPU sync).
 
-    Strategy: patch torch.Tensor.item to raise, then run the kernel.
-    The test passes if no exception is raised (no .item() call).
+    We exercise _draft_sample_with_dsl_kernel — the function that actually
+    implements sync-free early exit — rather than fused_parallel_draft_input,
+    so the monkeypatched .item() will catch any host synchronization in the
+    critical DSL path.
     """
-    from sglang.srt.speculative.triton_ops.fused_draft_input import (
-        fused_parallel_draft_input,
-    )
+    from sglang.srt.speculative.p_eagle_worker import PEAGLEDSLWorker
 
     device = torch.device("cuda")
-    batch_size, K, hidden_dim, vocab_size = 4, 3, 512, 256
-
-    original_item = torch.Tensor.item
+    batch_size, K, vocab_size = 4, 3, 256
 
     def _no_item(self):
         raise AssertionError(
-            "fused_parallel_draft_input called .item() — this causes CPU-GPU sync "
-            "and violates the sync-free DSL contract."
+            "_draft_sample_with_dsl_kernel called .item() — this causes "
+            "CPU-GPU sync and violates the sync-free DSL contract."
         )
 
     monkeypatch.setattr(torch.Tensor, "item", _no_item)
 
-    h_fused = torch.randn(batch_size, hidden_dim, dtype=torch.float16, device=device)
-    embed_table = torch.randn(
-        vocab_size, hidden_dim, dtype=torch.float16, device=device
-    )
-    last_tokens = torch.zeros(batch_size, dtype=torch.int64, device=device)
-    h_shared = h_fused.mean(0)
+    # Build a minimal PEAGLEDSLWorker instance (no model required)
+    worker = object.__new__(PEAGLEDSLWorker)
+    worker._dsl_continue_buf = torch.ones(batch_size, dtype=torch.bool, device=device)
+    worker.dsl_threshold = 2.0
 
-    # Should not raise
-    out = fused_parallel_draft_input(
-        h_fused=h_fused,
-        embed_table=embed_table,
-        last_tokens=last_tokens,
-        h_shared=h_shared,
-        mask_token_id=2,
-        K=K,
-    )
-    assert out.shape == (batch_size * K, hidden_dim)
+    all_logits = torch.randn(batch_size, K, vocab_size, dtype=torch.float32, device=device)
+
+    # Should not raise — any .item() call would propagate AssertionError
+    tokens, scores = worker._sample_with_dsl_kernel(all_logits, batch_size, K)
+
+    assert tokens.shape == (batch_size, K)
+    assert scores.shape == (batch_size, K)

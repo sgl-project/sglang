@@ -89,6 +89,11 @@ def _draft_sample_with_dsl_kernel(
     seq_id = tl.program_id(0)
 
     should_continue = True
+    # Default: stop after this step unless k==K-1 passes the threshold.
+    # Written here so that early exit (confidence < threshold at k < K-1)
+    # always clears the flag rather than leaving stale True from the previous
+    # invocation.
+    tl.store(continue_buf_ptr + seq_id, False)
 
     for k in range(K):
         if not should_continue:
