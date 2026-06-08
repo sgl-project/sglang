@@ -1078,9 +1078,8 @@ class Req(ReqDllmMixin):
             self.determine_dllm_phase()
         else:
             self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
-            self.fill_len = len(self.full_untruncated_fill_ids)
 
-        input_len = self.fill_len
+        input_len = len(self.full_untruncated_fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1098,7 +1097,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.get_fill_ids()[
+        token_ids_to_match = self.full_untruncated_fill_ids[
             : self._compute_max_prefix_len(input_len)
         ]
 
@@ -1163,7 +1162,7 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(self.fill_len - len(self.prefix_indices))
+        self.set_extend_input_len(input_len - len(self.prefix_indices))
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1371,6 +1370,7 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        self.fill_len = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1429,7 +1429,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = self.fill_len
+            logprob_start_len = len(self.full_untruncated_fill_ids)
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
