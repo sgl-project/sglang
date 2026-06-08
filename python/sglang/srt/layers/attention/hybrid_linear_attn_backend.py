@@ -710,7 +710,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         self,
         mixer: MambaMixer2,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         layer_id: int,
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
@@ -718,7 +718,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        intermediate_states = mixer.forward(
+        mixer_out, intermediate_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
             layer_cache=layer_cache,
@@ -751,6 +751,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     forward_batch.mamba_track_indices[-num_decodes:],
                     num_decodes,
                 )
+
+        return mixer_out
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(

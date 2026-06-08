@@ -356,7 +356,7 @@ class SamplingParams:
             or self.seed < 0
         ):
             raise ValueError(
-                "seed must be a non-negative int or list of ints, " f"got {self.seed!r}"
+                f"seed must be a non-negative int or list of ints, got {self.seed!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -1077,26 +1077,29 @@ class SamplingParams:
 
         # global switch: if True, allow overriding protected fields
         allow_override_protected = not user_params.no_override_protected_fields
-        for param_field in dataclasses.fields(user_params):
-            field_name = param_field.name
+        for field_info in dataclasses.fields(user_params):
+            field_name = field_info.name
             user_value = getattr(user_params, field_name)
             if hasattr(SamplingParams, field_name):
                 default_class_value = getattr(SamplingParams, field_name)
-            elif param_field.default is not dataclasses.MISSING:
-                default_class_value = param_field.default
-            elif param_field.default_factory is not dataclasses.MISSING:
-                default_class_value = param_field.default_factory()
+            elif field_info.default is not dataclasses.MISSING:
+                default_class_value = field_info.default
+            elif field_info.default_factory is not dataclasses.MISSING:
+                default_class_value = field_info.default_factory()
             else:
                 default_class_value = dataclasses.MISSING
 
-            is_user_modified = user_value != default_class_value or (
-                explicit_fields is not None and field_name in explicit_fields
-            )
+            if explicit_fields is not None:
+                is_user_modified = field_name in explicit_fields
+            else:
+                is_user_modified = user_value != default_class_value
             is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
+        if explicit_fields is not None:
+            self._explicit_fields = set(explicit_fields)
         self.__post_init__()
 
     @property
