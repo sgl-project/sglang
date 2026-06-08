@@ -1080,15 +1080,6 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.get_full_untruncated_fill_ids()[: self.fill_len]
 
-    def get_committed_fill_ids(self) -> array:
-        # Only committed KV belongs in the radix tree. fill_len equals
-        # kv_committed_len at every cache_unfinished_req call site, so key on
-        # kv_committed_len directly instead of the fill_len sentinel.
-        assert (
-            self.fill_len == self.kv_committed_len
-        ), f"{self.fill_len=} != {self.kv_committed_len=}"
-        return self.get_full_untruncated_fill_ids()[: self.kv_committed_len]
-
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
