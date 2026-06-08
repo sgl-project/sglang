@@ -26,6 +26,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     default_sana_wm_refiner_dtype,
     sana_wm_skip_refiner_enabled,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
+    SanaWMStreamingDecodingStage,
+    SanaWMStreamingDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming_refiner import (
+    SanaWMStreamingRefinerStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -96,10 +103,6 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         if getattr(server_args.pipeline_config, "streaming", False):
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
-                SanaWMStreamingDenoisingStage,
-            )
-
             DenoiseStage = SanaWMStreamingDenoisingStage
         else:
             DenoiseStage = SanaWMDenoisingStage
@@ -120,10 +123,6 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         if server_args is not None and getattr(
             server_args.pipeline_config, "streaming", False
         ):
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
-                SanaWMStreamingDecodingStage,
-            )
-
             DecodeStage = SanaWMStreamingDecodingStage
         else:
             DecodeStage = SanaWMDecodingStage
@@ -291,10 +290,6 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             dtype=default_sana_wm_refiner_dtype(server_args),
         )
         if getattr(pc, "streaming", False) and getattr(pc, "refiner_chunked", True):
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming_refiner import (
-                SanaWMStreamingRefinerStage,
-            )
-
             stage = SanaWMStreamingRefinerStage(
                 **common,
                 block_size=int(getattr(pc, "refiner_block_size", 3)),

@@ -26,9 +26,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.self_forcing import (
+    SanaWMSelfForcingSampler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.utils import (
     normalize_camera_actions,
     parse_action_string,
+    snap_num_frames,
 )
 from sglang.multimodal_gen.runtime.realtime.camera_controls import (
     RealtimeCameraControlState,
@@ -284,24 +288,14 @@ class SanaWMRealtimeAdapter(RealtimeModelAdapter):
         temporal_compression = int(
             server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
         )
-        # Sample action frames in lockstep with the session's FRONT-LOADED autoregressive
-        # segmentation (chunk 0 carries the latent_t % nfpb remainder, matching the batch
-        # path). A uniform nfpb*tc count leaves chunk 0's extra front-loaded latent frames
-        # reading static-padded camera poses, so the windowed camera_conditions/chunk_plucker
-        # diverge from batch and the error compounds over the clip (see realtime-vs-batch
-        # audit). Match each chunk's latent span instead.
+        # Match action sampling to the latent span used by the batch path. Chunk
+        # 0 may carry a front-loaded remainder, so a fixed nfpb*tc action count
+        # would read static-padded camera poses and drift from batch output.
         action_chunk_size = chunk_size * temporal_compression
         req_num_frames = (
             session.request.num_frames if session.request is not None else None
         )
         if req_num_frames is not None:
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.self_forcing import (
-                SanaWMSelfForcingSampler,
-            )
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.utils import (
-                snap_num_frames,
-            )
-
             snapped = snap_num_frames(int(req_num_frames), stride=temporal_compression)
             latent_t = (snapped - 1) // temporal_compression + 1
             segments = SanaWMSelfForcingSampler.create_autoregressive_segments(

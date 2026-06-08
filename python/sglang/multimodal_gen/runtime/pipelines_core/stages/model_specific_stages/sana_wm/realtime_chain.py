@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SANA-WM realtime stage CHAIN — decomposition of the former mega-stage
-(``SanaWMRealtimeStage.forward``).
+"""SANA-WM realtime stage chain.
 
 Per-tick pipeline:
 
@@ -14,8 +13,8 @@ Per-tick pipeline:
     SanaWMChunkedRefinerChainStage        -> batch.latents = refined buffer
     SanaWMCausalDecodeChainStage          -> OutputBatch (decodes past its frontier)
 
-Chain stages subclass the helper host ``SanaWMRealtimeStage`` so the
-parity-validated bodies are inherited verbatim rather than copied.
+Chain stages share ``SanaWMRealtimeStage`` for first-frame image handling and
+causal VAE decode helpers; model-specific chunk planning stays in this module.
 """
 
 from __future__ import annotations
@@ -129,8 +128,7 @@ class SanaWMRefinerChainState(BaseRealtimeState):
 # Chain stages
 # --------------------------------------------------------------------- #
 class SanaWMCondFrameEncodeStage(SanaWMRealtimeStage):
-    """Cond-frame VAE encode (parity-critical fp32 + long-video config path,
-    inherited verbatim) + the session input snapshot."""
+    """Encode the first frame and write the session input snapshot."""
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

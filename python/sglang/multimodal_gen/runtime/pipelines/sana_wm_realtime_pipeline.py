@@ -18,6 +18,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     default_sana_wm_refiner_dtype,
     sana_wm_skip_refiner_enabled,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_chain import (
+    SanaWMCameraCondStage,
+    SanaWMCausalDecodeChainStage,
+    SanaWMChunkedRefinerChainStage,
+    SanaWMCondFrameEncodeStage,
+    SanaWMRealtimeLatentPrepStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
+    SanaWMStreamingDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming_refiner import (
+    SanaWMStreamingRefinerStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 
@@ -27,13 +40,12 @@ DEFAULT_SANA_WM_TEXT_ENCODER = "Efficient-Large-Model/gemma-2-2b-it"
 class SanaWMRealtimeTextEncodingStage(
     RealtimeTextEncodingStage, SanaWMTextEncodingStage
 ):
-    """Realtime text encoding using SANA-WM's prompt processing (NOT the bare base).
+    """Realtime text encoding using SANA-WM prompt processing.
 
     MRO contract: ``RealtimeTextEncodingStage.forward`` (per-session cache) calls
-    ``super().forward``, which must resolve to ``SanaWMTextEncodingStage.forward`` (chi_prompt
-    prefix + official 300-token prompt window), not the generic ``TextEncodingStage.forward``.
-    Otherwise realtime prompt embeds diverge from the batch path, shifting DiT cross-attention
-    conditioning every chunk.
+    ``super().forward``, which must resolve to ``SanaWMTextEncodingStage.forward``.
+    This preserves the chi prompt prefix and official prompt window used by the
+    batch path.
     """
 
 
@@ -68,16 +80,11 @@ class SanaWMRealtimePipeline(SanaWMTwoStagePipeline):
         )
 
     def _build_realtime_refiner_stage(self, server_args: ServerArgs):
-        """Construct OUR chunked streaming refiner stage from the loaded refiner
-        modules, mirroring ``SanaWMTwoStagePipeline._maybe_add_refiner_stage``.
-        Returns ``None`` when the refiner is disabled / not loaded."""
+        """Build the chunked streaming refiner carrier when refiner modules exist."""
         if sana_wm_skip_refiner_enabled():
             return None
         if self.get_module("transformer_2") is None:
             return None
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming_refiner import (
-            SanaWMStreamingRefinerStage,
-        )
 
         pc = server_args.pipeline_config
         return SanaWMStreamingRefinerStage(
@@ -93,17 +100,6 @@ class SanaWMRealtimePipeline(SanaWMTwoStagePipeline):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_chain import (
-            SanaWMCameraCondStage,
-            SanaWMCausalDecodeChainStage,
-            SanaWMChunkedRefinerChainStage,
-            SanaWMCondFrameEncodeStage,
-            SanaWMRealtimeLatentPrepStage,
-        )
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
-            SanaWMStreamingDenoisingStage,
-        )
-
         refiner_stage = self._build_realtime_refiner_stage(server_args)
         common = dict(
             transformer=self.get_module("transformer"),
