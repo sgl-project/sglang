@@ -100,6 +100,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "mlu",
 ]
 
 # trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it

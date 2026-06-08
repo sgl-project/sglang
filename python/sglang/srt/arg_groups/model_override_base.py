@@ -307,9 +307,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
         2.3 Otherwise, we will use triton backend.
     """
     cfg = resolving_view(server_args)
-    # OOT platforms provide their own default attention backend.
-    if current_platform.is_out_of_tree():
-        return current_platform.get_default_attention_backend()
+    platform_backend = current_platform.get_default_attention_backend()
+    if platform_backend is not None:
+        return platform_backend
 
     # Whisper requires flashinfer for cross-attention CUDA graph support.
     if "WhisperForConditionalGeneration" in (

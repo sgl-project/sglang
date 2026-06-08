@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
@@ -51,6 +52,15 @@ def _is_xpu_available() -> bool:
     return torch.xpu.is_available()
 
 
+def _is_mlu_available() -> bool:
+    if not hasattr(torch, "mlu"):
+        try:
+            import torch_mlu  # noqa: F401
+        except ImportError:
+            return False
+    return bool(torch.mlu.is_available())
+
+
 def _resolve_platform() -> SRTPlatform:
     """
     Discover and instantiate the active platform.
@@ -73,6 +83,7 @@ def _resolve_platform() -> SRTPlatform:
          - 0 activated + CUDA available → fallback CudaSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + XPU available  → fallback XpuSRTPlatform
+         - 0 activated + MLU available → fallback MluSRTPlatform
          - 0 activated + none of the above → fallback base SRTPlatform
          - 1 activated → use it
          - N activated → RuntimeError (must set SGLANG_PLATFORM)
@@ -143,6 +154,9 @@ def _resolve_platform() -> SRTPlatform:
         if _is_xpu_available():
             logger.debug("No platform plugin detected. Using XPU SRTPlatform defaults.")
             return XpuSRTPlatform()
+        if _is_mlu_available():
+            logger.debug("No platform plugin detected. Using MLU SRTPlatform defaults.")
+            return MluSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 

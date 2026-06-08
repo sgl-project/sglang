@@ -210,6 +210,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_amd_specifics,
         handle_cpu_backends,
         handle_hpu_backends,
+        handle_mlu_backends,
         handle_mps_backends,
         handle_nccl_pre_warm,
         handle_npu_backends,
@@ -222,6 +223,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_cpu_backends, server_args)
     run_hook(handle_npu_backends, server_args)
     run_hook(handle_mps_backends, server_args)
+    run_hook(handle_mlu_backends, server_args)
     run_hook(handle_xpu_backends, server_args)
     # Must precede handle_gpu_memory_settings: its symm-mem prealloc default
     # keys off enable_symm_mem.

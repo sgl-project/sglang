@@ -63,6 +63,46 @@ def handle_mps_backends(server_args: Any):
             )
 
 
+def handle_mlu_backends(server_args: Any):
+    if not get_platform().is_mlu:
+        return
+    cfg = resolving_view(server_args)
+    for name, value in (
+        ("attention_backend", cfg.attention_backend),
+        ("prefill_attention_backend", cfg.prefill_attention_backend),
+        ("decode_attention_backend", cfg.decode_attention_backend),
+    ):
+        # None fills from get_default_attention_backend -> "mlu" later in
+        # the pipeline; the MLU kernels implement no other backend.
+        if value is not None and value != "mlu":
+            raise ValueError(
+                f"MLU currently supports only the 'mlu' attention backend; "
+                f"got {name}={value!r}."
+            )
+    if cfg.sampling_backend is None:
+        declare_resolution(
+            server_args, "_handle_mlu_backends", sampling_backend="pytorch"
+        )
+    elif cfg.sampling_backend != "pytorch":
+        raise ValueError(
+            "MLU currently supports only the 'pytorch' sampling backend; "
+            f"got sampling_backend={cfg.sampling_backend!r}."
+        )
+    if cfg.page_size is None:
+        # reshape_paged_cache scatters whole pages; _page_size_default would
+        # otherwise resolve 1.
+        declare_resolution(server_args, "_handle_mlu_backends", page_size=16)
+    # torch_mlu_ops ships no custom-allreduce kernel; CNCL covers collectives.
+    declare_resolution(
+        server_args, "_handle_mlu_backends", disable_custom_all_reduce=True
+    )
+    if cfg.enable_hierarchical_cache:
+        logger.warning("MLU does not support hierarchical cache; disabling it.")
+        declare_resolution(
+            server_args, "_handle_mlu_backends", enable_hierarchical_cache=False
+        )
+
+
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
         declare_resolution(

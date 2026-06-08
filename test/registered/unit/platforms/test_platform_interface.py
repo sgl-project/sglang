@@ -5,10 +5,13 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.platform_hook import handle_mlu_backends
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
@@ -19,9 +22,11 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -77,6 +82,7 @@ class TestPlatformEnum(CustomTestCase):
             "XPU",
             "MUSA",
             "NPU",
+            "MLU",
             "TPU",
             "MPS",
             "OOT",
@@ -125,6 +131,7 @@ _PLATFORM_IDENTITY = [
     (PlatformEnum.XPU, "xpu", "xpu", "is_xpu"),
     (PlatformEnum.MUSA, "musa", "musa", "is_musa"),
     (PlatformEnum.NPU, "npu", "npu", "is_npu"),
+    (PlatformEnum.MLU, "mlu", "mlu", "is_mlu"),
     (PlatformEnum.TPU, "tpu", "tpu", "is_tpu"),
     (PlatformEnum.MPS, "mps", "mps", "is_mps"),
 ]
@@ -134,6 +141,7 @@ _CUDA_ALIKE = [
     (PlatformEnum.CUDA, "cuda", "cuda", True),
     (PlatformEnum.ROCM, "rocm", "hip", True),
     (PlatformEnum.MUSA, "musa", "musa", True),
+    (PlatformEnum.MLU, "mlu", "mlu", False),
     (PlatformEnum.CPU, "cpu", "cpu", False),
     (PlatformEnum.NPU, "npu", "npu", False),
 ]
@@ -505,6 +513,76 @@ class TestCpuDeviceMixin(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
+class TestMluSRTPlatform(CustomTestCase):
+    """Tests for MLU platform defaults that do not require MLU hardware."""
+
+    def test_mlu_platform_identity(self):
+        base = MluSRTPlatform()
+        self.assertTrue(base.is_mlu())
+        self.assertFalse(base.is_cuda_alike())
+        self.assertEqual(base.device_name, "mlu")
+        self.assertEqual(base.device_type, "mlu")
+
+    def test_mlu_platform_backend_defaults(self):
+        base = MluSRTPlatform()
+        self.assertEqual(base.get_dispatch_key_name(), "mlu")
+        self.assertEqual(base.get_torch_distributed_backend_str(), "cncl")
+        self.assertFalse(base.support_cuda_graph())
+        self.assertFalse(base.support_piecewise_cuda_graph())
+        self.assertEqual(base.get_position_dtype(), torch.int32)
+
+    def test_mlu_pin_memory_available_for_accelerator_targets(self):
+        base = MluSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="mlu"))
+        self.assertTrue(base.is_pin_memory_available(device=torch.device("mlu", 0)))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+    def test_handle_mlu_backends_declares_mlu_defaults(self):
+        server_args = ServerArgs(model_path="dummy", enable_hierarchical_cache=True)
+
+        with patch(
+            "sglang.srt.arg_groups.platform_hook.get_platform",
+            return_value=SimpleNamespace(is_mlu=True),
+        ):
+            handle_mlu_backends(server_args)
+
+        self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
+        # The generic default would be 1; reshape_paged_cache scatters whole
+        # pages, so the handler must pin the kernel's native block size.
+        self.assertEqual(resolution_result(server_args, "page_size"), 16)
+        self.assertIs(resolution_result(server_args, "disable_custom_all_reduce"), True)
+        self.assertIs(
+            resolution_result(server_args, "enable_hierarchical_cache"), False
+        )
+
+    def test_handle_mlu_backends_preserves_operator_values(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            attention_backend="mlu",
+            sampling_backend="pytorch",
+            page_size=32,
+        )
+
+        with patch(
+            "sglang.srt.arg_groups.platform_hook.get_platform",
+            return_value=SimpleNamespace(is_mlu=True),
+        ):
+            handle_mlu_backends(server_args)
+
+        self.assertEqual(resolution_result(server_args, "page_size"), 32)
+
+    def test_handle_mlu_backends_rejects_unsupported_attention(self):
+        server_args = ServerArgs(model_path="dummy", attention_backend="triton")
+
+        with patch(
+            "sglang.srt.arg_groups.platform_hook.get_platform",
+            return_value=SimpleNamespace(is_mlu=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "supports only the 'mlu'"):
+                handle_mlu_backends(server_args)
+
+
 class TestPinMemoryAvailability(CustomTestCase):
     """Tests for common pin-memory helper dispatch through platforms."""
 
@@ -625,8 +703,9 @@ class TestResolvePlatformWithEnv(CustomTestCase):
     """Tests for _resolve_platform when SGLANG_PLATFORM is set."""
 
     @patch("sglang.srt.platforms.entry_points")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
-    def test_selected_plugin_activates(self, mock_envs, mock_ep):
+    def test_selected_plugin_activates(self, mock_envs, _mock_mlu, mock_ep):
         """When SGLANG_PLATFORM matches an entry point, it activates that plugin."""
         mock_envs.SGLANG_PLATFORM.get.return_value = "my_hardware"
         plugin_fn = MagicMock(return_value="pkg.Mod:MyPlatform")
@@ -639,8 +718,9 @@ class TestResolvePlatformWithEnv(CustomTestCase):
             self.assertEqual(result, mock_instance)
 
     @patch("sglang.srt.platforms.entry_points")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
-    def test_selected_plugin_not_found(self, mock_envs, mock_ep):
+    def test_selected_plugin_not_found(self, mock_envs, _mock_mlu, mock_ep):
         """When SGLANG_PLATFORM names a nonexistent plugin, raise RuntimeError."""
         mock_envs.SGLANG_PLATFORM.get.return_value = "nonexistent"
         mock_ep.return_value = []
@@ -648,8 +728,9 @@ class TestResolvePlatformWithEnv(CustomTestCase):
             _resolve_platform()
 
     @patch("sglang.srt.platforms.entry_points")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
-    def test_selected_plugin_hardware_unavailable(self, mock_envs, mock_ep):
+    def test_selected_plugin_hardware_unavailable(self, mock_envs, _mock_mlu, mock_ep):
         """When activate() returns None, hardware is not available."""
         mock_envs.SGLANG_PLATFORM.get.return_value = "my_hardware"
         plugin_fn = MagicMock(return_value=None)
@@ -658,8 +739,9 @@ class TestResolvePlatformWithEnv(CustomTestCase):
             _resolve_platform()
 
     @patch("sglang.srt.platforms.entry_points")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
-    def test_selected_plugin_load_exception(self, mock_envs, mock_ep):
+    def test_selected_plugin_load_exception(self, mock_envs, _mock_mlu, mock_ep):
         """When ep.load() or activate() throws, exception is re-raised."""
         mock_envs.SGLANG_PLATFORM.get.return_value = "my_hardware"
         plugin_fn = MagicMock(side_effect=ImportError("missing dep"))
@@ -668,8 +750,9 @@ class TestResolvePlatformWithEnv(CustomTestCase):
             _resolve_platform()
 
     @patch("sglang.srt.platforms.entry_points")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
-    def test_other_plugins_not_loaded(self, mock_envs, mock_ep):
+    def test_other_plugins_not_loaded(self, mock_envs, _mock_mlu, mock_ep):
         """When SGLANG_PLATFORM is set, other plugins are not imported."""
         mock_envs.SGLANG_PLATFORM.get.return_value = "target_hw"
         target_fn = MagicMock(return_value="pkg.Mod:TargetPlatform")
@@ -712,10 +795,11 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
             self.assertEqual(result, mock_instance)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms._is_cuda_available")
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_activates_cuda_fallback(
-        self, mock_envs, mock_is_cuda_available, mock_load
+        self, mock_envs, mock_is_cuda_available, _mock_mlu, mock_load
     ):
         """When CUDA is available and no plugin activates, return CUDA defaults."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -725,10 +809,11 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         self.assertIsInstance(result, CudaSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms._is_cuda_available")
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_no_cuda_activates_base_fallback(
-        self, mock_envs, mock_is_cuda_available, mock_load
+        self, mock_envs, mock_is_cuda_available, _mock_mlu, mock_load
     ):
         """When no plugin or CUDA is available, return the abstract base platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -739,10 +824,11 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         self.assertNotIsInstance(result, CudaSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=False)
     @patch("sglang.srt.platforms.torch")
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_rocm_does_not_activate_cuda_fallback(
-        self, mock_envs, mock_torch, mock_load
+        self, mock_envs, mock_torch, _mock_mlu, mock_load
     ):
         """ROCm exposes torch.cuda but must not use the CUDA fallback platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -799,6 +885,21 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_rocm_available", return_value=False)
+    @patch("sglang.srt.platforms._is_cuda_available", return_value=False)
+    @patch("sglang.srt.platforms._is_mlu_available", return_value=True)
+    @patch("sglang.srt.platforms._is_cpu_available", return_value=False)
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_activates_mlu_fallback(
+        self, mock_envs, _mock_cpu, _mock_mlu, _mock_cuda, _mock_rocm, mock_load
+    ):
+        """When MLU is available and no plugin activates, return MLU defaults."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, MluSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.envs")
