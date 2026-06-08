@@ -265,6 +265,50 @@ class TestContextParallelServerArgs(CustomTestCase):
                 )
 
 
+class TestDisableCudaPerfBoost(CustomTestCase):
+    """Cover the --disable-cuda-perf-boost CLI flag and its env propagation."""
+
+    _ENV_KEY = "CUDA_DISABLE_PERF_BOOST"
+
+    def setUp(self):
+        self._prev = os.environ.pop(self._ENV_KEY, None)
+
+    def tearDown(self):
+        os.environ.pop(self._ENV_KEY, None)
+        if self._prev is not None:
+            os.environ[self._ENV_KEY] = self._prev
+
+    def test_default_is_false_and_env_unset(self):
+        ServerArgs(model_path="dummy")
+        self.assertNotIn(self._ENV_KEY, os.environ)
+
+    def test_cli_flag_parses_and_sets_env(self):
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disable-cuda-perf-boost"]
+        )
+        self.assertTrue(server_args.disable_cuda_perf_boost)
+        self.assertEqual(os.environ.get(self._ENV_KEY), "1")
+
+    def test_field_true_sets_env(self):
+        ServerArgs(model_path="dummy", disable_cuda_perf_boost=True)
+        self.assertEqual(os.environ.get(self._ENV_KEY), "1")
+
+    def test_respects_existing_user_value(self):
+        os.environ[self._ENV_KEY] = "0"
+        ServerArgs(model_path="dummy", disable_cuda_perf_boost=True)
+        self.assertEqual(os.environ[self._ENV_KEY], "0")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_amd_hip_skips_env_set_and_warns(self, _mock_is_hip):
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+            ServerArgs(model_path="dummy", disable_cuda_perf_boost=True)
+        self.assertNotIn(self._ENV_KEY, os.environ)
+        self.assertTrue(
+            any("AMD/HIP" in msg for msg in cm.output),
+            f"expected AMD/HIP warning, got {cm.output}",
+        )
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

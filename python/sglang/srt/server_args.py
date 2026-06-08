@@ -783,6 +783,7 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    disable_cuda_perf_boost: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -940,6 +941,11 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args (model-independent).
         self._handle_asr_validation()
+
+        # Propagate --disable-cuda-perf-boost into the process env early so the
+        # NVIDIA driver picks it up at CUDA context creation (must happen before
+        # any torch/CUDA init and before scheduler subprocess fork).
+        self._handle_disable_cuda_perf_boost()
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -1232,6 +1238,20 @@ class ServerArgs:
             raise ValueError(
                 f"SGLANG_GRPC_PORT ({self.grpc_port}) must be between 1 and 65535"
             )
+
+    def _handle_disable_cuda_perf_boost(self):
+        # CUDA_DISABLE_PERF_BOOST is an NVIDIA driver env var (added in the 580
+        # driver series; older drivers silently ignore it). setdefault so an
+        # explicit user-set value (including "0") wins over the CLI flag.
+        if not self.disable_cuda_perf_boost:
+            return
+        if is_hip():
+            logger.warning(
+                "--disable-cuda-perf-boost has no effect on AMD/HIP devices; "
+                "CUDA_DISABLE_PERF_BOOST is an NVIDIA driver env var. Ignoring."
+            )
+            return
+        os.environ.setdefault("CUDA_DISABLE_PERF_BOOST", "1")
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -6965,6 +6985,17 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--disable-cuda-perf-boost",
+            action="store_true",
+            help="Set CUDA_DISABLE_PERF_BOOST=1 in the process environment before "
+            "CUDA context creation. Lets the NVIDIA DVFS governor drop idle SM "
+            "clocks instead of locking them at boost when a context is loaded, "
+            "saving ~26-66 W/GPU at 0%% utilization on Hopper/Ampere/Ada. "
+            "Adds a one-time ~150 ms ramp on the first request after idle; "
+            "steady-state latency is unchanged. Requires an NVIDIA driver "
+            "from the 580 series (older drivers silently ignore the env var).",
         )
         parser.add_argument(
             "--enable-mscclpp",
