@@ -869,15 +869,27 @@ def apply_qk_norm_rope(
         raise ValueError(
             f"apply_qk_norm_rope expects 4D q/k tensors, got q:{tuple(q.shape)} k:{tuple(k.shape)}"
         )
-    if q.shape != k.shape:
+    if q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]:
         raise ValueError(
-            f"apply_qk_norm_rope expects q/k to have the same shape, got {q.shape} vs {k.shape}"
+            "apply_qk_norm_rope expects q/k to share batch, sequence, and head size, "
+            f"got {q.shape} vs {k.shape}"
+        )
+    if not (isinstance(cos_sin_cache, torch.Tensor) and cos_sin_cache.dim() == 2):
+        raise ValueError("cos_sin_cache must be a 2D torch.Tensor")
+    if k.device != q.device or cos_sin_cache.device != q.device:
+        raise ValueError(
+            "q, k, and cos_sin_cache must be on the same device, "
+            f"got q={q.device}, k={k.device}, cos_sin_cache={cos_sin_cache.device}"
         )
 
     batch_size, seq_len, _, _ = q.shape
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
     rope_dim = cos_sin_cache.size(-1)
+    if rope_dim % 2 != 0 or rope_dim > head_dim:
+        raise ValueError(
+            f"cos_sin_cache width must be even and <= head_dim, got {rope_dim} vs {head_dim}"
+        )
     fused_enabled = os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower() not in {
         "0",
         "false",
@@ -898,6 +910,7 @@ def apply_qk_norm_rope(
             raise ValueError(
                 f"positions must be 1D of length {batch_size * seq_len}, got shape={tuple(positions.shape)}"
             )
+        positions = positions.to(device=q.device, dtype=torch.long)
 
     if (
         fused_enabled
