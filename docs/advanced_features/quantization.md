@@ -632,4 +632,3 @@ For the full quantization + format conversion workflow and a complete list of su
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
 - [auto-round](https://github.com/intel/auto-round)
 - [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
-
