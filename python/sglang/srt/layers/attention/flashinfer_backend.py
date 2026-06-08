@@ -34,6 +34,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolFP4
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -48,6 +51,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
     is_sm100_supported,
+    is_sm120_supported,
     next_power_of_2,
     require_gathered_buffer,
 )
@@ -286,6 +290,28 @@ def fast_prefill_plan(
         0,  # num_colocated_ctas
     ]
     self._plan_info = self._cached_module.plan(*args)
+def _is_nvfp4_native_kv_pool(token_to_kv_pool) -> bool:
+    if isinstance(token_to_kv_pool, MHATokenToKVPoolFP4):
+        return True
+    return (
+        isinstance(token_to_kv_pool, SWAKVPool)
+        and isinstance(token_to_kv_pool.full_kv_pool, MHATokenToKVPoolFP4)
+        and isinstance(token_to_kv_pool.swa_kv_pool, MHATokenToKVPoolFP4)
+    )
+
+
+def _nvfp4_inner_pool_and_layer_id(token_to_kv_pool, layer_id: int):
+    if not isinstance(token_to_kv_pool, SWAKVPool):
+        return token_to_kv_pool, layer_id
+
+    token_to_kv_pool._wait_for_layer(layer_id)
+    local_layer_id, is_swa_layer = token_to_kv_pool.layers_mapping[layer_id]
+    inner_pool = (
+        token_to_kv_pool.swa_kv_pool
+        if is_swa_layer
+        else token_to_kv_pool.full_kv_pool
+    )
+    return inner_pool, local_layer_id
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -310,6 +336,9 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         self.enable_mis = model_runner.server_args.enable_mis
+        self.is_nvfp4_native = _is_nvfp4_native_kv_pool(
+            self.token_to_kv_pool
+        ) and is_sm120_supported()
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -324,6 +353,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 get_parallel().attn_tp_size
             ),
         )
+        if self.is_nvfp4_native:
+            self.decode_use_tensor_cores = True
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -498,6 +529,49 @@ class FlashInferAttnBackend(AttentionBackend):
 
         kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
         return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
+    def _get_paged_kv_cache_and_kwargs(self, layer: RadixAttention):
+        kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if not self.is_nvfp4_native:
+            return kv_cache, {
+                "k_scale": layer.k_scale_float,
+                "v_scale": layer.v_scale_float,
+            }
+
+        kv_pool, local_layer_id = _nvfp4_inner_pool_and_layer_id(
+            self.token_to_kv_pool, layer.layer_id
+        )
+        k_sf, v_sf = kv_pool.get_kv_scale_buffer(local_layer_id)
+        k_global, v_global = kv_pool.get_kv_global_scale(local_layer_id)
+        return kv_cache, {
+            "kv_cache_sf": (k_sf, v_sf),
+            "k_scale": k_global,
+            "v_scale": v_global,
+        }
+
+    def _run_paged_native(
+        self,
+        wrapper,
+        q,
+        paged_kv_cache,
+        *,
+        causal,
+        sm_scale,
+        window_left,
+        logits_soft_cap,
+        return_lse,
+        paged_kv_kwargs,
+    ):
+        wrapper._causal = causal
+        wrapper._pos_encoding_mode = "NONE"
+        wrapper._use_fp16_qk_reduction = False
+        wrapper._window_left = -1 if window_left is None else window_left
+        wrapper._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
+        wrapper._sm_scale = sm_scale
+        wrapper._rope_scale = None
+        wrapper._rope_theta = None
+        return wrapper.run(
+            q, paged_kv_cache, return_lse=return_lse, **paged_kv_kwargs
+        )
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -987,36 +1061,50 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+            paged_kv_cache, paged_kv_kwargs = self._get_paged_kv_cache_and_kwargs(
+                layer
             )
+            paged_window_left = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
+            )
+            if self.is_nvfp4_native:
+                o = self._run_paged_native(
+                    prefill_wrapper_paged,
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    paged_kv_cache,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=paged_window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    return_lse=False,
+                    paged_kv_kwargs=paged_kv_kwargs,
+                )
+            else:
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    paged_kv_cache,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=paged_window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    **paged_kv_kwargs,
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
+                if self.is_nvfp4_native:
+                    raise RuntimeError(
+                        "FlashInfer ragged fallback cannot read packed NVFP4 KV "
+                        "as dense K/V. Use paged attention for native FP4 KV."
+                    )
                 k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
@@ -1059,14 +1147,31 @@ class FlashInferAttnBackend(AttentionBackend):
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    window_left=swa_window_left,
-                    logits_soft_cap=logits_soft_cap,
+                paged_kv_cache, paged_kv_kwargs = self._get_paged_kv_cache_and_kwargs(
+                    layer
                 )
+                if self.is_nvfp4_native:
+                    o2, s2 = self._run_paged_native(
+                        prefill_wrapper_paged,
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        paged_kv_cache,
+                        causal=False,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                        return_lse=True,
+                        paged_kv_kwargs=paged_kv_kwargs,
+                    )
+                else:
+                    o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        paged_kv_cache,
+                        causal=False,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                        **paged_kv_kwargs,
+                    )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
@@ -1113,16 +1218,27 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer.v_scale,
                 )
 
-        # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        paged_kv_cache, paged_kv_kwargs = self._get_paged_kv_cache_and_kwargs(layer)
+        if self.is_nvfp4_native:
+            o = self._run_paged_native(
+                decode_wrapper,
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                paged_kv_cache,
+                causal=False,
+                sm_scale=layer.scaling,
+                window_left=-1,
+                logits_soft_cap=layer.logit_cap,
+                return_lse=False,
+                paged_kv_kwargs=paged_kv_kwargs,
+            )
+        else:
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                paged_kv_cache,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                **paged_kv_kwargs,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1149,6 +1265,9 @@ class FlashInferIndicesUpdaterDecode:
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
+        self.kv_data_type = (
+            torch.uint8 if attn_backend.is_nvfp4_native else self.data_type
+        )
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1375,6 +1494,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.head_dim,
                 1,
                 data_type=self.data_type,
+                kv_data_type=self.kv_data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
@@ -1394,6 +1514,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.head_dim,
                 1,
                 data_type=self.data_type,
+                kv_data_type=self.kv_data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
@@ -1417,6 +1538,9 @@ class FlashInferIndicesUpdaterPrefill:
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
+        self.kv_data_type = (
+            torch.uint8 if attn_backend.is_nvfp4_native else self.data_type
+        )
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1819,7 +1943,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.head_dim,
             1,
             q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
+            kv_data_type=self.kv_data_type,
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
