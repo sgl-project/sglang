@@ -29,19 +29,19 @@ except ImportError:
 _skip_no_scipy = unittest.skipUnless(HAS_SCIPY, "scipy not installed")
 
 from sglang.multimodal_gen.runtime.pipelines.qwen_image import QwenImagePipeline
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
-    QWEN_IMAGE_SPECTRUM_A,
-    QWEN_IMAGE_SPECTRUM_BETA,
-    QwenImageProgressiveDenoisingStage,
-    _qwen_image_pack,
-    _qwen_image_unpack,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
     compute_stage_transitions,
     find_transition_steps,
     reset_scheduler_at_step,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
+    QWEN_IMAGE_SPECTRUM_A,
+    QWEN_IMAGE_SPECTRUM_BETA,
+    QwenImageProgressiveDenoisingStage,
+    _qwen_image_pack,
+    _qwen_image_unpack,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.spectral_ops import (
     dct_1d,

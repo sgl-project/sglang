@@ -4,9 +4,6 @@
 from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
-    QwenImageProgressiveDenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -14,6 +11,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
     QwenImageLayeredBeforeDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
+    QwenImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

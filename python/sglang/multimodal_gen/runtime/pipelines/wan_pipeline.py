@@ -11,15 +11,15 @@ using the modular pipeline architecture.
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
-    WanProgressiveDenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
+    WanProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

@@ -2,9 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
-    FluxProgressiveDenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -13,6 +10,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
     TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
+    FluxProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

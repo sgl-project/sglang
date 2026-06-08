@@ -1,15 +1,15 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
-    ZImageProgressiveDenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
+    ZImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
