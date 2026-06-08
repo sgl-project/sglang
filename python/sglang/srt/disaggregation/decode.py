@@ -1857,9 +1857,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
-                    req.set_extend_range(
-                        len(req.prefix_indices), req.kv_committed_len
-                    )
+                    req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:
                 waiting_queue.append(req)
 
