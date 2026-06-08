@@ -1637,9 +1637,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
                 # Storage fields are only present when L3 storage backend is enabled
                 if "storage" in cached_tokens_details:
-                    storage_tokens = cached_tokens_details["storage"]
-                    backend = cached_tokens_details.get("storage_backend", "unknown")
-                    report_cache_source(f"storage_{backend}", storage_tokens)
+                    backend = cached_tokens_details.get("storage_backend") or "unknown"
+                    report_cache_source(
+                        f"storage_{backend}", cached_tokens_details["storage"]
+                    )
             else:
                 # Fallback for backward compatibility
                 report_cache_source("total", cached_tokens)
