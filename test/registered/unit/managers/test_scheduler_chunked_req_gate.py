@@ -30,7 +30,8 @@ def _make_req(
     req.rid = "test-req"
     req.origin_input_ids = array("q", fill_ids)
     req.output_ids = array("q")
-    req.fill_ids = array("q", fill_ids)
+    req.full_untruncated_fill_ids = array("q", fill_ids)
+    req.fill_len = len(req.full_untruncated_fill_ids)
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
     req.extend_input_len = extend_input_len
