@@ -493,7 +493,6 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
-            enable_overlap=self.enable_overlap,
             page_size=self.page_size,
         )
 
@@ -1041,7 +1040,6 @@ class Scheduler(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
-            enable_overlap=self.enable_overlap,
         )
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
@@ -2941,8 +2939,8 @@ class Scheduler(
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
     @contextmanager
-    def _overlap_forward_isolation(self, batch: ScheduleBatch):
-        """Make SB transactional across one overlap forward.
+    def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+        """Make SB transactional across one forward (overlap and non-overlap).
 
         1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
@@ -2951,10 +2949,12 @@ class Scheduler(
         2. Substitute sampling_info with a forward-only copy (orchestrator=None,
            shares the pre-accumulated penalty buffer) so V2's multiple init_new
            calls don't double-accumulate penalties.
-        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
-           tensors in the snapshot survive the caching allocator past the
-           forward stream. Must run AFTER the sampling_info swap so the
-           forward-only copy gets pinned.
+        3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
+           for 2 iters so GPU tensors in the snapshot survive the caching
+           allocator past the forward stream. Must run AFTER the sampling_info
+           swap so the forward-only copy gets pinned. The non-overlap (sync) path
+           runs on a single stream and doesn't allocate batch_record_buf, so it
+           passes overlap=False.
         """
         # 1. snapshot
         snapshot_v2_full = batch.is_spec_v2
@@ -2969,8 +2969,9 @@ class Scheduler(
         if sched_sampling_info is not None:
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
-        # 3. pin for 2-iter tensor lifetime
-        self.record_batch_in_overlap(batch)
+        # 3. pin for 2-iter tensor lifetime (overlap path only)
+        if overlap:
+            self.record_batch_in_overlap(batch)
 
         try:
             yield
@@ -3018,7 +3019,7 @@ class Scheduler(
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
 
-                    with self._overlap_forward_isolation(batch):
+                    with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -3077,6 +3078,28 @@ class Scheduler(
                         batch.req_pool_indices, batch_result.next_token_ids
                     )
                 batch.input_ids = None
+            elif batch.is_spec_v2:
+                # Non-overlap V2: drive the V2 worker synchronously (no
+                # future_map relay / on_publish).
+                resolve_forward_inputs(batch, self.future_map)
+                with self._forward_isolation(batch, overlap=False):
+                    batch_result = self.model_worker.forward_batch_generation(batch)
+                # The isolation restore reverted the worker's in-forward SB edits;
+                # re-apply what must carry to the next iter.
+                batch.spec_info = batch_result.next_draft_input
+                if batch_result.new_seq_lens is not None:
+                    batch.seq_lens = batch_result.new_seq_lens
+                    if batch.seq_lens_cpu is not None:
+                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                batch.input_ids = None  # rebuilt next iter from draft_token
+                self.update_cache_from_scheduler(batch, batch_result)
+                # Sync D2H so the result processor can read CPU tensors.
+                batch_result.copy_done = self.device_module.Event()
+                batch_result.copy_to_cpu(
+                    return_logprob=batch.return_logprob,
+                    return_hidden_states=batch.return_hidden_states,
+                )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -3095,9 +3118,9 @@ class Scheduler(
                         )
                         batch.input_ids = None
                     else:
-                        # Spec_v1 (non-overlap spec): worker shape doesn't match
-                        # req_pool_indices; relay is unused (worker rebuilds input_ids
-                        # inside verify). Keep pre-PR behavior.
+                        # Spec_v1 (NGRAM / DFLASH / FROZEN_KV_MTP, non-overlap):
+                        # worker shape doesn't match req_pool_indices; relay is
+                        # unused (worker rebuilds input_ids inside verify).
                         batch.input_ids = batch_result.next_token_ids.to(torch.int64)
                 self.update_cache_from_scheduler(batch, batch_result)
 

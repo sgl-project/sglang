@@ -40,7 +40,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
 @dataclass
@@ -80,7 +80,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
     def __init__(
         self,
-        eagle_worker: EAGLEWorker,
+        eagle_worker: EagleDraftWorker,
         *,
         draft_attn_backend=None,
         speculative_num_steps: Optional[int] = None,

@@ -786,8 +786,10 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
-            x_scale = x_scale.transpose(-1, -2).contiguous().view(*x_scale.shape)
+        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
+        # Triton needs a row-major view, so adjust strides only. No copy.
+        if use_triton and _use_aiter_bpreshuffle_gfx95:
+            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,

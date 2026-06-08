@@ -43,7 +43,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
 @dataclass
@@ -74,7 +74,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def __init__(
         self,
-        eagle_worker: EAGLEWorker,
+        eagle_worker: EagleDraftWorker,
         *,
         draft_extend_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
