@@ -494,8 +494,11 @@ class TokenizerManager(TokenizerControlMixin):
                 async for response in self._handle_batch_request(obj, request):
                     yield response
 
+    @staticmethod
     def _detect_input_format(
-        self, texts: Union[str, List[str]], is_cross_encoder: bool
+        self: "RawTokenizerWrapper",
+        texts: Union[str, List[str]],
+        is_cross_encoder: bool,
     ) -> InputFormat:
         """Detect the format of input texts for proper tokenization handling.
 
@@ -517,8 +520,11 @@ class TokenizerManager(TokenizerControlMixin):
 
         return InputFormat.BATCH_STRINGS
 
+    @staticmethod
     def _prepare_tokenizer_input(
-        self, texts: Union[str, List[str]], input_format: InputFormat
+        self: "RawTokenizerWrapper",
+        texts: Union[str, List[str]],
+        input_format: InputFormat,
     ) -> Union[List[str], List[List[str]]]:
         """Prepare input for the tokenizer based on detected format."""
         if input_format == InputFormat.SINGLE_STRING:
@@ -528,8 +534,9 @@ class TokenizerManager(TokenizerControlMixin):
         else:  # BATCH_STRINGS
             return texts  # Already in correct format: ["text1", "text2"]
 
+    @staticmethod
     def _extract_tokenizer_results(
-        self,
+        self: "RawTokenizerWrapper",
         input_ids: List[List[int]],
         token_type_ids: Optional[List[List[int]]],
         input_format: InputFormat,
@@ -552,8 +559,11 @@ class TokenizerManager(TokenizerControlMixin):
         # For true batches, return as-is
         return input_ids, token_type_ids
 
+    @staticmethod
     async def _tokenize_texts(
-        self, texts: Union[str, List[str]], is_cross_encoder: bool = False
+        self: "RawTokenizerWrapper",
+        texts: Union[str, List[str]],
+        is_cross_encoder: bool = False,
     ) -> Union[
         Tuple[List[int], Optional[List[int]]],
         Tuple[List[List[int]], Optional[List[List[int]]]],
@@ -594,8 +604,12 @@ class TokenizerManager(TokenizerControlMixin):
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
         # Step 1: Detect input format and prepare for tokenization
-        input_format = self._detect_input_format(texts, is_cross_encoder)
-        tokenizer_input = self._prepare_tokenizer_input(texts, input_format)
+        input_format = TokenizerManager._detect_input_format(
+            self, texts, is_cross_encoder
+        )
+        tokenizer_input = TokenizerManager._prepare_tokenizer_input(
+            self, texts, input_format
+        )
         original_batch_size = len(texts) if not isinstance(texts, str) else 1
 
         # Step 2: Set up tokenizer arguments
@@ -635,8 +649,8 @@ class TokenizerManager(TokenizerControlMixin):
                 )
 
         # Step 4: Extract results based on input format
-        return self._extract_tokenizer_results(
-            input_ids, token_type_ids, input_format, original_batch_size
+        return TokenizerManager._extract_tokenizer_results(
+            self, input_ids, token_type_ids, input_format, original_batch_size
         )
 
     async def _tokenize_one_request(
@@ -676,8 +690,8 @@ class TokenizerManager(TokenizerControlMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
+                input_ids, token_type_ids = await TokenizerManager._tokenize_texts(
+                    self.raw_tokenizer_wrapper, input_text, is_cross_encoder_request
                 )
 
         contains_mm_input = obj.contains_mm_input()
@@ -1089,8 +1103,8 @@ class TokenizerManager(TokenizerControlMixin):
         )
 
         # Batch tokenize all texts using unified method
-        input_ids_list, token_type_ids_list = await self._tokenize_texts(
-            texts, is_cross_encoder_request
+        input_ids_list, token_type_ids_list = await TokenizerManager._tokenize_texts(
+            self.raw_tokenizer_wrapper, texts, is_cross_encoder_request
         )
 
         # Process all requests
