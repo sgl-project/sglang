@@ -38,7 +38,7 @@ class TestVLMEncoderDP(MMMUMultiModelTestBase):
         if is_in_ci():
             # DEBUG (Track B): pin to a failing model to reproduce the fault.
             models_to_test = [
-                next(m for m in MODELS if m.model == "Qwen/Qwen2.5-VL-72B-Instruct")
+                next(m for m in MODELS if m.model == "zai-org/GLM-4.1V-9B-Thinking")
             ]
 
         for model in models_to_test:
