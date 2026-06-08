@@ -27,6 +27,7 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
+    os.environ["ASCEND_USE_FIA"] = "1"
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
     7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
 )
