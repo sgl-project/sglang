@@ -562,9 +562,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            with forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ), canary_index_ctx:
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -851,7 +856,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
-                self, config_path=server_args.speculative_adaptive_config
+                self,
+                config_path=server_args.speculative_adaptive_config,
             )
 
         # Some dummy tensors
@@ -883,7 +889,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
-                self.adaptive_controller.init_states()
+                self.adaptive_controller.init_states(
+                    cuda_graph_bs=(
+                        None
+                        if self.server_args.disable_cuda_graph
+                        else self.server_args.cuda_graph_bs
+                    ),
+                )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -943,6 +955,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            self.activate_step_by_batch(batch.seq_lens.shape[0])
+
             if batch.spec_info is None:
                 capture_mode = (
                     CaptureHiddenMode.NULL
@@ -981,21 +995,34 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
-    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req, batch_size=batch_size
+            )
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.activate_step_by_batch(batch_size)
 
     # -- Adaptive speculative decoding protocol --
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs=None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
-            speculative_num_steps, speculative_num_draft_tokens
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
         ):
             self._draft_worker.init_attention_backend()
             self._draft_worker.init_cuda_graphs()
@@ -1081,7 +1108,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     @contextlib.contextmanager
     def _override_worker_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -1098,6 +1128,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs,
+            sa.disable_cuda_graph,
         )
 
         self.speculative_num_steps = speculative_num_steps
@@ -1106,6 +1138,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        if cuda_graph_bs is not None:
+            sa.cuda_graph_bs = cuda_graph_bs
+            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
+            # for steps that no BS range uses (e.g. step=1). Disable graph
+            # capture for those steps; restore in finally so subsequent steps
+            # are not affected.
+            if not cuda_graph_bs:
+                sa.disable_cuda_graph = True
         dw._rebuild_topk1_chain_buffers()
 
         try:
@@ -1123,6 +1163,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
+                sa.cuda_graph_bs,
+                sa.disable_cuda_graph,
             ) = backup
             dw._rebuild_topk1_chain_buffers()
 
@@ -1234,9 +1276,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
-            self._mamba_verify_update(
-                batch, verify_input, accept_lens, accept_index, bs
-            )
+            self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -1286,7 +1326,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _mamba_verify_update(
         self,
         batch: ScheduleBatch,
-        verify_input: EagleVerifyInput,
         accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
@@ -1294,9 +1333,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Update mamba state for hybrid GDN models after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-            if verify_input.topk != 1:
-                raise ValueError("Spec v2 currently only supports topk = 1.")
-
             accepted_indices_offset = torch.arange(
                 0,
                 bs * self.speculative_num_draft_tokens,
@@ -1304,7 +1340,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=accept_lens.dtype,
                 device=accept_lens.device,
             )
-            last_correct_step_indices = accept_lens - 1
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            # Per-req tree step of the last accepted node, i.e. the step whose
+            # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accepted_indices_offset
+            )
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1322,11 +1364,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 to_track_ith = torch.clamp(
                     tracking_point - seq_lens_pre_verify - 1, min=0
                 ).to(torch.int64)
-                req_idx = torch.arange(
-                    bs,
-                    dtype=torch.int64,
-                    device=accept_lens.device,
-                )
                 candidate_track_steps = (
                     accept_index[req_idx, to_track_ith] - accepted_indices_offset
                 )

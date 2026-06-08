@@ -241,7 +241,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.mamba_pool.clear()
+        self.mamba_allocator.clear()
 
 
 @dataclass
@@ -1676,6 +1676,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            # Reset so the next owner sees actual_room == 0 ("not yet written")
+            # instead of the stale value, avoiding a false-positive mismatch.
+            self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
