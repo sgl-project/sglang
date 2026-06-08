@@ -132,7 +132,9 @@ def apply_flashinfer_rope_qk_inplace(
             k_flat = k.reshape(bsz * seqlen, k_heads, d)
             q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
             k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
-            return q_rot.view(bsz, seqlen, q_heads, d), k_rot.view(bsz, seqlen, k_heads, d)
+            return q_rot.view(bsz, seqlen, q_heads, d), k_rot.view(
+                bsz, seqlen, k_heads, d
+            )
 
         def apply_rope_prefix(x: torch.Tensor, num_heads: int) -> torch.Tensor:
             x_flat = x.reshape(bsz * seqlen, num_heads, d)
