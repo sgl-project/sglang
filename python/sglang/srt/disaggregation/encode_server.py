@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
-import requests
+import requests as http_requests
 import torch
 import uvicorn
 import zmq
@@ -3157,7 +3157,7 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
 
     def _try_register_once(bootstrap_url: str) -> bool:
         try:
-            resp = requests.post(
+            resp = http_requests.post(
                 f"{bootstrap_url}/register_encoder_url",
                 json=payload,
                 timeout=request_timeout,
