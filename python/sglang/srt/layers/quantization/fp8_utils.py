@@ -85,6 +85,41 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
     ]
 
 
+# Token-count (M) at/above which the tuned-triton allowlist shapes below are
+# routed to non-preshuffle CK instead of triton. The allowlist
+# (use_aiter_triton_gemm_w8a8_tuned_gfx950) is decode/small-M tuned; at prefill
+# M triton is a net loss. Decode M (<= max_running_requests) stays on triton.
+_AITER_TRITON_TO_CK_LARGE_M_GFX950 = 1024
+
+# Allowlist (n, k) shapes for which non-preshuffle CK beats triton at large M.
+# Layout-safe: fp8.py leaves allowlist weights UNSHUFFLED, which is exactly what
+# both triton and ck_gemm_a8w8_blockscale consume (only the bpreshuffle kernel
+# needs a shuffled weight), so this override needs no load-time change and does
+# not perturb decode.
+# microbench (MI355 gfx950, M=8192, us): wo_b(7168,2048) triton 294 vs ck 207;
+# big(4096,7168) triton 654 vs ck 284.
+_AITER_TRITON_LARGE_M_CK_SHAPES_GFX950 = frozenset(
+    {
+        (7168, 2048),
+        (4096, 7168),
+    }
+)
+
+
+def _aiter_blockscale_override_triton_with_ck_gfx950(n: int, k: int, m: int) -> bool:
+    """True if an allowlist (triton) shape should use non-preshuffle CK at this M.
+
+    Applies at all dp sizes. The large-M win holds at the production per-rank M
+    (DP8 per-rank M=1024: non-preshuffle CK beats tuned-triton 2.27-2.77x on the
+    allowlist shapes); the previously suspected dp>1 high-conc regression was a
+    MI350X-vs-MI355X hardware gap, not this routing.
+    """
+    return (
+        m >= _AITER_TRITON_TO_CK_LARGE_M_GFX950
+        and (n, k) in _AITER_TRITON_LARGE_M_CK_SHAPES_GFX950
+    )
+
+
 if _use_aiter:
     import aiter
     from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
@@ -774,31 +809,52 @@ def aiter_w8a8_block_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     n, k = weight.shape
+    m = input_2d.shape[0]
 
-    if _use_aiter_bpreshuffle_gfx95:
-        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
-    elif _use_aiter_gfx95:
-        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
-    else:
-        use_triton = True
+    use_triton = (
+        use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) if _use_aiter_gfx95 else True
+    )
+
+    # M-aware override: at prefill M the tuned-triton allowlist loses to CK; for
+    # allowlist shapes with data, swap triton -> non-preshuffle CK. Both consume
+    # the same unshuffled weight, so this is layout-safe and leaves decode on
+    # triton. Only meaningful when bpreshuffle is active (else CK non-preshuffle
+    # is already the fallback for any non-triton shape).
+    override_triton_with_ck = (
+        _use_aiter_bpreshuffle_gfx95
+        and use_triton
+        and _aiter_blockscale_override_triton_with_ck_gfx950(n, k, m)
+    )
+    if override_triton_with_ck:
+        use_triton = False
+
+    # Only the bpreshuffle kernel needs the transposed x_scale layout; triton and
+    # non-preshuffle CK both take the non-transposed scale.
+    transpose_scale = (
+        _use_aiter_bpreshuffle_gfx95 and not use_triton and not override_triton_with_ck
+    )
 
     # if input_scale not None, input is quanted
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
-        # Triton needs a row-major view, so adjust strides only. No copy.
-        if use_triton and _use_aiter_bpreshuffle_gfx95:
+        # On ROCm >= 7.2, the pre-quantized scale arrives in bpreshuffle's
+        # transposed layout. The bpreshuffle kernel consumes it as-is; triton and
+        # the M-aware CK override both need a row-major view, so adjust strides
+        # only (no copy) whenever we are not feeding the bpreshuffle kernel.
+        if _use_aiter_bpreshuffle_gfx95 and not transpose_scale:
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=(_use_aiter_bpreshuffle_gfx95 and not use_triton),
+            transpose_scale=transpose_scale,
         )
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+    elif override_triton_with_ck:
+        gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
     elif _use_aiter_bpreshuffle_gfx95:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
     else:
