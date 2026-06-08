@@ -1948,7 +1948,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
                 if self.server_args.speculative_algorithm:
-                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+                    TokenizerManager._calculate_spec_decoding_metrics(
+                        meta_info,
+                        recv_obj=recv_obj,
+                        i=i,
+                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    )
                 if self.enable_metrics:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]
@@ -1993,15 +1998,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for s in pending_notify.values():
             s.event.set()
 
+    @staticmethod
     def _calculate_spec_decoding_metrics(
-        self,
         meta_info: Dict[str, Any],
+        *,
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
         ],
         i: int,
+        speculative_num_draft_tokens: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
         if (
@@ -2012,7 +2019,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Total number of proposed draft tokens per request.
             num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                self.server_args.speculative_num_draft_tokens - 1
+                speculative_num_draft_tokens - 1
             )
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
