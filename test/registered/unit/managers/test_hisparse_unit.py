@@ -55,9 +55,12 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         inflight_middle_chunks=0,
     )
     req.finished = lambda: req.finished_reason is not None
-    req.set_extend_input_len = lambda extend_input_len: setattr(
-        req, "extend_input_len", extend_input_len
-    )
+
+    def _set_extend_range(start, end):
+        req.extend_input_len = end - start
+        req.extend_fill_len = end
+
+    req.set_extend_range = _set_extend_range
     return req
 
 

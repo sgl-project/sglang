@@ -1386,10 +1386,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_loc,
         )
 
-        # Truncate extend_fill_len to kv_committed_len so cache_unfinished_req only
-        # inserts committed KV into the radix tree. The last output token
-        # hasn't had KV committed yet (output_ids is 1 ahead).
-        req.extend_fill_len = req.kv_committed_len
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
@@ -1397,7 +1393,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        req.set_extend_input_len(req.extend_fill_len - total_prefix_len)
+        # Truncate the extend end to kv_committed_len so cache_unfinished_req only
+        # inserts committed KV into the radix tree (output_ids is 1 ahead, so the
+        # last output token has no committed KV yet). The extend start is the full
+        # committed prefix (L1+L2+L3) total_prefix_len, NOT len(prefix_indices):
+        # the [prefix_len, total_prefix_len) host/storage portion is loaded back
+        # later, so the freshly-ingested span is [total_prefix_len, kv_committed_len).
+        req.set_extend_range(total_prefix_len, req.kv_committed_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1851,13 +1853,12 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                # Truncate extend_fill_len to kv_committed_len so cache_unfinished_req
+                # Truncate the extend end to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
-                    req.extend_fill_len = req.kv_committed_len
-                    req.set_extend_input_len(
-                        req.extend_fill_len - len(req.prefix_indices)
+                    req.set_extend_range(
+                        len(req.prefix_indices), req.kv_committed_len
                     )
             else:
                 waiting_queue.append(req)

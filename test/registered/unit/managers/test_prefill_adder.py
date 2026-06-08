@@ -77,6 +77,7 @@ class TestPrefillAdder(CustomTestCase):
         req.rid = str(rid)
         req.priority = priority
         req.extend_input_len = 0
+        req.get_uncommitted_extend_len.return_value = 0
         req.extend_logprob_start_len = 0
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
@@ -387,6 +388,7 @@ class TestPrefillAdder(CustomTestCase):
         req1.host_hit_length = 0
         req1.prefix_indices = []
         req1.get_full_untruncated_fill_len.return_value = 56
+        req1.get_uncommitted_extend_len.return_value = 56
         req1.extend_fill_len = 56
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
@@ -422,6 +424,7 @@ class TestPrefillAdder(CustomTestCase):
         req2.host_hit_length = 0
         req2.prefix_indices = []
         req2.get_full_untruncated_fill_len.return_value = 56
+        req2.get_uncommitted_extend_len.return_value = 56
         req2.extend_fill_len = 56
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
@@ -440,6 +443,7 @@ class TestPrefillAdder(CustomTestCase):
         req3.host_hit_length = 0
         req3.prefix_indices = []
         req3.get_full_untruncated_fill_len.return_value = 3
+        req3.get_uncommitted_extend_len.return_value = 3
         req3.extend_fill_len = 3
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
@@ -477,8 +481,9 @@ class TestPrefillAdder(CustomTestCase):
         req.extend_input_len = extend_input_len
         req.prefix_indices = []
         req.get_full_untruncated_fill_len.return_value = extend_input_len
+        req.get_uncommitted_extend_len.return_value = extend_input_len
         req.extend_fill_len = extend_input_len
-        req.set_extend_input_len = MagicMock()
+        req.set_extend_range = MagicMock()
         return adder, req
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
@@ -495,8 +500,9 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)  # truncated → chunked prefill continues
-        req.set_extend_input_len.assert_called_once()
-        new_len = req.set_extend_input_len.call_args.args[0]
+        req.set_extend_range.assert_called_once()
+        start, end = req.set_extend_range.call_args.args
+        new_len = end - start
         self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
         self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
 
@@ -513,7 +519,7 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)
-        req.set_extend_input_len.assert_not_called()
+        req.set_extend_range.assert_not_called()
         self.assertEqual(req.extend_input_len, original_len)
         self.assertEqual(len(adder.can_run_list), 0)
 
@@ -552,7 +558,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_chunked_req(req)
         self.assertIsNone(result)
-        req.set_extend_input_len.assert_called_once_with(200)
+        req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
 
 

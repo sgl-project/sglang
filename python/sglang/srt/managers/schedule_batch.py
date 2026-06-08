@@ -640,6 +640,27 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+class ExtendRange(NamedTuple):
+    """The half-open token range ``[start, end)`` filled by one extend pass.
+
+    ``start`` is the absolute boundary (index into ``full_untruncated_fill_ids``)
+    of the already-committed prefix that this extend does NOT reprocess; ``end``
+    is the absolute fill end. ``length`` (the number of tokens processed this
+    extend) is derived, never stored, so it can never drift from its anchor.
+
+    ``start`` is NOT always ``len(prefix_indices)``: in disagg decode it is the
+    full (L1+L2+L3) ``total_prefix_len`` whose host/storage portion is loaded
+    back later, and in a mixed batch's running reqs it is the decoded length.
+    """
+
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -696,7 +717,11 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        self.extend_fill_len: Optional[int] = None
+        # The token range [start, end) filled by the current extend pass. None
+        # outside an extend (e.g. during decode) — an invalid-state sentinel.
+        self.extend_range: Optional[ExtendRange] = None
+        # Whether _init_fill_ids_for_dllm has run at least once (dllm only).
+        self.dllm_initialized: bool = False
 
         self.session = session
         self.input_embeds = input_embeds
@@ -807,8 +832,6 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        # Number of tokens to run prefill.
-        self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
         # TODO(ispobock): rename to last_device_node
@@ -1077,6 +1100,25 @@ class Req(ReqDllmMixin):
             length += self.dllm_config.block_size
         return length
 
+    @property
+    def extend_fill_len(self) -> Optional[int]:
+        # Absolute fill end of the current extend pass; None outside an extend.
+        return self.extend_range.end if self.extend_range is not None else None
+
+    @property
+    def extend_input_len(self) -> int:
+        # Number of tokens processed by the current extend pass; 0 outside one.
+        return self.extend_range.length if self.extend_range is not None else 0
+
+    def set_extend_range(self, start: int, end: int) -> None:
+        self.extend_range = ExtendRange(start, end)
+        self._recompute_extend_logprob_start_len()
+
+    def get_uncommitted_extend_len(self) -> int:
+        # The untruncated extend length a not-yet-admitted req wants to run,
+        # relative to its currently materialized device prefix.
+        return self.get_full_untruncated_fill_len() - len(self.prefix_indices)
+
     def get_fill_ids(self) -> array:
         return self.get_full_untruncated_fill_ids()[: self.extend_fill_len]
 
@@ -1171,7 +1213,9 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(input_len - len(self.prefix_indices))
+        # The committed extend range is set later by the PrefillAdder (or the
+        # disagg/mixed paths). Until then get_uncommitted_extend_len() serves
+        # the not-yet-truncated candidate length.
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1356,7 +1400,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
-        self.extend_input_len = 0
+        self.extend_range = None
+        self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1379,7 +1424,6 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-        self.extend_fill_len = None
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1429,14 +1473,13 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_extend_input_len(self, extend_input_len: int):
-        # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
+    def _recompute_extend_logprob_start_len(self):
+        # Recompute the relative logprob start within the current extend batch.
         #
         # Key variables:
         # - logprob_start_len: Absolute position in full sequence where logprob computation begins
         # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
-        self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
             logprob_start_len = self.get_full_untruncated_fill_len()
         else:
@@ -1895,7 +1938,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if encoder_len == 0:
                 continue
             if len(req.prefix_indices) < encoder_len:
-                req.extend_input_len -= encoder_len
+                # The encoder span is processed as a whole, so an uncached
+                # encoder implies an empty device prefix.
+                assert len(req.prefix_indices) == 0
+                # Advance the extend start past the encoder tokens (which the
+                # encoder path handles), shrinking the decoder extend length.
+                req.extend_range = req.extend_range._replace(
+                    start=req.extend_range.start + encoder_len
+                )
                 req.extend_logprob_start_len = max(
                     0, req.extend_logprob_start_len - encoder_len
                 )
@@ -2279,8 +2329,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.extend_fill_len = req.get_full_untruncated_fill_len()
-            req.set_extend_input_len(1)
+            # A mixed-in running req contributes a single decode token, so its
+            # extend start is the full sequence minus that one token.
+            full_len = req.get_full_untruncated_fill_len()
+            req.set_extend_range(full_len - 1, full_len)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
@@ -2506,7 +2558,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         for req in self.reqs:
-            req.extend_fill_len = None
+            req.extend_range = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
