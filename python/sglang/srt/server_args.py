@@ -935,6 +935,10 @@ class ServerArgs:
 
         current_platform.apply_server_args_defaults(self)
 
+        if self.tokenizer_only:
+            self.skip_server_warmup = True
+            return
+
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
 
@@ -4348,9 +4352,6 @@ class ServerArgs:
                 "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
             self.disable_cuda_graph = True
-            self.skip_server_warmup = True
-
-        if self.tokenizer_only:
             self.skip_server_warmup = True
 
         # Validate limit_mm_per_prompt modalities
