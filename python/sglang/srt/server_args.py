@@ -758,9 +758,9 @@ class ServerArgs:
         Literal["breakable", "tc_piecewise", "disabled"]
     ] = None
     cuda_graph_max_bs_decode: Optional[int] = None
-    cuda_graph_max_tokens_prefill: Optional[int] = None
+    cuda_graph_max_bs_prefill: Optional[int] = None
     cuda_graph_bs_decode: Optional[List[int]] = None
-    cuda_graph_tokens_prefill: Optional[List[int]] = None
+    cuda_graph_bs_prefill: Optional[List[int]] = None
     cuda_graph_tc_compiler: Optional[Literal["eager", "inductor"]] = None
 
     # Legacy CLI inputs that fold into cuda_graph_config (with a CLI
@@ -1424,12 +1424,12 @@ class ServerArgs:
             _set(Phase.PREFILL, "backend", self.cuda_graph_backend_prefill)
         if self.cuda_graph_max_bs_decode is not None:
             _set(Phase.DECODE, "max_bs", self.cuda_graph_max_bs_decode)
-        if self.cuda_graph_max_tokens_prefill is not None:
-            _set(Phase.PREFILL, "max_bs", self.cuda_graph_max_tokens_prefill)
+        if self.cuda_graph_max_bs_prefill is not None:
+            _set(Phase.PREFILL, "max_bs", self.cuda_graph_max_bs_prefill)
         if self.cuda_graph_bs_decode is not None:
             _set(Phase.DECODE, "bs", self.cuda_graph_bs_decode)
-        if self.cuda_graph_tokens_prefill is not None:
-            _set(Phase.PREFILL, "bs", self.cuda_graph_tokens_prefill)
+        if self.cuda_graph_bs_prefill is not None:
+            _set(Phase.PREFILL, "bs", self.cuda_graph_bs_prefill)
         if self.cuda_graph_tc_compiler is not None:
             # Written to both phases so the value is in place when TC_PIECEWISE
             # decode is implemented; today decode ignores it.
@@ -6688,10 +6688,10 @@ class ServerArgs:
             help="Maximum batch size captured for the decode cuda graph.",
         )
         parser.add_argument(
-            "--cuda-graph-max-tokens-prefill",
+            "--cuda-graph-max-bs-prefill",
             type=int,
-            default=ServerArgs.cuda_graph_max_tokens_prefill,
-            help="Maximum token count captured for the prefill cuda graph.",
+            default=ServerArgs.cuda_graph_max_bs_prefill,
+            help="Maximum batch size captured for the prefill cuda graph.",
         )
         parser.add_argument(
             "--cuda-graph-bs-decode",
@@ -6701,11 +6701,11 @@ class ServerArgs:
             help="Explicit list of batch sizes to capture for the decode cuda graph.",
         )
         parser.add_argument(
-            "--cuda-graph-tokens-prefill",
+            "--cuda-graph-bs-prefill",
             type=int,
             nargs="+",
-            default=ServerArgs.cuda_graph_tokens_prefill,
-            help="Explicit list of token counts to capture for the prefill cuda graph.",
+            default=ServerArgs.cuda_graph_bs_prefill,
+            help="Explicit list of batch sizes to capture for the prefill cuda graph.",
         )
         parser.add_argument(
             "--cuda-graph-tc-compiler",
@@ -6823,9 +6823,9 @@ class ServerArgs:
             type=int,
             nargs="+",
             action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-tokens-prefill",
-            dest="cuda_graph_tokens_prefill",
-            help="Deprecated alias for --cuda-graph-tokens-prefill.",
+            new_flag="--cuda-graph-bs-prefill",
+            dest="cuda_graph_bs_prefill",
+            help="Deprecated alias for --cuda-graph-bs-prefill.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-compiler",
@@ -6840,9 +6840,9 @@ class ServerArgs:
             "--piecewise-cuda-graph-max-tokens",
             type=int,
             action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-tokens-prefill",
-            dest="cuda_graph_max_tokens_prefill",
-            help="Deprecated alias for --cuda-graph-max-tokens-prefill.",
+            new_flag="--cuda-graph-max-bs-prefill",
+            dest="cuda_graph_max_bs_prefill",
+            help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",
