@@ -1,7 +1,6 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     QWEN3_6_27B_W8A8_MODEL_PATH,
     TestAscendPerformanceTestCaseBase,
@@ -86,18 +85,17 @@ class TestNPUQwen3_6_27B_2P_In64k_Out1k_Prefix90_50ms(
     """Test NPU performance for Qwen3.6-27B-w8a8 2p in64k out1k prefix90 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_6_27B_W8A8_MODEL_PATH
     other_args = QWEN3_6_27B_64K_PREFIX_OTHER_ARGS
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
-    dataset_name = "random"
+    dataset_name = "generated-shared-prefix"
     max_concurrency = 20
     num_prompts = 80
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
-    aisbench_repeat_rate = 0.9
-    request_rate = 60
+    repeat_rate = 0.9
+    request_rate = float("inf")
     tpot = 50
     output_token_throughput = 225
 
