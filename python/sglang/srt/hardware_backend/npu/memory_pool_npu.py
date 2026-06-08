@@ -1,6 +1,5 @@
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
