@@ -22,16 +22,6 @@ _is_npu = is_npu()
 if _is_npu:
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
-        npu_add_rms_norm_batch_invariant,
-        npu_fused_infer_attention_score_batch_invariant,
-        npu_log_softmax_batch_invariant,
-        npu_matmul_batch_invariant,
-        npu_mean_batch_invariant,
-        npu_mm_batch_invariant,
-    )
-
-
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
@@ -1014,6 +1004,15 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
+        from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+            npu_add_rms_norm_batch_invariant,
+            npu_fused_infer_attention_score_batch_invariant,
+            npu_log_softmax_batch_invariant,
+            npu_matmul_batch_invariant,
+            npu_mean_batch_invariant,
+            npu_mm_batch_invariant,
+        )
+
         _batch_invariant_LIB.impl("aten::mm", npu_mm_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl(
             "aten::matmul", npu_matmul_batch_invariant, dispatch_key
