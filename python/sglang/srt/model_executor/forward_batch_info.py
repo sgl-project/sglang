@@ -385,6 +385,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
+    topk_indices: Optional[torch.Tensor] = None
+    reuse_mtp_topk_indices: Optional[bool] = False
+
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
