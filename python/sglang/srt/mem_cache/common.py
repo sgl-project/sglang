@@ -394,16 +394,15 @@ def alloc_paged_token_slots_extend(
     # space). It returns a DSV4OutCacheLoc bundle (not a bare loc tensor); we
     # unpack out_full_loc for the generic return and stash the bundle on the
     # batch so the attention backend / per-req-table hooks read it explicitly
-    # instead of via an allocator side-channel. Gate via hasattr so non-DSV4
-    # allocators stay unchanged.
+    # off the batch. Gate via hasattr so non-DSV4 allocators stay unchanged.
     is_dsv4 = req_pool_indices is not None and hasattr(
         allocator, "c4_attn_allocator"
     )
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Pass the per-req tables in per call (for the c-pool / state last_loc
-        # lookup) instead of a permanent allocator->pool back-ref.
+        # Pass the per-req tables in per call for the c-pool / state last_loc
+        # lookup; the allocator holds no reference to the pool.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
         if dsv4_state_lens is not None:
@@ -583,7 +582,8 @@ def alloc_paged_token_slots_decode(
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Per-call per-req tables for the last_loc lookup (no stored back-ref).
+        # Per-call per-req tables for the last_loc lookup; the allocator holds
+        # no reference to the pool.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
         if dsv4_state_lens is not None:
@@ -727,9 +727,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
-    # DSV4-NPU c4/c128 pool free piggy-backs on DSV4NPUReqToTokenPool.free —
-    # see hardware_backend/npu/dsv4_req_to_token_pool.py:free. No-op for
-    # other ReqToTokenPool subclasses.
+    # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
+    # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
 
 

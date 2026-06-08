@@ -2957,10 +2957,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.c4_state_alloc_offset:c4_watermark,
             ]
             allocator.c4_state_attn_allocator.free(c4_state_free.to(torch.int64))
-            if allocator.c4_index_state_attn_allocator is not None:
-                allocator.c4_index_state_attn_allocator.free(
-                    c4_state_free.to(torch.int64)
-                )
             req.c4_state_alloc_offset = c4_watermark
         if (
             allocator.c128_state_attn_allocator is not None
@@ -3032,13 +3028,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 allocator.c4_state_attn_allocator.free(
                     c4_state_free.to(torch.int64)
                 )
-                if allocator.c4_index_state_attn_allocator is not None:
-                    # Indexer state shares per-req table layout with attention
-                    # state — same slot ids, but managed by its own allocator
-                    # (separate slot space). Free in parallel.
-                    allocator.c4_index_state_attn_allocator.free(
-                        c4_state_free.to(torch.int64)
-                    )
                 req.c4_state_alloc_offset = new_swa_evicted_seqlen
             if (
                 hasattr(allocator, "c128_state_attn_allocator")

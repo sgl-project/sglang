@@ -377,8 +377,6 @@ class ModelRunnerKVCacheMixin:
             if _is_npu_fn():
                 from sglang.srt.hardware_backend.npu.dsv4_memory_pool import (
                     DSV4NPUTokenToKVPool,
-                )
-                from sglang.srt.hardware_backend.npu.dsv4_state_pool import (
                     npu_state_pool_size,
                 )
 
