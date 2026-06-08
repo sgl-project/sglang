@@ -5,7 +5,6 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestAscendAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     MINIMAX_M2_5_EAGLE3_MODEL_PATH,
     MINIMAX_M2_5_W8A8_MODEL_PATH,
@@ -98,19 +97,19 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
     """MiniMax-M2.5-w8a8 4p (4 cards) 64k input 1k output with 90% prefix cache performance test"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = MINIMAX_M2_5_W8A8_MODEL_PATH
     other_args = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS
     envs = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS
-    dataset_name = "random"
+    dataset_name = "generated-shared-prefix"
     max_concurrency = 36
     num_prompts = 144
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1
-    aisbench_repeat_rate = 0.9
+    repeat_rate = 0.9
     tpot = 50
     output_token_throughput = 380.31
+    request_rate = float("inf")
 
     def test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms(self):
         """Run MiniMax-M2.5-w8a8 4p 64k/1k prefix90 performance test"""

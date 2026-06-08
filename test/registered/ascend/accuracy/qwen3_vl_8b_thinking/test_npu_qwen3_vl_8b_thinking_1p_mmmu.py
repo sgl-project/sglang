@@ -35,8 +35,6 @@ OTHER_ARGS = [
     "ascend",
     "--device",
     "npu",
-    "--quantization",
-    "modelslim",
     "--max-running-requests",
     16,
     "--max-prefill-tokens",

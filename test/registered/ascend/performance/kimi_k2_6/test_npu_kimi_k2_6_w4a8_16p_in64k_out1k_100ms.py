@@ -7,6 +7,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
+    KIMI_K2_6_EAGLE3_MODEL_PATH,
     KIMI_K2_6_W4A8_MODEL_PATH,
     TestAscendPerfMultiNodePdMixTestCaseBase,
 )
@@ -21,19 +22,15 @@ register_npu_ci(
 
 ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_SET_CPU_AFFINITY": "1",
     "STREAMS_PER_DEVICE": "32",
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "96",
-    "HCCL_BUFFSIZE": "2400",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    "HCCL_BUFFSIZE": "4400",
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
-    "SGLANG_NPU_USE_MLAPO": "1",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
-    "SGLANG_SET_CPU_AFFINITY": "1",
 }
 
 OTHER_ARGS = [
@@ -51,15 +48,13 @@ OTHER_ARGS = [
     "--nnodes",
     2,
     "--mem-fraction-static",
-    0.62,
+    0.55,
     "--max-running-requests",
-    48,
+    32,
     "--chunked-prefill-size",
-    65536,
+    262144,
     "--context-length",
-    65536,
-    "--max-prefill-tokens",
-    65536,
+    75000,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
@@ -74,39 +69,30 @@ OTHER_ARGS = [
     "auto",
     "--cuda-graph-bs",
     1,
-    2,
-    4,
-    6,
-    8,
-    10,
-    12,
     "--disable-radix-cache",
-    "--model-loader-extra-config",
-    '{"enable_multithread_load": true}',
     "--speculative-algorithm",
     "EAGLE3",
+    "--speculative-draft-model-path",
+    KIMI_K2_6_EAGLE3_MODEL_PATH,
     "--speculative-num-steps",
-    4,
+    3,
     "--speculative-eagle-topk",
     1,
     "--speculative-num-draft-tokens",
-    5,
+    4,
     "--speculative-draft-model-quantization",
     "unquant",
 ]
 
-MODEL_CONFIG = {
-    "model_path": KIMI_K2_6_W4A8_MODEL_PATH,
-    "other_args": OTHER_ARGS,
-    "node_envs": ENVS,
-}
 
+class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestAscendAccuracyMultiNodePdMixTestCaseBase):
 
-class TestNPUKimiK2_6_W4A8_8P_AIME2025(TestAscendAccuracyMultiNodePdMixTestCaseBase):
-
-    model_config = MODEL_CONFIG
+    model = KIMI_K2_6_W4A8_MODEL_PATH
+    other_args = OTHER_ARGS
+    envs = ENVS
     accuracy = 0.961
     datasets = ["aime25"]
+    few_shot_num = 0
     eval_batch_size = 64
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
 
@@ -114,23 +100,24 @@ class TestNPUKimiK2_6_W4A8_8P_AIME2025(TestAscendAccuracyMultiNodePdMixTestCaseB
         self.run_accuracy()
 
 
-class TestNPUKimiK2_6_W4A8_8P_In64k_Out1k_50ms(
+class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(
     TestAscendPerfMultiNodePdMixTestCaseBase
 ):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    model_config = MODEL_CONFIG
+    model = KIMI_K2_6_W4A8_MODEL_PATH
+    other_args = OTHER_ARGS
+    envs = ENVS
     dataset_name = "random"
-    max_concurrency = 48
-    num_prompts = 48
-    request_rate = 1
-    input_len = 16384
-    output_len = 1024
+    max_concurrency = 32
+    num_prompts = 32
+    input_len = 64000
+    output_len = 1000
     random_range_ratio = 1
     tpot = 100
-    output_token_throughput = 1000
+    output_token_throughput = 160
 
-    def test_npu_kimi_k2_6_w4a8_8p_in64k_out1k_50ms(self):
+    def test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms(self):
         self.run_throughput()
 
 

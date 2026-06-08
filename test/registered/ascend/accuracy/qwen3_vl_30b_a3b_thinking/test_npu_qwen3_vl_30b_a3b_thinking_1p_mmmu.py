@@ -39,8 +39,6 @@ OTHER_ARGS = [
     "ascend",
     "--device",
     "npu",
-    "--quantization",
-    "modelslim",
     "--max-running-requests",
     162,
     "--disable-radix-cache",
