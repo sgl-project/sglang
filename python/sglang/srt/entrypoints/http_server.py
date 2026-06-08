@@ -42,6 +42,7 @@ from typing import (
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 
+import msgspec
 import numpy as np
 import requests
 import uvicorn
@@ -1629,8 +1630,9 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
         LoadLoRAAdapterReqInputIpc(**obj.__dict__),
         request,
     )
+    result = msgspec.to_builtins(result)
 
-    if result.success:
+    if result.get("success", False):
         return ORJSONResponse(
             result,
             status_code=HTTPStatus.OK,
@@ -1662,8 +1664,9 @@ async def load_lora_adapter_from_tensors(
         LoadLoRAAdapterFromTensorsReqInputIpc(**obj.__dict__),
         request,
     )
+    result = msgspec.to_builtins(result)
 
-    if result.success:
+    if result.get("success", False):
         return ORJSONResponse(result, status_code=HTTPStatus.OK)
     else:
         return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
@@ -1685,8 +1688,9 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
         UnloadLoRAAdapterReqInputIpc(**obj.__dict__),
         request,
     )
+    result = msgspec.to_builtins(result)
 
-    if result.success:
+    if result.get("success", False):
         return ORJSONResponse(
             result,
             status_code=HTTPStatus.OK,

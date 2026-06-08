@@ -1660,6 +1660,12 @@ def wrap_shm_features(obj):
         # large tensors inside mm_inputs
         obj.mm_inputs = pickle.dumps(obj.mm_inputs)
 
+    if hasattr(obj, "image_inputs"):
+        # Use pickle to serialize the image_inputs
+        # so that msgpack doesn't try to serialize the potentially
+        # large tensors inside mm_inputs
+        obj.image_inputs = pickle.dumps(obj.image_inputs)
+
     return obj
 
 

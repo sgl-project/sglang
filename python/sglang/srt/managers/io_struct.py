@@ -1075,7 +1075,7 @@ class TokenizedEmbeddingReqInput(BaseReqIpc, kw_only=True):
     # The input token ids
     input_ids: Optional[array]  # array[int]
     # The image inputs
-    image_inputs: Optional[dict]
+    image_inputs: Optional[object]
     # The token type ids
     token_type_ids: Optional[List[int]]
     # Dummy sampling params for compatibility
@@ -1954,7 +1954,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReqIpc, kw_only=True):
 class LoRAUpdateOutput(BaseReqIpc, kw_only=True):
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Optional[Dict[str, LoRARef]] = None
+    loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
