@@ -398,6 +398,32 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
 
+    # MoRI KV Transfer
+    # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
+    SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
+    # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
+    # values can increase parallelism and bandwidth utilization.
+    SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)
+    # Number of RDMA work requests posted in a single batch to each QP. Larger
+    # batch sizes reduce per-operation overhead and improve throughput at the
+    # cost of higher latency. -1 selects automatic sizing based on the number
+    # of merged work requests and available endpoints.
+    SGLANG_MORI_POST_BATCH_SIZE = EnvInt(-1)
+    # Number of worker threads in the RDMA executor thread pool. More workers
+    # can improve parallelism for large batch transfers across multiple QPs,
+    # but excessive threads may cause contention.
+    SGLANG_MORI_NUM_WORKERS = EnvInt(4)
+    # Number of sharded synchronous worker threads that drain KV transfers.
+    # Also the bound on outstanding (posted-but-not-completed) transfers, so it
+    # is the primary throttle keeping the RDMA send queue from overflowing.
+    SGLANG_MORI_TRANSFER_SHARDS = EnvInt(8)
+    # Poll cadence (ms) at which a transfer worker wakes to check the SLA while
+    # waiting for completion; real completion still wakes it immediately.
+    SGLANG_MORI_WAIT_POLL_MS = EnvInt(1000)
+    # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
+    # and relies on the RDMA retry-exceeded timeout only.
+    SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
