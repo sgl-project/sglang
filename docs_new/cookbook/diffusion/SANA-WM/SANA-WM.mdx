@@ -194,7 +194,7 @@ Notes on launch behavior:
 
 - **Default endpoint** is `127.0.0.1:30000` (`--host` / `--port` override).
 - **CPU offload flags are optional.** `--dit-cpu-offload`, `--text-encoder-cpu-offload`, and `--image-encoder-cpu-offload` are available; defaults are auto-adjusted from GPU memory (GPUs under 30 GB get more aggressive offloading).
-- **Warmup.** `serve` defaults warmup on; it is not auto-disabled for the realtime pipeline. If warmup is undesirable for your realtime deployment, disable it explicitly with `--warmup false`.
+- **Warmup.** Server warmup is **automatically skipped** for the realtime pipeline — a synthetic warmup request has no WebSocket session, so the server detects the registered realtime adapter and skips it. No `--warmup` flag is needed.
 
 Once up, the realtime WebSocket endpoint lives at `ws://127.0.0.1:30000/v1/realtime_video/generate` (use the Python client in §7 to connect — plain `curl` does not speak the `ws://` upgrade).
 
@@ -243,6 +243,8 @@ The server streams **frame batches** back. Each chunk arrives as one or more `fr
 | `camera_actions` | `list[list[str]]` or `{mode: "state", transitions: [...]}` | Frame-by-frame camera actions, or state-based transitions |
 | `action` | str | Action-DSL string, e.g. `"w-10,none-5,a-8"` (see §8) |
 | `intrinsics_path` | str | Server-side path to a camera-intrinsics **`.npy`** file (loaded via `np.load`; shapes `(4,)`, `(3,3)`, or `(F,3,3)`) |
+
+If you omit both `intrinsics_path` and `intrinsics`, the server estimates intrinsics from the first frame with **Pi3X** ([`github.com/yyfz/Pi3`](https://github.com/yyfz/Pi3); auto-downloads `yyfz233/Pi3X`) — install it (`pip install git+https://github.com/yyfz/Pi3.git`) or always pass intrinsics, otherwise the request fails with "Pi3X is not installed".
 
 ```json INIT (msgpack dict) — open-ended (omit num_frames)
 {
@@ -375,7 +377,10 @@ async def run():
             "realtime_output_format": "raw",
             "num_inference_steps": 4,
             "guidance_scale": 1.0,
-            "condition_inputs": {"action": "w-100,wd-50,d-30"},
+            "condition_inputs": {
+                "action": "w-100,wd-50,d-30",
+                "intrinsics_path": "/path/to/intrinsics.npy",  # omit only if Pi3X is installed
+            },
         }))
 
         # 2) optional: steer mid-stream
