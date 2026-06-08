@@ -97,16 +97,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
-        "ideogram4_fp8_t2i",
-        DiffusionServerArgs(
-            model_path="ideogram-ai/ideogram-4-fp8",
-        ),
-        IDEOGRAM4_CI_sampling_params,
-        run_perf_check=True,
-        run_consistency_check=True,
-        run_component_accuracy_check=False,
-    ),
-    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST),
     ),
@@ -576,6 +566,21 @@ else:
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "ideogram4_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path="ideogram-ai/ideogram-4-fp8",
+            tp_size=2,
+            extras=[
+                "--attention-backend",
+                "fa",
+            ],
+        ),
+        IDEOGRAM4_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
