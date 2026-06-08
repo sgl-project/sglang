@@ -117,6 +117,7 @@ def apply_flashinfer_rope_qk_inplace(
         if flashinfer_apply_rope_inplace is None:
             _warn_about_missing_flashinfer()
 
+        half_size = rope_dim // 2
         if positions is None:
             cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
             sin = cos_sin_cache[:seqlen, half_size:].to(q.dtype)
