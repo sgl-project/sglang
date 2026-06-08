@@ -606,9 +606,9 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.fill_len = req.get_full_untruncated_fill_len()
+                req.extend_fill_len = req.get_full_untruncated_fill_len()
                 req.logprob_start_len = -1
-                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+                req.set_extend_input_len(req.extend_fill_len - len(req.prefix_indices))
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -621,7 +621,7 @@ class SchedulerPPMixin:
                     self.spec_algorithm,
                 )
 
-                current_seq_len = req.fill_len
+                current_seq_len = req.extend_fill_len
 
                 if is_dp_attention_enabled():
                     # For profiling, we only have one request on PP0
@@ -685,7 +685,7 @@ class SchedulerPPMixin:
                 # Release KV cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : req.fill_len
+                        req.req_pool_idx, : req.extend_fill_len
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     self.req_to_token_pool.free(req)

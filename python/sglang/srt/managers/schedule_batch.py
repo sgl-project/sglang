@@ -696,7 +696,7 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        self.fill_len: Optional[int] = None
+        self.extend_fill_len: Optional[int] = None
 
         self.session = session
         self.input_embeds = input_embeds
@@ -958,8 +958,8 @@ class Req(ReqDllmMixin):
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
-        # kv_send(req.input_ids[req.start_send_idx:req.fill_len])
-        # start_send_idx = req.fill_len
+        # kv_send(req.input_ids[req.start_send_idx:req.extend_fill_len])
+        # start_send_idx = req.extend_fill_len
         self.start_send_idx: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
@@ -1078,7 +1078,7 @@ class Req(ReqDllmMixin):
         return length
 
     def get_fill_ids(self) -> array:
-        return self.get_full_untruncated_fill_ids()[: self.fill_len]
+        return self.get_full_untruncated_fill_ids()[: self.extend_fill_len]
 
     def init_next_round_input(
         self,
@@ -1379,7 +1379,7 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-        self.fill_len = None
+        self.extend_fill_len = None
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1562,10 +1562,10 @@ def _compute_chunked_req_next_prompt_token(
 ) -> Optional[int]:
     if chunked_req is None:
         return None
-    fill_len = chunked_req.fill_len
-    if fill_len >= len(chunked_req.origin_input_ids):
+    extend_fill_len = chunked_req.extend_fill_len
+    if extend_fill_len >= len(chunked_req.origin_input_ids):
         return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    return int(chunked_req.origin_input_ids[extend_fill_len])
 
 
 @dataclasses.dataclass
@@ -1912,8 +1912,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = [r.fill_len for r in reqs]
-        orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
+        seq_lens = [r.extend_fill_len for r in reqs]
+        orig_seq_lens = [max(r.extend_fill_len, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
@@ -1966,7 +1966,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
-                # fill_len/extend_input_len on chunk overflow but not input_embeds.
+                # extend_fill_len/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
                 )
@@ -2049,7 +2049,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # extend_input_logprob_token_id = [4, 0]
                 global_start_idx, global_end_idx = (
                     len(req.prefix_indices),
-                    req.fill_len,
+                    req.extend_fill_len,
                 )
                 if req.logprob_start_len == -1:
                     logprob_start_len = len(req.origin_input_ids)
@@ -2279,7 +2279,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.fill_len = req.get_full_untruncated_fill_len()
+            req.extend_fill_len = req.get_full_untruncated_fill_len()
             req.set_extend_input_len(1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
@@ -2506,7 +2506,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         for req in self.reqs:
-            req.fill_len = None
+            req.extend_fill_len = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None

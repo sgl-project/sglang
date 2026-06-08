@@ -488,8 +488,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             assert (
-                req.fill_len == req.kv_committed_len
-            ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
+                req.extend_fill_len == req.kv_committed_len
+            ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_fill_len=} {req.kv_committed_len=}"
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.kv_committed_len
             ]
@@ -499,8 +499,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         assert (
-            req.fill_len == req.kv_committed_len
-        ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
+            req.extend_fill_len == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_fill_len=} {req.kv_committed_len=}"
         token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)

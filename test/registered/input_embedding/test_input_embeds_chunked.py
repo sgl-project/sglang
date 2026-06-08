@@ -3,7 +3,7 @@
 Covers two bugs with the same crash signature
 (RuntimeError: shape mismatch in set_kv_buffer) but opposite polarity:
 
-- Chunked prefill truncation (#20376): PrefillAdder shrinks fill_len and
+- Chunked prefill truncation (#20376): PrefillAdder shrinks extend_fill_len and
   extend_input_len on chunk overflow but not input_embeds, so the full array
   flows through while out_cache_loc is sized for the truncated length.
   Polarity: cache_k > loc.

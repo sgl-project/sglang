@@ -68,7 +68,7 @@ class MockReq:
 
     def __init__(self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
         self.full_untruncated_fill_ids = array("q", fill_ids)
-        self.fill_len = len(self.full_untruncated_fill_ids)
+        self.extend_fill_len = len(self.full_untruncated_fill_ids)
         self.origin_input_ids = array(
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
@@ -84,7 +84,7 @@ class MockReq:
         self.kv_committed_freed = False
 
     def get_fill_ids(self):
-        return self.full_untruncated_fill_ids[: self.fill_len]
+        return self.full_untruncated_fill_ids[: self.extend_fill_len]
 
     def pop_committed_kv_cache(self):
         self.kv_committed_freed = True

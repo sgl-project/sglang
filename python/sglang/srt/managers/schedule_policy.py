@@ -660,7 +660,7 @@ class PrefillAdder:
         )
 
         req.extend_input_len = trunc_len
-        req.fill_len = prefix_len + trunc_len
+        req.extend_fill_len = prefix_len + trunc_len
 
         self.can_run_list.append(req)
 
@@ -681,7 +681,7 @@ class PrefillAdder:
         # Truncate input length to available tokens and update request metadata
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
-        req.fill_len = len(req.prefix_indices) + req.extend_input_len
+        req.extend_fill_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -721,7 +721,7 @@ class PrefillAdder:
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
-        req.fill_len = len(req.prefix_indices) + req.extend_input_len
+        req.extend_fill_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -828,10 +828,10 @@ class PrefillAdder:
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill — the whole sequence is committed this iter.
-            req.fill_len = req.get_full_untruncated_fill_len()
+            req.extend_fill_len = req.get_full_untruncated_fill_len()
             assert (
-                req.fill_len == len(req.prefix_indices) + req.extend_input_len
-            ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
+                req.extend_fill_len == len(req.prefix_indices) + req.extend_input_len
+            ), f"{req.extend_fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -848,7 +848,7 @@ class PrefillAdder:
 
             req.set_extend_input_len(trunc_len)
             assert len(req.prefix_indices) == 0
-            req.fill_len = len(req.prefix_indices) + trunc_len
+            req.extend_fill_len = len(req.prefix_indices) + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
@@ -967,10 +967,11 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
-                req.fill_len = req.get_full_untruncated_fill_len()
+                req.extend_fill_len = req.get_full_untruncated_fill_len()
                 assert (
-                    req.fill_len == len(req.prefix_indices) + req.extend_input_len
-                ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
+                    req.extend_fill_len
+                    == len(req.prefix_indices) + req.extend_input_len
+                ), f"{req.extend_fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -1010,7 +1011,7 @@ class PrefillAdder:
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)
-                req.fill_len = len(req.prefix_indices) + trunc_len
+                req.extend_fill_len = len(req.prefix_indices) + trunc_len
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
