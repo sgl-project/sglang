@@ -30,9 +30,8 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
+    align_evict_mask_to_page_size,
     assign_req_to_token_pool,
-    get_src_tgt_cache_loc,
-    get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
 
@@ -224,50 +223,22 @@ class NgramVerifyInput(SpecInput):
             batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             batch.out_cache_loc = batch.out_cache_loc[self.accept_indices]
         else:
-            # Shift the accepted tokens to the beginning.
-            # Only evict the last part
-            src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+            # Linear-chain optimization: NGRAM/SUFFIX produce linear chain drafts,
+            # so accept_indices form a contiguous prefix per request. Instead of
+            # compacting via move_kv_cache (which NSA paginated KV pool does not
+            # support), free only full-empty pages and leave gaps in partial pages.
+            # Mirrors EAGLE/MTP's topk==1 cleanup path in eagle_info.py.
+            evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+            evict_mask[self.accept_indices] = False
+            align_evict_mask_to_page_size[len(batch.seq_lens),](
                 batch.seq_lens,
-                batch.out_cache_loc,
-                self.accept_indices,
-                self.num_correct_drafts,
-                self.draft_token_num,
+                evict_mask,
                 page_size,
-            )
-            to_free_slots = torch.empty(
-                (to_free_num_slots.sum().item(),),
-                dtype=torch.int64,
-                device=to_free_num_slots.device,
-            )
-
-            # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
-            # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
-            # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
-            # to_free_slots: [      2,        5,     7  8]
-            # to_free_slots also needs to be page-aligned without the first partial page
-            #
-            # split each row of out_cache_loc into two parts.
-            # 1. the first part goes to tgt_cache_loc. length = num_correct_drafts[i] + 1
-            # 2. the second part goes to to_free_slots.
-            get_target_cache_loc[(bs,)](
-                tgt_cache_loc,
-                to_free_slots,
-                self.num_correct_drafts,
-                to_free_num_slots,
-                batch.out_cache_loc,
                 self.draft_token_num,
                 next_power_of_2(self.draft_token_num),
-                next_power_of_2(bs),
             )
-
-            # Free the kv cache
-            batch.token_to_kv_pool_allocator.free(to_free_slots)
-
-            # Copy the kv cache
-            batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                tgt_cache_loc, src_cache_loc
-            )
-            batch.out_cache_loc = tgt_cache_loc
+            batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            batch.out_cache_loc = batch.out_cache_loc[self.accept_indices]
 
         num_correct_drafts_list = num_correct_drafts_cpu.tolist()
         for i, req in enumerate(batch.reqs):
