@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_2_TI2V_5B_Config,
     TurboWanT2V480PConfig,
@@ -665,8 +666,10 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertEqual(qwen_deployment.auto_full_device_tp_size_candidates, ())
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
 
         self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
@@ -685,6 +688,115 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+
+        self.assertIsNone(sana_wm_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertEqual(
+            sana_wm_deployment.auto_full_device_tp_size_candidates, (2, 4)
+        )
+        self.assertFalse(sana_wm_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(
+            sana_wm_deployment.auto_disable_default_layerwise_offload_min_available_memory_gb,
+            70,
+        )
+        self.assertEqual(
+            sana_wm_deployment.auto_disable_component_offload_min_available_memory_gb,
+            70,
+        )
+        self.assertEqual(
+            sana_wm_deployment.auto_disable_component_offload_components,
+            ("dit", "text_encoder", "image_encoder", "vae"),
+        )
+
+    def test_auto_multi_gpu_sana_wm_prefers_native_tp_resident(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 1)
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertIsNone(args.layerwise_offload_components)
+
+    def test_auto_four_gpu_sana_wm_prefers_tp4(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 4,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.tp_size, 4)
+        self.assertEqual(args.sp_degree, 1)
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertFalse(args.use_fsdp_inference)
+
+    def test_auto_low_memory_sana_wm_keeps_offload_fallback(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            memory_gb=50,
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_speed_mode_sana_wm_prefers_native_tp_not_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 4,
+                "performance_mode": "speed",
+            },
+        )
+
+        self.assertEqual(args.tp_size, 4)
+        self.assertEqual(args.sp_degree, 1)
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.layerwise_offload_components)
+
+    def test_sana_wm_preserves_explicit_cfg_tp_parallel_policy(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 4,
+                "performance_mode": "auto",
+                "tp_size": 2,
+                "enable_cfg_parallel": True,
+            },
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.cfg_parallel_degree, 2)
+        self.assertEqual(args.sp_degree, 1)
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertFalse(args.use_fsdp_inference)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
@@ -1045,6 +1157,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
+        self.assertEqual(args.tp_size, 1)
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         self.assertTrue(args.dit_cpu_offload)
@@ -1346,6 +1459,10 @@ class TestModelIdResolution(unittest.TestCase):
         info = _get_config_info(path)
         self.assertIsNotNone(info)
 
+    def test_sana_wm_model_path_resolves_registry(self):
+        info = _get_config_info("Efficient-Large-Model/SANA-WM_bidirectional")
+        self.assertIs(info.pipeline_config_cls, SanaWMPipelineConfig)
+
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection
         # with an unresolvable path, expect RuntimeError from the detector step
@@ -1542,6 +1659,23 @@ class TestPerRoleParallelism(unittest.TestCase):
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
         _get_config_info.cache_clear()
+
+    def test_sana_wm_attention_flags_from_cli(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Efficient-Large-Model/SANA-WM_bidirectional",
+            "--dit-config.pad-attention-head-dim-to-flash",
+            "true",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        arch = server_args.pipeline_config.dit_config.arch_config
+        self.assertTrue(arch.pad_attention_head_dim_to_flash)
 
     def test_resolution_flag_overrides_qwen_image_layered_pipeline_config(self):
         parser = FlexibleArgumentParser()

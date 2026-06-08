@@ -28,6 +28,9 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    TI2I_sampling_params,
+    SANA_WM_TI2V_CI_sampling_params,
+    TI2V_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
@@ -44,6 +47,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
@@ -376,6 +380,15 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
         ),
     ),
+    DiffusionTestCase(
+        "sana_wm_ti2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST,
+        ),
+        SANA_WM_TI2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+    ),
     # flaky
     # === Helios T2V ===
     # DiffusionTestCase(
@@ -691,6 +704,16 @@ TWO_GPU_CASES = [
         run_perf_check=False,
     ),
     DiffusionTestCase(
+        "sana_wm_ti2v_tp2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST,
+            tp_size=2,
+        ),
+        SANA_WM_TI2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+    ),
+    DiffusionTestCase(
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
@@ -797,6 +820,10 @@ TWO_GPU_CASES = [
         ),
         run_component_accuracy_check=False,
     ),
+    # NOTE: SANA-WM does not currently support sequence parallelism. The DiT
+    # uses a frame-wise GDN recurrent scan and a temporal depth-wise conv that
+    # both span across frames, so splitting along T would corrupt outputs.
+    # Add a 2-GPU SP case once SP-aware (halo-exchange) GDN lands.
 ]
 
 if not current_platform.is_hip():

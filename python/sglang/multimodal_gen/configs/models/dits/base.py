@@ -7,6 +7,7 @@ from typing import Any
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.utils import StoreBoolean
 
 
 @dataclass
@@ -78,5 +79,14 @@ class DiTConfig(ModelConfig):
             default=None,
             help="Quantization configuration for the DiT model",
         )
-
+        parser.add_argument(
+            f"--{prefix}.pad-attention-head-dim-to-flash",
+            action=StoreBoolean,
+            dest=f"{prefix.replace('-', '_')}.pad_attention_head_dim_to_flash",
+            default=None,
+            help=(
+                "Enable SANA-WM opt-in head-dim padding for FlashAttention. "
+                "Ignored by models that do not expose this DiT option."
+            ),
+        )
         return parser

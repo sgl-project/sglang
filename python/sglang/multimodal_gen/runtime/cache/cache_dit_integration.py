@@ -7,7 +7,7 @@ on transformer modules in SGLang's modular pipeline architecture.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -222,6 +222,19 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+def _maybe_get_custom_cache_dit_block_adapter(
+    transformer: torch.nn.Module,
+) -> Any | None:
+    adapter_builder = getattr(transformer, "get_cache_dit_block_adapter", None)
+    if adapter_builder is None:
+        return None
+    if not callable(adapter_builder):
+        raise TypeError(
+            f"{transformer.__class__.__name__}.get_cache_dit_block_adapter must be callable."
+        )
+    return adapter_builder()
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
@@ -229,10 +242,11 @@ def enable_cache_on_transformer(
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.nn.Module:
-    """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
+    """Enable cache-dit on a transformer module, by wrapping the module with cache-dit.
 
-    This function enables cache-dit acceleration using the BlockAdapterRegister
-    for pre-registered models
+    This function enables cache-dit acceleration using cache-dit's
+    BlockAdapterRegister for pre-registered models, or a transformer-provided
+    custom BlockAdapter hook for models with native signatures.
 
     Args:
         model_name: Name of the model for logging purposes.
@@ -249,8 +263,10 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
+    block_adapter = _maybe_get_custom_cache_dit_block_adapter(transformer)
+
     # Check if the transformer is pre-registered in cache-dit
-    if not BlockAdapterRegister.is_supported(transformer):
+    if block_adapter is None and not BlockAdapterRegister.is_supported(transformer):
         transformer_cls_name = transformer.__class__.__name__
         raise ValueError(
             f"{transformer_cls_name} is not officially supported by cache-dit. "
@@ -313,7 +329,7 @@ def enable_cache_on_transformer(
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
     cache_dit.enable_cache(
-        transformer,
+        block_adapter or transformer,
         cache_config=cache_config,
         calibrator_config=calibrator_config,
         parallelism_config=None,

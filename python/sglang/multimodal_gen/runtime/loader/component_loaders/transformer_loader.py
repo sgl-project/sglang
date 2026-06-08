@@ -95,10 +95,16 @@ class TransformerLoader(ComponentLoader):
         )
 
         # 2. dit config
-        # Config from Diffusers supersedes sgl_diffusion's model config
+        # Config from Diffusers supersedes sgl_diffusion's model config.
+        raw_component_name = component_name
         component_name = _normalize_component_type(component_name)
-        server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
+        server_args.model_paths[raw_component_name] = component_model_path
+        if (
+            raw_component_name == "transformer_2"
+            and hasattr(server_args.pipeline_config, "refiner_dit_config")
+        ):
+            pipeline_dit_config_attr = "refiner_dit_config"
+        elif component_name in ("transformer", "unconditional_transformer", "video_dit"):
             pipeline_dit_config_attr = "dit_config"
         elif component_name in ("audio_dit",):
             pipeline_dit_config_attr = "audio_dit_config"
@@ -107,7 +113,12 @@ class TransformerLoader(ComponentLoader):
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
 
-        cls_name = config.pop("_class_name")
+        configured_cls_name = config.pop("_class_name")
+        cls_name = (
+            "SanaWMLTX2VideoRefiner"
+            if self.component_architecture == "SanaWMLTX2VideoRefiner"
+            else configured_cls_name
+        )
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         quant_spec = resolve_transformer_quant_load_spec(
@@ -117,6 +128,7 @@ class TransformerLoader(ComponentLoader):
             component_model_path=component_model_path,
             model_cls=model_cls,
             cls_name=cls_name,
+            arch_config=dit_config.arch_config,
         )
 
         logger.info(
@@ -137,7 +149,8 @@ class TransformerLoader(ComponentLoader):
             and component_server_args.transformer_weights_path is not None
         ):
             logger.warning(
-                "transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
+                "transformer_weights_path provided, but quantization config not "
+                "resolved, which is unexpected and likely to cause errors"
             )
         else:
             logger.debug("quantization config: %s", init_params["quant_config"])
