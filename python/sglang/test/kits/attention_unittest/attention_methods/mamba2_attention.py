@@ -1003,22 +1003,18 @@ def expected_mamba2_verify_output_from_inputs(
 ) -> torch.Tensor:
     """Reference output for chain (topk=1) target-verify cases.
 
-    Mamba2's SSM kernel does not consume the tree mask: under any topk it
-    processes the per-request draft tokens linearly through the chunked-scan
-    recurrence, just like EXTEND. For `topk == 1` this matches the
-    chain semantics the EAGLE verifier expects, so the eager SSM
-    reference (`_pure_torch_mamba2_reference`) doubles as the verify
-    reference. For `topk > 1` the production kernel still processes
-    siblings as a chain — this is documented at the call site as
-    structurally unsupported rather than wired through a tree-aware
-    reference.
+    This reference (`_pure_torch_mamba2_reference`) is a chain recurrence.
+    For `topk == 1` it matches the chain semantics the EAGLE verifier
+    expects, so it doubles as the verify reference. For `topk > 1` the
+    production SSM kernel DOES follow the draft tree (it consumes the
+    parent-indices plumbing), but this test has no tree-aware reference to
+    compare against, so tree verify is skipped here rather than validated.
     """
     if topk != 1:
         raise ValueError(
-            "Mamba2 tree verify (topk>1) is not exercised: the SSM kernel "
-            "ignores the tree mask and processes draft tokens linearly. "
-            "Wiring a parent-indices-aware reference here would not match "
-            "production behavior. Only chain (topk=1) is supported."
+            "Mamba2 tree verify (topk>1) is not exercised here: this "
+            "reference is chain-only. The production kernel supports tree "
+            "verify; a tree-aware reference is future work."
         )
     del inputs
     # `state` is the (ssm_states, conv_states) snapshot captured before
