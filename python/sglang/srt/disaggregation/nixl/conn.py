@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
 from sglang.srt.disaggregation.common.utils import (
@@ -1973,8 +1974,10 @@ class NixlKVSender(CommonKVSender):
         if exc is not None:
             raise exc
         if failure_reason is not None:
-            raise RuntimeError(failure_reason)
-        raise RuntimeError("NIXL KVSender Exception")
+            raise KVTransferError(self.bootstrap_room, failure_reason)
+        raise KVTransferError(
+            self.bootstrap_room, "NIXL KVSender Exception", is_from_another_rank=True
+        )
 
 
 class NixlKVReceiver(CommonKVReceiver):
@@ -2138,7 +2141,14 @@ class NixlKVReceiver(CommonKVReceiver):
                 )
 
     def failure_exception(self):
-        raise RuntimeError("NIXL KVReceiver Exception")
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "NIXL KVReceiver Exception"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):
