@@ -7749,9 +7749,20 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
+            # _PATCH_PP_SUFFIX_ASSERT: PP supports SUFFIX speculative decoding
+            # ONLY (CPU-draft NGRAM family, no draft-model forward). EAGLE / EAGLE3
+            # / NEXTN / STANDALONE / HYBRID_SUFFIX_MTP need a draft forward that the
+            # PP deferred-verify path does not implement, so they stay forbidden.
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            assert (
+                self.speculative_algorithm is None
+                or self.speculative_algorithm == "SUFFIX"
+            ), (
+                "Pipeline parallelism with speculative decoding supports only "
+                f"SUFFIX (got speculative_algorithm={self.speculative_algorithm})"
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
