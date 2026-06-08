@@ -786,10 +786,8 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-        # Producers emit the scale transposed only when bpreshuffle is the backend
-        # (>= ROCm 7.2). The triton GEMM reads a_scale by stride, so re-stride it back
-        # to row-major for free; bpreshuffle keeps the transposed layout it wants, and
-        # on ROCm 7.0 the scale is already row-major for the CK / triton GEMMs.
+        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
+        # Triton needs a row-major view, so adjust strides only. No copy.
         if use_triton and _use_aiter_bpreshuffle_gfx95:
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
