@@ -1359,6 +1359,8 @@ def fused_qk_rope_reshape_and_cache(
     if zeros_out is not None:
         return q_out.view(-1, qh * d), k_out, key_cache, value_cache, zeros_out
     return q_out.view(-1, qh * d), k_out, key_cache, value_cache
+
+
 def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     """Safety guard: a preallocated cuda-graph buffer must hold the runtime write.
 
