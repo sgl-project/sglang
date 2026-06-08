@@ -23,6 +23,7 @@
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
+//! | `sgl_router_sticky_total` | Counter | `outcome` |
 //!
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
@@ -97,6 +98,31 @@ impl DecodeAffinityOutcome {
     }
 }
 
+/// Sticky-policy selection outcome — see `StickyPolicy::select` for the
+/// four branches.
+#[derive(Debug, Clone, Copy)]
+pub enum StickyOutcome {
+    /// Routing key found and its assigned worker is still healthy.
+    Hit,
+    /// Routing key seen for the first time — a worker was assigned.
+    Assigned,
+    /// Routing key's assigned worker left the healthy set — remapped.
+    Remap,
+    /// Request carried no routing key — delegated to the fallback policy.
+    NoRoutingKey,
+}
+
+impl StickyOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Assigned => "assigned",
+            Self::Remap => "remap",
+            Self::NoRoutingKey => "no_routing_key",
+        }
+    }
+}
+
 /// Stale-request outcome label.
 #[derive(Debug, Clone, Copy)]
 pub enum StaleRequestOutcome {
@@ -136,6 +162,7 @@ pub struct MetricsRegistry {
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -257,6 +284,17 @@ impl MetricsRegistry {
     /// Bump `sgl_router_decode_affinity_total{outcome}`.
     pub fn record_decode_affinity(&self, outcome: DecodeAffinityOutcome) {
         let mut guard = self.decode_affinity_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_sticky_total{outcome}`.
+    pub fn record_sticky(&self, outcome: StickyOutcome) {
+        let mut guard = self.sticky_total.lock();
         let counter = guard
             .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -398,6 +436,25 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // sticky_total
+        out.push_str(
+            "# HELP sgl_router_sticky_total Sticky-session selection outcomes from StickyPolicy.\n",
+        );
+        out.push_str("# TYPE sgl_router_sticky_total counter\n");
+        let guard = self.sticky_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_sticky_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
         out
     }
 }
@@ -433,6 +490,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_active_load gauge"));
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
+        assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
     }
 
     #[test]
@@ -516,6 +574,21 @@ mod tests {
         assert!(out.contains(r#"sgl_router_decode_affinity_total{outcome="fallback_breaker"} 1"#));
         assert!(out
             .contains(r#"sgl_router_decode_affinity_total{outcome="fallback_load_imbalance"} 1"#,));
+    }
+
+    #[test]
+    fn sticky_counter_emits_all_outcomes() {
+        let reg = MetricsRegistry::new();
+        reg.record_sticky(StickyOutcome::Hit);
+        reg.record_sticky(StickyOutcome::Hit);
+        reg.record_sticky(StickyOutcome::Assigned);
+        reg.record_sticky(StickyOutcome::Remap);
+        reg.record_sticky(StickyOutcome::NoRoutingKey);
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_sticky_total{outcome="hit"} 2"#));
+        assert!(out.contains(r#"sgl_router_sticky_total{outcome="assigned"} 1"#));
+        assert!(out.contains(r#"sgl_router_sticky_total{outcome="remap"} 1"#));
+        assert!(out.contains(r#"sgl_router_sticky_total{outcome="no_routing_key"} 1"#));
     }
 
     #[test]
