@@ -288,7 +288,7 @@ def attention_autotune_config(
                 acceleration_cfg.get(
                     "attention_autotune_min_speedup",
                     _get_nested(acceleration_cfg, "attention", "autotune_min_speedup")
-                    or 1.10,
+                    or 1.03,
                 ),
             ),
         )

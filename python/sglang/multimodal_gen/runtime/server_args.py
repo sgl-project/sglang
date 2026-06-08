@@ -1124,7 +1124,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "default cuDNN SDPA auto mode, attention_autotune=false to disable "
                 "default warmup-time dense LocalAttention autotune, "
                 "attention_autotune_live_miss=true to autotune cache misses on "
-                "real requests, attention_autotune_min_speedup=1.10, "
+                "real requests, attention_autotune_min_speedup=1.03, "
                 "torch_compile_policy=auto|force_compile|force_eager|off, "
                 "torch_compile_live_miss=true, and torch_compile_min_speedup=1.05."
             ),

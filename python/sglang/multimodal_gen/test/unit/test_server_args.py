@@ -210,7 +210,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertEqual(warmup, 5)
         self.assertEqual(iters, 20)
-        self.assertEqual(min_speedup, 1.10)
+        self.assertEqual(min_speedup, 1.03)
         self.assertFalse(live_miss)
         compile_config = torch_compile_autotune_config({})
         self.assertEqual(compile_config.policy, "auto")

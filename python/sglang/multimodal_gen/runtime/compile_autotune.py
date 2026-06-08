@@ -33,11 +33,13 @@ class TorchCompileDecision:
 class _TorchCompileAutotuner:
     def __init__(
         self,
+        module: nn.Module,
         eager_forward: Callable[..., Any],
         compile_kwargs: Mapping[str, Any],
         config: TorchCompileAutotuneConfig,
         module_name: str,
     ) -> None:
+        self._module = module
         self._eager_forward = eager_forward
         self._compile_kwargs = dict(compile_kwargs)
         self._config = config
@@ -54,9 +56,12 @@ class _TorchCompileAutotuner:
 
         key = self._cache_key(args, kwargs)
         decision = self._decisions.get(key)
+        is_warmup_forward = self._is_warmup_forward()
         if decision is None:
-            if self._config.live_miss or self._is_warmup_forward():
-                decision = self._select_forward(key, args, kwargs)
+            if self._config.live_miss or is_warmup_forward:
+                decision = self._select_forward(
+                    key, args, kwargs, commit=is_warmup_forward
+                )
             else:
                 return self._eager_forward(*args, **kwargs)
 
@@ -81,7 +86,12 @@ class _TorchCompileAutotuner:
         return bool(getattr(forward_context.forward_batch, "is_warmup", False))
 
     def _select_forward(
-        self, key: tuple, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self,
+        key: tuple,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        commit: bool,
     ) -> TorchCompileDecision:
         eager_ms = self._time_candidate(lambda: self._eager_forward(*args, **kwargs))
         try:
@@ -98,6 +108,7 @@ class _TorchCompileAutotuner:
                 reason=f"compile_failed:{type(e).__name__}",
             )
             self._decisions[key] = decision
+            self._commit_if_ready(decision, commit)
             if not self._compile_failure_logged:
                 logger.warning(
                     "torch.compile autotune failed for %s, falling back to eager: %s",
@@ -133,7 +144,22 @@ class _TorchCompileAutotuner:
             speedup,
             self._config.min_speedup,
         )
+        self._commit_if_ready(decision, commit)
         return decision
+
+    def _commit_if_ready(self, decision: TorchCompileDecision, commit: bool) -> None:
+        if not commit or self._config.live_miss:
+            return
+        if decision.selected == "compiled":
+            self._module.forward = self._get_compiled_forward()
+        else:
+            self._module.forward = self._eager_forward
+            self._compiled_forward = None
+        logger.info(
+            "torch.compile autotune committed %s forward for %s",
+            decision.selected,
+            self._module_name,
+        )
 
     def _time_candidate(self, fn: Callable[[], Any]) -> float:
         result = None
@@ -179,6 +205,7 @@ def install_torch_compile_autotune(
         return False
 
     controller = _TorchCompileAutotuner(
+        module=module,
         eager_forward=forward,
         compile_kwargs=compile_kwargs,
         config=config,

@@ -2,7 +2,9 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
+from collections.abc import Callable
 from contextlib import nullcontext
+from statistics import median
 from typing import Type
 
 import torch
@@ -52,6 +54,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import get_compute_dtype
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
@@ -65,6 +68,7 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 # USPAttention masked branch and fall back to SDPA.
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 _LOCAL_ATTENTION_AUTOTUNE_CACHE: dict[tuple, str] = {}
+logger = init_logger(__name__)
 
 
 def build_varlen_mask_meta(
@@ -406,26 +410,55 @@ class LocalAttention(nn.Module):
             self.causal,
         )
 
-    def _time_attention_candidate(
-        self, fn, *, allow_failure: bool = False
+    def _time_attention_candidate_once(
+        self, fn, iters: int, *, allow_failure: bool = False
     ) -> float | None:
         try:
-            for _ in range(self.attention_autotune_warmup):
-                fn()
-            torch.cuda.synchronize()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            for _ in range(self.attention_autotune_iters):
+            for _ in range(iters):
                 fn()
             end.record()
             torch.cuda.synchronize()
-            return start.elapsed_time(end) / self.attention_autotune_iters
+            return start.elapsed_time(end) / iters
         except RuntimeError:
             if not allow_failure:
                 raise
             torch.cuda.synchronize()
             return None
+
+    def _time_attention_candidates(
+        self, candidates: dict[str, Callable[[], torch.Tensor]]
+    ) -> dict[str, float]:
+        active = []
+        for name, fn in candidates.items():
+            try:
+                for _ in range(self.attention_autotune_warmup):
+                    fn()
+                torch.cuda.synchronize()
+                active.append(name)
+            except RuntimeError:
+                if name == "native":
+                    raise
+                torch.cuda.synchronize()
+
+        rounds = 5
+        iters_per_round = max(1, self.attention_autotune_iters)
+        samples: dict[str, list[float]] = {name: [] for name in active}
+        for round_idx in range(rounds):
+            order = active[round_idx:] + active[:round_idx]
+            for name in order:
+                elapsed = self._time_attention_candidate_once(
+                    candidates[name],
+                    iters_per_round,
+                    allow_failure=name != "native",
+                )
+                if elapsed is not None:
+                    samples[name].append(elapsed)
+        return {
+            name: median(values) for name, values in samples.items() if len(values) > 0
+        }
 
     def _select_attention_backend(
         self,
@@ -446,17 +479,25 @@ class LocalAttention(nn.Module):
             "sdpa_cudnn": lambda: self._sdpa_forward(q, k, v, True),
             "sdpa_no_cudnn": lambda: self._sdpa_forward(q, k, v, False),
         }
-        timings = {}
-        for name, fn in candidates.items():
-            elapsed = self._time_attention_candidate(fn, allow_failure=name != "native")
-            if elapsed is not None:
-                timings[name] = elapsed
+        timings = self._time_attention_candidates(candidates)
 
         selected = min(timings, key=timings.get) if timings else "native"
+        speedup = 1.0
         if selected != "native" and "native" in timings:
             speedup = timings["native"] / timings[selected]
             if speedup < self.attention_autotune_min_speedup:
                 selected = "native"
+        logger.info(
+            "LocalAttention autotune selected %s for q=%s, k=%s, dtype=%s, backend=%s; timings=%s, speedup=%.3fx, threshold=%.3fx",
+            selected,
+            tuple(q.shape),
+            tuple(k.shape),
+            q.dtype,
+            self.backend.name,
+            ", ".join(f"{name}={elapsed:.4f}ms" for name, elapsed in timings.items()),
+            speedup,
+            self.attention_autotune_min_speedup,
+        )
         _LOCAL_ATTENTION_AUTOTUNE_CACHE[key] = selected
         return selected
 
