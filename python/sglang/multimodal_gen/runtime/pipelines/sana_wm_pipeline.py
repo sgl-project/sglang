@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -9,8 +10,18 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
     PipelineComponentLoader,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    _server_args_for_transformer_component,
+)
+from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_transformer_quant_load_spec,
+    resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     VanillaD2HStrategy,
@@ -42,8 +53,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMRefinerDecodingStage,
     _sana_wm_skip_refiner_enabled,
 )
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -53,6 +68,97 @@ logger = init_logger(__name__)
 class _SanaWMRefinerSubmodule:
     component_name: str
     subpath: str
+
+
+class _SanaWMNativeRefinerTransformerLoader(ComponentLoader):
+    """SANA-WM-only loader for the native LTX-2 refiner transformer."""
+
+    component_names: list[str] = []
+    expected_library = "diffusers"
+    cls_name = "SanaWMLTX2VideoRefiner"
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
+    ):
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+
+        config = get_diffusers_component_config(component_path=component_model_path)
+        safetensors_list = resolve_transformer_safetensors_to_load(
+            component_server_args, component_model_path
+        )
+
+        server_args.model_paths[component_name] = component_model_path
+        dit_config = getattr(server_args.pipeline_config, "refiner_dit_config")
+        dit_config.update_model_arch(config)
+        config.pop("_class_name", None)
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(self.cls_name)
+        quant_spec = resolve_transformer_quant_load_spec(
+            hf_config=config,
+            server_args=component_server_args,
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            model_cls=model_cls,
+            cls_name=self.cls_name,
+        )
+
+        logger.info(
+            "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
+            self.cls_name,
+            len(safetensors_list),
+            f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
+            quant_spec.param_dtype,
+        )
+        init_params: dict[str, Any] = {
+            "config": dit_config,
+            "hf_config": config,
+            "quant_config": quant_spec.runtime_quant_config,
+        }
+        if (
+            init_params["quant_config"] is None
+            and component_server_args.transformer_weights_path is not None
+        ):
+            logger.warning(
+                "transformer_weights_path provided for SANA-WM refiner, but "
+                "quantization config was not resolved; loading may fail."
+            )
+        else:
+            logger.debug(
+                "SANA-WM refiner quantization config: %s",
+                init_params["quant_config"],
+            )
+
+        model = maybe_load_fsdp_model(
+            model_cls=model_cls,
+            init_params=init_params,
+            weight_dir_list=safetensors_list,
+            device=get_local_torch_device(),
+            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+            hsdp_shard_dim=server_args.hsdp_shard_dim,
+            cpu_offload=component_server_args.dit_cpu_offload,
+            pin_cpu_memory=component_server_args.pin_cpu_memory,
+            fsdp_inference=component_server_args.use_fsdp_inference,
+            param_dtype=quant_spec.param_dtype,
+            reduce_dtype=torch.float32,
+            output_dtype=None,
+            strict=False,
+        )
+
+        for post_load_hook in quant_spec.post_load_hooks:
+            post_load_hook(model)
+
+        if (
+            next(model.parameters()).dtype != quant_spec.param_dtype
+            and quant_spec.param_dtype
+        ):
+            logger.warning(
+                "SANA-WM refiner dtype does not match expected param dtype, %s vs %s",
+                next(model.parameters()).dtype,
+                quant_spec.param_dtype,
+            )
+        return model
 
 
 def _default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
@@ -259,6 +365,24 @@ class _SanaWMRefinerModuleLoader:
         component_path: str,
         server_args: ServerArgs,
     ) -> tuple[Any, float]:
+        if component_name == "transformer_2":
+            module, memory_usage = _SanaWMNativeRefinerTransformerLoader().load(
+                component_path,
+                server_args,
+                component_name,
+                "diffusers",
+            )
+            if (
+                module.__class__.__name__
+                != _SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS
+            ):
+                raise RuntimeError(
+                    "SANA-WM native refiner backend expected "
+                    f"{_SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS}, "
+                    f"got {module.__class__.__name__}."
+                )
+            return module, memory_usage
+
         module, memory_usage = PipelineComponentLoader.load_component(
             component_name=component_name,
             component_model_path=component_path,
@@ -266,22 +390,7 @@ class _SanaWMRefinerModuleLoader:
                 component_name
             ),
             server_args=server_args,
-            component_architecture=(
-                _SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS
-                if component_name == "transformer_2"
-                else None
-            ),
         )
-        if (
-            component_name == "transformer_2"
-            and module.__class__.__name__
-            != _SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS
-        ):
-            raise RuntimeError(
-                "SANA-WM native refiner backend expected "
-                f"{_SanaWMRefinerModuleLoader.NATIVE_REFINER_CLASS}, "
-                f"got {module.__class__.__name__}."
-            )
         return module, memory_usage
 
 
