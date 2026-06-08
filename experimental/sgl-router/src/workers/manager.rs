@@ -304,6 +304,7 @@ mod tests {
                     cool_down_secs,
                 }),
                 cache_aware: None,
+                sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://test:30000".into()],

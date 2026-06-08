@@ -162,6 +162,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _is_xpu,
     _use_aiter,
+    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -376,7 +377,7 @@ class DeepseekV2MLP(nn.Module):
                     swiglu_limit=self.swiglu_limit,
                     activation="silu",
                     dtype_quant=dtypes.fp8,
-                    transpose_scale=False,
+                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
                 )
                 x = (x_fp8, x_scale)
             else:
