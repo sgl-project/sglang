@@ -1049,10 +1049,15 @@ def _register_configs():
         pipeline_config_cls=Ideogram4PipelineConfig,
         hf_model_paths=[
             "ideogram-ai/ideogram-4-fp8",
+            "ideogram-ai/ideogram-4-nf4",
+            "Comfy-Org/Ideogram-4",
         ],
         model_detectors=[
             lambda hf_id: "ideogram4pipeline" in hf_id.lower(),
             lambda hf_id: "ideogram-4-fp8" in hf_id.lower(),
+            lambda hf_id: "ideogram-4-nf4" in hf_id.lower(),
+            lambda hf_id: "comfy-org/ideogram-4" in hf_id.lower(),
+            lambda hf_id: "comfy-org--ideogram-4" in hf_id.lower(),
         ],
     )
 
