@@ -2365,35 +2365,26 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    if server_args.tokenizer_only:
-        tokenizer_manager, template_manager = init_tokenizer_manager_func(
-            server_args, None
-        )
-        port_args = None
-        scheduler_infos = [{"max_req_input_len": tokenizer_manager.max_req_input_len}]
-        subprocess_watchdog = None
-    else:
-        # Launch subprocesses
-        (
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result,
-            subprocess_watchdog,
-        ) = Engine._launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
-        scheduler_infos = scheduler_init_result.scheduler_infos
+    # Launch subprocesses
+    (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result,
+        subprocess_watchdog,
+    ) = Engine._launch_subprocesses(
+        server_args=server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
+    )
 
     _setup_and_run_http_server(
         server_args,
         tokenizer_manager,
         template_manager,
         port_args,
-        scheduler_infos,
+        scheduler_init_result.scheduler_infos,
         subprocess_watchdog,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
