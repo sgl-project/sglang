@@ -106,6 +106,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "multi-layer EAGLE requires speculative_num_draft_tokens == "
+            "speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
