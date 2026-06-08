@@ -7,7 +7,6 @@ import torch
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -30,7 +29,7 @@ def _jit_compress_norm_rope_module(
         dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
-    if head_dim == 128 and not is_hip_runtime():
+    if head_dim == 128:
         cuda_wrappers.append(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
         )
