@@ -255,7 +255,8 @@ void sgl_per_token_group_quant_8bit_v2(
     double max_8bit,
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m);
+    const std::optional<torch::Tensor>& masked_m,
+    const std::optional<double> swiglu_limit);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
     at::Tensor A,

@@ -107,6 +107,7 @@ def sgl_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
     enable_v2: Optional[bool] = None,
 ) -> None:
     _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
@@ -125,10 +126,12 @@ def sgl_per_token_group_quant_8bit(
             scale_ue8m0,
             fuse_silu_and_mul,
             masked_m,
+            swiglu_limit,
         )
 
     assert not fuse_silu_and_mul, "only v2 support fuse_silu_and_mul"
     assert masked_m is None, "only v2 support masked_m"
+    assert swiglu_limit is None, "only v2 support swiglu_limit"
     torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )

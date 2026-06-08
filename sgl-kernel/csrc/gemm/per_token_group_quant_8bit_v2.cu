@@ -30,13 +30,15 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 }
 
 __device__ __forceinline__ float silu(const float& val) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float half = 0.5f * val;
-  float t = __tanhf(half);
-  return half * (1.0f + t);
-#else
-  return val / (1.0f + __expf(-val));
-#endif
+  // To ensure accuracy, not use fast implementation.
+  // #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  //   float half = 0.5f * val;
+  //   float t = __tanhf(half);
+  //   return half * (1.0f + t);
+  // #else
+  // return val / (1.0f + __expf(-val));
+  // #endif
+  return val / (1.0f + expf(-val));
 }
 
 __device__ float2 fmul2_rn(float2 a, float2 b) {
@@ -266,7 +268,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     // TODO can this be removed?
     const int scale_expert_stride,
     const int scale_hidden_stride,
-    const int num_tokens_per_expert) {
+    const int num_tokens_per_expert,
+    const float swiglu_limit) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
@@ -341,14 +344,28 @@ __global__ void per_token_group_quant_8bit_kernel(
           }
         }
 
+        // Apply swiglu_limit clamp if enabled
+        if constexpr (FUSE_SILU_AND_MUL) {
+          if (swiglu_limit > 0.0f) {
+#pragma unroll
+            for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+              // Clamp gate to (-inf, swiglu_limit]
+              input_primary_vec[j] = __hmin(input_primary_vec[j], static_cast<T>(swiglu_limit));
+              // Clamp up to [-swiglu_limit, swiglu_limit]
+              input_secondary_vec[j] =
+                  __hmax(__hmin(input_secondary_vec[j], static_cast<T>(swiglu_limit)), static_cast<T>(-swiglu_limit));
+            }
+          }
+        }
         float local_absmax = LOCAL_ABSMAX_ABS;
 
 #pragma unroll
         for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
           float val;
           if constexpr (FUSE_SILU_AND_MUL) {
-            // TODO maybe vectorize
-            T val_lowprec = static_cast<T>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
+            // cast fp32 improve accuracy.
+            T val_lowprec = static_cast<T>(
+                silu(static_cast<float>(input_primary_vec[j])) * static_cast<float>(input_secondary_vec[j]));
             val = static_cast<float>(val_lowprec);
             input_primary_vec[j] = val_lowprec;
           } else {
@@ -421,7 +438,8 @@ void sgl_per_token_group_quant_8bit_v2(
     double max_8bit,
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m) {
+    const std::optional<torch::Tensor>& masked_m,
+    const std::optional<double> swiglu_limit) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   TORCH_CHECK(input.numel() > 0);
@@ -445,6 +463,9 @@ void sgl_per_token_group_quant_8bit_v2(
   const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
   const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
+
+  // Convert optional swiglu_limit to float (-1.0f means disabled)
+  const float swiglu_limit_f = swiglu_limit.has_value() ? static_cast<float>(swiglu_limit.value()) : -1.0f;
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)           \
   do {                                                                                                               \
@@ -474,7 +495,8 @@ void sgl_per_token_group_quant_8bit_v2(
         hidden_dim_num_groups,                                                                                       \
         scale_expert_stride,                                                                                         \
         scale_hidden_stride,                                                                                         \
-        num_tokens_per_expert);                                                                                      \
+        num_tokens_per_expert,                                                                                       \
+        swiglu_limit_f);                                                                                             \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \

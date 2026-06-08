@@ -91,7 +91,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def(
       "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
+      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m,"
+      " float? swiglu_limit=None) -> ()");
   m.impl("sgl_per_token_group_quant_8bit_v2", torch::kMUSA, &sgl_per_token_group_quant_8bit_v2);
 
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s) -> ()");
