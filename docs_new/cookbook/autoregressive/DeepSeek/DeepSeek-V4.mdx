@@ -29,7 +29,7 @@ tag: NEW
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">DeepSeek-V4-Flash</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>284B</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving: B200 / GB200 / GB300 / H200 on 4 GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving: B200 / GB200 / GB300 / H200 on 4 GPUs, or H20 (96 GB) on 8 GPUs (SGLang FP8)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
@@ -58,6 +58,7 @@ The Instruct repos ship **FP4 MoE experts + FP8 attention / dense** (one mixed-p
 **Resources:**
 
 - HuggingFace: [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash), [DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
+- SGLang repackaged FP8 version for Hopper: [DeepSeek-V4-Flash-FP8](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8), [DeepSeek-V4-Pro-FP8](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8)
 - ModelScope: [DeepSeek-V4-Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash), [DeepSeek-V4-Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro)
 
 ## 2. SGLang Installation
@@ -174,7 +175,7 @@ sglang serve deepseek-ai/DeepSeek-V4-Flash \
 
 We provide two different options for running DeepSeek-V4 models on Hopper devices (H200)
 - Original FP4 checkpoints: To run original FP4 checkpoints, we provide two different options for w4a16 MoE kernels: Marlin (`--moe-runner-backend marlin`) and Flashinfer (`--moe-runner-backend flashinfer_mxfp4`). For this variant we only support Tensor Parallelism. Complete Pro model can be run on a single H200 node with this option.
-- Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints (`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`), which support more parallelism and features.
+- Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints on HuggingFace ([`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8), [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8)), which support more parallelism and features.
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
@@ -606,7 +607,179 @@ Max ITL (ms):                            1930.74
 ==================================================
 ```
 
-#### 5.2.2 Blackwell
+#### 5.2.2 Hopper H20 (FP8)
+
+The original DeepSeek-V4 checkpoints use FP4 MoE experts, which on Hopper rely on
+the Marlin / Flashinfer `w4a16` paths and only support Tensor Parallelism. For
+production use on H20 we also publish a pre-converted FP8 checkpoint —
+`sgl-project/DeepSeek-V4-Flash-FP8` — which enables a wider set of parallelism
+strategies (DP-attn, DeepEP, MTP) and matches the Blackwell feature surface.
+See the [Hopper note](#hopper-note) above for background.
+
+{/* TODO: H20 has lower HBM bandwidth than H200; the command panel above
+    does not yet emit a dedicated H20 recipe — use the standalone launch
+    command below and tune --mem-fraction-static / --max-running-requests
+    against your real workload. */}
+
+**Test Environment:**
+
+- Hardware: NVIDIA H20 GPU (8x, 96 GB HBM per card)
+- Model: sgl-project/DeepSeek-V4-Flash-FP8
+- Pipeline Parallelism: 8 (single-node, `--tp-size 1 --pp-size 8`)
+- sglang version: 0.5.12
+
+<Note>
+  The numbers above are measured on the **H20 96 GB** SKU. The 141 GB SKU
+  has the same compute but ~47% more HBM per card, so `--mem-fraction-static`
+  and `--max-running-requests` can be raised accordingly; the 96 GB SKU is the
+  tighter memory budget and is therefore used as the reference here.
+</Note>
+
+**Model Deployment Command:**
+
+H20 8-GPU single-node PP=8 with DP-attention enabled. Tested against the FP8
+repackaged checkpoint; `SGLANG_DSV4_FP4_EXPERTS=0` keeps the experts in FP8
+end-to-end on Hopper, and `SGLANG_JIT_DEEPGEMM_PRECOMPILE=1` warms the DeepGEMM
+JIT cache during startup so the first forward pass does not pay compilation cost.
+
+```bash Command
+SGLANG_DSV4_FP4_EXPERTS=0 \
+SGLANG_JIT_DEEPGEMM_PRECOMPILE=1 \
+nohup python -m sglang.launch_server \
+  --trust-remote-code \
+  --model-path sgl-project/DeepSeek-V4-Flash-FP8 \
+  --mem-fraction-static 0.8 \
+  --tp-size 1 \
+  --pp-size 8 \
+  --dp-size 1 \
+  --enable-dp-attention \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --max-running-requests 256 &
+```
+
+##### Latency-Sensitive Benchmark
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model sgl-project/DeepSeek-V4-Flash-FP8 \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  67.82
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4220
+Request throughput (req/s):              0.15
+Input token throughput (tok/s):          89.95
+Output token throughput (tok/s):         62.22
+Peak output token throughput (tok/s):    64.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          152.17
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   6780.04
+Median E2E Latency (ms):                 5406.16
+P90 E2E Latency (ms):                    12312.80
+P99 E2E Latency (ms):                    15172.90
+---------------Time to First Token----------------
+Mean TTFT (ms):                          138.97
+Median TTFT (ms):                        139.84
+P99 TTFT (ms):                           151.77
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          15.80
+Median TPOT (ms):                        15.78
+P99 TPOT (ms):                           15.99
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           15.77
+Median ITL (ms):                         15.66
+P95 ITL (ms):                            16.39
+P99 ITL (ms):                            17.29
+Max ITL (ms):                            22.10
+==================================================
+```
+
+##### Throughput-Sensitive Benchmark
+
+Reuses the same H20 single-node PP=8 launch command shown under
+**Model Deployment Command** above — only the client-side concurrency changes.
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model sgl-project/DeepSeek-V4-Flash-FP8 \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  423.04
+Total input tokens:                      512842
+Total input text tokens:                 512842
+Total generated tokens:                  510855
+Total generated tokens (retokenized):    510770
+Request throughput (req/s):              2.36
+Input token throughput (tok/s):          1212.29
+Output token throughput (tok/s):         1207.59
+Peak output token throughput (tok/s):    1601.00
+Peak concurrent requests:                107
+Total token throughput (tok/s):          2419.88
+Concurrency:                             95.53
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   40411.90
+Median E2E Latency (ms):                 39315.52
+P90 E2E Latency (ms):                    75124.04
+P99 E2E Latency (ms):                    82777.49
+---------------Time to First Token----------------
+Mean TTFT (ms):                          291.50
+Median TTFT (ms):                        149.09
+P99 TTFT (ms):                           1652.15
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          79.24
+Median TPOT (ms):                        79.86
+P99 TPOT (ms):                           88.50
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           78.69
+Median ITL (ms):                         67.75
+P95 ITL (ms):                            133.54
+P99 ITL (ms):                            212.71
+Max ITL (ms):                            671.45
+==================================================
+```
+
+#### 5.2.3 Blackwell
 
 **Test Environment:**
 
