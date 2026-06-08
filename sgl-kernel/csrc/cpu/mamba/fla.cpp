@@ -57,6 +57,7 @@ struct l2norm_kernel<at::BFloat16, D, has_scale> {
 
     float sqsum = _mm512_reduce_add_ps(vsum);
     float rscale = 1.f / std::sqrt(sqsum + eps);
+    vrscale = _mm512_set1_ps(rscale);
 
     // step 2: apply scale to output
     auto map = [&](auto col) {
@@ -74,6 +75,42 @@ struct l2norm_kernel<at::BFloat16, D, has_scale> {
       _mm512_storeu_si512(out + col * 32, (__m512i)(_mm512_cvtne2ps_pbh(va1, va0)));
     };
     Unroll<COLS>{}(map);
+  }
+};
+#endif
+
+template <typename scalar_t, int CHUNK_SIZE, int BLOCK_H>
+struct cumsum_kernel {
+  static inline void
+  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int size, int ld_src, int ld_dst) {
+    TORCH_CHECK(false, "cumsum_kernel: scalar path not implemented!");
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <int CHUNK_SIZE, int BLOCK_H>
+struct cumsum_kernel<float, CHUNK_SIZE, BLOCK_H> {
+  static inline void apply(float* __restrict__ out, const float* __restrict__ input, int size, int ld_src, int ld_dst) {
+    // vector length of fp32 for avx512
+    static_assert(BLOCK_H == 16);
+
+    __m512i va[16];
+    __m512 vsum = _mm512_set1_ps(0.f);
+
+    for (int i = 0; i < CHUNK_SIZE; i += 16) {
+      // load input data
+      Unroll<16>{}([&](auto j) {
+        __m512 v = (i + j < size) ? _mm512_loadu_ps(input + (i + j) * ld_src) : _mm512_setzero_ps();
+        vsum = _mm512_add_ps(vsum, v);
+        va[j] = _mm512_castps_si512(vsum);
+      });
+
+      // transpose
+      transpose_16x16_32bit(va);
+
+      // store output data
+      Unroll<16>{}([&](auto j) { _mm512_storeu_si512(out + j * ld_dst + i, va[j]); });
+    }
   }
 };
 #endif
@@ -118,6 +155,47 @@ void l2norm_fwd_kernel_impl(
 
       // move to the next index
       data_index_step(t, T, h, H);
+    }
+  });
+}
+
+// g  : [B, T, Hv]
+// g_ : [B, Hv, NT, C] -> [B, NT, HB, BLOCK_H, C]
+// cu_seqlens : [num_seqs + 1]
+// chunk_indices : [NT * 2]
+template <typename scalar_t, int CHUNK_SIZE>
+void chunk_local_cumsum_kernel_impl(
+    scalar_t* __restrict__ g_,
+    const scalar_t* __restrict__ g,
+    const int32_t* __restrict__ cu_seqlens,
+    const int32_t* __restrict__ chunk_indices,
+    int64_t T,
+    int64_t Hv,
+    int64_t NT) {
+  constexpr int BLOCK_H = 16;
+  // TODO: now we only support qwen3.5 configs (H/Hv == 16/32)
+  TORCH_CHECK(Hv % BLOCK_H == 0);
+  int64_t HB = Hv / BLOCK_H;
+
+  // parallel on [NT * HB] to increase parallelism
+  at::parallel_for(0, NT * HB, 0, [&](int64_t begin, int64_t end) {
+    int64_t nt{0}, hb{0};
+    data_index_init(begin, nt, NT, hb, HB);
+
+    for (int64_t i = begin; i < end; ++i) {
+      int32_t bs = chunk_indices[nt * 2 + 0];
+      int32_t batch_offset = cu_seqlens[bs];
+      int32_t seqlen = cu_seqlens[bs + 1] - cu_seqlens[bs];
+      int64_t mb_start = chunk_indices[nt * 2 + 1] * CHUNK_SIZE;
+      int64_t mb_size = std::min(seqlen - mb_start, int64_t(CHUNK_SIZE));
+
+      const scalar_t* __restrict__ g_ptr = g + (batch_offset + mb_start) * Hv + hb * BLOCK_H;
+      scalar_t* __restrict__ gsum_ptr = g_ + nt * (Hv * CHUNK_SIZE) + hb * (BLOCK_H * CHUNK_SIZE);
+
+      cumsum_kernel<scalar_t, CHUNK_SIZE, BLOCK_H>::apply(gsum_ptr, g_ptr, mb_size, Hv, CHUNK_SIZE);
+
+      // move to the next index
+      data_index_step(nt, NT, hb, HB);
     }
   });
 }
@@ -1181,6 +1259,32 @@ CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::
   }
 }
 
+template <int CHUNK_SIZE>
+at::Tensor prepare_chunk_indices(const at::Tensor& cu_seqlens) {
+  int64_t num_seqs = cu_seqlens.size(0) - 1;
+  // get number of chunks
+  const int32_t* offsets_data = cu_seqlens.data_ptr<int32_t>();
+  int32_t num_chunks = 0;
+  for (int64_t row = 0; row < num_seqs; ++row) {
+    num_chunks += div_up(offsets_data[row + 1] - offsets_data[row], CHUNK_SIZE);
+  }
+  // get chunk indices
+  at::Tensor chunk_indices = at::empty({num_chunks, 2}, cu_seqlens.options());
+  int32_t* indices_data = chunk_indices.data_ptr<int32_t>();
+
+  int64_t idx = 0;
+  for (int32_t row = 0; row < num_seqs; ++row) {
+    int32_t num_chunks = div_up(offsets_data[row + 1] - offsets_data[row], CHUNK_SIZE);
+
+    for (int32_t col = 0; col < num_chunks; ++col) {
+      indices_data[idx * 2 + 0] = row;
+      indices_data[idx * 2 + 1] = col;
+      idx++;
+    }
+  }
+  return chunk_indices;
+}
+
 #define LAUNCH_L2NORM_KERNEL(HD)        \
   l2norm_fwd_kernel_impl<scalar_t, HD>( \
       query_norm.data_ptr<scalar_t>(),  \
@@ -1220,6 +1324,83 @@ std::tuple<at::Tensor, at::Tensor> l2norm_fwd(const at::Tensor& query, const at:
   return std::make_tuple(query_norm, key_norm);
 }
 
+// TODO: debug code remove me!!!
+at::Tensor l2norm(const at::Tensor& x, double eps, bool has_scale) {
+  auto xf = x.to(at::kFloat);
+  auto inv_norm = at::rsqrt((xf * xf).sum(-1, true) + eps);
+  auto out = xf * inv_norm;
+  if (has_scale) {
+    out.mul_(1.0 / std::sqrt(static_cast<double>(x.size(-1))));
+  }
+  return out.to(x.scalar_type());
+}
+
+template <int CHUNK_SIZE>
+at::Tensor chunk_local_cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens, const at::Tensor& chunk_indices) {
+  int64_t B = g.size(0);
+  int64_t T = g.size(1);
+  int64_t Hv = g.size(2);
+  int64_t NT = chunk_indices.size(0);
+
+  std::cout << "### chunk_local_cumsum" << std::endl;
+  std::cout << "### B: " << B << std::endl;
+  std::cout << "### Hv: " << Hv << std::endl;
+  std::cout << "### NT: " << NT << std::endl;
+  std::cout << "### CHUNK_SIZE: " << CHUNK_SIZE << std::endl;
+
+  at::Tensor g_ = at::empty({B, NT, Hv, CHUNK_SIZE}, g.options());
+  AT_DISPATCH_FLOATING_TYPES(g.scalar_type(), "chunk_local_cumsum", [&] {
+    chunk_local_cumsum_kernel_impl<scalar_t, CHUNK_SIZE>(
+        g_.data_ptr<scalar_t>(),
+        g.data_ptr<scalar_t>(),
+        cu_seqlens.data_ptr<int32_t>(),
+        chunk_indices.data_ptr<int32_t>(),
+        T,
+        Hv,
+        NT);
+  });
+  return g_;
+}
+
+// TODO: debug code remove me!!!
+// Reference for chunk_local_cumsum on a single sequence.
+// Matches test_mamba.py: F.pad(g, (0, pad_size)) + reshape + g.cumsum(dim=-1)
+// on head-first g with shape [B, Hv, T], returning [B, Hv, NT, chunk_size].
+at::Tensor cumsum(const at::Tensor& g, int chunk_size) {
+  TORCH_CHECK(g.dim() == 3, "cumsum: expect g with shape [B, T, Hv]");
+  TORCH_CHECK(chunk_size > 0, "cumsum: chunk_size must be positive");
+
+  auto g_hf = g.transpose(1, 2).contiguous();
+  const int64_t B = g_hf.size(0);
+  const int64_t Hv = g_hf.size(1);
+  const int64_t seq_len = g_hf.size(2);
+  const int64_t pad_size = (chunk_size - seq_len % chunk_size) % chunk_size;
+  if (pad_size > 0) {
+    auto padding = at::zeros({B, Hv, pad_size}, g.options());
+    g_hf = at::cat({g_hf, padding}, 2);
+  }
+  const int64_t NT = g_hf.size(2) / chunk_size;
+  return g_hf.view({B, Hv, NT, chunk_size}).cumsum(-1);
+}
+
+// Varlen packed batch reference: run single-sequence cumsum per cu_seqlens entry
+// and concatenate along the global chunk dimension.
+at::Tensor cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens, int chunk_size) {
+  TORCH_CHECK(g.dim() == 3, "cumsum: expect g with shape [B, T, Hv]");
+  TORCH_CHECK(g.size(0) == 1, "cumsum: varlen expects batch size 1");
+  TORCH_CHECK(cu_seqlens.dim() == 1, "cumsum: expect cu_seqlens to be 1D");
+
+  const int64_t num_seqs = cu_seqlens.size(0) - 1;
+  std::vector<at::Tensor> outputs;
+  outputs.reserve(num_seqs);
+  for (int64_t i = 0; i < num_seqs; ++i) {
+    const int64_t start = cu_seqlens[i].item<int32_t>();
+    const int64_t end = cu_seqlens[i + 1].item<int32_t>();
+    outputs.push_back(cumsum(g.narrow(1, start, end - start), chunk_size));
+  }
+  return at::cat(outputs, 2).transpose_(1, 2);
+}
+
 // [NB]: Support only varlen inputs
 //   B: packed batch dim of q/k/v (== 1)
 //   num_seqs: number of variable-length sequences
@@ -1243,7 +1424,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& cu_seqlens,
     bool head_first,
     bool use_qk_l2norm_in_kernel,
-    double eps = 1e-5) {
+    double eps = 1e-6) {
   TORCH_CHECK(!head_first, "chunk_gated_delta_rule_cpu: does not support head first");
 
   int64_t B = query.size(0);
@@ -1268,7 +1449,34 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 
   std::cout << "### chunk_gated_delta_rule_cpu ..." << std::endl;
 
+  constexpr int CHUNK_SIZE = 64;
+
+  // prepare chunk indices
+  at::Tensor chunk_indices = prepare_chunk_indices<CHUNK_SIZE>(cu_seqlens);
+  std::cout << "### cu_seqlens" << cu_seqlens << std::endl;
+  std::cout << "### chunk_indices" << chunk_indices << std::endl;
+
   auto [query_, key_] = use_qk_l2norm_in_kernel ? l2norm_fwd(query, key, eps) : std::make_tuple(query, key);
+
+  bool debug = true;
+  if (debug && use_qk_l2norm_in_kernel) {
+    auto q_ref = l2norm(query, eps, true);
+    auto k_ref = l2norm(key, eps, false);
+    std::cout << "### check l2norm q max_err: "
+              << (query_.to(at::kFloat) - q_ref.to(at::kFloat)).abs().max().item<float>() << std::endl;
+    std::cout << "### check l2norm k max_err: "
+              << (key_.to(at::kFloat) - k_ref.to(at::kFloat)).abs().max().item<float>() << std::endl;
+  }
+
+  auto g_ = chunk_local_cumsum<CHUNK_SIZE>(g, cu_seqlens, chunk_indices);
+
+  if (debug) {
+    auto g_ref = cumsum(g, cu_seqlens, CHUNK_SIZE);
+    std::cout << "### check cumsum g max_err: " << (g_.to(at::kFloat) - g_ref.to(at::kFloat)).abs().max().item<float>()
+              << std::endl;
+    // std::cout << "### g_ref[0][0]: " << g_ref[0][0].view({-1, CHUNK_SIZE}) << std::endl;
+    // std::cout << "### g_[0][0]: " << g_[0][0].view({-1, CHUNK_SIZE}) << std::endl;
+  }
 
   at::Tensor output = at::empty_like(value, value.options());  // [B, T, Hv, Dv]
   at::Tensor final_state = initial_state.to(at::kFloat);       // [num_seqs, Hv, D, Dv]
