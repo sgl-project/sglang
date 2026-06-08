@@ -363,8 +363,21 @@ def fuse_scale_shift_kernel(
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
         scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
-        # shift is per-token [B, L, C] -> [B*L, C]
-        shift_reshaped = shift.reshape(rows, C).contiguous()
+        if shift.dim() == 4:
+            # shift is per-frame [B, F, 1, C] (e.g. AdaLN output modulation from
+            # causal Wan / LingBot). Broadcast it across each frame's tokens to
+            # per-token [B, L, C] before flattening to [B*L, C], matching the
+            # per-token indexing in _fused_scale_shift_4d_kernel. This mirrors the
+            # CUDA fused path, which accepts [B, F, 1, C] shift and broadcasts it
+            # per-frame.
+            shift_reshaped = (
+                shift.expand(B, num_frames, frame_seqlen, C)
+                .reshape(rows, C)
+                .contiguous()
+            )
+        else:
+            # shift is per-token [B, L, C] -> [B*L, C]
+            shift_reshaped = shift.reshape(rows, C).contiguous()
 
         _fused_scale_shift_4d_kernel[grid](
             output_2d,
