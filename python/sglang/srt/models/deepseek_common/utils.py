@@ -110,6 +110,19 @@ def enable_nextn_moe_bf16_cast_to_fp8(
     )
 
 
+def is_w4afp8_or_w4a16_config(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    return bool(
+        quant_config
+        and (
+            quant_config.get_name() == "w4afp8"
+            or getattr(quant_config, "is_w4afp8_config", lambda: False)()
+            or getattr(quant_config, "is_w4a16_config", lambda: False)()
+        )
+    )
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
