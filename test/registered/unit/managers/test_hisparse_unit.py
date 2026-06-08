@@ -9,6 +9,7 @@ Tests cover:
 
 import os
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import torch
@@ -210,7 +211,8 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
-        req.fill_ids = list(range(fill_len))
+        req.full_untruncated_fill_ids = array("q", range(fill_len))
+        req.fill_len = fill_len
         return kv_loc
 
     # ==================================================================
