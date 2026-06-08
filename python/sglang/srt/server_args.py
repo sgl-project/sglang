@@ -617,6 +617,9 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+    # P-EAGLE DSL: confidence threshold for sync-free early exit
+    # (used when --speculative-algorithm PEAGLE_DSL)
+    peagle_dsl_threshold: float = 2.0
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -5996,6 +5999,14 @@ class ServerArgs:
             default=ServerArgs.speculative_skip_dp_mlp_sync,
             help="Skip the extra MLP sync that the scheduler performs before merging a new batch "
             "when speculative decoding + DP attention are both enabled.",
+        )
+        parser.add_argument(
+            "--peagle-dsl-threshold",
+            type=float,
+            default=ServerArgs.peagle_dsl_threshold,
+            help="P-EAGLE DSL confidence threshold (logit-gap) for sync-free early exit. "
+            "Lower values exit earlier with fewer draft tokens. "
+            "Only used when --speculative-algorithm PEAGLE_DSL.",
         )
 
         # Multi-layer Eagle speculative decoding
