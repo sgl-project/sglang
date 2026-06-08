@@ -89,6 +89,11 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "multi-layer EAGLE requires speculative_num_draft_tokens == "
+            "speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -764,10 +769,12 @@ class MultiLayerEagleWorker(TpModelWorker):
                     self.mtp_model_runner(step).attn_backend.init_forward_metadata(
                         forward_batch
                     )
+                    # Planned pre-pad; do NOT opt into post-pad re-plan — a
+                    # DP-padded re-plan breaks DSA's indexer schedule_meta
+                    # (see #27091). Use the marked pre-pad metadata as-is.
+                    forward_batch.mark_forward_metadata_ready()
                 logits_output = (
-                    self.mtp_model_runner(step)
-                    .forward(forward_batch, skip_attn_backend_init=True)
-                    .logits_output
+                    self.mtp_model_runner(step).forward(forward_batch).logits_output
                 )
 
             maybe_detect_nan(
