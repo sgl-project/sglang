@@ -151,7 +151,9 @@ export const GLM5Deployment = () => {
     const tpValue = hwConfig.tp;
     const memFraction = hwConfig.mem;
 
-    let cmd = 'sglang serve \\\n';
+    let cmd = '';
+    if (hardware === 'b200' && effectiveQuant === 'fp8') cmd += 'SGLANG_ENABLE_JIT_DEEPGEMM=1 ';
+    cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 
