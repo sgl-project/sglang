@@ -9,14 +9,19 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from enum import Enum, auto
 
 import torch
+from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_world_rank,
+    world_group_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -86,6 +91,22 @@ class PipelineStage(StageDedupMixin, ABC):
     def log_debug(self, msg, *args):
         """Logs a debug message with the stage name as a prefix."""
         logger.debug(f"[{self.__class__.__name__}] {msg}", *args)
+
+    def progress_bar(
+        self,
+        iterable: Iterable | None = None,
+        total: int | None = None,
+        *,
+        disable: bool = False,
+        **kwargs,
+    ) -> tqdm:
+        is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+        return tqdm(
+            iterable=iterable,
+            total=total,
+            disable=disable or not is_main_rank,
+            **kwargs,
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
