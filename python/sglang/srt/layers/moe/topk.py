@@ -1125,6 +1125,16 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = -1
 
 
+def _zero_topk_weights_padded_region(
+    topk_weights: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+):
+    if num_token_non_padded is None:
+        return
+    indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
+    topk_weights[indices >= num_token_non_padded, :] = 0.0
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
@@ -1464,7 +1474,7 @@ def _post_process_topk_ids(
     layer_id: int,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
@@ -1474,6 +1484,7 @@ def _post_process_topk_ids(
             layer_id=layer_id,
             topk_indices=topk_ids,
         )
+    recorder_topk_ids = None
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
@@ -1486,10 +1497,23 @@ def _post_process_topk_ids(
                 routed_cols, expert_location_dispatch_info, num_token_non_padded
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+            # ExpertDistributionRecorder tracks EPLB physical routed experts.
+            # DeepEP dispatch later inserts per-rank shared slots into topk_ids,
+            # so keep the routed physical ids separately for statistics.
+            recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
+    elif _is_hip:
+        # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
+        # (negative indices cause illegal memory access). Instead, zero the
+        # routing weights for padded tokens so their MoE output contributes
+        # nothing to the hidden state after the weighted sum.
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+
+    if recorder_topk_ids is None:
+        recorder_topk_ids = topk_ids
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
@@ -1528,7 +1552,13 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    return topk_ids, topk_weights
+    if _is_hip:
+        # Shared-expert append/remap can introduce non-zero weights after the
+        # initial HIP padding mask above. Ensure padded tokens leave this helper
+        # with all expert weights zeroed.
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+
+    return topk_ids, topk_weights, recorder_topk_ids
 
 
 def select_experts(
@@ -1746,7 +1776,7 @@ def select_experts(
         if k > 0:
             topk_weights = torch.full_like(topk_weights, 1.0 / k)
 
-    topk_ids, topk_weights = _post_process_topk_ids(
+    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         topk_config=topk_config,
@@ -1756,7 +1786,9 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(
+        topk_ids=recorder_topk_ids
+    )
 
     # ===== TO BE REFACTORED ====
     if packed_topk is not None:
