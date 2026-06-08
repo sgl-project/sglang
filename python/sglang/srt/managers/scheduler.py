@@ -2435,9 +2435,9 @@ class Scheduler(
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
+            # hybrid-SWA early-return) leaves extend_fill_len == len(prefix_indices),
             # so there is nothing new to cache and stashing would be a no-op.
-            if self.chunked_req.fill_len > len(self.chunked_req.prefix_indices):
+            if self.chunked_req.extend_fill_len > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.

@@ -32,7 +32,7 @@ def _make_req(
     req.dllm_config = None
     req.origin_input_ids = array("q", fill_ids)
     req.output_ids = array("q")
-    req.fill_len = fill_len
+    req.extend_fill_len = fill_len
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
     req.extend_input_len = extend_input_len
