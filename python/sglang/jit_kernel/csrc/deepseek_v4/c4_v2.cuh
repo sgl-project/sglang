@@ -74,33 +74,32 @@ struct C4Trait {
   static_assert(kHeadDim % kTileDim == 0);
 };
 
-template <typename Trait, bool kUsePDL, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat>
+template <typename Trait, bool kUsePDL, typename BufFloat, typename InFloat, typename OutFloat>
 SGL_DEVICE void c4_forward(
     const BufFloat* kv_buf_0,  // overlap [4n - 4, 4n - 1]
     const BufFloat* kv_buf_1,  // normal [4n + 0, 4n + 3]
     const InFloat* kv_src,     // ragged pointer at position = 4n + 3
     OutFloat* kv_out,
-    const ApeFloat* score_bias,
+    const InFloat* score_bias,
     const bool should_overlap,
     const int32_t buffer_len) {
   using namespace device;
 
-  /// NOTE: part 1: load kv + score. buffer/input/ape may each carry their own
-  /// dtype; values are converted to fp32 at load, so no host-side `.to()` is needed.
+  /// NOTE: part 1: load kv + score. kv_score_buffer (fp32, runtime state pool)
+  /// keeps its own BufFloat dtype; input/ape share InFloat (ape is cast to bf16
+  /// at load). Values are converted to fp32 at load.
   using StorageBuf = AlignedVector<BufFloat, kTileElements>;
   using StorageIn = AlignedVector<InFloat, kTileElements>;
-  using StorageApe = AlignedVector<ApeFloat, kTileElements>;
   /// NOTE: load one tile_dim (< head_dim) at at time
   const auto gmem_buf = tile::Memory<StorageBuf>::warp();
   const auto gmem_in = tile::Memory<StorageIn>::warp();
-  const auto gmem_ape = tile::Memory<StorageApe>::warp();
   float kv[8][kTileElements];
   float score[8][kTileElements];
-  StorageApe bias[8];
+  StorageIn bias[8];
 
 #pragma unroll
   for (int32_t i = 0; i < 8; ++i) {
-    bias[i] = gmem_ape.load(score_bias + i * Trait::kHeadDim);
+    bias[i] = gmem_in.load(score_bias + i * Trait::kHeadDim);
   }
 
   if (should_overlap) {
@@ -229,7 +228,7 @@ SGL_DEVICE void c4_write_decode(BufFloat* kv_buf, const InFloat* kv_src) {
   }
 }
 
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
@@ -245,7 +244,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   const auto kv_input = static_cast<const InFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufFloat*>(params.kv_buffer) + split_offset;
-  const auto score_bias = static_cast<const ApeFloat*>(params.score_bias) + split_offset;
+  const auto score_bias = static_cast<const InFloat*>(params.score_bias) + split_offset;
 
   const auto kv_src = kv_input + global_bid * Trait::kElementSize;
   const auto kv_out = kv_output + global_bid * Trait::kHeadDim;
@@ -257,12 +256,12 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   c4_write_decode<Trait, BufFloat, InFloat>(kv_dst, kv_src);
   if (plan.seq_len % 4 == 0) {
     const auto need_overlap = plan.seq_len > 4;
-    c4_forward<Trait, kUsePDL, BufFloat, InFloat, ApeFloat, OutFloat>(
+    c4_forward<Trait, kUsePDL, BufFloat, InFloat, OutFloat>(
         kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, 8);
   }
 }
 
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
@@ -278,7 +277,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto kv_input = static_cast<const InFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufFloat*>(params.kv_buffer) + split_offset;
-  const auto score_bias = static_cast<const ApeFloat*>(params.score_bias) + split_offset;
+  const auto score_bias = static_cast<const InFloat*>(params.score_bias) + split_offset;
   if (plan.is_invalid()) return;
 
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
@@ -288,11 +287,11 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   const bool need_overlap = plan.seq_len > 4;
   PDLWaitPrimary<kUsePDL>();
-  c4_forward<Trait, kUsePDL, BufFloat, InFloat, ApeFloat, OutFloat>(
+  c4_forward<Trait, kUsePDL, BufFloat, InFloat, OutFloat>(
       kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, plan.buffer_len);
 }
 
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
@@ -336,11 +335,11 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   }
 }
 
-template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename ApeFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufFloat, typename InFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress4Kernel {
-  static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufFloat, InFloat, ApeFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel = flash_c4_prefill<kHeadDim, BufFloat, InFloat, ApeFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel = write_c4_prefill<kHeadDim, BufFloat, InFloat, ApeFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufFloat, InFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel = flash_c4_prefill<kHeadDim, BufFloat, InFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_w_kernel = write_c4_prefill<kHeadDim, BufFloat, InFloat, OutFloat, kUsePDL>;
   static constexpr uint32_t kBlockSize = 128;
   static constexpr uint32_t kTileDim = kTileElements * device::kWarpThreads;
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
@@ -372,7 +371,7 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_output);
     TensorMatcher({8, kHeadDim})  // ape
-        .with_dtype<ApeFloat>()
+        .with_dtype<InFloat>()
         .with_device(device_)
         .verify(ape);
 
@@ -419,7 +418,7 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_output);
     TensorMatcher({8, kHeadDim})  // ape
-        .with_dtype<ApeFloat>()
+        .with_dtype<InFloat>()
         .with_device(device_)
         .verify(ape);
     const auto plan_c = compress::verify_plan_c(plan_c_, C, device_);

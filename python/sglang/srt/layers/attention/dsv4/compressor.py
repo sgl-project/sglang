@@ -390,6 +390,15 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
+        # Weight-loading cast: store the constant `ape` and RMSNorm `weight` in
+        # the kernels' compute dtype (bf16) once at load time, so the compress /
+        # fused-norm-rope kernels need no per-tensor ApeFloat/WeightFloat
+        # templating. `kv_score_buffer` stays fp32 (it is a runtime state pool,
+        # not a constant), so the compress kernel keeps its BufFloat template.
+        # The Triton fallback promotes both to fp32 internally, so bf16 is safe.
+        self.ape.data = self.ape.data.to(torch.bfloat16)
+        self.norm.weight.data = self.norm.weight.data.to(torch.bfloat16)
+
     def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
