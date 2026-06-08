@@ -11,7 +11,13 @@ Usage:
 
 import unittest
 
-from sglang.srt.constrained.utils import is_legacy_structural_tag
+import torch
+
+from sglang.srt.constrained.utils import (
+    is_dense_bool_mask_allowed_token,
+    is_legacy_structural_tag,
+    is_packed_bitmask_allowed_token,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(1.0, "base-a-test-cpu")
@@ -69,6 +75,28 @@ class TestIsLegacyStructuralTag(unittest.TestCase):
             "format": {"type": "json_schema"},
         }
         self.assertTrue(is_legacy_structural_tag(obj))
+
+
+class TestVocabMaskAllowedTokenUtils(unittest.TestCase):
+    def test_packed_bitmask_allowed_token(self):
+        vocab_mask = torch.zeros(2, dtype=torch.int32)
+        vocab_mask[0] = 1 << 7
+        vocab_mask[1] = 1 << 2
+
+        self.assertTrue(is_packed_bitmask_allowed_token(vocab_mask, 7, vocab_size=64))
+        self.assertFalse(is_packed_bitmask_allowed_token(vocab_mask, 8, vocab_size=64))
+        self.assertTrue(is_packed_bitmask_allowed_token(vocab_mask, 34, vocab_size=64))
+        self.assertFalse(is_packed_bitmask_allowed_token(vocab_mask, 34, vocab_size=34))
+        self.assertFalse(is_packed_bitmask_allowed_token(vocab_mask, 64, vocab_size=64))
+
+    def test_dense_bool_mask_allowed_token(self):
+        # Dense bool masks use False for allowed tokens and True for masked tokens.
+        vocab_mask = torch.tensor([True, False, True, False], dtype=torch.bool)
+
+        self.assertTrue(is_dense_bool_mask_allowed_token(vocab_mask, 1, vocab_size=4))
+        self.assertFalse(is_dense_bool_mask_allowed_token(vocab_mask, 0, vocab_size=4))
+        self.assertFalse(is_dense_bool_mask_allowed_token(vocab_mask, 4, vocab_size=4))
+        self.assertFalse(is_dense_bool_mask_allowed_token(vocab_mask, 3, vocab_size=3))
 
 
 if __name__ == "__main__":

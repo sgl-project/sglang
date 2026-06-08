@@ -339,14 +339,12 @@ def traverse_tree(
             is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
-            curr_token_id = draft_tokens[curr]
-            if vocab_size and curr_token_id >= vocab_size:
-                is_accepted = False
-            else:
-                # 32 boolean bitmask values are packed into 32-bit integers
-                is_accepted = (
-                    parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
-                ) != 0
+            curr_token_id = int(draft_tokens[curr])
+            is_accepted = grammar.is_vocab_mask_allowed_token(
+                parent_bitmask,
+                curr_token_id,
+                vocab_size=vocab_size,
+            )
 
         if is_accepted:
             if curr != 0:
