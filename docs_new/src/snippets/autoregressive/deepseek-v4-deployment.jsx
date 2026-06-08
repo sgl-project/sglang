@@ -397,6 +397,7 @@ export const DeepSeekV4Deployment = () => {
     "b200|big|balanced",
     "b200|big|max-throughput",
     "b200|big|cp",
+    "b200|big|pd-disagg",
     "h200|small|low-latency",
     "h200|small|balanced",
     "h200|small|max-throughput",
@@ -1048,7 +1049,13 @@ export const DeepSeekV4Deployment = () => {
     const buildRole = (mode, port, distPort) => {
       const roleEnv = [];
       if (hardware === "b200" && mode === "decode") {
-        roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
+        // B200 Pro decode at tp=8 + max-running 128 (see decode block below)
+        // only needs a 512-token dispatch buffer; 1024 wastes GPU memory and
+        // pushed us into CUDA-graph-capture OOM. B200 Flash (small) keeps the
+        // existing 1024 cap since it runs with --max-running-requests 256.
+        roleEnv.push(modelSize === "big"
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
       // GB300 PD needs DeepEP dispatch buffer cap on BOTH prefill + decode;
       // without it, the first forward fails `deep_ep.cpp:1233` assertion
@@ -1118,6 +1125,19 @@ export const DeepSeekV4Deployment = () => {
           flags.push("  --max-running-requests 128");
           flags.push("  --mem-fraction-static 0.9");
           flags.push("  --cuda-graph-max-bs 128");
+        } else if (hardware === "b200" && modelSize === "big") {
+          // B200 Pro PD decode at tp=8 + DP=8 + DeepEP: 180 GB HBM/GPU is the
+          // tightest budget of the verified PD recipes (~30 GB lost to NCCL +
+          // DeepEP + NVSHMEM non-PyTorch buffers, on top of ~134 GB static
+          // pool). CG capture at the default bs=256 OOMs (graph private pool
+          // alone wants ~13 GB at peak). Verified 2026-04-26: max-running 128
+          // + mem-frac 0.78 + cuda-graph disabled is the smallest working
+          // combination. Keeping CG enabled requires a small --cuda-graph-max-bs
+          // (<= 64) AND further mem-frac drop; treat that as a perf-tuning
+          // exercise rather than the default.
+          flags.push("  --max-running-requests 128");
+          flags.push("  --mem-fraction-static 0.78");
+          flags.push("  --disable-cuda-graph");
         } else {
           flags.push("  --max-running-requests 256");
         }
