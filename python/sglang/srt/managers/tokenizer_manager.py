@@ -79,6 +79,10 @@ from sglang.srt.managers.tokenizer_manager_components.lora_controller import (
 from sglang.srt.managers.tokenizer_manager_components.multimodal_processor import (
     MultimodalProcessor,
 )
+from sglang.srt.managers.tokenizer_manager_components.output_processor import (
+    OutputProcessor,
+    OutputProcessorConfig,
+)
 from sglang.srt.managers.tokenizer_manager_components.raw_tokenizer_wrapper import (
     RawTokenizerWrapper,
 )
@@ -206,6 +210,8 @@ class TokenizerManager(TokenizerControlMixin):
         self.init_request_metrics_recorder()
 
         self.init_corpus_controller()
+
+        self.init_output_processor()
 
         self.init_session_controller()
 
@@ -377,6 +383,28 @@ class TokenizerManager(TokenizerControlMixin):
                 max_external_corpus_tokens=self.server_args.speculative_ngram_external_corpus_max_tokens,
             ),
             auto_create_handle_loop=self.auto_create_handle_loop,
+        )
+
+    def init_output_processor(self):
+        self.output_processor = OutputProcessor(
+            rid_to_state=self.rid_to_state,
+            tokenizer=self.tokenizer,
+            request_metrics_recorder=self.request_metrics_recorder,
+            request_log_manager=self.request_log_manager,
+            lora_controller=self.lora_controller,
+            send_to_scheduler=self.send_to_scheduler,
+            get_weight_version=lambda: self.server_args.weight_version,
+            get_served_model_name=lambda: self.served_model_name,
+            config=OutputProcessorConfig(
+                batch_notify_size=self.server_args.batch_notify_size,
+                incremental_streaming_output=self.server_args.incremental_streaming_output,
+                enable_metrics=self.enable_metrics,
+                skip_tokenizer_init=self.server_args.skip_tokenizer_init,
+                speculative_algorithm=self.server_args.speculative_algorithm or "",
+                speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                dp_size=self.server_args.dp_size,
+                enable_lora=self.server_args.enable_lora,
+            ),
         )
 
     def init_session_controller(self):
@@ -1042,14 +1070,17 @@ class TokenizerManager(TokenizerControlMixin):
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
             ):
-                await self._handle_batch_output(recv_obj)
+                await TokenizerManager._handle_batch_output(
+                    self.output_processor, recv_obj
+                )
             else:
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
+    @staticmethod
     async def _handle_batch_output(
-        self,
+        self: "OutputProcessor",
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
@@ -1057,7 +1088,7 @@ class TokenizerManager(TokenizerControlMixin):
         ],
     ):
         pending_notify: dict[str, ReqState] = {}
-        batch_notify_size = self.server_args.batch_notify_size
+        batch_notify_size = self.config.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1074,7 +1105,7 @@ class TokenizerManager(TokenizerControlMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.server_args.weight_version,
+                "weight_version": self.get_weight_version(),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
@@ -1091,7 +1122,7 @@ class TokenizerManager(TokenizerControlMixin):
                 if num_waiting_reqs is not None:
                     meta_info["num_waiting_reqs"] = num_waiting_reqs
 
-            if self.enable_metrics:
+            if self.config.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
@@ -1103,7 +1134,7 @@ class TokenizerManager(TokenizerControlMixin):
                     top_logprobs_num=state.obj.top_logprobs_num,
                     token_ids_logprob=state.obj.token_ids_logprob,
                     return_text_in_logprobs=state.obj.return_text_in_logprobs
-                    and not self.server_args.skip_tokenizer_init,
+                    and not self.config.skip_tokenizer_init,
                     recv_obj=recv_obj,
                     recv_obj_index=i,
                     tokenizer=self.tokenizer,
@@ -1157,9 +1188,7 @@ class TokenizerManager(TokenizerControlMixin):
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
-                incremental = (
-                    self.server_args.incremental_streaming_output and is_stream
-                )
+                incremental = self.config.incremental_streaming_output and is_stream
                 delta_text = recv_obj.output_strs[i]
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
@@ -1207,9 +1236,7 @@ class TokenizerManager(TokenizerControlMixin):
                     out_dict["prompt_token_ids"] = state.prompt_token_ids
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
-                incremental = (
-                    self.server_args.incremental_streaming_output and is_stream
-                )
+                incremental = self.config.incremental_streaming_output and is_stream
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
@@ -1271,20 +1298,20 @@ class TokenizerManager(TokenizerControlMixin):
                             recv_obj=recv_obj,
                             i=i,
                             enable_trace=self.server_args.enable_trace,
-                            served_model_name=self.served_model_name,
+                            served_model_name=self.get_served_model_name(),
                         )
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
-                if self.server_args.speculative_algorithm:
+                if self.config.speculative_algorithm:
                     spec_decoding_meta.fill_spec_decoding_meta(
                         meta_info,
                         recv_obj=recv_obj,
                         i=i,
-                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        speculative_num_draft_tokens=self.config.speculative_num_draft_tokens,
                     )
-                if self.enable_metrics:
+                if self.config.enable_metrics:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]
                         if recv_obj.time_stats is not None
@@ -1304,7 +1331,7 @@ class TokenizerManager(TokenizerControlMixin):
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
+                if self.config.enable_lora and state.obj.lora_path:
                     asyncio.create_task(
                         self.lora_controller.lora_registry.release(state.obj.lora_id)
                     )
@@ -1319,7 +1346,7 @@ class TokenizerManager(TokenizerControlMixin):
                     pending_notify = {}
                     await asyncio.sleep(0)
 
-            if self.enable_metrics and state.obj.log_metrics:
+            if self.config.enable_metrics and state.obj.log_metrics:
                 self.request_metrics_recorder.collect_metrics(state, recv_obj, i)
             if (
                 self.request_log_manager.dump_requests_folder
