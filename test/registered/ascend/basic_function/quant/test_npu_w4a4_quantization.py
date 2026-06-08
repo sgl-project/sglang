@@ -47,6 +47,7 @@ class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
     num_questions = 1319
     gsm8k_num_shots = 5
     output_throughput = 1000  # GSM8K output throughput ≥1000 tokens/s
+    gsm8k_parallel = 64
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
