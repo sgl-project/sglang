@@ -696,7 +696,7 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        self.fill_len: int = 0
+        self.fill_len: Optional[int] = None
 
         self.session = session
         self.input_embeds = input_embeds
@@ -1379,7 +1379,7 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-        self.fill_len = 0
+        self.fill_len = None
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
