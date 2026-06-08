@@ -35,16 +35,11 @@ class LowConfidence(DllmAlgorithm):
         x = torch.argmax(logits, dim=-1)
         probs = torch.nn.functional.softmax(logits, dim=-1)
         confidence = torch.gather(probs, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)
-        confidence = torch.where(
-            block_mask_index,
-            confidence,
-            torch.tensor(-float("inf"), device=confidence.device),
-        )
+        confidence = torch.where(block_mask_index, confidence, -float("inf"))
 
         transfer_index = confidence > self.threshold
         has_transfer = transfer_index.sum(dim=1) > 0
-        _, top1_indices = torch.topk(confidence, k=1, dim=1)
-        top1_indices = top1_indices.squeeze(-1)
+        top1_indices = torch.argmax(confidence, dim=1)
         batch_indices = torch.arange(batch_size, device=top1_indices.device)
         top1_mask = torch.zeros_like(transfer_index, dtype=torch.bool)
         top1_mask[batch_indices, top1_indices] = True
@@ -53,8 +48,9 @@ class LowConfidence(DllmAlgorithm):
         )
 
         x = torch.where(block_mask_index, x, input_ids)
-        input_ids = torch.where(transfer_index, x, input_ids)
-        forward_batch.input_ids = input_ids.view(-1)
+        new_input_ids = torch.where(transfer_index, x, input_ids)
+        # In-place to preserve the input_ids tensor identity (CUDA graph safe).
+        forward_batch.input_ids.copy_(new_input_ids.view(-1))
 
         return done.tolist()
 

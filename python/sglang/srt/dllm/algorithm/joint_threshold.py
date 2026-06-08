@@ -32,13 +32,13 @@ class JointThreshold(DllmAlgorithm):
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        prompt_mask = input_ids != self.mask_id
+        # One host transfer for the whole batch; prompt mask is fixed per block.
+        prompt_mask = (input_ids != self.mask_id).tolist()
         return [
             {
                 "post_edit_steps": 0,
                 "finished": False,
-                # Prompt-carry positions, fixed for the block; CPU list for cheap carry.
-                "prompt_mask": prompt_mask[i].tolist(),
+                "prompt_mask": prompt_mask[i],
             }
             for i in range(batch_size)
         ]
@@ -51,6 +51,10 @@ class JointThreshold(DllmAlgorithm):
     ) -> List[bool]:
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
+        # One host-to-device transfer for the whole batch, not one per request.
+        prompt_masks = torch.tensor(
+            [state["prompt_mask"] for state in states], device=device, dtype=torch.bool
+        )
         done: List[bool] = []
 
         for i in range(batch_size):
@@ -65,9 +69,7 @@ class JointThreshold(DllmAlgorithm):
             block_end = block_start + self.block_size
             curr_input_ids = forward_batch.input_ids[block_start:block_end]
             curr_logits = full_logits[block_start:block_end]
-            curr_prompt_mask = torch.tensor(
-                state["prompt_mask"], device=device, dtype=torch.bool
-            )
+            curr_prompt_mask = prompt_masks[i]
 
             if self.penalty_lambda > 0:
                 prev_ids = curr_input_ids[:-1]
