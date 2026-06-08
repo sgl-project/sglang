@@ -154,8 +154,8 @@ class NVFP4KVQuantizeUtil:
     (global FP32 + block FP8 E4M3).
 
     Quantize formula:  x_fp4 * block_scale * global_scale = x_bf16
-    - Quantize: ``nvfp4_kv_quantize`` (SM100/SM120),
-      fallback ``fp4_quantize`` (SM90)
+    - Quantize: ``nvfp4_kv_quantize`` (SM100),
+      fallback ``fp4_quantize`` (SM90/SM120)
     - Dequantize: ``nvfp4_kv_dequantize`` (SM100+)
     """
 
@@ -165,8 +165,8 @@ class NVFP4KVQuantizeUtil:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize BF16/FP16 tensor to NVFP4 format.
 
-        Requires SM90/SM100/SM120.  Uses ``nvfp4_kv_quantize`` on SM100/SM120,
-        falls back to ``fp4_quantize`` on SM90.
+        Requires SM90/SM100/SM120.  Uses ``nvfp4_kv_quantize`` on SM100,
+        falls back to ``fp4_quantize`` on SM90/SM120.
 
         Args:
             tensor: Input tensor of shape [B, M, N]
@@ -198,7 +198,7 @@ class NVFP4KVQuantizeUtil:
         elif global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
 
-        if is_sm100_supported() or is_sm120_supported():
+        if is_sm100_supported():
             from flashinfer import nvfp4_kv_quantize
 
             # nvfp4_kv_quantize takes global_scale directly (not inverted)
