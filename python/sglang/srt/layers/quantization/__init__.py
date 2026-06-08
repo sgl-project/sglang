@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -90,6 +91,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
+    "quark_mxfp4": QuarkConfig,
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
@@ -149,6 +151,13 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             )
         else:
             return CPU_QUANTIZATION_METHODS[quantization]
+
+    if current_platform.is_out_of_tree():
+        config = current_platform.get_quantization_config(quantization)
+
+        # If the platform has a quantization config, use it else use the default
+        if config is not None:
+            return config
 
     return QUANTIZATION_METHODS[quantization]
 
