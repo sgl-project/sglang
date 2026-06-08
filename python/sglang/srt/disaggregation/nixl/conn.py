@@ -163,6 +163,7 @@ class KVArgsRegisterInfo:
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_homogeneous_mem_kind: Optional[str] = None
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
     staging: Optional["StagingRegisterInfo"] = None
@@ -296,6 +297,11 @@ class NixlKVManager(CommonKVManager):
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
             len(self.kv_args.kv_data_ptrs),
+        )
+        self.src_mem_kind = (
+            _homogeneous_kv_mem_kind(self.kv_args.kv_data_mem_kinds, "source")
+            if disaggregation_mode == DisaggregationMode.PREFILL
+            else None
         )
         try:
             from nixl._api import nixl_agent, nixl_agent_config
@@ -735,12 +741,12 @@ class NixlKVManager(CommonKVManager):
         )
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
-        src_mem_kind = _homogeneous_kv_mem_kind(
-            self.kv_args.kv_data_mem_kinds, "source"
-        )
+        assert self.src_mem_kind is not None
+        src_mem_kind = self.src_mem_kind
         dst_mem_kind = _homogeneous_kv_mem_kind(
             peer_info.dst_kv_mem_kinds, "destination"
         )
+        peer_info.dst_homogeneous_mem_kind = dst_mem_kind
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
             # Safe to use prefill's kv_item_lens for the dst dlist stride:
             # equal_tp guarantees identical heads-per-rank (same item_len);
@@ -886,9 +892,7 @@ class NixlKVManager(CommonKVManager):
                                     chunked_dst_kv_indice,
                                     dst_info.gpu_id,
                                     notif,
-                                    dst_mem_kind=_homogeneous_kv_mem_kind(
-                                        dst_info.dst_kv_mem_kinds, "destination"
-                                    ),
+                                    dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
                                 )
                             else:
                                 kv_xfer_handle = self.send_kvcache_slice(
@@ -1221,6 +1225,7 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         dst_mem_kind: str = "VRAM",
     ):
+        assert self.src_mem_kind is not None
         return self._send_kvcache_generic(
             peer_name=peer_name,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -1230,9 +1235,7 @@ class NixlKVManager(CommonKVManager):
             dst_data_indices=dst_kv_indices,
             dst_gpu_id=dst_gpu_id,
             notif=notif,
-            src_mem_kind=_homogeneous_kv_mem_kind(
-                self.kv_args.kv_data_mem_kinds, "source"
-            ),
+            src_mem_kind=self.src_mem_kind,
             dst_mem_kind=dst_mem_kind,
         )
 
