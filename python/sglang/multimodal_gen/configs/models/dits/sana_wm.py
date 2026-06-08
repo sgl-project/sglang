@@ -8,11 +8,13 @@ from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_transformer_b
 
 @dataclass
 class SanaWMArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks_or_transformer_blocks])
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [is_blocks_or_transformer_blocks]
+    )
 
     # --- Core dims (upstream: depth=20, hidden=2240, heads=20, linear_head_dim=112) ---
     patch_size: int = 1
-    in_channels: int = 128         # LTX-2 VAE latent channels
+    in_channels: int = 128  # LTX-2 VAE latent channels
     out_channels: int = 128
     num_layers: int = 20
 
@@ -27,7 +29,7 @@ class SanaWMArchConfig(DiTArchConfig):
     # In upstream, cross-attn uses num_heads (=20) with head_dim = hidden/num_heads = 112.
     num_cross_attention_heads: int = 20
     cross_attention_head_dim: int = 112
-    cross_attention_dim: int = 2240   # query dim used inside MultiHeadCrossAttention
+    cross_attention_dim: int = 2240  # query dim used inside MultiHeadCrossAttention
     cross_norm: bool = True
 
     # Gemma-2-2b-it hidden size (input to y_embedder.y_proj).
@@ -51,11 +53,11 @@ class SanaWMArchConfig(DiTArchConfig):
     conv_kernel_size: int = 4
     k_conv_only: bool = True
     chunk_gdn_chunk_size: int = 21
-    update_rule: str = "torch_chunk"   # main branch update rule
+    update_rule: str = "torch_chunk"  # main branch update rule
     cam_update_rule: str = "torch_chunk"  # camera branch update rule
 
     # --- Camera conditioning ---
-    cam_attn_compress: int = 1        # cam_dim == in_dim
+    cam_attn_compress: int = 1  # cam_dim == in_dim
     init_cam_from_base: bool = True
     use_chunk_plucker_post_attn: bool = True
     use_chunk_plucker_input: bool = False
@@ -74,6 +76,9 @@ class SanaWMArchConfig(DiTArchConfig):
     # Keep CUDA inference honest by default: if a requested Triton fast path is
     # missing or fails, raise instead of silently running the slow torch scan.
     allow_triton_fallback: bool = False
+    # Request-local caches for static text/camera conditioning inside one denoise.
+    request_runtime_cache: bool = True
+    cross_attn_kv_cache_max_bytes: int = 64 * 1024 * 1024
 
     # --- Temporal FFN (GLUMBConvTemp) ---
     ffn_type: str = "GLUMBConvTemp"
@@ -84,10 +89,10 @@ class SanaWMArchConfig(DiTArchConfig):
     pos_embed_type: str = "wan_rope"
 
     # --- VAE coupling (LTX-2) ---
-    vae_temporal_stride: int = 8       # original-frames per latent frame
-    vae_spatial_stride: int = 32       # pixels per latent token (per spatial axis)
+    vae_temporal_stride: int = 8  # original-frames per latent frame
+    vae_spatial_stride: int = 32  # pixels per latent token (per spatial axis)
 
-    sample_size: int = 32              # legacy, unused
+    sample_size: int = 32  # legacy, unused
     guidance_embeds: bool = False
     class_dropout_prob: float = 0.0
 
@@ -115,6 +120,8 @@ class SanaWMConfig(DiTConfig):
     pad_attention_head_dim_to_flash: bool | None = None
     use_triton_kernels: bool | None = None
     allow_triton_fallback: bool | None = None
+    request_runtime_cache: bool | None = None
+    cross_attn_kv_cache_max_bytes: int | None = None
 
     def apply_user_flags_to_arch_config(self) -> None:
         if self.pad_attention_head_dim_to_flash is not None:
@@ -125,6 +132,12 @@ class SanaWMConfig(DiTConfig):
             self.arch_config.use_triton_kernels = self.use_triton_kernels
         if self.allow_triton_fallback is not None:
             self.arch_config.allow_triton_fallback = self.allow_triton_fallback
+        if self.request_runtime_cache is not None:
+            self.arch_config.request_runtime_cache = self.request_runtime_cache
+        if self.cross_attn_kv_cache_max_bytes is not None:
+            self.arch_config.cross_attn_kv_cache_max_bytes = (
+                self.cross_attn_kv_cache_max_bytes
+            )
 
     def __post_init__(self):
         self.apply_user_flags_to_arch_config()

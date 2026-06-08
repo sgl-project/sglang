@@ -4,29 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Union
-
-import numpy as np
-import torch
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.runtime.utils.sana_wm_camera import (
-    SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
-    SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
-    SANA_WM_DEFAULT_TRANSLATION_SPEED,
-    normalize_sana_wm_condition_inputs,
-)
-
-# Type alias for camera tensor inputs accepted by SANA-WM.
-# Downstream code in the stage coerces any of these to torch.Tensor.
-CameraTensorLike = Union[
-    torch.Tensor,
-    np.ndarray,
-    Sequence[Sequence[Sequence[float]]],
-]
 
 
 @dataclass
@@ -37,8 +20,8 @@ class SanaWMSamplingParams(SamplingParams):
     height: int = 704
     width: int = 1280
 
-    # Frame count: 49 = (49-1)/8 = 6 latent frames → ~3 seconds at 16 fps.
-    # NOTE: NVlabs' official script uses 161–321 frames for production quality.
+    # Frame count: 49 = (49-1)/8 = 6 latent frames, about 3 seconds at 16 fps.
+    # NOTE: NVlabs' official script uses 161-321 frames for production quality.
     # 49 is a CI/speed-friendly default. For best quality use num_frames=161,
     # num_inference_steps=60, guidance_scale=5.0.
     num_frames: int = 49
@@ -55,23 +38,25 @@ class SanaWMSamplingParams(SamplingParams):
     # NVlabs' SANA-WM inference defaults to an empty negative prompt.
     negative_prompt: str = ""
 
-    # --- Camera trajectory (6-DoF) — optional ---
-    camera_to_world: Optional[CameraTensorLike] = None
-    intrinsics: Optional[CameraTensorLike] = None
-    camera_conditions: Optional[CameraTensorLike] = None
-    chunk_plucker: Optional[CameraTensorLike] = None
-    action: Optional[str] = None
-    translation_speed: float = SANA_WM_DEFAULT_TRANSLATION_SPEED
-    rotation_speed_deg: float = SANA_WM_DEFAULT_ROTATION_SPEED_DEG
-    pitch_limit_deg: float = SANA_WM_DEFAULT_PITCH_LIMIT_DEG
+    # --- Camera trajectory (6-DoF) - optional ---
+    camera_to_world: Any | None = None
+    intrinsics: Any | None = None
+    camera_conditions: Any | None = None
+    chunk_plucker: Any | None = None
+    action: str | None = None
+    translation_speed: float = 0.05
+    rotation_speed_deg: float = 1.2
+    pitch_limit_deg: float = 85.0
 
-    # Refiner control — use `skip_refiner` as the canonical field.
-    skip_refiner: Optional[Union[bool, str, int]] = None
-    refiner_prompt: Optional[Union[str, list[str]]] = None
+    # Refiner control; use `skip_refiner` as the canonical field.
+    skip_refiner: bool | str | int | None = None
+    refiner_prompt: str | list[str] | None = None
+    refiner_seed: int | list[int] | None = None
+    sink_size: int | None = None
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
-        for name in ("skip_refiner", "refiner_prompt"):
+        for name in ("skip_refiner", "refiner_prompt", "refiner_seed", "sink_size"):
             value = getattr(self, name)
             if value is not None:
                 extra[name] = value
@@ -79,26 +64,48 @@ class SanaWMSamplingParams(SamplingParams):
 
     def _adjust(self, server_args):
         super()._adjust(server_args)
+        if self.condition_inputs is None:
+            self.condition_inputs = {}
 
-        action_motion_params = (
-            (
-                self.translation_speed,
-                self.rotation_speed_deg,
-                self.pitch_limit_deg,
+        for name in (
+            "camera_conditions",
+            "chunk_plucker",
+            "camera_to_world",
+            "intrinsics",
+            "action",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                self.condition_inputs[name] = value
+
+        if self.action is not None:
+            self.condition_inputs["translation_speed"] = self.translation_speed
+            self.condition_inputs["rotation_speed_deg"] = self.rotation_speed_deg
+            self.condition_inputs["pitch_limit_deg"] = self.pitch_limit_deg
+
+        if isinstance(self.sink_size, bool) or (
+            self.sink_size is not None
+            and (not isinstance(self.sink_size, int) or self.sink_size <= 0)
+        ):
+            raise ValueError(
+                f"sink_size must be a positive int when set, got {self.sink_size!r}"
             )
-            if self.action is not None
-            else None
-        )
-        self.condition_inputs = normalize_sana_wm_condition_inputs(
-            self.condition_inputs,
-            camera_conditions=self.camera_conditions,
-            chunk_plucker=self.chunk_plucker,
-            camera_to_world=self.camera_to_world,
-            intrinsics=self.intrinsics,
-            action=self.action,
-            action_motion_params=action_motion_params,
-        )
-        if self.condition_inputs.get("action") is not None:
-            self.translation_speed = self.condition_inputs["translation_speed"]
-            self.rotation_speed_deg = self.condition_inputs["rotation_speed_deg"]
-            self.pitch_limit_deg = self.condition_inputs["pitch_limit_deg"]
+
+        if isinstance(self.refiner_seed, list):
+            if not self.refiner_seed:
+                raise ValueError("refiner_seed list must not be empty")
+            for seed in self.refiner_seed:
+                if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                    raise ValueError(
+                        "refiner_seed list must contain non-negative ints, "
+                        f"got {self.refiner_seed!r}"
+                    )
+        elif self.refiner_seed is not None and (
+            isinstance(self.refiner_seed, bool)
+            or not isinstance(self.refiner_seed, int)
+            or self.refiner_seed < 0
+        ):
+            raise ValueError(
+                "refiner_seed must be a non-negative int, list of ints, or None, "
+                f"got {self.refiner_seed!r}"
+            )

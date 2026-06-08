@@ -35,30 +35,38 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.sana_wm_runtime_cache import (
-    get_sana_wm_request_cache,
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_SANA_WM_REQUEST_RUNTIME_CACHE_KEY = "_sana_wm_runtime_cache"
 _SANA_WM_FLASH_ATTN_HEAD_SIZES = (32, 64, 96, 128, 160, 192, 224, 256)
 _SANA_WM_DETERMINISTIC = os.getenv(
     "SGLANG_ENABLE_DETERMINISTIC_INFERENCE", ""
 ).lower() in {"1", "true", "yes", "on"}
-_SANA_WM_DISABLE_FUSED_RMSNORM = os.getenv(
-    "SGLANG_SANA_WM_DISABLE_FUSED_RMSNORM", ""
-).lower() in {"1", "true", "yes", "on"} or _SANA_WM_DETERMINISTIC
-_SANA_WM_USE_TRITON_KERNELS = os.getenv(
-    "SGLANG_SANA_WM_USE_TRITON_KERNELS", ""
-).lower() in {"1", "true", "yes", "on"}
+_SANA_WM_DISABLE_FUSED_RMSNORM = _SANA_WM_DETERMINISTIC
 _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
-_SANA_WM_MODULE_CACHE_TOKEN_ATTR = "_sana_wm_inference_cache_token"
 _SANA_WM_TRITON_KERNELS_IMPORT_ERRORS: dict[str, BaseException] = {}
 
 
 class _SanaWMTritonFallbackBlocked(RuntimeError):
     pass
+
+
+def get_sana_wm_request_cache(name: str) -> dict | None:
+    ctx = get_forward_context_or_none()
+    if ctx is None:
+        return None
+
+    extra = getattr(ctx.forward_batch, "extra", None)
+    if extra is None:
+        return None
+
+    runtime_cache = extra.setdefault(_SANA_WM_REQUEST_RUNTIME_CACHE_KEY, {})
+    return runtime_cache.setdefault(name, {})
 
 
 def _record_sana_wm_triton_import_error(name: str, error: BaseException) -> None:
@@ -198,30 +206,6 @@ def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
     )
 
 
-def _module_inference_cache_key(module: nn.Module) -> Tuple[str, str, int]:
-    """Return a cheap module identity token for request-scoped inference caches.
-
-    SANA-WM request caches are enabled only for no-grad inference, where model
-    weights are frozen for the lifetime of a request. The previous key walked
-    every parameter/buffer on each denoising step; this token preserves the
-    relevant module identity without adding per-step Python traversal overhead.
-    """
-
-    token = getattr(module, _SANA_WM_MODULE_CACHE_TOKEN_ATTR, None)
-    if token is None:
-        cls = type(module)
-        token = (cls.__module__, cls.__qualname__, id(module))
-        setattr(module, _SANA_WM_MODULE_CACHE_TOKEN_ATTR, token)
-    return token
-
-
-def _sana_wm_bool_env(key: str, default: bool) -> bool:
-    value = os.getenv(key)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _sana_wm_torch_compile_disable(fn: Callable) -> Callable:
     compiler = getattr(torch, "compiler", None)
     disable = getattr(compiler, "disable", None)
@@ -236,27 +220,10 @@ def _sana_wm_torch_compile_disable(fn: Callable) -> Callable:
     return fn
 
 
-@functools.lru_cache(maxsize=1)
-def _sana_wm_cross_attn_kv_cache_max_bytes() -> int:
-    """Return the cross-attention KV-cache byte budget (resolved once at startup)."""
-    value = os.getenv("SGLANG_SANA_WM_CROSS_ATTN_KV_CACHE_MAX_BYTES")
-    if value is None or value.strip() == "":
-        return _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning_once(
-            "Invalid SGLANG_SANA_WM_CROSS_ATTN_KV_CACHE_MAX_BYTES="
-            f"{value!r}; using default "
-            f"{_SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES}."
-        )
-        return _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES
-
-
-def _sana_wm_request_runtime_cache_enabled() -> bool:
+def _sana_wm_request_runtime_cache_enabled(enabled: bool = True) -> bool:
     if torch.is_grad_enabled():
         return False
-    if not _sana_wm_bool_env("SGLANG_SANA_WM_REQUEST_RUNTIME_CACHE", True):
+    if not enabled:
         return False
 
     compiler = getattr(torch, "compiler", None)
@@ -523,6 +490,7 @@ class _RMSNorm(nn.Module):
         rms = x32.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return (x32 * rms * self.weight.to(dtype=x32.dtype)).type_as(x_in)
 
+
 class _ShortConvolution(nn.Module):
     def __init__(self, hidden_size: int, kernel_size: int) -> None:
         super().__init__()
@@ -698,7 +666,9 @@ def _sana_wm_materialize_repeated_raymats(
     cache: Optional[dict] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     source_tensors = tuple(
-        tensor for tensor in (raymats_flat, raymats_t, raymats_inv) if tensor is not None
+        tensor
+        for tensor in (raymats_flat, raymats_t, raymats_inv)
+        if tensor is not None
     )
     if not source_tensors:
         return raymats_flat, raymats_t, raymats_inv
@@ -986,7 +956,9 @@ def _build_ucpe_apply_fns(
     head_dim: int,
     raymats: torch.Tensor,  # (B, N, 4, 4) -- ray<-world
     rotary_emb: Optional[torch.Tensor],
-) -> Tuple[Callable, Callable, Callable, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+) -> Tuple[
+    Callable, Callable, Callable, torch.Tensor, torch.Tensor, torch.Tensor, dict
+]:
     P = raymats.contiguous()
     P_T = P.transpose(-1, -2).contiguous()
     P_inv = _invert_SE3(P).contiguous()
@@ -1095,9 +1067,7 @@ def process_camera_conditions_ucpe(
     cx_lat = cx / float(patch_size[2])
     cy_lat = cy / float(patch_size[1])
 
-    d_cam = _unproject_grid(
-        x_fov, y_fov, H, W, cx_lat, cy_lat, device, dtype
-    )
+    d_cam = _unproject_grid(x_fov, y_fov, H, W, cx_lat, cy_lat, device, dtype)
 
     R_c2w = C_to_W[..., :3, :3]
     t_c2w = C_to_W[..., :3, 3]
@@ -1357,9 +1327,7 @@ class GLUMBConvTemp(nn.Module):
         self, in_features: int, hidden_features: int, t_kernel_size: int = 3
     ) -> None:
         super().__init__()
-        inverted_conv = nn.Conv2d(
-            in_features, hidden_features * 2, 1, 1, 0, bias=True
-        )
+        inverted_conv = nn.Conv2d(in_features, hidden_features * 2, 1, 1, 0, bias=True)
         depth_conv = nn.Conv2d(
             hidden_features * 2,
             hidden_features * 2,
@@ -1583,9 +1551,7 @@ def _gdn_chunk_scan_forward(
         decay_c = decay_e[:, :, start:end]
 
         k_rot_beta = k_rot_c * beta_c
-        w_kv = decay_c * (
-            eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2))
-        )
+        w_kv = decay_c * (eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2)))
         u_kv = torch.matmul(v_c * beta_c, k_rot_c.transpose(-1, -2))
 
         k_beta = k_c * beta_c
@@ -1594,9 +1560,7 @@ def _gdn_chunk_scan_forward(
 
         state_kv_frames, state_z_frames = [], []
         for offset in range(end - start):
-            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[
-                :, :, offset
-            ]
+            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[:, :, offset]
             state_z = torch.matmul(w_z[:, :, offset], state_z) + u_z[:, :, offset]
             state_kv_frames.append(state_kv)
             state_z_frames.append(state_z)
@@ -1816,16 +1780,12 @@ def _single_path_delta_chunk_scan_forward(
         decay_c = decay_e[:, :, start:end]
 
         k_rot_beta = k_rot_c * beta_c
-        w_kv = decay_c * (
-            eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2))
-        )
+        w_kv = decay_c * (eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2)))
         u_kv = torch.matmul(v_c * beta_c, k_rot_c.transpose(-1, -2))
 
         state_frames = []
         for offset in range(end - start):
-            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[
-                :, :, offset
-            ]
+            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[:, :, offset]
             state_frames.append(state_kv)
 
         state_all = torch.stack(state_frames, dim=2)
@@ -1959,10 +1919,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self._triton_qkv_preprocess_warning_logged = False
         self._triton_cam_preprocess_warning_logged = False
         self._triton_cam_scan_warning_logged = False
-        self._out_proj_cam_local_input_only_cache: Optional[Tuple[int, bool]] = None
-        self._out_proj_cam_zero_output_cache: Optional[
-            Tuple[Tuple[int, Optional[int]], bool]
-        ] = None
         # ``torch_chunk`` is an algebraically equivalent chunked scan, not a
         # reset-at-chunk-boundaries approximation. State is carried across chunks.
         if self.update_rule not in ("torch_chunk", "torch_recurrent"):
@@ -2074,8 +2030,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 head_size=head_dim,
                 pad_head_dim_to_flash=pad_attention_head_dim_to_flash,
             )
-        self._fused_cam_qkv_weight: nn.Parameter | None = None
-        self._fused_cam_qkv_bias: nn.Parameter | None = None
 
     @staticmethod
     def _temporal_short_conv(
@@ -2096,151 +2050,14 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         # back to (B, T*S, C)
         return y.reshape(B, S, T, C).permute(0, 2, 1, 3).reshape(B, N, C)
 
-    def _cam_qkv_layers(self) -> Tuple[nn.Module, nn.Module, nn.Module]:
-        return self.q_proj_cam, self.k_proj_cam, self.v_proj_cam
-
-    def _can_fuse_cam_qkv_projection(self) -> bool:
-        if self.use_tp:
-            return False
-        if self._fused_cam_qkv_weight is not None:
-            return True
-
-        layers = self._cam_qkv_layers()
-        biases = [getattr(layer, "bias", None) for layer in layers]
+    def _cam_qkv(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
-            all(bias is None for bias in biases)
-            or all(bias is not None for bias in biases)
-        ) and all(
-            getattr(layer, "quant_config", None) is None
-            and hasattr(layer, "weight")
-            and layer.weight is not None
-            for layer in layers
+            _sana_wm_linear(self.q_proj_cam, x),
+            _sana_wm_linear(self.k_proj_cam, x),
+            _sana_wm_linear(self.v_proj_cam, x),
         )
-
-    def fuse_cam_qkv_projection(self) -> bool:
-        if not self._can_fuse_cam_qkv_projection():
-            return False
-        if self._fused_cam_qkv_weight is not None:
-            return True
-
-        layers = self._cam_qkv_layers()
-        with torch.no_grad():
-            self._fused_cam_qkv_weight = nn.Parameter(
-                torch.cat([layer.weight.detach() for layer in layers], dim=0)
-                .contiguous()
-                .to(self.q_proj_cam.weight.device),
-                requires_grad=False,
-            )
-            if all(layer.bias is not None for layer in layers):
-                self._fused_cam_qkv_bias = nn.Parameter(
-                    torch.cat([layer.bias.detach() for layer in layers], dim=0)
-                    .contiguous()
-                    .to(self.q_proj_cam.weight.device),
-                    requires_grad=False,
-                )
-        return True
-
-    def _dynamic_cam_qkv_params(self) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        layers = self._cam_qkv_layers()
-        qkv_weight = torch.cat([layer.weight for layer in layers], dim=0)
-        if all(layer.bias is None for layer in layers):
-            qkv_bias = None
-        elif all(layer.bias is not None for layer in layers):
-            qkv_bias = torch.cat([layer.bias for layer in layers], dim=0)
-        else:
-            raise RuntimeError("SANA-WM camera QKV projections use mixed bias state.")
-        return qkv_weight, qkv_bias
-
-    def _cam_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.use_tp:
-            return (
-                _sana_wm_linear(self.q_proj_cam, x),
-                _sana_wm_linear(self.k_proj_cam, x),
-                _sana_wm_linear(self.v_proj_cam, x),
-            )
-        if not torch.is_grad_enabled() and self.fuse_cam_qkv_projection():
-            qkv_weight = self._fused_cam_qkv_weight
-            qkv_bias = self._fused_cam_qkv_bias
-            if qkv_weight is None:
-                raise RuntimeError("SANA-WM fused camera QKV weight is missing.")
-        else:
-            qkv_weight, qkv_bias = self._dynamic_cam_qkv_params()
-        return F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
-
-    def _try_local_out_proj_cam(self, cam_raw: torch.Tensor) -> Optional[torch.Tensor]:
-        """Project TP-sharded camera output without all-gather when weights allow it."""
-        if not self.use_tp or torch.is_grad_enabled():
-            return None
-        weight = getattr(self.out_proj_cam, "weight", None)
-        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
-            return None
-        local_C = cam_raw.shape[-1]
-        if weight.shape != (local_C, self.out_dim):
-            return None
-
-        local_start = self.tp_rank * local_C
-        local_end = local_start + local_C
-        weight_key = weight.data_ptr()
-        cache = self._out_proj_cam_local_input_only_cache
-        if cache is None or cache[0] != weight_key:
-            with torch.no_grad():
-                left = weight[:, :local_start]
-                right = weight[:, local_end:]
-                left_zero = left.numel() == 0 or bool(
-                    torch.count_nonzero(left).item() == 0
-                )
-                right_zero = right.numel() == 0 or bool(
-                    torch.count_nonzero(right).item() == 0
-                )
-                local_only = left_zero and right_zero
-                flag = torch.tensor(
-                    [1.0 if local_only else 0.0],
-                    device=weight.device,
-                    dtype=torch.float32,
-                )
-                flag = tensor_model_parallel_all_reduce(flag)
-                local_only = bool(flag.item() == self.tp_size)
-            self._out_proj_cam_local_input_only_cache = (weight_key, local_only)
-        else:
-            local_only = cache[1]
-
-        if not local_only:
-            return None
-        bias = getattr(self.out_proj_cam, "bias", None)
-        return F.linear(cam_raw, weight[:, local_start:local_end], bias)
-
-    def _can_skip_camera_branch(self) -> bool:
-        """Skip UCPE camera work when its zero output projection makes it a no-op."""
-        if torch.is_grad_enabled():
-            return False
-        weight = getattr(self.out_proj_cam, "weight", None)
-        if not isinstance(weight, torch.Tensor):
-            return False
-        bias = getattr(self.out_proj_cam, "bias", None)
-        if bias is not None and not isinstance(bias, torch.Tensor):
-            return False
-
-        bias_key = None if bias is None else bias.data_ptr()
-        cache_key = (weight.data_ptr(), bias_key)
-        cache = self._out_proj_cam_zero_output_cache
-        if cache is not None and cache[0] == cache_key:
-            return cache[1]
-
-        with torch.no_grad():
-            weight_zero = bool(torch.count_nonzero(weight).item() == 0)
-            bias_zero = bias is None or bool(torch.count_nonzero(bias).item() == 0)
-            local_zero = weight_zero and bias_zero
-            if self.use_tp:
-                flag = torch.tensor(
-                    [1.0 if local_zero else 0.0],
-                    device=weight.device,
-                    dtype=torch.float32,
-                )
-                flag = tensor_model_parallel_all_reduce(flag)
-                local_zero = bool(flag.item() == self.tp_size)
-
-        self._out_proj_cam_zero_output_cache = (cache_key, local_zero)
-        return local_zero
 
     def _handle_triton_fallback(
         self,
@@ -2515,9 +2332,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         try:
             preprocess, can_use, preprocess_rope, can_use_rope = kernels
-            if can_use_rope(
-                qkv, self.q_norm.weight, self.k_norm.weight, rotary_emb
-            ):
+            if can_use_rope(qkv, self.q_norm.weight, self.k_norm.weight, rotary_emb):
                 return preprocess_rope(
                     qkv,
                     self.q_norm.weight,
@@ -3269,9 +3084,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> torch.Tensor:
         B, N, _ = x.shape
         local_C = self.local_out_dim
-        qkv = _sana_wm_linear(self.qkv, x).reshape(
-            B, N, 3, self.local_heads, self.dim
-        )
+        qkv = _sana_wm_linear(self.qkv, x).reshape(B, N, 3, self.local_heads, self.dim)
         q, k, v = qkv.unbind(2)
         if self.conv_k is not None:
             k = self._temporal_short_conv(
@@ -3356,9 +3169,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         )
         if cam_preprocessed is not None:
             q_dn, k_dn, v_dn, inflation_sq = cam_preprocessed
-            frame_inflation_sq = inflation_sq.view(
-                B, self.local_heads, T, S
-            ).mean(dim=-1)
+            frame_inflation_sq = inflation_sq.view(B, self.local_heads, T, S).mean(
+                dim=-1
+            )
             if beta.ndim == 3:
                 beta = beta / frame_inflation_sq.clamp_min(1.0)
             elif beta.ndim == 4:
@@ -3398,11 +3211,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 rotary_emb=rotary_emb,
                 raymats_flat=raymats_flat_triton,
             )
-            out_bhnd = (
-                apply_o(out_bhnd)
-                if triton_out_bhnd is None
-                else triton_out_bhnd
-            )
+            out_bhnd = apply_o(out_bhnd) if triton_out_bhnd is None else triton_out_bhnd
             out = out_bhnd.permute(0, 2, 1, 3).reshape(B, N, local_C)
             return out
 
@@ -3430,11 +3239,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = kv_proj.chunk(2, dim=1)
 
-        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         q_dn = q_proj.permute(0, 1, 3, 2)
         k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
         k_dn = k_proj.permute(0, 1, 3, 2)
-        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
         # Match the official BothTriton camera path: feed raw UCPE-transformed
@@ -3454,9 +3261,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         dtype = q_dn.dtype
         scan_chunk_size = (
-            self.chunk_gdn_chunk_size
-            if self.cam_update_rule == "torch_chunk"
-            else None
+            self.chunk_gdn_chunk_size if self.cam_update_rule == "torch_chunk" else None
         )
         q_scan = q_dn.float()
         k_scan = k_dn.float()
@@ -3559,15 +3364,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
             k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
             v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
-            q_dn = _downscale_to_reference_rms(
-                q_pre_dn, q_proj.permute(0, 1, 3, 2)
-            )
-            k_dn = _downscale_to_reference_rms(
-                k_pre_dn, k_proj.permute(0, 1, 3, 2)
-            )
-            v_dn = _downscale_to_reference_rms(
-                v_pre_dn, v_proj.permute(0, 1, 3, 2)
-            )
+            q_dn = _downscale_to_reference_rms(q_pre_dn, q_proj.permute(0, 1, 3, 2))
+            k_dn = _downscale_to_reference_rms(k_pre_dn, k_proj.permute(0, 1, 3, 2))
+            v_dn = _downscale_to_reference_rms(v_pre_dn, v_proj.permute(0, 1, 3, 2))
         else:
             q_dn, k_dn, v_dn = cam_preprocessed
 
@@ -3613,7 +3412,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         else:
             main_raw, beta, decay = self._main_branch_gdn(x, HW, rotary_emb)
 
-        if prope_fns is not None and not self._can_skip_camera_branch():
+        if prope_fns is not None:
             apply_q, apply_kv, apply_o = prope_fns[:3]
             raymats_flat = prope_fns[3] if len(prope_fns) > 3 else None
             raymats_t = prope_fns[4] if len(prope_fns) > 4 else None
@@ -3621,13 +3420,15 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             raymat_cache = prope_fns[6] if len(prope_fns) > 6 else None
             if not isinstance(raymat_cache, dict):
                 raymat_cache = None
-            raymats_flat, raymats_t, raymats_inv = _sana_wm_materialize_repeated_raymats(
-                raymats_flat,
-                raymats_t,
-                raymats_inv,
-                x.shape[0],
-                name="camera",
-                cache=raymat_cache,
+            raymats_flat, raymats_t, raymats_inv = (
+                _sana_wm_materialize_repeated_raymats(
+                    raymats_flat,
+                    raymats_t,
+                    raymats_inv,
+                    x.shape[0],
+                    name="camera",
+                    cache=raymat_cache,
+                )
             )
             if self.softmax_main:
                 cam_raw = self._cam_branch_softmax(
@@ -3659,11 +3460,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     raymats_t=raymats_t,
                     raymats_inv=raymats_inv,
                 )
-            cam_contrib = self._try_local_out_proj_cam(cam_raw)
-            if cam_contrib is None:
-                if self.use_tp:
-                    cam_raw = _sana_wm_all_gather_hidden(cam_raw, self.tp_size)
-                cam_contrib = _sana_wm_linear(self.out_proj_cam, cam_raw)
+            if self.use_tp:
+                cam_raw = _sana_wm_all_gather_hidden(cam_raw, self.tp_size)
+            cam_contrib = _sana_wm_linear(self.out_proj_cam, cam_raw)
             combined = main_raw + cam_contrib
         else:
             combined = main_raw
@@ -3683,6 +3482,10 @@ class MultiHeadCrossAttention(nn.Module):
         num_heads: int,
         qk_norm: bool = True,
         pad_attention_head_dim_to_flash: bool = False,
+        request_runtime_cache: bool = True,
+        cross_attn_kv_cache_max_bytes: int = (
+            _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES
+        ),
     ) -> None:
         super().__init__()
         assert d_model % num_heads == 0
@@ -3701,6 +3504,8 @@ class MultiHeadCrossAttention(nn.Module):
         self.local_num_heads = num_heads // self.tp_size
         self.local_d_model = self.local_num_heads * self.head_dim
         self.use_tp = self.tp_size > 1
+        self.request_runtime_cache = bool(request_runtime_cache)
+        self.cross_attn_kv_cache_max_bytes = int(cross_attn_kv_cache_max_bytes)
 
         if self.use_tp:
             self.q_linear = ColumnParallelLinear(
@@ -3740,7 +3545,9 @@ class MultiHeadCrossAttention(nn.Module):
         *,
         batch_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cache_enabled = _sana_wm_request_runtime_cache_enabled()
+        cache_enabled = _sana_wm_request_runtime_cache_enabled(
+            self.request_runtime_cache
+        )
         key = None
         request_cache = None
         if cache_enabled:
@@ -3755,8 +3562,8 @@ class MultiHeadCrossAttention(nn.Module):
                     self.head_dim,
                     self.tp_size,
                     _tensor_cache_key(cond),
-                    _module_inference_cache_key(self.kv_linear),
-                    _module_inference_cache_key(self.k_norm),
+                    id(self.kv_linear),
+                    id(self.k_norm),
                 )
                 cached = request_cache.get("entry")
                 if cached is not None and cached[0] == key:
@@ -3776,7 +3583,7 @@ class MultiHeadCrossAttention(nn.Module):
 
         if cache_enabled:
             cache_bytes = k.numel() * k.element_size() + v.numel() * v.element_size()
-            max_bytes = _sana_wm_cross_attn_kv_cache_max_bytes()
+            max_bytes = self.cross_attn_kv_cache_max_bytes
             cache_fits = max_bytes < 0 or cache_bytes <= max_bytes
             if request_cache is not None and cache_fits:
                 k = k.detach()
@@ -3836,6 +3643,10 @@ class SanaWMBlock(nn.Module):
         pad_attention_head_dim_to_flash: bool = False,
         use_triton_kernels: bool = True,
         allow_triton_fallback: bool = False,
+        request_runtime_cache: bool = True,
+        cross_attn_kv_cache_max_bytes: int = (
+            _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES
+        ),
     ) -> None:
         super().__init__()
         self.softmax_main = softmax_main
@@ -3866,6 +3677,8 @@ class SanaWMBlock(nn.Module):
             num_heads=num_heads,
             qk_norm=cross_norm,
             pad_attention_head_dim_to_flash=pad_attention_head_dim_to_flash,
+            request_runtime_cache=request_runtime_cache,
+            cross_attn_kv_cache_max_bytes=cross_attn_kv_cache_max_bytes,
         )
 
         self.mlp = GLUMBConvTemp(
@@ -4107,13 +3920,15 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.pad_attention_head_dim_to_flash = bool(
             getattr(arch, "pad_attention_head_dim_to_flash", False)
         )
-        self.use_triton_kernels = bool(
-            getattr(arch, "use_triton_kernels", True)
-            or _SANA_WM_USE_TRITON_KERNELS
-        )
-        self.allow_triton_fallback = bool(
-            getattr(arch, "allow_triton_fallback", False)
-            or _sana_wm_bool_env("SGLANG_SANA_WM_ALLOW_TRITON_FALLBACK", False)
+        self.use_triton_kernels = bool(getattr(arch, "use_triton_kernels", True))
+        self.allow_triton_fallback = bool(getattr(arch, "allow_triton_fallback", False))
+        self.request_runtime_cache = bool(getattr(arch, "request_runtime_cache", True))
+        self.cross_attn_kv_cache_max_bytes = int(
+            getattr(
+                arch,
+                "cross_attn_kv_cache_max_bytes",
+                _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES,
+            )
         )
         effective_softmax_head_dim = (
             _sana_wm_padded_attention_head_size(arch.linear_head_dim)
@@ -4185,6 +4000,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     pad_attention_head_dim_to_flash=self.pad_attention_head_dim_to_flash,
                     use_triton_kernels=self.use_triton_kernels,
                     allow_triton_fallback=self.allow_triton_fallback,
+                    request_runtime_cache=self.request_runtime_cache,
+                    cross_attn_kv_cache_max_bytes=self.cross_attn_kv_cache_max_bytes,
                 )
                 for i in range(depth)
             ]
@@ -4227,14 +4044,14 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if isinstance(module, WanRotaryPosEmbed):
                 if module._freqs.is_meta:
                     module._init_freqs_buffer()
-            elif isinstance(module, BidirectionalGDNUCPESinglePathLiteLA):
-                module.fuse_cam_qkv_projection()
 
     def _get_freqs(self, T: int, H: int, W: int, device: torch.device) -> torch.Tensor:
         key = (T, H, W, str(device))
         request_cache = (
             get_sana_wm_request_cache("freqs")
-            if _sana_wm_request_runtime_cache_enabled()
+            if _sana_wm_request_runtime_cache_enabled(
+                getattr(self, "request_runtime_cache", True)
+            )
             else None
         )
         if request_cache is None:
@@ -4249,9 +4066,13 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         *,
         HW: Tuple[int, int, int],
         freqs: torch.Tensor,
-    ) -> Tuple[Callable, Callable, Callable, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    ) -> Tuple[
+        Callable, Callable, Callable, torch.Tensor, torch.Tensor, torch.Tensor, dict
+    ]:
         head_dim = self.attention_head_dim
-        cache_enabled = _sana_wm_request_runtime_cache_enabled()
+        cache_enabled = _sana_wm_request_runtime_cache_enabled(
+            getattr(self, "request_runtime_cache", True)
+        )
         request_cache = None
         if not cache_enabled:
             raymats = process_camera_conditions_ucpe(
@@ -4307,7 +4128,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             _tensor_cache_key(weight),
             None if bias is None else _tensor_cache_key(bias),
         )
-        cache_enabled = _sana_wm_request_runtime_cache_enabled()
+        cache_enabled = _sana_wm_request_runtime_cache_enabled(
+            getattr(self, "request_runtime_cache", True)
+        )
         request_cache = None
         if cache_enabled:
             request_cache = get_sana_wm_request_cache("plucker_emb")
@@ -4335,7 +4158,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         *,
         batch_size: int,
     ) -> torch.Tensor:
-        cache_enabled = _sana_wm_request_runtime_cache_enabled()
+        cache_enabled = _sana_wm_request_runtime_cache_enabled(
+            getattr(self, "request_runtime_cache", True)
+        )
         key = None
         request_cache = None
         if cache_enabled:
@@ -4346,12 +4171,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     batch_size,
                     bool(self.y_norm),
                     _tensor_cache_key(encoder_hidden_states),
-                    _module_inference_cache_key(self.y_embedder),
-                    (
-                        _module_inference_cache_key(self.attention_y_norm)
-                        if self.y_norm
-                        else None
-                    ),
+                    id(self.y_embedder),
+                    id(self.attention_y_norm) if self.y_norm else None,
                 )
                 cached = request_cache.get("entry")
                 if cached is not None and cached[0] == key:
@@ -4371,50 +4192,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             y = y.detach()
             request_cache["entry"] = (key, encoder_hidden_states, y)
         return y
-
-    def prepare_sana_wm_static_conditioning(
-        self,
-        *,
-        camera_conditions: Optional[torch.Tensor],
-        chunk_plucker: Optional[torch.Tensor],
-        latent_shape: Tuple[int, int, int, int, int],
-    ) -> dict[str, object]:
-        """Precompute request-static camera and Plucker inputs before denoising."""
-        static_kwargs: dict[str, object] = {}
-        if camera_conditions is None and chunk_plucker is None:
-            return static_kwargs
-
-        p_t, p_h, p_w = self.patch_size
-        T = latent_shape[2] // p_t
-        H = latent_shape[3] // p_h
-        W = latent_shape[4] // p_w
-        latent_token_count = T * H * W
-
-        if camera_conditions is not None:
-            if camera_conditions.shape[1] != T:
-                raise ValueError(
-                    "SANA-WM camera_conditions must be sampled at transformer "
-                    f"frames: got {camera_conditions.shape[1]} frames, "
-                    f"expected T={T}."
-                )
-            freqs = self._get_freqs(T, H, W, camera_conditions.device)
-            static_kwargs["precomputed_prope_fns"] = self._get_ucpe_apply_fns(
-                camera_conditions,
-                HW=(T, H, W),
-                freqs=freqs,
-            )
-
-        needs_plucker_emb = (
-            chunk_plucker is not None
-            and self.plucker_embedder is not None
-            and (self.use_chunk_plucker_post_attn or self.use_chunk_plucker_input)
-        )
-        if needs_plucker_emb:
-            static_kwargs["precomputed_plucker_emb"] = self._get_plucker_emb(
-                chunk_plucker,
-                latent_token_count=latent_token_count,
-            )
-        return static_kwargs
 
     def forward(
         self,
@@ -4442,8 +4219,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "chunk_split_strategy", self.chunk_split_strategy
         )
         chunk_index = kwargs.get("chunk_index", None)
-        precomputed_prope_fns = kwargs.get("precomputed_prope_fns")
-        precomputed_plucker_emb = kwargs.get("precomputed_plucker_emb")
 
         # --- 1. Patch embed: (B, C, T, H, W) -> (B, T*H*W, D) ---
         x = self.x_embedder(hidden_states.to(dtype=self.x_embedder.proj.weight.dtype))
@@ -4481,8 +4256,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         freqs = self._get_freqs(T, H, W, x.device)
 
         # --- 5. Camera conditioning: compute UCPE prope_fns + Plucker ---
-        prope_fns = precomputed_prope_fns
-        if prope_fns is None and camera_conditions is not None:
+        prope_fns = None
+        if camera_conditions is not None:
             if camera_conditions.shape[1] != T:
                 raise ValueError(
                     "SANA-WM camera_conditions must be sampled at latent "
@@ -4496,27 +4271,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         # Plucker post-attn embedding (shared across all blocks)
-        plucker_emb = precomputed_plucker_emb
-        if plucker_emb is not None:
-            plucker_batch_ok = False
-            try:
-                _sana_wm_repeated_batch_factor(
-                    plucker_emb.shape[0],
-                    B,
-                    name="precomputed Plucker embedding",
-                )
-                plucker_batch_ok = True
-            except ValueError:
-                plucker_batch_ok = False
-            if not plucker_batch_ok or plucker_emb.shape[1] != x.shape[1]:
-                raise ValueError(
-                    "SANA-WM precomputed Plucker embedding shape mismatch: "
-                    f"got {tuple(plucker_emb.shape)}, expected token count "
-                    f"{x.shape[1]} and batch repeatable to {B}."
-                )
+        plucker_emb = None
         needs_plucker_emb = (
-            plucker_emb is None
-            and chunk_plucker is not None
+            chunk_plucker is not None
             and self.plucker_embedder is not None
             and (self.use_chunk_plucker_post_attn or self.use_chunk_plucker_input)
         )

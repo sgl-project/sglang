@@ -26,12 +26,35 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-SANA_WM_REFINER_BACKENDS: tuple[str, ...] = ("auto", "official", "native")
-SANA_WM_TWO_STAGE_RESIDENCY_MODES: tuple[str, ...] = (
+_SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG = 70.0
+_SANA_WM_MIN_DEFAULT_FOV_DEG = 25.0
+_SANA_WM_MAX_DEFAULT_FOV_DEG = 120.0
+_SANA_WM_REFINER_BACKENDS: tuple[str, ...] = ("auto", "official", "native")
+_SANA_WM_TWO_STAGE_RESIDENCY_MODES: tuple[str, ...] = (
     "auto",
     "resident",
     "sequential",
 )
+_SANA_WM_TORCH_COMPILE_SCOPES: tuple[str, ...] = ("regional", "full", "off")
+
+
+def _normalize_sana_wm_default_horizontal_fov_deg(value=None) -> float:
+    if value is None:
+        fov_deg = _SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG
+    else:
+        try:
+            fov_deg = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SANA-WM default horizontal FOV must be a number, " f"got {value!r}."
+            ) from exc
+    if not _SANA_WM_MIN_DEFAULT_FOV_DEG < fov_deg < _SANA_WM_MAX_DEFAULT_FOV_DEG:
+        raise ValueError(
+            f"SANA-WM default horizontal FOV must be in "
+            f"({_SANA_WM_MIN_DEFAULT_FOV_DEG}, "
+            f"{_SANA_WM_MAX_DEFAULT_FOV_DEG}) degrees, got {fov_deg}."
+        )
+    return fov_deg
 
 
 def _normalize_sana_wm_choice(
@@ -63,7 +86,7 @@ def _normalize_sana_wm_choice(
     return default
 
 
-def normalize_sana_wm_refiner_backend(
+def _normalize_sana_wm_refiner_backend(
     value,
     *,
     strict: bool = True,
@@ -72,13 +95,13 @@ def normalize_sana_wm_refiner_backend(
     return _normalize_sana_wm_choice(
         value,
         default="auto",
-        valid_values=SANA_WM_REFINER_BACKENDS,
+        valid_values=_SANA_WM_REFINER_BACKENDS,
         name=name,
         strict=strict,
     )
 
 
-def normalize_sana_wm_two_stage_residency(
+def _normalize_sana_wm_two_stage_residency(
     value,
     *,
     strict: bool = True,
@@ -87,18 +110,66 @@ def normalize_sana_wm_two_stage_residency(
     return _normalize_sana_wm_choice(
         value,
         default="auto",
-        valid_values=SANA_WM_TWO_STAGE_RESIDENCY_MODES,
+        valid_values=_SANA_WM_TWO_STAGE_RESIDENCY_MODES,
         name=name,
         strict=strict,
     )
 
 
-def sana_wm_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def _normalize_sana_wm_torch_compile_scope(
+    value,
+    *,
+    strict: bool = True,
+    name: str = "sana_wm_torch_compile_scope",
+) -> str:
+    if value is not None:
+        value = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "0": "off",
+            "false": "off",
+            "no": "off",
+            "none": "off",
+            "block": "regional",
+            "blocks": "regional",
+            "regional_blocks": "regional",
+            "module": "full",
+            "transformer": "full",
+            "full_module": "full",
+        }
+        value = aliases.get(value, value)
+    return _normalize_sana_wm_choice(
+        value,
+        default="regional",
+        valid_values=_SANA_WM_TORCH_COMPILE_SCOPES,
+        name=name,
+        strict=strict,
+    )
+
+
+def _normalize_sana_wm_bool(
+    value,
+    *,
+    name: str,
+) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}.")
+
+
+def _sana_wm_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
     """Extract Gemma-2 last hidden state as text conditioning (same as SANA T2I)."""
     return outputs.last_hidden_state
 
 
-SANA_WM_CHI_PROMPT: tuple[str, ...] = (
+_SANA_WM_CHI_PROMPT: tuple[str, ...] = (
     'Given a user prompt, generate an "Enhanced prompt" that provides detailed '
     "visual descriptions suitable for image generation. Evaluate the level of "
     "detail in the user prompt:",
@@ -141,6 +212,10 @@ class SanaWMPipelineConfig(PipelineConfig):
     sana_wm_refiner_backend: str = "auto"
     sana_wm_two_stage_residency: str = "auto"
     sana_wm_skip_refiner: bool = False
+    sana_wm_diagnostics: bool = False
+    sana_wm_torch_compile_scope: str = "regional"
+    sana_wm_torch_compile_mode: str | None = None
+    sana_wm_torch_compile_cache_size_limit: int = 128
 
     # --- VAE: LTX-2 (128ch, 8× temporal, 32× spatial) ---
     vae_config: VAEConfig = field(default_factory=LTXVideoVAEConfig)
@@ -156,11 +231,39 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # Load both encoder and decoder (need encoder for first-frame conditioning)
     def __post_init__(self):
-        self.sana_wm_refiner_backend = normalize_sana_wm_refiner_backend(
+        self.sana_wm_refiner_backend = _normalize_sana_wm_refiner_backend(
             self.sana_wm_refiner_backend
         )
-        self.sana_wm_two_stage_residency = normalize_sana_wm_two_stage_residency(
+        self.sana_wm_two_stage_residency = _normalize_sana_wm_two_stage_residency(
             self.sana_wm_two_stage_residency
+        )
+        self.sana_wm_skip_refiner = _normalize_sana_wm_bool(
+            self.sana_wm_skip_refiner,
+            name="sana_wm_skip_refiner",
+        )
+        self.sana_wm_diagnostics = _normalize_sana_wm_bool(
+            self.sana_wm_diagnostics,
+            name="sana_wm_diagnostics",
+        )
+        self.sana_wm_torch_compile_scope = _normalize_sana_wm_torch_compile_scope(
+            self.sana_wm_torch_compile_scope
+        )
+        if self.sana_wm_torch_compile_mode is not None:
+            self.sana_wm_torch_compile_mode = (
+                str(self.sana_wm_torch_compile_mode).strip() or None
+            )
+        self.sana_wm_torch_compile_cache_size_limit = int(
+            self.sana_wm_torch_compile_cache_size_limit
+        )
+        if self.sana_wm_torch_compile_cache_size_limit < 1:
+            raise ValueError(
+                "sana_wm_torch_compile_cache_size_limit must be positive, got "
+                f"{self.sana_wm_torch_compile_cache_size_limit}."
+            )
+        self.sana_wm_default_horizontal_fov_deg = (
+            _normalize_sana_wm_default_horizontal_fov_deg(
+                self.sana_wm_default_horizontal_fov_deg
+            )
         )
 
         if hasattr(self.dit_config, "apply_user_flags_to_arch_config"):
@@ -197,12 +300,12 @@ class SanaWMPipelineConfig(PipelineConfig):
             }
         ]
     )
-    chi_prompt: tuple[str, ...] = SANA_WM_CHI_PROMPT
+    chi_prompt: tuple[str, ...] = _SANA_WM_CHI_PROMPT
     preprocess_text_funcs: tuple[Callable | None, ...] = field(
         default_factory=lambda: (None,)
     )
     postprocess_text_funcs: tuple[Callable, ...] = field(
-        default_factory=lambda: (sana_wm_postprocess_text,)
+        default_factory=lambda: (_sana_wm_postprocess_text,)
     )
 
     # --- Scheduler ---
@@ -218,6 +321,7 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # --- Camera conditioning ---
     camera_conditioning: bool = True  # set False to disable camera branch
+    sana_wm_default_horizontal_fov_deg: float = _SANA_WM_DEFAULT_HORIZONTAL_FOV_DEG
 
     # --- Deployment ---
     def get_model_deployment_config(self) -> ModelDeploymentConfig:

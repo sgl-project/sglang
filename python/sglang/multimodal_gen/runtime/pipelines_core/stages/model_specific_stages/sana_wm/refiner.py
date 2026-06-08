@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
-import os
+import math
+from collections.abc import Callable
 from typing import Any
 
 import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+    get_tp_rank,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
     pack_latents,
@@ -29,13 +32,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
-    SanaWMDecodingStage,
-    sana_wm_broadcast_tensor_dict_from_tp_rank0,
-    sana_wm_is_tp_rank0,
-    sana_wm_stage_tp_world_size,
-    log_sana_wm_tensor_stats,
-    sana_wm_diagnostics_enabled,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -43,7 +41,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -52,42 +49,139 @@ STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 
 
 # Default Gemma-3 token budget for the refiner prompt encoder.
 _REFINER_TEXT_MAX_LENGTH = 1024
+_DIAGNOSTIC_MAX_EXACT_ELEMENTS = 4_194_304
+_DIAGNOSTIC_MAX_SAMPLE_ELEMENTS = 65_536
+
+_DEFAULT_VAE_TILE_MIN_FRAMES = 96
+_DEFAULT_VAE_TILE_STRIDE_FRAMES = 64
 
 
-class _OfficialLayerwiseModule(nn.Module, LayerwiseOffloadableModuleMixin):
-    def __init__(self, module: nn.Module) -> None:
-        super().__init__()
-        self.module = module
-        self.layerwise_offload_managers = []
+def _log_tensor_stats(
+    label: str,
+    tensor: torch.Tensor | None,
+    pipeline_config: Any | None,
+) -> None:
+    if not bool(getattr(pipeline_config, "sana_wm_diagnostics", False)):
+        return
+    if tensor is None:
+        logger.info("[SANA-WM diagnostics] %s: None", label)
+        return
+    if not isinstance(tensor, torch.Tensor):
+        logger.info(
+            "[SANA-WM diagnostics] %s: non-tensor type=%s",
+            label,
+            type(tensor).__name__,
+        )
+        return
 
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
+    with torch.no_grad():
+        data = tensor.detach()
+        if data.numel() == 0:
+            logger.info(
+                "[SANA-WM diagnostics] %s: shape=%s dtype=%s device=%s empty",
+                label,
+                tuple(data.shape),
+                data.dtype,
+                data.device,
+            )
+            return
 
-    def __getattr__(self, name: str):
+        numel = data.numel()
+        sampled = numel > _DIAGNOSTIC_MAX_EXACT_ELEMENTS
+        sample_stride = 1
+        if sampled:
+            sample_stride = max(1, math.ceil(numel / _DIAGNOSTIC_MAX_SAMPLE_ELEMENTS))
+            indices = torch.arange(0, numel, sample_stride, device=data.device)
+            stats = torch.take(data, indices).float()
+        else:
+            stats = data.float().reshape(-1)
+
+        finite = torch.isfinite(stats)
+        finite_ratio = float(finite.float().mean().item())
+        finite_stats = stats[finite] if bool(finite.any().item()) else stats
+        flat = finite_stats.reshape(-1)
+        stride = max(1, flat.numel() // 4096)
+        fingerprint = float(flat[::stride].sum().item())
+        std = float(finite_stats.std(unbiased=False).item())
+        logger.info(
+            "[SANA-WM diagnostics] %s: shape=%s dtype=%s device=%s "
+            "finite=%.6f min=%.6g max=%.6g mean=%.6g std=%.6g "
+            "l2=%.6g fingerprint=%.6g sampled=%s sample_stride=%d sample_size=%d",
+            label,
+            tuple(data.shape),
+            data.dtype,
+            data.device,
+            finite_ratio,
+            float(finite_stats.min().item()),
+            float(finite_stats.max().item()),
+            float(finite_stats.mean().item()),
+            std,
+            float(torch.linalg.vector_norm(finite_stats).item()),
+            fingerprint,
+            sampled,
+            sample_stride,
+            stats.numel(),
+        )
+
+
+def _configure_ltx2_vae_for_long_video(
+    vae: Any,
+    pipeline_config: Any,
+    *,
+    log_info: Callable[..., None] | None = None,
+) -> None:
+    vae_config = getattr(pipeline_config, "vae_config", None)
+    min_frames = getattr(
+        pipeline_config,
+        "vae_tile_sample_min_num_frames",
+        _DEFAULT_VAE_TILE_MIN_FRAMES,
+    )
+    if min_frames == _DEFAULT_VAE_TILE_MIN_FRAMES:
+        min_frames = getattr(vae_config, "tile_sample_min_num_frames", None)
+    min_frames = int(min_frames or _DEFAULT_VAE_TILE_MIN_FRAMES)
+
+    stride_frames = getattr(
+        pipeline_config,
+        "vae_tile_sample_stride_num_frames",
+        _DEFAULT_VAE_TILE_STRIDE_FRAMES,
+    )
+    if stride_frames == _DEFAULT_VAE_TILE_STRIDE_FRAMES:
+        stride_frames = getattr(vae_config, "tile_sample_stride_num_frames", None)
+    stride_frames = int(stride_frames or _DEFAULT_VAE_TILE_STRIDE_FRAMES)
+
+    use_tiling = bool(getattr(pipeline_config, "vae_tiling", True))
+    if use_tiling and hasattr(vae, "enable_tiling"):
         try:
-            return super().__getattr__(name)
-        except AttributeError as exc:
-            wrapped = self.__dict__.get("module")
-            if wrapped is not None:
-                return getattr(wrapped, name)
-            modules = self.__dict__.get("_modules", {})
-            wrapped = modules.get("module")
-            if wrapped is not None:
-                return getattr(wrapped, name)
-            raise exc
+            vae.enable_tiling(
+                tile_sample_min_num_frames=min_frames,
+                tile_sample_stride_num_frames=stride_frames,
+            )
+        except TypeError:
+            vae.enable_tiling()
 
+    if hasattr(vae, "use_framewise_encoding"):
+        vae.use_framewise_encoding = bool(
+            getattr(pipeline_config, "vae_framewise_encoding", True)
+        )
+    if hasattr(vae, "use_framewise_decoding"):
+        vae.use_framewise_decoding = bool(
+            getattr(pipeline_config, "vae_framewise_decoding", True)
+        )
+    if hasattr(vae, "tile_sample_min_num_frames"):
+        vae.tile_sample_min_num_frames = min_frames
+    if hasattr(vae, "tile_sample_stride_num_frames"):
+        vae.tile_sample_stride_num_frames = stride_frames
 
-class OfficialDiffusersLTX2RefinerModule(_OfficialLayerwiseModule):
-    """Thin offload wrapper around Diffusers' official LTX-2 refiner module."""
-
-    layer_names = ["module.transformer_blocks"]
-
-
-class OfficialGemma3TextEncoderModule(_OfficialLayerwiseModule):
-    layer_names = [
-        "module.language_model.layers",
-        "module.model.language_model.layers",
-    ]
+    if log_info is not None:
+        log_info(
+            "SANA-WM VAE tiling configured: spatial=%s, framewise_encode=%s, "
+            "framewise_decode=%s, tile_frames_min=%d, tile_frames_stride=%d",
+            getattr(vae, "use_tiling", use_tiling),
+            getattr(vae, "use_framewise_encoding", None),
+            getattr(vae, "use_framewise_decoding", None),
+            getattr(vae, "tile_sample_min_num_frames", min_frames),
+            getattr(vae, "tile_sample_stride_num_frames", stride_frames),
+        )
 
 
 def _truthy_flag(value: Any) -> bool:
@@ -100,13 +194,11 @@ def _truthy_flag(value: Any) -> bool:
     return False
 
 
-def sana_wm_skip_refiner_enabled(
+def _sana_wm_skip_refiner_enabled(
     batch: Req | None = None,
     pipeline_config: Any | None = None,
 ) -> bool:
     if _truthy_flag(getattr(pipeline_config, "sana_wm_skip_refiner", False)):
-        return True
-    if _truthy_flag(os.getenv("SGLANG_SANA_WM_SKIP_REFINER", "")):
         return True
     if batch is None:
         return False
@@ -120,15 +212,18 @@ def sana_wm_skip_refiner_enabled(
     )
 
 
-def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
-    precision = getattr(server_args.pipeline_config, "dit_precision", "bf16")
-    return PRECISION_TO_TYPE.get(precision, torch.bfloat16)
-
-
 def _refiner_prompt_value(batch: Req) -> Any:
     extra = getattr(batch, "extra", None) or {}
     prompt = extra.get("refiner_prompt")
     return getattr(batch, "prompt", None) if prompt is None else prompt
+
+
+def _refiner_seed_value(batch: Req) -> Any:
+    return (getattr(batch, "extra", None) or {}).get("refiner_seed")
+
+
+def _refiner_sink_size_value(batch: Req) -> Any:
+    return (getattr(batch, "extra", None) or {}).get("sink_size", 1)
 
 
 def _refiner_prompt_matches_batch(batch_size: int | None):
@@ -150,17 +245,54 @@ def _refiner_seeds_match_batch(batch_size: int | None):
             return True
         if batch_size is None:
             return False
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value >= 0
         if not isinstance(value, (list, tuple)):
             return False
-        if not all(isinstance(item, int) for item in value):
+        if not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in value
+        ):
+            return False
+        if any(item < 0 for item in value):
             return False
         return len(value) in (1, batch_size)
 
     return validator
 
 
-def _refiner_fps_valid(value: Any) -> bool:
-    return value is None or (isinstance(value, (int, float)) and value > 0)
+def _refiner_sink_size_is_valid(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _refiner_seeds_for_batch(batch: Req, batch_size: int) -> list[int]:
+    seed = _refiner_seed_value(batch)
+    if seed is None:
+        seed = 42
+    if isinstance(seed, int) and not isinstance(seed, bool):
+        if seed < 0:
+            raise ValueError(f"SANA-WM refiner_seed must be non-negative, got {seed}.")
+        return [int(seed)] * batch_size
+    if isinstance(seed, (list, tuple)):
+        if not seed:
+            raise ValueError("SANA-WM refiner_seed list must not be empty.")
+        if not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in seed
+        ):
+            raise ValueError(
+                "SANA-WM refiner_seed list must contain non-negative integers."
+            )
+        if any(item < 0 for item in seed):
+            raise ValueError(
+                "SANA-WM refiner_seed list must contain non-negative integers."
+            )
+        if len(seed) == 1:
+            return [int(seed[0])] * batch_size
+        if len(seed) == batch_size:
+            return [int(item) for item in seed]
+    raise ValueError(
+        "SANA-WM refiner_seed must be an int, one-element list, or one seed "
+        f"per batch item; got {seed!r} for batch size {batch_size}."
+    )
 
 
 def _is_current_cfg_main_rank() -> bool:
@@ -177,6 +309,37 @@ def _configured_tp_size(server_args: Any) -> int:
         return max(int(getattr(server_args, "tp_size", 1) or 1), 1)
     except (TypeError, ValueError):
         return 1
+
+
+def _runtime_tp_world_size() -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 1
+    try:
+        return get_tp_world_size()
+    except AssertionError:
+        return 1
+
+
+def _runtime_tp_rank() -> int:
+    if _runtime_tp_world_size() <= 1:
+        return 0
+    try:
+        return get_tp_rank()
+    except AssertionError:
+        return 0
+
+
+def _broadcast_tensor_dict_from_tp_rank0(
+    tensor_dict: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if _runtime_tp_world_size() <= 1:
+        if tensor_dict is None:
+            raise RuntimeError("SANA-WM TP broadcast payload is missing on rank 0.")
+        return tensor_dict
+    broadcasted = get_tp_group().broadcast_tensor_dict(tensor_dict, src=0)
+    if broadcasted is None:
+        raise RuntimeError("SANA-WM TP broadcast returned no payload.")
+    return broadcasted
 
 
 def _is_current_world_main_rank() -> bool:
@@ -243,8 +406,12 @@ def _refiner_config_value(transformer: nn.Module, name: str) -> Any:
 
 
 def _unwrap_diffusers_ltx2_refiner(transformer: nn.Module) -> nn.Module:
-    if isinstance(transformer, OfficialDiffusersLTX2RefinerModule):
-        return transformer.module
+    wrapped = getattr(transformer, "module", None)
+    if (
+        wrapped is not None
+        and wrapped.__class__.__name__ == "LTX2VideoTransformer3DModel"
+    ):
+        return wrapped
     return transformer
 
 
@@ -266,9 +433,10 @@ def _uses_tp_parallel_refiner(transformer: nn.Module, server_args: Any) -> bool:
 
 
 def _uses_native_refiner_tp_group(transformer: nn.Module, server_args: Any) -> bool:
-    return _uses_native_sana_wm_refiner(transformer) and _configured_tp_size(
-        server_args
-    ) > 1
+    return (
+        _uses_native_sana_wm_refiner(transformer)
+        and _configured_tp_size(server_args) > 1
+    )
 
 
 def _as_additive_attention_mask(
@@ -487,6 +655,19 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         self.tokenizer = tokenizer
         self.dtype = dtype
         self.text_max_sequence_length = int(text_max_sequence_length)
+        self._active_pipeline_config = None
+
+    def _pipeline_config(self) -> Any | None:
+        config = getattr(self, "_active_pipeline_config", None)
+        if config is not None:
+            return config
+        return getattr(getattr(self, "server_args", None), "pipeline_config", None)
+
+    def _diagnostics_enabled(self) -> bool:
+        return bool(getattr(self._pipeline_config(), "sana_wm_diagnostics", False))
+
+    def _log_tensor_stats(self, label: str, tensor: torch.Tensor | None) -> None:
+        _log_tensor_stats(label, tensor, self._pipeline_config())
 
     @property
     def role_affinity(self) -> RoleType:
@@ -505,20 +686,19 @@ class SanaWMLTX2RefinerStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        if sana_wm_skip_refiner_enabled(
+        if _sana_wm_skip_refiner_enabled(
             pipeline_config=getattr(server_args, "pipeline_config", None)
         ):
             return []
-        if (
-            not _uses_tp_parallel_refiner(self.transformer, server_args)
-            and not _is_current_refiner_execution_rank(server_args)
-        ):
+        if not _uses_tp_parallel_refiner(
+            self.transformer, server_args
+        ) and not _is_current_refiner_execution_rank(server_args):
             return []
 
         stage_name = self._component_stage_name(stage_name)
         if (
             _uses_native_refiner_tp_group(self.transformer, server_args)
-            and not sana_wm_is_tp_rank0()
+            and _runtime_tp_rank() != 0
         ):
             return [
                 ComponentUse(
@@ -566,7 +746,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             if latents is not None and latents.dim() == 5
             else None
         )
-        if not sana_wm_skip_refiner_enabled(
+        if not _sana_wm_skip_refiner_enabled(
             batch,
             pipeline_config=getattr(server_args, "pipeline_config", None),
         ):
@@ -578,12 +758,18 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             result.add_check(
                 "fps",
                 getattr(batch, "fps", 16),
-                _refiner_fps_valid,
+                lambda value: value is None
+                or (isinstance(value, (int, float)) and value > 0),
             )
             result.add_check(
-                "seeds",
-                getattr(batch, "seeds", None),
+                "refiner_seed",
+                _refiner_seed_value(batch),
                 _refiner_seeds_match_batch(batch_size),
+            )
+            result.add_check(
+                "sink_size",
+                _refiner_sink_size_value(batch),
+                _refiner_sink_size_is_valid,
             )
         return result
 
@@ -611,7 +797,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._should_broadcast_prompt_encoding_over_tp():
             payload = None
-            if sana_wm_is_tp_rank0():
+            if _runtime_tp_rank() == 0:
                 prompt_embeds, attention_mask = self._encode_prompts_local(
                     prompts, device
                 )
@@ -619,7 +805,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                     "prompt_embeds": prompt_embeds,
                     "attention_mask": attention_mask,
                 }
-            payload = sana_wm_broadcast_tensor_dict_from_tp_rank0(payload)
+            payload = _broadcast_tensor_dict_from_tp_rank0(payload)
             outputs = (
                 payload["prompt_embeds"].to(device=device, dtype=self.dtype),
                 payload["attention_mask"].to(device=device),
@@ -632,7 +818,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         server_args = getattr(self, "server_args", None)
         return (
             _uses_native_refiner_tp_group(self.transformer, server_args)
-            and sana_wm_stage_tp_world_size() > 1
+            and _runtime_tp_world_size() > 1
         )
 
     @torch.inference_mode()
@@ -677,13 +863,13 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             )
         stacked = torch.stack(per_layer_hidden, dim=-1)  # (B, L, D, n_layers)
         seq_lengths = attention_mask.sum(dim=-1)
-        log_sana_wm_tensor_stats("refiner.text_hidden_states_stacked", stacked)
+        self._log_tensor_stats("refiner.text_hidden_states_stacked", stacked)
         prompt_embeds = _pack_text_embeds(
             stacked,
             seq_lengths,
             padding_side=tokenizer.padding_side,
         ).to(dtype=self.dtype)
-        log_sana_wm_tensor_stats("refiner.prompt_embeds_packed", prompt_embeds)
+        self._log_tensor_stats("refiner.prompt_embeds_packed", prompt_embeds)
 
         with self.use_declared_component(
             component_name="connectors", module=self.connectors
@@ -691,8 +877,8 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             video_text_embedding, _, video_attention_mask = self.connectors(
                 prompt_embeds, attention_mask
             )
-        log_sana_wm_tensor_stats("refiner.video_text_embedding", video_text_embedding)
-        log_sana_wm_tensor_stats("refiner.video_attention_mask", video_attention_mask)
+        self._log_tensor_stats("refiner.video_text_embedding", video_text_embedding)
+        self._log_tensor_stats("refiner.video_attention_mask", video_attention_mask)
         return (
             video_text_embedding.to(device=device, dtype=self.dtype),
             video_attention_mask.to(device=device),
@@ -811,9 +997,9 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             seeds,
             sink_size,
             STAGE_2_DISTILLED_SIGMA_VALUES,
-            "on" if sana_wm_diagnostics_enabled() else "off",
+            "on" if self._diagnostics_enabled() else "off",
         )
-        log_sana_wm_tensor_stats("refiner.input_latent", z)
+        self._log_tensor_stats("refiner.input_latent", z)
 
         prompt_embeds, prompt_attention_mask = self._encode_prompts(prompts, device)
 
@@ -823,8 +1009,8 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         start_sigma = float(sigmas[0])
         sink = z[:, :, :sink_size].contiguous()
         current = z[:, :, sink_size:].contiguous()
-        log_sana_wm_tensor_stats("refiner.sink_latent", sink)
-        log_sana_wm_tensor_stats("refiner.current_latent_clean", current)
+        self._log_tensor_stats("refiner.sink_latent", sink)
+        self._log_tensor_stats("refiner.current_latent_clean", current)
         eps = torch.cat(
             [
                 torch.randn(
@@ -838,7 +1024,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             dim=0,
         )
         noisy = (1.0 - start_sigma) * current + start_sigma * eps
-        log_sana_wm_tensor_stats("refiner.current_latent_noisy_initial", noisy)
+        self._log_tensor_stats("refiner.current_latent_noisy_initial", noisy)
 
         patch_size = int(_refiner_config_value(self.transformer, "patch_size"))
         patch_size_t = int(_refiner_config_value(self.transformer, "patch_size_t"))
@@ -871,7 +1057,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 patch_size=patch_size,
                 patch_size_t=patch_size_t,
             )
-            if sana_wm_diagnostics_enabled():
+            if self._diagnostics_enabled():
                 velocity_5d = unpack_latents(
                     velocity_tokens,
                     num_frames=noisy.shape[2],
@@ -880,14 +1066,17 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                     patch_size=patch_size,
                     patch_size_t=patch_size_t,
                 )
-                log_sana_wm_tensor_stats(
+                self._log_tensor_stats(
                     f"refiner.step_{step_idx}.velocity_current",
                     velocity_5d.to(self.dtype),
                 )
-                log_sana_wm_tensor_stats(f"refiner.step_{step_idx}.current_latent", noisy)
+                self._log_tensor_stats(
+                    f"refiner.step_{step_idx}.current_latent",
+                    noisy,
+                )
 
         refined = torch.cat([sink, noisy], dim=2)
-        log_sana_wm_tensor_stats("refiner.output_latent", refined)
+        self._log_tensor_stats("refiner.output_latent", refined)
         return refined
 
     @torch.inference_mode()
@@ -910,6 +1099,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
 
     @torch.inference_mode()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        self._active_pipeline_config = getattr(server_args, "pipeline_config", None)
         if batch.latents is None:
             raise ValueError("SANA-WM refiner requires batch.latents from stage 1.")
         if batch.latents.ndim != 5:
@@ -918,35 +1108,35 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 f"got {tuple(batch.latents.shape)}."
             )
 
-        if sana_wm_skip_refiner_enabled(
+        if _sana_wm_skip_refiner_enabled(
             batch,
             pipeline_config=getattr(server_args, "pipeline_config", None),
         ):
             if batch.extra is None:
                 batch.extra = {}
             batch.extra["sana_wm_refiner_applied"] = False
-            self.log_info(
-                "SANA-WM LTX-2 refiner skipped by config or request flag."
-            )
+            self.log_info("SANA-WM LTX-2 refiner skipped by config or request flag.")
             return batch
 
         batch_size = int(batch.latents.shape[0])
         prompts = self._prompts_for_batch(batch, batch_size)
         fps = float(getattr(batch, "fps", 16) or 16)
 
-        seeds: list[int]
-        if batch.seeds is not None and len(batch.seeds) == batch_size:
-            seeds = [int(s) for s in batch.seeds]
-        elif batch.seeds is not None and len(batch.seeds) == 1:
-            seeds = [int(batch.seeds[0])] * batch_size
-        else:
-            seeds = [int(getattr(batch, "seed", 0) or 0)] * batch_size
+        seeds = _refiner_seeds_for_batch(batch, batch_size)
+        sink_size_value = _refiner_sink_size_value(batch)
+        if not _refiner_sink_size_is_valid(sink_size_value):
+            raise ValueError(
+                "SANA-WM refiner sink_size must be a positive int, "
+                f"got {sink_size_value!r}."
+            )
+        sink_size = int(sink_size_value)
 
         refined = self._refine_batch(
             batch.latents,
             prompts,
             fps=fps,
             seeds=seeds,
+            sink_size=sink_size,
         )
         batch.latents = refined.to(
             device=batch.latents.device, dtype=batch.latents.dtype
@@ -958,9 +1148,24 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         return batch
 
 
-class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
+class SanaWMRefinerDecodingStage(DecodingStage):
+    def _pipeline_config(self) -> Any | None:
+        config = getattr(self, "_active_pipeline_config", None)
+        if config is not None:
+            return config
+        return getattr(getattr(self, "server_args", None), "pipeline_config", None)
+
+    def _log_tensor_stats(self, label: str, tensor: torch.Tensor | None) -> None:
+        _log_tensor_stats(label, tensor, self._pipeline_config())
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = super().verify_input(batch, server_args)
+        result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
+        return result
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
+        self._active_pipeline_config = getattr(server_args, "pipeline_config", None)
         self._drop_refiner_sink = bool(
             (getattr(batch, "extra", None) or {}).get("sana_wm_refiner_applied", True)
         )
@@ -977,8 +1182,15 @@ class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
         *,
         vae_dtype: torch.dtype,
     ) -> torch.Tensor:
+        self._active_pipeline_config = getattr(server_args, "pipeline_config", None)
+        _configure_ltx2_vae_for_long_video(
+            self.vae,
+            server_args.pipeline_config,
+            log_info=self.log_info,
+        )
         frames = super().decode(latents, server_args, vae_dtype=vae_dtype)
-        log_sana_wm_tensor_stats("refiner.decode.frames_with_sink", frames)
+        self._log_tensor_stats("decode.frames", frames)
+        self._log_tensor_stats("refiner.decode.frames_with_sink", frames)
         if frames.ndim != 5:
             raise ValueError(
                 "SANA-WM refiner decoding expects decoded video shaped "
@@ -990,8 +1202,8 @@ class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
                 f"frames, got temporal length {frames.shape[2]}."
             )
         if not getattr(self, "_drop_refiner_sink", True):
-            log_sana_wm_tensor_stats("refiner.decode.frames_output", frames)
+            self._log_tensor_stats("refiner.decode.frames_output", frames)
             return frames
         frames = frames[:, :, 1:].contiguous()
-        log_sana_wm_tensor_stats("refiner.decode.frames_output", frames)
+        self._log_tensor_stats("refiner.decode.frames_output", frames)
         return frames
