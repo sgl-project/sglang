@@ -1387,9 +1387,6 @@ class ServerArgs:
         auto-disable cascade respects this lock (the old
         --enforce-piecewise-cuda-graph semantics generalized).
         """
-        # cuda_graph_config arrives as dict (CLI / SDK) or as
-        # CudaGraphConfig (SDK passing the new type, or re-parse).
-        # Normalize to a plain dict overlay for the precedence cascade.
         raw_input = self.cuda_graph_config
         if isinstance(raw_input, CudaGraphConfig):
             explicit_input = raw_input.to_dict()
