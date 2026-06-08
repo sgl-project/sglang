@@ -213,6 +213,7 @@ class SchedulerOutputStreamer:
         # (some requests want PHS, others don't) keep the raw list so
         # positional indexing on the receiver side stays correct.
         stacked_phs = None
+        is_pooled_hidden_states_stacked = False
         if has_phs:
             all_have_phs = all(t is not None for t in phs_list)
             if all_have_phs:
@@ -220,6 +221,7 @@ class SchedulerOutputStreamer:
                     # when stack all tensors, to keep the pooled_hidden_states data type
                     # wrap the tensor with list to avoid the msgpack issue
                     stacked_phs = [torch.stack(phs_list)]
+                    is_pooled_hidden_states_stacked = True
                 else:
                     stacked_phs = phs_list
             else:
@@ -239,6 +241,7 @@ class SchedulerOutputStreamer:
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
                 pooled_hidden_states=stacked_phs,
+                is_pooled_hidden_states_stacked=is_pooled_hidden_states_stacked,
             )
         )
 

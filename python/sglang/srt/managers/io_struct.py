@@ -1347,6 +1347,7 @@ class BatchEmbeddingOutput(BaseBatchReqIpc, kw_only=True):
     # Sent as a single stacked tensor to minimize pickle overhead.
     # Optional[Union[List[Optional[torch.Tensor]], torch.Tensor]]
     pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
+    is_pooled_hidden_states_stacked: bool = False
 
 
 class ClearHiCacheReqInput(BaseReqIpc, kw_only=True):
