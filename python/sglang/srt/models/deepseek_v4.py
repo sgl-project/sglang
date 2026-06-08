@@ -1198,7 +1198,6 @@ class DeepseekV4Model(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
-            dump_hidden_state("layer", hidden_states, forward_batch, i)
 
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
@@ -1214,7 +1213,6 @@ class DeepseekV4Model(nn.Module):
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
-        dump_hidden_state("final", hidden_states, forward_batch, 999)
 
         return hidden_states, pre_hc_head
 
