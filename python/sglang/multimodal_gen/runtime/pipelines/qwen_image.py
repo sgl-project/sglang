@@ -4,7 +4,7 @@
 from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.pipelines.qwen_image_progressive import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
     QwenImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
@@ -12,10 +12,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    DenoisingStage,
-    PipelineStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
     QwenImageLayeredBeforeDenoisingStage,
 )
@@ -26,54 +22,6 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 # TODO(will): move PRECISION_TO_TYPE to better place
 
 logger = init_logger(__name__)
-
-_PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
-
-
-class _QwenImageDenoisingStageRouter(PipelineStage):
-    def __init__(
-        self,
-        standard_stage: DenoisingStage,
-        progressive_stage: QwenImageProgressiveDenoisingStage,
-    ) -> None:
-        super().__init__()
-        self.standard_stage = standard_stage
-        self.progressive_stage = progressive_stage
-
-    @property
-    def role_affinity(self):
-        return RoleType.DENOISER
-
-    @property
-    def parallelism_type(self):
-        return self.standard_stage.parallelism_type
-
-    def set_component_residency_manager(self, manager) -> None:
-        super().set_component_residency_manager(manager)
-        self.standard_stage.set_component_residency_manager(manager)
-        self.progressive_stage.set_component_residency_manager(manager)
-
-    def set_registered_stage_name(self, stage_name: str) -> None:
-        super().set_registered_stage_name(stage_name)
-        self.standard_stage.set_registered_stage_name(stage_name)
-        self.progressive_stage.set_registered_stage_name(stage_name)
-
-    def set_profile_stage_name(self, stage_name: str) -> None:
-        super().set_profile_stage_name(stage_name)
-        self.standard_stage.set_profile_stage_name(stage_name)
-        self.progressive_stage.set_profile_stage_name(stage_name)
-
-    def _active_profile_stage_name(self) -> str:
-        return "DenoisingStage"
-
-    def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
-        return self.standard_stage.component_uses(server_args, stage_name)
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
-        if mode in _PROGRESSIVE_MODES:
-            return self.progressive_stage.forward(batch, server_args)
-        return self.standard_stage.forward(batch, server_args)
 
 
 def calculate_shift(
@@ -127,23 +75,8 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_text_encoding_stage()
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
-        self._add_qwen_denoising_stage()
+        self.add_progressive_denoising_stage(QwenImageProgressiveDenoisingStage)
         self.add_standard_decoding_stage()
-
-    def _add_qwen_denoising_stage(self, stage_name: str = "denoising_stage") -> None:
-        def create_stage():
-            kwargs = dict(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-                pipeline=self,
-                vae=self.get_module("vae", None),
-            )
-            return _QwenImageDenoisingStageRouter(
-                standard_stage=DenoisingStage(**kwargs),
-                progressive_stage=QwenImageProgressiveDenoisingStage(**kwargs),
-            )
-
-        self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
 
 
 class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):

@@ -10,6 +10,7 @@ between progressive stages.
 from __future__ import annotations
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -69,7 +70,7 @@ class ZImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         server_args: ServerArgs,
         h_lat: int,
         w_lat: int,
-        seed: int,
+        seed,
     ) -> torch.Tensor:
         """Generate low-res initial noise in Z-Image's native 5-D format [B, C, 1, H, W].
 
@@ -82,10 +83,11 @@ class ZImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
         dtype = server_args.pipeline_config.get_latent_dtype(
             batch.prompt_embeds[0].dtype if batch.prompt_embeds else torch.bfloat16
         )
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(seed)
-        noise_spatial = torch.randn(1, C, h_lat, w_lat, generator=gen, dtype=dtype).to(
-            device
+        noise_spatial = randn_tensor(
+            (self._initial_noise_batch_size(batch), C, h_lat, w_lat),
+            generator=self._get_initial_noise_generator(batch, seed, device),
+            device=device,
+            dtype=dtype,
         )
         return self._repack_latent(noise_spatial, h_lat, w_lat, batch, server_args)
 

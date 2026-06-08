@@ -23,24 +23,24 @@ Extension hooks for model-specific subclasses
 
 from __future__ import annotations
 
+import math
 import time
+from collections.abc import Callable, Sequence
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.scheduler_utils import (
-    compute_stage_transitions,
-    find_transition_steps,
-    reset_scheduler_at_step,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.upsample import (
     apply_upsample,
@@ -51,7 +51,150 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
+PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
+
+
+def is_progressive_resolution_mode(mode: str | None) -> bool:
+    return (mode or "fullres") in PROGRESSIVE_MODES
+
+
+def _P_omega(w: float, A: float, beta: float) -> float:
+    return A * abs(w) ** (-beta)
+
+
+def _activation_time(P: float, delta: float) -> float:
+    denom = P * (1.0 + P - delta)
+    if denom <= 0 or delta >= 1.0 + P:
+        raise ValueError(
+            f"delta={delta} >= 1+P={1+P:.4f}; criterion trivially satisfied."
+        )
+    return 1.0 / (1.0 + math.sqrt(delta / denom))
+
+
+def compute_stage_transitions(
+    delta: float,
+    n_levels: int,
+    A: float,
+    beta: float,
+    H_lat: int,
+    W_lat: int,
+) -> dict[int, float]:
+    stage_sigmas: dict[int, float] = {1: 1.0}
+    num_stages = n_levels + 1
+    for stage in range(2, num_stages + 1):
+        H_prev = H_lat // (2 ** (num_stages - stage + 1))
+        W_prev = W_lat // (2 ** (num_stages - stage + 1))
+        w = min(H_prev, W_prev) // 2
+        stage_sigmas[stage] = _activation_time(_P_omega(w, A, beta), delta)
+    return stage_sigmas
+
+
+def find_transition_steps(
+    scheduler_sigmas: torch.Tensor,
+    stage_sigmas: dict[int, float],
+    n_steps: int,
+) -> dict[int, int]:
+    transition_steps: dict[int, int] = {}
+    sigmas_list = scheduler_sigmas.cpu().tolist()
+    for stage, threshold in stage_sigmas.items():
+        if stage == 1:
+            continue
+        found = n_steps
+        for step_index in range(n_steps):
+            if sigmas_list[step_index] <= threshold:
+                found = step_index
+                break
+        transition_steps[stage] = found
+    return transition_steps
+
+
+def reset_scheduler_at_step(scheduler: object, step_index: int) -> None:
+    if hasattr(scheduler, "model_outputs"):
+        solver_order = getattr(
+            getattr(scheduler, "config", None),
+            "solver_order",
+            len(scheduler.model_outputs),
+        )
+        scheduler.model_outputs = [None] * solver_order
+    if hasattr(scheduler, "lower_order_nums"):
+        scheduler.lower_order_nums = 0
+    if hasattr(scheduler, "last_sample"):
+        scheduler.last_sample = None
+    if hasattr(scheduler, "this_order"):
+        scheduler.this_order = 0
+    if hasattr(scheduler, "timestep_list"):
+        solver_order = getattr(
+            getattr(scheduler, "config", None),
+            "solver_order",
+            len(scheduler.timestep_list),
+        )
+        scheduler.timestep_list = [None] * solver_order
+    scheduler._step_index = step_index
+
+
+class ProgressiveDenoisingStageRouter(PipelineStage):
+    def __init__(
+        self,
+        standard_stage: DenoisingStage,
+        progressive_stage_factory: Callable[[], DenoisingStage],
+    ) -> None:
+        super().__init__()
+        self.standard_stage = standard_stage
+        self._progressive_stage_factory = progressive_stage_factory
+        self._progressive_stage: DenoisingStage | None = None
+
+    def _get_progressive_stage(self) -> DenoisingStage:
+        if self._progressive_stage is None:
+            stage = self._progressive_stage_factory()
+            if self._component_residency_manager is not None:
+                stage.set_component_residency_manager(self._component_residency_manager)
+            if self._registered_stage_name is not None:
+                stage.set_registered_stage_name(self._registered_stage_name)
+            if self._profile_stage_name is not None:
+                stage.set_profile_stage_name(self._profile_stage_name)
+            self._progressive_stage = stage
+        return self._progressive_stage
+
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
+
+    @property
+    def parallelism_type(self):
+        return self.standard_stage.parallelism_type
+
+    def set_component_residency_manager(self, manager) -> None:
+        super().set_component_residency_manager(manager)
+        self.standard_stage.set_component_residency_manager(manager)
+        if self._progressive_stage is not None:
+            self._progressive_stage.set_component_residency_manager(manager)
+
+    def set_registered_stage_name(self, stage_name: str) -> None:
+        super().set_registered_stage_name(stage_name)
+        self.standard_stage.set_registered_stage_name(stage_name)
+        if self._progressive_stage is not None:
+            self._progressive_stage.set_registered_stage_name(stage_name)
+
+    def set_profile_stage_name(self, stage_name: str) -> None:
+        super().set_profile_stage_name(stage_name)
+        self.standard_stage.set_profile_stage_name(stage_name)
+        if self._progressive_stage is not None:
+            self._progressive_stage.set_profile_stage_name(stage_name)
+
+    def _active_profile_stage_name(self) -> str:
+        # keep progressive requests under the canonical perf baseline stage name
+        return "DenoisingStage"
+
+    def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
+        return self.standard_stage.component_uses(server_args, stage_name)
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
+        if is_progressive_resolution_mode(mode):
+            return self._get_progressive_stage().forward(batch, server_args)
+        if mode == "fullres":
+            return self.standard_stage.forward(batch, server_args)
+        raise ValueError(f"Unsupported progressive_mode: {mode!r}")
 
 
 def _get_scm_preset() -> str | None:
@@ -138,13 +281,54 @@ class ProgressiveDenoisingStage(DenoisingStage):
         seed = getattr(sp, "seed", None) if sp is not None else None
         return int(seed) if seed is not None else 42
 
+    @staticmethod
+    def _initial_noise_batch_size(batch: Req) -> int:
+        try:
+            return int(batch.batch_size)
+        except AttributeError:
+            prompt_embeds = getattr(batch, "prompt_embeds", None)
+            if prompt_embeds:
+                return int(prompt_embeds[0].shape[0])
+            latents = getattr(batch, "latents", None)
+            if latents is not None:
+                return int(latents.shape[0])
+            return 1
+
+    def _get_seeds(self, batch: Req, seed: int | Sequence[int]) -> list[int]:
+        batch_size = self._initial_noise_batch_size(batch)
+        if isinstance(seed, Sequence) and not isinstance(seed, (str, bytes)):
+            seeds = [int(item) for item in seed]
+        else:
+            batch_seeds = getattr(batch, "seeds", None)
+            if batch_seeds:
+                seeds = [int(item) for item in batch_seeds]
+            else:
+                seeds = [int(seed) + i for i in range(batch_size)]
+        if len(seeds) != batch_size:
+            raise ValueError(
+                "progressive seeds length must match batch size: "
+                f"{len(seeds)} vs {batch_size}"
+            )
+        return seeds
+
+    def _get_initial_noise_generator(
+        self, batch: Req, seed: int | Sequence[int], device: torch.device | str
+    ):
+        seeds = self._get_seeds(batch, seed)
+        generators = [
+            torch.Generator(device=device).manual_seed(seed) for seed in seeds
+        ]
+        if len(generators) == 1:
+            return generators[0]
+        return generators
+
     def _generate_initial_noise(
         self,
         batch: Req,
         server_args: ServerArgs,
         h_lat: int,
         w_lat: int,
-        seed: int,
+        seed: int | Sequence[int],
     ) -> torch.Tensor:
         """Generate low-res initial noise and return in model-native format."""
         from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -154,10 +338,11 @@ class ProgressiveDenoisingStage(DenoisingStage):
         dtype = server_args.pipeline_config.get_latent_dtype(
             batch.prompt_embeds[0].dtype if batch.prompt_embeds else torch.bfloat16
         )
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(seed)
-        noise_spatial = torch.randn(1, C, h_lat, w_lat, generator=gen, dtype=dtype).to(
-            device
+        noise_spatial = randn_tensor(
+            (self._initial_noise_batch_size(batch), C, h_lat, w_lat),
+            generator=self._get_initial_noise_generator(batch, seed, device),
+            device=device,
+            dtype=dtype,
         )
         return self._repack_latent(noise_spatial, h_lat, w_lat, batch, server_args)
 
@@ -186,7 +371,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
 
-        if mode not in _PROGRESSIVE_MODES:
+        if mode not in PROGRESSIVE_MODES:
             raise ValueError(
                 "ProgressiveDenoisingStage requires progressive_mode to be "
                 "'dct' or 'dct_rewind'. Route fullres requests to DenoisingStage."
@@ -202,6 +387,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
         levels = int(getattr(batch, "progressive_levels", 1))
         delta = float(getattr(batch, "progressive_delta", 0.01))
         seed = self._get_seed(batch)
+        seeds = self._get_seeds(batch, seed)
 
         latent_scale = self._latent_scale_factor(server_args)
         H_lat = batch.height // latent_scale
@@ -295,7 +481,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
 
                 # ── Resolution transition ──────────────────────────────────────
                 sigma_t = float(scheduler.sigmas[stage_end])
-                upsample_seed = seed + stage * 10_000
+                upsample_seed = [item + stage * 10_000 for item in seeds]
 
                 # Unpack → spatial, upsample, repack
                 x_spatial = self._unpack_latent(ctx.latents, cur_h_lat, cur_w_lat)

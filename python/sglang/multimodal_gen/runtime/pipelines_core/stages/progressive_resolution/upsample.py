@@ -11,6 +11,8 @@ tensor (..., 2H, 2W).  The rewind variant also returns t_eff.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.spectral_ops import (
@@ -22,7 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
 def dct_upsample_2d(
     x: torch.Tensor,
     sigma_t: float,
-    seed: int,
+    seed: int | Sequence[int],
     rewind: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, float]:
     """DCT-II 2× upsample: embed low-res coefficients top-left, noise-pad, IDCT.
@@ -46,11 +48,33 @@ def dct_upsample_2d(
 
     # Fill 2N×2N grid with float32 white Gaussian noise of variance sigma_t²
     # per DCT bin, matching the reference's float32 noise path.
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    big = torch.randn(
-        *leading, H2, W2, generator=gen, dtype=torch.float32, device="cpu"
-    ).to(x.device)
+    if isinstance(seed, Sequence) and not isinstance(seed, (str, bytes)):
+        if not leading or len(seed) != leading[0]:
+            batch_dim = leading[0] if leading else 0
+            raise ValueError(
+                "seed list length must match leading batch dimension: "
+                f"{len(seed)} vs {batch_dim}"
+            )
+        big = torch.cat(
+            [
+                torch.randn(
+                    1,
+                    *leading[1:],
+                    H2,
+                    W2,
+                    generator=torch.Generator(device=x.device).manual_seed(int(item)),
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                for item in seed
+            ],
+            dim=0,
+        )
+    else:
+        generator = torch.Generator(device=x.device).manual_seed(int(seed))
+        big = torch.randn(
+            *leading, H2, W2, generator=generator, dtype=torch.float32, device=x.device
+        )
     big = big * sigma_t
 
     # Embed low-res DCT coefficients in the top-left corner (no precision loss).
@@ -70,7 +94,7 @@ def dct_upsample_2d(
 def apply_upsample(
     x: torch.Tensor,
     sigma_t: float,
-    seed: int,
+    seed: int | Sequence[int],
     mode: str,
 ) -> torch.Tensor | tuple[torch.Tensor, float]:
     """Dispatch to the requested upsample function.

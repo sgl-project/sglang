@@ -17,10 +17,12 @@ spectrum P(ω) = A * |ω|^(-β):
 from __future__ import annotations
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
+    is_progressive_resolution_mode,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -116,12 +118,8 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         stage latent is guaranteed even.  For 480p L=1 this is a no-op (60 is
         already divisible by 4).  For 720p L=1: 90→88 latent rows (704 px).
         """
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
-            _PROGRESSIVE_MODES,
-        )
-
         mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
-        if mode not in _PROGRESSIVE_MODES:
+        if not is_progressive_resolution_mode(mode):
             return super().forward(batch, server_args)
 
         levels = int(getattr(batch, "progressive_levels", 1))
@@ -160,7 +158,7 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         server_args: ServerArgs,
         h_lat: int,
         w_lat: int,
-        seed: int,
+        seed,
     ) -> torch.Tensor:
         """Generate low-res initial noise [1, C, T_lat, h_lat, w_lat].
 
@@ -181,9 +179,10 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         dtype = server_args.pipeline_config.get_latent_dtype(
             batch.prompt_embeds[0].dtype if batch.prompt_embeds else torch.bfloat16
         )
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(seed)
-        noise = torch.randn(1, C, T_lat, h_lat, w_lat, generator=gen, dtype=dtype).to(
-            device
+        noise = randn_tensor(
+            (self._initial_noise_batch_size(batch), C, T_lat, h_lat, w_lat),
+            generator=self._get_initial_noise_generator(batch, seed, device),
+            device=device,
+            dtype=dtype,
         )
         return noise
