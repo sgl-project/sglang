@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import enum
-from array import array
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.dllm.config import DllmConfig
@@ -61,11 +60,6 @@ class ReqDllmMixin:
             0
             if self.fill_len == 0
             else self.dllm_block_offset + self.dllm_config.block_size
-        )
-        self.full_untruncated_fill_ids = (
-            self.origin_input_ids
-            + self.output_ids
-            + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
         )
         self.fill_len = self.get_full_untruncated_fill_len()
 

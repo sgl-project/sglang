@@ -696,10 +696,10 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Rebuilt at the top of each init_next_round_input; admission only
-        # updates fill_len, never mutates this array's length.
-        self.full_untruncated_fill_ids = array("q")
+        # Number of committed tokens of the full untruncated sequence
+        # (origin + output, plus the DLLM mask block) admitted to run this
+        # iteration; the sequence itself is computed on demand via
+        # get_full_untruncated_fill_ids(). Admission only advances fill_len.
         self.fill_len: int = 0
 
         self.session = session
@@ -1093,8 +1093,6 @@ class Req(ReqDllmMixin):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
-        else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
         full_fill_ids = self.get_full_untruncated_fill_ids()
         input_len = len(full_fill_ids)
@@ -2286,7 +2284,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
             req.fill_len = req.get_full_untruncated_fill_len()
             req.set_extend_input_len(1)
 
