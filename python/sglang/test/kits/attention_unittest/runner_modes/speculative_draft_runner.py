@@ -21,7 +21,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
     FrozenKVMTPCudaGraphRunner,
 )
@@ -175,10 +175,16 @@ class _EagleDraftWorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
         self.model_runner.forward = model_forward
-        self.draft_forward = MethodType(EAGLEWorker.draft_forward, self)
+        self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
 
     @property
     def draft_model_runner(self):
+        return self.model_runner
+
+    @property
+    def draft_runner(self):
+        # V2 draft_forward reads self.draft_runner (forward / model_config /
+        # canary_manager); for the harness that's the fixture runner.
         return self.model_runner
 
 
