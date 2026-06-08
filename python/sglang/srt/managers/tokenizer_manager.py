@@ -252,12 +252,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init running status
         self.init_running_status()
 
+        # Init logging and dumping (request_logger needed in all modes)
+        self.init_request_logging_and_dumping()
+
+        # Init metric collector and watchdog (soft_watchdog needed in all modes)
+        self.init_metric_collector_watchdog()
+
         if not server_args.tokenizer_only:
             # Init inter-process communication
             self.init_ipc_channels(port_args)
-
-            # Init logging and dumping
-            self.init_request_logging_and_dumping()
 
             # Init weight update
             self.init_weight_update()
@@ -267,9 +270,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Init PD disaggregation and encoder disaggregation
             self.init_disaggregation()
-
-            # Init metric collector and watchdog
-            self.init_metric_collector_watchdog()
 
             # Init request dispatcher
             self.init_request_dispatcher()
