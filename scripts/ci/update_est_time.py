@@ -167,7 +167,8 @@ def main():
     print(f"Fetching {args.model_url}", file=sys.stderr)
     model = fetch_model(args.model_url)
     print(
-        f"  model data_as_of={model.get('data_as_of')} "
+        f"  model fit_window_start={model.get('fit_window_start')} "
+        f"fit_window_days={model.get('fit_window_days')} "
         f"n_runs={model.get('n_runs')} "
         f"n_suites={len(model.get('est', {}))}",
         file=sys.stderr,

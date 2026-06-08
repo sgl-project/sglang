@@ -161,9 +161,9 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del input_size, output_size
         quant_ratio = _calculate_quant_ratio(params_dtype)
-        total_size = input_size_per_partition * sum(output_partition_sizes)
+        output_size_per_partition = sum(output_partition_sizes)
+        total_size = input_size_per_partition * output_size_per_partition
         if total_size % quant_ratio != 0:
             raise ValueError(
                 "The input size is not aligned with the quantized weight shape."
@@ -180,6 +180,18 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
                 "output_dim": 0,
                 "pack_factor": quant_ratio,
                 "use_bitsandbytes_4bit": True,
+                "bnb_full_shape": (output_size, input_size),
+                "bnb_local_shape": (
+                    output_size_per_partition,
+                    input_size_per_partition,
+                ),
+                "bnb_output_shard_start": getattr(layer, "tp_rank", 0)
+                * output_size_per_partition,
+                "bnb_input_shard_start": (
+                    0
+                    if input_size_per_partition == input_size
+                    else getattr(layer, "tp_rank", 0) * input_size_per_partition
+                ),
             },
         )
         layer.register_parameter("weight", qweight)
@@ -377,7 +389,49 @@ def attach_bitsandbytes_4bit_quant_states(
         if param is None:
             raise ValueError(f"Parameter {param_name} not found in the model.")
 
+        quant_state = _maybe_shard_bitsandbytes_4bit_quant_state(param, quant_state)
         state_by_shard = {0: quant_state}
         set_weight_attrs(param, {"bnb_quant_state": state_by_shard})
         offsets = torch.tensor([0, param.numel()]).cpu()
         set_weight_attrs(param, {"bnb_shard_offsets": offsets})
+
+
+def _maybe_shard_bitsandbytes_4bit_quant_state(
+    param: torch.nn.Parameter,
+    quant_state: Any,
+) -> Any:
+    full_shape = tuple(getattr(param, "bnb_full_shape", tuple(quant_state.shape or ())))
+    local_shape = tuple(getattr(param, "bnb_local_shape", full_shape))
+    if not full_shape or local_shape == full_shape:
+        return quant_state
+
+    output_start = getattr(param, "bnb_output_shard_start", 0)
+    input_start = getattr(param, "bnb_input_shard_start", 0)
+    if input_start != 0 or local_shape[1] != full_shape[1]:
+        raise NotImplementedError(
+            "bitsandbytes 4-bit TP only supports column-parallel output shards."
+        )
+    if getattr(quant_state, "nested", False):
+        raise NotImplementedError(
+            "bitsandbytes 4-bit TP does not support nested quant states."
+        )
+
+    blocksize = quant_state.blocksize
+    start_elem = output_start * full_shape[1]
+    local_numel = local_shape[0] * local_shape[1]
+    if start_elem % blocksize != 0 or local_numel % blocksize != 0:
+        raise ValueError(
+            "bitsandbytes 4-bit TP shard is not aligned to quantization blocks."
+        )
+    start_block = start_elem // blocksize
+    num_blocks = local_numel // blocksize
+    return type(quant_state)(
+        absmax=quant_state.absmax.narrow(0, start_block, num_blocks).contiguous(),
+        shape=torch.Size(local_shape),
+        code=quant_state.code,
+        blocksize=quant_state.blocksize,
+        quant_type=quant_state.quant_type,
+        dtype=quant_state.dtype,
+        offset=None,
+        state2=None,
+    )

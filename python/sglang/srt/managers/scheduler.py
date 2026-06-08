@@ -419,6 +419,10 @@ class Scheduler(
         # Init mamba backend
         self.init_mamba_backend()
 
+        # Must precede init_model_worker: revert targets like _init_pools run during it,
+        # so patching them afterwards is a no-op.
+        maybe_revert_pr_fix()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -563,8 +567,6 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
-
-        maybe_revert_pr_fix()
 
         self.is_initializing = False
 
@@ -934,15 +936,6 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
-        # Tracks whether the current self.chunked_req was actually scheduled
-        # into last iteration's batch (i.e., in can_run_list -> got a fresh
-        # req_pool_idx from prepare_for_extend). Used to gate the
-        # stash_chunked_request call at the top of get_next_batch_to_run:
-        # if add_chunked_req early-returned under hybrid-SWA pressure,
-        # the req_pool_idx was already freed and fill_ids was reset by
-        # init_next_round_input, so running stash would double-free and
-        # corrupt prefix_indices.
-        self._chunked_req_scheduled_last_iter = False
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2157,7 +2150,7 @@ class Scheduler(
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.fill_ids[matched_len:]
+                new_input_tokens = req.full_untruncated_fill_ids[matched_len:]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2441,7 +2434,11 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
 
-            if self._chunked_req_scheduled_last_iter:
+            # Stash (cache) the previous chunk only when it produced new KV
+            # beyond what is already cached. A parked chunk (add_chunked_req
+            # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
+            # so there is nothing new to cache and stashing would be a no-op.
+            if self.chunked_req.fill_len > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -2643,11 +2640,6 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            self._chunked_req_scheduled_last_iter = (
-                self.chunked_req in adder.can_run_list
-            )
-        else:
-            self._chunked_req_scheduled_last_iter = False
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2660,9 +2652,9 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
-        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
-        if mamba_pool is not None:
-            mamba_pool.alloc_group_begin(len(self.waiting_queue))
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is not None:
+            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2723,14 +2715,14 @@ class Scheduler(
                     and req.mamba_pool_idx is not None
                     and not getattr(req, "session", None)
                 ):
-                    self.tree_cache.req_to_token_pool.mamba_pool.free(
+                    self.tree_cache.req_to_token_pool.mamba_allocator.free(
                         req.mamba_pool_idx.unsqueeze(-1)
                     )
                     req.mamba_pool_idx = None
                 break
 
-        if mamba_pool is not None:
-            mamba_pool.alloc_group_end()
+        if mamba_allocator is not None:
+            mamba_allocator.alloc_group_end()
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -2747,9 +2739,6 @@ class Scheduler(
             # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
-            # new_chunked_req is added to can_run_list by add_one_req,
-            # so it will be scheduled this iter -> stash is needed next iter.
-            self._chunked_req_scheduled_last_iter = True
 
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
@@ -2865,9 +2854,13 @@ class Scheduler(
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
-            mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)
+            mamba_allocator = getattr(
+                self.tree_cache.req_to_token_pool, "mamba_allocator", None
+            )
             old_mamba_available = (
-                mamba_pool.available_size() if mamba_pool is not None else None
+                mamba_allocator.available_size()
+                if mamba_allocator is not None
+                else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
@@ -2875,8 +2868,8 @@ class Scheduler(
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
-                mamba_pool.available_size() - old_mamba_available
-                if mamba_pool is not None
+                mamba_allocator.available_size() - old_mamba_available
+                if mamba_allocator is not None
                 else None
             )
 
@@ -3324,7 +3317,7 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
-            and (self.ps.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+            and self._pp_microbatches_drained()
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -3359,6 +3352,13 @@ class Scheduler(
                     idle &= len(tc.ongoing_backup) == 0
 
         return idle
+
+    def _pp_microbatches_drained(self) -> bool:
+        if self.ps.pp_size == 1:
+            return True
+        return all(x.is_empty() for x in self.running_mbs) and all(
+            mb is None or mb.is_empty() for mb in self.mbs
+        )
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
