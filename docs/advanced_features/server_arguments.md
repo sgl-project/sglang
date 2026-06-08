@@ -389,6 +389,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | --- | --- | --- | --- |
 | `--dllm-algorithm` | The diffusion LLM algorithm, such as LowConfidence. | `None` | Type: str |
 | `--dllm-algorithm-config` | The diffusion LLM algorithm configurations. Must be a YAML file. | `None` | Type: str |
+| `--dllm-fdfo` | Enable First-Done-First-Out (FDFO) scheduling so completed requests leave the batch immediately instead of waiting for slower requests, eliminating head-of-line blocking. Works with any dLLM algorithm. | `False` | Type: bool |
 
 ## Offloading
 | Argument | Description | Defaults | Options |

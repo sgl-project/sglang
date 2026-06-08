@@ -140,6 +140,12 @@ class SchedulerDllmMixin:
 
             req.dllm_incomplete_ids = array("q")
             req.dllm_algo_state = None
+
+            # Mirror the resolved block into fill_ids (as the synchronous path
+            # does) so the prefix cache keys on the real tokens rather than the
+            # mask block when this request is stashed next round.
+            req.fill_ids[-block_size:] = array("q", next_token_ids)
+
             len_input = len(req.origin_input_ids)
             len_fill = len(req.fill_ids)
             if len_fill <= len_input:
