@@ -2598,7 +2598,7 @@ class IncModelLoader(DefaultModelLoader):
     def _parse_quantization(self, quantization: str):
         """Map quantization to AutoRound's scheme and format."""
         AR_QUANT_CFG_CHOICES = {
-            "auto-round-int8": ("INT8_W8A8", "llm_compressor"),
+            "auto-round-int8": ("INT8", "llm_compressor"),
         }
         quant_cfg = AR_QUANT_CFG_CHOICES.get(quantization)
         if not quant_cfg:
