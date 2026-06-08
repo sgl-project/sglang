@@ -387,7 +387,7 @@ class TestPrefillAdder(CustomTestCase):
         req1.host_hit_length = 0
         req1.prefix_indices = []
         req1.get_full_untruncated_fill_len.return_value = 56
-        req1.fill_len = 56
+        req1.extend_fill_len = 56
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
@@ -422,7 +422,7 @@ class TestPrefillAdder(CustomTestCase):
         req2.host_hit_length = 0
         req2.prefix_indices = []
         req2.get_full_untruncated_fill_len.return_value = 56
-        req2.fill_len = 56
+        req2.extend_fill_len = 56
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
@@ -440,7 +440,7 @@ class TestPrefillAdder(CustomTestCase):
         req3.host_hit_length = 0
         req3.prefix_indices = []
         req3.get_full_untruncated_fill_len.return_value = 3
-        req3.fill_len = 3
+        req3.extend_fill_len = 3
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
@@ -477,7 +477,7 @@ class TestPrefillAdder(CustomTestCase):
         req.extend_input_len = extend_input_len
         req.prefix_indices = []
         req.get_full_untruncated_fill_len.return_value = extend_input_len
-        req.fill_len = extend_input_len
+        req.extend_fill_len = extend_input_len
         req.set_extend_input_len = MagicMock()
         return adder, req
 

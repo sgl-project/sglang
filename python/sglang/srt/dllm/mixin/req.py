@@ -58,10 +58,10 @@ class ReqDllmMixin:
     def _init_fill_ids_for_dllm(self: Req):
         self.dllm_block_offset = (
             0
-            if self.fill_len is None
+            if self.extend_fill_len is None
             else self.dllm_block_offset + self.dllm_config.block_size
         )
-        self.fill_len = self.get_full_untruncated_fill_len()
+        self.extend_fill_len = self.get_full_untruncated_fill_len()
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
