@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from collections import deque
 from typing import TYPE_CHECKING, Any
 
 from fastapi import WebSocket
@@ -31,10 +30,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     normalize_camera_actions,
     parse_action_string,
 )
-from sglang.multimodal_gen.runtime.realtime.condition_events import (
-    ControlSignal,
-    ControlStateSamplingQueue,
-    ControlStateTransition,
+from sglang.multimodal_gen.runtime.realtime.camera_controls import (
+    RealtimeCameraControlState,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
@@ -58,87 +55,23 @@ SANA_WM_DEFAULT_GUIDANCE = 1.0
 SANA_WM_CONTROL_PULSE_FRAMES = 8
 
 
-class SanaWMRealtimeAdapterState:
+def _normalize_sana_wm_state_actions(actions: list[Any]) -> list[str]:
+    return [str(action).lower() for action in actions]
+
+
+class SanaWMRealtimeAdapterState(RealtimeCameraControlState):
     def __init__(self):
-        self.camera_state = ControlStateSamplingQueue(
-            default_item=[],
+        super().__init__(
             min_pulse_items=SANA_WM_CONTROL_PULSE_FRAMES,
+            script_maxlen=2048,
             max_transitions=512,
+            normalize_state_actions=_normalize_sana_wm_state_actions,
         )
-        self.camera_script_queue: deque[ControlSignal] = deque(maxlen=2048)
         self.base_condition_inputs: dict[str, Any] = {}
-        self.latest_sampled_event_id: int | None = None
 
     def clear(self) -> None:
-        self.camera_state.clear()
-        self.camera_script_queue.clear()
+        super().clear()
         self.base_condition_inputs.clear()
-        self.latest_sampled_event_id = None
-
-    def receive_camera_script(
-        self,
-        camera_actions: list[list[str]],
-        *,
-        event_id: int | None = None,
-    ) -> None:
-        self.camera_state.clear()
-        self.camera_script_queue.clear()
-        for actions in camera_actions:
-            self.camera_script_queue.append(
-                ControlSignal(
-                    kind="camera_actions",
-                    payload=list(actions),
-                    seq_id=event_id,
-                )
-            )
-
-    def receive_camera_state_transitions(
-        self,
-        transitions: list[ControlStateTransition],
-    ) -> None:
-        self.camera_script_queue.clear()
-        self.camera_state.push_many(transitions)
-
-    def _camera_state_transition(
-        self,
-        actions: list[str],
-        *,
-        event_id: int | None,
-        timestamp_ms: int | None,
-    ) -> ControlStateTransition:
-        return ControlStateTransition(
-            payload=list(actions),
-            seq_id=event_id,
-            timestamp_ms=timestamp_ms,
-        )
-
-    def _camera_transitions_from_event_payload(
-        self,
-        payload: dict[str, Any],
-        *,
-        event_id: int | None,
-    ) -> list[ControlStateTransition]:
-        transitions = payload.get("transitions")
-        if not isinstance(transitions, list):
-            raise ValueError("camera_actions state payload requires transitions")
-        result = []
-        for transition in transitions:
-            if not isinstance(transition, dict):
-                raise ValueError("camera_actions transition must be a map")
-            actions = transition.get("actions")
-            if not isinstance(actions, list):
-                raise ValueError("camera_actions transition actions must be a list")
-            timestamp_ms = transition.get("client_ts_ms")
-            if timestamp_ms is not None:
-                timestamp_ms = int(timestamp_ms)
-            result.append(
-                self._camera_state_transition(
-                    [str(action).lower() for action in actions],
-                    event_id=event_id,
-                    timestamp_ms=timestamp_ms,
-                )
-            )
-        return result
 
     def receive_camera_event_payload(
         self,
@@ -146,36 +79,11 @@ class SanaWMRealtimeAdapterState:
         *,
         event_id: int | None,
     ) -> str:
-        if isinstance(payload, dict) and payload.get("mode") == "state":
-            transitions = self._camera_transitions_from_event_payload(
-                payload,
-                event_id=event_id,
-            )
-            self.receive_camera_state_transitions(transitions)
-            return f"kind=camera_actions, mode=state, transitions={len(transitions)}"
-
-        camera_actions = SanaWMRealtimeAdapter._validate_camera_actions(payload)
-        self.receive_camera_script(camera_actions, event_id=event_id)
-        return f"kind=camera_actions, mode=script, frames={len(camera_actions)}"
-
-    def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
-        if self.camera_script_queue:
-            chunk: list[list[str]] = []
-            latest_event_id = self.latest_sampled_event_id
-            while self.camera_script_queue and len(chunk) < chunk_size:
-                signal = self.camera_script_queue.popleft()
-                chunk.append(list(signal.payload))
-                latest_event_id = signal.seq_id
-            while len(chunk) < chunk_size:
-                chunk.append([])
-            self.latest_sampled_event_id = latest_event_id
-            return chunk
-
-        action_list = self.camera_state.sample_chunk(chunk_size)
-        if action_list is None:
-            return None
-        self.latest_sampled_event_id = self.camera_state.latest_sampled_seq_id()
-        return [list(actions) for actions in action_list]
+        return super().receive_camera_event_payload(
+            payload,
+            event_id=event_id,
+            validate_camera_actions=SanaWMRealtimeAdapter._validate_camera_actions,
+        )
 
 
 class SanaWMRealtimeAdapter(RealtimeModelAdapter):

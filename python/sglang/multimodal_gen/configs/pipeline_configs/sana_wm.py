@@ -326,4 +326,10 @@ class SanaWMRealtimeConfig(SanaWMPipelineConfig):
     class (matching the upstream/LingBot-World pattern) without renaming the base.
     """
 
-    pass
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            auto_disable_component_offload_min_available_memory_gb=120,
+            auto_disable_component_offload_components=("dit",),
+            auto_enable_cfg_parallel=False,
+        )

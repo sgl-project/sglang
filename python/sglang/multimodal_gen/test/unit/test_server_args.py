@@ -20,7 +20,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
+    SanaWMPipelineConfig,
+    SanaWMRealtimeConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_2_TI2V_5B_Config,
     TurboWanT2V480PConfig,
@@ -703,6 +706,19 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMRealtimeConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_streaming",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(

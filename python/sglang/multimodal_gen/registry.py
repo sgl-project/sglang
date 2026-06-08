@@ -973,6 +973,7 @@ def _register_configs():
         pipeline_config_cls=SanaWMPipelineConfig,
         hf_model_paths=[
             "Efficient-Large-Model/SANA-WM_bidirectional",
+            "Efficient-Large-Model/SANA-WM_streaming",
         ],
         model_detectors=[
             # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
