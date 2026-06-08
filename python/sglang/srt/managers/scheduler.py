@@ -1908,15 +1908,16 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native session: session_id is just a tag on the req; it builds a
-        # plain Req tagged + floor-priced in the radix cache by req.session_id.
+        # Radix-native session: session_id is just a tag on the Req; the radix
+        # cache groups its KV by req.session_id for bulk release on close.
         radix_native_session = (
             session_id is not None and self.server_args.enable_session_radix_cache
         )
         if radix_native_session:
             sp = recv_req.session_params
-            # Native path sends full context each turn; legacy reconstruct params
-            # don't apply -- warn rather than silently produce wrong context.
+            # Full context is sent each turn here, so the reconstruct params
+            # (rid/offset/replace/drop_previous_output) don't apply -- warn
+            # instead of silently dropping them.
             if sp.rid or sp.offset or sp.replace or sp.drop_previous_output:
                 logger.warning(
                     "Radix-native session %s ignores session_params "
@@ -1978,7 +1979,7 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
             if radix_native_session:
-                req.session_id = session_id  # tag for RadixCache (see release_session)
+                req.session_id = session_id
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -3832,12 +3833,9 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         if self.server_args.enable_session_radix_cache:
-            # Session = a tag namespace over evictable radix KV; "open" just
-            # registers the id so the cache can group this session's leaves.
+            # Radix-native sessions need no open: a session is just a per-request
+            # tag, released on close. Accept and no-op for protocol compatibility.
             session_id = recv_req.session_id
-            register = getattr(self.tree_cache, "register_session", None)
-            if register is not None and session_id is not None:
-                register(session_id)
             output = OpenSessionReqOutput(session_id, session_id is not None)
         else:
             output = self.session_controller.open(recv_req)

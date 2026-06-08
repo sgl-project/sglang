@@ -28,15 +28,11 @@ import sys
 import time
 from array import array
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
-
-# Floor priority for session-radix-cache KV: evicted first under pressure so the
-# pool cannot wedge. Effective under `--radix-eviction-policy priority`.
-RADIX_NATIVE_SESSION_PRIORITY = -(sys.maxsize - 1)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -293,9 +289,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
-        # session_id -> set of leaf nodes it tagged. Lets release_session be
-        # O(session) instead of scanning all tree leaves.
-        self._session_leaves: Dict[str, set] = {}
         # Leaf seeds queued by release_session, freed a bounded number per
         # scheduler iteration by drain_pending_release (close never blocks).
         self._pending_release: list = []
@@ -332,8 +325,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
-        if hasattr(self, "_session_leaves"):
-            self._session_leaves.clear()
         if hasattr(self, "_pending_release"):
             self._pending_release.clear()
         self._empty_match_result = MatchResult(
@@ -550,48 +541,37 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self._tag_session_leaf(req, radix_key, node=new_last_node)
 
     def _radix_node_priority(self, req: Req) -> int:
-        """Node insert priority: session KV gets the floor (reclaimed first);
-        others keep req.priority. Sets NODE priority only, not req.priority."""
-        if getattr(req, "session_id", None) is not None:
-            return RADIX_NATIVE_SESSION_PRIORITY
+        """Node insert priority = req.priority (default 0). Session KV is
+        LRU-neutral: a session is a release-grouping tag, not an eviction class,
+        so it competes as ordinary radix KV. A per-session demote/protect hint
+        can set this later (see RFC #27574)."""
         return getattr(req, "priority", 0) or 0
 
-    def register_session(self, session_id: str) -> None:
-        """Track a session's leaves from open. Only registered sessions are
-        tagged, so a request finishing after close can't re-create the entry."""
-        self._session_leaves.setdefault(session_id, set())
-
     def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
-        """Tag this request's leaf node with its session_id for release_session.
-        No-op for non-session requests and for closed (unregistered) sessions."""
+        """Stamp this request's leaf node with its session_id so release_session
+        can find it at close. No-op for non-session requests. No open/registration:
+        the tag is the only session state, and release scans for it."""
         sid = getattr(req, "session_id", None)
-        if sid is None or sid not in self._session_leaves:
+        if sid is None:
             return
         if node is None:
             node = self.match_prefix(MatchPrefixParams(key=radix_key)).last_device_node
         if node is not None and node is not self.root_node:
             node.session_id = sid
-            self._session_leaves[sid].add(node)
-            logger.debug(
-                "tag session %s: node=%d len=%d (registered=%d)",
-                sid, node.id, len(node.key), len(self._session_leaves[sid]),
-            )
+            logger.debug("tag session %s: node=%d len=%d", sid, node.id, len(node.key))
 
     def release_session(self, session_id: str) -> int:
         """Queue a session's tagged leaves for deferred free (drained by
         drain_pending_release). Each seed frees the session's unique leaf->branch
-        chain; shared prefixes are branch points and are preserved."""
-        registered = self._session_leaves.pop(session_id, None)
-        if not registered:
-            logger.info("release_session %s: no tagged leaves", session_id)
-            return 0
+        chain; shared prefixes are branch points and are preserved. Finds the
+        leaves by scanning evictable_leaves for the session tag -- no per-session
+        index, so a request that finishes after close has nothing to leak."""
         seeds = [
-            n for n in registered if n in self.evictable_leaves and n.lock_ref == 0
+            n
+            for n in self.evictable_leaves
+            if getattr(n, "session_id", None) == session_id and n.lock_ref == 0
         ]
-        logger.info(
-            "release_session %s: %d leaves registered, %d seeds queued",
-            session_id, len(registered), len(seeds),
-        )
+        logger.info("release_session %s: %d seeds queued", session_id, len(seeds))
         self._pending_release.extend(seeds)
         return len(seeds)
 
