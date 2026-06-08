@@ -313,6 +313,13 @@ def compress_forward(
     out: Optional[torch.Tensor] = None,
     is_online: bool = False,
 ) -> torch.Tensor:
+    if not is_online and kv_score_input.dtype != kv_score_buffer.dtype:
+        # The C4/C128 v2 kernel templates a single dtype for the state buffer,
+        # ragged input and ape, and derives it from the input. The DSV4 state
+        # buffer (and ape) are always fp32, but on the HIP+AITER path the input
+        # arrives as bf16 (compute_kv_score skips the fp32 cast), so align the
+        # input to the buffer dtype to satisfy the kernel's TensorMatcher.
+        kv_score_input = kv_score_input.to(kv_score_buffer.dtype)
     if out is None:
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
