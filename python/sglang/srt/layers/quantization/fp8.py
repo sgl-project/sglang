@@ -1121,8 +1121,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
 
             assert quant_config.activation_scheme == "dynamic"
-            if get_moe_runner_backend().is_cutlass():
-                Fp8MoEMethod._ensure_cutlass_buffers_initialized(layer)
 
         else:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -1223,6 +1221,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             with_bias=with_bias,
             extra_weight_attrs=extra_weight_attrs,
         )
+
+        if self.block_quant and get_moe_runner_backend().is_cutlass():
+            self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
