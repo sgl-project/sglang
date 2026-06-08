@@ -29,7 +29,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.hicache_spec_storage_common import HiCacheSpecStorageMixin
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_cuda_ci(est_time=240, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=353, stage="extra-a", runner_config="2-gpu-large")
 
 
 @unittest.skipIf(

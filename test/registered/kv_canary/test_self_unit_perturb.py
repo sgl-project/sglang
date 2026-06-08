@@ -40,7 +40,7 @@ from sglang.test.test_utils import CustomTestCase
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
-register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestParseTargetGroupKind(CustomTestCase):

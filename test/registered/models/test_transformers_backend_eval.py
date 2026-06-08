@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=48, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=58, stage="base-b", runner_config="1-gpu-small")
 register_cpu_ci(est_time=320, suite="base-b-test-cpu")
 
 

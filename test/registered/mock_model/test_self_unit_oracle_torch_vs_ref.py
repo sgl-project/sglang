@@ -10,7 +10,7 @@ from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=7, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestHashOracleTorchVsRef(CustomTestCase):

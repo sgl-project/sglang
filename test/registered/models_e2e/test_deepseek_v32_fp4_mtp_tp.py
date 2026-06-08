@@ -6,7 +6,7 @@ from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
-register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=666, stage="base-c", runner_config="4-gpu-b200")
 
 DSV32_FP4_MODEL = "nvidia/DeepSeek-V3.2-NVFP4"
 

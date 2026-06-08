@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=168, stage="base-b", runner_config="1-gpu-large")
 
 
 def get_server_info(base_url: str) -> dict:

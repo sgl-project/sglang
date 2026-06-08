@@ -13,7 +13,7 @@ from sglang.test.kv_canary.fixtures import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="extra-a", runner_config="1-gpu-small")
 
 
 def _make_static_plan_input(*, bs_capacity: int, device) -> PlanInput:

@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_forward_batch
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="extra-a", runner_config="1-gpu-small")
 
 
 def _make_req(*, origin: list[int], output: list[int]) -> SimpleNamespace:

@@ -38,8 +38,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
     run_dsa_eagle_draft_cuda_graph_runner_case,
 )
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=36, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=34, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

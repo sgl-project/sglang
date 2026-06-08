@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=768, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=868, stage="base-c", runner_config="4-gpu-h100")
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):

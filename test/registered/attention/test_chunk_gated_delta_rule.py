@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-large")
 register_xpu_ci(est_time=900, suite="stage-a-test-1-gpu-xpu")
 
 

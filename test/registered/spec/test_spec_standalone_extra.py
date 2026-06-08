@@ -6,7 +6,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Non-V2 standalone speculative decoding tests (FA3, Triton, FlashInfer
 # backends). Sibling V2 classes stay per-commit in test_spec_standalone.py.
-register_cuda_ci(est_time=406, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=201, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestStandaloneSpeculativeDecodingBase(StandaloneServerBase, CustomTestCase):

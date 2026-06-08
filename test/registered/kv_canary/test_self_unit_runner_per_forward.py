@@ -20,7 +20,7 @@ from sglang.test.kv_canary.runner_test_base import (
     make_manager,
 )
 
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestManagerPerForward(CanaryManagerTestCase):

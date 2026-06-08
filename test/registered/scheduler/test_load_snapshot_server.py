@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=249, stage="base-b", runner_config="2-gpu-large")
 
 
 def _query_loads(base_url, retries=5, interval=2.0):
