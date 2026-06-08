@@ -672,8 +672,7 @@ async def print_exception_wrapper(func):
         if hasattr(func, "__self__") and isinstance(
             func.__self__, MultiTokenizerRouter
         ):
-            TokenizerManager.dump_requests_before_crash(
-                func.__self__.request_log_manager,
+            func.__self__.request_log_manager.dump_requests_before_crash(
                 rid_to_state=func.__self__.rid_to_state,
             )
         kill_process_tree(os.getpid(), include_parent=True)

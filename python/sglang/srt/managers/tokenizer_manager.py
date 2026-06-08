@@ -19,15 +19,10 @@ import asyncio
 import copy
 import logging
 import os
-import pickle
 import signal
-import socket
 import sys
 import threading
-import time
-from collections import deque
 from contextlib import nullcontext
-from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
 from typing import Awaitable, Dict, Iterable, List, Optional, Tuple, Union
@@ -114,12 +109,8 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.observability.req_time_stats import (
-    convert_time_to_realtime,
     real_time,
     set_time_batch,
-)
-from sglang.srt.observability.request_metrics_exporter import (
-    RequestMetricsExporterManager,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -136,13 +127,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
-from sglang.srt.utils.cudacore_pyspy_dump_utils import (
-    collect_scheduler_processes,
-    pyspy_dump_schedulers,
-    trigger_cuda_user_coredump,
-)
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -295,33 +280,6 @@ class TokenizerManager(TokenizerControlMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
-
-    def init_request_logging_and_dumping(self):
-        # TODO: Refactor and organize the log export code.
-        # Request logging
-        self.request_logger = RequestLogger(
-            log_requests=self.server_args.log_requests,
-            log_requests_level=self.server_args.log_requests_level,
-            log_requests_format=self.server_args.log_requests_format,
-            log_requests_target=self.server_args.log_requests_target,
-        )
-
-        # Dumping
-        self.dump_requests_folder = ""  # By default do not dump
-        self.dump_requests_threshold = 1000
-        self.dump_requests_exclude_meta_keys: List[str] = [
-            "routed_experts",
-            "hidden_states",
-        ]
-        self.dump_request_list: List[Tuple] = []
-        self.crash_dump_request_list: deque[Tuple] = deque()
-        self.crash_dump_performed = False  # Flag to ensure dump is only called once
-
-        # Initialize performance metrics loggers with proper skip names
-        _, obj_skip_names, out_skip_names = self.request_logger.metadata
-        self.request_metrics_exporter_manager = RequestMetricsExporterManager(
-            self.server_args, obj_skip_names, out_skip_names
-        )
 
     def init_request_log_manager(self):
         self.request_log_manager = RequestLogManager.from_server_args(
@@ -1381,17 +1339,13 @@ class TokenizerManager(TokenizerControlMixin):
                 and state.finished
                 and state.obj.log_metrics
             ):
-                TokenizerManager.dump_requests(
-                    self.request_log_manager, state, out_dict
-                )
+                self.request_log_manager.dump_requests(state, out_dict)
             if (
                 self.request_log_manager.crash_dump_folder
                 and state.finished
                 and state.obj.log_metrics
             ):
-                TokenizerManager.record_request_for_crash_dump(
-                    self.request_log_manager, state, out_dict
-                )
+                self.request_log_manager.record_request_for_crash_dump(state, out_dict)
 
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
@@ -1468,205 +1422,6 @@ class TokenizerManager(TokenizerControlMixin):
                 spec_verify_ct=spec_verify_ct,
             )
 
-    @staticmethod
-    def dump_requests(self: "RequestLogManager", state: ReqState, out_dict: dict):
-        if self.dump_requests_exclude_meta_keys and isinstance(
-            out_dict.get("meta_info"), dict
-        ):
-            exclude = self.dump_requests_exclude_meta_keys
-            if any(k in out_dict["meta_info"] for k in exclude):
-                filtered_meta = {
-                    k: v for k, v in out_dict["meta_info"].items() if k not in exclude
-                }
-                out_dict = {**out_dict, "meta_info": filtered_meta}
-
-        self.dump_request_list.append(
-            (
-                state.obj,
-                out_dict,
-                convert_time_to_realtime(state.time_stats.created_time),
-                convert_time_to_realtime(state.time_stats.finished_time),
-            )
-        )
-
-        if len(self.dump_request_list) >= self.dump_requests_threshold:
-            filename = os.path.join(
-                self.dump_requests_folder,
-                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
-            )
-            TokenizerManager._dump_data_to_file(
-                self,
-                data_list=self.dump_request_list,
-                filename=filename,
-                log_message=f"Dump {len(self.dump_request_list)} requests to {filename}",
-            )
-            self.dump_request_list = []
-
-    @staticmethod
-    def record_request_for_crash_dump(
-        self: "RequestLogManager", state: ReqState, out_dict: dict
-    ):
-        current_time = real_time()
-        self.crash_dump_request_list.append(
-            (
-                state.obj,
-                out_dict,
-                convert_time_to_realtime(state.time_stats.created_time),
-                current_time,
-            )
-        )
-        # Remove requests older than 5 minutes based on finish time
-        while (
-            self.crash_dump_request_list
-            and current_time - self.crash_dump_request_list[0][3] >= 300
-        ):
-            self.crash_dump_request_list.popleft()
-
-    @staticmethod
-    def _dump_data_to_file(
-        self: "RequestLogManager",
-        data_list: List[Tuple],
-        filename: str,
-        log_message: str,
-    ):
-        logger.info(log_message)
-        to_dump_with_server_args = {
-            "server_args": self.server_args,
-            "requests": data_list.copy(),
-        }
-
-        def background_task():
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            with open(filename, "wb") as f:
-                try:
-                    pickle.dump(to_dump_with_server_args, f)
-                except Exception as e:
-                    # When the server is launched with --trust-remote-code,
-                    # server_args sometimes fails to pickle. Retry without
-                    # server_args so the request data still gets persisted.
-                    logger.error(
-                        f"Failed to pickle dump with server_args: {e!r}; "
-                        "retrying without server_args"
-                    )
-                    f.seek(0)
-                    f.truncate()
-                    to_dump_with_server_args["server_args"] = None
-                    pickle.dump(to_dump_with_server_args, f)
-
-        asyncio.create_task(asyncio.to_thread(background_task))
-
-    @staticmethod
-    def dump_requests_before_crash(
-        self: "RequestLogManager",
-        *,
-        rid_to_state: Dict[str, ReqState],
-        hostname: str = os.getenv("HOSTNAME", socket.gethostname()),
-    ):
-        should_dump_pyspy = envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.get()
-        should_dump_cuda_coredump = envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.get()
-        should_dump_diagnostics = should_dump_pyspy or should_dump_cuda_coredump
-        if not self.crash_dump_folder and not should_dump_diagnostics:
-            return
-
-        if self.crash_dump_performed:
-            logger.info(
-                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
-            )
-            return
-        else:
-            self.crash_dump_performed = True
-
-        # Dump requests info
-        if self.crash_dump_folder:
-            logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
-
-            # Add finished requests from crash_dump_request_list
-            data_to_dump = []
-            if self.crash_dump_request_list:
-                data_to_dump.extend(self.crash_dump_request_list)
-
-            # Add unfinished requests from rid_to_state
-            unfinished_requests = []
-            for rid, state in rid_to_state.items():
-                if not state.finished:
-                    state.time_stats.set_finished_time()
-                    unfinished_requests.append(
-                        (
-                            state.obj,
-                            (
-                                state.out_list[-1]
-                                if state.out_list
-                                else state.get_crash_dump_output()
-                            ),
-                            convert_time_to_realtime(state.time_stats.created_time),
-                            convert_time_to_realtime(state.time_stats.finished_time),
-                        )
-                    )
-            if unfinished_requests:
-                data_to_dump.extend(unfinished_requests)
-
-            if data_to_dump:
-                # Create a file
-                filename = os.path.join(
-                    self.crash_dump_folder,
-                    hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
-                )
-                os.makedirs(os.path.dirname(filename), exist_ok=True)
-
-                # Write the data to the file
-                data_to_dump_with_server_args = {
-                    "server_args": self.server_args,
-                    "requests": data_to_dump,
-                    "launch_command": " ".join(sys.argv),
-                }
-                with open(filename, "wb") as f:
-                    try:
-                        pickle.dump(data_to_dump_with_server_args, f)
-                    except Exception as e:
-                        # When the server is launched with --trust-remote-code,
-                        # server_args sometimes fails to pickle. Retry without
-                        # server_args so the request data still gets persisted.
-                        logger.error(
-                            f"Failed to pickle dump with server_args: {e!r}; "
-                            "retrying without server_args"
-                        )
-                        f.seek(0)
-                        f.truncate()
-                        data_to_dump_with_server_args["server_args"] = None
-                        pickle.dump(data_to_dump_with_server_args, f)
-                logger.error(
-                    f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
-                )
-
-        # Dump pyspy and cuda coredump
-        if should_dump_diagnostics:
-            logger.info(
-                "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
-            )
-            time.sleep(5)
-
-            scheduler_procs = collect_scheduler_processes()
-            if scheduler_procs:
-                if should_dump_pyspy:
-                    pyspy_dump_schedulers(scheduler_only=True)
-
-                if should_dump_cuda_coredump:
-                    trigger_cuda_user_coredump(scheduler_only=True)
-                    cuda_coredump_wait_secs = (
-                        envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS.get()
-                    )
-                    if cuda_coredump_wait_secs > 0:
-                        logger.info(
-                            "Waiting %.1f seconds for CUDA coredumps before exiting.",
-                            cuda_coredump_wait_secs,
-                        )
-                        time.sleep(cuda_coredump_wait_secs)
-            else:
-                logger.error(
-                    "No live scheduler processes found; skipping py-spy and CUDA coredump."
-                )
-
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
@@ -1681,8 +1436,7 @@ class TokenizerManager(TokenizerControlMixin):
                 logger.error(
                     "Signal SIGTERM received while health check failed. Force exiting."
                 )
-                TokenizerManager.dump_requests_before_crash(
-                    self.request_log_manager,
+                self.request_log_manager.dump_requests_before_crash(
                     rid_to_state=self.rid_to_state,
                 )
                 self.force_exit_handler()
@@ -1898,9 +1652,8 @@ async def print_exception_wrapper(func):
         traceback = get_exception_traceback()
         logger.error(f"TokenizerManager hit an exception: {traceback}")
         if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
-            TokenizerManager.dump_requests_before_crash(
-                func.__self__.request_log_manager,
-                rid_to_state=func.__self__.rid_to_state,
+            func.__self__.request_log_manager.dump_requests_before_crash(
+                rid_to_state=func.__self__.rid_to_state
             )
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
@@ -1924,9 +1677,8 @@ class SignalHandler:
         # crash detection during normal shutdown
         if self.tokenizer_manager._subprocess_watchdog is not None:
             self.tokenizer_manager._subprocess_watchdog.stop()
-        TokenizerManager.dump_requests_before_crash(
-            self.tokenizer_manager.request_log_manager,
-            rid_to_state=self.tokenizer_manager.rid_to_state,
+        self.tokenizer_manager.request_log_manager.dump_requests_before_crash(
+            rid_to_state=self.tokenizer_manager.rid_to_state
         )
         kill_process_tree(os.getpid())
 
