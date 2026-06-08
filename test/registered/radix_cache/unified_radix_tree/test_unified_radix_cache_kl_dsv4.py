@@ -111,6 +111,8 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache L3 (file backend) + UnifiedRadixCache."""
 
+    extra_server_args: list[str] = []
+
     @classmethod
     def setUpClass(cls):
         cls.model = DSV4_FLASH_MODEL
@@ -148,6 +150,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
                 "--swa-full-tokens-ratio",
                 "0.25",
+                *cls.extra_server_args,
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
@@ -161,6 +164,17 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
+
+
+class TestUnifiedDeepSeekV4FlashHiCacheL3SWACheckpoint(
+    TestUnifiedDeepSeekV4FlashHiCacheL3
+):
+    """Same as TestUnifiedDeepSeekV4FlashHiCacheL3 but with periodic SWA
+    checkpoints to L3 enabled. Verifies that decode parity holds when only
+    a small subset of SWA pages reaches L3 storage.
+    """
+
+    extra_server_args = ["--hicache-swa-checkpoint-interval", "4096"]
 
 
 if __name__ == "__main__":

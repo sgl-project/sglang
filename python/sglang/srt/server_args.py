@@ -695,6 +695,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    hicache_swa_checkpoint_interval: int = 0
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -3766,6 +3767,22 @@ class ServerArgs:
         if io_changed:
             self._resolve_layout_io_compatibility()
 
+        # Step 5: Validate SWA periodic checkpoint interval against page_size.
+        # The sliding_window_size lower bound is checked in SWAComponent.__init__
+        # because sliding_window_size is derived per-worker, not known at ServerArgs level.
+        if self.hicache_swa_checkpoint_interval > 0:
+            ps = self.page_size
+            if (
+                ps is not None
+                and ps > 0
+                and self.hicache_swa_checkpoint_interval % ps != 0
+            ):
+                raise ValueError(
+                    f"--hicache-swa-checkpoint-interval "
+                    f"({self.hicache_swa_checkpoint_interval}) "
+                    f"must be a multiple of --page-size ({ps})."
+                )
+
     def _resolve_layout_io_compatibility(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -6324,6 +6341,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--hicache-swa-checkpoint-interval",
+            type=int,
+            default=ServerArgs.hicache_swa_checkpoint_interval,
+            help="Persist SWA pages to L3 storage only at sequence positions that are multiples of N tokens. "
+            "0 disables (writes every SWA leaf). When > 0, must be a multiple of --page-size and >= sliding_window_size.",
         )
 
         # Hierarchical sparse attention

@@ -59,6 +59,25 @@ class SWAComponent(TreeComponent):
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
+        # Smallest page-aligned size that still covers the sliding window.
+        page_size = cache.page_size
+        self.window_tail_size = (
+            (self.sliding_window_size + page_size - 1) // page_size * page_size
+        )
+
+        self.checkpoint_interval = params.swa_checkpoint_interval
+        if self.checkpoint_interval > 0:
+            if self.checkpoint_interval % page_size != 0:
+                raise ValueError(
+                    f"hicache_swa_checkpoint_interval ({self.checkpoint_interval}) "
+                    f"must be a multiple of page_size ({page_size})."
+                )
+            if self.checkpoint_interval < self.sliding_window_size:
+                raise ValueError(
+                    f"hicache_swa_checkpoint_interval ({self.checkpoint_interval}) "
+                    f"must be >= sliding_window_size ({self.sliding_window_size})."
+                )
+
     component_type = ComponentType.SWA
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
@@ -280,6 +299,7 @@ class SWAComponent(TreeComponent):
             return
 
         self._maybe_split_leaf_for_swa_lock(node)
+        self._maybe_split_for_checkpoints(node)
 
     def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
         """Cap a fresh SWA leaf at one page-aligned window so locking it pins
@@ -291,8 +311,7 @@ class SWAComponent(TreeComponent):
             return
 
         page_size = self.cache.page_size
-        # Smallest page-aligned size that still covers the sliding window.
-        tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
+        tail_size = self.window_tail_size
         leaf_len = len(leaf.key)
         if leaf_len <= tail_size:
             return
@@ -301,6 +320,42 @@ class SWAComponent(TreeComponent):
             return
 
         self.cache._split_node(leaf.key, leaf, split_at)
+
+    def _maybe_split_for_checkpoints(self, leaf: UnifiedTreeNode) -> None:
+        """Carve a window-sized tail at every k*N boundary inside SWA-bearing
+        ancestors so the L3 gate persists only those tails, not whole chunks.
+        """
+        if self.checkpoint_interval <= 0:
+            return
+
+        ct = self.component_type
+        N = self.checkpoint_interval
+        W_tail = self.window_tail_size
+
+        cur = leaf
+        while (
+            cur is not self.cache.root_node and cur.component_data[ct].value is not None
+        ):
+            start = cur.seqlen_start
+            end = start + len(cur.key)
+            pos = (start // N + 1) * N
+            while pos < end:
+                offset = pos - start
+                new_parent = self.cache._split_node(cur.key, cur, offset)
+                tail_offset = offset - W_tail
+                if tail_offset > 0:
+                    self.cache._split_node(new_parent.key, new_parent, tail_offset)
+                start = cur.seqlen_start
+                end = start + len(cur.key)
+                pos += N
+            cur = cur.parent
+
+    def _is_checkpoint_tail_node(self, node: UnifiedTreeNode) -> bool:
+        end = node.seqlen_start + len(node.key)
+        return (
+            end % self.checkpoint_interval == 0
+            and len(node.key) <= self.window_tail_size
+        )
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -592,6 +647,8 @@ class SWAComponent(TreeComponent):
                 return None
             num_pages = len(cd.host_value) // self.cache.page_size
             if num_pages == 0:
+                return None
+            if self.checkpoint_interval > 0 and not self._is_checkpoint_tail_node(node):
                 return None
             return [
                 PoolTransfer(
