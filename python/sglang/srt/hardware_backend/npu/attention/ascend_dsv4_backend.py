@@ -51,30 +51,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _build_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
-    """Sylvester-construction Walsh-Hadamard matrix of size n × n.
-
-    n must be a power of 2 (asserted by callers). Caches per (n, dtype, device)
-    on the function so repeated calls within a forward batch don't rebuild.
-    """
-    cache = _build_hadamard_matrix._cache  # type: ignore[attr-defined]
-    key = (n, dtype, str(device))
-    if key in cache:
-        return cache[key]
-    H = torch.tensor([[1.0]], dtype=torch.float32)
-    while H.size(0) < n:
-        H = torch.cat(
-            [torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)],
-            dim=0,
-        )
-    H = H.to(dtype=dtype, device=device).contiguous()
-    cache[key] = H
-    return H
-
-
-_build_hadamard_matrix._cache = {}  # type: ignore[attr-defined]
-
-
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
