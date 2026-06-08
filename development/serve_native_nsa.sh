@@ -54,6 +54,9 @@ PAGE_SIZE="${PAGE_SIZE:-64}"
 # headroom while keeping a large KV pool. (The DS launcher uses 0.6 because
 # it additionally reserves a per-rank TokenLabelTable; the baseline does not.)
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+# Fixed server seed so a paired DS-vs-baseline SLO comparison is seed-matched
+# (the only intended column differences are DS enablement/config + DS mem fraction).
+RANDOM_SEED="${RANDOM_SEED:-20260607}"
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
 
 # Radix-off parity knob for the quick smoke (see header NOTE). Default 0 keeps
@@ -91,6 +94,7 @@ exec python3 -m sglang.launch_server \
   --dsa-decode-backend flashmla_kv \
   --disable-overlap-schedule \
   --disable-piecewise-cuda-graph \
+  --random-seed "${RANDOM_SEED}" \
   ${RADIX_CACHE_ARG} \
   --trust-remote-code \
   2>&1 | tee "${LOG_FILE}"

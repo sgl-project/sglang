@@ -52,6 +52,9 @@ SIGNATURE_DTYPE="${SIGNATURE_DTYPE:-fp16}"
 # generation on V3.2/H200. 0.6 boots and serves stably (verified): weights are
 # ~80 GB/rank, leaving a small KV pool plus ~38 GB of runtime headroom.
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.6}"
+# Fixed server seed so a paired DS-vs-baseline SLO comparison is seed-matched
+# (the only intended column differences are DS enablement/config + DS mem fraction).
+RANDOM_SEED="${RANDOM_SEED:-20260607}"
 
 # Loop-7 measurement op-point. The stock defaults (fp16 / mem 0.6) are the safe
 # fp16-table boot point, NOT the Loop-7 baseline/oracle/M1 operating point
@@ -156,6 +159,7 @@ exec python3 -m sglang.launch_server \
   --disable-piecewise-cuda-graph \
   --enable-double-sparsity \
   --double-sparsity-config "${DS_CONFIG}" \
+  --random-seed "${RANDOM_SEED}" \
   "${CUDA_GRAPH_ARGS[@]}" \
   `# Radix cache: --disable-radix-cache (default radix-off) or the` \
   `# fixtures-passed artifact path (radix-on), selected above.` \

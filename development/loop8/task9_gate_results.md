@@ -51,39 +51,45 @@ conc 64 TTFT is cold-burst-inflated, per BL-20260530-cold-flood-not-steady-state
   trained DSA indexer; DS is the default-off long-context-recall fallback, not a throughput win here).
 - Artifacts: `runs/20260607_glm51_loop8/parity_{dsa,ds}_c{16,32,64}.jsonl`.
 
-### Reading (characterization)
-At the standard client op-point, **DS-on is slower than DSA-native** (decode 17 vs 30 tok/s) and its P99
-TTFT (43 s) is admission-bound by the smaller DS KV pool (mem 0.7 + per-rank TokenLabelTable → achieved
-conc 26.5 < 32). DSA-native nearly meets the bar (decode P50 29.63, marginally under 30 at conc 32;
-P99 TTFT 15.6 s < 22 s — passes TTFT). Decode is **coherent** (not degenerate). This is the **expected**
-posture from the plan: GLM ships a strong trained DSA indexer, so DS is the **reversible default-OFF
-opt-in fallback**, valuable where the indexer underperforms (long-context recall), **not** a throughput
-win on the standard workload.
+### Reading (characterization) — R5 parity numbers
+At the standard client op-point, **DS-on is slower than DSA-native** (decode P50 17.1 vs 31.5 tok/s at
+conc 32) and its P99 TTFT is admission-bound by the smaller DS KV pool (mem 0.7 + per-rank
+TokenLabelTable → achieved conc 22.6 < 32). **DSA-native PASSES** the SLO at conc 16 (38.7 tok/s / 7.2 s)
+and conc 32 (31.5 tok/s / 14.2 s), and fails only at conc 64 (24.4 / 28.3 s — a cold-burst short run).
+**DS-on fails the decode-TPS ≥ 30 bar at EVERY concurrency** (23.2 / 17.1 / 17.1). Decode is **coherent**
+(not degenerate). This is the **expected** posture from the plan: GLM ships a strong trained DSA indexer,
+so DS is the **reversible default-OFF opt-in fallback**, valuable where the indexer underperforms
+(long-context recall), **not** a throughput win on the standard workload.
 
-## Accuracy gates (i) MMLU + (ii) NIAH — PENDING
+## Accuracy gates (i) MMLU + (ii) NIAH — PENDING (executable offline path landed R6)
 `test/manual/test_double_sparsity_v32.py` requires `DS_BASE_URL` **and** `DSA_BASE_URL` live
-simultaneously (skipUnless), but two TP=8 servers cannot co-reside on 8×H200. **Execution plan:** run the
-two columns sequentially and reconcile offline (boot DSA → score MMLU/NIAH → persist; boot DS → score →
-persist; compare), OR run both at TP=4 (4+4 GPUs) for the accuracy comparison only (accuracy is
-op-point-insensitive vs the SLO). `AC12_INDEX_TOPK=2048` (GLM index_topk = 2048); NIAH within-budget
-(≤2048 tokens) is the fair recall gate; beyond-budget (4K/16K/64K) is characterization-only.
+simultaneously (skipUnless); two TP=8 servers cannot co-reside on 8×H200 **and GLM-5.1 cannot run at TP=4**
+(weights ~2× exceed a single H200), so the only viable path is **sequential collect + offline compare**.
+`development/loop8/accuracy_gate.py` provides it (reusing the harness's tuned MMLU parser + deterministic
+NIAH prompt-gen + recall scorer): `AC12_MODE=collect` scores ONE live server (`AC12_SIDE=dsa|ds`,
+`AC12_BASE_URL=…`) and writes a per-side artifact (run_id + prompt-set hashes + hits/totals + index_topk);
+`AC12_MODE=compare` (offline, no server) validates the two sides used the same prompt set and applies the
+mandatory thresholds (MMLU DS within 1.0 pp of DSA; within-budget NIAH DS within 5.0 pp; beyond-budget =
+characterization-only), failing closed on any mismatch. Offline-compare unit tests:
+`test/registered/unit/test_accuracy_gate_compare.py` (9 pass). `AC12_INDEX_TOPK=2048` (GLM index_topk).
+**The scoring RUN (collect DSA → collect DS → compare) on hardware is the next round.**
 
 ## DEC-2 landing-policy assessment (preliminary)
 - **AC-1 DS-off byte-identical (mandatory): PASS** (task7, R3 — GLM DSA-native byte-identical HEAD vs
   d018026f9, 6/6 prompts).
-- **MMLU within tolerance of DSA (mandatory): PENDING** (accuracy gate not yet run).
+- **MMLU within tolerance of DSA (mandatory): PENDING** (offline gate path landed R6; scoring run next).
 - **DS-vs-DSA non-regression of the shipped default (mandatory): PASS** — the served default is DSA-native
   (DS default-off); AC-1 proves it unregressed.
-- **SLO decode-TPS ≥ 30 + P99 TTFT < 22 s (mandatory): DS-on FAILS (preliminary, conc 32)** — decode P50
-  17.12 < 30 and P99 TTFT 43.4 s ≥ 22 s. Note the **DSA-native** column ALSO does **not** pass the
-  decode-TPS bar at conc 32 (P50 29.63 < 30); it passes only TTFT (15.6 s < 22 s). Both are preliminary
-  (conc 32, 64 prompts, no locked window); the conc-16/32/64 curve + locked sweep are needed for the
-  authoritative numbers.
+- **SLO decode-TPS ≥ 30 + P99 TTFT < 22 s (mandatory): DS-on FAILS (R5 parity, preliminary window)** —
+  decode P50 17.1 < 30 at every concurrency (23.2/17.1/17.1) and P99 TTFT fails at conc 32/64. The
+  **DSA-native** column PASSES the SLO at conc 16/32 (38.7/31.5 tok/s ≥ 30, TTFT < 22 s) and fails conc 64
+  (cold-burst). Preliminary window (`num_prompts=conc`, no 600 s); the locked 3×600 s sweep is needed for
+  the authoritative steady-state numbers (esp. conc 64).
 - **NIAH / long-context recall (characterization-only): PENDING.**
 
 **Landing status per DEC-2 (unchanged — SLO mandatory):** DEC-2 resolves "parity + SLO mandatory-to-land".
-On the preliminary conc-32 data, **DS-on does not meet the mandatory SLO** (fails both decode-TPS and P99
-TTFT), and even DSA-native is marginally under the 30-TPS bar at conc 32. This record does **not**
+On the R5 parity (preliminary-window) data, **DS-on does not meet the mandatory SLO** (fails decode-TPS at
+all concurrencies + TTFT at conc 32/64), while DSA-native passes at conc 16/32. This record does **not**
 reinterpret DEC-2. Resolving the landing therefore requires the authoritative conc-16/32/64 + locked-window
 numbers and, if DS-on still fails (expected, given GLM's strong trained indexer makes DS the default-off
 recall fallback rather than a throughput win), an **explicit user plan-evolution decision** on whether a
@@ -109,24 +115,37 @@ The same inherited DS wiring + bind-time `verify_bind_shapes` gate serve both sh
 GLM 192/256) — see task6_serving_smoke.md.
 
 ## Repro
-**SLO (per column, sequential on the same node):**
+**SLO — sequential per column via the PAIRED launchers (launch-arg parity; seed-matched as of R6):**
 ```bash
-# DSA column: boot GLM DS-off (mem 0.8), then:
-python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30000 \
-  --dataset-name generated-shared-prefix --gsp-num-groups 1 --gsp-prompts-per-group 64 \
-  --gsp-system-prompt-len 2253 --gsp-question-len 1843 --gsp-output-len 512 --gsp-range-ratio 1.0 \
-  --num-prompts 64 --max-concurrency 32 --seed 431 --output-file gate_dsa_c32.jsonl --output-details
-# DS column: boot GLM DS-on with the 256 mask (mem 0.7) via development/serve_double_sparsity.sh
-#   (MODEL_PATH=<glm snapshot> CHANNEL_MASK_PATH=/models/glm51-fp8-channel-mask-s256.safetensors), then
-#   the same bench_serving line → gate_ds_c32.jsonl.
-python development/benchmark_compare.py --baseline gate_dsa_c32.jsonl --ds gate_ds_c32.jsonl
+GLM=/cluster-storage/models/models--zai-org--GLM-5.1-FP8/snapshots/f396cf805182f4ca10fa675e1a99815b3ca384db
+# DSA-native column:
+MODEL_PATH=$GLM MEM_FRACTION_STATIC=0.8 DISABLE_RADIX_CACHE=1 RANDOM_SEED=20260607 PORT=30000 \
+  bash development/serve_native_nsa.sh   # then bench_serving (gsp 2253+1843/512) per conc -> parity_dsa_c{16,32,64}.jsonl
+# DS column (shut DSA first):
+MODEL_PATH=$GLM CHANNEL_MASK_PATH=/models/glm51-fp8-channel-mask-s256.safetensors \
+  MEM_FRACTION_STATIC=0.7 RANDOM_SEED=20260607 PORT=30000 \
+  bash development/serve_double_sparsity.sh   # then the same bench_serving per conc -> parity_ds_c{16,32,64}.jsonl
+python development/benchmark_compare.py --baseline parity_dsa_c32.jsonl --ds parity_ds_c32.jsonl
 ```
-**Full locked landing sweep (next):** `development/benchmark_baseline.sh` (MODE=native_nsa) + `benchmark.sh`
-(MODE=double_sparsity) with conc 16/32/64, TRIALS=3, WARMUP_SECONDS=120, MEASUREMENT_WINDOW_S=600, then
-`benchmark_compare.py --ac11`. **Accuracy:** `DS_BASE_URL=… DSA_BASE_URL=… AC12_INDEX_TOPK=2048
-PYTHONPATH=python python -m pytest test/manual/test_double_sparsity_v32.py -v` (sequential per the plan above).
+**Full locked landing sweep (next round):** `development/benchmark_baseline.sh` (MODE=native_nsa) +
+`benchmark.sh` (MODE=double_sparsity) with `CONCURRENCIES="16 32 64" NUM_PROMPTS=320 TRIALS=3
+WARMUP_SECONDS=120 MEASUREMENT_WINDOW_S=600 RANDOM_SEED=20260607`, then `benchmark_compare.py --ac11`.
+**Accuracy — sequential collect + offline compare (the executable path; both-URLs-at-once is infeasible):**
+```bash
+# boot DSA-native, then:
+AC12_MODE=collect AC12_SIDE=dsa AC12_BASE_URL=http://127.0.0.1:30000 AC12_INDEX_TOPK=2048 \
+  python development/loop8/accuracy_gate.py
+# shut DSA, boot DS (256 mask), then:
+AC12_MODE=collect AC12_SIDE=ds  AC12_BASE_URL=http://127.0.0.1:30000 AC12_INDEX_TOPK=2048 \
+  python development/loop8/accuracy_gate.py
+# offline (no server):
+AC12_MODE=compare AC12_DSA_ARTIFACT=<dsa.json> AC12_DS_ARTIFACT=<ds.json> \
+  python development/loop8/accuracy_gate.py   # exit 0 iff MMLU within 1.0pp AND within-budget NIAH within 5.0pp
+```
 
 ## Remaining for the final landing record
-1. Accuracy gates (MMLU + NIAH within/beyond budget), DS vs DSA.
-2. Full locked SLO sweep (conc 16/32/64 × 3 trials × 600 s) for landing-grade decode-TPS + P99 TTFT.
-3. Resolve the DEC-2 SLO-applies-to-default-vs-DS-on landing question with the user.
+1. **Accuracy gates** — RUN the collect→collect→compare flow on hardware (path landed R6, scoring run next).
+2. **Full locked SLO sweep** (conc 16/32/64 × 3 trials × 600 s) for landing-grade steady-state numbers.
+3. **DEC-2 landing decision (user)** — DS-on fails the mandatory SLO at all concurrencies; whether a
+   default-off DS opt-in may land anyway (plan framing) vs literal DEC-2 SLO-mandatory is the user's call,
+   recorded as plan evolution if relaxed.
