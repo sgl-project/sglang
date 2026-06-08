@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import logging
 import os
 import pickle
@@ -80,7 +79,10 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_components import logprob_ops
+from sglang.srt.managers.tokenizer_manager_components import (
+    logprob_ops,
+    request_tracing,
+)
 from sglang.srt.managers.tokenizer_manager_components.request_state import (
     ReqState,
     init_req,
@@ -101,7 +103,6 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
-from sglang.srt.observability.trace import SpanAttributes
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -1935,7 +1936,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:
                     state.time_stats.trace_ctx.trace_set_root_attrs(
-                        TokenizerManager.convert_to_span_attrs(
+                        request_tracing.make_span_attrs(
                             state=state,
                             recv_obj=recv_obj,
                             i=i,
@@ -2545,78 +2546,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self.mm_receiver.send_encode_request(obj)
             else:
                 obj.need_wait_for_mm_inputs = False
-
-    @staticmethod
-    def convert_to_span_attrs(
-        *,
-        state: ReqState,
-        recv_obj: Union[
-            BatchStrOutput,
-            BatchEmbeddingOutput,
-            BatchTokenIDOutput,
-        ],
-        i: int,
-        enable_trace: bool,
-        served_model_name: str,
-    ) -> Dict[str, Any]:
-        """Convert attributes to span attributes."""
-        span_attrs = {}
-
-        if not enable_trace:
-            return span_attrs
-
-        # Token usage attributes
-        if not isinstance(recv_obj, BatchEmbeddingOutput):
-            span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
-                recv_obj.completion_tokens[i]
-            )
-        span_attrs[SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = recv_obj.prompt_tokens[
-            i
-        ]
-        span_attrs[SpanAttributes.GEN_AI_USAGE_CACHED_TOKENS] = recv_obj.cached_tokens[
-            i
-        ]
-
-        # Request identifiers
-        span_attrs[SpanAttributes.GEN_AI_REQUEST_ID] = (
-            str(state.obj.rid) if state.obj.rid else None
-        )
-
-        # Sampling parameters
-        sampling_params = state.obj.sampling_params or {}
-
-        if max_new_tokens := sampling_params.get("max_new_tokens"):
-            span_attrs[SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS] = max_new_tokens
-
-        if top_p := sampling_params.get("top_p"):
-            span_attrs[SpanAttributes.GEN_AI_REQUEST_TOP_P] = top_p
-
-        if temperature := sampling_params.get("temperature"):
-            span_attrs[SpanAttributes.GEN_AI_REQUEST_TEMPERATURE] = temperature
-
-        if top_k := sampling_params.get("top_k"):
-            span_attrs[SpanAttributes.GEN_AI_REQUEST_TOP_K] = top_k
-
-        if n := sampling_params.get("n"):
-            span_attrs[SpanAttributes.GEN_AI_REQUEST_N] = n
-
-        # Response attributes
-        span_attrs[SpanAttributes.GEN_AI_RESPONSE_MODEL] = served_model_name
-
-        finish_reason = (
-            recv_obj.finished_reasons[i].get("type")
-            if recv_obj.finished_reasons[i]
-            else None
-        )
-        if finish_reason:
-            span_attrs[SpanAttributes.GEN_AI_RESPONSE_FINISH_REASONS] = json.dumps(
-                [finish_reason]
-            )
-
-        # Latency attributes
-        span_attrs.update(state.time_stats.convert_to_gen_ai_span_attrs())
-
-        return span_attrs
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         """Set the default priority value."""
