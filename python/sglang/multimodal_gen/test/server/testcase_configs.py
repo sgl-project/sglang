@@ -427,6 +427,61 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
+
+IDEOGRAM4_CI_PROMPT = json.dumps(
+    {
+        "high_level_description": IDEOGRAM4_CI_TEXT_PROMPT,
+        "style_description": {
+            "aesthetics": "warm, peaceful, vibrant",
+            "lighting": "bright afternoon sunlight, long soft shadows",
+            "photo": "shallow depth of field, eye-level, 85mm lens",
+            "medium": "photograph",
+            "color_palette": [
+                "#F5C542",
+                "#87CEEB",
+                "#4A4A4A",
+                "#FFFFFF",
+                "#2E8B57",
+            ],
+        },
+        "compositional_deconstruction": {
+            "background": (
+                "A sunlit garden path with green hedges and a wooden bench. "
+                "Dappled light filters through overhead trees."
+            ),
+            "elements": [
+                {
+                    "type": "obj",
+                    "bbox": [260, 260, 760, 780],
+                    "desc": (
+                        "A small tabby cat sitting calmly on a wooden bench, "
+                        "looking toward the camera."
+                    ),
+                },
+                {
+                    "type": "obj",
+                    "bbox": [180, 580, 840, 840],
+                    "desc": (
+                        "A weathered wooden garden bench with soft sunlight "
+                        "falling across the seat."
+                    ),
+                },
+            ],
+        },
+    },
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
+
+IDEOGRAM4_CI_sampling_params = replace(
+    T2I_sampling_params,
+    prompt=IDEOGRAM4_CI_PROMPT,
+    output_size="1024x1024",
+    output_format="png",
+    extras={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",

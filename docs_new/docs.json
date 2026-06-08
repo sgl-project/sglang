@@ -1115,6 +1115,13 @@
                     ]
                   },
                   {
+                    "group": "Ideogram",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Ideogram/Ideogram4"
+                    ]
+                  },
+                  {
                     "group": "Wan",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
