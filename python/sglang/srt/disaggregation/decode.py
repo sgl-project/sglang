@@ -1055,7 +1055,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @property
     def num_tokens_pre_allocated(self):
         return sum(
-            decode_req.req.extend_fill_len for decode_req in self.transfer_queue.queue
+            decode_req.req.extend_range.end for decode_req in self.transfer_queue.queue
         )
 
     def _need_space_for_single_req(
@@ -1393,12 +1393,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        # Truncate the extend end to kv_committed_len so cache_unfinished_req only
-        # inserts committed KV into the radix tree (output_ids is 1 ahead, so the
-        # last output token has no committed KV yet). The extend start is the full
-        # committed prefix (L1+L2+L3) total_prefix_len, NOT len(prefix_indices):
-        # the [prefix_len, total_prefix_len) host/storage portion is loaded back
-        # later, so the freshly-ingested span is [total_prefix_len, kv_committed_len).
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
 
         # Return the transfer destination indices:
@@ -1853,9 +1847,6 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                # Truncate the extend end to kv_committed_len so cache_unfinished_req
-                # only sees committed KV (full array includes one uncommitted
-                # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
                     req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:

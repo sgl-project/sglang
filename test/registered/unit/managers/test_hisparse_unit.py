@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -57,8 +58,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
     req.finished = lambda: req.finished_reason is not None
 
     def _set_extend_range(start, end):
-        req.extend_input_len = end - start
-        req.extend_fill_len = end
+        req.extend_range = Range(start, end)
 
     req.set_extend_range = _set_extend_range
     return req
@@ -213,7 +213,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
-        req.extend_fill_len = fill_len
+        req.extend_range = Range(0, fill_len)
         return kv_loc
 
     # ==================================================================
@@ -682,7 +682,7 @@ class TestHiSparseUnit(unittest.TestCase):
         )
         self.assertEqual(req.kv_allocated_len, fill_len)
         self.assertEqual(req.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_input_len, fill_len)
+        self.assertEqual(req.extend_range.length, fill_len)
 
         rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
         self.assertEqual(

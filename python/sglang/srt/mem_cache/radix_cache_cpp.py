@@ -211,8 +211,8 @@ class RadixCacheCpp(BasePrefixCache):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
         assert (
-            req.extend_fill_len == req.kv_committed_len
-        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_fill_len=} {req.kv_committed_len=}"
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[

@@ -678,7 +678,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Truncate input length to available tokens and update request metadata
-        cand_len = req.get_uncommitted_extend_len()
+        cand_len = req.get_full_untruncated_fill_len() - len(req.prefix_indices)
         truncated = cand_len > _rem_tokens
         new_len = min(cand_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -691,7 +691,7 @@ class PrefillAdder:
             else 0
         )
         self._update_prefill_budget(
-            0, req.extend_input_len, max_new_tokens, req.retracted_stain
+            0, req.extend_range.length, max_new_tokens, req.retracted_stain
         )
 
         # Return based on remaining token availability
@@ -719,14 +719,14 @@ class PrefillAdder:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
-        cand_len = req.get_uncommitted_extend_len()
+        cand_len = req.get_full_untruncated_fill_len() - len(req.prefix_indices)
         truncated = cand_len > _rem_tokens
         new_len = min(cand_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
-            req.extend_input_len,
+            req.extend_range.length,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
                 if not truncated
@@ -756,7 +756,7 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
-        cand_len = req.get_uncommitted_extend_len()
+        cand_len = req.get_full_untruncated_fill_len() - len(req.prefix_indices)
         paged_input = self.ceil_paged_tokens(cand_len)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
@@ -834,7 +834,7 @@ class PrefillAdder:
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
-                req.extend_input_len,
+                req.extend_range.length,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
             )
@@ -889,7 +889,7 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_len = req.get_uncommitted_extend_len()
+        cand_len = req.get_full_untruncated_fill_len() - len(req.prefix_indices)
         total_tokens = cand_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -941,9 +941,9 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            # Recompute the candidate against the (possibly host-loaded-back)
-            # prefix length, which may have grown just above.
-            input_tokens = self.ceil_paged_tokens(req.get_uncommitted_extend_len())
+            input_tokens = self.ceil_paged_tokens(
+                req.get_full_untruncated_fill_len() - len(req.prefix_indices)
+            )
 
             if (
                 self.rem_chunk_tokens is None
@@ -1052,7 +1052,8 @@ class PrefillAdder:
 
         preemptible_reqs = []
         min_tokens_to_remove = (
-            req.get_uncommitted_extend_len()
+            req.get_full_untruncated_fill_len()
+            - len(req.prefix_indices)
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )

@@ -12,9 +12,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ExtendRange, Req
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -34,7 +35,7 @@ def _make_req(
     req.output_ids = array("q")
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
-    req.extend_range = ExtendRange(fill_len - extend_input_len, fill_len)
+    req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.cache_protected_len = 0

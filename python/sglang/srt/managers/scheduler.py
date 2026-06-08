@@ -1227,7 +1227,7 @@ class Scheduler(
             request_lengths = []
             for req in batch.reqs:
                 start = len(req.prefix_indices)
-                end = start + req.extend_input_len
+                end = start + req.extend_range.length
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
@@ -2438,7 +2438,7 @@ class Scheduler(
             # beyond what is already cached. A parked chunk (add_chunked_req
             # hybrid-SWA early-return) leaves extend_fill_len == len(prefix_indices),
             # so there is nothing new to cache and stashing would be a no-op.
-            if self.chunked_req.extend_fill_len > len(self.chunked_req.prefix_indices):
+            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -2777,7 +2777,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_input_len
+                    self.chunked_req.extend_range.length
                     if self.chunked_req is not None
                     else 0
                 ),
@@ -3105,7 +3105,7 @@ class Scheduler(
             # we can use the correct values in output processing.
             if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
-                    req.extend_input_len for req in batch.reqs
+                    req.extend_range.length for req in batch.reqs
                 ]
                 batch_result.extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs

@@ -723,8 +723,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         assert (
-            req.extend_fill_len == req.kv_committed_len
-        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_fill_len=} {req.kv_committed_len=}"
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
 
         if self.disable:
