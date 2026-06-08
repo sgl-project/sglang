@@ -38,6 +38,8 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 logger = __import__("logging").getLogger(__name__)
 
 
@@ -698,11 +700,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
             output = trtllm_fp8_block_scale_moe_wrapper(
-                routing_logits=(
-                    router_logits.to(torch.float32)
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else router_logits
-                ),
+                routing_logits=router_logits,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
@@ -758,11 +756,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
 
-        # The DeepSeekV3 routing method requires float32 router logits.
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-        else:
-            router_logits = router_logits.to(torch.bfloat16)
+        router_logits = router_logits.to(torch.bfloat16)
 
         output = trtllm_fp8_per_tensor_scale_moe_wrapper(
             routing_logits=router_logits,
@@ -884,9 +878,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
         from flashinfer import SfLayout, nvfp4_quantize
 
+        e4m3_max = 448.0
+        if (
+            envs.FLASHINFER_NVFP4_4OVER6.get()
+            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+        ):
+            e4m3_max = 256.0
+
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (448.0 * 6.0),
+            1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
         )
@@ -907,6 +908,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     activation_type = get_activation_type(
         runner_config.activation, is_gated=runner_config.is_gated
     )
+
+    # Build per-expert clamp-limit tensor from the per-layer scalar.
+    _clamp_val = runner_config.gemm1_clamp_limit
+    if _clamp_val is not None:
+        gemm1_clamp_limit = torch.full(
+            (quant_info.local_num_experts,),
+            _clamp_val,
+            dtype=torch.float32,
+            device=hs_fp4.device,
+        )
+    else:
+        gemm1_clamp_limit = None
 
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
@@ -932,6 +945,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
             )
 
+    # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
+    if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
+        use_routed_topk = True
+
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
 
@@ -948,7 +965,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
@@ -977,10 +994,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         topk_config = topk_output.topk_config
         routing_method_type = quant_info.routing_method_type
 
-        # DeepSeekV3 style routing requires float32 router logits
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-
         correction_bias = (
             None
             if topk_config.correction_bias is None
@@ -996,7 +1009,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
@@ -1205,3 +1218,9 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
     )
+
+
+# Register the experimental experimental_sgl_trtllm MoE fused-func (MoeRunner needs it at
+# build time even for LoRA); gated by the master switch so the upstream path is untouched.
+if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+    from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401

@@ -60,11 +60,7 @@ class TestEagleConstrainedDecoding(
             cls.grammar_backend,
         ]
         launch_args.extend(cls.other_launch_args)
-        with (
-            envs.SGLANG_ENABLE_SPEC_V2.override(cls.spec_v2),
-            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
-            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
-        ):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(cls.spec_v2):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

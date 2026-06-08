@@ -7,6 +7,7 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -58,13 +59,18 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
-    module = _jit_fused_store_module(
-        name=type,
-        input_dtype=input.dtype,
-        index_dtype=indices.dtype,
-        page_size=page_size,
-    )
-    module.run(input, cache, indices)
+    if is_hip_runtime():
+        from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache
+
+        triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
+    else:
+        module = _jit_fused_store_module(
+            name=type,
+            input_dtype=input.dtype,
+            index_dtype=indices.dtype,
+            page_size=page_size,
+        )
+        module.run(input, cache, indices)
 
 
 @triton.jit

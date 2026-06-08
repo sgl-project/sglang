@@ -233,6 +233,16 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg(
             )
             tl.store(p_Ai_ij, b_Ai_ij.to(A.dtype.element_ty), boundary_check=(0, 1))
 
+    # Clean up scratch slots: Pass 2 stored raw A_ij blocks in the upper-triangular
+    # part of row i_tc0 (cols BC..3*BC). These must be zeroed because
+    # recompute_w_u_fwd reads the full BT×BT block.
+    b_zero = tl.zeros([BC, BC], dtype=tl.float32)
+    for sc in tl.static_range(1, BT // BC):
+        p_scratch = tl.make_block_ptr(
+            A, (T, BT), (H * BT, 1), (i_tc0, sc * BC), (BC, BC), (1, 0)
+        )
+        tl.store(p_scratch, b_zero.to(A.dtype.element_ty), boundary_check=(0, 1))
+
 
 def chunk_gated_delta_rule_fwd_intra(
     k: torch.Tensor,
