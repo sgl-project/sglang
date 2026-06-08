@@ -69,7 +69,6 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -1588,6 +1587,34 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ):
+        if forward_batch.contains_mm_inputs():
+            raise NotImplementedError(
+                "Qwen3.5 multimodal split-prefill is not supported"
+            )
+
+        _, end = split_interval
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        self.model.forward_split_prefill(
+            input_ids, positions, forward_batch, split_interval, input_embeds
+        )
+
+        if end == self.end_layer:
+            return self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        return None
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2078,38 +2105,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         split_interval: Tuple[int, int],
         input_embeds: torch.Tensor = None,
     ):
-        start, end = split_interval
+        if forward_batch.contains_mm_inputs():
+            raise NotImplementedError(
+                "Qwen3.5 multimodal split-prefill is not supported"
+            )
 
-        # Handle mrope positions
+        _, end = split_interval
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        # On first chunk, handle visual + text embeddings
-        if start == 0:
-            if forward_batch.contains_image_inputs():
-                input_embeds = general_mm_embed_routine(
-                    input_ids=input_ids,
-                    forward_batch=forward_batch,
-                    language_model=self.model,
-                    multimodal_model=self,
-                    positions=positions,
-                    use_deepstack=self.use_deepstack,
-                    pp_proxy_tensors=None,
-                    return_hidden_states_only=True,
-                )
-
-        # Delegate layer computation to inner language model
         self.model.forward_split_prefill(
             input_ids, positions, forward_batch, split_interval, input_embeds
         )
 
-        # On last chunk, apply logits
         if end == self.end_layer:
-            result = self.logits_processor(
+            return self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
             )
-            return result
-
         return None
 
 
