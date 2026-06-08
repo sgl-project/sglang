@@ -42,11 +42,13 @@ class ReqDllmMixin:
         prefix_length = len(self.prefix_indices)
         min_required_length = prefix_length + self.dllm_config.block_size
 
-        if len(self.full_untruncated_fill_ids) < min_required_length:
+        if self.get_full_untruncated_fill_len() < min_required_length:
             # still incoming stage
             return
 
-        input_block = self.full_untruncated_fill_ids[prefix_length:min_required_length]
+        input_block = self.get_full_untruncated_fill_ids()[
+            prefix_length:min_required_length
+        ]
         is_prefill_phase = self.dllm_config.mask_id not in input_block
 
         if is_prefill_phase:
@@ -65,7 +67,7 @@ class ReqDllmMixin:
             + self.output_ids
             + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
         )
-        self.fill_len = len(self.full_untruncated_fill_ids)
+        self.fill_len = self.get_full_untruncated_fill_len()
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)

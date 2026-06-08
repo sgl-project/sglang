@@ -1096,7 +1096,8 @@ class Req(ReqDllmMixin):
         else:
             self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
-        input_len = len(self.full_untruncated_fill_ids)
+        full_fill_ids = self.get_full_untruncated_fill_ids()
+        input_len = len(full_fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1114,7 +1115,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
+        token_ids_to_match = full_fill_ids[
             : self._compute_max_prefix_len(input_len)
         ]
 
@@ -1446,7 +1447,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.full_untruncated_fill_ids)
+            logprob_start_len = self.get_full_untruncated_fill_len()
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -2288,7 +2289,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for req in running_batch.reqs:
             req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-            req.fill_len = len(req.full_untruncated_fill_ids)
+            req.fill_len = req.get_full_untruncated_fill_len()
             req.set_extend_input_len(1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
