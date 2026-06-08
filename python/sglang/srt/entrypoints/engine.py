@@ -1153,7 +1153,9 @@ class Engine(EngineScoreMixin, EngineBase):
             load_format=load_format,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+            TokenizerManager.load_lora_adapter_from_tensors(
+                self.tokenizer_manager.lora_controller, lora_req, None
+            )
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
@@ -1166,7 +1168,9 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
         return self.loop.run_until_complete(
-            self.tokenizer_manager.load_lora_adapter(obj, None)
+            TokenizerManager.load_lora_adapter(
+                self.tokenizer_manager.lora_controller, obj, None
+            )
         )
 
     def unload_lora_adapter(self, lora_name: str):
@@ -1175,7 +1179,9 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
         return self.loop.run_until_complete(
-            self.tokenizer_manager.unload_lora_adapter(obj, None)
+            TokenizerManager.unload_lora_adapter(
+                self.tokenizer_manager.lora_controller, obj, None
+            )
         )
 
     async def async_load_lora_adapter(
@@ -1193,7 +1199,9 @@ class Engine(EngineScoreMixin, EngineBase):
             pinned=pinned,
         )
 
-        return await self.tokenizer_manager.load_lora_adapter(obj, None)
+        return await TokenizerManager.load_lora_adapter(
+            self.tokenizer_manager.lora_controller, obj, None
+        )
 
     async def async_unload_lora_adapter(self, lora_name: str):
         """
@@ -1204,7 +1212,9 @@ class Engine(EngineScoreMixin, EngineBase):
 
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
-        return await self.tokenizer_manager.unload_lora_adapter(obj, None)
+        return await TokenizerManager.unload_lora_adapter(
+            self.tokenizer_manager.lora_controller, obj, None
+        )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
