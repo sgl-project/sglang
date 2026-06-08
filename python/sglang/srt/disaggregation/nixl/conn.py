@@ -309,12 +309,8 @@ class TransferStatus:
     expects_state: bool = False
     # KV part notifications for mixed-memory transfers. Keyed by
     # (pp_rank, chunk_id); normal homogeneous transfers bypass this.
-    received_kv_parts_per_pp: Dict[Tuple[int, int], Set[int]] = dataclasses.field(
-        default_factory=lambda: defaultdict(set)
-    )
-    expected_kv_parts_per_pp: Dict[Tuple[int, int], int] = dataclasses.field(
-        default_factory=dict
-    )
+    received_kv_parts_per_pp: Optional[Dict[Tuple[int, int], Set[int]]] = None
+    expected_kv_parts_per_pp: Optional[Dict[Tuple[int, int], int]] = None
 
     def is_done(self):
         if self.num_pp_ranks_expected is None or not self.received_aux:
@@ -1092,10 +1088,16 @@ class NixlKVManager(CommonKVManager):
                     continue
 
                 while handles:
-                    states = [self.agent.check_xfer_state(h) for h in handles]
-                    if any(s == "ERR" for s in states):
-                        raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
-                    if all(s == "DONE" for s in states):
+                    all_done = True
+                    for handle in handles:
+                        state = self.agent.check_xfer_state(handle)
+                        if state == "ERR":
+                            raise RuntimeError(
+                                f"NIXL transfer encountered ERR room={room}"
+                            )
+                        if state != "DONE":
+                            all_done = False
+                    if all_done:
                         break
                     time.sleep(0)
 
@@ -2112,6 +2114,10 @@ class NixlKVManager(CommonKVManager):
 
         key = (pp_rank, chunk_id)
         status = self.transfer_statuses[room]
+        if status.received_kv_parts_per_pp is None:
+            status.received_kv_parts_per_pp = defaultdict(set)
+        if status.expected_kv_parts_per_pp is None:
+            status.expected_kv_parts_per_pp = {}
         expected = status.expected_kv_parts_per_pp.setdefault(key, num_parts)
         if expected != num_parts:
             raise RuntimeError(
