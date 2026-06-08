@@ -18,30 +18,38 @@ Accuracy + client-SLO gates for the opt-in Double-Sparsity path on GLM-5.1-FP8, 
   gate PASS all 78 layers/8 ranks) and serves. This is the production landing artifact (supersedes the
   32-sample bring-up mask `e7dbf4c9308f` used for R0 smoke).
 
-## Op-point (both columns, same node)
-Model `zai-org/GLM-5.1 (FP8)` (snapshot f396cf805…), TP=8, page 64, fp8 e4m3 KV, CUDA graph ON, radix
-OFF, seed 431, gsp workload 4096 ISL (sys 2253 + q 1843, ~55% prefix cache) / 512 OSL, conc 32, 64 prompts.
-- **DSA-native column:** DS off, `mem-fraction-static 0.8` (no DS table); `attention_backend='dsa'`.
-- **DS column:** `--enable-double-sparsity`, 256 mask, top_k 2048, `mem-fraction-static 0.7` (DS
-  TokenLabelTable overhead — the documented DS-vs-DSA mem-fraction asymmetry; the comparator ignores it).
+## Op-point (both columns, same node — launch-arg parity verified, R5)
+Both columns booted via the **paired locked-op-point launchers** (`serve_native_nsa.sh` DSA-native /
+`serve_double_sparsity.sh` DS) with the GLM model + 256 mask. From each JSONL's `server_info`, the columns
+match on **TP=8, page 64, kv_cache_dtype fp8_e4m3, disable_radix_cache=True, disable_piecewise_cuda_graph=
+True, disable_overlap_schedule=True, dsa_prefill/decode_backend=flashmla_kv**, differing **only** by
+`enable_double_sparsity` (False/True) and `mem_fraction_static` (DSA 0.8 / DS 0.7 — the inherent DS
+TokenLabelTable reservation; the comparator ignores this asymmetry per BL-20260529). This **fixes the R4
+op-point mismatch** (R4's DSA had `disable_piecewise_cuda_graph=False`). Workload: gsp 4096 ISL (sys 2253 +
+q 1843, ~55% prefix cache) / 512 OSL, seed 431.
 
-## SLO gates (iii) decode TPS + (iv) P99 TTFT — PRELIMINARY (conc 32)
+## SLO gates (iii) decode TPS + (iv) P99 TTFT — parity conc curve (R5, PRELIMINARY window)
 Decode TPS = `output_tokens / (e2e_latency − ttft)` per request (DEC-4). Via `bench_serving` →
-`benchmark_compare.py` (decode-TPS primary, strict `P99 TTFT < 22 s`):
+`benchmark_compare.py` (decode-TPS primary, strict `P99 TTFT < 22 s`). **PRELIMINARY:** `num_prompts =
+concurrency`, single pass, NO 120 s/600 s window — short cold runs, not the locked landing sweep (esp.
+conc 64 TTFT is cold-burst-inflated, per BL-20260530-cold-flood-not-steady-state-slo).
 
-| Metric | DSA-native | DS (256 mask) |
-|--------|-----------:|--------------:|
-| Per-request decode tok/s **P50** | **29.63** | **17.12** |
-| decode tok/s mean / P10 / min | 28.56 / 22.04 / 16.99 | 17.76 / 15.56 / 14.12 |
-| **P99 TTFT (s)** | **15.55** | **43.37** |
-| TTFT P50 (s) | 14.21 | 6.66 |
-| TPOT P50 / P99 (ms) | 33.81 / 57.11 | 58.53 / 70.20 |
-| Output throughput (tok/s) | 516.2 | 351.7 |
-| Achieved concurrency | 31.99 | 26.46 (admission-bound) |
-| Benchmark duration (s) | 63.5 | 93.2 |
+| conc | DSA decode P50 | DSA P99 TTFT | DSA verdict | DS decode P50 | DS P99 TTFT | DS verdict |
+|-----:|---------------:|-------------:|:-----------:|--------------:|------------:|:----------:|
+| 16 | **38.69** | 7.24 s | **PASS** | **23.16** | 3.68 s | FAIL (TPS) |
+| 32 | **31.52** | 14.19 s | **PASS** | **17.09** | 37.17 s | FAIL |
+| 64 | 24.35 | 28.32 s | FAIL (cold-burst) | 17.11 | 74.33 s | FAIL |
 
-**`benchmark_compare.py` DS SLO verdict (decode P50 ≥ 30, P99 TTFT < 22 s): FAIL.**
-Artifacts: `runs/20260607_glm51_loop8/gate_dsa_c32.jsonl`, `gate_ds_c32.jsonl`.
+(DS achieved concurrency 16.0 / 22.6 / 40.2 — admission-bound at conc 32/64 by the smaller DS KV pool.)
+
+**Findings (authoritative for the preliminary window):**
+- **DS-on FAILS the decode-TPS ≥ 30 bar at EVERY concurrency** (best case conc-16 = 23.16 < 30), and the
+  P99-TTFT bar at conc 32/64. Confirmed via the parity-matched comparator (DS SLO verdict: **fail**).
+- **DSA-native PASSES the SLO at conc 16 and 32** (decode ≥ 30 + TTFT < 22 s) and fails only at conc 64
+  (24.35 TPS / 28 s TTFT — a cold-burst short run; re-confirm under the locked steady-state window).
+- DS-on is consistently ~1.4–1.7× slower decode than DSA-native — the expected posture (GLM ships a strong
+  trained DSA indexer; DS is the default-off long-context-recall fallback, not a throughput win here).
+- Artifacts: `runs/20260607_glm51_loop8/parity_{dsa,ds}_c{16,32,64}.jsonl`.
 
 ### Reading (characterization)
 At the standard client op-point, **DS-on is slower than DSA-native** (decode 17 vs 30 tok/s) and its P99
@@ -66,16 +74,20 @@ op-point-insensitive vs the SLO). `AC12_INDEX_TOPK=2048` (GLM index_topk = 2048)
 - **MMLU within tolerance of DSA (mandatory): PENDING** (accuracy gate not yet run).
 - **DS-vs-DSA non-regression of the shipped default (mandatory): PASS** — the served default is DSA-native
   (DS default-off); AC-1 proves it unregressed.
-- **SLO decode-TPS ≥ 30 + P99 TTFT < 22 s (mandatory): DS-on FAILS at conc 32 (preliminary)**; the
-  DSA-native default nearly meets it (passes TTFT; TPS 29.63 at conc 32 — re-measure conc 16 for headroom).
+- **SLO decode-TPS ≥ 30 + P99 TTFT < 22 s (mandatory): DS-on FAILS (preliminary, conc 32)** — decode P50
+  17.12 < 30 and P99 TTFT 43.4 s ≥ 22 s. Note the **DSA-native** column ALSO does **not** pass the
+  decode-TPS bar at conc 32 (P50 29.63 < 30); it passes only TTFT (15.6 s < 22 s). Both are preliminary
+  (conc 32, 64 prompts, no locked window); the conc-16/32/64 curve + locked sweep are needed for the
+  authoritative numbers.
 - **NIAH / long-context recall (characterization-only): PENDING.**
 
-**Open landing question (flagged for the user / DEC-2 call):** the client SLO is met by the **DSA-native
-default** (which is what ships); **DS-on does not meet it on the standard workload** and is intended as a
-default-off recall fallback. Whether that satisfies "SLO mandatory-to-land" (DEC-2) depends on reading the
-bar as applying to the shipped default (→ land DS default-off, DSA meets SLO) vs to the DS-on path itself
-(→ DS-on would not pass at this op-point). The plan's framing favors the former (DS = reversible opt-in).
-**Not resolved here** — recorded for the landing decision.
+**Landing status per DEC-2 (unchanged — SLO mandatory):** DEC-2 resolves "parity + SLO mandatory-to-land".
+On the preliminary conc-32 data, **DS-on does not meet the mandatory SLO** (fails both decode-TPS and P99
+TTFT), and even DSA-native is marginally under the 30-TPS bar at conc 32. This record does **not**
+reinterpret DEC-2. Resolving the landing therefore requires the authoritative conc-16/32/64 + locked-window
+numbers and, if DS-on still fails (expected, given GLM's strong trained indexer makes DS the default-off
+recall fallback rather than a throughput win), an **explicit user plan-evolution decision** on whether a
+default-off DS opt-in may land despite a DS-on SLO miss — recorded as plan evolution if so, not assumed here.
 
 ## V3.2-vs-GLM shape matrix
 | dim | DeepSeek-V3.2 | GLM-5.1 |
