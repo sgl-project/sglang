@@ -635,5 +635,250 @@ class TestRecordL1L2TransferComplete(unittest.TestCase):
         self.assertEqual(ctrl.hicache_l1_l2_transfer_totals["offload"]["events"], 1)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Prometheus text exposition — real prometheus_client, isolated registry
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestHiCacheL1L2TransferCollectorPrometheusOutput(unittest.TestCase):
+    """Verify that record_transfer produces correct Prometheus text exposition.
+
+    Uses an isolated CollectorRegistry per test so metrics don't leak into
+    the global registry and tests remain independent of each other.
+    """
+
+    def setUp(self):
+        import prometheus_client
+        from prometheus_client import CollectorRegistry
+
+        self.registry = CollectorRegistry()
+        _reg = self.registry
+        _PC = prometheus_client.Counter
+        _PH = prometheus_client.Histogram
+
+        # Wrapper classes that forward construction to the real prometheus_client
+        # types but bind them to our isolated registry.  Each setUp() call
+        # produces a new class object, so the _metric_cache key is unique and
+        # a fresh Counter/Histogram pair is created every test.
+        class _BoundCounter:
+            def __init__(self, *args, **kwargs):
+                kwargs["registry"] = _reg
+                self._inner = _PC(*args, **kwargs)
+
+            def labels(self, **kwargs):
+                return self._inner.labels(**kwargs)
+
+        class _BoundHistogram:
+            def __init__(self, *args, **kwargs):
+                kwargs["registry"] = _reg
+                self._inner = _PH(*args, **kwargs)
+
+            def labels(self, **kwargs):
+                return self._inner.labels(**kwargs)
+
+        class _TestCollector(HiCacheL1L2TransferMetricsCollector):
+            _counter_cls = _BoundCounter
+            _histogram_cls = _BoundHistogram
+
+        self._TestCollector = _TestCollector
+        HiCacheL1L2TransferMetricsCollector._metric_cache.clear()
+
+    def tearDown(self):
+        HiCacheL1L2TransferMetricsCollector._metric_cache.clear()
+
+    def _make_collector(self):
+        return self._TestCollector(labels={"tp_rank": "0", "io_backend": "nixl"})
+
+    def _exposition(self) -> str:
+        from prometheus_client import generate_latest
+
+        return generate_latest(self.registry).decode("utf-8")
+
+    # ── metric names ──────────────────────────────────────────────────────────
+
+    def test_blocks_counter_name_in_exposition(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=5,
+            bytes_=81920,
+            xfer_us=None,
+        )
+        self.assertIn("sglang:hicache_l1_l2_transfer_blocks_total", self._exposition())
+
+    def test_bytes_counter_name_in_exposition(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=1,
+            bytes_=16384,
+            xfer_us=None,
+        )
+        self.assertIn("sglang:hicache_l1_l2_transfer_bytes_total", self._exposition())
+
+    def test_duration_histogram_name_in_exposition(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="onboard",
+            src="sglang_hicache::L2",
+            dst="sglang_hicache::L1",
+            blocks=2,
+            bytes_=32768,
+            xfer_us=3000,
+        )
+        self.assertIn("sglang:hicache_l1_l2_transfer_duration_us", self._exposition())
+
+    # ── label values ──────────────────────────────────────────────────────────
+
+    def test_direction_label_in_exposition(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="onboard",
+            src="sglang_hicache::L2",
+            dst="sglang_hicache::L1",
+            blocks=3,
+            bytes_=49152,
+            xfer_us=None,
+        )
+        self.assertIn('direction="onboard"', self._exposition())
+
+    def test_src_and_dst_labels_in_exposition(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=1,
+            bytes_=1024,
+            xfer_us=None,
+        )
+        output = self._exposition()
+        self.assertIn('src="sglang_hicache::L1"', output)
+        self.assertIn('dst="sglang_hicache::L2"', output)
+
+    def test_constructor_labels_in_exposition(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=1,
+            bytes_=1024,
+            xfer_us=None,
+        )
+        output = self._exposition()
+        self.assertIn('tp_rank="0"', output)
+        self.assertIn('io_backend="nixl"', output)
+
+    # ── counter values ────────────────────────────────────────────────────────
+
+    def _find_metric_line(self, exposition: str, name_fragment: str, **label_filters) -> str:
+        """Return the first non-comment exposition line matching name_fragment
+        and all label_filters, or raise AssertionError."""
+        for line in exposition.splitlines():
+            if line.startswith("#"):
+                continue
+            if name_fragment not in line:
+                continue
+            if all(f'{k}="{v}"' in line for k, v in label_filters.items()):
+                return line
+        self.fail(
+            f"No metric line found for fragment={name_fragment!r} "
+            f"labels={label_filters} in:\n{exposition}"
+        )
+
+    def test_blocks_counter_value(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=7,
+            bytes_=114688,
+            xfer_us=None,
+        )
+        line = self._find_metric_line(
+            self._exposition(),
+            "hicache_l1_l2_transfer_blocks_total",
+            direction="offload",
+        )
+        self.assertTrue(line.endswith(" 7.0"), f"Expected value 7.0 in: {line!r}")
+
+    def test_bytes_counter_value(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="onboard",
+            src="sglang_hicache::L2",
+            dst="sglang_hicache::L1",
+            blocks=1,
+            bytes_=32768,
+            xfer_us=None,
+        )
+        line = self._find_metric_line(
+            self._exposition(),
+            "hicache_l1_l2_transfer_bytes_total",
+            direction="onboard",
+        )
+        self.assertTrue(line.endswith(" 32768.0"), f"Expected value 32768.0 in: {line!r}")
+
+    # ── histogram ─────────────────────────────────────────────────────────────
+
+    def test_duration_histogram_sum_when_xfer_us_provided(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=1,
+            bytes_=1024,
+            xfer_us=2500,
+        )
+        line = self._find_metric_line(
+            self._exposition(),
+            "hicache_l1_l2_transfer_duration_us_sum",
+            direction="offload",
+        )
+        self.assertTrue(line.endswith(" 2500.0"), f"Expected sum 2500.0 in: {line!r}")
+
+    def test_duration_histogram_count_when_xfer_us_provided(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=1,
+            bytes_=1024,
+            xfer_us=1000,
+        )
+        line = self._find_metric_line(
+            self._exposition(),
+            "hicache_l1_l2_transfer_duration_us_count",
+            direction="offload",
+        )
+        self.assertTrue(line.endswith(" 1.0"), f"Expected count 1.0 in: {line!r}")
+
+    def test_duration_histogram_not_observed_when_xfer_us_none(self):
+        c = self._make_collector()
+        c.record_transfer(
+            direction="offload",
+            src="sglang_hicache::L1",
+            dst="sglang_hicache::L2",
+            blocks=1,
+            bytes_=1024,
+            xfer_us=None,
+        )
+        # Count must be 0 — no observation recorded.
+        line = self._find_metric_line(
+            self._exposition(),
+            "hicache_l1_l2_transfer_duration_us_count",
+            direction="offload",
+        )
+        self.assertTrue(line.endswith(" 0.0"), f"Expected count 0.0 in: {line!r}")
+
+
 if __name__ == "__main__":
     unittest.main()
