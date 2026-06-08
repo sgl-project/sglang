@@ -29,11 +29,15 @@ The subclass overrides only:
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
+import torch_npu
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4IndexerPool,
     DeepSeekV4TokenToKVPool,
     ONLINE_C128,
 )
@@ -164,6 +168,75 @@ class NPUCompressStatePool(CompressStatePool):
         self.kv_score_buffer.score[:page_size].fill_(float("-inf"))
 
 
+class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
+    """NPU c4-indexer pool. Keeps the base packed CUDA buffer (read by
+    get_contiguous_buf_infos / NSA) and ADDS dedicated int8 K + float16 scale
+    buffers in PA_ND layout at the global ``kernel_page_size``, written by
+    ``torch_npu.npu_scatter_nd_update_`` and read by
+    ``torch.ops.custom.npu_quant_lightning_indexer``.
+    """
+
+    def __init__(self, *args, kernel_page_size: int, **kwargs):
+        # Set before super().__init__ — it calls _create_buffer().
+        self._kernel_page_size = kernel_page_size
+        super().__init__(*args, **kwargs)
+
+    def _create_buffer(self):
+        # Base allocates the packed CUDA index_k_with_scale_buffer (kept for
+        # get_contiguous_buf_infos / NSA compat); then add the NPU buffers.
+        super()._create_buffer()
+        kp = self._kernel_page_size
+        npu_num_pages = (self.size + kp + 1) // kp
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.index_k_buffer = [
+                torch.zeros(
+                    npu_num_pages, kp, 1, self.index_head_dim,
+                    dtype=torch.int8, device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.index_scale_buffer = [
+                torch.zeros(
+                    npu_num_pages, kp, 1, 1,
+                    dtype=torch.float16, device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+    @property
+    def has_npu_storage(self) -> bool:
+        return True
+
+    def get_index_k(self, layer_id: int) -> torch.Tensor:
+        return self.index_k_buffer[layer_id]
+
+    def get_index_scale(self, layer_id: int) -> torch.Tensor:
+        return self.index_scale_buffer[layer_id]
+
+    def set_index_k_scale(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: Optional[torch.Tensor],
+    ) -> None:
+        # int8 K + fp16 scale come from _compressor_epilog_npu's npu_dynamic_quant
+        # output (index_k: int8 [T, D], index_k_scale: fp16 [T, 1]).
+        d = self.index_head_dim
+        loc_long = loc.view(-1, 1).long()
+        torch_npu.npu_scatter_nd_update_(
+            self.index_k_buffer[layer_id].view(-1, 1, d),
+            loc_long,
+            index_k.to(torch.int8).view(-1, 1, d),
+        )
+        if index_k_scale is not None:
+            torch_npu.npu_scatter_nd_update_(
+                self.index_scale_buffer[layer_id].view(-1, 1, 1),
+                loc_long,
+                index_k_scale.to(torch.float16).view(-1, 1, 1),
+            )
+
+
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """NPU-only DSV4 KV pool with paged compress-state buffers.
 
@@ -209,6 +282,29 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             page_size=self.swa_page_size,
+        )
+
+    def _make_indexer_pool(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+    ) -> NPUDeepSeekV4IndexerPool:
+        # NPU dedicated int8 K + fp16 scale buffers use the GLOBAL page_size
+        # (= self.page_size) as kernel_page_size, matching ori_kv for the kernel.
+        return NPUDeepSeekV4IndexerPool(
+            size,
+            page_size,
+            dtype,
+            index_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            kernel_page_size=self.page_size,
         )
 
     def translate_kv_loc_to_compress_state_loc(

@@ -22,9 +22,6 @@ from sglang.srt.utils import ceil_div, is_npu
 
 _is_npu = is_npu()
 
-if _is_npu:
-    import torch_npu
-
 logger = logging.getLogger(__name__)
 
 ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
@@ -284,100 +281,6 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
 
 
-class IndexerStorageCUDA:
-    """CUDA c4-indexer storage: one packed uint8 buffer per layer holding fp8 K
-    and fp32 scales, packed/unpacked by the Triton ``index_buf_accessor`` or the
-    tvm_ffi ``fused_store_cache``. ``pool`` is the owning DeepSeekV4IndexerPool
-    (the accessor reads quant_block_size / index_head_dim / page_size off it).
-    """
-
-    def __init__(self, buffer, *, pool, page_size: int, start_layer: int):
-        self.buffer = buffer
-        self._pool = pool
-        self.page_size = page_size
-        self.start_layer = start_layer
-
-    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.buffer[layer_id]
-
-    def get_index_k_scale_buffer(
-        self, layer_id: int, seq_len: int, page_indices: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return index_buf_accessor.GetKAndS.execute(
-            self._pool,
-            self.buffer[layer_id],
-            seq_len=seq_len,
-            page_indices=page_indices,
-        )
-
-    def set_index_k_scale_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-        index_k_scale: torch.Tensor,
-    ) -> None:
-        index_buf_accessor.SetKAndS.execute(
-            pool=self._pool,
-            buf=self.buffer[layer_id - self.start_layer],
-            loc=loc,
-            index_k=index_k,
-            index_k_scale=index_k_scale,
-        )
-
-    def set_index_fused(
-        self, layer_id: int, loc: torch.Tensor, cache_k: torch.Tensor
-    ) -> None:
-        return fused_store_cache(
-            input=cache_k,
-            cache=self.buffer[layer_id - self.start_layer],
-            indices=loc,
-            page_size=self.page_size,
-            type="indexer",
-        )
-
-
-class IndexerStorageNPU:
-    """NPU c4-indexer storage: a dedicated int8 K buffer + float16 dequant-scale
-    buffer per layer (PA_ND layout), written by ``torch_npu.npu_scatter_nd_update_``
-    and read directly by ``torch.ops.custom.npu_quant_lightning_indexer``.
-    Encapsulates what used to be scattered ``npu_index_k_buffer`` /
-    ``npu_index_scale_buffer`` field pokes across DeepSeekV4TokenToKVPool.
-    """
-
-    def __init__(self, k_buffer, scale_buffer, index_head_dim: int):
-        self.k_buffer = k_buffer  # List[[npu_num_pages, kpage, 1, D] int8]
-        self.scale_buffer = scale_buffer  # List[[npu_num_pages, kpage, 1, 1] fp16]
-        self.index_head_dim = index_head_dim
-
-    def get_index_k(self, layer_id: int) -> torch.Tensor:
-        return self.k_buffer[layer_id]
-
-    def get_index_scale(self, layer_id: int) -> torch.Tensor:
-        return self.scale_buffer[layer_id]
-
-    def set_index_k_scale(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-        index_k_scale: Optional[torch.Tensor],
-    ) -> None:
-        # int8 K + fp16 scale come from _compressor_epilog_npu's npu_dynamic_quant
-        # output (index_k: int8 [T, D], index_k_scale: fp16 [T, 1]).
-        d = self.index_head_dim
-        loc_long = loc.view(-1, 1).long()
-        k_view = index_k.to(torch.int8).view(-1, 1, d)
-        torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id].view(-1, 1, d), loc_long, k_view
-        )
-        if index_k_scale is not None:
-            scale_view = index_k_scale.to(torch.float16).view(-1, 1, 1)
-            torch_npu.npu_scatter_nd_update_(
-                self.scale_buffer[layer_id].view(-1, 1, 1), loc_long, scale_view
-            )
-
-
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
@@ -393,7 +296,6 @@ class DeepSeekV4IndexerPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        kernel_page_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -406,15 +308,6 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        # Kernel-view page size — what npu_quant_lightning_indexer expects
-        # cmp_kv.shape[1] to equal (= global page_size, typically 256).
-        # main's V4 pool passes c4_page_size = page_size // 4 = 64 as
-        # `page_size` here for the CUDA layout; on NPU we need page_size=256
-        # to match ori_kv. If unset, default to self.page_size (CUDA backward
-        # compat).
-        self.kernel_page_size = (
-            kernel_page_size if kernel_page_size is not None else page_size
-        )
 
         self._create_buffer()
 
@@ -422,75 +315,28 @@ class DeepSeekV4IndexerPool(KVCache):
         num_scales_per_token = self.index_head_dim // self.quant_block_size
         page_bytes = self.page_size * self.index_head_dim
         page_bytes += self.page_size * num_scales_per_token * 4
-        num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                cuda_buffer = [
+                self.index_k_with_scale_buffer = [
                     torch.zeros(
-                        num_pages,
+                        (self.size + self.page_size + 1) // self.page_size,
                         page_bytes,
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
-        self.cuda_storage = IndexerStorageCUDA(
-            cuda_buffer,
-            pool=self,
-            page_size=self.page_size,
-            start_layer=self.start_layer,
-        )
-
-        # NPU layout: dedicated int8 K + float16 scale buffers (PA_ND) so the
-        # kernel reads/writes directly without unpacking the CUDA packed layout.
-        # NPU buffers use GLOBAL kernel_page_size (= 256), not the pool's
-        # per-ratio page_size, so cmp_kv.shape[1] matches ori_kv. Allocated
-        # outside the memory-saver region (matches the pre-refactor behavior).
-        if _is_npu:
-            npu_num_pages = (
-                self.size + self.kernel_page_size + 1
-            ) // self.kernel_page_size
-            npu_k = [
-                torch.zeros(
-                    npu_num_pages,
-                    self.kernel_page_size,
-                    1,
-                    self.index_head_dim,
-                    dtype=torch.int8,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            npu_scale = [
-                torch.zeros(
-                    npu_num_pages,
-                    self.kernel_page_size,
-                    1,
-                    1,
-                    dtype=torch.float16,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.npu_storage: Optional[IndexerStorageNPU] = IndexerStorageNPU(
-                npu_k, npu_scale, self.index_head_dim
-            )
-        else:
-            self.npu_storage = None
-
-    @property
-    def index_k_with_scale_buffer(self):
-        # Back-compat: external code (get_contiguous_buf_infos, NSA) reads the
-        # packed CUDA buffer list directly off the pool.
-        return self.cuda_storage.buffer
 
     @property
     def has_npu_storage(self) -> bool:
-        return self.npu_storage is not None
+        # CUDA pool holds only the packed buffer. The NPU subclass
+        # (hardware_backend/npu/dsv4_memory_pool.py) overrides this to True and
+        # adds dedicated int8 K + fp16 scale buffers.
+        return False
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
@@ -504,9 +350,8 @@ class DeepSeekV4IndexerPool(KVCache):
     def set_kv_buffer(self, *args, **kwargs) -> None:
         raise NotImplementedError()
 
-    # CUDA packed-layout accessors → IndexerStorageCUDA.
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.cuda_storage.get_index_k_with_scale_buffer(layer_id)
+        return self.index_k_with_scale_buffer[layer_id]
 
     def get_index_k_scale_buffer(
         self,
@@ -514,8 +359,9 @@ class DeepSeekV4IndexerPool(KVCache):
         seq_len: int,
         page_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.cuda_storage.get_index_k_scale_buffer(
-            layer_id, seq_len, page_indices
+        buf = self.index_k_with_scale_buffer[layer_id]
+        return index_buf_accessor.GetKAndS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
     def set_index_k_scale_buffer(
@@ -525,8 +371,9 @@ class DeepSeekV4IndexerPool(KVCache):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        self.cuda_storage.set_index_k_scale_buffer(
-            layer_id, loc, index_k, index_k_scale
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
     def set_index_fused(
@@ -535,23 +382,13 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        return self.cuda_storage.set_index_fused(layer_id, loc, cache_k)
-
-    # NPU dedicated-buffer accessors → IndexerStorageNPU (None on CUDA).
-    def get_index_k(self, layer_id: int) -> torch.Tensor:
-        return self.npu_storage.get_index_k(layer_id)
-
-    def get_index_scale(self, layer_id: int) -> torch.Tensor:
-        return self.npu_storage.get_index_scale(layer_id)
-
-    def set_index_k_scale(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-        index_k_scale: Optional[torch.Tensor],
-    ) -> None:
-        self.npu_storage.set_index_k_scale(layer_id, loc, index_k, index_k_scale)
+        return fused_store_cache(
+            input=cache_k,
+            cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
+            indices=loc,
+            page_size=self.page_size,
+            type="indexer",
+        )
 
 
 class DeepSeekV4LayerItem(NamedTuple):
@@ -666,7 +503,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             kernel_page_size=page_size,
         )
 
-        self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
+        self.c4_indexer_kv_pool = self._make_indexer_pool(
             self.c4_logical_size,
             c4_page_size,
             dtype,
@@ -674,7 +511,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_layer_num,
             device,
             enable_memory_saver,
-            kernel_page_size=page_size,  # global; NPU buffers use this
         )
 
         self._init_compressed_layer_mapping()
@@ -807,6 +643,29 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             page_size=self.swa_page_size,
+        )
+
+    def _make_indexer_pool(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+    ) -> DeepSeekV4IndexerPool:
+        """Build the c4 lightning-indexer K pool (packed CUDA layout).
+        Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the
+        dedicated-buffer NPU variant (int8 K + fp16 scale)."""
+        return DeepSeekV4IndexerPool(
+            size,
+            page_size,
+            dtype,
+            index_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
         )
 
     def _init_compressed_layer_mapping(self):
@@ -1152,7 +1011,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if from_indexer:
             assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
             if device_type == "npu":
-                # NPU c4 indexer K/scale write — IndexerStorageNPU does the
+                # NPU c4 indexer K/scale write — the NPU indexer pool does the
                 # npu_scatter_nd_update_ into its int8 K + fp16 scale buffers.
                 assert self.c4_indexer_kv_pool.has_npu_storage, (
                     "NPU index buffers not allocated — pool was init'd on CUDA?"
@@ -1203,9 +1062,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         from_indexer: bool,
     ) -> torch.Tensor:
-        # Returns the float16 dequant scale buffer. NPU has a dedicated scale
-        # buffer (IndexerStorageNPU) alongside the int8 K buffer; CUDA still
-        # uses the packed uint8 layout.
+        # Returns the float16 dequant scale buffer. The NPU indexer pool has a
+        # dedicated scale buffer alongside the int8 K buffer; CUDA still uses
+        # the packed uint8 layout.
         assert from_indexer, "only indexer compress pool has dequant scale"
         compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
         if self.c4_indexer_kv_pool.has_npu_storage:
