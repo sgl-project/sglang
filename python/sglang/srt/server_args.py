@@ -8033,13 +8033,28 @@ class PortArgs:
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+                derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
+                if derived_port > 65535:
+                    derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
+                na = NetworkAddress("127.0.0.1", derived_port)
             else:
                 na = NetworkAddress.parse(server_args.dist_init_addr)
 
             dist_init_host = na.host
             dist_init_port = na.port
-            port_base = dist_init_port + 1
+
+            # We need 5 consecutive ports from port_base for:
+            # port_base, detokenizer, rpc, metrics, scheduler.
+            # In multi-node, all nodes derive ports independently from
+            # dist_init_port, so the derivation must be deterministic
+            # (no availability-based search). If incrementing would
+            # overflow the valid TCP range, decrement instead.
+            NUM_DERIVED_PORTS = 5
+            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+            else:
+                port_base = dist_init_port + 1
+
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3

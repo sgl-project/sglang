@@ -798,7 +798,8 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.fill_ids = array("q", input_ids + output_ids)
+        req.full_untruncated_fill_ids = array("q", input_ids + output_ids)
+        req.fill_len = len(req.full_untruncated_fill_ids)
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 
@@ -821,8 +822,9 @@ class UnifiedRadixCacheSuite:
         output_ids = self._make_seq(2000, 7)
         req.origin_input_ids = array("q", prompt_ids)
         req.output_ids = array("q", output_ids)
-        req.fill_ids = array("q", prompt_ids + output_ids)
-        kv_len = len(req.fill_ids)
+        req.full_untruncated_fill_ids = array("q", prompt_ids + output_ids)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        kv_len = req.fill_len
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
@@ -875,7 +877,8 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.fill_ids = array("q", tokens)
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
 
         avail_before = allocator.available_size()
         tree.cache_finished_req(req, is_insert=False)
@@ -892,7 +895,8 @@ class UnifiedRadixCacheSuite:
         tokens = self._make_seq(1, 3)
         req.origin_input_ids = array("q", tokens)
         req.output_ids = array("q")
-        req.fill_ids = array("q", tokens)
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -1026,7 +1030,8 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.fill_ids = array("q", input_ids)
+        req.full_untruncated_fill_ids = array("q", input_ids)
+        req.fill_len = len(req.full_untruncated_fill_ids)
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 
