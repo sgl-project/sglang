@@ -27,7 +27,9 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/object.h>
 
+#include <cfloat>
 #include <cstdint>
+#include <type_traits>
 
 namespace {
 
@@ -102,37 +104,52 @@ SGL_DEVICE void c128_forward(
   const auto lane_id = threadIdx.x % kWarpThreads;
 
   /// NOTE: part 1: load kv + score
-  using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
-  using StorageInput = AlignedVector<InputFloat, kTileElements>;
-  const auto gmem_buffer = tile::Memory<StorageBuffer>{lane_id, kWarpThreads};
-  const auto gmem_input = tile::Memory<StorageInput>{lane_id, kWarpThreads};
-  StorageBuffer kv_hist[kElementsPerWarp];
-  StorageBuffer score_hist[kElementsPerWarp];
-  StorageInput kv_live[kElementsPerWarp];
-  StorageInput score_live[kElementsPerWarp];
-  StorageInput bias[kElementsPerWarp];
+  using StorageIn = AlignedVector<InputFloat, kTileElements>;
+  const auto gmem_in = tile::Memory<StorageIn>{lane_id, kWarpThreads};
+  StorageIn kv[kElementsPerWarp];
+  StorageIn score[kElementsPerWarp];
+  StorageIn bias[kElementsPerWarp];
   const int32_t warp_offset = warp_id * kElementsPerWarp;
 
 #pragma unroll
   for (int32_t i = 0; i < 8; ++i) {
     const int32_t j = i + warp_offset;
-    bias[i] = gmem_input.load(score_bias + j * Trait::kHeadDim);
+    bias[i] = gmem_in.load(score_bias + j * Trait::kHeadDim);
   }
 
   const auto kv_start = kv_src - 127 * Trait::kElementSize;  // point to start
 
+  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
 #pragma unroll
-  for (int32_t i = 0; i < kElementsPerWarp; ++i) {
-    const int32_t j = i + warp_offset;
-    __builtin_assume(j < 128);
-    if (j < buffer_len) {
-      const auto src = kv_buf + j * Trait::kElementSize;
-      kv_hist[i] = gmem_buffer.load(src);
-      score_hist[i] = gmem_buffer.load(src + Trait::kScoreOffset);
-    } else {
-      const auto src = kv_start + j * Trait::kElementSize;
-      kv_live[i] = gmem_input.load(src);
-      score_live[i] = gmem_input.load(src + Trait::kScoreOffset);
+    for (int32_t i = 0; i < kElementsPerWarp; ++i) {
+      const int32_t j = i + warp_offset;
+      __builtin_assume(j < 128);
+      const auto src = j < buffer_len ? kv_buf : kv_start;
+      kv[i] = gmem_in.load(src + j * Trait::kElementSize);
+      score[i] = gmem_in.load(src + j * Trait::kElementSize + Trait::kScoreOffset);
+    }
+  } else {  // mixed dtype
+    using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
+    const auto gmem_buffer = tile::Memory<StorageBuffer>{lane_id, kWarpThreads};
+
+#pragma unroll
+    for (int32_t i = 0; i < kElementsPerWarp; ++i) {
+      const int32_t j = i + warp_offset;
+      __builtin_assume(j < 128);
+      if (j < buffer_len) {
+        const auto src = kv_buf + j * Trait::kElementSize;
+        const auto kv_tmp = gmem_buffer.load(src);
+        const auto score_tmp = gmem_buffer.load(src + Trait::kScoreOffset);
+#pragma unroll
+        for (int32_t k = 0; k < kTileElements; ++k) {
+          kv[i][k] = cast<InputFloat>(kv_tmp[k]);
+          score[i][k] = cast<InputFloat>(score_tmp[k]);
+        }
+      } else {
+        const auto src = kv_start + j * Trait::kElementSize;
+        kv[i] = gmem_in.load(src);
+        score[i] = gmem_in.load(src + Trait::kScoreOffset);
+      }
     }
   }
 
@@ -146,28 +163,35 @@ SGL_DEVICE void c128_forward(
   TmpStorage tmp_exp_sum;
   TmpStorage tmp_product;
 
+  float score_fp32[kTileElements][kElementsPerWarp];
+
+  // convert to fp32 and apply bias first
 #pragma unroll
   for (int32_t i = 0; i < kTileElements; ++i) {
-    float score_fp32[kElementsPerWarp];
-
-    float max_value = -INFINITY;
 #pragma unroll
     for (int32_t j = 0; j < kElementsPerWarp; ++j) {
-      const float score_value =
-          j + warp_offset < buffer_len ? cast<float>(score_hist[j][i]) : cast<float>(score_live[j][i]);
-      const float score = score_value + cast<float>(bias[j][i]);
-      score_fp32[j] = score;
-      max_value = fmaxf(max_value, score);
+      score_fp32[i][j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
+    }
+  }
+
+#pragma unroll
+  for (int32_t i = 0; i < kTileElements; ++i) {
+    const auto& score = score_fp32[i];
+    float max_value = score[0];
+    float sum_exp_value = 0.0f;
+
+#pragma unroll
+    for (int32_t j = 1; j < kElementsPerWarp; ++j) {
+      const auto fp32_score = score[j];
+      max_value = fmaxf(max_value, fp32_score);
     }
 
-    float sum_exp_value = 0.0f;
     float sum_product = 0.0f;
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
-      const auto fp32_score = score_fp32[j];
+      const auto fp32_score = score[j];
       const auto exp_score = expf(fp32_score - max_value);
-      const float kv_value = j + warp_offset < buffer_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
-      sum_product += kv_value * exp_score;
+      sum_product += cast<float>(kv[j][i]) * exp_score;
       sum_exp_value += exp_score;
     }
 
@@ -223,21 +247,33 @@ template <typename Trait, typename BufferFloat, typename InputFloat>
 SGL_DEVICE void c128_write_decode(BufferFloat* kv_buf, const InputFloat* kv_src) {
   using namespace device;
 
-  using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
   using StorageInput = AlignedVector<InputFloat, kTileElements>;
-  const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
   StorageInput data[2];
-  StorageBuffer data_cast[2];
 #pragma unroll
   for (int32_t i = 0; i < 2; ++i) {
     data[i] = gmem_input.load(kv_src + Trait::kHeadDim * i);
+  }
+
+  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
 #pragma unroll
-    for (int32_t j = 0; j < kTileElements; ++j) {
-      data_cast[i][j] = cast<BufferFloat>(data[i][j]);
+    for (int32_t i = 0; i < 2; ++i) {
+      gmem_input.store(kv_buf + Trait::kHeadDim * i, data[i]);
     }
-    gmem_buffer.store(kv_buf + Trait::kHeadDim * i, data_cast[i]);
+  } else {
+    using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
+    const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
+
+    StorageBuffer data_cast[2];
+#pragma unroll
+    for (int32_t i = 0; i < 2; ++i) {
+#pragma unroll
+      for (int32_t j = 0; j < kTileElements; ++j) {
+        data_cast[i][j] = cast<BufferFloat>(data[i][j]);
+      }
+      gmem_buffer.store(kv_buf + Trait::kHeadDim * i, data_cast[i]);
+    }
   }
 }
 
@@ -303,7 +339,6 @@ template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename 
 WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
-  using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
   using StorageInput = AlignedVector<InputFloat, kTileElements>;
 
   const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -323,24 +358,39 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   // each warp will handle a contiguous region
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
-  const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
+
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
   PDLWaitPrimary<kUsePDL>();
   StorageInput data[2];
-  StorageBuffer data_cast[2];
 #pragma unroll
   for (int32_t i = 0; i < 2; ++i) {
     data[i] = gmem_input.load(kv_src, i);
-#pragma unroll
-    for (int32_t j = 0; j < kTileElements; ++j) {
-      data_cast[i][j] = cast<BufferFloat>(data[i][j]);
-    }
   }
-  PDLTriggerSecondary<kUsePDL>();
+
+  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
+    PDLTriggerSecondary<kUsePDL>();
 #pragma unroll
-  for (int32_t i = 0; i < 2; ++i) {
-    gmem_buffer.store(kv_buf, data_cast[i], i);
+    for (int32_t i = 0; i < 2; ++i) {
+      gmem_input.store(kv_buf, data[i], i);
+    }
+  } else {
+    using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
+    const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
+
+    StorageBuffer data_cast[2];
+#pragma unroll
+    for (int32_t i = 0; i < 2; ++i) {
+#pragma unroll
+      for (int32_t j = 0; j < kTileElements; ++j) {
+        data_cast[i][j] = cast<BufferFloat>(data[i][j]);
+      }
+    }
+    PDLTriggerSecondary<kUsePDL>();
+#pragma unroll
+    for (int32_t i = 0; i < 2; ++i) {
+      gmem_buffer.store(kv_buf, data_cast[i], i);
+    }
   }
 }
 

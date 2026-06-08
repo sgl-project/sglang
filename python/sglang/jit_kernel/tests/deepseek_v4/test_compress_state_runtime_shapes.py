@@ -105,6 +105,7 @@ register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
 
 Mode = Literal["decode", "prefill"]
 ShapeTier = Literal["ci", "smoke", "full"]
+MAX_PRESET_PREFILL_Q_TOKENS = 32768
 
 
 @dataclass(frozen=True)
@@ -511,6 +512,11 @@ def _make_shape_specs(args: argparse.Namespace) -> Iterable[BenchSpec]:
                 for tokens_per_req in prefill_extend_lens:
                     _validate_tokens("prefill", ratio, tokens_per_req)
                     for batch_size in prefill_batch_sizes:
+                        # The legacy prefill planner rejects very large
+                        # synthetic q-token grids. Keep long-prefill coverage,
+                        # but do not form unsupported cross-product cases.
+                        if batch_size * tokens_per_req > MAX_PRESET_PREFILL_Q_TOKENS:
+                            continue
                         yield BenchSpec(
                             shape_name=shape_name,
                             ratio=ratio,
