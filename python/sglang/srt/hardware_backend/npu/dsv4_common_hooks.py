@@ -1,16 +1,17 @@
 """Helpers used by mem_cache/common.py to wire DSV4-NPU per-req tables.
 
 mem_cache/common.py runs platform-agnostic alloc flow. When the model is
-DSV4 on NPU, after each ``alloc_extend`` / ``alloc_decode`` we need to:
+DSV4 on NPU, ``alloc_paged_token_slots_{extend,decode}`` already stashed the
+:class:`DSV4OutCacheLoc` the allocator returned onto
+``batch.out_cache_loc_dsv4``. After each ``alloc_extend`` / ``alloc_decode``
+these hooks then:
 
-  1. Fetch the bundled :class:`DSV4OutCacheLoc` from the allocator.
-  2. Stash it on ``batch.out_cache_loc_dsv4`` so the attention backend
-     can consume it.
-  3. Write the per-pool slot ids into the per-req tables on the
+  1. Read the bundle from ``batch.out_cache_loc_dsv4``.
+  2. Write the per-pool slot ids into the per-req tables on the
      :class:`DSV4NPUReqToTokenPool`.
 
-Non-DSV4 paths short-circuit on ``hasattr(allocator, 'get_last_dsv4_alloc')``
-so this module is a no-op for them.
+Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
+no-op for them.
 
 TODO: disagg DSV4 path bypasses ``alloc_for_extend`` / ``alloc_for_decode``
 entirely (see ``disaggregation/decode.py``: it calls
@@ -50,13 +51,12 @@ def maybe_write_dsv4_extend(
     Also writes ``req_to_token_swa[req, prefix:seq]`` with the swa slots
     derived from out_full_loc via the SWA index mapping.
     """
-    allocator = batch.tree_cache.token_to_kv_pool_allocator
-    if not hasattr(allocator, "get_last_dsv4_alloc"):
-        return
-    bundle = allocator.get_last_dsv4_alloc()
+    # The DSV4 allocator returns the DSV4OutCacheLoc bundle, which
+    # mem_cache/common.py already stashed on batch.out_cache_loc_dsv4. Read it
+    # here (no allocator side-channel). None on CUDA / non-V4 paths → no-op.
+    bundle = batch.out_cache_loc_dsv4
     if bundle is None:
         return
-    batch.out_cache_loc_dsv4 = bundle
 
     req_to_token_pool = batch.req_to_token_pool
     if not hasattr(req_to_token_pool, "write_c4"):
@@ -132,13 +132,12 @@ def maybe_write_dsv4_decode(
     ``token_per_req``); the new compressed tokens go at positions
     ``[(old_seq) // ratio, (new_seq) // ratio)``.
     """
-    allocator = batch.tree_cache.token_to_kv_pool_allocator
-    if not hasattr(allocator, "get_last_dsv4_alloc"):
-        return
-    bundle = allocator.get_last_dsv4_alloc()
+    # The DSV4 allocator returns the DSV4OutCacheLoc bundle, which
+    # mem_cache/common.py already stashed on batch.out_cache_loc_dsv4. Read it
+    # here (no allocator side-channel). None on CUDA / non-V4 paths → no-op.
+    bundle = batch.out_cache_loc_dsv4
     if bundle is None:
         return
-    batch.out_cache_loc_dsv4 = bundle
 
     req_to_token_pool = batch.req_to_token_pool
     if not hasattr(req_to_token_pool, "write_c4"):

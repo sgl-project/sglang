@@ -355,28 +355,15 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
-def _collect_dsv4_state_kwargs(batch) -> Optional[dict]:
-    """Pull the per-req c{4,128}_state pool lens off the batch.
+def _get_dsv4_state_lens(batch):
+    """Return the per-req c{4,128}_state pool alloc lens (a ``DSV4StateLens``)
+    the scheduler attached to the batch in
+    :meth:`ScheduleBatch._compute_dsv4_state_lens_extend` / ``..._decode``.
 
-    Populated by :meth:`ScheduleBatch._compute_dsv4_state_lens_extend` /
-    ``..._decode`` when the allocator is DSV4-NPU; absent otherwise. Returns
-    None when the helper did not run (CUDA / non-V4 paths), so the
+    None on CUDA / non-V4 paths (where the helper did not run), so the
     ``alloc_paged_token_slots_*`` forwarding stays a no-op.
     """
-    if getattr(batch, "c4_state_seq_lens", None) is None:
-        return None
-    return {
-        "c4_state_prefix_lens": batch.c4_state_prefix_lens,
-        "c4_state_prefix_lens_cpu": batch.c4_state_prefix_lens_cpu,
-        "c4_state_seq_lens": batch.c4_state_seq_lens,
-        "c4_state_seq_lens_cpu": batch.c4_state_seq_lens_cpu,
-        "c4_state_extend_num_tokens": batch.c4_state_extend_num_tokens,
-        "c128_state_prefix_lens": batch.c128_state_prefix_lens,
-        "c128_state_prefix_lens_cpu": batch.c128_state_prefix_lens_cpu,
-        "c128_state_seq_lens": batch.c128_state_seq_lens,
-        "c128_state_seq_lens_cpu": batch.c128_state_seq_lens_cpu,
-        "c128_state_extend_num_tokens": batch.c128_state_extend_num_tokens,
-    }
+    return getattr(batch, "dsv4_state_lens", None)
 
 
 def alloc_paged_token_slots_extend(
@@ -389,7 +376,8 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_kwargs: Optional[dict] = None,
+    dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    batch=None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -401,18 +389,27 @@ def alloc_paged_token_slots_extend(
         state = allocator.backup_state()
 
     # DSV4-NPU allocator additionally needs req_pool_indices (for c-pool
-    # last_loc lookup via per-req tables) and per-req c{4,128}_state pool
-    # lens (tail-only allocation in a separate paged slot space). Gate via
-    # hasattr so non-DSV4 allocators stay unchanged.
+    # last_loc lookup via per-req tables) and the per-req c{4,128}_state pool
+    # lens (DSV4StateLens — tail-only allocation in a separate paged slot
+    # space). It returns a DSV4OutCacheLoc bundle (not a bare loc tensor); we
+    # unpack out_full_loc for the generic return and stash the bundle on the
+    # batch so the attention backend / per-req-table hooks read it explicitly
+    # instead of via an allocator side-channel. Gate via hasattr so non-DSV4
+    # allocators stay unchanged.
+    is_dsv4 = req_pool_indices is not None and hasattr(
+        allocator, "c4_attn_allocator"
+    )
     extra_alloc_kwargs = {}
-    if req_pool_indices is not None and hasattr(
-        allocator, "register_req_to_token_pool"
-    ):
+    if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        if dsv4_state_kwargs:
-            extra_alloc_kwargs.update(dsv4_state_kwargs)
+        # Pass the per-req tables in per call (for the c-pool / state last_loc
+        # lookup) instead of a permanent allocator->pool back-ref.
+        if batch is not None:
+            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+        if dsv4_state_lens is not None:
+            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out_cache_loc = allocator.alloc_extend(
+    out = allocator.alloc_extend(
         prefix_lens,
         prefix_lens_cpu,
         seq_lens,
@@ -421,6 +418,14 @@ def alloc_paged_token_slots_extend(
         extend_num_tokens,
         **extra_alloc_kwargs,
     )
+
+    if is_dsv4:
+        bundle = out
+        out_cache_loc = None if bundle is None else bundle.out_full_loc
+        if batch is not None:
+            batch.out_cache_loc_dsv4 = bundle
+    else:
+        out_cache_loc = out
 
     if out_cache_loc is None:
         error_msg = (
@@ -514,7 +519,8 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
-            dsv4_state_kwargs=_collect_dsv4_state_kwargs(batch),
+            dsv4_state_lens=_get_dsv4_state_lens(batch),
+            batch=batch,
         )
 
     # Write to req_to_token_pool
@@ -532,9 +538,9 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    # DSV4-NPU hook: stash bundled per-pool slots on batch.out_cache_loc_dsv4
-    # and write the c4/c128/swa per-req tables. No-op on non-DSV4 paths
-    # (gated by `hasattr(allocator, 'get_last_dsv4_alloc')`).
+    # DSV4-NPU hook: write the c4/c128/swa per-req tables from the bundle
+    # already stashed on batch.out_cache_loc_dsv4 above. No-op on non-DSV4
+    # paths (batch.out_cache_loc_dsv4 stays None there).
     if _is_npu:
         from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
             maybe_write_dsv4_extend,
@@ -557,7 +563,8 @@ def alloc_paged_token_slots_decode(
     last_loc: torch.Tensor,
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_kwargs: Optional[dict] = None,
+    dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -565,20 +572,34 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    # DSV4-NPU allocator additionally needs req_pool_indices and per-req
-    # c{4,128}_state pool lens; gate via hasattr so non-DSV4 allocators
-    # stay unchanged.
+    # DSV4-NPU allocator additionally needs req_pool_indices and the per-req
+    # c{4,128}_state pool lens (DSV4StateLens); it returns a DSV4OutCacheLoc
+    # bundle, which we unpack to out_full_loc and stash on the batch (see
+    # alloc_paged_token_slots_extend). Gate via hasattr so non-DSV4
+    # allocators stay unchanged.
+    is_dsv4 = req_pool_indices is not None and hasattr(
+        allocator, "c4_attn_allocator"
+    )
     extra_alloc_kwargs = {}
-    if req_pool_indices is not None and hasattr(
-        allocator, "register_req_to_token_pool"
-    ):
+    if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        if dsv4_state_kwargs:
-            extra_alloc_kwargs.update(dsv4_state_kwargs)
+        # Per-call per-req tables for the last_loc lookup (no stored back-ref).
+        if batch is not None:
+            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+        if dsv4_state_lens is not None:
+            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out_cache_loc = allocator.alloc_decode(
+    out = allocator.alloc_decode(
         seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
     )
+
+    if is_dsv4:
+        bundle = out
+        out_cache_loc = None if bundle is None else bundle.out_full_loc
+        if batch is not None:
+            batch.out_cache_loc_dsv4 = bundle
+    else:
+        out_cache_loc = out
 
     if out_cache_loc is None:
         error_msg = (
@@ -622,7 +643,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             last_loc=last_loc,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
-            dsv4_state_kwargs=_collect_dsv4_state_kwargs(batch),
+            dsv4_state_lens=_get_dsv4_state_lens(batch),
+            batch=batch,
         )
 
     # Write to req_to_token_pool
@@ -635,8 +657,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
-    # DSV4-NPU hook: post-decode write of per-req c4/c128/swa tables and
-    # stash bundled slots on batch.out_cache_loc_dsv4. No-op on non-DSV4.
+    # DSV4-NPU hook: post-decode write of per-req c4/c128/swa tables from the
+    # bundle already stashed on batch.out_cache_loc_dsv4 above. No-op on
+    # non-DSV4 paths (batch.out_cache_loc_dsv4 stays None there).
     if _is_npu:
         from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
             maybe_write_dsv4_decode,
