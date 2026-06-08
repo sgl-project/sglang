@@ -68,6 +68,7 @@ Its core features include:
 ## Getting Started
 - [Install SGLang](https://docs.sglang.io/get_started/install.html)
 - [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
+- [Launch SGLang on rented cloud GPUs with AI Badgr](https://aibadgr.com/gpu/launch?template=sglang)
 - [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 - [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
 - [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
@@ -76,7 +77,7 @@ Its core features include:
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
 
 ## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, [AI Badgr](https://aibadgr.com/gpu/launch?template=sglang), Novita, InnoMatrix, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations.
+SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, InnoMatrix, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations.
 As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
 SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
 
