@@ -722,7 +722,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -2258,9 +2258,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_write_queue:
@@ -2283,8 +2282,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
-        if cc is None or not self.ongoing_load_back:
+        if cc is None:
             return
+        # Every rank must enter the all_reduce below; ongoing_load_back can
+        # diverge across ranks.
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_load_queue:
@@ -2330,7 +2331,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_chunks.reverse()
             return torch.cat(prefix_chunks)
 
-        if best_match_node.evicted or params.host_hit_length > 0:
+        if (
+            best_match_node.evicted
+            or params.host_hit_length > 0
+            or (
+                req is not None
+                and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
+            )
+        ):
             if self.load_back(best_match_node, mem_quota, req=req):
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
@@ -2511,7 +2519,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if ct.is_swa:
                 available_size = self.token_to_kv_pool_allocator.swa_available_size()
             elif ct.is_mamba:
-                available_size = self.req_to_token_pool.mamba_pool.available_size()
+                available_size = self.req_to_token_pool.mamba_allocator.available_size()
             else:
                 continue
 

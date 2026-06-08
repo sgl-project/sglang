@@ -2574,8 +2574,8 @@ class PoolEntry:
     device_evict_fn: Optional[Callable] = None
     # Optional alloc/free overrides for the device side, used by
     # _resolve_pool_transfers_allocation. Set when entry.device_pool is the
-    # raw KV pool (layout) rather than an allocator (e.g. SWA, where alloc
-    # lives on a separate sub-allocator inside SWATokenToKVPoolAllocator).
+    # raw KV/state pool (layout) rather than an allocator (e.g. SWA/Mamba,
+    # where alloc lives on a separate allocator object).
     # When None, fall back to entry.device_pool.alloc/free.
     device_alloc_fn: Optional[Callable] = None
     device_free_fn: Optional[Callable] = None
