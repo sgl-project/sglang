@@ -43,7 +43,7 @@ _is_xpu = is_xpu()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
