@@ -57,13 +57,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # The MTP model is unquantized in serialized NVFP4 checkpoints. Online
-        # FP4 conversion still needs the quant config for BF16/FP8 sources.
-        if (
-            quant_config
-            and quant_config.get_name() == "modelopt_fp4"
-            and getattr(quant_config, "is_checkpoint_nvfp4_serialized", False)
-        ):
+        # The MTP model is unquantized in the nvfp4 checkpoint.
+        if quant_config and quant_config.get_name() == "modelopt_fp4":
             quant_config = None
         if (
             is_npu()

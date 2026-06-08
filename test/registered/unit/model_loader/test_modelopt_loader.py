@@ -625,42 +625,6 @@ class TestParseQuantHfConfig(CustomTestCase):
         self.assertNotIn("quant_algo", result)
 
 
-class TestModelOptFp4Config(CustomTestCase):
-    def test_nested_fp8_config_uses_online_fp4_source_path(self):
-        with patch.dict(
-            "os.environ",
-            {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "false"},
-        ):
-            quant_config = ModelOptFp4Config.from_config(
-                {"quantization": {"quant_method": "modelopt_fp8"}}
-            )
-
-        self.assertFalse(quant_config.is_checkpoint_nvfp4_serialized)
-        self.assertTrue(quant_config.is_checkpoint_fp8_serialized)
-        self.assertTrue(quant_config.use_per_token_activation)
-        self.assertFalse(hasattr(quant_config, "activation_scheme"))
-        self.assertFalse(hasattr(quant_config, "weight_block_size"))
-
-    def test_serialized_nvfp4_activation_scaling_stays_env_controlled(self):
-        with patch.dict(
-            "os.environ",
-            {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "false"},
-        ):
-            quant_config = ModelOptFp4Config.from_config(
-                {
-                    "quantization": {
-                        "quant_algo": "NVFP4",
-                        "exclude_modules": [],
-                    },
-                    "group_size": 16,
-                }
-            )
-
-        self.assertTrue(quant_config.is_checkpoint_nvfp4_serialized)
-        self.assertFalse(quant_config.is_checkpoint_fp8_serialized)
-        self.assertFalse(quant_config.use_per_token_activation)
-
-
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
     def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -45,9 +44,7 @@ from sglang.srt.layers.quantization.fp4_utils import (
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    block_quant_dequant,
     cutlass_fp8_supported,
-    inverse_transform_scale_ue8m0,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -290,6 +287,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.use_per_token_activation = False
 
     def _get_quant_method(
         self,
@@ -1167,21 +1165,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Config class for FP4."""
 
-    @staticmethod
-    def _normalize_ignored_layers(
-        ignored_layers: Optional[List[str]],
-    ) -> List[str]:
-        if not ignored_layers:
-            return []
-        if isinstance(ignored_layers, str):
-            ignored_layers = [ignored_layers]
-        normalized_ignored_layers = []
-        for layer in ignored_layers:
-            base = layer.removeprefix("model.")
-            normalized_ignored_layers.append(base)
-            normalized_ignored_layers.append(f"model.{base}")
-        return list(dict.fromkeys(normalized_ignored_layers))
-
     def __init__(
         self,
         is_checkpoint_nvfp4_serialized: bool = False,
@@ -1189,39 +1172,20 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         group_size: int = None,
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
-        is_checkpoint_fp8_serialized: bool = False,
         use_per_token_activation: Optional[bool] = None,
-        use_mxfp8: bool = False,
     ) -> None:
-        source_ignored_layers = self._normalize_ignored_layers(exclude_modules)
-        fp4_ignored_layers = list(source_ignored_layers)
-        if ignored_layers_str := envs.SGLANG_FP4_IGNORED_LAYERS.get():
-            fp4_ignored_layers.extend(
-                layer.strip()
-                for layer in ignored_layers_str.split(",")
-                if layer.strip()
-            )
-        fp4_ignored_layers = self._normalize_ignored_layers(fp4_ignored_layers)
-        super().__init__(
-            kv_cache_quant_algo, source_ignored_layers, packed_modules_mapping
-        )
-        self.fp4_ignored_layers = fp4_ignored_layers
+        super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
                 "Detected nvfp4 checkpoint. Please note that the "
                 "format is experimental and subject to change."
             )
-        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
-        self.group_size = group_size or 16
+        self.group_size = group_size
         self.use_per_token_activation = (
             use_per_token_activation
             or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-            or not is_checkpoint_nvfp4_serialized
         )
-        self.is_fp4_experts = False
-        self.use_mxfp8 = use_mxfp8
-        self._fp8_source_quant_config = None
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1281,22 +1245,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         # In future modelopt will deprecate hf_quant_config.json, and only keep config.json.
         # For legacy reasons, we keep hf_quant_config.json for now.
 
+        # Initialize variables
         kv_cache_quant_algo = None
-        group_size = 16
+        group_size = None
         exclude_modules = []
-        quant_methods = [
-            str(config.get("quant_method", "")).lower(),
-            str(config.get("quant_algo", "")).lower(),
-        ]
-        quantization_config = config.get("quantization")
-        if isinstance(quantization_config, dict):
-            quant_methods.extend(
-                [
-                    str(quantization_config.get("quant_method", "")).lower(),
-                    str(quantization_config.get("quant_algo", "")).lower(),
-                ]
-            )
-        use_mxfp8 = any("mxfp8" in method for method in quant_methods)
 
         # Try flat format first (config.json quantization_config - preferred format)
         quant_method = config.get("quant_algo")
@@ -1323,7 +1275,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             else:
                 kv_cache_quant_algo = "auto"
 
-            group_size = config.get("group_size", group_size)
+            group_size = config.get("group_size")
             # If group_size is not at top level, try to extract from config_groups
             if group_size is None:
                 config_groups = config.get("config_groups", {})
@@ -1331,83 +1283,34 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     # Get group_size from the first group's weights config
                     first_group = next(iter(config_groups.values()), {})
                     weights_config = first_group.get("weights", {})
-                    group_size = weights_config.get("group_size", 16)
+                    group_size = weights_config.get("group_size")
 
             exclude_modules = config.get("ignore", [])
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
-            quant_config = config.get("quantization")
-            if isinstance(quant_config, dict):
-                quant_method = quant_config.get("quant_algo") or quant_config.get(
-                    "quant_method"
-                )
-                if quant_method is None:
-                    raise ValueError(
-                        "Cannot find 'quant_algo' or 'quant_method' in the "
-                        "model's nested quantization config."
-                    )
+            try:
+                quant_config = cls.get_from_keys(config, ["quantization"])
+                quant_method = quant_config["quant_algo"]
                 kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
                 if not kv_cache_quant_algo:
                     kv_cache_quant_algo = "auto"
-                quant_method_lower = str(quant_method).lower()
-                if "fp4" in quant_method_lower:
-                    group_size = ModelOptFp4Config.common_group_size(config)
-                else:
-                    group_size = config.get("group_size", group_size)
+                group_size = ModelOptFp4Config.common_group_size(config)
                 exclude_modules = quant_config.get("exclude_modules", [])
-            elif any(
-                "fp8" in method or "nvfp4" in method or method == "modelopt_fp4"
-                for method in quant_methods
-            ):
-                quant_method = (
-                    "NVFP4"
-                    if any(
-                        "nvfp4" in method or method == "modelopt_fp4"
-                        for method in quant_methods
-                    )
-                    else "FP8"
-                )
-                kv_cache_quant_algo = "auto"
-                group_size = config.get("group_size", group_size)
-                exclude_modules = cls.get_from_keys_or(
-                    config,
-                    [
-                        "ignored_layers",
-                        "modules_to_not_convert",
-                        "ignore",
-                        "exclude_modules",
-                    ],
-                    [],
-                )
-            else:
+            except (ValueError, KeyError):
                 raise ValueError(
                     "Cannot find 'quant_algo' in the model's quantization config. "
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if quant_method is None:
-            quant_method = (
-                "NVFP4" if any("nvfp4" in m for m in quant_methods) else "FP8"
-            )
-        quant_method = str(quant_method).upper()
-        if "NVFP4" in quant_method or "FP4" in quant_method:
-            quant_method = "NVFP4"
-        elif "FP8" in quant_method:
-            quant_method = "FP8"
-        else:
+        if not quant_method in ["FP8", "NVFP4"]:
             raise ValueError(
                 f"ModelOpt currently only supports: FP8, NVFP4"
                 " quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
-        is_checkpoint_fp8_serialized = (
-            any("fp8" in method for method in quant_methods) or use_mxfp8
-        )
 
-        if is_checkpoint_nvfp4_serialized and (
-            group_size is None or exclude_modules is None
-        ):
+        if group_size is None or exclude_modules is None:
             logger.warning(
                 f"group_size: {group_size},"
                 f"kv_cache_quant_algo: {kv_cache_quant_algo},"
@@ -1423,52 +1326,15 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             group_size,
             exclude_modules,
             config.get("packed_modules_mapping"),
-            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
-            use_mxfp8=use_mxfp8,
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization.fp8 import (
-            Fp8Config,
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+        return self._get_quant_method(
+            layer,
+            prefix,
+            Linear=ModelOptFp4LinearMethod,
+            Moe=ModelOptNvFp4FusedMoEMethod,
         )
-
-        if self.is_checkpoint_fp8_serialized and self._fp8_source_quant_config is None:
-            self._fp8_source_quant_config = Fp8Config(
-                is_checkpoint_fp8_serialized=True,
-                activation_scheme="dynamic",
-                weight_block_size=[128, 128],
-                packed_modules_mapping=self.packed_modules_mapping,
-            )
-
-        if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
-            if self.is_checkpoint_nvfp4_serialized:
-                return ModelOptFp4LinearMethod(self)
-            if self.is_checkpoint_fp8_serialized:
-                return Fp8LinearMethod(self._fp8_source_quant_config)
-            return UnquantizedLinearMethod()
-        if isinstance(layer, FusedMoE):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
-                return None
-            if self.is_checkpoint_nvfp4_serialized:
-                return ModelOptNvFp4FusedMoEMethod(self, prefix)
-            if is_layer_skipped(
-                prefix, self.fp4_ignored_layers, self.packed_modules_mapping
-            ):
-                if self.is_checkpoint_fp8_serialized:
-                    return Fp8MoEMethod(self._fp8_source_quant_config)
-                return None
-            return ModelOptNvFp4FusedMoEMethod(self, prefix)
-        return None
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
@@ -1814,20 +1680,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         quant_config: NVFP4 Quant Config
     """
 
-    def __init__(
-        self, quant_config: ModelOptFp4Config, layer_prefix: Optional[str] = None
-    ):
+    def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        layer_match = (
-            re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_prefix)
-            if layer_prefix is not None
-            else None
-        )
-        self.layer_log_name = (
-            f"layer {layer_match.group(1)} ({layer_prefix})"
-            if layer_match is not None
-            else layer_prefix or "MoE layer"
-        )
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and is_cuda():
             capability = get_device_capability()
@@ -1859,380 +1713,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe import get_moe_runner_backend
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
-
-    def get_online_weight_loader(self, layer, original_weight_loader):
-        from flashinfer import SfLayout, nvfp4_quantize
-
-        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-
-        quant_config = self.quant_config
-        fp8_dtypes = {
-            dtype
-            for dtype in (
-                getattr(torch, "float8_e4m3fn", None),
-                getattr(torch, "float8_e5m2", None),
-            )
-            if dtype is not None
-        }
-        pending_w13_weights = {}
-        pending_w13_lock = threading.Lock()
-        pending_fp8_weights = {}
-        pending_fp8_weight_scales = {}
-        pending_fp8_lock = threading.Lock()
-        quantization_log_lock = threading.Lock()
-        did_log_quantization = False
-
-        def log_quantization_start() -> None:
-            nonlocal did_log_quantization
-            if did_log_quantization:
-                return
-            with quantization_log_lock:
-                if did_log_quantization:
-                    return
-                logger.info(
-                    "Running online NVFP4 quantization for MoE expert weights in %s.",
-                    self.layer_log_name,
-                )
-                did_log_quantization = True
-
-        def should_skip_loaded_expert(
-            param: torch.nn.Parameter,
-            expert_id: Optional[int],
-        ) -> bool:
-            if expert_id is None:
-                return False
-            if getattr(param, "_sglang_require_global_experts", False):
-                return False
-            # With EPLB or explicit expert placement, logical expert IDs can map
-            # to one or more physical experts. Let the canonical MoE loader do
-            # that mapping instead of pre-skipping from the trivial EP layout.
-            if get_global_expert_location_metadata() is not None:
-                return False
-            return layer._map_global_expert_id_to_local_expert_id(expert_id) == -1
-
-        def quantize_weight_nvfp4(
-            weight: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            if weight.ndim != 2:
-                raise ValueError(
-                    "--quantization modelopt_fp4 online quantization expects "
-                    f"2D expert weights, got shape {tuple(weight.shape)}."
-                )
-            if weight.shape[-1] % 16 != 0:
-                raise ValueError(
-                    "--quantization modelopt_fp4 online quantization requires "
-                    "expert weight K to be a multiple of 16, got shape "
-                    f"{tuple(weight.shape)}."
-                )
-
-            # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
-            # reciprocal as the global encode scale, matching 448 * 6 / amax.
-            weight_amax = (
-                weight.abs()
-                .nan_to_num()
-                .amax()
-                .to(device=weight.device, dtype=torch.float32)
-            )
-            e4m3_max = (
-                256.0
-                if envs.FLASHINFER_NVFP4_4OVER6.get()
-                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-                else float(torch.finfo(torch.float8_e4m3fn).max)
-            )
-            fp8_fp4_max = e4m3_max * 6.0
-            weight_scale_2 = torch.where(
-                weight_amax > 0,
-                weight_amax / fp8_fp4_max,
-                torch.ones_like(weight_amax),
-            )
-            fp4_weight, weight_sf = nvfp4_quantize(
-                weight.contiguous(),
-                1.0 / weight_scale_2,
-                sfLayout=SfLayout.layout_linear,
-                backend="cuda",
-            )
-            rows, cols = weight.shape
-            weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
-            return (
-                fp4_weight.reshape(rows, cols // 2),
-                weight_sf.contiguous(),
-                weight_scale_2,
-            )
-
-        def dequantize_fp8_weight(
-            weight: torch.Tensor,
-            weight_scale: torch.Tensor,
-            device: torch.device,
-        ) -> torch.Tensor:
-            if quant_config.use_mxfp8:
-                raise ValueError(
-                    "--quantization modelopt_fp4 does not support online "
-                    "requantization from MXFP8 expert checkpoints."
-                )
-
-            weight = weight.to(device).contiguous()
-            weight_scale = weight_scale.to(device=device).contiguous()
-            if weight_scale.dtype == torch.int32:
-                weight_scale = inverse_transform_scale_ue8m0(
-                    weight_scale, mn=weight.shape[-2]
-                )
-            weight_scale = weight_scale.to(dtype=torch.float32).contiguous()
-
-            if weight_scale.numel() == 1:
-                return (
-                    per_tensor_dequantize(weight, weight_scale)
-                    .to(torch.bfloat16)
-                    .contiguous()
-                )
-
-            return block_quant_dequant(
-                weight,
-                weight_scale,
-                [128, 128],
-                torch.bfloat16,
-            ).contiguous()
-
-        def store_quantized_weight(
-            param: torch.nn.Parameter,
-            fp4_weight: torch.Tensor,
-            weight_scale: torch.Tensor,
-            weight_scale_2: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: Optional[int],
-        ) -> None:
-            original_weight_loader(
-                param,
-                fp4_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-
-            if "weight" in weight_name:
-                weight_prefix, weight_suffix = weight_name.rsplit("weight", 1)
-                weight_scale_name = f"{weight_prefix}weight_scale{weight_suffix}"
-                weight_scale_2_name = f"{weight_prefix}weight_scale_2{weight_suffix}"
-            else:
-                weight_scale_name = f"{weight_name}.weight_scale"
-                weight_scale_2_name = f"{weight_name}.weight_scale_2"
-
-            scale_param = (
-                layer.w13_weight_scale
-                if shard_id in ("w1", "w3")
-                else layer.w2_weight_scale
-            )
-            original_weight_loader(
-                scale_param,
-                weight_scale,
-                weight_name=weight_scale_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-            scale_2_param = (
-                layer.w13_weight_scale_2
-                if shard_id in ("w1", "w3")
-                else layer.w2_weight_scale_2
-            )
-            original_weight_loader(
-                scale_2_param,
-                weight_scale_2,
-                weight_name=weight_scale_2_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-
-        def process_loaded_weight(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: Optional[int],
-        ) -> None:
-            log_quantization_start()
-            if shard_id == "w2":
-                loaded_weight = loaded_weight.to(param.device)
-                fp4_weight, weight_scale, weight_scale_2 = quantize_weight_nvfp4(
-                    loaded_weight
-                )
-                store_quantized_weight(
-                    param,
-                    fp4_weight,
-                    weight_scale,
-                    weight_scale_2,
-                    weight_name,
-                    shard_id,
-                    expert_id,
-                )
-                return
-
-            pending_key = expert_id
-            current = (
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-            )
-            with pending_w13_lock:
-                pending = pending_w13_weights.pop(pending_key, None)
-                if pending is None:
-                    pending_w13_weights[pending_key] = current
-                    return
-
-            (
-                pending_param,
-                pending_weight,
-                pending_name,
-                pending_shard_id,
-                pending_eid,
-            ) = pending
-            if pending_shard_id == shard_id:
-                raise ValueError(
-                    "--quantization modelopt_fp4 expects paired w1/w3 expert "
-                    f"weights, got two {shard_id} tensors for expert {expert_id}."
-                )
-            pending_weight = pending_weight.to(param.device)
-            loaded_weight = loaded_weight.to(param.device)
-            pending_rows = pending_weight.shape[0]
-            loaded_rows = loaded_weight.shape[0]
-            fp4_weight, weight_scale, weight_scale_2 = quantize_weight_nvfp4(
-                torch.cat([pending_weight, loaded_weight], dim=0)
-            )
-            pending_fp4_weight, loaded_fp4_weight = fp4_weight.split(
-                [pending_rows, loaded_rows], dim=0
-            )
-            pending_weight_scale, loaded_weight_scale = weight_scale.split(
-                [pending_rows, loaded_rows], dim=0
-            )
-            store_quantized_weight(
-                pending_param,
-                pending_fp4_weight.contiguous(),
-                pending_weight_scale.contiguous(),
-                weight_scale_2,
-                pending_name,
-                pending_shard_id,
-                pending_eid,
-            )
-            store_quantized_weight(
-                param,
-                loaded_fp4_weight.contiguous(),
-                loaded_weight_scale.contiguous(),
-                weight_scale_2,
-                weight_name,
-                shard_id,
-                expert_id,
-            )
-
-        def process_fp8_weight(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: Optional[int],
-        ) -> None:
-            if loaded_weight.dtype not in fp8_dtypes:
-                process_loaded_weight(
-                    param, loaded_weight, weight_name, shard_id, expert_id
-                )
-                return
-            if not quant_config.is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    "--quantization modelopt_fp4 received an FP8 expert "
-                    "weight, but the checkpoint quantization config does not "
-                    "declare serialized FP8 weights."
-                )
-
-            key = (expert_id, shard_id)
-            with pending_fp8_lock:
-                weight_scale = pending_fp8_weight_scales.pop(key, None)
-                if weight_scale is None:
-                    pending_fp8_weights[key] = (
-                        param,
-                        loaded_weight,
-                        weight_name,
-                        shard_id,
-                        expert_id,
-                    )
-                    return
-
-            log_quantization_start()
-            loaded_weight = dequantize_fp8_weight(
-                loaded_weight, weight_scale, param.device
-            )
-            process_loaded_weight(
-                param, loaded_weight, weight_name, shard_id, expert_id
-            )
-
-        def process_fp8_weight_scale(
-            loaded_weight: torch.Tensor,
-            shard_id: str,
-            expert_id: Optional[int],
-        ) -> None:
-            key = (expert_id, shard_id)
-            with pending_fp8_lock:
-                pending = pending_fp8_weights.pop(key, None)
-                if pending is None:
-                    pending_fp8_weight_scales[key] = loaded_weight
-                    return
-
-            log_quantization_start()
-            (
-                pending_param,
-                pending_weight,
-                pending_name,
-                pending_shard_id,
-                pending_eid,
-            ) = pending
-            loaded_weight = dequantize_fp8_weight(
-                pending_weight, loaded_weight, pending_param.device
-            )
-            process_loaded_weight(
-                pending_param,
-                loaded_weight,
-                pending_name,
-                pending_shard_id,
-                pending_eid,
-            )
-
-        def online_modelopt_fp4_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: Optional[int],
-        ):
-            if shard_id not in ("w1", "w2", "w3"):
-                original_weight_loader(
-                    param,
-                    loaded_weight,
-                    weight_name=weight_name,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
-                return
-            if should_skip_loaded_expert(param, expert_id):
-                return
-
-            if "weight_scale" in weight_name and "weight_scale_2" not in weight_name:
-                process_fp8_weight_scale(loaded_weight, shard_id, expert_id)
-                return
-
-            if "weight" in weight_name:
-                process_fp8_weight(
-                    param, loaded_weight, weight_name, shard_id, expert_id
-                )
-                return
-
-            original_weight_loader(
-                param,
-                loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-
-        return online_modelopt_fp4_weight_loader
 
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
@@ -2266,11 +1746,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        use_online_weight_loader = not self.quant_config.is_checkpoint_nvfp4_serialized
-        if self.quant_config.use_per_token_activation:
+        is_online_per_token_nvfp4 = getattr(
+            self.quant_config, "is_online_per_token_nvfp4", False
+        )
+        if (
+            not self.quant_config.is_checkpoint_nvfp4_serialized
+            and not is_online_per_token_nvfp4
+        ):
+            raise ValueError(
+                "NVFP4 quantization was selected, "
+                " dynamic quantization is not supported."
+            )
+        if is_online_per_token_nvfp4:
             if not self.enable_flashinfer_trtllm_moe:
                 raise ValueError(
-                    "Per-token NVFP4 activation supports only "
+                    "--quantization per_token_nvfp4 supports only "
                     "--moe-runner-backend flashinfer_trtllm or "
                     "flashinfer_trtllm_routed."
                 )
@@ -2283,7 +1773,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
-        if use_online_weight_loader:
+        if is_online_per_token_nvfp4:
             weight_loader = self.get_online_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
@@ -2383,7 +1873,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
-        if use_online_weight_loader and self.quant_config.is_checkpoint_fp8_serialized:
+        if is_online_per_token_nvfp4 and self.quant_config.is_checkpoint_fp8_serialized:
             # FP8 checkpoints usually store expert scales as weight_scale_inv.
             # Online NVFP4 consumes them in the loader and writes the generated
             # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.

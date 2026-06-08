@@ -550,12 +550,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        skip_fp4_dense_quant = (
-            quant_config is not None
-            and quant_config.get_name() == "modelopt_fp4"
-            and not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        linear_attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
         )
-        linear_attn_quant_config = None if skip_fp4_dense_quant else quant_config
         self.linear_attn = Qwen3_5GatedDeltaNet(
             config, layer_id, linear_attn_quant_config, alt_stream, prefix
         )
@@ -724,12 +723,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        skip_fp4_dense_quant = (
-            quant_config is not None
-            and quant_config.get_name() == "modelopt_fp4"
-            and not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
         )
-        attn_quant_config = None if skip_fp4_dense_quant else quant_config
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,

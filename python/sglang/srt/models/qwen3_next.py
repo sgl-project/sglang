@@ -646,23 +646,19 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),  # see impl of get_rope
         )
 
-        # qkv_proj is not quantized for FP4. FP8-source checkpoints still need
-        # the FP8 linear loader when modelopt_fp4 performs online MoE FP4
-        # conversion.
-        qkv_quant_config = quant_config
-        if (
-            quant_config is not None
-            and quant_config.get_name() == "modelopt_fp4"
-            and not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
-        ):
-            qkv_quant_config = None
+        # qkv_proj is not quantized for fp4
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=qkv_quant_config,
+            quant_config=(
+                quant_config
+                if quant_config is not None
+                and quant_config.get_name() != "modelopt_fp4"
+                else None
+            ),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
