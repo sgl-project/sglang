@@ -15,11 +15,11 @@ _is_musa = is_musa()
 
 
 def _compute_enable_deep_gemm():
+    if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get():
+        return False
+
     sm_version = get_device_sm()
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
-        return False
-    # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
-    if sm_version == 120:
         return False
     if not (_is_cuda or _is_musa):
         return False
@@ -29,7 +29,7 @@ def _compute_enable_deep_gemm():
     except ImportError:
         return False
 
-    return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
+    return True
 
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
