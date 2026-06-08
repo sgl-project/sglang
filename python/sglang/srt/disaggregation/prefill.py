@@ -170,6 +170,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_data_mem_kinds = ["VRAM"] * len(kv_data_ptrs)
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -262,7 +263,7 @@ class PrefillBootstrapQueue:
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
-        assert req.pending_bootstrap, f"finalize_bootstrap is not idempotent"
+        assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
         if not self.ensure_metadata_buffer(req):
             return False
 
@@ -653,9 +654,9 @@ class SchedulerDisaggregationPrefillMixin:
                         logprob_pt += num_input_logprobs
 
                 if self.enable_overlap:
-                    assert (
-                        req.metadata_buffer_index >= 0
-                    ), f"Req {req.rid} does not have metadata buffer allocated"
+                    assert req.metadata_buffer_index >= 0, (
+                        f"Req {req.rid} does not have metadata buffer allocated"
+                    )
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -688,7 +689,6 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
