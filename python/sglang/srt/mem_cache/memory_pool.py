@@ -103,6 +103,7 @@ def _set_kv_buffer_impl(
     row_dim: int,  # head_num * head_dim
     store_dtype: torch.dtype,
     device_module: Any,
+    size_limit: int,
     alt_stream: Optional[torch.cuda.Stream] = None,
     same_kv_dim: bool = True,
 ) -> None:
@@ -115,6 +116,7 @@ def _set_kv_buffer_impl(
             v_cache.view(-1, row_dim),
             indices,
             row_bytes=row_bytes,
+            size_limit=size_limit,
         )
 
     if _is_cpu and _cpu_has_amx_support:
@@ -1254,6 +1256,9 @@ class MHATokenToKVPool(KVCache):
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
             device_module=self.device_module,
+            # size + page_size = real slots + the reserved padding slot (padded /
+            # dummy tokens write there); valid index range is [0, size + page_size).
+            size_limit=self.size + self.page_size,
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
