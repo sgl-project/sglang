@@ -42,7 +42,35 @@ import { GLM45VDeployment } from "/src/snippets/autoregressive/glm-45v-deploymen
 - **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 - **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder`.
 - **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
-- For more detailed configuration tips, please refer to [GLM-4.5V/GLM-4.6V Usage](../../../docs/basic_usage/glmv).
+- **Hardware Notes:**
+  - **H100 (FP8):** Use the FP8 checkpoint for best memory efficiency.
+  - **A100 / H100 (BF16):** Use standard multimodal parameters to manage throughput and GPU memory usage.
+  - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
+- **Additional Multimodal Parameters:**
+  - `--mm-attention-backend fa3`: Specify multimodal attention backend (Flash Attention 3).
+  - `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid D2H memory copies.
+  - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Use CUDA IPC shared memory for multimodal data transport to significantly improve E2E latency.
+
+**Example with full multimodal optimizations:**
+```bash Command
+SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
+SGLANG_VLM_CACHE_SIZE_MB=0 \
+python -m sglang.launch_server \
+  --model-path zai-org/GLM-4.5V \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code \
+  --tp-size 8 \
+  --enable-cache-report \
+  --log-level info \
+  --max-running-requests 64 \
+  --mem-fraction-static 0.65 \
+  --chunked-prefill-size 8192 \
+  --attention-backend fa3 \
+  --mm-attention-backend fa3 \
+  --mm-enable-dp-encoder \
+  --enable-metrics
+```
 
 ## 4. Model Invocation
 
@@ -468,6 +496,27 @@ final_response = client.chat.completions.create(
 
 print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+#### 4.2.4 Thinking Budget
+
+Beyond enabling/disabling the full reasoning mode (section 4.2.2), you can cap the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor` and pass `Glm4MoeThinkingBudgetLogitProcessor` in the request:
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import Glm4MoeThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=[{"role": "user", "content": "Describe this image briefly."}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": Glm4MoeThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
 ```
 
 ## 5. Benchmark

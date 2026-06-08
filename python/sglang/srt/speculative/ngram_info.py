@@ -465,6 +465,8 @@ class NgramVerifyInput(SpecInput):
 
         batch.seq_lens.add_(self.num_accept_tokens)
         batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
+        # Keep seq_lens_sum in sync; attn backends size kv_indices from it.
+        batch.seq_lens_sum += int(num_accept_tokens_cpu.sum())
 
         return logits_output, self.accept_tokens, num_correct_drafts
 
