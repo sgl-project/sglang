@@ -363,13 +363,14 @@ def fuse_scale_shift_kernel(
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
         scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
-        if shift.dim() == 4:
-            # shift is per-frame [B, F, 1, C] (e.g. AdaLN output modulation from
-            # causal Wan / LingBot). Broadcast it across each frame's tokens to
-            # per-token [B, L, C] before flattening to [B*L, C], matching the
-            # per-token indexing in _fused_scale_shift_4d_kernel. This mirrors the
-            # CUDA fused path, which accepts [B, F, 1, C] shift and broadcasts it
-            # per-frame.
+        if shift.dim() == 4 and current_platform.is_hip():
+            # ROCm has no fused CUTLASS scale-shift kernel, so this native path
+            # handles the causal Wan / LingBot output AdaLN, which passes a
+            # per-frame shift [B, F, 1, C]. Broadcast it across each frame's
+            # tokens to per-token [B, L, C] before flattening to [B*L, C],
+            # matching the per-token indexing in _fused_scale_shift_4d_kernel
+            # (the CUDA fused path accepts [B, F, 1, C] shift and broadcasts it
+            # per-frame).
             shift_reshaped = (
                 shift.expand(B, num_frames, frame_seqlen, C)
                 .reshape(rows, C)
