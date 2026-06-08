@@ -29,6 +29,7 @@ while [ $# -gt 0 ]; do
 done
 
 TESTS_DIR="${DEEPGEMM_SRC}/tests"
+SGL_TESTS_DIR="${DEEPGEMM_SRC}/sgl_deep_gemm/tests"
 PYTHON="${PYTHON:-python3}"
 
 if [ ! -d "${TESTS_DIR}" ]; then
@@ -76,10 +77,11 @@ SKIPPED=()
 
 run_test() {
   local name="$1"; shift
+  local dir="${RUN_DIR:-${TESTS_DIR}}"
   echo ""
   echo "----- RUN ${name} $* -----"
   local log; log=$(mktemp)
-  (cd "${TESTS_DIR}" && "${PYTHON}" "${name}" "$@") 2>&1 | tee "${log}"
+  (cd "${dir}" && "${PYTHON}" "${name}" "$@") 2>&1 | tee "${log}"
   local rc=${PIPESTATUS[0]}
   # Fork-based multiprocessing tests can crash in child processes while the
   # launcher still exits 0; treat an unhandled traceback as a failure too.
@@ -142,7 +144,7 @@ MEGA_MOE_L1=(
 )
 if [ "${SKIP_MEGA_MOE}" -eq 1 ]; then
   for t in "${MEGA_MOE_ALL[@]}"; do
-    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "--skip-mega-moe"
+    { [ -f "${TESTS_DIR}/${t}" ] || [ -f "${SGL_TESTS_DIR}/${t}" ]; } && skip_test "${t}" "--skip-mega-moe"
   done
 elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   if [ -f "${TESTS_DIR}/test_mega_moe.py" ]; then
@@ -157,12 +159,12 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   # (TMA stride at >=8 ranks, rel-RMSE). sglang's real path is covered by
   # test_mega_moe_pre_dispatch + test_mega_moe. Confirm on B200 before re-enabling.
   for t in "${MEGA_MOE_L1[@]}"; do
-    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "fp4 kernel failures, see comment (confirm on B200)"
+    [ -f "${SGL_TESTS_DIR}/${t}" ] && skip_test "${t}" "fp4 kernel failures, see comment (confirm on B200)"
   done
-  [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
+  [ -f "${SGL_TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && RUN_DIR="${SGL_TESTS_DIR}" run_test test_mega_moe_pre_dispatch.py
 else
   for t in "${MEGA_MOE_ALL[@]}"; do
-    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
+    { [ -f "${TESTS_DIR}/${t}" ] || [ -f "${SGL_TESTS_DIR}/${t}" ]; } && skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
   done
 fi
 
