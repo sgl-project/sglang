@@ -26,13 +26,11 @@ class JointThreshold(DllmAlgorithm):
         self.penalty_lambda = config.algorithm_config.get("penalty_lambda", 0)
 
     def max_steps(self, block_size: int) -> int:
-        # block_size fills + post-edit budget + the trailing completion step.
         return block_size + self.max_post_edit_steps + 1
 
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        # One host transfer for the whole batch; prompt mask is fixed per block.
         prompt_mask = (input_ids != self.mask_id).tolist()
         return [
             {
@@ -51,7 +49,7 @@ class JointThreshold(DllmAlgorithm):
     ) -> List[bool]:
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
-        # One host-to-device transfer for the whole batch, not one per request.
+        # Single batched host-to-device transfer, not one per request.
         prompt_masks = torch.tensor(
             [state["prompt_mask"] for state in states], device=device, dtype=torch.bool
         )

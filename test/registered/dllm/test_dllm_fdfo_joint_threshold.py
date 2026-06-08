@@ -14,8 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Multi-block prompts (block_size is 32 for LLaDA2, so max_tokens=128 spans
-# several decode blocks and exercises the cross-step dllm_algo_state carry).
+# max_tokens=128 spans several decode blocks (block_size 32 for LLaDA2).
 PROMPTS = [
     "Question: Natalia sold clips to 48 friends in April, and half as many in "
     "May. How many clips did she sell altogether? Answer:",
@@ -25,10 +24,9 @@ PROMPTS = [
 
 
 class TestBatchingFDFOJointThreshold(CustomTestCase):
-    """JointThreshold is a stateful dLLM algorithm: it carries edit-budget and
-    prompt-mask state across denoise steps. At a single in-flight request, FDFO
-    and synchronous execution run identical forward shapes, so a correct
-    ``dllm_algo_state`` carry must produce byte-identical multi-block output.
+    """At a single in-flight request, FDFO and synchronous execution run identical
+    forward shapes, so a correct stateful (``dllm_algo_state``) carry must produce
+    byte-identical multi-block output.
     """
 
     model = "inclusionAI/LLaDA2.0-mini"

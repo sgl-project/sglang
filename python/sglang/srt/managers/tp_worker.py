@@ -437,7 +437,6 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: ForwardBatch,
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
-        # FDFO carries per-request algorithm state across rounds; feed it in.
         algo_states = None
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]

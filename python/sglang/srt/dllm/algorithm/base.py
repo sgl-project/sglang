@@ -11,9 +11,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 
-# run() return value:
-#   (logits_output, next_token_ids, accept_length_per_req_cpu, algo_states, can_run_cuda_graph)
-# accept_length_per_req_cpu and algo_states are only populated in FDFO mode.
+# (logits_output, next_token_ids, accept_length_per_req_cpu, algo_states, can_run_cuda_graph)
 DllmRunOutput = Tuple[
     Union[LogitsProcessorOutput, torch.Tensor],
     List,
@@ -44,15 +42,10 @@ class DllmAlgorithm:
         config = DllmConfig.from_server_args(server_args)
         return get_algorithm(config)
 
-    # ------------------------------------------------------------------
-    # Strategy: implemented by concrete algorithms.
-    # ------------------------------------------------------------------
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
-        """Per-block initial cross-step state (one ``None`` per block if stateless)."""
         return [None] * forward_batch.batch_size
 
     def max_steps(self, block_size: int) -> int:
-        """Max denoise steps per block, including the trailing completion step."""
         return block_size + 1
 
     def step(
@@ -61,15 +54,12 @@ class DllmAlgorithm:
         full_logits: torch.Tensor,
         states: List[Any],
     ) -> List[bool]:
-        """Run one denoise step, advancing ``forward_batch.input_ids``/``states`` in
+        """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
         place. Returns, per block, whether it was already complete *on entry* --
-        i.e. this forward pass persisted its final KV cache and it can be emitted.
+        i.e. this forward persisted its final KV cache and it can be emitted.
         """
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
-    # Execution: provided by the base class, shared by all algorithms.
-    # ------------------------------------------------------------------
     def run(
         self,
         model_runner: ModelRunner,
@@ -81,7 +71,6 @@ class DllmAlgorithm:
         return self._run_sync(model_runner, forward_batch)
 
     def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
-        """Number of already-filled (non-mask) tokens at the start of each block."""
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         return (input_ids != self.mask_id).sum(dim=1).tolist()
@@ -100,8 +89,6 @@ class DllmAlgorithm:
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
-        # Per-request slice of newly generated tokens (tensors, as the synchronous
-        # process_batch_result_dllm path expects).
         next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
@@ -116,7 +103,7 @@ class DllmAlgorithm:
     ) -> DllmRunOutput:
         batch_size = forward_batch.batch_size
 
-        # Fresh blocks (first decode round) carry no state; initialise them.
+        # Fresh blocks (first decode round) carry no state.
         if algo_states is None:
             algo_states = [None] * batch_size
         fresh: Optional[List[Any]] = None
@@ -132,8 +119,7 @@ class DllmAlgorithm:
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
 
-        # Complete-on-entry blocks have their final KV persisted; accept the whole
-        # block. Otherwise carry the in-progress state to the next round.
+        # Complete-on-entry blocks have their final KV persisted; accept them whole.
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
         next_token_ids_list = forward_batch.input_ids.view(
             batch_size, self.block_size

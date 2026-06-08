@@ -31,8 +31,7 @@ class GenerationBatchResult:
     ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
-    # FDFO dLLM batching: per-request accepted block length (block_size when the
-    # block is resolved, else 0) and the algorithm state carried to the next round.
+    # FDFO dLLM batching: per-request accepted block length and carried algo state.
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
