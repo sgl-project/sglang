@@ -100,7 +100,9 @@ async def get_loads(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
-        mc = getattr(tokenizer_manager, "metrics_collector", None)
+        mc = getattr(
+            tokenizer_manager.request_metrics_recorder, "metrics_collector", None
+        )
         if mc is not None:
             mc.get_loads_duration_seconds.labels(**mc.labels).observe(
                 time.perf_counter() - start

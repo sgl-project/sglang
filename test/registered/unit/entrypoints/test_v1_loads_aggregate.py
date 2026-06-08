@@ -51,7 +51,7 @@ class _FakeTokenizerManager(TokenizerControlMixin):
 
 
 class _FakeHttpTokenizerManager:
-    metrics_collector = None
+    request_metrics_recorder = SimpleNamespace(metrics_collector=None)
 
     def __init__(self, loads):
         self.loads = loads
