@@ -1343,7 +1343,7 @@ class HiRadixCache(RadixCache):
             return True
 
         if (
-            can_terminate
+            completed
             and getattr(operation, "pool_transfers", None)
             and not getattr(operation, "pool_transfers_done", True)
         ):
