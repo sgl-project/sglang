@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "a17a6cd676d16d0f6c93cc80d0144138ab87dca1"
+SGL_TEST_FILES_CI_DATA_REVISION = "af6e712a2c49ab5fcd81dde58e2f54c78e77683b"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -45,10 +45,18 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
 SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = (
     f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated"
 )
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/official_generated/ascend"
+)
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated/ascend"
+)
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+    SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND,
+    SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND,
 )
 # LTX cases listed here compare against official-generated GT.
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
@@ -107,6 +115,9 @@ def _load_clip_processor_with_roberta_processing_compat(
 # ---------------------------------------------------------------------------
 
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
+
+# Cosmos3 generation models
+DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"
 
 # Qwen image generation models
 DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image"
