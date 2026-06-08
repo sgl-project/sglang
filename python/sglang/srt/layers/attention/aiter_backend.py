@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.utils import (
+    assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
@@ -1450,7 +1451,13 @@ class AiterAttnBackend(AttentionBackend):
             # metadata sites + paged_attention_ragged call site + FP8 KV
             # coordination, after which this allocation can revert to
             # per-page (gated on use_mla).
-            buffer_numel = max_bs * max_num_blocks_per_seq * self.page_size
+            # Reserve draft slack: MLA target_verify writes seq_len +
+            # num_draft_tokens per row; without it a near-full sequence
+            # overflows the buffer. Mirrors dsa / flashmla.
+            draft_slack = self.num_draft_tokens or 0
+            buffer_numel = max_bs * (
+                max_num_blocks_per_seq * self.page_size + draft_slack
+            )
             self.cuda_graph_kv_indices = torch.zeros(
                 (buffer_numel,),
                 dtype=torch.int32,
@@ -1691,6 +1698,18 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
+            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
+            if seq_lens_sum is not None:
+                kv_indices_used = seq_lens_sum + (
+                    self.num_draft_tokens * bs if self.use_mla else 0
+                )
+                assert_buffer_fits(
+                    kv_indices_used,
+                    kv_indices.numel(),
+                    "aiter target_verify kv_indices",
+                    bs=bs,
+                    seq_lens_sum=seq_lens_sum,
+                )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
