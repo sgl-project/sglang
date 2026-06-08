@@ -1175,8 +1175,12 @@ def fill_gateup_input_triton_kernel(
 
 @triton.jit
 def _per_token_group_quant_fp8_pow2_kernel(
-    x_ptr, out_ptr, scale_ptr,
-    M, K, group_size: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    M,
+    K,
+    group_size: tl.constexpr,
     fp8_max: tl.constexpr,
     BLOCK_GROUP: tl.constexpr,
 ):
@@ -1211,7 +1215,14 @@ def _per_token_group_quant_fp8_pow2(x, group_size):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     grid = (M, num_groups)
     _per_token_group_quant_fp8_pow2_kernel[grid](
-        x, x_q, x_s, M, K, group_size, fp8_max, BLOCK_GROUP=group_size,
+        x,
+        x_q,
+        x_s,
+        M,
+        K,
+        group_size,
+        fp8_max,
+        BLOCK_GROUP=group_size,
     )
     return x_q, x_s
 
@@ -1273,9 +1284,7 @@ def moe_ep_deepgemm_preprocess(
                 hidden_states, block_k
             )
         else:
-            hidden_states, scale = per_token_group_quant_fp8(
-                hidden_states, block_k
-            )
+            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
         gateup_input_scale = torch.empty(
             (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
