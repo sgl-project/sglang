@@ -17,7 +17,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -143,6 +143,21 @@ def _build_image_response_kwargs(
 
     return ret
 
+async def _stream_image_response(response: ImageResponse):
+    for idx, item in enumerate(response.data):
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "image_generation.partial_image",
+                    "partial_image_index": idx,
+                    "b64_json": item.b64_json,
+                }
+            )
+            + "\n\n"
+        )
+
+    yield "data: [DONE]\n\n"
 
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
@@ -256,7 +271,13 @@ async def generations(
             is_persistent=is_persistent,
         )
 
-    return ImageResponse(**response_kwargs)
+    response = ImageResponse(**response_kwargs)
+    if request.stream:
+        return StreamingResponse(
+            _stream_image_response(response),
+            media_type="text/event-stream",
+        )
+    return response
 
 
 @router.post("/edits", response_model=ImageResponse)
