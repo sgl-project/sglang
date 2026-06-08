@@ -434,7 +434,13 @@ class TritonAttnBackend(AttentionBackend):
         Returns ``(qo_indptr, kv_indptr, num_tokens_per_bs)``.
         """
         seq_lens = seq_lens[:bs]
-        num_tokens_per_bs = self.speculative_num_steps + 1
+        # V2 draft-extend fills num_draft_tokens per req (the cuda-graph runner's
+        # token layout); num_steps+1 only equals that when topk == 1.
+        num_tokens_per_bs = (
+            self.num_draft_tokens
+            if forward_mode.is_draft_extend_v2()
+            else self.speculative_num_steps + 1
+        )
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
