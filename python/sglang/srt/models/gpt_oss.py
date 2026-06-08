@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_hip,
     is_npu,
     is_sm90_supported,
     make_layers,
@@ -92,6 +93,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_tinygemm_supported = (
     _is_cuda
@@ -163,6 +165,36 @@ class TinyGemmLinear(ReplicatedLinear):
             return out, None
 
         return super().forward(x)
+
+
+def _resolve_moe_input_pad_multiple(
+    quant_config: Optional[QuantizationConfig],
+) -> int:
+    """Return the alignment the MoE backend requires on its input
+    hidden_size, or 0 when no fused pad should be inserted into the
+    preceding layernorm. See post_attention_layernorm construction in
+    GptOssDecoderLayer for the safety preconditions."""
+    if quant_config is None:
+        return 0
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_AITER_FUSE_RMSNORM_PAD.get():
+        return 0
+    if not (_is_hip and envs.SGLANG_USE_AITER.get()):
+        return 0
+    # Only the MXFP4 path needs the 256-multiple pad on hidden_size; other
+    # quant methods (or unquantized bf16) consume the unpadded layernorm
+    # output directly.
+    if quant_config.get_name() != "mxfp4":
+        return 0
+    if get_tensor_model_parallel_world_size() != 1:
+        # Mid-layer hidden_states still flow through CommunicateWith...
+        # AllReduceAndLayerNormFn helpers other than `_simple` when
+        # attn_tp_size > 1; those helpers haven't been updated to handle
+        # a padded layernorm output. Keep the optimisation off to stay
+        # correct.
+        return 0
+    return 256
 
 
 class GptOssSparseMoeBlock(nn.Module):
@@ -250,18 +282,44 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
+        # `hidden_states` may arrive pre-padded along the last dim when the
+        # preceding RMSNorm fused the MoE input pad (gated by
+        # SGLANG_AITER_FUSE_RMSNORM_PAD). Router/topk are computed on the
+        # unpadded slice so the small bf16 router GEMM dimensions stay
+        # untouched, while the experts call gets to keep the padded view
+        # and skip the duplicate pad inside the MXFP4 method. The output
+        # is then trimmed back to the unpadded width so postprocess_layer
+        # can pair it with the (M, hidden_dim_unpadded) residual.
+        num_tokens = hidden_states.shape[0]
+        hidden_dim_unpadded = self.experts.hidden_size
+        is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
+        if is_prepadded:
+            router_input = hidden_states[..., :hidden_dim_unpadded]
+        else:
+            router_input = hidden_states
+
         if is_in_piecewise_cuda_graph():
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
-            router_logits, _ = self.router(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            router_logits, _ = self.router(router_input)
+            topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        ans = final_hidden_states.view(num_tokens, hidden_dim)
+        # When input was pre-padded, FusedMoE.forward_impl captured the
+        # padded width as `origin_hidden_states_dim` and skipped its own
+        # output-trim contiguous() — so the experts output is still
+        # (M, hidden_dim_padded). Drop the pad columns here. When input
+        # was unpadded (default code path), FusedMoE.forward_impl already
+        # produced a contiguous (M, hidden_dim_unpadded) tensor, so the
+        # view is a no-op and matches the pre-fusion behavior bit-for-bit.
+        if is_prepadded:
+            ans = final_hidden_states[..., :hidden_dim_unpadded].contiguous()
+            ans = ans.view(num_tokens, hidden_dim_unpadded)
+        else:
+            ans = final_hidden_states.view(num_tokens, hidden_dim_unpadded)
         return ans
 
 
@@ -505,8 +563,19 @@ class GptOssDecoderLayer(nn.Module):
                 "Please use GptOssSparseMoeBlock instead."
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Optionally fuse the MoE-input zero-pad into post_attention_layernorm
+        # via aiter's `fused_add_rmsnorm_pad`. Only enabled when:
+        #   * SGLANG_AITER_FUSE_RMSNORM_PAD=1
+        #   * Quant method is MXFP4 (the only path that demands a 256-pad)
+        #   * Communication path between layernorm and MoE is the no-op
+        #     `_simple` route (attn_tp_size == 1) — otherwise the padded
+        #     hidden_states would have to survive an AllReduce/scatter that
+        #     hasn't been taught about the extra columns yet.
+        post_attn_pad_multiple = _resolve_moe_input_pad_multiple(quant_config)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            x_pad_to_multiple=post_attn_pad_multiple,
         )
 
         self.layer_communicator = LayerCommunicator(

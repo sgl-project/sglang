@@ -178,10 +178,8 @@ def create_bench_cache(
 
     # --- KV pool + allocator ---
     if has_swa:
-        from sglang.srt.mem_cache.swa_memory_pool import (
-            SWAKVPool,
-            SWATokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = SWAKVPool(
             size=kv_size,
@@ -248,7 +246,7 @@ def create_bench_cache(
         req = Req(
             rid=_rid[0],
             origin_input_text="",
-            origin_input_ids=[],
+            origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         _rid[0] += 1

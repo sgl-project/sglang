@@ -56,6 +56,7 @@ import logging
 import multiprocessing
 import os
 import time
+from array import array
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -367,7 +368,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         req = Req(
             rid=i,
             origin_input_text=prompts[i],
-            origin_input_ids=tmp_input_ids,
+            origin_input_ids=array("q", tmp_input_ids),
             sampling_params=sampling_params,
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
@@ -414,7 +415,7 @@ def prepare_synthetic_inputs_for_latency_test(
         req = Req(
             rid=i,
             origin_input_text="",
-            origin_input_ids=list(input_ids[i]),
+            origin_input_ids=array("q", input_ids[i]),
             sampling_params=sampling_params,
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
@@ -463,6 +464,15 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
+    if (
+        batch.input_ids is None
+        and getattr(batch, "prefill_input_ids_cpu", None) is not None
+    ):
+        batch.input_ids = batch.prefill_input_ids_cpu.to(
+            batch.device, non_blocking=True
+        )
+        batch.prefill_input_ids_cpu = None
+
     forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
