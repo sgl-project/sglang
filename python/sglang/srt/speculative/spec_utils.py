@@ -14,13 +14,9 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_draft_cache_locs as assign_draft_cache_locs,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -468,39 +464,3 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
-
-
-# Disable torch.compile for this function because it will be
-# even slower.
-# @torch.compile(dynamic=True)
-def get_last_loc_large_page_size_large_top_k(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    speculative_num_steps: int,
-    topk: int,
-    page_size: int,
-):
-    prefix_lens = seq_lens
-    last_page_lens = prefix_lens % page_size
-    num_new_pages_per_topk = (
-        last_page_lens + speculative_num_steps + page_size - 1
-    ) // page_size
-    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
-        page_size * topk
-    )
-    extend_lens = seq_lens - prefix_lens
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
-    )
-
-    return (
-        prefix_lens,
-        seq_lens,
-        last_loc,
-        num_new_pages_per_topk,
-        extend_lens,
-        last_page_lens,
-    )
