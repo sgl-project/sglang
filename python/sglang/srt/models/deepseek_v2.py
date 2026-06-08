@@ -175,6 +175,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
@@ -191,6 +192,10 @@ if _use_aiter:
 if _is_cuda:
     from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+
+    from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
+        dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
+    )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -1655,10 +1660,13 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and not self.is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 256 == 0
             and _is_cuda
-            and 90 <= _device_sm < 120
+            and _device_sm >= 90
+        )
+        self.use_cutedsl_fused_a_gemm = (
+            self.use_min_latency_fused_a_gemm and is_sm120_supported()
         )
 
         self.init_mha_forward()
@@ -1864,7 +1872,12 @@ class DeepseekV2AttentionMLA(
             and self.use_min_latency_fused_a_gemm
             and not lora_active
         ):
-            qkv_latent = dsv3_fused_a_gemm(
+            fused_a_gemm = (
+                cutedsl_dsv3_fused_a_gemm
+                if self.use_cutedsl_fused_a_gemm
+                else dsv3_fused_a_gemm
+            )
+            qkv_latent = fused_a_gemm(
                 hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
             )
         else:
