@@ -523,6 +523,21 @@ class SchedulerDisaggregationPrefillMixin:
         if not hasattr(model, "forward_split_prefill"):
             return 0
 
+        # Layer-pipelined transfer sends KV during forward, so optimistic requests
+        # must wait until bootstrap finalizes sender metadata and prefix offsets.
+        if any(req.pending_bootstrap for req in batch.reqs):
+            return 0
+
+        # Multimodal split-prefill support is not covered by this path yet.
+        if any(req.multimodal_inputs is not None for req in batch.reqs):
+            return 0
+
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+        # Compressed MLA uses a bucketed KV pointer layout rather than a simple
+        # per-layer layout; keep it on the normal transfer path for now.
+        if getattr(kv_args, "mla_compression_ratios", None):
+            return 0
+
         # DP attention requires prepare_mlp_sync_batch() which forward_split_prefill
         # bypasses — DP buffers would be uninitialized, causing incorrect results.
         if self.server_args.enable_dp_attention:
