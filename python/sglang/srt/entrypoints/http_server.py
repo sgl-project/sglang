@@ -1068,8 +1068,8 @@ async def dump_expert_distribution_record_async():
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message, num_paused_requests = (
-        await TokenizerManager.update_weights_from_disk(
-            _global_state.tokenizer_manager.weight_updater_controller, obj, request
+        await _global_state.tokenizer_manager.weight_updater_controller.update_weights_from_disk(
+            obj, request
         )
     )
 

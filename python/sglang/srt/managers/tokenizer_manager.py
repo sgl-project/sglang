@@ -25,7 +25,7 @@ import threading
 from contextlib import nullcontext
 from enum import Enum
 from http import HTTPStatus
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import fastapi
 import pybase64
@@ -60,7 +60,6 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
@@ -446,9 +445,7 @@ class TokenizerManager(TokenizerControlMixin):
                 ),
                 (
                     UpdateWeightFromDiskReqOutput,
-                    lambda x: TokenizerManager.handle_update_weights_from_disk_req_output(
-                        self.weight_updater_controller, x
-                    ),
+                    self.weight_updater_controller.handle_update_weights_from_disk_req_output,
                 ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
@@ -916,70 +913,11 @@ class TokenizerManager(TokenizerControlMixin):
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
-    @staticmethod
-    async def update_weights_from_disk(
-        self: "WeightUpdaterController",
-        obj: UpdateWeightFromDiskReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        self.auto_create_handle_loop()
-
-        # default the load format to the server_args
-        if obj.load_format is None:
-            obj.load_format = self.server_args.load_format
-        logger.info("Start update_weights. Load format=%s", obj.load_format)
-
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause_getter()
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            success, message, num_paused_requests = (
-                await TokenizerManager._wait_for_model_update_from_disk(self, obj)
-            )
-
-        if success and obj.weight_version is not None:
-            TokenizerControlMixin._update_weight_version_if_provided(
-                self, obj.weight_version
-            )
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message, num_paused_requests
-
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.model_path = model_path
-
-    @staticmethod
-    async def _wait_for_model_update_from_disk(
-        self: "WeightUpdaterController", obj: UpdateWeightFromDiskReqInput
-    ) -> Tuple[bool, str]:
-        self.send_to_scheduler.send_pyobj(obj)
-        self.model_update_result = asyncio.Future()
-        if self.server_args.dp_size == 1:
-            result = await self.model_update_result
-            if result.success:
-                self.update_model_path_info(obj.model_path, obj.load_format)
-            return result.success, result.message, result.num_paused_requests
-        else:  # self.server_args.dp_size > 1
-            self.model_update_tmp = []
-            result = await self.model_update_result
-
-            all_success = all([r.success for r in result])
-            if all_success is True:
-                self.update_model_path_info(obj.model_path, obj.load_format)
-            all_message = [r.message for r in result]
-            all_message = " | ".join(all_message)
-            all_paused_requests = [r.num_paused_requests for r in result]
-            return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         self.request_log_manager.request_logger.configure(
@@ -1446,18 +1384,6 @@ class TokenizerManager(TokenizerControlMixin):
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
-
-    @staticmethod
-    def handle_update_weights_from_disk_req_output(
-        self: "WeightUpdaterController", recv_obj
-    ):
-        if self.server_args.dp_size == 1:
-            self.model_update_result.set_result(recv_obj)
-        else:  # self.server_args.dp_size > 1
-            self.model_update_tmp.append(recv_obj)
-            # set future if the all results are received
-            if len(self.model_update_tmp) == self.server_args.dp_size:
-                self.model_update_result.set_result(self.model_update_tmp)
 
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

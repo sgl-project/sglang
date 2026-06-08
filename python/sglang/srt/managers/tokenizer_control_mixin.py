@@ -424,8 +424,8 @@ class TokenizerControlMixin:
 
         success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
-            TokenizerControlMixin._update_weight_version_if_provided(
-                self.weight_updater_controller, obj.weight_version
+            self.weight_updater_controller._update_weight_version_if_provided(
+                obj.weight_version
             )
             message += f" Weight version updated to {obj.weight_version}."
 
@@ -483,8 +483,8 @@ class TokenizerControlMixin:
 
         success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
-            TokenizerControlMixin._update_weight_version_if_provided(
-                self.weight_updater_controller, obj.weight_version
+            self.weight_updater_controller._update_weight_version_if_provided(
+                obj.weight_version
             )
             message += f" Weight version updated to {obj.weight_version}."
 
@@ -520,8 +520,8 @@ class TokenizerControlMixin:
             success, message = False, error_msg
 
         if success and obj.weight_version is not None:
-            TokenizerControlMixin._update_weight_version_if_provided(
-                self.weight_updater_controller, obj.weight_version
+            self.weight_updater_controller._update_weight_version_if_provided(
+                obj.weight_version
             )
             message += f" Weight version updated to {obj.weight_version}."
 
@@ -838,11 +838,3 @@ class TokenizerControlMixin:
             results = reader.read_all()
 
         return results
-
-    @staticmethod
-    def _update_weight_version_if_provided(
-        self: "WeightUpdaterController", weight_version: Optional[str]
-    ) -> None:
-        """Update weight version if provided."""
-        if weight_version is not None:
-            self.server_args.weight_version = weight_version
