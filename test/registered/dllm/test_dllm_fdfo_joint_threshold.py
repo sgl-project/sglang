@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# max_tokens=128 spans several decode blocks (block_size 32 for LLaDA2).
 PROMPTS = [
     "Question: Natalia sold clips to 48 friends in April, and half as many in "
     "May. How many clips did she sell altogether? Answer:",

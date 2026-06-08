@@ -10,10 +10,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class JointThreshold(DllmAlgorithm):
-    """Joint-threshold denoising with a post-fill edit phase: mask-to-token (M2T)
-    unmasking above ``threshold`` plus token-to-token (T2T) edits above
-    ``edit_threshold``, finishing on no-change or an exhausted edit budget. Stateful
-    (edit budget + prompt mask), carried across FDFO rounds via ``dllm_algo_state``.
+    """Joint-threshold denoising: mask-to-token (M2T) unmasking plus token-to-token
+    (T2T) edits, finishing on no-change or an exhausted edit budget. Stateful (edit
+    budget + prompt mask), carried across FDFO rounds via ``dllm_algo_state``.
     """
 
     def __init__(self, config: DllmConfig):
@@ -49,7 +48,6 @@ class JointThreshold(DllmAlgorithm):
     ) -> List[bool]:
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
-        # Single batched host-to-device transfer, not one per request.
         prompt_masks = torch.tensor(
             [state["prompt_mask"] for state in states], device=device, dtype=torch.bool
         )
@@ -57,11 +55,9 @@ class JointThreshold(DllmAlgorithm):
 
         for i in range(batch_size):
             state = states[i]
-            # Finished in a prior step => complete on entry, KV persisted here.
             if state["finished"]:
                 done.append(True)
                 continue
-            done.append(False)
 
             block_start = i * self.block_size
             block_end = block_start + self.block_size
@@ -90,6 +86,7 @@ class JointThreshold(DllmAlgorithm):
 
             # Mask to token (M2T)
             mask_transfer_index = torch.zeros_like(mask_index)
+            budget_exhausted = False
             if has_mask:
                 confidence = torch.where(mask_index, p, -np.inf)
                 mask_transfer_index = confidence > self.threshold
@@ -100,20 +97,23 @@ class JointThreshold(DllmAlgorithm):
                 state["post_edit_steps"] += 1
                 if state["post_edit_steps"] > self.max_post_edit_steps:
                     state["finished"] = True
-                    continue
+                    budget_exhausted = True
 
-            # Token to token (T2T)
-            edit_mask = ~mask_index & ~curr_prompt_mask
-            edit_transfer_index = (
-                (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
-            )
+            if not budget_exhausted:
+                # Token to token (T2T)
+                edit_mask = ~mask_index & ~curr_prompt_mask
+                edit_transfer_index = (
+                    (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
+                )
+                transfer_index = mask_transfer_index | edit_transfer_index
+                if transfer_index.any():
+                    curr_input_ids[transfer_index] = x[transfer_index]
+                else:
+                    state["finished"] = True
 
-            transfer_index = mask_transfer_index | edit_transfer_index
-            if not transfer_index.any():
-                state["finished"] = True
-                continue
-
-            curr_input_ids[transfer_index] = x[transfer_index]
+            # A terminating step changes nothing, so this forward already holds the
+            # block's final KV: emit it now rather than after an extra forward.
+            done.append(state["finished"])
 
         return done
 

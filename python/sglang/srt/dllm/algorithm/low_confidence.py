@@ -9,8 +9,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 class LowConfidence(DllmAlgorithm):
     """Each step unmasks positions whose predicted-token confidence exceeds a
-    threshold (falling back to the single highest-confidence masked position).
-    Stateless, so it runs in both synchronous and FDFO modes unchanged.
+    threshold (falling back to the highest-confidence masked position).
     """
 
     def __init__(self, config: DllmConfig):
@@ -28,8 +27,6 @@ class LowConfidence(DllmAlgorithm):
         logits = full_logits.view(batch_size, self.block_size, vocab_size)
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         block_mask_index = input_ids == self.mask_id
-
-        # No mask on entry => block already resolved, KV persisted by this forward.
         done = block_mask_index.sum(dim=1) == 0
 
         x = torch.argmax(logits, dim=-1)

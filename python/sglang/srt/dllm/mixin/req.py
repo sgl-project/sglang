@@ -20,7 +20,6 @@ class DllmReqPhase(str, enum.Enum):
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
-        # FDFO carry-over for an unfinished block (reset on completion).
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
         self.dllm_block_offset = 0

@@ -15,19 +15,6 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
-## First-Done-First-Out (FDFO) Scheduling
-
-By default the requests in a batch advance in lockstep, so fast-converging requests must wait for slow long-tail requests before leaving the batch (head-of-line blocking). Add `--dllm-fdfo` to free each request as soon as its block is resolved, which improves throughput. The flag is orthogonal to `--dllm-algorithm` and works with any dLLM algorithm:
-
-```shell
-python3 -m sglang.launch_server \
-  --model-path inclusionAI/LLaDA2.0-mini \
-  --dllm-algorithm LowConfidence \
-  --dllm-fdfo \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
 ## Example Configuration File
 
 Depending on the algorithm selected, the configuration parameters vary.

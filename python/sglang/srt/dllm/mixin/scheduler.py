@@ -124,7 +124,6 @@ class SchedulerDllmMixin:
             assert len(next_token_ids) == block_size
 
             if result.accept_length_per_req_cpu[idx] == 0:
-                # Incomplete block: carry it to the next round, free its mask KV.
                 req.dllm_incomplete_ids = array("q", next_token_ids)
                 req.dllm_algo_state = (
                     algo_states[idx] if algo_states is not None else None

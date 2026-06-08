@@ -2427,7 +2427,6 @@ class Scheduler(
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
                 if self.dllm_config.first_done_first_out_mode:
-                    # FDFO frees the req-pool slot every round; cache only mid-block reqs.
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
                     self.req_to_token_pool.free(req)
