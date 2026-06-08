@@ -252,7 +252,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         return StreamingResponse(
             self._generate_transcription_stream(adapted_request, request, raw_request),
             media_type="text/event-stream",
-            background=self.tokenizer_manager.create_abort_task(adapted_request),
+            background=self.tokenizer_manager.response_emitter.create_abort_task(
+                adapted_request
+            ),
         )
 
     async def _generate_transcription_stream(

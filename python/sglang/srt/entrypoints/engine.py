@@ -952,7 +952,7 @@ class Engine(EngineScoreMixin, EngineBase):
             timeout=timeout,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.open_session(obj, None)
+            self.tokenizer_manager.session_controller.open_session(obj, None)
         )
 
     def close_session(self, session_id: str) -> None:
@@ -962,7 +962,9 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id: The session ID to close.
         """
         obj = CloseSessionReqInput(session_id=session_id)
-        self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
+        self.loop.run_until_complete(
+            self.tokenizer_manager.session_controller.close_session(obj, None)
+        )
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
@@ -1015,7 +1017,9 @@ class Engine(EngineScoreMixin, EngineBase):
             backend=backend,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.init_weights_update_group(obj, None)
+            self.tokenizer_manager.weight_updater_controller.init_weights_update_group(
+                obj, None
+            )
         )
 
     def destroy_weights_update_group(
@@ -1027,7 +1031,9 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.destroy_weights_update_group(obj, None)
+            self.tokenizer_manager.weight_updater_controller.destroy_weights_update_group(
+                obj, None
+            )
         )
 
     def update_weights_from_distributed(
@@ -1049,7 +1055,9 @@ class Engine(EngineScoreMixin, EngineBase):
             load_format=load_format,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_distributed(obj, None)
+            self.tokenizer_manager.weight_updater_controller.update_weights_from_distributed(
+                obj, None
+            )
         )
 
     def update_weights_from_tensor(
@@ -1073,7 +1081,9 @@ class Engine(EngineScoreMixin, EngineBase):
             flush_cache=flush_cache,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_tensor(obj, None)
+            self.tokenizer_manager.weight_updater_controller.update_weights_from_tensor(
+                obj, None
+            )
         )
 
     def update_weights_from_disk(
@@ -1093,7 +1103,9 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
         return self.loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_disk(obj, None)
+            self.tokenizer_manager.weight_updater_controller.update_weights_from_disk(
+                obj, None
+            )
         )
 
     def update_weights_from_ipc(
@@ -1107,14 +1119,18 @@ class Engine(EngineScoreMixin, EngineBase):
             flush_cache=flush_cache,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_ipc(obj, None)
+            self.tokenizer_manager.weight_updater_controller.update_weights_from_ipc(
+                obj, None
+            )
         )
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         return self.loop.run_until_complete(
-            self.tokenizer_manager.get_weights_by_name(obj, None)
+            self.tokenizer_manager.weight_updater_controller.get_weights_by_name(
+                obj, None
+            )
         )
 
     def load_lora_adapter_from_tensors(
@@ -1137,7 +1153,9 @@ class Engine(EngineScoreMixin, EngineBase):
             load_format=load_format,
         )
         return self.loop.run_until_complete(
-            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+            self.tokenizer_manager.lora_controller.load_lora_adapter_from_tensors(
+                lora_req, None
+            )
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
@@ -1150,7 +1168,7 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
         return self.loop.run_until_complete(
-            self.tokenizer_manager.load_lora_adapter(obj, None)
+            self.tokenizer_manager.lora_controller.load_lora_adapter(obj, None)
         )
 
     def unload_lora_adapter(self, lora_name: str):
@@ -1159,7 +1177,7 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
         return self.loop.run_until_complete(
-            self.tokenizer_manager.unload_lora_adapter(obj, None)
+            self.tokenizer_manager.lora_controller.unload_lora_adapter(obj, None)
         )
 
     async def async_load_lora_adapter(
@@ -1177,7 +1195,7 @@ class Engine(EngineScoreMixin, EngineBase):
             pinned=pinned,
         )
 
-        return await self.tokenizer_manager.load_lora_adapter(obj, None)
+        return await self.tokenizer_manager.lora_controller.load_lora_adapter(obj, None)
 
     async def async_unload_lora_adapter(self, lora_name: str):
         """
@@ -1188,18 +1206,24 @@ class Engine(EngineScoreMixin, EngineBase):
 
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
-        return await self.tokenizer_manager.unload_lora_adapter(obj, None)
+        return await self.tokenizer_manager.lora_controller.unload_lora_adapter(
+            obj, None
+        )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         return self.loop.run_until_complete(
-            self.tokenizer_manager.release_memory_occupation(obj, None)
+            self.tokenizer_manager.weight_updater_controller.release_memory_occupation(
+                obj, None
+            )
         )
 
     def resume_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         return self.loop.run_until_complete(
-            self.tokenizer_manager.resume_memory_occupation(obj, None)
+            self.tokenizer_manager.weight_updater_controller.resume_memory_occupation(
+                obj, None
+            )
         )
 
     def freeze_gc(self):

@@ -1614,7 +1614,7 @@ class ShmPointerMMData:
 def _get_is_default_transport():
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
-        from sglang.srt.managers.tokenizer_manager import (
+        from sglang.srt.managers.tokenizer_manager_components.raw_tokenizer_wrapper import (
             _determine_tensor_transport_mode,
         )
 

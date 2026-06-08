@@ -748,7 +748,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
-            background=_global_state.tokenizer_manager.create_abort_task(obj),
+            background=_global_state.tokenizer_manager.response_emitter.create_abort_task(
+                obj
+            ),
         )
     else:
         try:
@@ -816,7 +818,9 @@ async def add_external_corpus(request: Request):
             {"success": False, "message": str(e)},
             status_code=HTTPStatus.BAD_REQUEST,
         )
-    result = await _global_state.tokenizer_manager.add_external_corpus(obj)
+    result = (
+        await _global_state.tokenizer_manager.corpus_controller.add_external_corpus(obj)
+    )
     return ORJSONResponse(
         {
             "success": result.success,
@@ -839,7 +843,11 @@ async def remove_external_corpus(request: Request):
             {"success": False, "message": "corpus_id is required."},
             status_code=HTTPStatus.BAD_REQUEST,
         )
-    result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
+    result = (
+        await _global_state.tokenizer_manager.corpus_controller.remove_external_corpus(
+            corpus_id
+        )
+    )
     return ORJSONResponse(
         {"success": result.success, "message": result.message},
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
@@ -850,7 +858,9 @@ async def remove_external_corpus(request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def list_external_corpora():
     """List all active external corpora."""
-    result = await _global_state.tokenizer_manager.list_external_corpora()
+    result = (
+        await _global_state.tokenizer_manager.corpus_controller.list_external_corpora()
+    )
     return ORJSONResponse(
         {
             "success": result.success,
@@ -1068,7 +1078,9 @@ async def dump_expert_distribution_record_async():
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
+        await _global_state.tokenizer_manager.weight_updater_controller.update_weights_from_disk(
+            obj, request
+        )
     )
 
     content = {
@@ -1166,8 +1178,10 @@ async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    success, message = await _global_state.tokenizer_manager.init_weights_update_group(
-        obj, request
+    success, message = (
+        await _global_state.tokenizer_manager.weight_updater_controller.init_weights_update_group(
+            obj, request
+        )
     )
     content = {"success": success, "message": message}
     if success:
@@ -1183,7 +1197,9 @@ async def destroy_weights_update_group(
 ):
     """Destroy the parameter update group."""
     success, message = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+        await _global_state.tokenizer_manager.weight_updater_controller.destroy_weights_update_group(
+            obj, request
+        )
     )
     content = {"success": success, "message": message}
     return ORJSONResponse(
@@ -1203,8 +1219,10 @@ async def update_weights_from_tensor(
     3. Any binary data in the named tensors should be base64 encoded.
     """
 
-    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
-        obj, request
+    success, message = (
+        await _global_state.tokenizer_manager.weight_updater_controller.update_weights_from_tensor(
+            obj, request
+        )
     )
 
     content = {"success": success, "message": message}
@@ -1220,7 +1238,7 @@ async def update_weights_from_distributed(
 ):
     """Update model parameter from distributed online."""
     success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
+        await _global_state.tokenizer_manager.weight_updater_controller.update_weights_from_distributed(
             obj, request
         )
     )
@@ -1236,14 +1254,21 @@ async def update_weights_from_distributed(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
-    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
-        obj, request
+    success, message = (
+        await _global_state.tokenizer_manager.weight_updater_controller.update_weights_from_ipc(
+            obj, request
+        )
     )
 
     content = {"success": success, "message": message}
     if success:
-        if _global_state.tokenizer_manager.initial_weights_loaded is False:
-            _global_state.tokenizer_manager.initial_weights_loaded = True
+        if (
+            _global_state.tokenizer_manager.weight_updater_controller.initial_weights_loaded
+            is False
+        ):
+            _global_state.tokenizer_manager.weight_updater_controller.initial_weights_loaded = (
+                True
+            )
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
@@ -1285,7 +1310,9 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
+        ret = await _global_state.tokenizer_manager.weight_updater_controller.get_weights_by_name(
+            obj, request
+        )
         if ret is None:
             return _create_error_response("Get parameter by name failed")
         else:
@@ -1301,7 +1328,9 @@ async def release_memory_occupation(
 ):
     """Release GPU memory occupation temporarily."""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        await _global_state.tokenizer_manager.weight_updater_controller.release_memory_occupation(
+            obj, request
+        )
     except Exception as e:
         return _create_error_response(e)
 
@@ -1313,7 +1342,9 @@ async def resume_memory_occupation(
 ):
     """Resume GPU memory occupation."""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        await _global_state.tokenizer_manager.weight_updater_controller.resume_memory_occupation(
+            obj, request
+        )
     except Exception as e:
         return _create_error_response(e)
 
@@ -1326,7 +1357,9 @@ async def check_weights(
     if obj is None:
         obj = CheckWeightsReqInput()
     success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
+        await _global_state.tokenizer_manager.weight_updater_controller.check_weights(
+            obj, request
+        )
     )
     body = {"success": success, "message": message}
     if ranks is not None:
@@ -1354,7 +1387,9 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
+    result = await _global_state.tokenizer_manager.lora_controller.load_lora_adapter(
+        obj, request
+    )
 
     if result.success:
         return ORJSONResponse(
@@ -1373,7 +1408,7 @@ async def load_lora_adapter_from_tensors(
     obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
-    result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+    result = await _global_state.tokenizer_manager.lora_controller.load_lora_adapter_from_tensors(
         obj, request
     )
 
@@ -1387,7 +1422,9 @@ async def load_lora_adapter_from_tensors(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+    result = await _global_state.tokenizer_manager.lora_controller.unload_lora_adapter(
+        obj, request
+    )
 
     if result.success:
         return ORJSONResponse(
@@ -1405,7 +1442,11 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await _global_state.tokenizer_manager.open_session(obj, request)
+        session_id = (
+            await _global_state.tokenizer_manager.session_controller.open_session(
+                obj, request
+            )
+        )
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
@@ -1419,7 +1460,9 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 async def close_session(obj: CloseSessionReqInput, request: Request):
     """Close the session."""
     try:
-        await _global_state.tokenizer_manager.close_session(obj, request)
+        await _global_state.tokenizer_manager.session_controller.close_session(
+            obj, request
+        )
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -1671,7 +1714,7 @@ async def available_models():
 
     # Add loaded LoRA adapters
     if _global_state.tokenizer_manager.server_args.enable_lora:
-        lora_registry = _global_state.tokenizer_manager.lora_registry
+        lora_registry = _global_state.tokenizer_manager.lora_controller.lora_registry
         for _, lora_ref in lora_registry.get_all_adapters().items():
             model_cards.append(
                 ModelCard(
@@ -2104,7 +2147,9 @@ def _wait_weights_ready():
     start_time = time.time()
 
     for _ in range(timeout):
-        if _global_state.tokenizer_manager.initial_weights_loaded:
+        if (
+            _global_state.tokenizer_manager.weight_updater_controller.initial_weights_loaded
+        ):
             logger.info(
                 f"Weights are ready after {time.time() - start_time:.2f} seconds"
             )
@@ -2115,7 +2160,7 @@ def _wait_weights_ready():
     logger.error(
         f"Weights are not ready after waiting {timeout} seconds. "
         f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
-        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.weight_updater_controller.initial_weights_loaded}"
     )
 
 

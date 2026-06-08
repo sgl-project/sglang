@@ -1093,7 +1093,7 @@ class TestMultiSamHttpMock(CustomTestCase):
         tm = mock_state.tokenizer_manager
 
         # Wire up async methods that the HTTP handlers call
-        tm.add_external_corpus = AsyncMock(
+        tm.corpus_controller.add_external_corpus = AsyncMock(
             return_value=AddExternalCorpusReqOutput(
                 success=True,
                 corpus_id="test-id",
@@ -1101,12 +1101,12 @@ class TestMultiSamHttpMock(CustomTestCase):
                 loaded_token_count=100,
             )
         )
-        tm.remove_external_corpus = AsyncMock(
+        tm.corpus_controller.remove_external_corpus = AsyncMock(
             return_value=RemoveExternalCorpusReqOutput(
                 success=True, message="Removed corpus 'test-id'."
             )
         )
-        tm.list_external_corpora = AsyncMock(
+        tm.corpus_controller.list_external_corpora = AsyncMock(
             return_value=ListExternalCorporaReqOutput(
                 success=True, corpus_token_counts={"a": 100, "b": 200}
             )

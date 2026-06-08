@@ -53,6 +53,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.server_args = Mock(enable_cache_report=False)
 
         tm.generate_request = AsyncMock()
+        tm.response_emitter = tm
         tm.create_abort_task = Mock()
 
         self.template_manager = _MockTemplateManager()
