@@ -870,7 +870,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
-                    len(self.chunked_req.fill_ids),
+                    self.chunked_req.fill_len,
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
@@ -906,7 +906,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(len(req.fill_ids), len(req.origin_input_ids))
+            else min(req.fill_len, len(req.origin_input_ids))
         )
 
         if not last_chunk:
@@ -937,7 +937,7 @@ class SchedulerDisaggregationPrefillMixin:
             # length here avoids emitting an extra state page when the sampled
             # token crosses a page boundary, which mismatched src/dst lengths in
             # group_concurrent_contiguous.
-            seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
+            seq_len = min(req.fill_len, len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [
