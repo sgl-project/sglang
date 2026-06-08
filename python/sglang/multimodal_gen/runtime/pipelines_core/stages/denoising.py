@@ -1924,11 +1924,72 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
-            model_output = runner(**call_kwargs)
+            model_output = runner(**self._bcg_pad_prompt_kwargs(call_kwargs))
         else:
             model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
 
+    def _bcg_pad_prompt_kwargs(self, call_kwargs: dict):
+        """Pad the prompt-conditioning inputs to a FIXED bucket length so the
+        breakable-CUDA-graph capture signature is invariant to prompt length —
+        different prompts then replay one captured graph instead of re-capturing.
+
+        Pads ``encoder_hidden_states`` and every prompt-length mask
+        (``encoder_attention_mask`` / ``encoder_hidden_states_mask``, including
+        list-wrapped ones) along the sequence dim to ``SGLANG_BCG_TEXT_BUCKET``
+        (default 512). Masks are padded with 0 (== "ignore") so for any
+        cross-attention model the appended positions are masked out and the
+        result is bit-exact with the unpadded run (masked keys contribute zero).
+
+        Gated on an ``encoder_attention_mask`` being present (so padding can be
+        masked); no-op when text already equals the bucket or exceeds it.
+        """
+        import os
+
+        ehs = call_kwargs.get("encoder_hidden_states")
+        mask = call_kwargs.get("encoder_attention_mask")
+        if isinstance(mask, (list, tuple)) and len(mask) == 1:
+            mask = mask[0]
+        if not torch.is_tensor(ehs) or ehs.dim() < 2:
+            return call_kwargs
+        if not torch.is_tensor(mask) or mask.dim() < 2:
+            return call_kwargs
+        seq = ehs.shape[1]
+        bucket = int(os.environ.get("SGLANG_BCG_TEXT_BUCKET", "512"))
+        if seq == bucket:
+            return call_kwargs
+        if seq > bucket:
+            logger.warning(
+                "[Diffusion BCG] text length %d exceeds bucket %d; not padding "
+                "(this length captures its own graph). Raise SGLANG_BCG_TEXT_BUCKET.",
+                seq,
+                bucket,
+            )
+            return call_kwargs
+        pad = bucket - seq
+
+        def _pad_seq(x):
+            # Pad dim-1 from seq -> bucket for tensors whose dim-1 == seq.
+            # Embeds keep zeros (masked out); masks get 0 (== ignore).
+            if torch.is_tensor(x) and x.dim() >= 2 and x.shape[1] == seq:
+                npad = (0, 0) * (x.dim() - 2) + (0, pad)
+                return torch.nn.functional.pad(x, npad)
+            if isinstance(x, list):
+                return [_pad_seq(e) for e in x]
+            if isinstance(x, tuple):
+                return tuple(_pad_seq(e) for e in x)
+            return x
+
+        out = dict(call_kwargs)
+        for key in (
+            "encoder_hidden_states",
+            "encoder_hidden_states_2",
+            "encoder_attention_mask",
+            "encoder_hidden_states_mask",
+        ):
+            if key in out and out[key] is not None:
+                out[key] = _pad_seq(out[key])
+        return out
     def _maybe_get_bcg_runner(self, current_model):
         """Return (lazily creating) the breakable CUDA graph runner for
         ``current_model``, or ``None`` if BCG is disabled / inapplicable.
