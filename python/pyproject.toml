@@ -91,6 +91,7 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
+suffix = ["arctic_inference>=0.1.2"]  # SUFFIX speculative decoding (model-free, CPU suffix tree)
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
