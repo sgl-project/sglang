@@ -264,11 +264,41 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+            mamba_track_indices = mamba_track_indices.to(torch.int64)
+            mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
+
+            move_intermediate_cache(
+                ssm_states,
+                intermediate_state_cache,
+                mamba_track_indices,
+                src_indices_tensor,
+                mamba_steps_to_track,
+            )
+
+            track_mask = mamba_steps_to_track >= 0
+            # Track conv state from the verify-time window before rolling back
+            # the working slot; NPU does not keep per-step conv intermediates.
+            track_indices = mamba_track_indices[track_mask]
+            if track_indices.numel() > 0:
+                conv_states[:, track_indices] = conv_states[
+                    :, dst_indices_tensor[track_mask]
+                ]
+
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(
                 conv_states,
                 dst_indices_tensor,
                 last_steps,
+                draft_token_num,
+            )
+
+        if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
+            conv_state_rollback(
+                conv_states,
+                mamba_track_indices,
+                mamba_steps_to_track,
                 draft_token_num,
             )
 
