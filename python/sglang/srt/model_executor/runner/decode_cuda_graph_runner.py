@@ -401,7 +401,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
-        if self.require_mlp_tp_gather:
+        if (
+            self.require_mlp_tp_gather
+            and forward_batch.global_num_tokens_cpu is not None
+        ):
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
