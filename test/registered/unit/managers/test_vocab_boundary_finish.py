@@ -71,7 +71,9 @@ class TestVocabBoundaryFinish(CustomTestCase):
 
     def test_stop_token_used_when_no_eos(self):
         # Without eos tokens, the slot is rewritten to a stop token instead.
-        req = _make_req(output_ids=[VOCAB_SIZE], eos_token_ids=set(), stop_token_ids={7})
+        req = _make_req(
+            output_ids=[VOCAB_SIZE], eos_token_ids=set(), stop_token_ids={7}
+        )
         self.assertTrue(req._check_vocab_boundary_finish([VOCAB_SIZE]))
         self.assertEqual(req.output_ids[0], 7)
 
