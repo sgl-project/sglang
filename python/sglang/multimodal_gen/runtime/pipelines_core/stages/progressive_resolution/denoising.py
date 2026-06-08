@@ -27,6 +27,10 @@ import time
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    refresh_context_on_dual_transformer,
+    refresh_context_on_transformer,
+)
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -48,6 +52,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
+
+
+def _get_scm_preset() -> str | None:
+    from sglang.multimodal_gen import envs
+
+    preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+    return None if (preset is None or preset == "none") else preset
 
 
 class ProgressiveDenoisingStage(DenoisingStage):
@@ -323,6 +334,37 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 )
 
                 reset_scheduler_at_step(scheduler, stage_end)
+
+                # Refresh cache-dit context so its step counter and cached
+                # activations start clean for the new resolution.  The coarse-
+                # stage activations have the wrong shape and would corrupt the
+                # residual-diff decision for the first full-res steps.
+                if self._cache_dit_enabled:
+                    n_remaining = n_steps - stage_end
+                    scm_preset = _get_scm_preset()
+                    if self.transformer_2 is not None:
+                        n_high = n_remaining // 2
+                        n_low = n_remaining - n_high
+                        refresh_context_on_dual_transformer(
+                            self.transformer,
+                            self.transformer_2,
+                            n_high,
+                            n_low,
+                            scm_preset=scm_preset,
+                        )
+                    else:
+                        refresh_context_on_transformer(
+                            self.transformer,
+                            n_remaining,
+                            scm_preset=scm_preset,
+                        )
+                    logger.info(
+                        "cache-dit context refreshed at stage transition "
+                        "(step %d, %d steps remaining)",
+                        stage_end,
+                        n_remaining,
+                    )
+
                 cur_h_lat = new_h_lat
                 cur_w_lat = new_w_lat
                 stage_start = stage_end
