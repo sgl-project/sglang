@@ -6,6 +6,7 @@ via KL divergence.
 """
 
 import os
+import random
 import shutil
 import tempfile
 import unittest
@@ -45,6 +46,9 @@ class AccuracyTwoPassMixin:
     mmlu_num_threads: int = 32
 
     max_accuracy_diff: float = 0.02
+
+    l3_prefetch_page_size: int = 64
+    l3_prefetch_prompt_pages: int = 16
 
     def _run_gsm8k(self):
         from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
@@ -126,6 +130,27 @@ class AccuracyTwoPassMixin:
     def test_mmlu_two_passes(self):
         """Run MMLU twice with flush in between, verify accuracy diff <= max_accuracy_diff."""
         self._two_pass("MMLU", self._run_mmlu, self.mmlu_threshold)
+
+    def test_l3_prefetch_full_prefix_hit_after_flush(self):
+        from sglang.test.kl_test_utils import _flush_cache, _generate
+
+        page = int(self.l3_prefetch_page_size)
+        n_tokens = page * int(self.l3_prefetch_prompt_pages)
+
+        rng = random.Random(987)
+        input_ids = [rng.randint(1, 30000) for _ in range(n_tokens)]
+
+        _generate(self.base_url, [input_ids], max_new_tokens=4)
+        _flush_cache(self.base_url)
+        results = _generate(self.base_url, [input_ids], max_new_tokens=4)
+        cached = int(results[0]["meta_info"]["cached_tokens"])
+
+        expected_min = n_tokens - page
+        self.assertGreaterEqual(
+            cached,
+            expected_min,
+            f"cached_tokens={cached} < {expected_min} (= input_len - page_size)",
+        )
 
 
 class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
