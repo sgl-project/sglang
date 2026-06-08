@@ -1,0 +1,114 @@
+import os
+import subprocess
+from abc import ABC
+from types import SimpleNamespace
+
+import torch_mlu  # noqa: F401
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.mlu.test_mlu_utils import write_results_to_github_step_summary
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+    write_github_step_summary,
+)
+
+
+class GSM8KMLUMixin(ABC):
+    model = ""
+
+    timeout_for_server_launch = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    other_args = [
+        "--device",
+        "mlu",
+        "--trust-remote-code",
+        "--attention-backend",
+        "mlu",
+        "--sampling-backend",
+        "pytorch",
+        "--skip-server-warmup",
+    ]
+    server_cmd = ""
+    gsm8k_num_shots = 5
+    num_questions = 200
+    gsm8k_parallel = 128
+    max_new_tokens = 16384
+    temperature = 0.0
+    top_p = 1.0
+    random_seed = None
+
+    env = {
+        **os.environ,
+        "TRANSFORMERS_VERBOSITY": os.getenv("TRANSFORMERS_VERBOSITY", "error"),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        try:
+            other_args = list(cls.other_args)
+            if cls.random_seed is not None:
+                other_args.extend(["--random-seed", str(cls.random_seed)])
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=cls.timeout_for_server_launch,
+                other_args=other_args,
+                env=cls.env,
+                device="mlu",
+            )
+            cls.server_cmd = subprocess.list2cmdline(cls.process.args)
+        except Exception as e:
+            write_github_step_summary(f"Failed to launch server for {cls.model}: {e}")
+            raise AssertionError(f"Test failed for {cls.model}: {e}")
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        accuracy_threshold = getattr(self, "accuracy", 0.00)
+        output_throughput_threshold = getattr(self, "output_throughput", 0.00)
+
+        model_metrics = {
+            "server": self.server_cmd,
+            "client": "few_shot_gsm8k",
+            "accuracy_threshold": getattr(self, "accuracy", "N/A"),
+            "output_throughput_threshold": getattr(
+                self, "output_throughput", "N/A"
+            ),
+        }
+
+        try:
+            args = SimpleNamespace(
+                num_shots=self.gsm8k_num_shots,
+                data_path=None,
+                num_questions=self.num_questions,
+                max_new_tokens=self.max_new_tokens,
+                parallel=self.gsm8k_parallel,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                host="http://127.0.0.1",
+                port=int(self.base_url.split(":")[-1]),
+            )
+            metrics = run_eval(args)
+            model_metrics["accuracy"] = metrics["accuracy"]
+            model_metrics["output_throughput"] = metrics["output_throughput"]
+            model_metrics["latency"] = metrics["latency"]
+            self.assertGreaterEqual(
+                metrics["accuracy"],
+                accuracy_threshold,
+                f'Accuracy of {self.model} is {str(metrics["accuracy"])}, is lower than {accuracy_threshold}',
+            )
+            self.assertGreaterEqual(
+                metrics["output_throughput"],
+                output_throughput_threshold,
+                f'Output throughput of {self.model} is {str(metrics["output_throughput"])}, is lower than {output_throughput_threshold}',
+            )
+        except Exception as e:
+            model_metrics["error"] = e
+            self.fail(f"Test failed for {self.model}: {e}")
+        finally:
+            write_results_to_github_step_summary({self.model: model_metrics})

@@ -110,7 +110,8 @@ def run_eval(args):
     tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         arguments,
-        temperature=args.temperature if hasattr(args, "temperature") else 0,
+        temperature=getattr(args, "temperature", 0),
+        top_p=getattr(args, "top_p", 1.0),
         num_threads=args.parallel,
         progress_bar=True,
         return_logprob=getattr(args, "return_logprob", None),
@@ -162,5 +163,6 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     args = parser.parse_args()
     run_eval(args)
