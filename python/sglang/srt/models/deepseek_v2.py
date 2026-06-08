@@ -163,7 +163,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_xpu,
     _use_aiter,
     _use_aiter_gfx95,
-    is_w4afp8_or_w4a16_config,
+    is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -2613,7 +2613,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) "
                 "can use shared experts fusion optimization under expert parallelism."
             )
-        elif is_w4afp8_or_w4a16_config(self.quant_config):
+        elif is_wint4afp8_or_wint4a16_config(self.quant_config):
             disable_reason = "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
