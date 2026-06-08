@@ -2679,7 +2679,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            # V1 SUFFIX uses NgramVerifyInput at K = num_draft_tokens.
+            # V2 SUFFIX uses EagleVerifyInput (build_suffix_v2_eagle_verify_input).
+            # Route V2 SUFFIX through the Eagle branch when overlap is enabled;
+            # V1 SUFFIX stays on the Ngram branch below.
+            _suffix_v2 = (
+                self.spec_algorithm.is_suffix()
+                and not self.server_args.disable_overlap_schedule
+            )
+            if (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+                or _suffix_v2
+            ):
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:
@@ -2716,7 +2728,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                 )
 
-            elif self.spec_algorithm.is_ngram():
+            elif self.spec_algorithm.is_ngram() and not _suffix_v2:
                 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
                 spec_info = NgramVerifyInput(

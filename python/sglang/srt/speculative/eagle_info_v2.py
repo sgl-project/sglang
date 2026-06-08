@@ -414,9 +414,18 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        # SUFFIX is model-free and never consumes target hidden states, so it
+        # verifies in NULL capture mode and reuses the cheaper NULL cuda graph.
+        # Standalone EAGLE3 is likewise NULL. Every other non-standalone V2
+        # spec algo (EAGLE/MTP, and the HYBRID SUFFIX path that feeds MTP
+        # keep-up) still needs FULL. The getattr guard keeps this safe for
+        # pure EAGLE/MTP runs where the SUFFIX plugin (which installs
+        # is_suffix()) was never imported.
+        spec_algo = target_worker.model_runner.spec_algorithm
+        _is_suffix = getattr(spec_algo, "is_suffix", None)
         capture_mode = (
             CaptureHiddenMode.NULL
-            if target_worker.model_runner.spec_algorithm.is_standalone()
+            if spec_algo.is_standalone() or (callable(_is_suffix) and _is_suffix())
             else CaptureHiddenMode.FULL
         )
         batch.capture_hidden_mode = capture_mode
