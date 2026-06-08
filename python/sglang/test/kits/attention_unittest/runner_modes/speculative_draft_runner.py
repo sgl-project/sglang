@@ -176,10 +176,13 @@ class _EagleDraftWorkerHarness:
         self.hot_token_id = None
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
-        # draft_forward's topk=1 fast path reads these prealloc buffers, which
-        # EagleDraftWorker.__init__ creates; the harness binds the method but
-        # skips __init__, so mirror that setup here.
+        # draft_forward's topk=1 fast path reads these prealloc buffers (built
+        # in EagleDraftWorker.__init__, which the harness skips), so build them
+        # here. _rebuild_topk1_chain_buffers asserts num_draft_tokens ==
+        # num_steps + 1; the fast path never reads num_draft_tokens, so pin it.
         self.device = self.model_runner.device
+        if self.topk == 1:
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)
