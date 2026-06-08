@@ -809,6 +809,7 @@ class ComposedPipelineBase(ABC):
         image_vae_key: str = "vae",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        progressive_denoising_stage_cls: type[DenoisingStage] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -845,7 +846,10 @@ class ComposedPipelineBase(ABC):
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_denoising_stage()
+        if progressive_denoising_stage_cls is None:
+            self.add_standard_denoising_stage()
+        else:
+            self.add_progressive_denoising_stage(progressive_denoising_stage_cls)
         self.add_standard_decoding_stage()
         return self
 

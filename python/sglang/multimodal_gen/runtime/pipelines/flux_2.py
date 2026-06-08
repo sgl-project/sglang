@@ -7,10 +7,6 @@ from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ImageVAEEncodingStage,
-    InputValidationStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
     Flux2ProgressiveDenoisingStage,
 )
@@ -57,21 +53,14 @@ class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
             * 2
         )
 
-        self.add_stage(InputValidationStage(vae_image_processor=vae_image_processor))
-        self.add_standard_text_encoding_stage()
-        self.add_stage(
-            ImageVAEEncodingStage(
-                vae=self.get_module("vae"),
-                component_name="vae",
-                vae_image_processor=vae_image_processor,
-            )
+        self.add_standard_ti2i_stages(
+            include_input_validation=True,
+            vae_image_processor=vae_image_processor,
+            prompt_encoding="text",
+            image_vae_stage_kwargs={"vae_image_processor": vae_image_processor},
+            prepare_extra_timestep_kwargs=[compute_empirical_mu],
+            progressive_denoising_stage_cls=Flux2ProgressiveDenoisingStage,
         )
-        self.add_standard_latent_preparation_stage()
-        self.add_standard_timestep_preparation_stage(
-            prepare_extra_kwargs=[compute_empirical_mu]
-        )
-        self.add_progressive_denoising_stage(Flux2ProgressiveDenoisingStage)
-        self.add_standard_decoding_stage()
 
 
 EntryClass = Flux2Pipeline
