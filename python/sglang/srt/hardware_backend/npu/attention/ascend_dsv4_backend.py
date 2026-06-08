@@ -480,15 +480,6 @@ class DeepseekV4AscendAttnBackend(
         # read -1 (= "no sparse index") to keep npu_sparse_attn_sharedkv stable.
         fm.c4_topk_indices.fill_(-1)
 
-        # [debug] per-replay ForwardMetadata dump for mainbase-vs-reference
-        # comparison. No-op unless env DSV4_REPLAY_DUMP=1. Debug only (the
-        # .cpu()/.tolist() inside force a device sync) — keep OFF for perf runs.
-        from sglang.srt.hardware_backend.npu.attention._dsv4_dump import (
-            dump_replay_metadata,
-        )
-
-        dump_replay_metadata(fm, forward_mode, bs, req_pool_indices, live_seq_lens)
-
         self.forward_metadata = fm
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
