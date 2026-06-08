@@ -348,8 +348,9 @@ class TestMluSRTPlatform(CustomTestCase):
     def test_mlu_platform_backend_defaults(self):
         base = MluSRTPlatform()
         self.assertEqual(base.get_dispatch_key_name(), "mlu")
+        self.assertEqual(base.get_default_attention_backend(), "mlu")
         self.assertEqual(base.get_torch_distributed_backend_str(), "cncl")
-        self.assertFalse(base.support_cuda_graph())
+        self.assertTrue(base.support_cuda_graph())
         self.assertFalse(base.support_piecewise_cuda_graph())
 
     def test_mlu_apply_server_args_defaults(self):
@@ -360,6 +361,9 @@ class TestMluSRTPlatform(CustomTestCase):
         with patch.object(MluSRTPlatform, "init_backend"):
             MluSRTPlatform().apply_server_args_defaults(args)
 
+        self.assertEqual(args.attention_backend, "mlu")
+        self.assertEqual(args.prefill_attention_backend, "mlu")
+        self.assertEqual(args.decode_attention_backend, "mlu")
         self.assertEqual(args.sampling_backend, "pytorch")
         self.assertEqual(args.page_size, 16)
         self.assertTrue(args.disable_custom_all_reduce)

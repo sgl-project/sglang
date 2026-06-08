@@ -255,7 +255,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_out_of_tree():
+elif (current_platform.is_out_of_tree() or current_platform.is_mlu()):
     current_platform.init_backend()
 
 MLA_ATTENTION_BACKENDS = [
@@ -852,7 +852,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_world_group().cpu_group,
                 )
             self.init_decode_cuda_graph()
-        elif current_platform.is_out_of_tree():
+        elif (current_platform.is_out_of_tree() or current_platform.is_mlu()):
             self.init_attention_backend()
             if current_platform.support_cuda_graph():
                 self.init_decode_cuda_graph()
@@ -1719,7 +1719,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.device == "cuda"
             or self.device == "musa"
             or (
-                current_platform.is_out_of_tree()
+                (current_platform.is_out_of_tree() or current_platform.is_mlu())
                 and current_platform.support_cuda_graph()
             )
         ):
@@ -2895,12 +2895,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "musa": "cuda graph",
                 "cpu": "cpu graph",
                 "npu": "npu graph",
+                "mlu": "mlu graph",
             },
         )
         logger.info(
             f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        if current_platform.is_out_of_tree():
+        if (current_platform.is_out_of_tree() or current_platform.is_mlu()):
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_cuda_graph_runner = GraphRunnerCls(self)
         else:
