@@ -378,6 +378,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else False
             )
+            self._use_group_semantics = (
+                self.enable_group_semantics
+                and self._supports_group_ids
+                and self._replicate_config_cls is not None
+            )
             if self.enable_group_semantics and not self._supports_group_ids:
                 logger.warning(
                     "Mooncake group semantics is enabled, but the installed "
@@ -662,11 +667,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return [f"{ self.extra_backend_tag}_{key}" for key in keys]
 
     def _can_use_group_semantics(self) -> bool:
-        return (
-            self.enable_group_semantics
-            and self._supports_group_ids
-            and self._replicate_config_cls is not None
-        )
+        return self._use_group_semantics
 
     def _make_group_id(self, logical_key: str) -> str:
         return f"sglang-hicache:{logical_key}"
