@@ -1,4 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+#
+# Architecture and model configuration for SANA DiT (Diffusion Transformer).
+#
+# SANA uses a linear-attention-based transformer that replaces standard
+# quadratic self-attention with ReLU-based linear attention, enabling
+# efficient high-resolution image synthesis. Cross-attention (standard SDPA)
+# is used for text conditioning via Gemma2 embeddings.
+#
+# Defaults below correspond to the SANA-1.6B / 1024px variant.
+# For 4.8B, override num_layers=36, num_attention_heads=64, etc.
+#
+# Reference: https://arxiv.org/abs/2410.10629
 
 from dataclasses import dataclass, field
 

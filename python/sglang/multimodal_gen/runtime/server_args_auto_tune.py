@@ -56,9 +56,6 @@ class ServerArgsAutoTuner:
 
         if args.performance_mode == "speed":
             logger.info("Applying performance_mode=speed")
-            if self._apply_auto_tp_priority_defaults():
-                self._set_gpu_resident_defaults(use_fsdp=False)
-                return
             if args.num_gpus >= 2 and self._can_apply_fsdp_policy(
                 require_memory_headroom=False
             ):
@@ -88,9 +85,6 @@ class ServerArgsAutoTuner:
                 self._set_component_offload_defaults()
             return
 
-        if args.performance_mode == "auto":
-            self._apply_auto_tp_priority_defaults()
-
     def maybe_adjust_auto_component_residency_after_offload(self) -> None:
         args = self.server_args
         if (
@@ -113,17 +107,6 @@ class ServerArgsAutoTuner:
             components = (
                 self._deployment_config().auto_disable_component_offload_components
             )
-            if (
-                "dit" in components
-                and args.num_gpus >= 2
-                and self._can_apply_fsdp_policy(require_memory_headroom=True)
-            ):
-                # Keep DiT offload visible to the later FSDP auto-selection
-                # pass. Multi-GPU FSDP+CFG parallel is preferred over simple
-                # component residency when both are viable.
-                components = tuple(
-                    component for component in components if component != "dit"
-                )
             if args._uses_ltx23_snapshot_two_stage_residency():
                 # ltx2 snapshot mode uses DiT offload to release/prefetch stage DiTs between phases
                 components = tuple(
@@ -230,8 +213,6 @@ class ServerArgsAutoTuner:
         ):
             return
         if not current_platform.is_cuda():
-            return
-        if self._should_skip_auto_default_layerwise_by_memory_headroom():
             return
 
         layerwise_components = self._default_layerwise_components_for_unset_placement()
@@ -450,54 +431,6 @@ class ServerArgsAutoTuner:
             cls.__module__.endswith(".wan")
             for cls in self.server_args.pipeline_config.__class__.mro()
         )
-
-    def _should_skip_auto_default_layerwise_by_memory_headroom(self) -> bool:
-        disable_threshold_gb = (
-            self._deployment_config().auto_disable_default_layerwise_offload_min_available_memory_gb
-        )
-        if disable_threshold_gb is None:
-            return False
-
-        min_available_gb = self._get_min_available_device_memory_gb()
-        return (
-            min_available_gb is not None
-            and min_available_gb >= disable_threshold_gb
-        )
-
-    def _apply_auto_tp_priority_defaults(self) -> bool:
-        args = self.server_args
-        candidates = tuple(
-            sorted(
-                {
-                    int(candidate)
-                    for candidate in self._deployment_config().auto_full_device_tp_size_candidates
-                },
-                reverse=True,
-            )
-        )
-        if (
-            not candidates
-            or not current_platform.is_cuda()
-            or self._explicit_memory_policy
-            or self._has_explicit_parallel_policy()
-        ):
-            return False
-
-        tp_size = next(
-            (candidate for candidate in candidates if args.num_gpus == candidate),
-            None,
-        )
-        if tp_size is None:
-            return False
-
-        args.tp_size = tp_size
-        args.sp_degree = 1
-        logger.info(
-            "Automatically selecting TP-first defaults for %s: tp_size=%d, sp_degree=1",
-            args.pipeline_config.__class__.__name__,
-            args.tp_size,
-        )
-        return True
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args

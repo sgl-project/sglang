@@ -128,7 +128,6 @@ class TransformerLoader(ComponentLoader):
             component_model_path=component_model_path,
             model_cls=model_cls,
             cls_name=cls_name,
-            arch_config=dit_config.arch_config,
         )
 
         logger.info(

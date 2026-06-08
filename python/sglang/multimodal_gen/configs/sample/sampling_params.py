@@ -900,36 +900,6 @@ class SamplingParams:
             ),
         )
         add_argument(
-            "--action",
-            type=str,
-            help=(
-                "SANA-WM WASD/IJKL action DSL, e.g. "
-                "'w-80,jw-40,w-40,lw-60,w-100'. Model-specific fields are "
-                "ignored by other pipelines."
-            ),
-        )
-        add_argument(
-            "--translation-speed",
-            "--translation_speed",
-            type=float,
-            dest="translation_speed",
-            help="SANA-WM action DSL per-frame translation speed.",
-        )
-        add_argument(
-            "--rotation-speed-deg",
-            "--rotation_speed_deg",
-            type=float,
-            dest="rotation_speed_deg",
-            help="SANA-WM action DSL per-frame rotation speed in degrees.",
-        )
-        add_argument(
-            "--pitch-limit-deg",
-            "--pitch_limit_deg",
-            type=float,
-            dest="pitch_limit_deg",
-            help="SANA-WM action DSL absolute pitch clamp in degrees.",
-        )
-        add_argument(
             "--moba-config-path",
             type=str,
             help="Path to a JSON file containing V-MoBA specific configurations.",

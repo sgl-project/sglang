@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -101,42 +100,3 @@ def test_negative_text_cache_keeps_default_warmup():
         get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
 
     assert stage.calls == 1
-
-
-def test_forward_reuses_preencoded_negative_prompt_embeds():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-    negative_prompt_embeds = torch.zeros(1, 1, 1)
-    req = Req(
-        prompt=["hello", "world"],
-        negative_prompt=None,
-        negative_prompt_embeds=[negative_prompt_embeds],
-        guidance_scale=4.0,
-    )
-
-    out = stage.forward(req, server_args)
-
-    assert stage.calls == 1
-    assert out.negative_prompt_embeds[0].shape[0] == 2
-    assert torch.equal(out.negative_prompt_embeds[0][0], negative_prompt_embeds[0])
-    assert torch.equal(out.negative_prompt_embeds[0][1], negative_prompt_embeds[0])
-
-
-def test_dedup_fingerprint_tracks_preencoded_negative_prompt_embed_identity():
-    stage = DummyTextEncodingStage()
-    first = Req(
-        prompt="hello",
-        negative_prompt=None,
-        negative_prompt_embeds=[torch.zeros(1, 1, 1)],
-        guidance_scale=4.0,
-    )
-    second = Req(
-        prompt="hello",
-        negative_prompt=None,
-        negative_prompt_embeds=[torch.zeros(1, 1, 1)],
-        guidance_scale=4.0,
-    )
-
-    assert stage.build_dedup_fingerprint(first, make_server_args()) != (
-        stage.build_dedup_fingerprint(second, make_server_args())
-    )

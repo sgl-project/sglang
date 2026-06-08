@@ -53,7 +53,6 @@ def get_model_default_negative_prompt(
 class TextEncodingFingerprint:
     prompt: Any
     negative_prompt: Any
-    negative_prompt_embeds: Any
     do_classifier_free_guidance: bool
     prompt_template: Any
     max_sequence_length: int | None
@@ -67,30 +66,6 @@ def stack_tensors(name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
                 f"Cannot stack {name} with differing shapes: {[list(t.shape) for t in tensors]}"
             )
     return torch.stack(tensors, dim=0)
-
-
-def has_preencoded_negative_prompt_embeds(batch: Req) -> bool:
-    neg_embeds = getattr(batch, "negative_prompt_embeds", None)
-    if isinstance(neg_embeds, torch.Tensor):
-        return True
-    if neg_embeds is None:
-        return False
-    try:
-        return len(neg_embeds) > 0
-    except TypeError:
-        return bool(neg_embeds)
-
-
-def tensor_identity_for_dedup(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return ("tensor_id", id(value), tuple(value.shape), str(value.dtype))
-    if isinstance(value, (list, tuple)):
-        return tuple(tensor_identity_for_dedup(item) for item in value)
-    if isinstance(value, dict):
-        return tuple(
-            sorted((key, tensor_identity_for_dedup(item)) for key, item in value.items())
-        )
-    return value
 
 
 class TextEncodingStage(ConditionEncodingStage):
@@ -333,72 +308,6 @@ class TextEncodingStage(ConditionEncodingStage):
                 )
             )
 
-    def _align_preencoded_negative_text_outputs(
-        self,
-        batch: Req,
-        prompt_embeds_list,
-    ) -> None:
-        target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
-
-        def as_list(value):
-            if value is None:
-                return None
-            if isinstance(value, torch.Tensor):
-                return [value]
-            return list(value)
-
-        def align_negative_batch_dim(
-            tensor: torch.Tensor | None, target_batch: int, name: str
-        ) -> torch.Tensor | None:
-            if tensor is None:
-                return None
-            if tensor.shape[0] == target_batch:
-                return tensor
-            if tensor.shape[0] == 1 and target_batch > 1:
-                return tensor.expand(target_batch, *tensor.shape[1:])
-            raise ValueError(
-                f"{name} batch dimension mismatch: got {tensor.shape[0]}, expected 1 or {target_batch}"
-            )
-
-        def align_tensor_list(value, name: str):
-            tensors = as_list(value)
-            if tensors is None:
-                return None
-            aligned = []
-            for idx, tensor in enumerate(tensors):
-                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
-                aligned.append(align_negative_batch_dim(tensor, target_batch, name))
-            return aligned
-
-        def align_seq_lens(value):
-            seq_lens_list = as_list(value)
-            if seq_lens_list is None:
-                return None
-            aligned = []
-            for idx, seq_lens in enumerate(seq_lens_list):
-                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
-                if len(seq_lens) == target_batch:
-                    aligned.append([int(x) for x in seq_lens])
-                elif len(seq_lens) == 1 and target_batch > 1:
-                    aligned.append([int(seq_lens[0])] * target_batch)
-                else:
-                    raise ValueError(
-                        "negative_prompt_seq_lens batch dimension mismatch: "
-                        f"got {len(seq_lens)}, expected 1 or {target_batch}"
-                    )
-            return aligned
-
-        batch.negative_prompt_embeds = align_tensor_list(
-            batch.negative_prompt_embeds, "negative_prompt_embeds"
-        )
-        batch.negative_attention_mask = align_tensor_list(
-            batch.negative_attention_mask, "negative_attention_mask"
-        )
-        batch.negative_prompt_embeds_mask = align_tensor_list(
-            batch.negative_prompt_embeds_mask, "negative_prompt_embeds_mask"
-        )
-        batch.negative_prompt_seq_lens = align_seq_lens(batch.negative_prompt_seq_lens)
-
     @torch.no_grad()
     def forward(
         self,
@@ -436,8 +345,7 @@ class TextEncodingStage(ConditionEncodingStage):
             max_length=max_seq_length,
         )
 
-        has_preencoded_negative = has_preencoded_negative_prompt_embeds(batch)
-        if batch.do_classifier_free_guidance and not has_preencoded_negative:
+        if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
             (
                 neg_embeds_list,
@@ -460,21 +368,15 @@ class TextEncodingStage(ConditionEncodingStage):
 
         # Encode negative prompt if CFG is enabled
         if batch.do_classifier_free_guidance:
-            if has_preencoded_negative:
-                self._align_preencoded_negative_text_outputs(
-                    batch,
-                    prompt_embeds_list,
-                )
-            else:
-                self._append_negative_text_outputs(
-                    batch,
-                    prompt_embeds_list,
-                    neg_embeds_list,
-                    neg_masks_list,
-                    neg_pooler_embeds_list,
-                    neg_embeds_masks_list,
-                    neg_seq_lens_list,
-                )
+            self._append_negative_text_outputs(
+                batch,
+                prompt_embeds_list,
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            )
 
         return batch
 
@@ -484,11 +386,6 @@ class TextEncodingStage(ConditionEncodingStage):
         return TextEncodingFingerprint(
             prompt=self.freeze_for_dedup(batch.prompt),
             negative_prompt=self.freeze_for_dedup(batch.negative_prompt),
-            negative_prompt_embeds=(
-                tensor_identity_for_dedup(batch.negative_prompt_embeds)
-                if has_preencoded_negative_prompt_embeds(batch)
-                else None
-            ),
             do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
             prompt_template=self.freeze_for_dedup(batch.prompt_template),
             max_sequence_length=batch.max_sequence_length,
@@ -502,7 +399,6 @@ class TextEncodingStage(ConditionEncodingStage):
             "negative_prompt",
             batch.negative_prompt,
             lambda x: not batch.do_classifier_free_guidance
-            or has_preencoded_negative_prompt_embeds(batch)
             or V.string_not_none(x)
             or isinstance(x, str),
         )

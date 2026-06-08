@@ -552,6 +552,7 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     direct_url_test=True,
     output_size="384x640",
     num_frames=17,
+    fps=16,
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
 )
 

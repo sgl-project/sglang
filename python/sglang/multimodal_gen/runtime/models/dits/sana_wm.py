@@ -34,7 +34,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.managers.forward_context import (
-    get_forward_context_or_none,
+    get_forward_context,
 )
 from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -45,8 +45,16 @@ logger = init_logger(__name__)
 _SANA_WM_CROSS_ATTN_KV_CACHE_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 _SANA_WM_REQUEST_RUNTIME_CACHE_NAMESPACE = "sana_wm"
 
+
 def _sana_wm_deterministic_inference_enabled() -> bool:
     return get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE")
+
+
+def _sana_wm_get_forward_context_or_none():
+    try:
+        return get_forward_context()
+    except AssertionError:
+        return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -2872,7 +2880,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if forward_batch is None and _sana_wm_request_runtime_cache_enabled(
             getattr(self, "request_runtime_cache", True)
         ):
-            ctx = get_forward_context_or_none()
+            ctx = _sana_wm_get_forward_context_or_none()
             forward_batch = None if ctx is None else ctx.forward_batch
 
         # --- 1. Patch embed: (B, C, T, H, W) -> (B, T*H*W, D) ---

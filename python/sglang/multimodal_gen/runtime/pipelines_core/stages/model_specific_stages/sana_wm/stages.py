@@ -2018,6 +2018,73 @@ class SanaWMTextEncodingStage(TextEncodingStage):
                 seq_lens.append([int(x) for x in mask.long().sum(dim=-1).tolist()])
         return seq_lens
 
+    @staticmethod
+    def _align_preencoded_negative_text_outputs(
+        batch: Req,
+        prompt_embeds_list: list[torch.Tensor],
+    ) -> None:
+        target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
+
+        def as_list(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return [value]
+            return list(value)
+
+        def align_negative_batch_dim(
+            tensor: torch.Tensor | None, target_batch: int, name: str
+        ) -> torch.Tensor | None:
+            if tensor is None:
+                return None
+            if tensor.shape[0] == target_batch:
+                return tensor
+            if tensor.shape[0] == 1 and target_batch > 1:
+                return tensor.expand(target_batch, *tensor.shape[1:])
+            raise ValueError(
+                f"{name} batch dimension mismatch: got {tensor.shape[0]}, "
+                f"expected 1 or {target_batch}"
+            )
+
+        def align_tensor_list(value, name: str):
+            tensors = as_list(value)
+            if tensors is None:
+                return None
+            aligned = []
+            for idx, tensor in enumerate(tensors):
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                aligned.append(align_negative_batch_dim(tensor, target_batch, name))
+            return aligned
+
+        def align_seq_lens(value):
+            seq_lens_list = as_list(value)
+            if seq_lens_list is None:
+                return None
+            aligned = []
+            for idx, seq_lens in enumerate(seq_lens_list):
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                if len(seq_lens) == target_batch:
+                    aligned.append([int(x) for x in seq_lens])
+                elif len(seq_lens) == 1 and target_batch > 1:
+                    aligned.append([int(seq_lens[0])] * target_batch)
+                else:
+                    raise ValueError(
+                        "negative_prompt_seq_lens batch dimension mismatch: "
+                        f"got {len(seq_lens)}, expected 1 or {target_batch}"
+                    )
+            return aligned
+
+        batch.negative_prompt_embeds = align_tensor_list(
+            batch.negative_prompt_embeds, "negative_prompt_embeds"
+        )
+        batch.negative_attention_mask = align_tensor_list(
+            batch.negative_attention_mask, "negative_attention_mask"
+        )
+        batch.negative_prompt_embeds_mask = align_tensor_list(
+            batch.negative_prompt_embeds_mask, "negative_prompt_embeds_mask"
+        )
+        batch.negative_prompt_seq_lens = align_seq_lens(batch.negative_prompt_seq_lens)
+
     def _encode_text_on_tp_rank0(
         self,
         *args,
@@ -2045,6 +2112,7 @@ class SanaWMTextEncodingStage(TextEncodingStage):
                 "SANA-WM stage-1 expects exactly one Gemma-2 text encoder."
             )
         assert batch.prompt is not None
+        batch.do_classifier_free_guidance = _sana_wm_should_do_cfg(batch)
 
         max_length = self._text_encoder_max_length(server_args)
         chi_prompt = self._chi_prompt(server_args)

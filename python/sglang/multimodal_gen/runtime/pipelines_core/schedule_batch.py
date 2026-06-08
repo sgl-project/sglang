@@ -339,19 +339,7 @@ class Req:
             if self.true_cfg_scale is not None
             else self.guidance_scale
         )
-        cfg_scale = 1.0 if cfg_scale is None else float(cfg_scale)
-        if isinstance(self.negative_prompt_embeds, torch.Tensor):
-            has_negative_prompt_embeds = True
-        elif self.negative_prompt_embeds is None:
-            has_negative_prompt_embeds = False
-        else:
-            try:
-                has_negative_prompt_embeds = len(self.negative_prompt_embeds) > 0
-            except TypeError:
-                has_negative_prompt_embeds = bool(self.negative_prompt_embeds)
-        if cfg_scale > 1.0 and (
-            self.negative_prompt is not None or has_negative_prompt_embeds
-        ):
+        if cfg_scale > 1.0 and self.negative_prompt is not None:
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []

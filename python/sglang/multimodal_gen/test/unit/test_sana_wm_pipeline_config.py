@@ -238,20 +238,17 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertIs(kwargs["camera_conditions"], camera_conditions)
         self.assertIs(kwargs["chunk_plucker"], chunk_plucker)
 
-    def test_get_model_deployment_config_prefers_native_tp_residency(self) -> None:
+    def test_get_model_deployment_config_keeps_high_memory_components_resident(
+        self,
+    ) -> None:
         deployment = self.config.get_model_deployment_config()
-        self.assertEqual(deployment.auto_full_device_tp_size_candidates, (2, 4))
         self.assertFalse(deployment.auto_dit_layerwise_offload)
-        self.assertEqual(
-            deployment.auto_disable_default_layerwise_offload_min_available_memory_gb,
-            70,
-        )
         self.assertEqual(
             deployment.auto_disable_component_offload_min_available_memory_gb, 70
         )
         self.assertEqual(
             deployment.auto_disable_component_offload_components,
-            ("dit", "text_encoder", "image_encoder", "vae"),
+            ("dit", "text_encoder", "image_encoder"),
         )
         self.assertIsNone(deployment.fsdp_auto_min_available_memory_gb)
 
@@ -2644,7 +2641,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             guidance_scale=4.5,
         )
 
-        self.assertTrue(batch.do_classifier_free_guidance)
+        self.assertFalse(batch.do_classifier_free_guidance)
         self.assertTrue(_sana_wm_should_do_cfg(batch))
 
     def test_prepare_timesteps_uses_inference_flow_shift(self) -> None:
@@ -3061,19 +3058,9 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         self.assertNotIn(SANA_WM_REQUEST_RUNTIME_CACHE_NAMESPACE, batch.extra)
         self.assertIn("other_key", batch.extra)
 
-    def test_stage_attention_backend_head_size_uses_sana_wm_padding(self) -> None:
-        stage = object.__new__(SanaWMDenoisingStage)
-        stage.server_args = SimpleNamespace(pipeline_config=SanaWMPipelineConfig())
-
-        self.assertEqual(stage._infer_transformer_attention_head_size(), 128)
-
-        pipeline_config = SanaWMPipelineConfig()
-        pipeline_config.update_pipeline_config(
-            {"dit_config": {"pad_attention_head_dim_to_flash": False}}
-        )
-        stage.server_args = SimpleNamespace(pipeline_config=pipeline_config)
-
-        self.assertEqual(stage._infer_transformer_attention_head_size(), 112)
+    def test_model_attention_helper_pads_head_size_for_flash(self) -> None:
+        self.assertEqual(_sana_wm_padded_attention_head_size(112), 128)
+        self.assertEqual(_sana_wm_padded_attention_head_size(128), 128)
 
     def test_parallelism_type_follows_cfg_parallel_flag(self) -> None:
         stage = object.__new__(SanaWMDenoisingStage)

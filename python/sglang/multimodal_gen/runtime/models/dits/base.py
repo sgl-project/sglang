@@ -112,10 +112,6 @@ class CachableDiT(TeaCacheMixin, BaseDiT):
         super().__init__(config, **kwargs)
         self._init_teacache_state()
 
-    def get_cache_dit_block_adapter(self) -> Any | None:
-        """Return a model-specific cache-dit BlockAdapter when needed."""
-        return None
-
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, dict[str, Any]]:
         """

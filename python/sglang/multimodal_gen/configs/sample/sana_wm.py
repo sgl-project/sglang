@@ -54,6 +54,47 @@ class SanaWMSamplingParams(SamplingParams):
     refiner_seed: int | list[int] | None = None
     sink_size: int | None = None
 
+    @staticmethod
+    def add_cli_args(parser: Any) -> Any:
+        parser = SamplingParams.add_cli_args(parser)
+
+        def add_argument(*name_or_flags, **kwargs):
+            import argparse
+
+            kwargs.setdefault("default", argparse.SUPPRESS)
+            return parser.add_argument(*name_or_flags, **kwargs)
+
+        add_argument(
+            "--action",
+            type=str,
+            help=(
+                "SANA-WM WASD/IJKL action DSL, e.g. "
+                "'w-80,jw-40,w-40,lw-60,w-100'."
+            ),
+        )
+        add_argument(
+            "--translation-speed",
+            "--translation_speed",
+            type=float,
+            dest="translation_speed",
+            help="SANA-WM action DSL per-frame translation speed.",
+        )
+        add_argument(
+            "--rotation-speed-deg",
+            "--rotation_speed_deg",
+            type=float,
+            dest="rotation_speed_deg",
+            help="SANA-WM action DSL per-frame rotation speed in degrees.",
+        )
+        add_argument(
+            "--pitch-limit-deg",
+            "--pitch_limit_deg",
+            type=float,
+            dest="pitch_limit_deg",
+            help="SANA-WM action DSL absolute pitch clamp in degrees.",
+        )
+        return parser
+
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
         for name in ("skip_refiner", "refiner_prompt", "refiner_seed", "sink_size"):

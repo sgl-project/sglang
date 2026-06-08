@@ -7,7 +7,7 @@ import argparse
 import dataclasses
 import json
 import os
-from typing import cast
+from typing import Any, cast
 
 from sglang.multimodal_gen import DiffGenerator
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -55,6 +55,70 @@ def _resolve_cli_sampling_params_cls(server_args: ServerArgs) -> type[SamplingPa
         logger.debug("Falling back to base SamplingParams for CLI parsing: %s", exc)
 
     return SamplingParams
+
+
+def _resolve_cli_sampling_params_cls_from_args(
+    args: argparse.Namespace,
+) -> type[SamplingParams]:
+    config_args = {}
+    config_file = getattr(args, "config", None)
+    if config_file:
+        try:
+            config_args = ServerArgs.load_config_file(config_file) or {}
+        except Exception as exc:
+            logger.debug(
+                "Falling back to base SamplingParams before config load: %s", exc
+            )
+
+    def value(name: str, default=None):
+        current = getattr(args, name, None)
+        return current if current is not None else config_args.get(name, default)
+
+    pipeline_class_name = value("pipeline_class_name")
+    if pipeline_class_name:
+        try:
+            from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+            config_classes = get_pipeline_config_classes(pipeline_class_name)
+            if config_classes is not None:
+                _, sampling_params_cls = config_classes
+                return sampling_params_cls
+        except Exception as exc:
+            logger.debug(
+                "Falling back to model-path CLI sampling resolution: %s", exc
+            )
+
+    model_path = value("model_path")
+    if not model_path:
+        return SamplingParams
+
+    try:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            model_path,
+            backend=value("backend"),
+            model_id=value("model_id"),
+        )
+        if model_info is not None:
+            return model_info.sampling_param_cls
+    except Exception as exc:
+        logger.debug("Falling back to base SamplingParams for CLI parsing: %s", exc)
+
+    return SamplingParams
+
+
+def _parse_model_specific_cli_args(
+    unknown_args: list[str] | None,
+    sampling_params_cls: type[SamplingParams],
+) -> tuple[list[str], dict[str, Any]]:
+    if not unknown_args:
+        return [], {}
+
+    parser = argparse.ArgumentParser(add_help=False)
+    sampling_params_cls.add_cli_args(parser)
+    model_args, remaining = parser.parse_known_args(unknown_args)
+    return remaining, vars(model_args)
 
 
 def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
@@ -155,8 +219,17 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     """The entry point for the generate command."""
     args.request_id = "mocked_fake_id_for_offline_generate"
 
+    sampling_params_cls_hint = _resolve_cli_sampling_params_cls_from_args(args)
+    unknown_args, model_specific_cli_kwargs = _parse_model_specific_cli_args(
+        unknown_args, sampling_params_cls_hint
+    )
     server_args = ServerArgs.from_cli_args(args, unknown_args)
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
+    if sampling_params_cls is not sampling_params_cls_hint:
+        unknown_args, late_model_specific_cli_kwargs = _parse_model_specific_cli_args(
+            unknown_args, sampling_params_cls
+        )
+        model_specific_cli_kwargs.update(late_model_specific_cli_kwargs)
 
     sampling_params_kwargs = {}
     config_file = getattr(args, "config", None)
@@ -175,6 +248,7 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
         )
 
     sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
+    sampling_params_kwargs.update(model_specific_cli_kwargs)
     _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
 

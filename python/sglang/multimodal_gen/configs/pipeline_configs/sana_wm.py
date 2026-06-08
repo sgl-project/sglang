@@ -307,18 +307,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     # --- Deployment ---
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            # Sana-WM has tensor-parallel native DiTs for both stages. Treat
-            # offload/layerwise/FSDP as memory fallbacks instead of the default
-            # throughput path.
-            auto_full_device_tp_size_candidates=(2, 4),
-            auto_disable_default_layerwise_offload_min_available_memory_gb=70,
+            # On high-memory GPUs, keep the default component-offload path
+            # resident. Tensor parallelism remains an explicit launch choice.
             auto_disable_component_offload_min_available_memory_gb=70,
-            auto_disable_component_offload_components=(
-                "dit",
-                "text_encoder",
-                "image_encoder",
-                "vae",
-            ),
         )
 
     # --- Latent shape ---

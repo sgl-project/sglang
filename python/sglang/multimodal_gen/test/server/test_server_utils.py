@@ -1267,7 +1267,11 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no edit config")
 
         # Build extra_body for optional features
-        extra_body = {"reference_url": sampling_params.image_path}
+        extra_body = {
+            "reference_url": sampling_params.image_path,
+            "fps": sampling_params.fps,
+            "num_frames": sampling_params.num_frames,
+        }
         extra_body.update(sampling_params.extras)
 
         return _create_and_download_video(
@@ -1275,13 +1279,9 @@ def get_generate_fn(
             case_id,
             model=model_path,
             prompt=sampling_params.prompt,
-            size=sampling_params.output_size,
+            size=output_size,
             seconds=video_seconds,
-            extra_body={
-                "reference_url": sampling_params.image_path,
-                "fps": sampling_params.fps,
-                "num_frames": sampling_params.num_frames,
-            },
+            extra_body=extra_body,
         )
 
     def generate_text_image_to_video(case_id, client) -> tuple[str, bytes]:

@@ -18,6 +18,7 @@ from sglang.multimodal_gen.configs.sample.flux import (
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     _json_safe,
@@ -217,6 +218,33 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
             self._parse_cli_kwargs(["--seed", "7", "8"])["seed"],
             [7, 8],
         )
+
+    def test_sana_wm_cli_args_are_model_specific(self):
+        base_parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(base_parser)
+        _, remaining = base_parser.parse_known_args(["--action", "w-80"])
+        self.assertEqual(remaining, ["--action", "w-80"])
+
+        sana_parser = argparse.ArgumentParser()
+        SanaWMSamplingParams.add_cli_args(sana_parser)
+        args = sana_parser.parse_args(
+            [
+                "--action",
+                "w-80",
+                "--translation-speed",
+                "0.08",
+                "--rotation-speed-deg",
+                "2.5",
+                "--pitch-limit-deg",
+                "60",
+            ]
+        )
+        kwargs = SanaWMSamplingParams.get_cli_args(args)
+
+        self.assertEqual(kwargs["action"], "w-80")
+        self.assertEqual(kwargs["translation_speed"], 0.08)
+        self.assertEqual(kwargs["rotation_speed_deg"], 2.5)
+        self.assertEqual(kwargs["pitch_limit_deg"], 60)
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):
         params = self._make_qwen_image_params([])
