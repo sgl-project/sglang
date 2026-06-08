@@ -77,6 +77,7 @@ class _MockTokenizerManager:
             }
 
         self.generate_request = Mock(return_value=_mock_generate())
+        self.response_emitter = self
         self.create_abort_task = Mock()
 
 

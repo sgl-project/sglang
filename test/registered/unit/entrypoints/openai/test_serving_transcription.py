@@ -56,6 +56,7 @@ class _MockTokenizerManager:
             asr_max_concurrent_sessions=32,
         )
         self.tokenizer = Mock()
+        self.response_emitter = self
         self._stream_chunks = stream_chunks
 
     def generate_request(self, adapted_request, raw_request):

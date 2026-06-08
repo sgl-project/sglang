@@ -945,8 +945,8 @@ class OpenAIServingChat(OpenAIServingBase):
         return StreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
-            background=self.tokenizer_manager.create_abort_task(
-                self.tokenizer_manager.response_emitter, adapted_request
+            background=self.tokenizer_manager.response_emitter.create_abort_task(
+                adapted_request
             ),
         )
 

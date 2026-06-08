@@ -24,14 +24,12 @@ import sys
 import threading
 from contextlib import nullcontext
 from enum import Enum
-from http import HTTPStatus
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import fastapi
 import uvloop
 import zmq
 import zmq.asyncio
-from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -590,8 +588,8 @@ class TokenizerManager(TokenizerControlMixin):
                 if obj.return_prompt_token_ids:
                     state.prompt_token_ids = list(tokenized_obj.input_ids)
                 self._send_one_request(tokenized_obj)
-                async for response in TokenizerManager._wait_one_response(
-                    self.response_emitter, obj, request
+                async for response in self.response_emitter._wait_one_response(
+                    obj, request
                 ):
                     yield response
             else:
@@ -623,207 +621,6 @@ class TokenizerManager(TokenizerControlMixin):
         self.send_to_scheduler.send_pyobj(batch_req)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
-    @staticmethod
-    def _coalesce_streaming_chunks(
-        self: "ResponseEmitter",
-        out_list: list,
-        rid: str,
-        customized_info_keys: Optional[Iterable[str]] = None,
-    ) -> dict:
-        """Coalesce multiple incremental streaming chunks into one.
-
-        Both text and output_ids are incremental deltas, so we concatenate them;
-        all other fields (meta_info, etc.) are taken from the last chunk.
-        """
-        if len(out_list) >= 20:
-            logger.warning(
-                "Streaming backlog: rid=%s, coalescing %d queued chunks into one. "
-                "This may inflate P99 ITL for affected requests.",
-                rid,
-                len(out_list),
-            )
-        out = dict(out_list[-1])
-        if "output_ids" in out:
-            out["output_ids"] = [id for chunk in out_list for id in chunk["output_ids"]]
-        if "text" in out:
-            out["text"] = "".join(chunk["text"] for chunk in out_list)
-        if "meta_info" in out:
-            meta_info_list = [chunk["meta_info"] for chunk in out_list]
-            meta_info = dict(meta_info_list[-1])
-            incremental_streaming_keys = set(
-                logprob_ops.INCREMENTAL_STREAMING_META_INFO_KEYS
-            )
-            if customized_info_keys is not None:
-                incremental_streaming_keys.update(customized_info_keys)
-            for key in incremental_streaming_keys:
-                if any(key in m for m in meta_info_list):
-                    meta_info[key] = [
-                        item for m in meta_info_list for item in m.get(key, [])
-                    ]
-            out["meta_info"] = meta_info
-        return out
-
-    @staticmethod
-    async def _handle_abort_finish_reason(
-        self: "ResponseEmitter",
-        out: dict,
-        state: ReqState,
-        is_stream: bool,
-    ) -> Optional[dict]:
-        """Handle abort/error finish reasons from the scheduler.
-
-        Returns the output dict if it should be yielded (stream abort), or None
-        for normal flow. Raises ValueError or HTTPException for non-stream aborts.
-        """
-        finish_reason = out["meta_info"]["finish_reason"]
-
-        if (
-            finish_reason.get("type") == "abort"
-            and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
-        ):
-            if not is_stream:
-                raise ValueError(finish_reason["message"])
-            return out
-
-        if finish_reason.get("type") == "abort" and finish_reason.get(
-            "status_code"
-        ) in (
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-        ):
-            # Delete the key to prevent resending abort request to the scheduler and
-            # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
-                del self.rid_to_state[state.obj.rid]
-
-            # Mark ongoing LoRA request as finished.
-            if self.server_args.enable_lora and state.obj.lora_path:
-                await self.lora_controller.lora_registry.release(state.obj.lora_id)
-            if not is_stream:
-                raise fastapi.HTTPException(
-                    status_code=finish_reason["status_code"],
-                    detail=finish_reason["message"],
-                )
-            return out
-
-        return None
-
-    @staticmethod
-    async def _wait_one_response(
-        self: "ResponseEmitter",
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-    ):
-        """Wait for the response of one request."""
-        state = self.rid_to_state[obj.rid]
-        # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
-        is_stream = getattr(obj, "stream", False)
-        while True:
-            try:
-                await asyncio.wait_for(
-                    state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
-                    )
-                continue
-
-            # Drain all pending outputs atomically.
-            out_list = state.out_list
-            state.out_list = []
-            finished = state.finished
-            state.event.clear()
-
-            # With incremental streaming, each chunk is a delta — coalesce
-            # multiple queued chunks to avoid dropping token ids.
-            incremental_stream = (
-                is_stream and self.server_args.incremental_streaming_output
-            )
-            if incremental_stream and len(out_list) > 1:
-                out = TokenizerManager._coalesce_streaming_chunks(
-                    self,
-                    out_list,
-                    obj.rid,
-                    state.customized_info_accumulated.keys(),
-                )
-            else:
-                out = out_list[-1]
-
-            # Resolve deferred text for non-incremental streaming.
-            # _handle_batch_output sets "text": None on intermediate chunks
-            # to avoid O(n) string rebuild per step (O(n^2) total).
-            if (
-                is_stream
-                and not incremental_stream
-                and "text" in out
-                and out["text"] is None
-            ):
-                out["text"] = state.get_text()
-
-            if finished:
-                # Record response sent time right before we log finished results and metrics.
-                if not state.time_stats.response_sent_to_client_time:
-                    state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
-                self.request_log_manager.request_logger.log_finished_request(
-                    obj,
-                    out,
-                    request=request,
-                )
-
-                if (
-                    self.request_log_manager.request_metrics_exporter_manager.exporter_enabled()
-                ):
-                    asyncio.create_task(
-                        self.request_log_manager.request_metrics_exporter_manager.write_record(
-                            obj, out
-                        )
-                    )
-
-                # Check if this was an abort/error created by scheduler
-                if isinstance(out["meta_info"].get("finish_reason"), dict):
-                    abort_out = await TokenizerManager._handle_abort_finish_reason(
-                        self, out, state, is_stream
-                    )
-                    if abort_out is not None:
-                        yield abort_out
-                        break
-
-                yield out
-                break
-
-            if is_stream:
-                # Record response sent time right before we send response.
-                if not state.time_stats.response_sent_to_client_time:
-                    state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
-                yield out
-            else:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
-
     async def _handle_batch_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -849,9 +646,7 @@ class TokenizerManager(TokenizerControlMixin):
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     generators.append(
-                        TokenizerManager._wait_one_response(
-                            self.response_emitter, tmp_obj, request
-                        )
+                        self.response_emitter._wait_one_response(tmp_obj, request)
                     )
                     rids.append(tmp_obj.rid)
             else:
@@ -871,9 +666,7 @@ class TokenizerManager(TokenizerControlMixin):
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
                         generators.append(
-                            TokenizerManager._wait_one_response(
-                                self.response_emitter, tmp_obj, request
-                            )
+                            self.response_emitter._wait_one_response(tmp_obj, request)
                         )
                         rids.append(tmp_obj.rid)
         else:
@@ -912,8 +705,8 @@ class TokenizerManager(TokenizerControlMixin):
                     disagg_mode=self.disaggregation_mode,
                 )
                 self._send_one_request(tokenized_obj)
-                await TokenizerManager._wait_one_response(
-                    self.response_emitter, tmp_obj, request
+                await self.response_emitter._wait_one_response(
+                    tmp_obj, request
                 ).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -940,9 +733,7 @@ class TokenizerManager(TokenizerControlMixin):
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
                     generators.append(
-                        TokenizerManager._wait_one_response(
-                            self.response_emitter, tmp_obj, request
-                        )
+                        self.response_emitter._wait_one_response(tmp_obj, request)
                     )
                     rids.append(tmp_obj.rid)
 
@@ -1050,21 +841,6 @@ class TokenizerManager(TokenizerControlMixin):
         self.send_to_scheduler.send_pyobj(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
-
-    @staticmethod
-    def create_abort_task(self: "ResponseEmitter", obj: GenerateReqInput):
-        # Abort the request if the client is disconnected.
-        async def abort_request():
-            await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
-
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(abort_request)
-        return background_tasks
 
     def auto_create_handle_loop(self):
         if self.event_loop is not None:
