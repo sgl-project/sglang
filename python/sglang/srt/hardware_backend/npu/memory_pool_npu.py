@@ -113,11 +113,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             )
 
             if self.use_fia:
+                # Explicitly compute the flattened page dimension to avoid -1
+                # in view(), which is ambiguous for 0-element tensors during
+                # graph capture (torch.compile / Dynamo tracing).
+                flat_page_dim = (self.size // self.page_size + 1) * self.page_size
                 self.k_buffer = self.k_buffer.view(
-                    self.layer_num, -1, 1, self.head_num, self.head_dim
+                    self.layer_num, flat_page_dim, 1, self.head_num, self.head_dim
                 )
                 self.v_buffer = self.v_buffer.view(
-                    self.layer_num, -1, 1, self.head_num, self.v_head_dim
+                    self.layer_num, flat_page_dim, 1, self.head_num, self.v_head_dim
                 )
 
     # for disagg
