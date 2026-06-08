@@ -383,6 +383,16 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # The draft embed clamps unconditionally (to tolerate multimodal pad
+        # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
+        # would be clamped away instead of surfacing.
+        maybe_detect_oob(
+            next_token_ids,
+            0,
+            self.model_config.vocab_size,
+            "draft_extend_for_prefill: next_token_ids before draft embed",
+        )
+
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,

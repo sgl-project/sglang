@@ -245,7 +245,15 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if not self.skip_topk or prev_topk_indices is None:
+                # skip_topk (shared) layers carry no indexer weights in the
+                # checkpoint, so they must reuse the carried topk and never run
+                # the indexer. Do NOT widen this to `or prev_topk_indices is
+                # None` (the upstream gate): that recomputes with an
+                # uninitialized indexer whenever cross-layer propagation is
+                # unavailable (e.g. the TBO op path drops topk_indices),
+                # reintroducing the >index_topk garbling. The is_nextn clause is
+                # the sole intentional fallback (layer 78 has its own weights).
+                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -264,7 +272,12 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    if not self.skip_topk or prev_topk_indices is None:
+                    # See the skip_topk note above: shared layers have no
+                    # indexer weights, so this gate must not fall back to
+                    # computing when prev_topk_indices is None.
+                    if not self.skip_topk or (
+                        self.is_nextn and prev_topk_indices is None
+                    ):
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,

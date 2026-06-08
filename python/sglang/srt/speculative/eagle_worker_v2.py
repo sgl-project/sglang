@@ -562,9 +562,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            with forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ), canary_index_ctx:
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -1271,9 +1276,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
-            self._mamba_verify_update(
-                batch, verify_input, accept_lens, accept_index, bs
-            )
+            self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -1323,7 +1326,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _mamba_verify_update(
         self,
         batch: ScheduleBatch,
-        verify_input: EagleVerifyInput,
         accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
@@ -1331,9 +1333,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Update mamba state for hybrid GDN models after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-            if verify_input.topk != 1:
-                raise ValueError("Spec v2 currently only supports topk = 1.")
-
             accepted_indices_offset = torch.arange(
                 0,
                 bs * self.speculative_num_draft_tokens,
@@ -1341,7 +1340,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=accept_lens.dtype,
                 device=accept_lens.device,
             )
-            last_correct_step_indices = accept_lens - 1
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            # Per-req tree step of the last accepted node, i.e. the step whose
+            # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accepted_indices_offset
+            )
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1359,11 +1364,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 to_track_ith = torch.clamp(
                     tracking_point - seq_lens_pre_verify - 1, min=0
                 ).to(torch.int64)
-                req_idx = torch.arange(
-                    bs,
-                    dtype=torch.int64,
-                    device=accept_lens.device,
-                )
                 candidate_track_steps = (
                     accept_index[req_idx, to_track_ith] - accepted_indices_offset
                 )
