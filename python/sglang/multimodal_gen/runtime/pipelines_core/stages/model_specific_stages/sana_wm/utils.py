@@ -1,22 +1,16 @@
 # Copyright 2024 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
-"""Small utility surface for standalone SANA-WM inference."""
+"""Runtime utility surface for SANA-WM stages."""
 
 from __future__ import annotations
 
-import gc
 import math
-import os
-import shutil
-import subprocess
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
-
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 TARGET_HEIGHT = 704
 TARGET_WIDTH = 1280
@@ -28,96 +22,7 @@ TARGET_WIDTH = 1280
 DEFAULT_TRANSLATION_SPEED = 0.05
 DEFAULT_ROTATION_SPEED_DEG = 1.2
 DEFAULT_PITCH_LIMIT_DEG = 85.0
-MIN_FOV_DEG = 25.0
-MAX_FOV_DEG = 120.0
 ALLOWED_ACTION_KEYS = frozenset("wasdijkl")
-
-
-def split_hf_uri(uri: str) -> tuple[str, str]:
-    if not uri.startswith("hf://"):
-        raise ValueError(f"not an hf:// URI: {uri}")
-    parts = uri[len("hf://") :].split("/")
-    if len(parts) < 2:
-        raise ValueError(f"hf:// URI must include owner/repo: {uri}")
-    return f"{parts[0]}/{parts[1]}", "/".join(parts[2:])
-
-
-def join_hf_or_local(root: str | Path, *parts: str) -> str:
-    root = str(root)
-    suffix = "/".join(part.strip("/") for part in parts if part)
-    if root.startswith("hf://"):
-        return "/".join(part for part in (root.rstrip("/"), suffix) if part)
-    return str(Path(root).joinpath(*parts))
-
-
-def resolve_path(path: str | Path) -> str:
-    path = str(path)
-    if not path.startswith("hf://"):
-        return path
-
-    from huggingface_hub import hf_hub_download
-
-    repo, filename = split_hf_uri(path)
-    if not filename:
-        raise ValueError(f"hf:// file URI must include a file path: {path}")
-    return hf_hub_download(repo, filename)
-
-
-def resolve_hf_dir(path: str | Path) -> str:
-    path = str(path)
-    if not path.startswith("hf://"):
-        return path
-
-    from huggingface_hub import snapshot_download
-
-    repo, subdir = split_hf_uri(path)
-    root = snapshot_download(repo, allow_patterns=f"{subdir}/**" if subdir else None)
-    return str(Path(root) / subdir) if subdir else str(root)
-
-
-def read_state_dict(
-    path: str | Path, map_location: str | torch.device = "cpu"
-) -> dict[str, torch.Tensor]:
-    path = Path(path)
-    if path.suffix == ".safetensors":
-        from safetensors.torch import load_file
-
-        state = load_file(str(path), device=str(map_location))
-    else:
-        state = torch.load(path, map_location=map_location)
-
-    if isinstance(state, dict) and "generator" in state:
-        state = state["generator"]
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-    if not isinstance(state, dict):
-        raise TypeError(f"checkpoint {path} did not contain a state dict")
-    state = {
-        (key[len("model.") :] if key.startswith("model.") else key): value
-        for key, value in state.items()
-    }
-    state.pop("pos_embed", None)
-    return state
-
-
-def load_checkpoint_fail_fast(
-    model: torch.nn.Module,
-    path: str | Path,
-    *,
-    allowed_missing: set[str] | None = None,
-) -> None:
-    allowed_missing = allowed_missing or {"pos_embed"}
-    state = read_state_dict(path)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    bad_missing = sorted(key for key in missing if key not in allowed_missing)
-    bad_unexpected = sorted(unexpected)
-    if bad_missing or bad_unexpected:
-        details = []
-        if bad_missing:
-            details.append(f"missing={bad_missing}")
-        if bad_unexpected:
-            details.append(f"unexpected={bad_unexpected}")
-        raise RuntimeError(f"checkpoint does not match model: {'; '.join(details)}")
 
 
 def pil_to_model_tensor(
@@ -126,127 +31,6 @@ def pil_to_model_tensor(
     arr = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(arr).permute(2, 0, 1)
     return (tensor * 2.0 - 1.0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=dtype)
-
-
-def write_video(path: Path, video: np.ndarray, fps: int) -> None:
-    import imageio.v3 as iio
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    iio.imwrite(path, video, fps=fps)
-
-
-def _resolve_ffmpeg_binary() -> str:
-    configured = os.environ.get("FFMPEG_BINARY")
-    if configured:
-        return configured
-    discovered = shutil.which("ffmpeg")
-    if discovered:
-        return discovered
-    try:
-        import imageio_ffmpeg
-
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as exc:
-        raise RuntimeError(
-            "ffmpeg is required for streaming MP4 output; set FFMPEG_BINARY to a valid ffmpeg executable"
-        ) from exc
-
-
-class StreamingMp4Writer:
-    def __init__(
-        self,
-        path: Path,
-        *,
-        height: int,
-        width: int,
-        fps: int,
-        crf: int = 18,
-        preset: str = "medium",
-    ) -> None:
-        self.path = Path(path).expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.frames_written = 0
-        ffmpeg = _resolve_ffmpeg_binary()
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-loglevel",
-            "warning",
-            "-f",
-            "rawvideo",
-            "-vcodec",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{int(width)}x{int(height)}",
-            "-r",
-            str(int(fps)),
-            "-i",
-            "pipe:0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            str(preset),
-            "-crf",
-            str(int(crf)),
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(self.path),
-        ]
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        self._closed = False
-
-    def write_chunk(self, frames_uint8: np.ndarray) -> None:
-        if self._closed:
-            raise RuntimeError("writer is closed")
-        if (
-            frames_uint8.dtype != np.uint8
-            or frames_uint8.ndim != 4
-            or frames_uint8.shape[-1] != 3
-        ):
-            raise ValueError(
-                f"expected uint8 frames shaped (T,H,W,3), got {frames_uint8.shape} {frames_uint8.dtype}"
-            )
-        if not frames_uint8.flags["C_CONTIGUOUS"]:
-            frames_uint8 = np.ascontiguousarray(frames_uint8)
-        stdin: IO[bytes] | None = self._proc.stdin
-        if stdin is None:
-            raise RuntimeError("ffmpeg stdin is unavailable")
-        try:
-            stdin.write(frames_uint8.tobytes())
-        except BrokenPipeError as exc:
-            stderr = (
-                self._proc.stderr.read().decode(errors="replace")
-                if self._proc.stderr is not None
-                else ""
-            )
-            raise RuntimeError(f"ffmpeg exited while writing:\n{stderr}") from exc
-        self.frames_written += int(frames_uint8.shape[0])
-
-    def close(self) -> Path:
-        if self._closed:
-            return self.path
-        self._closed = True
-        if self._proc.stdin is not None:
-            self._proc.stdin.close()
-        stderr = (
-            self._proc.stderr.read().decode(errors="replace")
-            if self._proc.stderr is not None
-            else ""
-        )
-        ret = self._proc.wait()
-        if ret != 0:
-            raise RuntimeError(f"ffmpeg failed with exit code {ret}:\n{stderr}")
-        return self.path
 
 
 def _rot_x(angle_rad: float) -> np.ndarray:
@@ -420,75 +204,6 @@ def load_intrinsics(path: Path, num_frames: int) -> np.ndarray:
     raise ValueError(
         f"unsupported intrinsics shape {arr.shape}; expected (4,), (3,3), or (F,3,3)"
     )
-
-
-def estimate_intrinsics_with_pi3x(
-    image: Image.Image, device: torch.device | str = "cuda"
-) -> np.ndarray:
-    """Estimate ``[fx, fy, cx, cy]`` with Pi3X when --intrinsics is omitted."""
-    try:
-        from pi3.models.pi3x import Pi3X
-        from pi3.utils.geometry import recover_intrinsic_from_rays_d
-    except ImportError as exc:
-        raise RuntimeError(
-            "intrinsics were omitted, but Pi3X is not installed; pass --intrinsics or install pi3"
-        ) from exc
-
-    device = torch.device(device)
-    orig_w, orig_h = image.size
-    pixel_limit = 255_000
-    scale = (
-        math.sqrt(pixel_limit / (orig_w * orig_h))
-        if orig_w * orig_h > pixel_limit
-        else 1.0
-    )
-    target_w, target_h = orig_w * scale, orig_h * scale
-    k = max(1, round(target_w / 14))
-    m = max(1, round(target_h / 14))
-    while (k * 14) * (m * 14) > pixel_limit:
-        if k / m > target_w / target_h:
-            k -= 1
-        else:
-            m -= 1
-    model_w, model_h = max(1, k) * 14, max(1, m) * 14
-    resized = image.resize((model_w, model_h), Image.LANCZOS)
-    arr = np.asarray(resized, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device)
-
-    dtype = (
-        torch.bfloat16
-        if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8
-        else torch.float16
-    )
-    model = Pi3X.from_pretrained("yyfz233/Pi3X").to(device).eval()
-    model.disable_multimodal()
-    model.requires_grad_(False)
-    with torch.no_grad(), torch.amp.autocast(
-        device.type, dtype=dtype, enabled=device.type == "cuda"
-    ):
-        out = model(imgs=tensor)
-    rays_d = torch.nn.functional.normalize(out["local_points"], dim=-1)
-    intrinsics = recover_intrinsic_from_rays_d(
-        rays_d, force_center_principal_point=True
-    )[0, 0]
-    intrinsics = intrinsics.detach().cpu().float().numpy()
-
-    sx, sy = orig_w / model_w, orig_h / model_h
-    fx, fy = float(intrinsics[0, 0] * sx), float(intrinsics[1, 1] * sy)
-    cx, cy = float(intrinsics[0, 2] * sx), float(intrinsics[1, 2] * sy)
-    fov_x = math.degrees(2.0 * math.atan(orig_w / (2.0 * fx)))
-    fov_y = math.degrees(2.0 * math.atan(orig_h / (2.0 * fy)))
-    if not (MIN_FOV_DEG < fov_x < MAX_FOV_DEG and MIN_FOV_DEG < fov_y < MAX_FOV_DEG):
-        raise RuntimeError(
-            f"Pi3X-estimated FOV H={fov_x:.1f}, V={fov_y:.1f} is outside "
-            f"[{MIN_FOV_DEG}, {MAX_FOV_DEG}]; pass trusted --intrinsics"
-        )
-
-    del model, out, rays_d, tensor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
-    return np.array([fx, fy, cx, cy], dtype=np.float32)
 
 
 def snap_num_frames(

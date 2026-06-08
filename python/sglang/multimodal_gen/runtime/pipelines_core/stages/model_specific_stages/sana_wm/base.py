@@ -930,9 +930,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             f"{type(encoded).__name__}"
         )
 
-    def _get_vae_scaling_factor(self, vae) -> float:
-        return sana_wm_vae_scaling_factor(vae, self.pipeline_config)
-
     def _prepare_noise_latents(
         self,
         shape: tuple,
