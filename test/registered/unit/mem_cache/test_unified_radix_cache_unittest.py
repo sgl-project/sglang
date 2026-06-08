@@ -4054,6 +4054,68 @@ class TestSWACheckpointSplit(CustomTestCase):
         self.assertEqual(starts, [0, 2 * _SWA_CP_PAGE_SIZE])
         tree.sanity_check()
 
+    def test_chunk_boundary_inside_tail_window_admits_full_tail(self):
+        """Chunk boundary inside (k*N - W_tail, k*N): tail must split at both
+        ends and the gate must admit every sub-node in the window."""
+        page_size = 256
+        W_tail = 1024
+        chunk = 3840
+        N = 4096
+        cfg = CacheConfig(
+            page_size=page_size,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=W_tail,
+            kv_size=4 * N,
+            max_num_reqs=4,
+            max_context_len=4 * N,
+            head_num=1,
+            head_dim=8,
+        )
+        tree, allocator, _ = build_fixture(cfg)
+        self._set_checkpoint_interval(tree, N)
+
+        def alloc(size):
+            aligned = ((size + page_size - 1) // page_size) * page_size
+            full = allocator.full_attn_allocator.alloc(aligned)
+            swa = allocator.swa_attn_allocator.alloc(aligned)
+            assert full is not None and swa is not None
+            allocator.full_to_swa_index_mapping[full] = swa
+            return full[:size]
+
+        def insert(num_tokens):
+            tokens = list(range(1, 1 + num_tokens))
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens)),
+                    value=alloc(num_tokens),
+                    swa_evicted_seqlen=0,
+                )
+            )
+
+        insert(chunk)
+        insert(2 * chunk)
+
+        _, _, _, ends = self._shape(tree)
+        self.assertIn(N - W_tail, ends)
+        self.assertIn(N, ends)
+
+        swa = tree.components[ComponentType.SWA]
+        chain, _, starts, ends_full = self._shape(tree)
+        admitted_lens = [
+            end - start
+            for n, start, end in zip(chain, starts, ends_full)
+            if start >= N - W_tail and end <= N
+        ]
+        self.assertGreater(len(admitted_lens), 0)
+        self.assertEqual(sum(admitted_lens), W_tail)
+        for n, start, end in zip(chain, starts, ends_full):
+            if start >= N - W_tail and end <= N:
+                self.assertTrue(
+                    swa._is_checkpoint_tail_node(n),
+                    f"node [{start}..{end}] inside tail window not admitted",
+                )
+        tree.sanity_check()
+
 
 if __name__ == "__main__":
     unittest.main()

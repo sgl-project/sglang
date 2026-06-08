@@ -336,25 +336,29 @@ class SWAComponent(TreeComponent):
         while (
             cur is not self.cache.root_node and cur.component_data[ct].value is not None
         ):
+            original_parent = cur.parent
             start = cur.seqlen_start
             end = start + len(cur.key)
-            pos = (start // N + 1) * N
-            while pos < end:
-                offset = pos - start
-                new_parent = self.cache._split_node(cur.key, cur, offset)
-                tail_offset = offset - W_tail
-                if tail_offset > 0:
-                    self.cache._split_node(new_parent.key, new_parent, tail_offset)
-                start = cur.seqlen_start
-                end = start + len(cur.key)
-                pos += N
-            cur = cur.parent
+
+            split_points = set()
+            for k in range(start // N + 1, (end - 1) // N + 1):
+                split_points.add(k * N)
+            for k in range((start + W_tail) // N + 1, (end + W_tail - 1) // N + 1):
+                split_points.add(k * N - W_tail)
+
+            for p in sorted(p for p in split_points if start < p < end):
+                offset = p - cur.seqlen_start
+                if 0 < offset < len(cur.key):
+                    self.cache._split_node(cur.key, cur, offset)
+
+            cur = original_parent
 
     def _is_checkpoint_tail_node(self, node: UnifiedTreeNode) -> bool:
-        end = node.seqlen_start + len(node.key)
+        N = self.checkpoint_interval
+        cp = (node.seqlen_start // N + 1) * N
         return (
-            end % self.checkpoint_interval == 0
-            and len(node.key) <= self.window_tail_size
+            node.seqlen_start >= cp - self.window_tail_size
+            and node.seqlen_start + len(node.key) <= cp
         )
 
     def redistribute_on_node_split(
