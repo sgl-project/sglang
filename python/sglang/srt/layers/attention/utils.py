@@ -1359,3 +1359,14 @@ def fused_qk_rope_reshape_and_cache(
     if zeros_out is not None:
         return q_out.view(-1, qh * d), k_out, key_cache, value_cache, zeros_out
     return q_out.view(-1, qh * d), k_out, key_cache, value_cache
+def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
+    """Safety guard: a preallocated cuda-graph buffer must hold the runtime write.
+
+    The kv_indices / page_table scatter kernels bound writes only per-row, not
+    against the destination buffer, so an undersized buffer silently overflows
+    into the adjacent row. Fail fast on the host-known extent instead. All args
+    are host ints, so this is always-on (no device sync, unlike async probes).
+    """
+    assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
+        f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
+    )

@@ -54,7 +54,7 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-benchmark-1-gpu-large",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
-        "base-c-test-4-gpu-gb200",
+        "base-c-test-4-gpu-gb300",
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
