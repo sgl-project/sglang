@@ -42,6 +42,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - [Performance Overview](performance/index.md): overview of attention, caching, and profiling
 - [Environment Variables](environment_variables.md): platform, caching, storage, and debugging configuration
 - [Support New Models](support_new_models.md): implementation guide for new diffusion pipelines
+- [Cosmos3 (Nano / Super)](cosmos3.md): omni serving for T2I / T2V / I2V / V2V, joint video+sound, and robot action (policy / forward / inverse dynamics), with the native FlowUniPC scheduler
 - [CI Performance](ci_perf.md): performance baseline generation
 
 ## References

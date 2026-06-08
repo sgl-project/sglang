@@ -8,14 +8,21 @@ cross-attends to the cached UND K/V at each denoising step.
 
 import os
 
+import torch
+from huggingface_hub import snapshot_download
+
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_sound_vae import Cosmos3SoundVAE
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3ActionLatentPreparationStage,
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
+    Cosmos3SoundLatentPreparationStage,
     Cosmos3TimestepPreparationStage,
     Cosmos3TokenizationStage,
 )
@@ -59,6 +66,24 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         transformer = self.get_module("transformer")
         scheduler = self.get_module("scheduler")
 
+        # Decode-only sound tokenizer for joint video+audio generation, loaded
+        # only when the checkpoint has a sound head.
+        sound_vae = None
+        if transformer.sound_gen:
+            model_path = server_args.model_path
+            if not os.path.isdir(model_path):
+                model_path = snapshot_download(
+                    model_path, allow_patterns=["sound_tokenizer/*"]
+                )
+            sound_vae = (
+                Cosmos3SoundVAE.from_pretrained(
+                    os.path.join(model_path, "sound_tokenizer")
+                )
+                .to(get_local_torch_device(), dtype=torch.bfloat16)
+                .eval()
+            )
+            logger.info("Loaded Cosmos3 sound tokenizer (decode-only)")
+
         guardrails_disabled = (
             os.environ.get("SGLANG_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
         )
@@ -84,9 +109,15 @@ class Cosmos3Pipeline(ComposedPipelineBase):
 
             self.add_stage(Cosmos3TextGuardrailStage())
         self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
-        self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
+        self.add_stage(Cosmos3SoundLatentPreparationStage(transformer))
+        self.add_stage(Cosmos3ActionLatentPreparationStage(transformer))
+        self.add_stage(Cosmos3TimestepPreparationStage(scheduler, transformer))
         self.add_stage(Cosmos3DenoisingStage(transformer, scheduler, server_args))
-        self.add_stage(Cosmos3DecodingStage(vae, guardrails=guardrails_on))
+        self.add_stage(
+            Cosmos3DecodingStage(
+                vae, guardrails=guardrails_on, sound_vae=sound_vae
+            )
+        )
 
         logger.info(
             "Cosmos3 pipeline stages created successfully (guardrails=%s)",
