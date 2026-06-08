@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Sequence, Union
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
+from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -57,25 +58,6 @@ def _assert_nonneg_and_invalidate(
     Compiled so the reduction + assert + scatter run as one kernel launch."""
     torch._assert_async((values >= 0).all())
     buf[indices] = -1
-
-
-@torch.compile(dynamic=True, disable=_is_npu)
-def _gather_spec_extras(
-    indices: torch.Tensor,
-    topk_p_buf: torch.Tensor,
-    topk_index_buf: torch.Tensor,
-    output_tokens_buf: torch.Tensor,
-    hidden_states_buf: Optional[torch.Tensor],
-):
-    """Compiled gather of spec extras. `hidden_states_buf` is None when the
-    build does not capture hidden states."""
-    topk_p = topk_p_buf[indices]
-    topk_index = topk_index_buf[indices]
-    bonus_tokens = output_tokens_buf[indices]
-    hidden_states = (
-        hidden_states_buf[indices] if hidden_states_buf is not None else None
-    )
-    return topk_p, topk_index, bonus_tokens, hidden_states
 
 
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
@@ -200,7 +182,7 @@ class FutureMap:
             draft_input.topk_index,
             draft_input.bonus_tokens,
             hidden_states,
-        ) = _gather_spec_extras(
+        ) = gather_spec_extras(
             indices,
             self.topk_p_buf,
             self.topk_index_buf,
