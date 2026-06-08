@@ -3201,6 +3201,37 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     ).start()
 
 
+def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
+    """Best-effort deregistration of this encoder from all bootstrap servers.
+
+    Called via ``atexit`` so that graceful shutdown removes stale URLs
+    immediately instead of waiting for health-check eviction.
+    """
+    encoder_url = _encoder_url_for_registration(server_args)
+    payload = {"url": encoder_url}
+    timeout = 5.0
+
+    for bootstrap_url in server_args.encoder_register_urls:
+        try:
+            resp = http_requests.delete(
+                f"{bootstrap_url}/unregister_encoder_url",
+                json=payload,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    f"Unregistered encoder URL '{encoder_url}' from "
+                    f"bootstrap at {bootstrap_url}"
+                )
+            else:
+                logger.warning(
+                    f"Bootstrap {bootstrap_url} returned "
+                    f"{resp.status_code} on unregister: {resp.text}"
+                )
+        except Exception as e:
+            logger.debug(f"Unregister from {bootstrap_url} failed: {e}")
+
+
 def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
     if server_args.dp_size > 1:
