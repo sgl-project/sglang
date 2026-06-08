@@ -13,12 +13,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_chain import (
     SanaWMNoiseState,
     SanaWMRealtimeLatentPrepStage,
     SanaWMSessionInputsState,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_stage import (
+    SanaWMRealtimeStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
     SanaWMStreamCacheState,
@@ -52,6 +56,10 @@ def _prep_stage():
     )
 
 
+def _realtime_stage():
+    return SanaWMRealtimeStage(transformer=None, vae=None, model_path="")
+
+
 def _batch(session, block_idx, image_latent):
     return SimpleNamespace(
         session=session,
@@ -66,6 +74,25 @@ def _batch(session, block_idx, image_latent):
 
 def _server_args():
     return SimpleNamespace(pipeline_config=SimpleNamespace(dit_precision="fp32"))
+
+
+def test_realtime_intrinsics_default_to_centered_heuristic():
+    stage = _realtime_stage()
+    state = SimpleNamespace(
+        intrinsics_raw=None,
+        intrinsics_image=Image.new("RGB", (832, 480)),
+    )
+
+    intrinsics = stage._prepare_intrinsics(
+        SimpleNamespace(condition_inputs={}),
+        state,
+        num_frames=3,
+        device=torch.device("cpu"),
+    )
+
+    assert intrinsics.shape == (3, 4)
+    assert intrinsics[0].tolist() == pytest.approx([665.6, 665.6, 416.0, 240.0])
+    assert intrinsics[2].tolist() == pytest.approx([665.6, 665.6, 416.0, 240.0])
 
 
 def test_latent_prep_plan_and_noise_discipline(_global_args):

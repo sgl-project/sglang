@@ -44,7 +44,6 @@ from .utils import (
     TARGET_HEIGHT,
     TARGET_WIDTH,
     action_string_to_c2w,
-    estimate_intrinsics_with_pi3x,
     load_camera,
     load_intrinsics,
     normalize_camera_actions,
@@ -148,6 +147,16 @@ def _motion_param(batch: Req, name: str, default: float) -> float:
     if value is None:
         value = batch.extra.get(f"sana_wm_{name}", default)
     return float(value)
+
+
+def _default_source_intrinsics(image: Image.Image, num_frames: int) -> np.ndarray:
+    width, height = image.size
+    focal = 0.8 * float(max(width, height))
+    intrinsics = np.array(
+        [focal, focal, width / 2.0, height / 2.0],
+        dtype=np.float32,
+    )
+    return np.broadcast_to(intrinsics, (num_frames, 4)).copy()
 
 
 class SanaWMRealtimeStage(PipelineStage):
@@ -292,8 +301,8 @@ class SanaWMRealtimeStage(PipelineStage):
             return cached
         if state.intrinsics_image is None:
             raise ValueError("SANA-WM image is not initialized")
-        estimated = estimate_intrinsics_with_pi3x(state.intrinsics_image, device)
-        return np.broadcast_to(estimated, (num_frames, 4)).copy()
+        logger.info("No intrinsics provided; using heuristic centered intrinsics.")
+        return _default_source_intrinsics(state.intrinsics_image, num_frames)
 
     def _append_realtime_camera_actions(self, batch: Req, state) -> None:
         actions = _normalize_camera_actions(

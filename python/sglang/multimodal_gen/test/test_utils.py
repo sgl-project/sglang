@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "ddaad3fca6eba761b0c9692972b8f22b7c463a4d"
+SGL_TEST_FILES_CI_DATA_REVISION = "11256832ef94701c5d535e630ce848651731ab70"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -156,6 +156,9 @@ DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
 
 # SANA-WM world model (TI2V with optional camera conditioning)
 DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirectional"
+DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/SANA-WM_streaming"
+)
 
 
 def print_value_formatted(description: str, value: int | float | str):

@@ -90,9 +90,13 @@ class SanaWMArchConfig(DiTArchConfig):
     guidance_embeds: bool = False
     class_dropout_prob: float = 0.0
 
-    # The released checkpoint stores raw upstream parameter names (no leading
-    # "transformer." prefix), so we use an identity mapping.
-    param_names_mapping: dict = field(default_factory=lambda: {})
+    # the released checkpoints store raw upstream parameter names; streaming
+    # also keeps an unused all-zero pos_embed while the native model uses RoPE
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            "^pos_embed$": "",
+        }
+    )
 
     def __post_init__(self):
         super().__post_init__()

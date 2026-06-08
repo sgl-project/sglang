@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
     lingbot_world_realtime_adapter as lingbot_realtime,
+    sana_wm_realtime_adapter as sana_wm_realtime,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
     GenerateSession,
@@ -146,6 +147,24 @@ def test_lingbot_realtime_camera_state_compacts_multiple_pending_updates():
 
     assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
     assert state.latest_sampled_event_id == 9
+
+
+def test_sana_wm_realtime_camera_state_uses_sana_normalizer():
+    state = sana_wm_realtime.SanaWMRealtimeAdapterState()
+    result = state.receive_camera_event_payload(
+        {
+            "mode": "state",
+            "transitions": [
+                {"actions": ["W"], "client_ts_ms": 100},
+                {"actions": [], "client_ts_ms": 120},
+            ],
+        },
+        event_id=11,
+    )
+
+    assert result == "kind=camera_actions, mode=state, transitions=2"
+    assert state.sample_camera_actions(10) == [["w"]] * 8 + [[], []]
+    assert state.latest_sampled_event_id == 11
 
 
 def test_lingbot_realtime_adapter_ingests_generic_events():
