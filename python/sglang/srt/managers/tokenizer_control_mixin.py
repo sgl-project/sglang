@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 import msgspec
+import pybase64
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -474,6 +475,12 @@ class TokenizerControlMixin:
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        serialized_named_tensors = [
+            pybase64.b64decode(data, validate=True) if isinstance(data, str) else data
+            for data in obj.serialized_named_tensors
+        ]
+        obj.serialized_named_tensors = serialized_named_tensors
 
         async with self.is_pause_cond:
             is_paused = self.is_pause

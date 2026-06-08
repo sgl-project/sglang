@@ -177,7 +177,7 @@ class SchedulerWeightUpdaterManager:
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return GetWeightsByNameReqOutput(parameter)
+        return GetWeightsByNameReqOutput(parameter=parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
