@@ -18,13 +18,9 @@ def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
-    # SM120 uses mma.sync.block_scale (no TMEM/tcgen05). Only enable when
-    # the SM120-compatible DeepGEMM branch is installed (has MoE grouped GEMM).
+    # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
     if sm_version == 120:
-        try:
-            from deep_gemm import m_grouped_fp8_fp4_gemm_nt_contiguous  # noqa: F401
-        except (ImportError, AttributeError):
-            return False
+        return False
     if not (_is_cuda or _is_musa):
         return False
 
