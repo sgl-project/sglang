@@ -228,7 +228,7 @@ class ReqTimeStatsBase:
     metrics_collector: Optional[object] = None
     # Union[TraceReqContext, TraceNullContext]
     trace_ctx: object = field(default_factory=TraceNullContext)
-    disagg_mode: DisaggregationMode = DisaggregationMode.NULL
+    disagg_mode: Optional[DisaggregationMode] = DisaggregationMode.NULL
     diff_realtime_monotonic: float = 0.0
 
     @classmethod
