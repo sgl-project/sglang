@@ -525,7 +525,9 @@ class LoRAMemoryPool:
             has_shared_experts = (
                 hasattr(cfg, "shared_expert_intermediate_size")
                 and cfg.shared_expert_intermediate_size > 0
-            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0 or (
+                getattr(cfg, "num_dense_layers", 0) or 0
+            ) > 0
             has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)

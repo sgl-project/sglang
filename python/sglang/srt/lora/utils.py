@@ -131,7 +131,7 @@ def get_hidden_dim(
             return config.hidden_size, head_dim * (
                 config.num_attention_heads + config.num_key_value_heads * 2
             )
-        elif module_name == "o_proj":
+        elif module_name == "o_proj" or module_name == "out_proj":
             o_head_dim = getattr(config, "v_head_dim", None) or head_dim
             return (
                 o_head_dim * config.num_attention_heads,
