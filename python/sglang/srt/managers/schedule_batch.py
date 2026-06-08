@@ -696,10 +696,6 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        # Number of committed tokens of the full untruncated sequence
-        # (origin + output, plus the DLLM mask block) admitted to run this
-        # iteration; the sequence itself is computed on demand via
-        # get_full_untruncated_fill_ids(). Admission only advances fill_len.
         self.fill_len: int = 0
 
         self.session = session
@@ -1066,9 +1062,6 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def get_full_untruncated_fill_ids(self) -> array:
-        # The full untruncated sequence: origin + output (+ DLLM mask block).
-        # Computed on demand from origin_input_ids/output_ids; admission only
-        # advances fill_len, which get_fill_ids applies as the truncation cursor.
         ids = self.origin_input_ids + self.output_ids
         if self.is_dllm():
             ids = ids + array(
