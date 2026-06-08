@@ -114,6 +114,7 @@ class DSV4AttnMetadata:
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c4_sparse_topk_lengths: torch.Tensor = field(init=False)
     c4_sparse_page_indices: torch.Tensor = field(init=False)
+    c4_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
