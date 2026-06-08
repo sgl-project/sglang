@@ -177,7 +177,12 @@ class SWAComponent(TreeComponent):
         ), f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
 
         if swa_evicted_seqlen <= total_prefix_len:
-            # Branch 1: entire value_slice is within SWA window — recover
+            # Branch 1: entire value_slice is within SWA window — recover.
+            # node is a SWA tombstone; clear its stale full->swa mapping before
+            # freeing, else free_swa frees a slot already reused by value_slice.
+            self.cache.token_to_kv_pool_allocator.clear_swa_mapping(
+                node.component_data[BASE_COMPONENT_TYPE].value
+            )
             self.cache.token_to_kv_pool_allocator.free(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
@@ -190,6 +195,9 @@ class SWAComponent(TreeComponent):
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
+            self.cache.token_to_kv_pool_allocator.clear_swa_mapping(
+                node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
+            )
             self.cache.token_to_kv_pool_allocator.free(
                 node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
             )

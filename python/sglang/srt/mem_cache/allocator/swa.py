@@ -335,6 +335,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
+    def clear_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        """Clear full->swa entries without freeing any swa slot.
+
+        A SWA-tombstone node owns no swa slot, so its full->swa mapping must be
+        0. If it is stale (points to a slot already reused by another full),
+        free_swa on it would erroneously free that live slot. Clear instead.
+        """
+        if full_indices.numel() == 0:
+            return
+        if _is_npu:
+            full_indices = full_indices.to(torch.int64)
+        self.full_to_swa_index_mapping[full_indices] = 0
+
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
