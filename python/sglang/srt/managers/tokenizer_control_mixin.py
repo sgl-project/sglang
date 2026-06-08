@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -19,7 +17,6 @@ from sglang.srt.managers.io_struct import (
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
-    CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -47,7 +44,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
-    OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -79,9 +75,6 @@ from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
-    from sglang.srt.managers.tokenizer_manager_components.session_controller import (
-        SessionController,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -839,42 +832,6 @@ class TokenizerControlMixin:
             results = reader.read_all()
 
         return results
-
-    @staticmethod
-    async def open_session(
-        self: "SessionController",
-        obj: OpenSessionReqInput,
-        request: Optional[fastapi.Request] = None,
-    ):
-        self.auto_create_handle_loop()
-        if obj.streaming:
-            if not self.server_args.enable_streaming_session:
-                raise ValueError(
-                    "Streaming sessions are disabled. "
-                    "Please relaunch with --enable-streaming-session."
-                )
-
-        if obj.session_id is None:
-            obj.session_id = uuid.uuid4().hex
-        elif obj.session_id in self.session_futures:
-            return None
-
-        future = asyncio.Future()
-        self.session_futures[obj.session_id] = future
-        self.send_to_scheduler.send_pyobj(obj)
-
-        try:
-            return await future
-        finally:
-            self.session_futures.pop(obj.session_id, None)
-
-    @staticmethod
-    async def close_session(
-        self: "SessionController",
-        obj: CloseSessionReqInput,
-        request: Optional[fastapi.Request] = None,
-    ):
-        await self.send_to_scheduler.send_pyobj(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

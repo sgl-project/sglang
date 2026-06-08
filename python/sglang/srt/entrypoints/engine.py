@@ -952,9 +952,7 @@ class Engine(EngineScoreMixin, EngineBase):
             timeout=timeout,
         )
         return self.loop.run_until_complete(
-            TokenizerManager.open_session(
-                self.tokenizer_manager.session_controller, obj, None
-            )
+            self.tokenizer_manager.session_controller.open_session(obj, None)
         )
 
     def close_session(self, session_id: str) -> None:
@@ -965,9 +963,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         obj = CloseSessionReqInput(session_id=session_id)
         self.loop.run_until_complete(
-            TokenizerManager.close_session(
-                self.tokenizer_manager.session_controller, obj, None
-            )
+            self.tokenizer_manager.session_controller.close_session(obj, None)
         )
 
     def start_profile(self, **kwargs):

@@ -1405,8 +1405,10 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await TokenizerManager.open_session(
-            _global_state.tokenizer_manager.session_controller, obj, request
+        session_id = (
+            await _global_state.tokenizer_manager.session_controller.open_session(
+                obj, request
+            )
         )
         if session_id is None:
             raise Exception(
@@ -1421,8 +1423,8 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 async def close_session(obj: CloseSessionReqInput, request: Request):
     """Close the session."""
     try:
-        await TokenizerManager.close_session(
-            _global_state.tokenizer_manager.session_controller, obj, request
+        await _global_state.tokenizer_manager.session_controller.close_session(
+            obj, request
         )
         return Response(status_code=200)
     except Exception as e:
