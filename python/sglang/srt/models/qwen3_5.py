@@ -953,19 +953,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if positions.dim() == 2 and positions.shape[0] == 3:
-            positions_fusable = not forward_batch.contains_mm_inputs()
-            fused_positions = positions[0]
-        else:
-            # defensive fallback
-            positions_fusable = positions.dim() == 1
-            fused_positions = positions
+        # Fused QK-norm+RoPE+cache is ROCm/aiter-only; the kernel handle is None on
+        # every other platform, so skip the gating (and its mm/position probing)
+        # entirely there and fall through to the native/NPU path unchanged.
+        use_aiter_fused = False
+        if _aiter_fused_qkv_split_qk_norm_rope_cache is not None:
+            # mRoPE uses 3-row positions [3, T] but the fused kernel does 1-D RoPE
+            # only; fuse on row 0 only when there are no mm inputs (rows then identical).
+            if positions.dim() == 2 and positions.shape[0] == 3:
+                positions_fusable = not forward_batch.contains_mm_inputs()
+                fused_positions = positions[0]
+            else:
+                # Plain 1-D positions fuse directly; anything else is not fusable.
+                positions_fusable = positions.dim() == 1
+                fused_positions = positions
 
-        use_aiter_fused = (
-            _aiter_fused_qkv_split_qk_norm_rope_cache is not None
-            and positions_fusable
-            and forward_batch.out_cache_loc is not None
-        )
+            # The fused kernel writes the KV cache inline, so require a real
+            # out_cache_loc (it is None during warmup/idle).
+            use_aiter_fused = (
+                positions_fusable and forward_batch.out_cache_loc is not None
+            )
 
         if use_aiter_fused:
             q, k, v, gate = self._prepare_qkv_aiter_fused(
