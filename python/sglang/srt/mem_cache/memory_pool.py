@@ -1485,6 +1485,7 @@ class HybridLinearKVPool(KVCache):
         device: str,
         mamba_pool: MambaPool,
         enable_memory_saver: bool = False,
+        enable_kv_cache_copy: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
@@ -1525,6 +1526,7 @@ class HybridLinearKVPool(KVCache):
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                enable_kv_cache_copy=enable_kv_cache_copy,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
