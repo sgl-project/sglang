@@ -1,5 +1,4 @@
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any, Optional, Tuple
 
@@ -9,8 +8,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_FP4_SCALE_B_UE8M0,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
+    DEEPGEMM_SM90_SCALE_B_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
@@ -117,8 +118,6 @@ def grouped_gemm_nt_f8fp4bf16_masked(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        block_m_override = int(os.getenv("DG_W4_BLOCK_M_OVERRIDE", "0")) or None
-        block_n_override = int(os.getenv("DG_W4_BLOCK_N_OVERRIDE", "0")) or None
         return kernel(
             lhs,
             rhs,
@@ -128,8 +127,6 @@ def grouped_gemm_nt_f8fp4bf16_masked(
             gran_k=gran_k_a,
             gran_k_a=gran_k_a,
             gran_k_b=gran_k_b,
-            block_m_override=block_m_override,
-            block_n_override=block_n_override,
             masked_m_max_hint=masked_m_max_hint,
             active_groups_hint=active_groups_hint,
         )
