@@ -896,6 +896,271 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.init_attention_backend()
 
+    def _get_nvfp4_native_kv_pools(self) -> list:
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolFP4
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        pool = self.token_to_kv_pool
+        if isinstance(pool, MHATokenToKVPoolFP4):
+            return [pool]
+        if (
+            isinstance(pool, SWAKVPool)
+            and isinstance(pool.full_kv_pool, MHATokenToKVPoolFP4)
+            and isinstance(pool.swa_kv_pool, MHATokenToKVPoolFP4)
+        ):
+            return [pool.full_kv_pool, pool.swa_kv_pool]
+        return []
+
+    def _zero_nvfp4_kv_cache_slots(self, loc: torch.Tensor) -> None:
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        def zero_pool(pool, pool_loc):
+            if pool_loc.numel() == 0:
+                return
+            for buffers_name in (
+                "k_buffer",
+                "v_buffer",
+                "k_scale_buffer",
+                "v_scale_buffer",
+            ):
+                for buf in getattr(pool, buffers_name, []):
+                    buf[pool_loc].zero_()
+
+        pool = self.token_to_kv_pool
+        if isinstance(pool, SWAKVPool):
+            zero_pool(pool.full_kv_pool, loc)
+            swa_loc = pool.translate_loc_from_full_to_swa(loc)
+            zero_pool(pool.swa_kv_pool, swa_loc[swa_loc > 0])
+        else:
+            zero_pool(pool, loc)
+
+    def _calibrate_nvfp4_kv_cache(self) -> None:
+        """Run one eager prefill to freeze NVFP4 KV global scales before capture."""
+        fp4_pools = self._get_nvfp4_native_kv_pools()
+        if not fp4_pools:
+            return
+        if os.environ.get("SGLANG_FP4_KV_AUTOCALIB", "1") == "0":
+            return
+
+        allocator = self.token_to_kv_pool_allocator
+        out_cache_loc = None
+        allocated_out_cache_loc = None
+        req_pool_idx = None
+        explicit_calib_marked = False
+        try:
+            page_size = max(1, int(getattr(allocator, "page_size", 1)))
+            token_limits = [
+                4096,
+                int(self.model_config.context_len),
+                int(getattr(self.req_to_token_pool, "max_context_len", 4096)),
+            ]
+            max_prefill_tokens = getattr(self.server_args, "max_prefill_tokens", None)
+            if max_prefill_tokens is not None and max_prefill_tokens > 0:
+                token_limits.append(int(max_prefill_tokens))
+            max_total_num_tokens = int(getattr(self, "max_total_num_tokens", 0))
+            if max_total_num_tokens > page_size:
+                token_limits.append(max_total_num_tokens - page_size)
+            available_size = int(allocator.available_size())
+            if available_size > page_size:
+                token_limits.append(available_size - page_size)
+
+            num_tokens = max(1, min(token_limits))
+            if num_tokens <= 0:
+                return
+            if num_tokens > available_size:
+                raise RuntimeError(
+                    f"need {num_tokens} KV slots, only {available_size} available"
+                )
+            if not getattr(self.req_to_token_pool, "free_slots", None):
+                raise RuntimeError("no request-pool slot available")
+
+            vocab_size = max(1, int(self.model_config.vocab_size))
+            input_ids = torch.arange(
+                num_tokens, dtype=torch.int64, device=self.device
+            ) % vocab_size
+            positions = torch.arange(
+                num_tokens, dtype=torch.int64, device=self.device
+            )
+            seq_lens = torch.tensor(
+                [num_tokens], dtype=torch.int64, device=self.device
+            )
+            seq_lens_cpu = torch.tensor([num_tokens], dtype=torch.int64)
+            extend_prefix_lens = torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            )
+            extend_seq_lens = torch.tensor(
+                [num_tokens], dtype=torch.int32, device=self.device
+            )
+
+            if page_size == 1:
+                out_cache_loc = allocator.alloc(num_tokens)
+            else:
+                out_cache_loc = allocator.alloc_extend(
+                    extend_prefix_lens.to(torch.int64),
+                    torch.zeros((1,), dtype=torch.int64),
+                    seq_lens,
+                    seq_lens_cpu,
+                    torch.tensor([-1], dtype=torch.int64, device=self.device),
+                    num_tokens,
+                )
+            if out_cache_loc is None:
+                raise RuntimeError(f"failed to allocate {num_tokens} KV slots")
+            allocated_out_cache_loc = out_cache_loc
+
+            req_pool_idx = self.req_to_token_pool.free_slots.pop(0)
+            req_pool_indices = torch.tensor(
+                [req_pool_idx], dtype=torch.int64, device=self.device
+            )
+            self.req_to_token_pool.write(
+                (req_pool_idx, slice(0, num_tokens)), out_cache_loc
+            )
+
+            global_num_tokens_cpu = None
+            global_num_tokens_for_logprob_cpu = None
+            global_num_tokens_gpu = None
+            global_num_tokens_for_logprob_gpu = None
+            global_dp_buffer_len = None
+            require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
+            if require_mlp_tp_gather_:
+                global_num_tokens_cpu = [num_tokens] * self.server_args.dp_size
+            elif require_attn_tp_gather(self.server_args):
+                global_num_tokens_cpu = [num_tokens]
+            if global_num_tokens_cpu is not None:
+                global_dp_buffer_len = sum(global_num_tokens_cpu)
+                global_num_tokens_for_logprob_cpu = list(global_num_tokens_cpu)
+                global_num_tokens_gpu = torch.tensor(
+                    global_num_tokens_cpu, dtype=torch.int32, device=self.device
+                )
+                global_num_tokens_for_logprob_gpu = global_num_tokens_gpu.clone()
+
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=1,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                orig_seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=num_tokens,
+                positions=positions,
+                extend_num_tokens=num_tokens,
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_start_loc=torch.zeros(
+                    (1,), dtype=torch.int32, device=self.device
+                ),
+                extend_prefix_lens_cpu=[0],
+                extend_seq_lens_cpu=[num_tokens],
+                return_logprob=False,
+                spec_algorithm=self.spec_algorithm,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                global_forward_mode=ForwardMode.EXTEND,
+                global_num_tokens_cpu=global_num_tokens_cpu,
+                global_num_tokens_for_logprob_cpu=global_num_tokens_for_logprob_cpu,
+                global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+                global_dp_buffer_len=global_dp_buffer_len,
+                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+                num_token_non_padded=torch.tensor(
+                    [num_tokens], dtype=torch.int32, device=self.device
+                ),
+            )
+
+            if forward_batch.global_num_tokens_cpu is not None:
+                forward_batch.prepare_mlp_sync_batch(self)
+            else:
+                forward_batch.prepare_attn_tp_scatter_input(self)
+                set_dp_buffer_len(
+                    None,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                    None,
+                )
+                set_is_extend_in_batch(False)
+
+            kwargs = {}
+            signature = inspect.signature(self.model.forward).parameters
+            if "get_embedding" in signature:
+                kwargs["get_embedding"] = True
+            if self.pp_size > 1 and "pp_proxy_tensors" in signature:
+                hc_hidden_size = getattr(self.model_config, "hc_hidden_size", None)
+                pp_tensors = {
+                    "hidden_states": torch.zeros(
+                        (
+                            num_tokens,
+                            hc_hidden_size or self.model_config.hidden_size,
+                        ),
+                        dtype=self.model_config.dtype,
+                        device=self.device,
+                    )
+                }
+                if hc_hidden_size is None:
+                    pp_tensors["residual"] = torch.zeros(
+                        (num_tokens, self.model_config.hidden_size),
+                        dtype=self.model_config.dtype,
+                        device=self.device,
+                    )
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(pp_tensors)
+
+            if hasattr(self.model, "prepare_forward_batch"):
+                self.model.prepare_forward_batch(forward_batch)
+            self.attn_backend.init_forward_metadata(forward_batch)
+
+            for pool in fp4_pools:
+                setattr(pool, "_explicit_autocalib_in_progress", True)
+            explicit_calib_marked = True
+            with forward_context(ForwardContext(attn_backend=self.attn_backend)):
+                with torch.inference_mode():
+                    self.model.forward(
+                        input_ids,
+                        positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+            torch.get_device_module(self.device).synchronize()
+
+            calibrated = sum(
+                sum(1 for flag in getattr(pool, "_gs_calibrated", []) if flag)
+                for pool in fp4_pools
+            )
+            total = sum(
+                len(getattr(pool, "_gs_calibrated", [])) for pool in fp4_pools
+            )
+            if calibrated != total:
+                raise RuntimeError(
+                    f"only calibrated {calibrated}/{total} NVFP4 KV layers"
+                )
+            logger.info(
+                "NVFP4 KV cache calibrated %d layers from %d eager prefill tokens",
+                calibrated,
+                num_tokens,
+            )
+        except Exception as e:
+            logger.warning(
+                "NVFP4 KV cache calibration warmup failed; first real prefill "
+                "will remain the fallback for auto-calibration. Error: %s",
+                e,
+            )
+        finally:
+            if explicit_calib_marked:
+                for pool in fp4_pools:
+                    setattr(pool, "_explicit_autocalib_in_progress", False)
+            if allocated_out_cache_loc is not None:
+                try:
+                    self._zero_nvfp4_kv_cache_slots(allocated_out_cache_loc)
+                except Exception:
+                    pass
+                allocator.free(allocated_out_cache_loc)
+            if req_pool_idx is not None:
+                try:
+                    self.req_to_token_pool.req_to_token[
+                        req_pool_idx, : allocated_out_cache_loc.numel()
+                    ].zero_()
+                except Exception:
+                    pass
+                self.req_to_token_pool.free_slots.append(req_pool_idx)
+
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
 
@@ -910,6 +1175,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # it. Always built: it serves both the fully-disabled case (decode/prefill
         # runners point at it) and the eager fallback when a cg runner can't run a
         # batch.
+        # Freeze NVFP4 KV global scales via one eager prefill before
+        # the eager runner warms kernels and cuda graphs capture.
+        self._calibrate_nvfp4_kv_cache()
         self.eager_runner = EagerRunner(self)
 
         # cuda-graph capture: prefill before decode, so both coalesce onto the
