@@ -1675,9 +1675,7 @@ def _post_process_topk_ids(
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
     elif _is_cpu:
-        topk_ids = topk_ids_logical_to_physical(
-            topk_ids, expert_location_dispatch_info
-        )
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
     if recorder_topk_ids is None:
