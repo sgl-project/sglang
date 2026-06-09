@@ -1201,6 +1201,33 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def _dataset_specific_args(args: argparse.Namespace) -> Dict[str, Any]:
+    """Return only the dataset-shaping args relevant to ``args.dataset_name``.
+
+    Keeps the benchmark result from advertising unrelated defaults (e.g.
+    ``random_input_len`` for a ``generated-shared-prefix`` run), which is
+    misleading for downstream consumers reading the dumped result.
+    """
+    if args.dataset_name in ("random", "random-ids", "image"):
+        return {
+            "random_input_len": args.random_input_len,
+            "random_output_len": args.random_output_len,
+            "random_range_ratio": args.random_range_ratio,
+        }
+    if args.dataset_name == "generated-shared-prefix":
+        return {
+            "gsp_num_groups": args.gsp_num_groups,
+            "gsp_prompts_per_group": args.gsp_prompts_per_group,
+            "gsp_system_prompt_len": args.gsp_system_prompt_len,
+            "gsp_question_len": args.gsp_question_len,
+            "gsp_output_len": args.gsp_output_len,
+            "gsp_range_ratio": args.gsp_range_ratio,
+        }
+    if args.dataset_name in ("sharegpt", "custom"):
+        return {"sharegpt_output_len": args.sharegpt_output_len}
+    return {}
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1592,10 +1619,7 @@ async def benchmark(
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
-            "sharegpt_output_len": args.sharegpt_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
+            **_dataset_specific_args(args),
             # Information
             "server_info": server_info,
             # Results

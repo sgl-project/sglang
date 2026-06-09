@@ -1089,5 +1089,57 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             self.assertNotIn(forbidden, stderr)
 
 
+class TestDatasetSpecificResultArgs(unittest.TestCase):
+    """`_dataset_specific_args` should only surface args for the active dataset."""
+
+    def _args(self, dataset_name: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            dataset_name=dataset_name,
+            sharegpt_output_len=None,
+            random_input_len=1024,
+            random_output_len=1024,
+            random_range_ratio=0.0,
+            gsp_num_groups=64,
+            gsp_prompts_per_group=16,
+            gsp_system_prompt_len=2048,
+            gsp_question_len=128,
+            gsp_output_len=256,
+            gsp_range_ratio=1.0,
+        )
+
+    def test_random_dataset_omits_gsp_and_sharegpt(self):
+        from sglang.bench_serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("random"))
+        self.assertEqual(
+            result,
+            {
+                "random_input_len": 1024,
+                "random_output_len": 1024,
+                "random_range_ratio": 0.0,
+            },
+        )
+
+    def test_gsp_dataset_omits_random_and_sharegpt(self):
+        from sglang.bench_serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("generated-shared-prefix"))
+        self.assertNotIn("random_input_len", result)
+        self.assertNotIn("sharegpt_output_len", result)
+        self.assertEqual(result["gsp_system_prompt_len"], 2048)
+        self.assertEqual(result["gsp_output_len"], 256)
+
+    def test_sharegpt_dataset_omits_random_and_gsp(self):
+        from sglang.bench_serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("sharegpt"))
+        self.assertEqual(result, {"sharegpt_output_len": None})
+
+    def test_other_dataset_returns_empty(self):
+        from sglang.bench_serving import _dataset_specific_args
+
+        self.assertEqual(_dataset_specific_args(self._args("mooncake")), {})
+
+
 if __name__ == "__main__":
     unittest.main()
