@@ -165,8 +165,9 @@ def _ceil_to_ue8m0_recompile_limit() -> int:
 
 
 def _configure_ceil_to_ue8m0_dynamo_recompile_limit() -> None:
-    torch._dynamo.config.recompile_limit = max(
-        torch._dynamo.config.recompile_limit,
+    import torch._dynamo.config as dynamo_config
+    dynamo_config.recompile_limit = max(
+        dynamo_config.recompile_limit,
         _ceil_to_ue8m0_recompile_limit(),
     )
 
