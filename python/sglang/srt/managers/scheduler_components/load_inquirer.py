@@ -53,6 +53,19 @@ class SchedulerLoadInquirer:
     get_spec_total_num_forward_ct: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
+        """Get the total number of tokens pending prefill.
+
+        This includes tokens from waiting queue requests plus remaining tokens
+        from the currently chunked request.
+
+        Args:
+            chunk_deduct: extra tokens to subtract from the chunked request's
+                remaining count. At batch-scheduling time the current chunk
+                has been planned but ``prefix_indices`` does not yet include it,
+                so callers pass ``extend_input_len`` here. At load-reporting
+                time ``prefix_indices`` is already up-to-date, so the default
+                0 is correct.
+        """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
         chunked_req = next(iter(self.get_chunked_reqs()), None)
         if chunked_req is not None:
