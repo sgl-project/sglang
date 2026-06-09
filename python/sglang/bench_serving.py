@@ -39,7 +39,7 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets import DATASET_RESULT_ARG_KEYS, DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -1210,28 +1210,8 @@ def _dataset_specific_args(args: argparse.Namespace) -> Dict[str, Any]:
     tolerated and surfaced as ``None`` instead of raising ``AttributeError``.
     """
     dataset_name = getattr(args, "dataset_name", None)
-    if dataset_name in ("random", "random-ids", "image"):
-        return {
-            "random_input_len": getattr(args, "random_input_len", None),
-            "random_output_len": getattr(args, "random_output_len", None),
-            "random_range_ratio": getattr(args, "random_range_ratio", None),
-        }
-    if dataset_name == "mmmu":
-        return {"random_output_len": getattr(args, "random_output_len", None)}
-    if dataset_name == "generated-shared-prefix":
-        return {
-            "gsp_num_groups": getattr(args, "gsp_num_groups", None),
-            "gsp_prompts_per_group": getattr(args, "gsp_prompts_per_group", None),
-            "gsp_system_prompt_len": getattr(args, "gsp_system_prompt_len", None),
-            "gsp_question_len": getattr(args, "gsp_question_len", None),
-            "gsp_output_len": getattr(args, "gsp_output_len", None),
-            "gsp_range_ratio": getattr(args, "gsp_range_ratio", None),
-            "gsp_group_distribution": getattr(args, "gsp_group_distribution", None),
-            "gsp_zipf_alpha": getattr(args, "gsp_zipf_alpha", None),
-        }
-    if dataset_name in ("sharegpt", "custom", "autobench", "openai", "longbench_v2"):
-        return {"sharegpt_output_len": getattr(args, "sharegpt_output_len", None)}
-    return {}
+    result_keys = DATASET_RESULT_ARG_KEYS.get(dataset_name, ())
+    return {key: getattr(args, key, None) for key in result_keys}
 
 
 async def benchmark(
