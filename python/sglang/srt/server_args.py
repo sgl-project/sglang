@@ -632,6 +632,12 @@ class ServerArgs:
     speculative_suffix_max_cached_requests: int = 10000
     speculative_suffix_max_spec_factor: float = 1.0
     speculative_suffix_min_token_prob: float = 0.1
+    # HYBRID_SUFFIX_MTP: keep the MTP draft KV warm by running
+    # forward_draft_extend_after_decode after every SUFFIX step. When False
+    # (default), MTP draft KV is only kept warm on MTP-picked steps; the
+    # first MTP step after a SUFFIX-picked step pays a one-time keep-up
+    # forward cost.
+    speculative_hybrid_mtp_always_warm: bool = False
     enable_multi_layer_eagle: bool = False
 
     # Adaptive speculative decoding
@@ -6016,6 +6022,14 @@ class ServerArgs:
             type=float,
             default=ServerArgs.speculative_suffix_min_token_prob,
             help="SUFFIX minimum per-token probability for a draft token to be proposed.",
+        )
+        parser.add_argument(
+            "--speculative-hybrid-mtp-always-warm",
+            action="store_true",
+            default=ServerArgs.speculative_hybrid_mtp_always_warm,
+            help="HYBRID_SUFFIX_MTP: keep MTP draft KV warm after every SUFFIX-picked step "
+            "(extra forward_draft_extend_after_decode per step). Without this, the first "
+            "MTP step after a SUFFIX run pays a one-time keep-up forward cost.",
         )
         parser.add_argument(
             "--speculative-adaptive",
