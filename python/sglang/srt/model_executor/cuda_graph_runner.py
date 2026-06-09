@@ -648,6 +648,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_ddtree()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1012,7 +1013,10 @@ class CudaGraphRunner:
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash()
+                    (
+                        self.model_runner.spec_algorithm.is_dflash()
+                        or self.model_runner.spec_algorithm.is_ddtree()
+                    )
                     and self.model_runner.is_draft_worker
                     and "input_embeds" in inspect.signature(forward).parameters
                 ):
@@ -1102,6 +1106,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_ddtree()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1119,7 +1124,8 @@ class CudaGraphRunner:
         )
 
         if (
-            self.model_runner.spec_algorithm.is_dflash()
+            (self.model_runner.spec_algorithm.is_dflash()
+             or self.model_runner.spec_algorithm.is_ddtree())
             and self.model_runner.is_draft_worker
             and forward_batch.input_embeds is not None
         ):
@@ -1175,7 +1181,8 @@ class CudaGraphRunner:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                (self.model_runner.spec_algorithm.is_dflash()
+                 or self.model_runner.spec_algorithm.is_ddtree())
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
@@ -1289,6 +1296,23 @@ class CudaGraphRunner:
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
+            )
+
+        elif self.model_runner.spec_algorithm.is_ddtree():
+            from sglang.srt.speculative.ddtree_info import DDTreeVerifyInput
+
+            tree_budget = getattr(
+                self.model_runner.server_args, "speculative_ddtree_budget", None
+            )
+            if tree_budget is None:
+                tree_budget = self.model_runner.server_args.speculative_num_draft_tokens - 1
+            draft_token_num = tree_budget + 1
+            spec_info = DDTreeVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=draft_token_num,
+                tree_budget=tree_budget,
+                custom_mask=self.buffers.custom_mask,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

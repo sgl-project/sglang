@@ -474,7 +474,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        if (self.spec_algorithm.is_dflash() or self.spec_algorithm.is_ddtree()) and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 parse_dflash_draft_config,
             )
@@ -2716,6 +2716,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         if self.is_draft_worker
                         else CaptureHiddenMode.FULL
                     ),
+                )
+
+            elif self.spec_algorithm.is_ddtree():
+                from sglang.srt.speculative.ddtree_info import DDTreeVerifyInput
+
+                tree_budget = getattr(self.server_args, "speculative_ddtree_budget", None)
+                if tree_budget is None:
+                    tree_budget = self.server_args.speculative_num_draft_tokens - 1
+                draft_token_num = tree_budget + 1
+                spec_info = DDTreeVerifyInput(
+                    draft_token=torch.empty(
+                        (self.max_total_num_tokens,), dtype=torch.long, device=self.device
+                    ),
+                    positions=torch.empty(
+                        (self.max_total_num_tokens,), dtype=torch.int64, device=self.device
+                    ),
+                    draft_token_num=draft_token_num,
+                    tree_budget=tree_budget,
                 )
 
             elif self.spec_algorithm.is_ngram():

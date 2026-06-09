@@ -607,6 +607,7 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_ddtree_budget: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -5872,6 +5873,12 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-ddtree-budget",
+            type=int,
+            help="DDTREE only. Tree node budget B. Controls how many tree nodes are verified per round (excluding root). Defaults to speculative_num_draft_tokens - 1.",
+            default=ServerArgs.speculative_ddtree_budget,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

@@ -355,6 +355,14 @@ class TritonAttnBackend(AttentionBackend):
             )
         return kv_indptr, window_kv_indptr, window_kv_lens
 
+    def _resolve_target_verify_num_draft_tokens(self, spec_info) -> int:
+        if spec_info is not None and hasattr(spec_info, "draft_token_num"):
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            if hasattr(spec_info, "tree_budget"):
+                return int(spec_info.draft_token_num)
+        return self.num_draft_tokens
+
     def _update_target_verify_buffers(
         self,
         bs: int,
@@ -368,11 +376,12 @@ class TritonAttnBackend(AttentionBackend):
         ``(qo_indptr, kv_indptr, custom_mask, mask_indptr,
           window_kv_indptr, window_kv_indices, window_num_kv_splits, window_kv_offsets)``
         """
+        num_draft_tokens = self._resolve_target_verify_num_draft_tokens(spec_info)
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
-            (1 + bs) * self.num_draft_tokens,
-            step=self.num_draft_tokens,
+            (1 + bs) * num_draft_tokens,
+            step=num_draft_tokens,
             dtype=torch.int32,
             device=self.device,
         )
@@ -407,7 +416,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
-        seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
+        seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
@@ -612,10 +621,11 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
+            num_draft_tokens = self._resolve_target_verify_num_draft_tokens(spec_info)
             qo_indptr = torch.arange(
                 0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
+                (1 + bs) * num_draft_tokens,
+                step=num_draft_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -653,13 +663,13 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
+            seq_mask_len = num_draft_tokens * (
+                forward_batch.seq_lens + num_draft_tokens
             )
             mask_indptr = self.mask_indptr
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
-            max_extend_len = self.num_draft_tokens
+            max_extend_len = num_draft_tokens
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -873,6 +883,7 @@ class TritonAttnBackend(AttentionBackend):
                 swa_attn_logits=self.cuda_graph_swa_attn_logits,
             )
         elif forward_mode.is_target_verify():
+            num_draft_tokens = self._resolve_target_verify_num_draft_tokens(spec_info)
             custom_mask = (
                 self.cuda_graph_custom_mask
                 if spec_info is not None
@@ -882,7 +893,7 @@ class TritonAttnBackend(AttentionBackend):
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
-                max_extend_len=self.num_draft_tokens,
+                max_extend_len=num_draft_tokens,
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
                 kv_indices=self.cuda_graph_kv_indices,

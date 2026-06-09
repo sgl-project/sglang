@@ -189,7 +189,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                (self.model_runner.spec_algorithm.is_dflash()
+                 or self.model_runner.spec_algorithm.is_ddtree())
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
