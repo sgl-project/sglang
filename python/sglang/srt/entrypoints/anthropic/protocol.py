@@ -138,8 +138,9 @@ class AnthropicMessagesRequest(BaseModel):
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
 
-    type: Optional[Literal["text_delta", "input_json_delta"]] = None
+    type: Optional[Literal["text_delta", "input_json_delta", "thinking_delta"]] = None
     text: Optional[str] = None
+    thinking: Optional[str] = None
     partial_json: Optional[str] = None
 
     # Message delta fields

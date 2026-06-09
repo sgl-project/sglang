@@ -439,6 +439,7 @@ class AnthropicServing:
         first_chunk = True
         content_block_index = 0
         content_block_open = False
+        content_block_type: Optional[str] = None
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -461,6 +462,7 @@ class AnthropicServing:
                         stop_event.model_dump_json(exclude_none=True),
                         "content_block_stop",
                     )
+                    content_block_type = None
 
                 # Emit message_delta with stop_reason and usage
                 stop_reason = STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
@@ -570,6 +572,7 @@ class AnthropicServing:
                                 "content_block_stop",
                             )
                             content_block_index += 1
+                            content_block_type = None
 
                         # Start tool_use content block
                         start_event = AnthropicStreamEvent(
@@ -587,6 +590,7 @@ class AnthropicServing:
                             "content_block_start",
                         )
                         content_block_open = True
+                        content_block_type = "tool_use"
 
                         # Stream initial arguments if present
                         if tc_func.arguments:
@@ -619,8 +623,63 @@ class AnthropicServing:
                         )
                 continue
 
+            if delta.reasoning_content is not None and delta.reasoning_content != "":
+                if content_block_open and content_block_type != "thinking":
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    content_block_open = False
+                    content_block_type = None
+
+                if not content_block_open:
+                    start_event = AnthropicStreamEvent(
+                        type="content_block_start",
+                        index=content_block_index,
+                        content_block=AnthropicContentBlock(
+                            type="thinking", thinking="", signature=""
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        start_event.model_dump_json(exclude_none=True),
+                        "content_block_start",
+                    )
+                    content_block_open = True
+                    content_block_type = "thinking"
+
+                delta_event = AnthropicStreamEvent(
+                    type="content_block_delta",
+                    index=content_block_index,
+                    delta=AnthropicDelta(
+                        type="thinking_delta",
+                        thinking=delta.reasoning_content,
+                    ),
+                )
+                yield _wrap_sse_event(
+                    delta_event.model_dump_json(exclude_none=True),
+                    "content_block_delta",
+                )
+
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
+                if content_block_open and content_block_type != "text":
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    content_block_open = False
+                    content_block_type = None
+
                 # Start a text content block if needed
                 if not content_block_open:
                     start_event = AnthropicStreamEvent(
@@ -633,6 +692,7 @@ class AnthropicServing:
                         "content_block_start",
                     )
                     content_block_open = True
+                    content_block_type = "text"
 
                 # Emit text delta
                 delta_event = AnthropicStreamEvent(
@@ -663,7 +723,15 @@ class AnthropicServing:
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
 
-        # Add text content
+        if choice.message.reasoning_content:
+            content.append(
+                AnthropicContentBlock(
+                    type="thinking",
+                    thinking=choice.message.reasoning_content,
+                    signature="",
+                )
+            )
+
         if choice.message.content:
             content.append(
                 AnthropicContentBlock(type="text", text=choice.message.content)
