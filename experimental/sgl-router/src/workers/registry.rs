@@ -196,6 +196,15 @@ impl WorkerRegistry {
     pub fn get(&self, id: &WorkerId) -> Option<Arc<Worker>> {
         self.by_id.get(id).map(|w| Arc::clone(&w))
     }
+
+    /// Snapshot of every registered worker, across all models and modes.
+    ///
+    /// Used by fleet-wide admin fan-out (e.g. `/flush_cache`) that targets
+    /// every worker the router knows about rather than one model's pool.
+    /// Order is unspecified (iterates the underlying `DashMap`).
+    pub fn all(&self) -> Vec<Arc<Worker>> {
+        self.by_id.iter().map(|e| Arc::clone(e.value())).collect()
+    }
 }
 
 /// `true` when the two modes can't coexist for the same model — i.e.
@@ -242,6 +251,22 @@ mod tests {
         assert_eq!(m1.len(), 2);
         assert_eq!(m2.len(), 1);
         assert!(m_missing.is_empty());
+    }
+
+    #[test]
+    fn all_returns_every_worker_across_models_and_modes() {
+        let r = WorkerRegistry::default();
+        let _ = r.add(spec("w1", WorkerMode::Plain, &["m1"]));
+        let _ = r.add(spec("p", WorkerMode::Prefill, &["m2"]));
+        let _ = r.add(spec("d", WorkerMode::Decode, &["m2"]));
+        let mut ids: Vec<String> = r.all().into_iter().map(|w| w.id.0.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["d", "p", "w1"]);
+    }
+
+    #[test]
+    fn all_is_empty_for_fresh_registry() {
+        assert!(WorkerRegistry::default().all().is_empty());
     }
 
     #[test]

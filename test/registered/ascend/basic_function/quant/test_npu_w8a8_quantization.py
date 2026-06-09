@@ -6,74 +6,39 @@ python3 -m unittest test_ascend_w8a8_quantization.TestAscendW8A8.test_gsm8k
 import os
 import time
 import unittest
-from types import SimpleNamespace
-from urllib.parse import urlparse
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    is_in_ci,
-    popen_launch_server,
+from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from sglang.test.ascend.test_ascend_utils import (
+    REDHATAI_QWEN2_5_0_5B_INSTRUCT_QUANTIZED_W8A8_WEIGHTS_PATH,
 )
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci, write_github_step_summary
 
 register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
-if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
-DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-    7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
-)
-DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
+class TestAscendW8A8CompressedTensors(GSM8KAscendMixin, CustomTestCase):
+    model = REDHATAI_QWEN2_5_0_5B_INSTRUCT_QUANTIZED_W8A8_WEIGHTS_PATH
+    other_args = [
+        "--trust-remote-code",
+        "--disable-cuda-graph",
+        "--device",
+        "npu",
+        "--attention-backend",
+        "ascend",
+    ]
+    env = {
+        **os.environ,
+    }
 
-class TestAscendW8A8CompressedTensors(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        # TODO: Move model to CI or Modelscope
-        cls.model = "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--disable-cuda-graph",
-                "--device",
-                "npu",
-                "--attention-backend",
-                "ascend",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        base_url = DEFAULT_URL_FOR_TEST
-        url = urlparse(base_url)
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{url.hostname}",
-            port=int(url.port),
-        )
-        metrics = run_eval(args)
-        print(metrics)
-
-        self.assertGreaterEqual(metrics["accuracy"], 0.3)
-        self.assertGreaterEqual(metrics["output_throughput"], 700)
+    # GSM8K Configs
+    accuracy = 0.3  # GSM8K accuracy ≥0.3
+    num_questions = 200
+    gsm8k_num_shots = 5
+    output_throughput = 700  # GSM8K output throughput >=700 tokens/s
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -95,11 +60,12 @@ class TestAscendW8A8CompressedTensors(CustomTestCase):
         tic = time.perf_counter()
         res = self.run_decode(max_tokens)
         tok = time.perf_counter()
-        print(res["text"])
         throughput = max_tokens / (tok - tic)
-        print(f"Throughput: {throughput} tokens/s")
+        summary = f"\nThroughput: {throughput} tokens/s"
+        print(res["text"] + summary)
 
         if is_in_ci():
+            write_github_step_summary(summary + "\nThroughput threshold: 25 tokens/s")
             self.assertGreaterEqual(throughput, 25)
 
 
