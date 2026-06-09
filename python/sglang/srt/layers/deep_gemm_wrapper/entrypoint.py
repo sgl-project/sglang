@@ -20,10 +20,22 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
+_SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+_PDL_CONFIGURED = False
+
+
+def _maybe_set_deep_gemm_pdl():
+    global _PDL_CONFIGURED
+
+    if _PDL_CONFIGURED or not ENABLE_JIT_DEEPGEMM:
+        return
+
+    # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
+    # scheduler/TP worker has been forked and assigned a GPU.
     if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
         deep_gemm.set_pdl(True)
 
-_SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+    _PDL_CONFIGURED = True
 
 
 # TODO maybe rename these functions
@@ -208,6 +220,7 @@ def tf32_hc_prenorm_gemm(
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+    _maybe_set_deep_gemm_pdl()
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
