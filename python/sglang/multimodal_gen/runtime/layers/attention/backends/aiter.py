@@ -297,7 +297,6 @@ def _mla_prefill_ps_attention(
         output,
         final_lse,
     )
-
     return output.view(B, S_q, H, D_v)
 
 
@@ -332,7 +331,8 @@ class AITerImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Performs attention using one of:
           - _mla_prefill_ps_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1)
@@ -357,7 +357,10 @@ class AITerImpl(AttentionImpl):
                 one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
                 q_scale = k_scale = v_scale = one
 
-            if _can_use_mla_prefill(v_fp8.shape[-1], q_fp8.shape[2]):
+            if (
+                _can_use_mla_prefill(v_fp8.shape[-1], q_fp8.shape[2])
+                and not return_softmax_lse
+            ):
                 return _mla_prefill_ps_attention(
                     q_fp8,
                     k_fp8,
@@ -371,7 +374,7 @@ class AITerImpl(AttentionImpl):
 
             logger.warning_once(
                 "FP8 MLA prefill kernel unsupported "
-                "(need gfx950, v_head_dim=%d, num_heads divisible by %d; "
+                "(need gfx950, no return_lse, v_head_dim=%d, num_heads divisible by %d; "
                 "got v_head_dim=%d, num_heads=%d). Falling back to BF16.",
                 _MLA_PREFILL_V_HEAD_DIM,
                 _MLA_PREFILL_HEAD_TILE,
@@ -380,7 +383,7 @@ class AITerImpl(AttentionImpl):
             )
 
         # BF16 path
-        output, _ = aiter.flash_attn_func(
+        output, softmax_lse = aiter.flash_attn_func(
             query,
             key,
             value,
@@ -389,4 +392,7 @@ class AITerImpl(AttentionImpl):
             return_attn_probs=False,
             return_lse=True,
         )
-        return output
+        if return_softmax_lse:
+            return output, softmax_lse
+        else:
+            return output

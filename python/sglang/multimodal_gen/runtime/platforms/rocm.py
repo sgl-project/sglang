@@ -114,11 +114,11 @@ class RocmPlatform(Platform):
         elif selected_backend == AttentionBackendEnum.AITER:
             if dtype not in (torch.float16, torch.bfloat16):
                 logger.warning(
-                    "AITer backend works best with fp16/bf16 inputs but got dtype=%s. "
-                    "Proceeding with AITer anyway.",
+                    "AITER backend works best with fp16/bf16 inputs but got dtype=%s. "
+                    "Proceeding with AITER anyway.",
                     dtype,
                 )
-            logger.info("Using AITer backend on ROCm.")
+            logger.info("Using AITER backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
         elif selected_backend == AttentionBackendEnum.AITER_SAGE:
@@ -130,6 +130,30 @@ class RocmPlatform(Platform):
                     "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
                     dtype,
                 )
+        elif selected_backend == AttentionBackendEnum.FA2:
+            try:
+                import flash_attn  # noqa: F401
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
+                    FlashAttention2Backend,
+                )
+
+                supported_sizes = FlashAttention2Backend.get_supported_head_sizes()
+                if head_size in supported_sizes:
+                    logger.info("Using FlashAttention-2 backend on ROCm.")
+                    return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
+                logger.info(
+                    "Cannot use FlashAttention-2 backend for head size %d. "
+                    "Falling back to AITER on ROCm.",
+                    head_size,
+                )
+            except ImportError:
+                logger.info(
+                    "Cannot use FlashAttention-2 backend because the "
+                    "flash_attn package is not found. "
+                    "Falling back to AITER on ROCm."
+                )
+            # Fall through to auto-selection below
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
@@ -143,55 +167,26 @@ class RocmPlatform(Platform):
                 f"Invalid attention backend for {cls.device_name}: {selected_backend}"
             )
 
-        target_backend = AttentionBackendEnum.FA
-        if dtype not in (torch.float16, torch.bfloat16):
-            logger.info(
-                "Cannot use FlashAttention backend for dtype other than "
-                "torch.float16 or torch.bfloat16."
-            )
-            target_backend = AttentionBackendEnum.TORCH_SDPA
+        # ROCm auto-selection: AITER is the preferred backend.
+        # FA/FA3 is CUDA-only; FA2 can be explicitly selected via CLI.
+        try:
+            import aiter  # noqa: F401
 
-        if target_backend == AttentionBackendEnum.FA:
-            try:
-                import flash_attn  # noqa: F401
-
-                from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
-                    FlashAttentionBackend,
+            if dtype not in (torch.float16, torch.bfloat16):
+                logger.warning(
+                    "AITER backend works best with fp16/bf16 inputs but got dtype=%s. "
+                    "Proceeding with AITER anyway.",
+                    dtype,
                 )
+            logger.info("Using AITER backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+        except ImportError:
+            logger.info("AITER not available, falling back to Torch SDPA backend.")
 
-                if not _is_fa3_supported():
-                    logger.info(
-                        "FlashAttention backend now dispatches through FA3 "
-                        "(CUDA-only). Using Torch SDPA backend on ROCm."
-                    )
-                    target_backend = AttentionBackendEnum.TORCH_SDPA
-
-                if target_backend == AttentionBackendEnum.FA:
-                    supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                    if head_size not in supported_sizes:
-                        logger.info(
-                            "Cannot use FlashAttention-2 backend for head size %d.",
-                            head_size,
-                        )
-                        target_backend = AttentionBackendEnum.TORCH_SDPA
-            except ImportError:
-                logger.info(
-                    "Cannot use FlashAttention backend because the "
-                    "flash_attn package is not found. "
-                    "Make sure that flash_attn was built and installed "
-                    "(on by default)."
-                )
-                target_backend = AttentionBackendEnum.TORCH_SDPA
-
-        if target_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend.")
-
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-
-        logger.info("Using Flash Attention backend.")
-
-        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        logger.info("Using Torch SDPA backend.")
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
