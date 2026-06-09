@@ -715,25 +715,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
-            # Copy into independent lists: original_* is the pre-DP-padding
-            # snapshot, while global_num_tokens_cpu may be padded in place later
-            # (prepare_mlp_sync_batch). Without the copy both would alias the same
-            # schedule-batch list and the snapshot would be lost.
-            # original_* must be the SPEC-ADJUSTED actual row count
-            # (global_num_tokens), not the raw per-request count
-            # (batch.global_num_tokens): for a spec target_verify batch each
-            # request occupies num_draft_tokens rows, and _zero_dp_global_padding_rows
-            # treats rows in [original_, padded) as DP padding and zeros them. Using
-            # the raw count would wrongly zero the 2nd..Nth verify token of every
-            # request under dp-attention (corrupting all but position 0). For the
-            # non-spec path global_num_tokens is batch.global_num_tokens (no-op).
+            # Independent pre-DP-padding snapshot (prepare_mlp_sync_batch pads
+            # global_num_tokens in place), spec-adjusted to ROW count: a verify
+            # request spans num_draft_tokens rows, and rows in [original_, padded)
+            # are zeroed as DP padding by _zero_dp_global_padding_rows.
             ret.original_global_num_tokens_cpu = list(global_num_tokens)
-            ret.global_num_tokens_cpu = list(global_num_tokens)
+            ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
             ).to(device, non_blocking=True)
 
-            ret.global_num_tokens_for_logprob_cpu = list(global_num_tokens_for_logprob)
+            ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
@@ -1093,11 +1085,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_for_logprob_cpu is not None
 
         setattr(self, "_original_batch_size", self.batch_size)
-        self.original_global_num_tokens_cpu = list(self.original_global_num_tokens_cpu)
-        self.global_num_tokens_for_logprob_cpu = list(
-            self.global_num_tokens_for_logprob_cpu
-        )
-        global_num_tokens = list(self.global_num_tokens_cpu)
+        global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
 
@@ -1151,13 +1139,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_idle()
         ):
             if self.spec_info is not None and not self.spec_info.is_draft_input():
-                # Spec target-verify batch. Keep the num_tokens_per_req structure so
-                # every DP rank runs the SAME verify forward with identical collectives
-                # (the decode-style IDLE->EXTEND conversion below collapses verify's
-                # multi-token reqs and leaves idle ranks empty -> NCCL deadlock). An
-                # idle rank is promoted to TARGET_VERIFY; _pad_inputs_to_size then fills
-                # num_tokens fake rows / (num_tokens//ntpr) fake reqs whose req_pool
-                # indices drive generate_attn_arg_prefill (draft_token content is unused).
+                # Spec target-verify: keep the num_tokens_per_req structure so every
+                # DP rank runs the same verify forward with identical collectives
+                # (the IDLE->EXTEND conversion below collapses verify's multi-token
+                # reqs and leaves idle ranks empty -> NCCL deadlock). Idle ranks are
+                # promoted to TARGET_VERIFY and padded with fake reqs/rows.
                 if self.forward_mode.is_idle():
                     setattr(self, "_original_forward_mode", self.forward_mode)
                     self.forward_mode = ForwardMode.TARGET_VERIFY
@@ -1166,16 +1152,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
                 # MAX_LEN reaches here only for an idle/empty rank (assert below).
-                # Build extend metadata sized by num_tokens (not bs) so seq_lens/
-                # req_pool_indices stay non-empty -> the attention plan never calls
-                # max() on a 0-size tensor and the idle rank issues the same
-                # collectives as busy ranks.
-                # Represent the rank as ONE fake request spanning all num_tokens tokens
-                # (prefix 0), NOT num_tokens single-token requests -- the latter
-                # inflates bs past the attention backend's per-rank kv_indptr buffer
-                # (sized for ~max_running/dp_size reqs) and overflows it. One fake req
-                # keeps bs == 1 while still producing num_tokens rows; the output is
-                # discarded downstream (real_tokens == 0).
+                # Synthesize ONE fake request spanning all num_tokens rows (prefix 0)
+                # so the rank issues the same collectives as busy ranks with non-empty
+                # metadata. One request — not num_tokens single-token ones, which
+                # would overflow the attention backend's per-rank kv_indptr buffer.
+                # The output is discarded downstream (real_tokens == 0).
                 dev = self.seq_lens.device
                 assert (
                     self.seq_lens.shape[0] == 0
