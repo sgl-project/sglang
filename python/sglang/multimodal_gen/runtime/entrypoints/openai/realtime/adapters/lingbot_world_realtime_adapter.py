@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from collections import deque
 from typing import TYPE_CHECKING, Any
 
 from fastapi import WebSocket
@@ -28,12 +27,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
 )
+from sglang.multimodal_gen.runtime.realtime.camera_controls import (
+    RealtimeCameraControlState,
+)
 from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ConditionEvent,
     ConditionEventQueue,
     ControlSignal,
-    ControlStateSamplingQueue,
-    ControlStateTransition,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
@@ -53,22 +53,18 @@ LINGBOT_REALTIME_DEFAULT_NUM_INFERENCE_STEPS = 4
 LINGBOT_REALTIME_MIN_CONDITION_CHUNKS = 2
 
 
-class LingBotWorldRealtimeState:
+class LingBotWorldRealtimeState(RealtimeCameraControlState):
     def __init__(self):
-        self.events = ConditionEventQueue(max_events={"prompt": 1})
-        self.camera_state = ControlStateSamplingQueue(
-            default_item=[],
+        super().__init__(
             min_pulse_items=1,
+            script_maxlen=512,
             max_transitions=512,
         )
-        self.camera_script_queue: deque[ControlSignal] = deque(maxlen=512)
-        self.latest_sampled_event_id: int | None = None
+        self.events = ConditionEventQueue(max_events={"prompt": 1})
 
     def clear(self) -> None:
+        super().clear()
         self.events.clear()
-        self.camera_state.clear()
-        self.camera_script_queue.clear()
-        self.latest_sampled_event_id = None
 
     def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
         self.events.push(
@@ -82,125 +78,17 @@ class LingBotWorldRealtimeState:
             )
         )
 
-    def receive_camera_script(
-        self,
-        camera_actions: list[list[str]],
-        *,
-        event_id: int | None = None,
-    ) -> None:
-        self.camera_script_queue.clear()
-        self.camera_state.clear()
-        for actions in camera_actions:
-            self.camera_script_queue.append(
-                ControlSignal(
-                    kind="camera_actions",
-                    payload=list(actions),
-                    seq_id=event_id,
-                )
-            )
-
-    def receive_camera_state_transitions(
-        self,
-        transitions: list[ControlStateTransition],
-    ) -> None:
-        self.camera_script_queue.clear()
-        self.camera_state.push_many(transitions)
-
-    def receive_camera_actions(
-        self,
-        camera_actions: list[list[str]],
-        *,
-        event_id: int | None = None,
-    ) -> None:
-        self.receive_camera_script(camera_actions, event_id=event_id)
-
-    def receive_camera_state(
-        self,
-        actions: list[str],
-        *,
-        event_id: int | None = None,
-        timestamp_ms: int | None = None,
-    ) -> None:
-        self.receive_camera_state_transitions(
-            [
-                ControlStateTransition(
-                    payload=list(actions),
-                    seq_id=event_id,
-                    timestamp_ms=timestamp_ms,
-                )
-            ]
-        )
-
-    def _sample_camera_script(self, chunk_size: int) -> list[list[str]]:
-        chunk: list[list[str]] = []
-        latest_event_id = self.latest_sampled_event_id
-        while self.camera_script_queue and len(chunk) < chunk_size:
-            signal = self.camera_script_queue.popleft()
-            chunk.append(list(signal.payload))
-            latest_event_id = signal.seq_id
-        while len(chunk) < chunk_size:
-            chunk.append([])
-        self.latest_sampled_event_id = latest_event_id
-        return chunk
-
-    def _camera_state_transition(
-        self,
-        actions: list[str],
-        *,
-        event_id: int | None,
-        timestamp_ms: int | None,
-    ) -> ControlStateTransition:
-        return ControlStateTransition(
-            payload=list(actions),
-            seq_id=event_id,
-            timestamp_ms=timestamp_ms,
-        )
-
-    def _camera_transitions_from_event_payload(
-        self,
-        payload: dict[str, Any],
-        *,
-        event_id: int | None,
-    ) -> list[ControlStateTransition]:
-        transitions = payload.get("transitions")
-        if not isinstance(transitions, list):
-            raise ValueError("camera_actions state payload requires transitions")
-        result = []
-        for transition in transitions:
-            if not isinstance(transition, dict):
-                raise ValueError("camera_actions transition must be a map")
-            actions = transition.get("actions")
-            if not isinstance(actions, list):
-                raise ValueError("camera_actions transition actions must be a list")
-            timestamp_ms = transition.get("client_ts_ms")
-            if timestamp_ms is not None:
-                timestamp_ms = int(timestamp_ms)
-            result.append(
-                self._camera_state_transition(
-                    list(actions),
-                    event_id=event_id,
-                    timestamp_ms=timestamp_ms,
-                )
-            )
-        return result
-
     def receive_camera_event_payload(
         self,
         payload: Any,
         *,
         event_id: int | None,
     ) -> str:
-        if isinstance(payload, dict) and payload.get("mode") == "state":
-            transitions = self._camera_transitions_from_event_payload(
-                payload,
-                event_id=event_id,
-            )
-            self.receive_camera_state_transitions(transitions)
-            return f"kind=camera_actions, mode=state, transitions={len(transitions)}"
-
-        camera_actions = LingBotWorldRealtimeAdapter._validate_camera_actions(payload)
-        self.receive_camera_script(camera_actions, event_id=event_id)
-        return f"kind=camera_actions, mode=script, frames={len(camera_actions)}"
+        return super().receive_camera_event_payload(
+            payload,
+            event_id=event_id,
+            validate_camera_actions=LingBotWorldRealtimeAdapter._validate_camera_actions,
+        )
 
     def sample_prompt(self) -> str:
         prompt = self.events.pop_latest("prompt")
@@ -208,20 +96,6 @@ class LingBotWorldRealtimeState:
             raise ValueError("prompt event payload must be a string")
         self.latest_sampled_event_id = self.events.last_sampled_seq_id("prompt")
         return prompt
-
-    def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
-        """samples a sequence of camera actions for the chunk with chunk_size frames
-
-        Args:
-            chunk_size: number of frames
-        """
-        if self.camera_script_queue:
-            return self._sample_camera_script(chunk_size)
-        action_list = self.camera_state.sample_chunk(chunk_size)
-        if action_list is None:
-            return None
-        self.latest_sampled_event_id = self.camera_state.latest_sampled_seq_id()
-        return [list(actions) for actions in action_list]
 
     def has_prompt(self) -> bool:
         return self.events.has_events("prompt")
