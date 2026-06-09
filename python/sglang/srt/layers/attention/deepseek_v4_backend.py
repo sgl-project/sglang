@@ -620,14 +620,27 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        num_draft_tokens: Optional[int] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
+        # HYBRID_SUFFIX_MTP verifies at several chain widths (K_suffix /
+        # K_mtp / 1) within one server, so the active K may differ from the
+        # backend-wide speculative_num_draft_tokens. Callers with a
+        # forward_batch pass the actual per-batch K; plain SUFFIX/EAGLE paths
+        # fall back to the backend default.
+        if num_draft_tokens is None:
+            num_draft_tokens = self.speculative_num_draft_tokens
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
-            if not hasattr(self, "extend_seq_lens_buffer"):
-                self.extend_seq_lens_buffer = torch.tensor(
-                    [self.speculative_num_draft_tokens] * 1025, device=self.device
+            # Per-K cache: the buffer holds the constant K per req.
+            if not hasattr(self, "extend_seq_lens_buffers"):
+                self.extend_seq_lens_buffers = {}
+            if num_draft_tokens not in self.extend_seq_lens_buffers:
+                self.extend_seq_lens_buffers[num_draft_tokens] = torch.tensor(
+                    [num_draft_tokens] * 1025, device=self.device
                 )
-            extend_seq_lens = self.extend_seq_lens_buffer[: len(seq_lens)]
+            extend_seq_lens = self.extend_seq_lens_buffers[num_draft_tokens][
+                : len(seq_lens)
+            ]
 
             return DSV4RawVerifyMetadata(
                 req_pool_indices=req_pool_indices,
@@ -644,6 +657,7 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                num_draft_tokens=num_draft_tokens,
             )
 
     def init_forward_metadata_target_verify_old(
@@ -654,13 +668,16 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        num_draft_tokens: Optional[int] = None,
     ) -> DSV4Metadata:
+        if num_draft_tokens is None:
+            num_draft_tokens = self.speculative_num_draft_tokens
         batch_size = len(seq_lens)
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
-        seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
-        extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+        seq_lens = seq_lens + num_draft_tokens
+        seq_lens_cpu = [x + num_draft_tokens for x in seq_lens_cpu]
+        extend_seq_lens_cpu = [num_draft_tokens] * batch_size
         extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
-        num_tokens = self.speculative_num_draft_tokens * batch_size
+        num_tokens = num_draft_tokens * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
@@ -684,8 +701,13 @@ class DeepseekV4AttnBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
-        bs, num_draft_tokens = len(seq_lens), self.speculative_num_draft_tokens
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
+        # Derive K from the raw metadata's own shape (out_cache_loc is padded
+        # to bs * K). HYBRID_SUFFIX_MTP raw-verify metadata can carry several
+        # K values, so the backend-wide speculative_num_draft_tokens is only
+        # an upper bound, not the active K.
+        bs = len(seq_lens)
+        num_draft_tokens = len(out_cache_loc) // bs
+        seq_lens = seq_lens + num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
 
         seq_lens_casual, req_pool_indices_repeated = (
@@ -902,7 +924,13 @@ class DeepseekV4AttnBackend(
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
-            num_tokens_v = self.speculative_num_draft_tokens * bs
+            # HYBRID_SUFFIX_MTP runs multiple TARGET_VERIFY runners with
+            # different K (main K=num_draft_tokens, short_chain K=num_steps+1,
+            # baseline K=1), so derive K from the active forward_batch rather
+            # than assuming speculative_num_draft_tokens. input_ids is present
+            # on both the capture ForwardBatch and the replay fb_view
+            # (positions is not).
+            num_tokens_v = forward_batch.input_ids.numel()
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, num_tokens_v - len(out_cache_loc)),
@@ -915,6 +943,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
+                num_draft_tokens=num_tokens_v // bs,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
@@ -939,8 +968,16 @@ class DeepseekV4AttnBackend(
         else:
             raise NotImplementedError
 
+        # HYBRID_SUFFIX_MTP needs the TARGET_VERIFY metadata cache keyed by
+        # (bs, K) so the captured runners (main K=num_draft_tokens,
+        # short_chain K=num_steps+1, baseline K=1) don't clobber each other.
+        cache_key = (
+            (bs, forward_batch.input_ids.numel() // bs)
+            if bucket == _GraphBucket.TARGET_VERIFY
+            else bs
+        )
         self.replay_cuda_graph_metadata_from(
-            bs=bs, temp_metadata=temp_metadata, bucket=bucket
+            bs=cache_key, temp_metadata=temp_metadata, bucket=bucket
         )
 
         if in_capture:
@@ -1005,6 +1042,10 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
+                # Eager (cuda-graph-miss) path: HYBRID verifies at several
+                # chain widths, so take K from the live batch.
+                num_draft_tokens=forward_batch.input_ids.numel()
+                // forward_batch.batch_size,
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -1064,10 +1105,20 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        # Idempotent: HYBRID_SUFFIX_MTP instantiates up to three
+        # CudaGraphRunners against this one shared backend (main K, short
+        # chain K, baseline K=1), and each runner's __init__ calls this.
+        # Resetting the metadata dict on the 2nd/3rd call would orphan the
+        # metadata objects the already-captured graphs replay into.
+        if hasattr(self, "cuda_graph_metadata_of_bucket_and_bs"):
+            return
+        # Key type is ``int`` for DECODE_OR_IDLE / DRAFT_EXTEND (single K) and
+        # ``Tuple[int, int]`` ``(bs, K)`` for TARGET_VERIFY so HYBRID's
+        # captured runners with different K can coexist.
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                Union[int, Tuple[int, int]],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -1081,7 +1132,7 @@ class DeepseekV4AttnBackend(
 
     def replay_cuda_graph_metadata_from(
         self,
-        bs: int,
+        bs,
         temp_metadata: Union[
             DSV4Metadata,
             DSV4RawVerifyMetadata,
@@ -1089,6 +1140,9 @@ class DeepseekV4AttnBackend(
         ],
         bucket: _GraphBucket,
     ) -> None:
+        # ``bs`` is either an int (DECODE_OR_IDLE / DRAFT_EXTEND) or a
+        # ``(bs, K)`` tuple (TARGET_VERIFY) — see init_forward_metadata_out_graph
+        # where HYBRID_SUFFIX_MTP needs per-K slots.
         if bs not in self.cuda_graph_metadata_of_bucket_and_bs[bucket]:
             # First call (from capture): store the new metadata directly.
             self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = temp_metadata

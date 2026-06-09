@@ -437,13 +437,28 @@ class EagleVerifyInputV2Mixin:
         batch.capture_hidden_mode = capture_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
-        # Run attention backend plan and cuda graph preparation
-        can_run_cuda_graph = bool(
-            target_worker.model_runner.graph_runner
-            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
-        )
+        # Run attention backend plan and cuda graph preparation.
+        # HYBRID_SUFFIX_MTP captures up to three runners at different chain
+        # widths (short_chain K=num_steps+1, baseline K=1, main K=num_draft_
+        # tokens); pick the one whose captured K matches this verify batch —
+        # the extra runners' can_run gate on exact token width, so at most
+        # one claims it. For every other algorithm the getattrs are None and
+        # this reduces to the plain main-runner check. Must mirror the
+        # dispatch order in ModelRunner._forward_raw so replay_prepare and
+        # the later replay land on the same runner.
+        _mr = target_worker.model_runner
+        _picked_runner = None
+        for _runner in (
+            getattr(_mr, "short_chain_graph_runner", None),
+            getattr(_mr, "baseline_chain_graph_runner", None),
+            _mr.graph_runner,
+        ):
+            if _runner is not None and _runner.can_run(verify_forward_batch):
+                _picked_runner = _runner
+                break
+        can_run_cuda_graph = _picked_runner is not None
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            _picked_runner.replay_prepare(verify_forward_batch)
             verify_forward_batch.mark_forward_metadata_ready()
         # Non-cuda-graph: defer init to forward_extend, which runs after
         # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
