@@ -3,7 +3,6 @@ import os
 
 import numpy as np
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     STAGE_2_DISTILLED_SIGMA_VALUES as _SHARED_STAGE_2_DISTILLED_SIGMA_VALUES,
@@ -27,6 +26,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     SnapshotModuleResidency,
     SnapshotStrategy,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_ltx2_flow_match import (
+    LTX2FlowMatchScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -262,44 +264,6 @@ def _add_ltx2_decoding_stage(pipeline: ComposedPipelineBase):
             pipeline=pipeline,
         )
     )
-
-
-class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
-    """Override ``_time_shift_exponential`` to use torch f32 instead of numpy f64."""
-
-    def set_timesteps(
-        self,
-        num_inference_steps=None,
-        device=None,
-        sigmas=None,
-        mu=None,
-        timesteps=None,
-    ):
-        if sigmas is not None and timesteps is None and mu is None:
-            sigmas = torch.tensor(sigmas, dtype=torch.float32, device=device)
-            timesteps = sigmas * self.config.num_train_timesteps
-            sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
-            self.num_inference_steps = len(timesteps)
-            self.timesteps = timesteps
-            self.sigmas = sigmas
-            self._step_index = None
-            self._begin_index = None
-            return
-
-        return super().set_timesteps(
-            num_inference_steps=num_inference_steps,
-            device=device,
-            sigmas=sigmas,
-            mu=mu,
-            timesteps=timesteps,
-        )
-
-    def _time_shift_exponential(self, mu, sigma, t):
-        if isinstance(t, np.ndarray):
-            t_torch = torch.from_numpy(t).to(torch.float32)
-            result = math.exp(mu) / (math.exp(mu) + (1 / t_torch - 1) ** sigma)
-            return result.numpy()
-        return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
 
 
 class _BaseLTX2Pipeline(LoRAPipeline):
