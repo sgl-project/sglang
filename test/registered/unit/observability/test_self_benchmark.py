@@ -46,6 +46,7 @@ def _make_scheduler(output_path: str):
             benchmark_warmup_iterations=0,
             benchmark_output_path=output_path,
             benchmark_timeout=300,
+            chunked_prefill_size=None,
         ),
         enable_fpm=True,
         max_req_input_len=16,
@@ -59,7 +60,16 @@ def _make_scheduler(output_path: str):
         result_queue=deque(),
         waiting_queue=[],
         running_batch=None,
+        chunked_req=None,
     )
+
+
+class _FakeReq:
+    def __init__(self, finished: bool = False):
+        self._finished = finished
+
+    def finished(self):
+        return self._finished
 
 
 class TestSelfBenchmark(unittest.TestCase):
@@ -132,6 +142,50 @@ class TestSelfBenchmark(unittest.TestCase):
             2,
         )
 
+    def test_prefill_point_accumulates_fpms_until_request_finishes(self):
+        benchmark = SelfBenchmark(_make_scheduler("/tmp/unused.json"))
+        point = BenchmarkPoint(point_type="prefill", isl=32)
+        req = _FakeReq(finished=False)
+        benchmark.phase = BenchmarkPhase.SWEEP
+        benchmark._grid = [point]
+        benchmark._current = BenchmarkPointResult(point=point)
+        benchmark._active_reqs = [req]
+
+        first_chunk = ForwardPassMetrics(
+            scheduled_requests=ScheduledRequestMetrics(
+                num_prefill_requests=1,
+                sum_prefill_tokens=16,
+                sum_prefill_kv_tokens=0,
+            )
+        )
+        final_chunk = ForwardPassMetrics(
+            scheduled_requests=ScheduledRequestMetrics(
+                num_prefill_requests=1,
+                sum_prefill_tokens=16,
+                sum_prefill_kv_tokens=16,
+            )
+        )
+        batch = types.SimpleNamespace(forward_mode=_FakeForwardMode(is_extend=True))
+
+        benchmark.observe_forward_pass(batch, first_chunk)
+
+        self.assertIsNotNone(benchmark._current)
+        self.assertEqual(len(benchmark._results), 0)
+        self.assertEqual(len(benchmark._current.fpms), 1)
+
+        req._finished = True
+        benchmark.observe_forward_pass(batch, final_chunk)
+
+        self.assertIsNone(benchmark._current)
+        self.assertEqual(len(benchmark._results), 1)
+        self.assertEqual(len(benchmark._results[0].fpms), 2)
+        self.assertEqual(
+            benchmark._results[0].fpms[1]["scheduled_requests"][
+                "sum_prefill_kv_tokens"
+            ],
+            16,
+        )
+
     def test_decode_grid_preserves_room_for_one_decode_token(self):
         scheduler = _make_scheduler("/tmp/unused.json")
         scheduler.max_req_input_len = 16
@@ -161,6 +215,27 @@ class TestSelfBenchmark(unittest.TestCase):
             max(p.context_length for p in decode_points),
             80,
         )
+
+    def test_prefill_grid_is_not_capped_at_chunked_prefill_size(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.server_args.chunked_prefill_size = 8
+        scheduler.max_req_input_len = 128
+        scheduler.max_total_num_tokens = 64
+
+        benchmark = SelfBenchmark(scheduler)
+
+        prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
+        self.assertGreater(len(prefill_points), 0)
+        self.assertEqual(max(p.isl for p in prefill_points), 62)
+
+    def test_chunked_prefill_request_counts_as_inflight_work(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertFalse(benchmark._has_inflight_work())
+        scheduler.chunked_req = object()
+        self.assertTrue(benchmark._has_inflight_work())
 
     def test_disaggregated_workers_only_build_supported_grid(self):
         scheduler = _make_scheduler("/tmp/unused.json")
