@@ -135,8 +135,8 @@ _CEIL_TO_UE8M0_MIN_RECOMPILE_LIMIT = 16
 
 @functools.cache
 def _ceil_to_ue8m0_compile_options(dynamic: Optional[bool]) -> dict:
+    import torch._inductor.config as inductor_config
     options = {}
-    inductor_config = torch._inductor.config
     triton_config = getattr(inductor_config, "triton", None)
     if triton_config is not None and hasattr(triton_config, "enable_pdl"):
         options["triton.enable_pdl"] = True
