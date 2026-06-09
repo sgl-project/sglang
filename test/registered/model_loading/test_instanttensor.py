@@ -64,7 +64,7 @@ class TestInstantTensorModelLoading(CustomTestCase):
                 ref_tensor = hf_safetensors_tensors[name]
                 self.assertEqual(instanttensor_tensor.dtype, ref_tensor.dtype)
                 self.assertEqual(instanttensor_tensor.shape, ref_tensor.shape)
-                self.assertTrue(torch.all(instanttensor_tensor.eq(ref_tensor)))
+                self.assertTrue(torch.equal(instanttensor_tensor, ref_tensor))
 
     def test_engine_can_generate_with_instanttensor_loader(self):
         """Engine should generate non-empty outputs with instanttensor load format."""
