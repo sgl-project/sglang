@@ -81,10 +81,11 @@ class TorchNpuDispatcher(BaseDispatcher):
             # Prefill
             self.init_routing_prefill = NPUMoEInitRouting_v1()
             self.finalize_routing_prefill = NPUFinalizeRouting()
+            self.group_list_type_prefill = 0
             # Decode
             self.init_routing_decode = NPUMoEInitRouting_v2()
             self.finalize_routing_decode = NPUFinalizeRouting()
-            self.group_list_type = 1
+            self.group_list_type_decode = 1
 
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             # Prefill
@@ -112,10 +113,12 @@ class TorchNpuDispatcher(BaseDispatcher):
             phase = "decode"
             init = self.init_routing_decode
             finalize = self.finalize_routing_decode
+            group_list_type = self.group_list_type_decode
         else:
             phase = "prefill"
             init = self.init_routing_prefill
             finalize = self.finalize_routing_prefill
+            group_list_type = self.group_list_type_prefill
 
         # Store phase so combine() uses the matching finalize kernel
         self._dispatch_phase = phase
@@ -138,7 +141,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             topk_output=topk_output,
             expanded_row_idx=expanded_row_idx,
             expert_tokens=expert_tokens,
-            group_list_type=self.group_list_type,
+            group_list_type=group_list_type,
         )
         return self._dispatch_output
 
