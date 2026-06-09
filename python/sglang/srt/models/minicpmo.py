@@ -1183,7 +1183,7 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         return outputs
 
 
-# Copied from from transformers.models.whisper.modeling_whisper.WhisperEncoder and add use_cache for streaming inference
+# Copied from transformers.models.whisper.modeling_whisper.WhisperEncoder and add use_cache for streaming inference
 class MiniCPMWhisperEncoder(WhisperEncoder):
 
     def __init__(self, config: WhisperConfig):
