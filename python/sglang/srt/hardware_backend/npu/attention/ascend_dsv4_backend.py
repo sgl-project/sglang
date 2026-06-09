@@ -1478,7 +1478,7 @@ class DeepseekV4AscendAttnBackend(
             # graph capture rejects with error 107027).
             if bs == 0 or forward_batch.forward_mode.is_idle():
                 return torch.full(
-                    (bs, c4_indexer.index_topk),
+                    (bs, self._dsv4_index_topk),
                     -1,
                     dtype=torch.int32,
                     device=device,
@@ -1533,7 +1533,7 @@ class DeepseekV4AscendAttnBackend(
                     causal, float("-inf"), torch.zeros((), device=device)
                 )
                 topk_idx = index_score.topk(
-                    min(c4_indexer.index_topk, seq_i // ratio), dim=-1
+                    min(self._dsv4_index_topk, seq_i // ratio), dim=-1
                 )[1]
                 # Drop the diagonal token (position seq_i % ratio == 0
                 # leaves a self-loop after the // ratio division).
@@ -1551,11 +1551,11 @@ class DeepseekV4AscendAttnBackend(
                     index_score.relu_() * weights.unsqueeze(-1)[i]
                 ).sum(dim=1)
                 topk_idx = index_score.topk(
-                    min(c4_indexer.index_topk, seq_i // ratio), dim=-1
+                    min(self._dsv4_index_topk, seq_i // ratio), dim=-1
                 )[1]
             topk_idx = F.pad(
                 topk_idx,
-                (0, c4_indexer.index_topk - topk_idx.shape[-1]),
+                (0, self._dsv4_index_topk - topk_idx.shape[-1]),
                 mode="constant",
                 value=-1,
             )
@@ -1624,11 +1624,11 @@ class DeepseekV4AscendAttnBackend(
             query_quant_mode=0,
             key_quant_mode=0,
             sparse_mode=3,
-            sparse_count=c4_indexer.index_topk,
+            sparse_count=self._dsv4_index_topk,
             metadata=li_quant_metadata,
         )
         topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**kwargs)
-        return topk_idxs.view(-1, c4_indexer.index_topk)
+        return topk_idxs.view(-1, self._dsv4_index_topk)
 
     def forward_c4_indexer(  # type: ignore[override]
         self,

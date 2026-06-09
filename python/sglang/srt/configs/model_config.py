@@ -645,11 +645,7 @@ class ModelConfig:
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
-            self.window_size = (
-                self.sliding_window_size
-                if self.sliding_window_size is not None
-                else getattr(self.hf_config, "window_size", None)
-            )
+            self.window_size = self.hf_config.sliding_window
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim

@@ -23,7 +23,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
 
-
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
@@ -494,7 +493,6 @@ class C4Indexer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
-        self.index_topk = config.index_topk
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,

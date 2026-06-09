@@ -277,12 +277,3 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 artifacts/
 .claude/scheduled_tasks.lock
-
-# Local backups & torch.compile debug dumps
-python.bak_20260515*
-torch_compile_debug*
-profiling*
-extra-info*
-
-# Local git worktrees
-.worktrees/

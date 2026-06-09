@@ -303,7 +303,7 @@ class Compressor(nn.Module):
         self.is_in_indexer = is_in_indexer
         self.dim = config.hidden_size
         self.head_dim = head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
+        self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
         assert compress_ratio != 0, "compress_ratio should not be 0"
         self.ratio = compress_ratio
         self.overlap = self.ratio == 4
