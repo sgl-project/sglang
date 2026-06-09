@@ -77,7 +77,6 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    DSV4StateLens,
     ForwardBatch,
     ForwardMode,
 )
@@ -655,29 +654,6 @@ class Req(ReqDllmMixin):
         #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
         # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
         self.swa_evicted_seqlen = 0
-
-        # DSV4-NPU only: per-req low-water mark for compress-state pool
-        # eviction. State slots in ``[0, c{4,128}_state_alloc_offset)`` have
-        # been released to the c{4,128}_state_attn_allocator (tied to SWA
-        # eviction frontier in ``ScheduleBatch._evict_swa``); ``release_kv_cache``
-        # only needs to free the tail ``[offset, kv_committed_len)`` so we
-        # don't double-free. Default 0 = no state evicted yet. Has no
-        # effect on CUDA / non-DSV4 paths (state pool isn't paged there).
-        self.c4_state_alloc_offset = 0
-        self.c128_state_alloc_offset = 0
-
-        # DSV4-NPU only: cumulative slot count this req has consumed in the
-        # paged c{4,128}_state pools (separate slot space from raw-token
-        # positions). Drives the underlying paged allocator's prefix/seq
-        # contract: ``alloc_extend(prefix=prev_state_kv_len, seq=prev+alloc_len,
-        # extend=alloc_len)`` keeps slot-within-page continuity intact.
-        # Unlike ``swa_evicted_seqlen``, this does NOT decrease on eviction —
-        # freed slots return to the paged allocator's free list, but the
-        # per-req cumulative position keeps growing (each extend gets a fresh
-        # tail-only allocation; no rollback). Default 0 = no state allocated
-        # yet. Has no effect on CUDA / non-DSV4 paths.
-        self.c4_state_kv_len = 0
-        self.c128_state_kv_len = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -1436,12 +1412,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
-    # DSV4-NPU: bundled per-pool slots (full/swa/c4/c128/c4_state/c128_state)
-    # produced by DSV4NPUTokenToKVPoolAllocator. None on non-DSV4 paths.
+    # DSV4-NPU: bundled per-pool slots produced by DSV4NPUTokenToKVPoolAllocator
+    # (None on non-DSV4 paths). See hardware_backend/npu/dsv4_schedule_hooks.py.
+    # The c4/c128 compress-state alloc lens ride on ``batch.dsv4_state_lens``,
+    # set dynamically by those hooks (read via getattr in mem_cache/common.py).
     out_cache_loc_dsv4: Optional[Any] = None
-    # DSV4-NPU: per-extend/decode c4/c128 compress-state pool alloc lens
-    # (DSV4StateLens), produced by _compute_dsv4_state_lens_*. None otherwise.
-    dsv4_state_lens: Optional[Any] = None
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -1777,10 +1752,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # DSV4-NPU only: compute per-req tail-only c{4,128}_state pool lens
-        # before allocator runs (the paged state allocator needs per-pool
-        # prefix/seq tensors that are independent of raw token positions).
-        self._compute_dsv4_state_lens_extend(reqs, seq_lens)
+        # DSV4-NPU only (no-op elsewhere): compute per-req tail-only
+        # c{4,128}_state pool alloc lens before the allocator runs.
+        from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
+            maybe_compute_dsv4_state_lens_extend,
+        )
+
+        maybe_compute_dsv4_state_lens_extend(self, reqs, seq_lens)
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
@@ -2365,10 +2343,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # DSV4-NPU only: bump per-req c{4,128}_state cumulative lens by 1
-        # per req before allocator runs (decode adds exactly one state slot
-        # per req per pool).
-        self._compute_dsv4_state_lens_decode(bs)
+        # DSV4-NPU only (no-op elsewhere): bump per-req c{4,128}_state
+        # cumulative lens by 1 before the allocator runs.
+        from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
+            maybe_compute_dsv4_state_lens_decode,
+        )
+
+        maybe_compute_dsv4_state_lens_decode(self, bs)
 
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
@@ -2714,15 +2695,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if req.decode_batch_idx % eviction_interval == 1:
                         self._evict_swa(req, req.seqlen - 1)
 
-                    # DSV4-NPU only: state pool is per-req and small
-                    # (~2 pages c4 / ~3 pages c128 worth of raw positions).
-                    # SWA evict only fires every ``eviction_interval`` steps,
-                    # which for models with large sliding_window leaves the
-                    # state pool to exhaust long before the first SWA
-                    # frontier advance. Run state-only evict EVERY decode
-                    # step (gated below via hasattr) to keep the pool drained
-                    # at steady-state without waiting for SWA cadence.
-                    self._maybe_evict_dsv4_state(req, req.seqlen - 1)
+                    # DSV4-NPU only (no-op elsewhere): the small paged
+                    # compress-state pool needs draining every decode step,
+                    # independent of SWA evict cadence.
+                    from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
+                        maybe_evict_dsv4_state,
+                    )
+
+                    maybe_evict_dsv4_state(self, req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
@@ -2754,223 +2734,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
-
-    def _compute_dsv4_state_lens_extend(
-        self, reqs: List[Req], seq_lens: List[int]
-    ) -> None:
-        """DSV4-NPU per-req c{4,128}_state pool alloc lens for extend.
-
-        Per reference (iforgetmyname/sglang dsv4_release schedule_batch.py
-        L1742-1747), state pool stores only the trailing portion of each
-        sequence (the c{N} compressor's read/write window). The tail length
-        depends on raw seq_len's alignment to the SWA page boundary (128):
-
-          * ``c4_alloc_len  = tail + 128 if (tail <= 3 and seq_len >= 128)
-                              else tail``
-          * ``c128_alloc_len = tail`` where ``tail = seq_len % 128``
-
-        Long prefills don't allocate state slots for already-compressed
-        positions — only the trailing partial window. This keeps the small
-        paged state pool (~256 slots/req) sufficient even for 28k-token
-        AIME prompts.
-
-        Side effects per req:
-          * Updates ``req.c{4,128}_state_kv_len`` (cumulative slot count;
-            drives the paged allocator's prefix/seq contract).
-          * Updates ``req.c{4,128}_state_alloc_offset = seq_len - alloc_len``
-            (raw-position offset where state writes start; used by the hook
-            for tail-only ``req_to_token_c{N}_state`` writes and by
-            ``_evict_swa`` to avoid double-free with the final-release path).
-
-        Side effects per batch (set as attributes on self):
-          * ``c{4,128}_state_prefix_lens`` / ``..._cpu`` — per-req prev
-            cumulative state slot count (int64 [B] tensors).
-          * ``c{4,128}_state_seq_lens`` / ``..._cpu`` — per-req new cumulative
-            state slot count after this extend.
-          * ``c{4,128}_state_extend_num_tokens`` — sum of per-req alloc_lens
-            (int, total slots to allocate this step).
-
-        Gated on the DSV4-NPU allocator having paged state pools; CUDA /
-        non-V4 paths skip entirely (zero overhead).
-        """
-        allocator = self.token_to_kv_pool_allocator
-        if (
-            not hasattr(allocator, "c4_state_attn_allocator")
-            or allocator.c4_state_attn_allocator is None
-        ):
-            return
-        c4_prefix_list: List[int] = []
-        c4_seq_list: List[int] = []
-        c128_prefix_list: List[int] = []
-        c128_seq_list: List[int] = []
-        for req, seq_len in zip(reqs, seq_lens):
-            tail = seq_len % 128
-            c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
-            c128_alloc_len = tail
-
-            prev_c4 = req.c4_state_kv_len
-            prev_c128 = req.c128_state_kv_len
-            new_c4 = prev_c4 + c4_alloc_len
-            new_c128 = prev_c128 + c128_alloc_len
-
-            c4_prefix_list.append(prev_c4)
-            c4_seq_list.append(new_c4)
-            c128_prefix_list.append(prev_c128)
-            c128_seq_list.append(new_c128)
-
-            req.c4_state_kv_len = new_c4
-            req.c128_state_kv_len = new_c128
-            req.c4_state_alloc_offset = seq_len - c4_alloc_len
-            req.c128_state_alloc_offset = seq_len - c128_alloc_len
-
-        c4_prefix_lens_cpu = torch.tensor(c4_prefix_list, dtype=torch.int64)
-        c4_seq_lens_cpu = torch.tensor(c4_seq_list, dtype=torch.int64)
-        c128_prefix_lens_cpu = torch.tensor(c128_prefix_list, dtype=torch.int64)
-        c128_seq_lens_cpu = torch.tensor(c128_seq_list, dtype=torch.int64)
-        self.dsv4_state_lens = DSV4StateLens(
-            c4_prefix_lens=c4_prefix_lens_cpu.to(self.device, non_blocking=True),
-            c4_prefix_lens_cpu=c4_prefix_lens_cpu,
-            c4_seq_lens=c4_seq_lens_cpu.to(self.device, non_blocking=True),
-            c4_seq_lens_cpu=c4_seq_lens_cpu,
-            c4_extend_num_tokens=int(
-                sum(s - p for s, p in zip(c4_seq_list, c4_prefix_list))
-            ),
-            c128_prefix_lens=c128_prefix_lens_cpu.to(self.device, non_blocking=True),
-            c128_prefix_lens_cpu=c128_prefix_lens_cpu,
-            c128_seq_lens=c128_seq_lens_cpu.to(self.device, non_blocking=True),
-            c128_seq_lens_cpu=c128_seq_lens_cpu,
-            c128_extend_num_tokens=int(
-                sum(s - p for s, p in zip(c128_seq_list, c128_prefix_list))
-            ),
-        )
-
-    def _compute_dsv4_state_lens_decode(self, bs: int) -> None:
-        """DSV4-NPU per-req c{4,128}_state pool alloc lens for decode.
-
-        Decode adds exactly 1 state slot per req per pool (each generated
-        token produces one new state slot). ``c{N}_state_alloc_offset`` does
-        NOT advance during decode — it only advances when SWA evict releases
-        old raw positions (see ``_evict_swa``).
-        """
-        allocator = self.token_to_kv_pool_allocator
-        if (
-            not hasattr(allocator, "c4_state_attn_allocator")
-            or allocator.c4_state_attn_allocator is None
-        ):
-            return
-        c4_prefix_list: List[int] = []
-        c4_seq_list: List[int] = []
-        c128_prefix_list: List[int] = []
-        c128_seq_list: List[int] = []
-        for req in self.reqs:
-            prev_c4 = req.c4_state_kv_len
-            prev_c128 = req.c128_state_kv_len
-            new_c4 = prev_c4 + 1
-            new_c128 = prev_c128 + 1
-
-            c4_prefix_list.append(prev_c4)
-            c4_seq_list.append(new_c4)
-            c128_prefix_list.append(prev_c128)
-            c128_seq_list.append(new_c128)
-
-            req.c4_state_kv_len = new_c4
-            req.c128_state_kv_len = new_c128
-
-        c4_prefix_lens_cpu = torch.tensor(c4_prefix_list, dtype=torch.int64)
-        c4_seq_lens_cpu = torch.tensor(c4_seq_list, dtype=torch.int64)
-        c128_prefix_lens_cpu = torch.tensor(c128_prefix_list, dtype=torch.int64)
-        c128_seq_lens_cpu = torch.tensor(c128_seq_list, dtype=torch.int64)
-        self.dsv4_state_lens = DSV4StateLens(
-            c4_prefix_lens=c4_prefix_lens_cpu.to(self.device, non_blocking=True),
-            c4_prefix_lens_cpu=c4_prefix_lens_cpu,
-            c4_seq_lens=c4_seq_lens_cpu.to(self.device, non_blocking=True),
-            c4_seq_lens_cpu=c4_seq_lens_cpu,
-            c4_extend_num_tokens=bs,
-            c128_prefix_lens=c128_prefix_lens_cpu.to(self.device, non_blocking=True),
-            c128_prefix_lens_cpu=c128_prefix_lens_cpu,
-            c128_seq_lens=c128_seq_lens_cpu.to(self.device, non_blocking=True),
-            c128_seq_lens_cpu=c128_seq_lens_cpu,
-            c128_extend_num_tokens=bs,
-        )
-
-    def _maybe_evict_dsv4_state(self, req: Req, pre_len: int) -> None:
-        """Per-decode evict for the DSV4-NPU compress-state pools.
-
-        Runs **independently of SWA evict cadence**. The state pool is
-        sized for ~2 pages (c4) / ~3 pages (c128) of raw positions per req
-        — small enough that with a large sliding_window (where SWA evict
-        fires every ``eviction_interval`` steps and requires
-        ``pre_len > sliding_window + page_size`` to actually free anything),
-        the state pool exhausts long before the first SWA frontier
-        advance. Reference (iforgetmyname/sglang dsv4_release) uses a
-        dedicated ``evict_swa_c4c128_state`` path on its
-        ``supports_swa_c4c128`` tree cache; we don't have that branch so
-        we evict here instead.
-
-        Retention windows match reference (chunk_cache.compress_state_window_sizes):
-
-          * c4: ``8 + 16 = 24`` raw positions (kernel read window 8 raw
-            positions + 16 token safety margin for the next decode batches).
-          * c128: ``128 + 64 = 192`` raw positions (kernel read window
-            spans 128 raw positions + 64 token margin).
-
-        The retention is intentionally SMALLER than one SWA page so the
-        first eviction fires well before the (small) state pool fills.
-        With pool size = 2*page_size (c4) or 3*page_size (c128), a
-        page-sized retention would let active grow to pool capacity before
-        the first watermark advance — exhaustion. Reference's small
-        retention puts the first evict at ``pre_len ≈ page_size +
-        retention`` (decode step ~26 for c4 with prefill seq=128), leaving
-        plenty of pool headroom.
-
-        Watermarks are page-aligned so the freed slots correspond to
-        whole pages returned to the paged allocator's free list (partial
-        pages can't be reclaimed by ``NPUPagedTokenToKVPoolAllocator.free``).
-
-        No-op on non-DSV4-NPU paths (hasattr-gated allocator + pool).
-        """
-        allocator = self.token_to_kv_pool_allocator
-        pool = self.req_to_token_pool
-        if not hasattr(allocator, "c4_state_attn_allocator") or (
-            allocator.c4_state_attn_allocator is None
-            and allocator.c128_state_attn_allocator is None
-        ):
-            return
-
-        page_size = self.tree_cache.page_size
-        # Retention: kernel read window + decode lookahead margin. Values
-        # mirror iforgetmyname/sglang dsv4_release chunk_cache.py:140-144.
-        C4_RETENTION = 8 + 16
-        C128_RETENTION = 128 + 64
-        c4_watermark = max(0, pre_len - C4_RETENTION)
-        c4_watermark = (c4_watermark // page_size) * page_size
-        c128_watermark = max(0, pre_len - C128_RETENTION)
-        c128_watermark = (c128_watermark // page_size) * page_size
-
-        if (
-            allocator.c4_state_attn_allocator is not None
-            and hasattr(pool, "req_to_token_c4_state")
-            and c4_watermark > req.c4_state_alloc_offset
-        ):
-            c4_state_free = pool.req_to_token_c4_state[
-                req.req_pool_idx,
-                req.c4_state_alloc_offset:c4_watermark,
-            ]
-            allocator.c4_state_attn_allocator.free(c4_state_free.to(torch.int64))
-            req.c4_state_alloc_offset = c4_watermark
-        if (
-            allocator.c128_state_attn_allocator is not None
-            and hasattr(pool, "req_to_token_c128_state")
-            and c128_watermark > req.c128_state_alloc_offset
-        ):
-            c128_state_free = pool.req_to_token_c128_state[
-                req.req_pool_idx,
-                req.c128_state_alloc_offset:c128_watermark,
-            ]
-            allocator.c128_state_attn_allocator.free(
-                c128_state_free.to(torch.int64)
-            )
-            req.c128_state_alloc_offset = c128_watermark
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
@@ -3004,45 +2767,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
 
-            # DSV4-NPU compress-state slots ride along with SWA eviction:
-            # state at raw positions < swa_evicted_seqlen is no longer
-            # readable (compressor only reads the trailing ``2*ratio``
-            # window) and must be returned to its paged allocator to keep
-            # the small state pool from exhausting on long generations.
-            # Mirrors iforgetmyname/sglang dsv4_release's chunk_cache state
-            # eviction (which uses ``c{4,128}_alloc_offset`` the same way).
-            # Gated by hasattr so non-DSV4-NPU paths (CUDA / non-V4 models)
-            # are untouched.
-            allocator = self.token_to_kv_pool_allocator
-            pool = self.req_to_token_pool
-            if (
-                hasattr(allocator, "c4_state_attn_allocator")
-                and allocator.c4_state_attn_allocator is not None
-                and hasattr(pool, "req_to_token_c4_state")
-                and new_swa_evicted_seqlen > req.c4_state_alloc_offset
-            ):
-                c4_state_free = pool.req_to_token_c4_state[
-                    req.req_pool_idx,
-                    req.c4_state_alloc_offset : new_swa_evicted_seqlen,
-                ]
-                allocator.c4_state_attn_allocator.free(
-                    c4_state_free.to(torch.int64)
-                )
-                req.c4_state_alloc_offset = new_swa_evicted_seqlen
-            if (
-                hasattr(allocator, "c128_state_attn_allocator")
-                and allocator.c128_state_attn_allocator is not None
-                and hasattr(pool, "req_to_token_c128_state")
-                and new_swa_evicted_seqlen > req.c128_state_alloc_offset
-            ):
-                c128_state_free = pool.req_to_token_c128_state[
-                    req.req_pool_idx,
-                    req.c128_state_alloc_offset : new_swa_evicted_seqlen,
-                ]
-                allocator.c128_state_attn_allocator.free(
-                    c128_state_free.to(torch.int64)
-                )
-                req.c128_state_alloc_offset = new_swa_evicted_seqlen
+            # DSV4-NPU only (no-op elsewhere): compress-state slots at raw
+            # positions < swa_evicted_seqlen ride along with SWA eviction.
+            from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
+                maybe_evict_dsv4_state_on_swa,
+            )
+
+            maybe_evict_dsv4_state_on_swa(self, req, new_swa_evicted_seqlen)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):
@@ -3115,11 +2846,9 @@ class ModelWorkerBatch:
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None
 
-    # DSV4-NPU: bundled per-pool allocation slots. Populated by the NPU V4
-    # allocator on alloc_extend/alloc_decode; the NPU attention backend
-    # reads it to write the 5 per-req tables and to build PA_ND block
-    # tables. None for non-DSV4 paths. Typed as Any to avoid an import
-    # cycle with forward_batch_info.
+    # DSV4-NPU: bundled per-pool allocation slots (None for non-DSV4 paths).
+    # Typed as Any to avoid an import cycle with forward_batch_info. See
+    # hardware_backend/npu/dsv4_schedule_hooks.py.
     out_cache_loc_dsv4: Optional[Any] = None
 
     # For corss-encoder model
