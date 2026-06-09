@@ -114,7 +114,8 @@ PER_COMMIT_SUITES = {
         "stage-b-e2e-mlx",
     ],
     HWBackend.MLU: [
-        "pr-test-mlu",
+        "pr-test-1-mlu",
+        "pr-test-2-mlu",
     ],
 }
 
