@@ -31,15 +31,14 @@ def _build_cosmos3_param_names_mapping() -> dict:
     GEN patterns (`*_moe_gen`, `add_*`, `to_add_out`, `norm_added_*`) must
     precede the UND catch-all so the catch-all can't claim GEN keys.
     `norm.weight` and `lm_head.weight` are inherited from Qwen3-VL
-    pretraining and not used at inference; audio/action keys are reserved
-    for a future modality extension — all skipped via empty-string replacement.
+    pretraining and not used at inference; both are skipped.
+    Audio and action keys (``audio_proj_*``, ``action_proj_*``, modality
+    embeds) pass through unchanged.
     """
     return {
         # Inherited from Qwen3-VL pretraining; unused at diffusion inference.
         r"^lm_head\.weight$": "",
         r"^norm\.weight$": "",
-        # Action modality not yet wired; skip to avoid load warnings.
-        r"^action_.*$": "",
         # Top-level norms / embeddings.
         r"^norm_moe_gen\.(.*)$": r"norm_moe_gen.\1",
         r"^embed_tokens\.(.*)$": r"language_model.embed_tokens.\1",
@@ -159,6 +158,11 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     sound_dim: int = 64
     sound_latent_fps: float = 25.0
     temporal_compression_factor_sound: int = 1
+
+    # Action modality
+    action_gen: bool = False
+    action_dim: int = 64
+    num_embodiment_domains: int = 32
 
     # Timestep embedding
     timestep_scale: float = 0.001
