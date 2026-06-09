@@ -74,7 +74,6 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -1590,7 +1589,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batch configs
     model_config: ModelConfig = None
     enable_overlap: bool = False
-    is_hybrid_swa: bool = False
 
     # Device
     device: str = "cuda"
@@ -1758,10 +1756,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
-        is_hybrid_swa = False
-        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            is_hybrid_swa = True
-
         is_extend_intermediate = [
             _compute_is_extend_intermediate(req, dllm_config, forward_mode)
             for req in reqs
@@ -1772,7 +1766,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
