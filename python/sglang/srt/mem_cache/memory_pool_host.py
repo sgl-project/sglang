@@ -958,9 +958,8 @@ class MiMoMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             )
         else:
             raise ValueError(
-                f"Unsupported layout for MiMoMHATokenToKVPoolHost "
-                f"(head_dim != v_head_dim): {self.layout}; expected "
-                f"'page_first' or 'page_first_direct'."
+                f"Unsupported layout for models with head_dim != v_head_dim: "
+                f"{self.layout}; expected 'page_first' or 'page_first_direct'."
             )
 
         # token_stride_size / layout_dim are intentionally NOT set: K and V
@@ -987,7 +986,7 @@ class MiMoMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
     def _kernel_path_unsupported(self) -> "NotImplementedError":
         return NotImplementedError(
-            "MiMoMHATokenToKVPoolHost (head_dim != v_head_dim) only supports "
+            "Models with head_dim != v_head_dim only support "
             "io_backend='direct' with layout in {page_first, page_first_direct}; "
             "the 'kernel' transfer path passes a single item_size and would "
             "silently corrupt V transfers."
@@ -995,10 +994,9 @@ class MiMoMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
     def _flat_page_unsupported(self) -> "NotImplementedError":
         return NotImplementedError(
-            "MiMoMHATokenToKVPoolHost (head_dim != v_head_dim) does not "
-            "support the flat-page interface used by HiCache L3 storage "
-            "backends {hf3fs, eic, nixl}. Use a backend that does not use "
-            "this interface (e.g. mooncake, simm)."
+            "Models with head_dim != v_head_dim do not support the flat-page "
+            "interface used by HiCache L3 storage backends {hf3fs, eic, nixl}. "
+            "Use a backend that does not use this interface (e.g. mooncake, simm)."
         )
 
     def load_to_device_per_layer(
@@ -1037,15 +1035,16 @@ class MiMoMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         self, indices: torch.Tensor, split_factor: int
     ):
         raise NotImplementedError(
-            "get_split_heads_page_buffer_meta is not supported for "
-            "MiMoMHATokenToKVPoolHost (head_dim != v_head_dim)."
+            "get_split_heads_page_buffer_meta requires layout='page_head', "
+            "which is not supported for models with head_dim != v_head_dim."
         )
 
     def get_page_buffer_meta(self, indices):
         assert len(indices) % self.page_size == 0
         if self.layout not in ("page_first", "page_first_direct"):
             raise ValueError(
-                f"Unsupported layout for MiMoMHATokenToKVPoolHost: {self.layout}"
+                f"Unsupported layout for models with head_dim != v_head_dim: "
+                f"{self.layout}"
             )
         indices = indices.tolist()
         k_base_ptr = self.k_buffer.data_ptr()
