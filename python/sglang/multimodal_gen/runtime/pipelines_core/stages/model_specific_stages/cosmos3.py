@@ -171,7 +171,10 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         Inverse-dynamics action mode conditions on the whole input video, so
         every latent frame is locked.
         """
-        if getattr(batch.sampling_params, "action_mode", None) == ACTION_MODE_INVERSE_DYNAMICS:
+        if (
+            getattr(batch.sampling_params, "action_mode", None)
+            == ACTION_MODE_INVERSE_DYNAMICS
+        ):
             num_latent_frames = (batch.num_frames - 1) // 4 + 1
             return list(range(num_latent_frames))
         cond_indexes = getattr(batch.sampling_params, "condition_frame_indexes", None)
@@ -870,10 +873,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         do_cfg = guidance_scale > 1.0
 
         enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
-        if sound_latents is not None and enable_cfg_parallel:
-            raise NotImplementedError(
-                "Cosmos3 sound generation does not support CFG parallel yet"
-            )
         if action_latents is not None and enable_cfg_parallel:
             raise NotImplementedError(
                 "Cosmos3 action generation does not support CFG parallel yet"
@@ -953,6 +952,12 @@ class Cosmos3DenoisingStage(PipelineStage):
                         cond_text_seq_len=batch.extra["cond_text_seq_len"],
                         uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
                         current_timestep=i,
+                        sound_latents=sound_latents,
+                        action_latents=action_latents,
+                        action_domain_ids=action_domain_ids,
+                        action_noisy_mask=action_velocity_mask,
+                        action_fps=action_fps,
+                        action_start_frame_offset=action_start_frame_offset,
                     )
                 elif effective_scale == 1.0:
                     noise_pred = self._run_transformer(
@@ -1193,45 +1198,54 @@ class Cosmos3DenoisingStage(PipelineStage):
         cond_text_seq_len: int | None = None,
         uncond_text_seq_len: int | None = None,
         current_timestep: int | None = None,
-    ) -> torch.Tensor:
+        sound_latents: torch.Tensor | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_fps: float | None = None,
+        action_start_frame_offset: int = 1,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run CFG with one branch per CFG rank, combined by all-reduce.
 
         Rank 0 runs the conditional branch and contributes ``g·cond`` to the
         sum; rank 1 runs the unconditional branch and contributes
         ``(1−g)·uncond``. The all-reduce sum is exactly the standard CFG
         result. Each rank keeps its own UND K/V cache (``"cond"`` /
-        ``"uncond"``).
+        ``"uncond"``). When sound/action modalities are present the forward
+        returns a per-modality tuple; each branch scales every modality by its
+        coefficient and the reduction combines them element-wise.
         """
         if cfg_rank == 0:
-            noise_pred = self._run_transformer(
-                latents=latents,
-                timestep=timestep,
-                text_ids=cond_text_ids,
-                text_mask=cond_text_mask,
-                video_shape=video_shape,
-                fps=fps,
-                cache_key="cond",
-                noisy_frame_mask=noisy_frame_mask,
-                max_text_seq_len=cond_text_seq_len,
-                current_timestep=current_timestep,
-            )
-            partial = guidance_scale * noise_pred
+            text_ids, text_mask, cache_key = cond_text_ids, cond_text_mask, "cond"
+            text_seq_len = cond_text_seq_len
+            coeff = guidance_scale
         else:
-            noise_pred = self._run_transformer(
-                latents=latents,
-                timestep=timestep,
-                text_ids=uncond_text_ids,
-                text_mask=uncond_text_mask,
-                video_shape=video_shape,
-                fps=fps,
-                cache_key="uncond",
-                noisy_frame_mask=noisy_frame_mask,
-                max_text_seq_len=uncond_text_seq_len,
-                current_timestep=current_timestep,
-            )
-            partial = (1.0 - guidance_scale) * noise_pred
+            text_ids, text_mask, cache_key = uncond_text_ids, uncond_text_mask, "uncond"
+            text_seq_len = uncond_text_seq_len
+            coeff = 1.0 - guidance_scale
 
-        return cfg_model_parallel_all_reduce(partial)
+        out = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key=cache_key,
+            noisy_frame_mask=noisy_frame_mask,
+            max_text_seq_len=text_seq_len,
+            current_timestep=current_timestep,
+            sound_latents=sound_latents,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_fps=action_fps,
+            action_start_frame_offset=action_start_frame_offset,
+        )
+
+        if isinstance(out, tuple):
+            return tuple(cfg_model_parallel_all_reduce(coeff * p) for p in out)
+        return cfg_model_parallel_all_reduce(coeff * out)
 
 
 class Cosmos3DecodingStage(PipelineStage):
