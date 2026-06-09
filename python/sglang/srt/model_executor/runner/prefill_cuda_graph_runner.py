@@ -547,9 +547,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
         else:
-            post_warmup_hook = getattr(
-                attn_backend, "on_after_cuda_graph_warmup", None
-            )
+            post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
             num_tokens,
             run_once,
