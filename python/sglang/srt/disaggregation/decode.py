@@ -1055,7 +1055,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @property
     def num_tokens_pre_allocated(self):
         return sum(
-            decode_req.req.fill_len for decode_req in self.transfer_queue.queue
+            decode_req.req.extend_range.end for decode_req in self.transfer_queue.queue
         )
 
     def _need_space_for_single_req(
