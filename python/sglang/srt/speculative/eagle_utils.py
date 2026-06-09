@@ -82,8 +82,10 @@ def _eagle_prefill_tail_tokens(
     )
 
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
-    for i, (req, mode) in enumerate(zip(batch.reqs, batch.output_process_mode)):
-        if not (mode.is_intermediate() and not req.is_dllm()):
+    for i, (req, is_intermediate) in enumerate(
+        zip(batch.reqs, batch.is_extend_intermediate)
+    ):
+        if not (is_intermediate and not req.is_dllm()):
             continue
         next_prompt_token = _compute_chunked_req_next_prompt_token(req)
         if next_prompt_token is not None:

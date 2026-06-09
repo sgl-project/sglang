@@ -1793,9 +1793,9 @@ class SchedulerDisaggregationDecodeMixin:
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
-            modes = new_prebuilt_batch.output_process_mode or []
+            is_extend_intermediate = new_prebuilt_batch.is_extend_intermediate or []
             assert not any(
-                m.is_intermediate() for m in modes
+                is_extend_intermediate
             ), "prebuilt batch carries intermediate-mode reqs"
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():

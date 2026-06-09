@@ -4,10 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.managers.schedule_batch import (
-    OutputProcessMode,
     Req,
     _compute_chunked_req_next_prompt_token,
-    _decide_output_process_mode,
+    _decide_is_extend_intermediate,
 )
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -132,18 +131,16 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertTrue(req.has_pending_chunk)
         self.assertEqual(req.get_full_untruncated_fill_len(), 805)
-        self.assertEqual(
-            _decide_output_process_mode(req, dllm_config=None, forward_mode=None),
-            OutputProcessMode.EXTEND_MIDDLE_CHUNK,
+        self.assertTrue(
+            _decide_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
         )
         self.assertEqual(_compute_chunked_req_next_prompt_token(req), 600)
 
         req.extend_range = Range(0, 805)
 
         self.assertFalse(req.has_pending_chunk)
-        self.assertEqual(
-            _decide_output_process_mode(req, dllm_config=None, forward_mode=None),
-            OutputProcessMode.EXTEND_LAST_CHUNK,
+        self.assertFalse(
+            _decide_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
         )
         self.assertIsNone(_compute_chunked_req_next_prompt_token(req))
 
@@ -173,11 +170,10 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(last_chunk_req.get_full_untruncated_fill_len(), 128)
         self.assertFalse(last_chunk_req.has_pending_chunk)
-        self.assertEqual(
-            _decide_output_process_mode(
+        self.assertFalse(
+            _decide_is_extend_intermediate(
                 last_chunk_req, dllm_config=None, forward_mode=None
-            ),
-            OutputProcessMode.EXTEND_LAST_CHUNK,
+            )
         )
         self.assertIsNone(_compute_chunked_req_next_prompt_token(last_chunk_req))
 

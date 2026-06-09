@@ -564,15 +564,15 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
-        for i, (req, next_token_id, mode) in enumerate(
+        for i, (req, next_token_id, is_intermediate) in enumerate(
             zip(
                 batch.reqs,
                 next_token_ids,
-                batch.output_process_mode,
+                batch.is_extend_intermediate,
                 strict=True,
             )
         ):
-            if not mode.is_intermediate():
+            if not is_intermediate:
                 req.time_stats.set_prefill_finished_time()
 
                 # For optimistic requests, check bootstrap before side effects

@@ -222,14 +222,19 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             logprob_pt = 0
 
-            for i, (req, next_token_id, mode) in enumerate(
-                zip(batch.reqs, next_token_ids, batch.output_process_mode, strict=True)
+            for i, (req, next_token_id, is_intermediate) in enumerate(
+                zip(
+                    batch.reqs,
+                    next_token_ids,
+                    batch.is_extend_intermediate,
+                    strict=True,
+                )
             ):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
 
-                if not mode.is_intermediate():
+                if not is_intermediate:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
@@ -311,8 +316,8 @@ class SchedulerBatchResultProcessor:
                     phs = phs.cpu().detach()
 
             # Check finish conditions
-            for i, (req, mode) in enumerate(
-                zip(batch.reqs, batch.output_process_mode, strict=True)
+            for i, (req, is_intermediate) in enumerate(
+                zip(batch.reqs, batch.is_extend_intermediate, strict=True)
             ):
                 if req.is_retracted:
                     continue
@@ -321,7 +326,7 @@ class SchedulerBatchResultProcessor:
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
 
-                if not mode.is_intermediate():
+                if not is_intermediate:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
@@ -440,26 +445,28 @@ class SchedulerBatchResultProcessor:
         if not getattr(result, "skipped_output_comm", False):
             if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
                 has_consumed_output = any(
-                    not mode.is_intermediate()
-                    for req, mode in zip(
-                        batch.reqs, batch.output_process_mode, strict=True
+                    not is_intermediate
+                    for req, is_intermediate in zip(
+                        batch.reqs, batch.is_extend_intermediate, strict=True
                     )
                     if not req.finished() and not req.is_retracted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
-                    modes = [m.name for m in batch.output_process_mode]
+                    flags = batch.is_extend_intermediate
                     logger.warning(
                         f"PP non-skip output comm: no req consumed next_token_ids. "
                         f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
-                        f"num_reqs={len(batch.reqs)}, all output_process_mode={modes}"
+                        f"num_reqs={len(batch.reqs)}, all is_extend_intermediate={flags}"
                     )
             return
 
-        for req, mode in zip(batch.reqs, batch.output_process_mode, strict=True):
+        for req, is_intermediate in zip(
+            batch.reqs, batch.is_extend_intermediate, strict=True
+        ):
             if not req.finished() and not req.is_retracted:
-                assert mode.is_intermediate(), (
+                assert is_intermediate, (
                     f"PP skip output comm invariant violated: req {req.rid} "
-                    f"has output_process_mode={mode.name} "
+                    f"has is_extend_intermediate={is_intermediate} "
                     f"(not intermediate) but output was skipped "
                     f"(contains_last_prefill_chunk="
                     f"{batch.contains_last_prefill_chunk}). "

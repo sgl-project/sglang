@@ -2506,9 +2506,9 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
-            modes = self.running_batch.output_process_mode or []
+            is_extend_intermediate = self.running_batch.is_extend_intermediate or []
             assert not any(
-                m.is_intermediate() for m in modes
+                is_extend_intermediate
             ), "running_batch contains intermediate-mode reqs in is_prefill_only branch"
             self.running_batch.filter_batch()
             if self.running_batch.is_empty():
@@ -2818,9 +2818,9 @@ class Scheduler(
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
-            modes = self.running_batch.output_process_mode or []
+            is_extend_intermediate = self.running_batch.is_extend_intermediate or []
             assert not any(
-                m.is_intermediate() for m in modes
+                is_extend_intermediate
             ), "running_batch contains intermediate-mode reqs before mix_with_running"
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()

@@ -238,16 +238,6 @@ class MultimodalInputFormat(Enum):
     PRECOMPUTED_EMBEDDING = auto()
 
 
-class OutputProcessMode(Enum):
-
-    EXTEND_MIDDLE_CHUNK = "extend_middle_chunk"
-    EXTEND_LAST_CHUNK = "extend_last_chunk"
-    DECODE = "decode"
-
-    def is_intermediate(self) -> bool:
-        return self is OutputProcessMode.EXTEND_MIDDLE_CHUNK
-
-
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
@@ -1506,25 +1496,23 @@ def set_mamba_track_indices_from_reqs(batch):
     )
 
 
-def _decide_output_process_mode(
+def _decide_is_extend_intermediate(
     req: Req,
     dllm_config: Optional[DllmConfig],
     forward_mode: Optional[ForwardMode],
-) -> OutputProcessMode:
+) -> bool:
+    # dLLM extend steps never transition to autoregressive decode, so they are
+    # always intermediate (their output is committed via dllm_manager).
     if dllm_config is not None:
-        # dLLM steps are always intermediate: their output is committed via
-        # dllm_manager, not the normal output path. Reuse the generic
-        # intermediate mode instead of a dedicated dLLM enum value.
-        return OutputProcessMode.EXTEND_MIDDLE_CHUNK
+        return True
 
     if forward_mode is not None and (
         forward_mode.is_decode() or forward_mode.is_prebuilt()
     ):
-        return OutputProcessMode.DECODE
+        return False
 
-    if req.extend_range.end >= req.get_full_untruncated_fill_len():
-        return OutputProcessMode.EXTEND_LAST_CHUNK
-    return OutputProcessMode.EXTEND_MIDDLE_CHUNK
+    # Non-final (middle) extend chunk is intermediate; the last chunk is not.
+    return req.extend_range.end < req.get_full_untruncated_fill_len()
 
 
 def release_req(
@@ -1734,9 +1722,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_lens: List[int] = None
     extend_logprob_start_lens: List[int] = None
 
-    output_process_mode: List[OutputProcessMode] = dataclasses.field(
-        default_factory=list
-    )
+    is_extend_intermediate: List[bool] = dataclasses.field(default_factory=list)
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -1774,8 +1760,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
 
-        output_process_mode = [
-            _decide_output_process_mode(req, dllm_config, forward_mode) for req in reqs
+        is_extend_intermediate = [
+            _decide_is_extend_intermediate(req, dllm_config, forward_mode)
+            for req in reqs
         ]
 
         batch = cls(
@@ -1793,7 +1780,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             dllm_config=dllm_config,
-            output_process_mode=output_process_mode,
+            is_extend_intermediate=is_extend_intermediate,
         )
         return batch
 
@@ -2534,7 +2521,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
-        self.output_process_mode = [OutputProcessMode.DECODE] * bs
+        self.is_extend_intermediate = [False] * bs
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -2635,27 +2622,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         only_decode_ready: bool = False,
     ):
         if keep_indices is None:
-            modes = self.output_process_mode
+            is_extend_intermediate = self.is_extend_intermediate
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and not (only_decode_ready and modes and modes[i].is_intermediate())
+                and not (
+                    only_decode_ready
+                    and is_extend_intermediate
+                    and is_extend_intermediate[i]
+                )
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
-            self.output_process_mode = []
+            self.is_extend_intermediate = []
             return
 
         if len(keep_indices) == len(self.reqs):
             # No need to filter
             return
 
-        if self.output_process_mode:
-            self.output_process_mode = [
-                self.output_process_mode[i] for i in keep_indices
+        if self.is_extend_intermediate:
+            self.is_extend_intermediate = [
+                self.is_extend_intermediate[i] for i in keep_indices
             ]
 
         keep_indices_device = torch.tensor(
@@ -2714,14 +2705,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        if other.output_process_mode:
-            assert all(
-                not mode.is_intermediate() for mode in other.output_process_mode
-            ), (
+        if other.is_extend_intermediate:
+            assert not any(other.is_extend_intermediate), (
                 "merge_batch requires the other batch to be decode-ready; "
-                f"got modes={other.output_process_mode}"
+                f"got is_extend_intermediate={other.is_extend_intermediate}"
             )
-            self.output_process_mode.extend(other.output_process_mode)
+            self.is_extend_intermediate.extend(other.is_extend_intermediate)
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2793,7 +2782,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
-            output_process_mode=self.output_process_mode[:],
+            is_extend_intermediate=self.is_extend_intermediate[:],
             spec_algorithm=self.spec_algorithm,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
