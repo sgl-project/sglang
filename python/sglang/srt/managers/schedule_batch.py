@@ -1075,6 +1075,7 @@ class Req(ReqDllmMixin):
             length += self.dllm_config.block_size
         return length
 
+    # TODO: inline this method into its callers — it has no side effects, it only sets extend_range.
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
 
@@ -1551,14 +1552,13 @@ def compute_extend_logprob_start_len(
     because the value is bound to one extend forward, not to live Req state (under
     overlap scheduling the Req's prefix_indices/extend_range/logprob_start_len are
     overwritten by the next round before the current forward's output is processed).
-
-    Key variables:
-    - logprob_start_len: absolute position in the full sequence where logprob starts
-      (-1 means "no input logprobs", i.e. start at the very end of the sequence).
-    - prefix_len: number of cached prefix tokens (extend window starts here).
-    - extend_len: number of tokens processed in this extend window.
-    - full_untruncated_fill_len: full sequence length, used to resolve the -1 sentinel.
     """
+    # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
+    #
+    # Key variables:
+    # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+    # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+    # - extend_input_len: Number of tokens that need to be processed in this extend batch
     if logprob_start_len == -1:
         resolved_start = full_untruncated_fill_len
     else:
