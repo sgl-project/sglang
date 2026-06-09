@@ -1222,45 +1222,6 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_output
 
             if self.use_fia:
-                # """FIA will support multi-bs in the later version of CANN"""
-                # #print(f"in fia prefill branch")
-                # q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                # attn_output = torch.empty(
-                #     (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                #     device=q.device,
-                #     dtype=q.dtype,
-                # )
-                # q_len_offset = 0
-                # for q_len in forward_batch.extend_seq_lens_cpu:
-                #     attn_output[q_len_offset : q_len_offset + q_len] = (
-                #         torch.ops.npu.npu_fused_infer_attention_score(
-                #             q[None, q_len_offset : q_len_offset + q_len],
-                #             k[None, q_len_offset : q_len_offset + q_len],
-                #             v[None, q_len_offset : q_len_offset + q_len],
-                #             num_heads=layer.tp_q_head_num,
-                #             num_key_value_heads=layer.tp_k_head_num,
-                #             input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                #             atten_mask=self.fia_mask.unsqueeze(0),
-                #             sparse_mode=3 if q_len != 1 else 0,
-                #             scale=layer.scaling,
-                #             next_tokens=0,
-                #             #antiquant_mode=0,
-                #             #key_antiquant_mode=0,
-                #             #value_antiquant_mode=0,
-                #             #key_antiquant_scale=torch.ones(512, device=torch.device("npu"), dtype=torch.bfloat16),
-                #             #value_antiquant_scale=torch.ones(512, device=torch.device("npu"), dtype=torch.bfloat16),
-                #             #key_antiquant_scale=layer.k_quant_scale,
-                #             #key_antiquant_offset=layer.k_quant_offset,
-                #             #value_antiquant_scale=layer.v_quant_scale,
-                #             #value_antiquant_offset=layer.v_quant_offset,
-                #         )[0]
-                #     )
-                #     q_len_offset += q_len
-                # attn_output = attn_output.view(
-                #     -1, layer.tp_q_head_num * layer.v_head_dim
-                # )
-                #torch.save(attn_output, "/home/tbaydasov/original_prefill_dump.pt")
-                
                 """FIA supports multi-bs in the current version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_token_padding = q.shape[0]
@@ -1987,12 +1948,10 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                #key_antiquant_mode=1,
-                #value_antiquant_mode=1,
-                key_antiquant_scale=layer.k_dequant_scale,
-                key_antiquant_offset=layer.k_quant_offset,
-                value_antiquant_scale=layer.v_dequant_scale,
-                value_antiquant_offset=layer.v_quant_offset,
+                key_antiquant_scale=layer.k_dequant_scale if hasattr(layer, 'k_dequant_scale') else None,
+                key_antiquant_offset=layer.k_quant_offset if hasattr(layer, 'k_quant_offset') else None,
+                value_antiquant_scale=layer.v_dequant_scale if hasattr(layer, 'v_dequant_scale') else None,
+                value_antiquant_offset=layer.v_quant_offset if hasattr(layer, 'v_quant_offset') else None,
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
@@ -2011,18 +1970,13 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                #key_antiquant_mode=1,
-                #value_antiquant_mode=1,
-                key_antiquant_scale=layer.k_dequant_scale,
-                key_antiquant_offset=layer.k_quant_offset,
-                value_antiquant_scale=layer.v_dequant_scale,
-                value_antiquant_offset=layer.v_quant_offset,
+                key_antiquant_scale=layer.k_dequant_scale if hasattr(layer, 'k_dequant_scale') else None,
+                key_antiquant_offset=layer.k_quant_offset if hasattr(layer, 'k_quant_offset') else None,
+                value_antiquant_scale=layer.v_dequant_scale if hasattr(layer, 'v_dequant_scale') else None,
+                value_antiquant_offset=layer.v_quant_offset if hasattr(layer, 'v_quant_offset') else None,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
-            #print(f"query shape: {query.shape}", flush=True)
-            #torch.save(output, f"/home/tbaydasov/original_decode_dump/original_decode.pt")
-            #raise ValueError("Debug stop")
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -2266,12 +2220,10 @@ class AscendAttnBackend(AttentionBackend):
                     block_table=self.forward_metadata.block_tables,
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
-                    # antiquant_mode=0,
-                    # antiquant_scale=None,
-                    key_antiquant_scale=layer.k_quant_scale,
-                    key_antiquant_offset=layer.k_quant_offset,
-                    value_antiquant_scale=layer.v_quant_scale,
-                    value_antiquant_offset=layer.v_quant_offset,
+                    key_antiquant_scale=layer.k_dequant_scale if hasattr(layer, 'k_dequant_scale') else None,
+                    key_antiquant_offset=layer.k_quant_offset if hasattr(layer, 'k_quant_offset') else None,
+                    value_antiquant_scale=layer.v_dequant_scale if hasattr(layer, 'v_dequant_scale') else None,
+                    value_antiquant_offset=layer.v_quant_offset if hasattr(layer, 'v_quant_offset') else None,
                 )
                 if actual_bs != num_token_padding:
                     attn_output = torch.cat(
