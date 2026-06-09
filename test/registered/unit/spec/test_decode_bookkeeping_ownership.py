@@ -1,15 +1,17 @@
-"""Ownership contract for per-decode-iter bookkeeping.
+"""Ownership contract for per-request bookkeeping clocks.
 
-Each decode iter must tick `req.decode_batch_idx` and call
-`batch.maybe_evict_swa()` exactly once, by exactly one owner: the scheduler
-for non-spec, `EagleDraftInputV2Mixin.prepare_for_decode` for spec v2 (draft
-workers must not repeat them), the worker itself for spec v1.
+Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
+clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks,
+`spec_verify_ct`, and the `maybe_evict_swa()` call) must be advanced by a
+small, reviewed set of owner sites: the scheduler for non-spec,
+`EagleDraftInputV2Mixin.prepare_for_decode` plus the resolve path for spec
+v2 (draft workers must not repeat them), the worker itself for spec v1.
 
-A fast clock fires SWA eviction in the first-decode-iter overlap race window
-and releases the SWA prefix lock before the decode position truly passes the
-window; neither shows up in e2e CI or the idle leak checker. AST-based so it
-covers every code path without GPU, and picks up new `BaseDraftWorker`
-subclasses automatically.
+A clock that runs fast fires SWA eviction in the first-decode-iter overlap
+race window and releases the SWA prefix lock early; mis-accounted KV
+watermarks corrupt allocation. Neither shows up in e2e CI or the idle leak
+checker. AST-based so it covers every code path without GPU, and picks up
+new `BaseDraftWorker` subclasses automatically.
 """
 
 import ast
@@ -26,29 +28,66 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SRT_DIR = _REPO_ROOT / "python" / "sglang" / "srt"
 _SPECULATIVE_DIR = _SRT_DIR / "speculative"
 
-_CLOCK_ATTR = "decode_batch_idx"
+_TRACKED_ATTRS = (
+    "decode_batch_idx",
+    "extend_batch_idx",
+    "kv_committed_len",
+    "kv_allocated_len",
+    "spec_verify_ct",
+)
 _EVICT_METHOD = "maybe_evict_swa"
 
 # Exhaustive allowlist of (path relative to srt/, scope, kind), where kind is
-# "tick" (a `decode_batch_idx` mutation; `= 0` resets exempt) or "evict" (a
-# `maybe_evict_swa()` call). Any added or removed site fails the test until
+# the mutated attribute (`= 0` resets exempt) or "evict" for a
+# `maybe_evict_swa()` call. Any added or removed site fails the test until
 # reviewed here; a spec-v2 draft worker almost never qualifies as a new owner.
+_SB = "managers/schedule_batch.py"
+_MIXIN = ("speculative/eagle_info_v2.py", "EagleDraftInputV2Mixin.prepare_for_decode")
+_RESOLVE = (
+    "managers/scheduler_components/batch_result_processor.py",
+    "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
+)
+_SS = "session/streaming_session.py"
 _OWNER_SITES = {
-    # non-spec decode
-    ("managers/schedule_batch.py", "ScheduleBatch.prepare_for_decode", "tick"),
+    # non-spec scheduler
+    (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"),
+    (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"),
+    (_SB, "ScheduleBatch.prepare_for_decode", "kv_allocated_len"),
+    (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"),
+    (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"),
+    (_SB, "ScheduleBatch.prepare_for_extend", "kv_allocated_len"),
     ("mem_cache/common.py", "alloc_for_extend", "evict"),
     ("mem_cache/common.py", "alloc_for_decode", "evict"),
-    # spec v2, scheduler-driven via `batch.is_spec_v2`
-    (
-        "speculative/eagle_info_v2.py",
-        "EagleDraftInputV2Mixin.prepare_for_decode",
-        "tick",
-    ),
-    (
-        "speculative/eagle_info_v2.py",
-        "EagleDraftInputV2Mixin.prepare_for_decode",
-        "evict",
-    ),
+    # spec v2: pre-claim in the scheduler-driven mixin, settle in resolve
+    (*_MIXIN, "decode_batch_idx"),
+    (*_MIXIN, "evict"),
+    (*_MIXIN, "kv_committed_len"),
+    (*_MIXIN, "kv_allocated_len"),
+    (*_RESOLVE, "kv_committed_len"),
+    (*_RESOLVE, "spec_verify_ct"),
+    # spec v1: each verify path owns its own settlement
+    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_committed_len"),
+    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_allocated_len"),
+    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "spec_verify_ct"),
+    ("speculative/ngram_info.py", "NgramVerifyInput._fill_requests", "spec_verify_ct"),
+    ("speculative/ngram_info.py", "NgramVerifyInput._free_cache", "kv_committed_len"),
+    ("speculative/ngram_info.py", "NgramVerifyInput._free_cache", "kv_allocated_len"),
+    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_committed_len"),
+    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_allocated_len"),
+    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "spec_verify_ct"),
+    # disaggregation decode prealloc
+    ("disaggregation/decode.py", "DecodePreallocQueue._pre_alloc", "kv_committed_len"),
+    ("disaggregation/decode.py", "DecodePreallocQueue._pre_alloc", "kv_allocated_len"),
+    # streaming session slot save/restore and tail trimming
+    (_SS, "SessionSlot.save_from_req", "kv_committed_len"),
+    (_SS, "SessionSlot.save_from_req", "kv_allocated_len"),
+    (_SS, "SessionSlot.restore_to_req", "kv_committed_len"),
+    (_SS, "SessionSlot.restore_to_req", "kv_allocated_len"),
+    (_SS, "StreamingSession._free_tail", "kv_committed_len"),
+    (_SS, "StreamingSession._free_tail", "kv_allocated_len"),
+    (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"),
+    (_SS, "StreamingSession._trim_overshoot", "kv_allocated_len"),
+    (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"),
 }
 
 
@@ -82,10 +121,10 @@ def _scan_tree(tree):
             for target in targets:
                 if (
                     isinstance(target, ast.Attribute)
-                    and target.attr == _CLOCK_ATTR
+                    and target.attr in _TRACKED_ATTRS
                     and not _is_zero_reset(node)
                 ):
-                    sites.add((scope, "tick"))
+                    sites.add((scope, target.attr))
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
