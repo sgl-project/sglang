@@ -173,6 +173,11 @@ class UnifiedLRUList:
         self.cache[node.id] = node
         self._add_node(node)
 
+    def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
+        assert node.id not in self.cache
+        self.cache[node.id] = node
+        self._add_node_after(prev_node, node)
+
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
         del self.cache[node.id]
@@ -218,6 +223,11 @@ class UnifiedLRUList:
 
     def in_list(self, node: Optional[UnifiedTreeNode]):
         return node is not None and node.id in self.cache
+
+    def get_raw_prev(self, node: UnifiedTreeNode):
+        """Return the immediate LRU predecessor, including locked nodes."""
+        assert node.id in self.cache
+        return node.lru_prev[self._pt]
 
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
@@ -1011,8 +1021,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return result
 
     def _split_node(
-        self, key: RadixKey, child: UnifiedTreeNode, split_len: int
+        self,
+        key: RadixKey,
+        child: UnifiedTreeNode,
+        split_len: int,
+        preserve_lru_position: bool = False,
     ) -> UnifiedTreeNode:
+        """Split a radix node.
+
+        When preserve_lru_position is true, device component LRU entries are
+        reinserted as parent then child at the child's original position. This
+        preserves their local eviction order without treating the split as a
+        cache hit.
+        """
         new_node = UnifiedTreeNode(self.tree_components, priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -1020,6 +1041,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
 
+        device_lru_prev: dict[ComponentType, UnifiedTreeNode] = {}
+        if preserve_lru_position:
+            new_node.last_access_time = child.last_access_time
+            for ct in self.tree_components:
+                if ct == BASE_COMPONENT_TYPE:
+                    continue
+                lru = self.lru_lists[ct]
+                if lru.in_list(child):
+                    device_lru_prev[ct] = lru.get_raw_prev(child)
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
         child.parent = new_node
@@ -1035,13 +1065,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
 
-        self._for_each_component_lru(
-            new_node, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        self._for_each_component_lru(
-            child, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        child.last_access_time = get_and_increase_time_counter()
+        if preserve_lru_position:
+            for ct, prev_node in device_lru_prev.items():
+                lru = self.lru_lists[ct]
+                insert_after = prev_node
+                if new_node.component_data[ct].value is not None:
+                    lru.insert_after(insert_after, new_node)
+                    insert_after = new_node
+                if child.component_data[ct].value is not None:
+                    lru.insert_after(insert_after, child)
+        else:
+            self._for_each_component_lru(
+                new_node, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            self._for_each_component_lru(
+                child, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            child.last_access_time = get_and_increase_time_counter()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
