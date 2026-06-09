@@ -18,9 +18,32 @@ spec:
         - name: router
           image: sgl-router:e2e
           imagePullPolicy: Never
+          # Configured entirely via CLI flags. K8s EndpointSlice discovery
+          # watches `app=sglang` pods in this namespace. The aggressive
+          # circuit breaker (threshold 1, 5s cool-down) lets a terminating
+          # pod's connection-refused immediately drop it from the candidate
+          # set — the reconciliation tests scale workers rapidly and depend
+          # on fast eviction to absorb the churn.
           args:
-            - "--config"
-            - "/etc/config/router.toml"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8090"
+            - "--model-id"
+            - "tiny"
+            - "--tokenizer-path"
+            - "/etc/tokenizer/tiny.json"
+            - "--policy"
+            - "round_robin"
+            - "--cb-threshold"
+            - "1"
+            - "--cb-cool-down-secs"
+            - "5"
+            - "--service-discovery"
+            - "--service-discovery-namespace"
+            - "sgl-router-test"
+            - "--selector"
+            - "app=sglang"
           ports:
             - containerPort: 8090
               name: http
@@ -36,13 +59,6 @@ spec:
               port: 8090
             initialDelaySeconds: 5
             periodSeconds: 10
-          volumeMounts:
-            - name: config
-              mountPath: /etc/config
-      volumes:
-        - name: config
-          configMap:
-            name: sgl-router-config
 ---
 apiVersion: v1
 kind: Service

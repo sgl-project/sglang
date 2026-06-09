@@ -109,6 +109,9 @@ class SchedulerStats:
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
+    # Adaptive speculative decoding (currently active tier).
+    spec_num_steps: int = 0
+    spec_num_draft_tokens: int = 0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -391,6 +394,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Weight update
+        # =================================================================
+        self.weight_load_duration_seconds = Gauge(
+            name="sglang:weight_load_duration_seconds",
+            documentation=(
+                "Wall time of the most recent update_weights_from_<source> call on "
+                "this scheduler rank (seconds). `source` label is one of: disk, "
+                "distributed, tensor, ipc. Event-detection via "
+                "changes(...[<range>]) > 0 — no separate counter needed."
+            ),
+            labelnames=[*labels.keys(), "source"],
+            multiprocess_mode="mostrecent",
+        )
+
+        # =================================================================
         # Speculative decoding
         # =================================================================
         self.spec_accept_length = Gauge(
@@ -402,6 +420,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
             documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_num_steps = Gauge(
+            name="sglang:spec_num_steps",
+            documentation="Currently active speculative_num_steps.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_num_draft_tokens = Gauge(
+            name="sglang:spec_num_draft_tokens",
+            documentation="Currently active speculative_num_draft_tokens (decouples from steps under topk>1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1109,6 +1139,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
+    def observe_weight_load(self, duration_seconds: float, source: str) -> None:
+        # Edge-triggered: engine is paused during the update, so log_stats
+        # won't fire — write the gauge inline at end of update_weights_from_*.
+        # `source` is "disk" | "distributed" | "tensor" | "ipc".
+        self.weight_load_duration_seconds.labels(**self.labels, source=source).set(
+            duration_seconds
+        )
+
     def observe_prefill_delayer_outcome(
         self,
         forward_passes: int,
@@ -1248,6 +1286,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
+        self._log_gauge(self.spec_num_draft_tokens, stats.spec_num_draft_tokens)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
