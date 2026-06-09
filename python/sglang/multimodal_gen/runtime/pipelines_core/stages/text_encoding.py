@@ -22,7 +22,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
+    ConditionEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -66,7 +68,7 @@ def stack_tensors(name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(tensors, dim=0)
 
 
-class TextEncodingStage(PipelineStage):
+class TextEncodingStage(ConditionEncodingStage):
     """
     Stage for encoding text prompts into embeddings for diffusion models.
 
@@ -247,12 +249,21 @@ class TextEncodingStage(PipelineStage):
     ) -> None:
         assert batch.negative_prompt_embeds is not None
 
-        # a single negative prompt can be shared across positive prompts
-        target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
+        # a single negative prompt can be shared across positive prompts.
+        # 2-D embeddings (seq × dim, e.g. Z-Image single-prompt) carry no explicit
+        # batch dimension; treat them as batch=1.
+        target_batch_sizes = [
+            1 if pe.ndim == 2 else pe.shape[0] for pe in prompt_embeds_list
+        ]
 
         def align_negative_batch_dim(
             tensor: torch.Tensor, target_batch: int, name: str
         ) -> torch.Tensor:
+            # 2-D: seq × dim with no batch dim — implicitly batch=1.
+            if tensor.ndim == 2:
+                if target_batch > 1:
+                    return tensor.unsqueeze(0).repeat(target_batch, 1, 1)
+                return tensor
             if tensor.shape[0] == target_batch:
                 return tensor
             if tensor.shape[0] == 1 and target_batch > 1:
@@ -429,7 +440,7 @@ class TextEncodingStage(PipelineStage):
         # TODO: Keep this begin-only interval until manager supports explicit
         # declared-use interval grouping. Wrapping each encoder call separately
         # can offload between positive and negative prompt encoding.
-        manager.before_use(use)
+        manager.begin_use(use, module=self.text_encoders[encoder_index])
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
         if not getattr(text_encoder, "uses_sglang_forward_context", True):

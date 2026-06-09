@@ -30,6 +30,7 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     KVCache,
@@ -37,6 +38,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -78,18 +80,19 @@ def synchronized(func):
     return wrapper
 
 
-class HostTensorAllocator(abc.ABC):
+class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
         self.dims = None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        """Allocate a tensor of given dims and dtype on the memory."""
+        assert (
+            device == "cpu"
+        ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
         self.dtype = dtype
         self.dims = dims
-        tensor = torch.empty(dims, dtype=dtype, device=device)
-        return tensor
+        return alloc_mmap(dims, dtype)
 
 
 class HiSparseHostPoolMixin:
@@ -187,9 +190,16 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-        )
+        cudart = torch.cuda.cudart()
+        n_bytes = buffer.numel() * buffer.element_size()
+        rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+        if int(rc) != 0:
+            raise RuntimeError(
+                f"cudaHostRegister failed (rc={int(rc)}, "
+                f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
+                f"size={n_bytes}; host buffer is not pinned and device transfers "
+                f"may silently return stale data."
+            )
     return buffer
 
 
@@ -321,6 +331,19 @@ class HostKVCache(abc.ABC):
         Set a flat data page to the host memory pool.
         """
         raise NotImplementedError()
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        Subclasses should override this with a layout-specific stride formula.
+        This base implementation logs a warning and returns False (safe default).
+        """
+        logger.warning(
+            "%s does not implement is_stride_page_aligned(); assuming not aligned. "
+            "O_DIRECT with a file-based NIXL backend will fall back to copy mode for this pool.",
+            type(self).__name__,
+        )
+        return False
 
     @synchronized
     def clear(self):
@@ -848,6 +871,30 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        When O_DIRECT is used with any file-based NIXL backend, every data pointer
+        passed to the kernel must be page-aligned.  In zero-copy mode the
+        pointer for KV page ``p`` is:
+
+            base_ptr + p * page_size * layer_num * head_num * head_dim * itemsize
+
+        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
+        stride must itself be a multiple of the OS page size.
+        """
+        if self.layout not in ("page_first", "page_first_direct", "page_head"):
+            return False
+        stride = (
+            self.page_size
+            * self.layer_num
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
+        return base_aligned and stride % page_size_bytes == 0
+
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
@@ -1247,6 +1294,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        When O_DIRECT is used with any file-based NIXL backend, every data pointer
+        passed to the kernel must be page-aligned.  In zero-copy mode the
+        pointer for KV page ``p`` is:
+
+            base_ptr + p * page_size * layer_num * kv_cache_dim * itemsize
+
+        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
+        stride must itself be a multiple of the OS page size.
+        """
+        if self.layout not in ("page_first", "page_first_direct"):
+            return False
+        stride = (
+            self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+        )
+        base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
+        return base_aligned and stride % page_size_bytes == 0
 
 
 class MambaPoolHost(HostKVCache):
@@ -1808,7 +1875,7 @@ class LogicalHostPool:
         return 0
 
 
-class DeepSeekV4PagedHostPool(HostKVCache):
+class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     """Host mirror for a DeepSeek V4 paged KV/indexer sub-pool."""
 
     def __init__(
@@ -1913,13 +1980,27 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         )
         self.clear()
 
+    def get_contiguous_buf_infos(self):
+        """Return per-layer page-row buffers for PD direct-to-host transfer."""
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        if indices.numel() % self.slot_page_size != 0:
-            raise ValueError(
-                f"{self.pool_name} transfer indices must be page-aligned, "
-                f"got numel={indices.numel()}, slot_page_size={self.slot_page_size}"
-            )
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+
+    def _has_transfer_indices(
+        self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
+    ) -> bool:
+        if host_indices is None or device_indices is None:
+            return False
+        if host_indices.numel() != device_indices.numel():
+            raise ValueError(
+                f"{self.pool_name} transfer index size mismatch: "
+                f"host={host_indices.numel()}, device={device_indices.numel()}"
+            )
+        return host_indices.numel() > 0
 
     def get_size_per_token(self):
         return self.item_bytes
@@ -1960,12 +2041,26 @@ class DeepSeekV4PagedHostPool(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        if host_indices is None or device_indices is None:
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        if (
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            # Whole C4 pages can use the normal HiCache page-row copy below.
+            # Token-granular DSV4 C4 copy needs this helper because a token is
+            # not one contiguous byte range in the paged row:
+            # [value0..value63][scale0..scale63].
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.device_ptrs,
+                dst_ptrs=self.data_ptrs,
+                src_indices=device_indices.to(dtype=torch.int64),
+                dst_indices=host_indices.to(dtype=torch.int64),
+            )
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
-            assert self.data_ptrs is not None
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
                 dst_layers=self.data_ptrs,
@@ -2008,10 +2103,24 @@ class DeepSeekV4PagedHostPool(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        if host_indices is None or device_indices is None:
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        if (
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            # Same DSV4 C4 layout issue as backup: this is token-granular
+            # preload, so it cannot use the normal HiCache page-row copy.
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
+                dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
+                src_indices=host_indices.to(dtype=torch.int64),
+                dst_indices=device_indices.to(dtype=torch.int64),
+            )
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
@@ -2465,8 +2574,8 @@ class PoolEntry:
     device_evict_fn: Optional[Callable] = None
     # Optional alloc/free overrides for the device side, used by
     # _resolve_pool_transfers_allocation. Set when entry.device_pool is the
-    # raw KV pool (layout) rather than an allocator (e.g. SWA, where alloc
-    # lives on a separate sub-allocator inside SWATokenToKVPoolAllocator).
+    # raw KV/state pool (layout) rather than an allocator (e.g. SWA/Mamba,
+    # where alloc lives on a separate allocator object).
     # When None, fall back to entry.device_pool.alloc/free.
     device_alloc_fn: Optional[Callable] = None
     device_free_fn: Optional[Callable] = None

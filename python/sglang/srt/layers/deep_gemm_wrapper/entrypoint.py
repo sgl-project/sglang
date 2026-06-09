@@ -20,6 +20,9 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
+    if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
+        deep_gemm.set_pdl(True)
+
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 
@@ -183,6 +186,25 @@ def gemm_nt_bf16bf16f32(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+
+
+def tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_splits: Optional[int],
+):
+    m, k = x.shape
+    n, _ = fn.shape
+    num_splits_key = num_splits if num_splits is not None else 0
+    kernel_type = compile_utils.DeepGemmKernelType.TF32_HC_PRENORM_GEMM
+
+    if m == 0:
+        return
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_splits_key, kernel_type):
+        deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
