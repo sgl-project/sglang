@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
     is_flashinfer_available,
+    is_sm90_supported,
     is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -42,18 +43,32 @@ _flashinfer_allreduce_supports_trigger_completion = False
 _mnnvl_non_blackwell_fallback_logged = False
 
 
-def _resolve_backend(backend: str) -> str:
+def _mnnvl_supported(is_multi_node: bool) -> bool:
+    """Whether the mnnvl backend is usable on the current system.
+
+    mnnvl runs on Blackwell (SM10x) for both single- and multi-node, and on
+    SM90 for single-node only. Multi-node mnnvl on non-Blackwell is not
+    supported and must fall back to trtllm.
+    """
+    if is_sm100_supported():
+        return True
+    return is_sm90_supported() and not is_multi_node
+
+
+def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
     global _mnnvl_non_blackwell_fallback_logged
 
     if backend == "auto":
-        return "mnnvl" if is_sm100_supported() else "trtllm"
+        # Prefer mnnvl wherever it is supported (any Blackwell system, or SM90
+        # single-node); fall back to trtllm otherwise.
+        return "mnnvl" if _mnnvl_supported(is_multi_node) else "trtllm"
 
-    if backend == "mnnvl" and not is_sm100_supported():
+    if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
         if not _mnnvl_non_blackwell_fallback_logged:
             logger.info(
                 "FlashInfer allreduce fusion: forcing trtllm backend "
-                "(mnnvl is only enabled on Blackwell systems)."
+                "(mnnvl requires a Blackwell system, or SM90 single-node)."
             )
             _mnnvl_non_blackwell_fallback_logged = True
         return "trtllm"
@@ -64,7 +79,8 @@ def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
     backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
     if backend is None:
         return None
-    return _resolve_backend(backend)
+    is_multi_node = getattr(server_args, "nnodes", 1) > 1
+    return _resolve_backend(backend, is_multi_node)
 
 
 if is_flashinfer_available():
@@ -182,14 +198,16 @@ if is_flashinfer_available():
 # FlashInfer allreduce fusion backend support matrix for
 # --flashinfer-allreduce-fusion-backend:
 #
-#   Backend   | SM103 | SM100 | SM90 | Single-Node | Multi-Node |
-#   --------- | ----- | -- -- | ---- | ----------- | ---------- |
-#   trtllm    | Yes   | Yes   | Yes  | Yes         | No         |
-#   mnnvl     | Yes   | Yes   | No   | Yes         | Yes        |
+#   Backend   | SM103 | SM100 | SM90        | Single-Node | Multi-Node |
+#   --------- | ----- | ----- | ----------- | ----------- | ---------- |
+#   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
+#   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
 #
-# auto/mnnvl: only resolves to mnnvl on Blackwell GPUs (SM10x) where it has
-# been validated. On every other platform the selection is forced to trtllm
-# (see _resolve_backend).
+# mnnvl runs on any Blackwell GPU (SM10x) for both single- and multi-node, and
+# on SM90 for single-node only. auto resolves to mnnvl wherever it is supported
+# and to trtllm otherwise. An explicit mnnvl request on an unsupported
+# configuration (e.g. SM90 multi-node) falls back to trtllm (see
+# _resolve_backend).
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
@@ -647,10 +665,12 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_backend = get_global_server_args().flashinfer_allreduce_fusion_backend
+    server_args = get_global_server_args()
+    server_backend = server_args.flashinfer_allreduce_fusion_backend
     if server_backend is None:
         return False
-    backend = _resolve_backend(server_backend)
+    is_multi_node = getattr(server_args, "nnodes", 1) > 1
+    backend = _resolve_backend(server_backend, is_multi_node)
 
     if (
         not workspace_manager.initialized

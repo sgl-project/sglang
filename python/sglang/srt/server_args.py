@@ -2591,8 +2591,9 @@ class ServerArgs:
         # FlashInfer's TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
         # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
-        # trtllm: single-node. mnnvl: single-node and multi-node on SM100.
-        # auto resolves to mnnvl on SM100 and trtllm otherwise.
+        # trtllm: single-node. mnnvl: single-node on SM90, single- and
+        # multi-node on SM100. auto resolves to mnnvl wherever it is supported
+        # (SM100, or SM90 single-node) and to trtllm otherwise.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch

@@ -70,16 +70,42 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 class TestFlashInferCommFusion(unittest.TestCase):
     def test_auto_backend_resolves_by_arch(self):
-        args = types.SimpleNamespace(flashinfer_allreduce_fusion_backend="auto")
+        single_node = types.SimpleNamespace(
+            flashinfer_allreduce_fusion_backend="auto", nnodes=1
+        )
+        multi_node = types.SimpleNamespace(
+            flashinfer_allreduce_fusion_backend="auto", nnodes=2
+        )
 
+        # Blackwell: mnnvl regardless of node count.
         with patch.object(fusion, "is_sm100_supported", return_value=True):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(args), "mnnvl"
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node), "mnnvl"
+            )
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node), "mnnvl"
             )
 
-        with patch.object(fusion, "is_sm100_supported", return_value=False):
+        # SM90: mnnvl on single-node, trtllm fallback on multi-node.
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=False),
+            patch.object(fusion, "is_sm90_supported", return_value=True),
+        ):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(args), "trtllm"
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node), "mnnvl"
+            )
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node), "trtllm"
+            )
+
+        # Pre-SM90: trtllm everywhere.
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=False),
+            patch.object(fusion, "is_sm90_supported", return_value=False),
+        ):
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
+                "trtllm",
             )
 
     def test_allreduce_fusion_backends_match_torch_baseline(self):
