@@ -123,8 +123,10 @@ def test_per_token_group_quant_with_column_major(
         pytest.skip("Only Blackwell need ue8m0 fusion")
         return
 
-    if (flags["scale_ue8m0"] and (group_size != 128)) or (
-        (dst_dtype == torch.int8) and flags["column_major_scales"]
+    if (
+        (flags["scale_ue8m0"] and (group_size != 128))
+        or ((dst_dtype == torch.int8) and flags["column_major_scales"])
+        or flags["fuse_silu_and_mul"]
     ):
         pytest.skip()
         return
@@ -154,8 +156,11 @@ def test_per_token_group_quant_with_column_major(
         *triton_per_token_group_quant_8bit(**execute_kwargs)
     )
 
-    fuse_silu_and_mul = False
-    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+    scale_ue8m0 = flags["scale_ue8m0"]
+    column_major_scales = flags["column_major_scales"]
+    scale_tma_aligned = flags["scale_tma_aligned"]
+
+    out_shape = x.shape
 
     fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
@@ -165,10 +170,15 @@ def test_per_token_group_quant_with_column_major(
         x_shape=out_shape,
         device=x.device,
         group_size=group_size,
-        column_major_scales=False,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
     )
+    if scale_ue8m0:
+        # The JIT kernel writes one uint8 per int32 slot; zero-init so unused
+        # bytes within each pack don't contain garbage when num_groups_per_row
+        # is not a multiple of 4.
+        x_s.zero_()
 
     execute_kwargs = dict(
         input=x,
@@ -178,6 +188,7 @@ def test_per_token_group_quant_with_column_major(
         eps=1e-10,
         fp8_max=fp8_max,
         fp8_min=fp8_min,
+        scale_ue8m0=scale_ue8m0,
     )
     x_q_sglang, x_s_sglang = _postprocess(
         *sglang_per_token_group_quant_8bit(**execute_kwargs)
