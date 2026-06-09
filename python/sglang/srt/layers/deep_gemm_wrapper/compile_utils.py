@@ -32,6 +32,7 @@ _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
+_AUTO_TF32_HC_PRENORM_NUM_SPLITS = -1
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -109,6 +110,14 @@ class DeepGemmKernelType(IntEnum):
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
 
+def _compute_num_split_for_tf32_hc_prenorm_gemm(m: int, k: int) -> int:
+    block_m, block_k = 64, 64
+    grid_size = ceil_div(m, block_m)
+    num_block_k = ceil_div(k, block_k)
+    n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+
+
 # TODO improve code
 def _maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
@@ -119,7 +128,12 @@ def _maybe_compile_deep_gemm_one_type_all(
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
 
-    query_key = (kernel_type, n, k, num_groups)
+    compile_num_groups = (
+        _AUTO_TF32_HC_PRENORM_NUM_SPLITS
+        if kernel_type == DeepGemmKernelType.TF32_HC_PRENORM_GEMM and num_groups > 0
+        else num_groups
+    )
+    query_key = (kernel_type, n, k, compile_num_groups)
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
@@ -141,7 +155,7 @@ def _maybe_compile_deep_gemm_one_type_all(
 
         logger.info(
             f"Try DeepGEMM JIT Compiling for "
-            f"<{kernel_type.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
+            f"<{kernel_type.name}> N={n}, K={k}, num_groups={compile_num_groups} with all Ms."
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
@@ -149,7 +163,7 @@ def _maybe_compile_deep_gemm_one_type_all(
             kernel_type=kernel_type,
             n=n,
             k=k,
-            num_groups=num_groups,
+            num_groups=compile_num_groups,
             m_list=_BUILTIN_M_LIST,
         )
 
@@ -172,6 +186,18 @@ def _compile_deep_gemm_one_type_all(
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+        elif (
+            kernel_type == DeepGemmKernelType.TF32_HC_PRENORM_GEMM
+            and num_groups == _AUTO_TF32_HC_PRENORM_NUM_SPLITS
+        ):
+            max_m = max(m_list)
+            # Fast warmup samples larger Ms sparsely. Add one representative M for
+            # each MHC prenorm split bucket so all num_splits variants are compiled.
+            representatives = {
+                _compute_num_split_for_tf32_hc_prenorm_gemm(m, k): m
+                for m in range(1, max_m + 1)
+            }
+            m_list = sorted(set(m_list) | set(representatives.values()))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
         memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
@@ -273,7 +299,10 @@ class _BaseWarmupExecutor:
         elif kernel_type == DeepGemmKernelType.TF32_HC_PRENORM_GEMM:
             # The generic hook's fourth dimension is num_splits for MHC.
             # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
-            num_splits = num_groups if num_groups > 0 else 1
+            if num_groups == _AUTO_TF32_HC_PRENORM_NUM_SPLITS:
+                num_splits = _compute_num_split_for_tf32_hc_prenorm_gemm(1, k)
+            else:
+                num_splits = num_groups if num_groups > 0 else 1
             return (max_m * k * 2 + n * k * 4 + num_splits * max_m * (n + 1) * 4) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
@@ -410,29 +439,37 @@ class _TF32HcPrenormWarmupExecutor(_BaseWarmupExecutor):
         self.x = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
         self.fn = torch.empty((n, k), device="cuda", dtype=torch.float32)
         self.n = n
+        self.k = k
         # The generic warmup executor's num_groups argument is num_splits here.
         # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
-        self.num_splits = num_groups if num_groups > 0 else None
+        self.num_splits = (
+            num_groups
+            if num_groups == _AUTO_TF32_HC_PRENORM_NUM_SPLITS or num_groups > 0
+            else None
+        )
 
     def execute(self, m):
-        if self.num_splits is None:
+        num_splits = (
+            _compute_num_split_for_tf32_hc_prenorm_gemm(m, self.k)
+            if self.num_splits == _AUTO_TF32_HC_PRENORM_NUM_SPLITS
+            else self.num_splits
+        )
+        if num_splits is None:
             out = torch.empty((m, self.n), device="cuda", dtype=torch.float32)
             sqrsum = torch.empty((m,), device="cuda", dtype=torch.float32)
         else:
             # Slicing the middle dimension of a preallocated
             # (num_splits, max_m, n) output would create a strided view.
             out = torch.empty(
-                (self.num_splits, m, self.n), device="cuda", dtype=torch.float32
+                (num_splits, m, self.n), device="cuda", dtype=torch.float32
             )
-            sqrsum = torch.empty(
-                (self.num_splits, m), device="cuda", dtype=torch.float32
-            )
+            sqrsum = torch.empty((num_splits, m), device="cuda", dtype=torch.float32)
         deep_gemm.tf32_hc_prenorm_gemm(
             self.x[:m],
             self.fn,
             out,
             sqrsum,
-            num_splits=self.num_splits,
+            num_splits=num_splits,
         )
 
 
