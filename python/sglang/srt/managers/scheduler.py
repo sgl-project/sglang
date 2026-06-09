@@ -919,16 +919,16 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
-    def _activate(self, req: Req) -> None:
+    def _activate_req(self, req: Req) -> None:
         if req.is_dllm():
             return
         assert req.rid not in self.active_reqs, f"already active: {req.rid}"
         self.active_reqs[req.rid] = req
 
-    def _deactivate(self, req: Req) -> None:
+    def _deactivate_req(self, req: Req) -> None:
         self.active_reqs.pop(req.rid, None)
 
-    def _assert_invariants(self) -> None:
+    def _assert_reqs_invariants(self) -> None:
         if not os.environ.get("DEBUG_INVARIANTS"):
             return
         if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -1792,7 +1792,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
-            deactivate_req=self._deactivate,
+            deactivate_req=self._deactivate_req,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2446,7 +2446,7 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        self._assert_invariants()
+        self._assert_reqs_invariants()
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -2455,7 +2455,12 @@ class Scheduler(
             self.dllm_manager.filter_finished_reqs()
 
         for req in self.chunked_reqs():
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            # Stash (cache) the previous chunk only when it produced new KV
+            # beyond what is already cached. A chunk that committed no new KV
+            # leaves extend_range.end == len(prefix_indices), so caching would
+            # be a no-op; skip it to avoid a wasted insert pass.
+            if req.extend_range.end > len(req.prefix_indices):
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             for req in self.dllm_manager.staging_queue:
@@ -2551,7 +2556,7 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
-        self._assert_invariants()
+        self._assert_reqs_invariants()
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2747,13 +2752,13 @@ class Scheduler(
         for req in can_run_list:
             if req.rid in self.active_reqs:
                 continue
-            self._activate(req)
+            self._activate_req(req)
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
-                self._deactivate(req)
+                self._deactivate_req(req)
                 self._add_request_to_queue(req)
 
         chunked_in_batch = [r for r in can_run_list if r.has_pending_chunk]
@@ -2930,9 +2935,9 @@ class Scheduler(
             logger.warning(msg_prefix + msg_details)
 
             for req in reqs_to_abort:
-                self._deactivate(req)
+                self._deactivate_req(req)
             for req in retracted_reqs:
-                self._deactivate(req)
+                self._deactivate_req(req)
                 self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
@@ -3658,7 +3663,7 @@ class Scheduler(
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
-                self._deactivate(req)
+                self._deactivate_req(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -3728,9 +3733,12 @@ class Scheduler(
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # manipulation logic and the accounting bugs that come with it.
+            # All scheduler state (running_batch, last_batch, result_queue) is
+            # left untouched. On resume, the normal event loop
+            # (get_next_batch_to_run) handles last_batch merge and overlap
+            # result processing through the standard code paths. This avoids
+            # duplicating batch manipulation logic and the accounting bugs that
+            # come with it.
             return
 
         if self.enable_overlap and self.last_batch:
@@ -3771,7 +3779,7 @@ class Scheduler(
                     tree_cache=self.tree_cache,
                     hisparse_coordinator=self.hisparse_coordinator,
                 )
-                self._deactivate(req)
+                self._deactivate_req(req)
                 self._add_request_to_queue(req)
 
             self.running_batch.reqs = []

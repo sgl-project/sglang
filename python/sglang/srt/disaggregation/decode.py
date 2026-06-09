@@ -1844,7 +1844,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                self._activate(req)
+                self._activate_req(req)
                 tree_cache = (
                     None
                     if self.server_args.disaggregation_decode_enable_radix_cache
@@ -1865,6 +1865,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,

@@ -1553,29 +1553,6 @@ def release_req(
     req.reset_for_retract()
 
 
-def retract_all(
-    *,
-    reqs: List[Req],
-    server_args: ServerArgs,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
-) -> List[Req]:
-    retracted_reqs = reqs
-    for idx in range(len(reqs)):
-        release_req(
-            req=reqs[idx],
-            remaing_req_count=len(reqs) - idx,
-            server_args=server_args,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            hisparse_coordinator=hisparse_coordinator,
-        )
-    return retracted_reqs
-
-
 def compute_extend_logprob_start_len(
     *,
     logprob_start_len: int,
@@ -2137,7 +2114,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
+                # We will need req.extend_range.length - extend_logprob_start_lens[i]
+                # number of tokens, and logprob_token_ids is for input logprob,
+                # so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
@@ -2758,10 +2737,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "merge_batch requires the other batch to be decode-ready; "
                 f"got modes={other.output_process_mode}"
             )
-            if not self.output_process_mode:
-                self.output_process_mode = list(other.output_process_mode)
-            else:
-                self.output_process_mode.extend(other.output_process_mode)
+            self.output_process_mode.extend(other.output_process_mode)
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
