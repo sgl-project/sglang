@@ -534,15 +534,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
 
+        # Main's monolithic BCG runner never invokes
+        # on_after_cuda_graph_warmup between warmup iterations — the BCG
+        # contract is to keep warmup state untouched and let
+        # init_forward_metadata_in_graph (recorded inside the captured
+        # forward) do any raw->full upgrade. cg-refactor's runner_backend
+        # abstraction exposes a post_warmup_hook for backends that need
+        # workspace cleanup between iterations; suppress it for BCG so
+        # DSV4's hook (which restores forward_metadata to a stale
+        # _current_capture_raw left over from decode CG capture) doesn't
+        # corrupt warmup iter 2's metadata read.
+        if isinstance(self.backend, BreakableCudaGraphBackend):
+            post_warmup_hook = None
+        else:
+            post_warmup_hook = getattr(
+                attn_backend, "on_after_cuda_graph_warmup", None
+            )
         self.backend.capture_one(
             num_tokens,
             run_once,
             dummies=None,
-            post_warmup_hook=getattr(
-                attn_backend,
-                "on_after_cuda_graph_warmup",
-                None,
-            ),
+            post_warmup_hook=post_warmup_hook,
         )
 
     # -----------------------------------------------------------------
