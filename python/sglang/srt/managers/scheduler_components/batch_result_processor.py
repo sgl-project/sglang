@@ -630,6 +630,22 @@ class SchedulerBatchResultProcessor:
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
+        # NGRAM verify flattens logits_output.hidden_states to
+        # [sum(num_accept_per_req), hidden_dim] (one row per accepted token, incl.
+        # bonus, in batch-row order). To attribute rows back to their request we
+        # need per-req boundaries; the legacy `hidden_states[i]` indexing only
+        # ever pulled one row per step.
+        ngram_hs_offsets = None
+        if (
+            is_spec_v1
+            and batch.spec_algorithm.is_ngram()
+            and logits_output.hidden_states is not None
+            and result.num_correct_drafts_per_req_cpu is not None
+        ):
+            ngram_hs_offsets = [0]
+            for c in result.num_correct_drafts_per_req_cpu:
+                ngram_hs_offsets.append(ngram_hs_offsets[-1] + c + 1)
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -646,9 +662,18 @@ class SchedulerBatchResultProcessor:
                     req, batch, result, i, logits_output
                 )
                 if req.return_hidden_states and logits_output.hidden_states is not None:
-                    req.hidden_states.append(
-                        logits_output.hidden_states[i].cpu().clone().tolist()
-                    )
+                    if ngram_hs_offsets is not None:
+                        start, end = ngram_hs_offsets[i], ngram_hs_offsets[i + 1]
+                        req.hidden_states.extend(
+                            logits_output.hidden_states[start:end]
+                            .cpu()
+                            .clone()
+                            .tolist()
+                        )
+                    else:
+                        req.hidden_states.append(
+                            logits_output.hidden_states[i].cpu().clone().tolist()
+                        )
                 if req.grammar is not None:
                     req.grammar.finished = req.finished()
                 continue
