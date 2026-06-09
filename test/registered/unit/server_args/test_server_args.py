@@ -1,8 +1,11 @@
+import importlib
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -657,6 +660,59 @@ class TestCutedslMoeMaxNumTokens(unittest.TestCase):
             cuda_graph_max_bs=64,
         )
         self.assertEqual(args.cutedsl_moe_max_num_tokens(), 512)
+
+
+class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
+    """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
+
+    The choice set is built once at server_args.py import time, so each subtest
+    reloads the module with the env var set to the desired value.
+    """
+
+    def _reload_server_args_with_env(self, *, enabled: bool):
+        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
+        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
+        try:
+            return importlib.reload(server_args_module)
+        finally:
+            if previous is None:
+                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+            else:
+                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+
+    def test_token_oracle_rejected_when_env_disabled(self):
+        reloaded = self._reload_server_args_with_env(enabled=False)
+        self.assertNotIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+
+        with self.assertRaises(SystemExit):
+            reloaded.prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--sampling-backend",
+                    "token_oracle",
+                ]
+            )
+
+    def test_token_oracle_accepted_when_env_enabled(self):
+        reloaded = self._reload_server_args_with_env(enabled=True)
+        self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+
+        parsed = reloaded.prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--sampling-backend",
+                "token_oracle",
+                # Explicit device so ServerArgs.__post_init__ does not call
+                # get_device() (fails on CPU-only CI runners) and does not run
+                # _handle_cpu_backends (which would override sampling_backend
+                # to "pytorch", masking what we want to verify).
+                "--device",
+                "cuda",
+            ]
+        )
+        self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
 if __name__ == "__main__":

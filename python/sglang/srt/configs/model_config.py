@@ -531,6 +531,7 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         ]
 
     def _detect_attention_sinks(self) -> bool:
@@ -1144,6 +1145,7 @@ class ModelConfig:
             "mxfp4",
             "auto-round",
             "quark_int4fp8_moe",
+            "quark_mxfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -1166,6 +1168,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "modelslim",
+            "quark_mxfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -1509,11 +1512,13 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 multimodal_model_archs = [
     "CLIPModel",
+    "Cohere2VisionForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
@@ -1693,6 +1698,7 @@ def is_hybrid_swa_model(
         "Step3p7ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
@@ -1756,6 +1762,7 @@ def get_hybrid_layer_ids(
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
+        or "Gemma4UnifiedForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [

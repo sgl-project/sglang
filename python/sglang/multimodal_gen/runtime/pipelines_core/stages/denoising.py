@@ -10,14 +10,13 @@ import math
 import os
 import time
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
@@ -43,6 +42,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_group,
     get_world_group,
     get_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
     run_cfg_parallel,
@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
+    world_group_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -610,7 +611,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         scheduler = batch.scheduler
         assert scheduler is not None
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch, scheduler)
+        boundary_timestep = (
+            self._handle_boundary_ratio(server_args, batch, scheduler)
+            if self.transformer_2 is not None
+            else None
+        )
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
@@ -853,7 +858,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             "invalidations": 0,
         }
 
-        if ctx.is_warmup or get_world_group().local_rank != 0:
+        if not (active or requested):
+            return
+
+        if ctx.is_warmup or (
+            world_group_is_initialized() and get_world_group().local_rank != 0
+        ):
             return
 
         if active:
@@ -1075,7 +1085,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             not state
             or not state["requested"]
             or ctx.is_warmup
-            or get_world_group().local_rank != 0
+            or (world_group_is_initialized() and get_world_group().local_rank != 0)
         ):
             return
 
@@ -1118,7 +1128,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Gather noise_pred if using sequence parallelism
         # noise_pred has the same shape as latents (sharded along sequence dimension)
         if (
-            get_sp_world_size() > 1
+            self._sp_world_size() > 1
             and getattr(batch, "did_sp_shard_latents", False)
             and server_args.comfyui_mode
             and hasattr(batch, "noise_pred")
@@ -1167,7 +1177,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
-        if get_sp_world_size() <= 1:
+        if self._sp_world_size() <= 1:
             return
 
         if batch.latents is not None:
@@ -1205,7 +1215,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         trajectory_tensor: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
-        if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
+        if self._sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
             latents = self.server_args.pipeline_config.gather_latents_for_sp(
                 latents, batch=batch
             )
@@ -1230,6 +1240,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         if trajectory_tensor.shape[2] > orig_s:
                             trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
+
+    def _sp_world_size(self) -> int:
+        if not model_parallel_is_initialized():
+            return 1
+        return get_sp_world_size()
 
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
@@ -1476,16 +1491,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if accepts_var_kwargs:
             return kwargs
         return {k: v for k, v in kwargs.items() if k in param_names}
-
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
-        """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def _predict_noise_with_cfg(
         self,
