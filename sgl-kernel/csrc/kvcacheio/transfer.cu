@@ -354,11 +354,7 @@ void transfer_kv_launcher(
   int64_t v_item_size = different_head_dim ? item_size / k_head_dim * v_head_dim : item_size;
   // ``transfer_item_warp`` copies in uint64 chunks; rescaled V item size must
   // stay 8-byte aligned or the tail bytes are silently dropped.
-  TORCH_CHECK(
-      v_item_size % 8 == 0,
-      "Rescaled V item byte size (",
-      v_item_size,
-      ") must be divisible by 8");
+  TORCH_CHECK(v_item_size % 8 == 0, "Rescaled V item byte size (", v_item_size, ") must be divisible by 8");
 
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   if constexpr (PageHeadLayout) {
