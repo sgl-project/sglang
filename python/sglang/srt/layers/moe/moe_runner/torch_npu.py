@@ -128,7 +128,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             x,
             expert_tokens,
             pertoken_scale=runner_input.hidden_states_scale,
-            output_dtype=torch.bfloat16,
+            output_dtype=torch.float16,
             weight_prefix="w13",
             group_list_type=group_list_type,
         )
@@ -152,7 +152,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             hidden_states,
             expert_tokens,
             pertoken_scale=pertoken_scale,
-            output_dtype=torch.bfloat16,
+            output_dtype=torch.float16,
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
