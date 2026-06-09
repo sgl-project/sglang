@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     remote_instance_transfer_engine_enabled,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True, kw_only=True)
 class RemoteInstanceWeightTransporter:
+    server_args: ServerArgs
     get_model: Callable[[], torch.nn.Module]
     # Registration may run after the runner's construction scope has exited.
     tp_rank: int = field(init=False, default_factory=lambda: get_parallel().tp_rank)
@@ -57,9 +59,12 @@ class RemoteInstanceWeightTransporter:
         self.session_id = NetworkAddress(
             local_ip, self.engine.get_rpc_port()
         ).to_host_port_str()
-        self.parallelism_config = RankParallelismConfig.from_parallel_state(
-            self.tp_rank
-        )
+
+    def maybe_init_parallelism_config(self) -> None:
+        if self.server_args.registers_parallelism_config():
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
@@ -79,19 +84,19 @@ class RemoteInstanceWeightTransporter:
         # The P2P weight-update client needs each rank's parallelism layout to
         # map training-side parameters onto this rank's shards.
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            self.server_args.registers_parallelism_config()
             and self.parallelism_config is not None
         ):
             self._register_parallelism_config_to_bootstrap()
 
     def _bootstrap_url(self) -> str:
-        if self.server_args.dist_init_addr:
+        if get_parallel().dist_init_addr:
             bootstrap_host = (
-                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+                NetworkAddress.parse(get_parallel().dist_init_addr).resolved().host
             )
         else:
             bootstrap_host = "127.0.0.1"
-        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        bootstrap_port = get_model().engine_info_bootstrap_port
         return NetworkAddress(bootstrap_host, bootstrap_port).to_url()
 
     def _register_parallelism_config_to_bootstrap(self) -> None:

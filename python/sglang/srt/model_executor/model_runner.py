@@ -585,6 +585,7 @@ class ModelRunner:
 
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
+            server_args=self.server_args,
             get_model=lambda: self.model,
             gpu_id=self.gpu_id,
         )
@@ -685,6 +686,7 @@ class ModelRunner:
     def maybe_init_remote_instance_transfer_engine(self):
         if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
+        self.remote_instance_weight_transporter.maybe_init_parallelism_config()
 
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:

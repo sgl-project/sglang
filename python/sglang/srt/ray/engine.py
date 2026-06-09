@@ -182,6 +182,22 @@ def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> Non
         )
 
 
+def get_scheduler_actor_name(
+    *,
+    rank0_node_ip: str,
+    dp_rank: int,
+    pp_rank: int,
+    tp_rank: int,
+    pg_id_hex: str,
+    bundle_idx: int,
+) -> str:
+    return (
+        f"sglang_scheduler_node{rank0_node_ip}"
+        f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
+        f"_pg{pg_id_hex}_bundle{bundle_idx}"
+    )
+
+
 def _create_scheduler_actor(
     pg: PlacementGroup,
     bundle_idx: int,
@@ -203,14 +219,25 @@ def _create_scheduler_actor(
         rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
     """
+    rdt = server_args.enable_rdt_weight_sync
+
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
-        name=(
-            f"sglang_scheduler_node{rank0_node_ip}"
-            f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
-            f"_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+        # run_event_loop() blocks one thread for the actor's lifetime; leave a spare
+        # for pull_weights, which the trainer calls while generation is paused.
+        max_concurrency=2 if rdt else 1,
+        name=get_scheduler_actor_name(
+            rank0_node_ip=rank0_node_ip,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
+            tp_rank=tp_rank,
+            pg_id_hex=pg.id.hex()[:8],
+            bundle_idx=bundle_idx,
         ),
+        # SchedulerActor calls set_device() with the absolute id from
+        # get_accelerator_ids(), which is only valid if Ray leaves the mask alone.
+        runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_bundle_index=bundle_idx,
