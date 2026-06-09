@@ -988,7 +988,8 @@ class Req(ReqDllmMixin):
             return False
         if self.extend_range is None:
             return False
-        return 0 < self.extend_range.end < self.get_full_untruncated_fill_len()
+        assert self.extend_range.end > 0, f"{self.rid=} {self.extend_range=}"
+        return self.extend_range.end < self.get_full_untruncated_fill_len()
 
     @property
     def is_prefill_only(self) -> bool:
