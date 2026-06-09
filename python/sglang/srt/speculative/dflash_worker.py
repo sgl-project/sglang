@@ -108,11 +108,19 @@ class DFlashWorker:
             # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
             import torch as _torch
 
-            draft_backend = "triton" if _torch.version.hip else "flashinfer"
+            draft_backend = (
+                "ascend"
+                if is_npu()
+                else "triton" if _torch.version.hip else "flashinfer"
+            )
         elif draft_backend == "trtllm_mha":
             import torch as _torch
 
-            _fb = "triton" if _torch.version.hip else "flashinfer"
+            _fb = (
+                "ascend"
+                if is_npu()
+                else "triton" if _torch.version.hip else "flashinfer"
+            )
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
                 "draft path requires non-causal attention. Falling back to "
@@ -123,7 +131,11 @@ class DFlashWorker:
         elif draft_backend not in supported_draft_backends:
             import torch as _torch
 
-            _fb = "triton" if _torch.version.hip else "flashinfer"
+            _fb = (
+                "ascend"
+                if is_npu()
+                else "triton" if _torch.version.hip else "flashinfer"
+            )
             logger.warning(
                 "DFLASH draft worker only supports attention_backend in %s for now, "
                 "but got %r. Falling back to '%s'.",
@@ -219,7 +231,7 @@ class DFlashWorker:
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
             draft_token_num=int(self.block_size),
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
@@ -652,7 +664,7 @@ class DFlashWorker:
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
             with torch.inference_mode():

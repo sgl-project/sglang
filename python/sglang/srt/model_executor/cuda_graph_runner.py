@@ -1284,11 +1284,7 @@ class CudaGraphRunner:
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
                     else self.buffers.custom_mask
                 ),
-                capture_hidden_mode=(
-                    CaptureHiddenMode.NULL
-                    if self.model_runner.is_draft_worker
-                    else CaptureHiddenMode.FULL
-                ),
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():
