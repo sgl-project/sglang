@@ -400,7 +400,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             # ROCm's argmax tie-breaks differently from CUDA's softmax+max
             # path on FP8 logits, which corrupts MTP draft selection on AMD.
             # Keep the fastpath CUDA-only.
-            if self.topk == 1 and not _is_hip and not _is_npu:
+            if self.topk == 1 and not _is_hip:
                 ret.topk_index = torch.argmax(
                     ret.next_token_logits, dim=-1, keepdim=True
                 )

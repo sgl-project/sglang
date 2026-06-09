@@ -573,7 +573,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.topk == 1 and not _is_hip and not _is_npu:
+            if self.topk == 1 and not _is_hip:
                 # topk=1 → degenerate single-path tree; `topk_p` is unused
                 # downstream, so skip softmax and just argmax over logits.
                 # Gated to CUDA: on ROCm the argmax tie-break diverges from
@@ -781,7 +781,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if self.topk == 1 and not _is_hip and not _is_npu:
+        if self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
             ret_topk_index = torch.argmax(
