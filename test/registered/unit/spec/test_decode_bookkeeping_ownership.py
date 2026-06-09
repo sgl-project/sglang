@@ -1,29 +1,15 @@
 """Ownership contract for per-decode-iter bookkeeping.
 
-Each decode iteration must run the per-request bookkeeping -- the
-`req.decode_batch_idx` clock tick and the `batch.maybe_evict_swa()` call --
-exactly once, by exactly one owner:
+Each decode iter must tick `req.decode_batch_idx` and call
+`batch.maybe_evict_swa()` exactly once, by exactly one owner: the scheduler
+for non-spec, `EagleDraftInputV2Mixin.prepare_for_decode` for spec v2 (draft
+workers must not repeat them), the worker itself for spec v1.
 
-- non-spec decode: `ScheduleBatch.prepare_for_decode` (+ `alloc_for_decode`)
-- spec v2 (any algorithm where `supports_spec_v2()` is true):
-  `EagleDraftInputV2Mixin.prepare_for_decode`, driven by the scheduler.
-  Spec-v2 draft workers must NOT repeat either operation.
-- spec v1 workers own their bookkeeping inside the worker (the scheduler's
-  `prepare_for_decode` returns early for them).
-
-Double-ticking the clock is silent and dangerous: `decode_batch_idx` gates
-when SWA eviction may fire (the first-decode-iter overlap race guard) and
-when the SWA prefix tree lock is released (`>= sliding_window_size` uses the
-iter count as a lower-bound proxy for generated tokens). A clock that runs
-fast releases KV that in-flight or in-window readers still need; a clock
-that never ticks merely wastes memory. Neither failure shows up in e2e CI
-(short sequences, no memory pressure) or in the idle leak checker (the
-freed-too-early path is accounting-clean), hence this source-level guard.
-
-Both tests are static (AST-based) so they cover every code path of every
-worker without needing GPU forwards, and new spec-v2 draft workers are
-picked up automatically: subclass `BaseDraftWorker` and the contract test
-applies to you with no edits here.
+A fast clock fires SWA eviction in the first-decode-iter overlap race window
+and releases the SWA prefix lock before the decode position truly passes the
+window; neither shows up in e2e CI or the idle leak checker. AST-based so it
+covers every code path without GPU, and picks up new `BaseDraftWorker`
+subclasses automatically.
 """
 
 import ast
@@ -36,34 +22,23 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
-_THIS_FILE = Path(__file__).resolve()
-# test/registered/unit/spec/<this file> -> repo root is 4 levels up.
-_REPO_ROOT = _THIS_FILE.parents[4]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 _SRT_DIR = _REPO_ROOT / "python" / "sglang" / "srt"
 _SPECULATIVE_DIR = _SRT_DIR / "speculative"
 
-# The clock attribute and the eviction entry point this contract is about.
 _CLOCK_ATTR = "decode_batch_idx"
 _EVICT_METHOD = "maybe_evict_swa"
 
-# Every site in python/sglang/srt that ticks the clock or calls eviction,
-# as (path relative to srt/, enclosing scope, kind). Kind is "tick" for a
-# `decode_batch_idx` mutation (resets to literal 0 are exempt) and "evict"
-# for a `maybe_evict_swa()` call.
-#
-# This list is exhaustive on purpose: adding a bookkeeping site anywhere in
-# srt/ fails this test until the site is reviewed and recorded here, and
-# removing one fails until it is dropped here. If you are adding a spec-v2
-# draft worker, the answer is almost certainly that your worker must NOT
-# tick or evict at all -- the scheduler-driven
-# `EagleDraftInputV2Mixin.prepare_for_decode` already does both.
+# Exhaustive allowlist of (path relative to srt/, scope, kind), where kind is
+# "tick" (a `decode_batch_idx` mutation; `= 0` resets exempt) or "evict" (a
+# `maybe_evict_swa()` call). Any added or removed site fails the test until
+# reviewed here; a spec-v2 draft worker almost never qualifies as a new owner.
 _OWNER_SITES = {
-    # non-spec decode owner
+    # non-spec decode
     ("managers/schedule_batch.py", "ScheduleBatch.prepare_for_decode", "tick"),
-    # allocation paths shared by non-spec decode and (for extend) all modes
     ("mem_cache/common.py", "alloc_for_extend", "evict"),
     ("mem_cache/common.py", "alloc_for_decode", "evict"),
-    # spec v2 owner, driven by the scheduler via `batch.is_spec_v2`
+    # spec v2, scheduler-driven via `batch.is_spec_v2`
     (
         "speculative/eagle_info_v2.py",
         "EagleDraftInputV2Mixin.prepare_for_decode",
@@ -78,8 +53,7 @@ _OWNER_SITES = {
 
 
 def _iter_scoped_nodes(tree):
-    """Yield (scope_name, node) for every node, where scope_name is the
-    dotted Class.method / function path enclosing the node."""
+    """Yield (node, dotted Class.method scope) for every node."""
     scope_of = {}
 
     def visit(node, scope):
@@ -122,9 +96,7 @@ def _scan_tree(tree):
 
 
 def _parse(path: Path):
-    # utf-8-sig: a couple of srt files carry a UTF-8 BOM, which plain utf-8
-    # surfaces as U+FEFF and breaks ast.parse. SyntaxWarnings (e.g. invalid
-    # escape sequences in scanned sources) are not this test's business.
+    # utf-8-sig: some srt files carry a BOM that breaks plain-utf-8 ast.parse.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
         return ast.parse(path.read_text(encoding="utf-8-sig"))
@@ -170,29 +142,23 @@ class TestDecodeBookkeepingOwnership(CustomTestCase):
         msg = []
         if unexpected:
             msg.append(
-                "New per-decode-iter bookkeeping site(s) found:\n  "
+                "New bookkeeping site(s):\n  "
                 + "\n  ".join(map(str, sorted(unexpected)))
-                + "\nEach decode iter must tick `decode_batch_idx` and call "
-                "`maybe_evict_swa` exactly once, by exactly one owner (see "
-                "module docstring). If your code runs under spec v2, the "
-                "scheduler-driven EagleDraftInputV2Mixin.prepare_for_decode "
-                "already owns both -- do not repeat them. If you are adding "
-                "a genuinely new owner, update _OWNER_SITES in this test."
+                + "\nUnder spec v2 these are owned by "
+                "EagleDraftInputV2Mixin.prepare_for_decode -- do not repeat "
+                "them; a genuinely new owner must be added to _OWNER_SITES."
             )
         if missing:
             msg.append(
-                "Recorded bookkeeping site(s) no longer exist:\n  "
+                "Recorded site(s) no longer exist (update _OWNER_SITES):\n  "
                 + "\n  ".join(map(str, sorted(missing)))
-                + "\nIf the owning code moved or was removed, update "
-                "_OWNER_SITES so this allowlist stays exact."
             )
         self.assertFalse(msg, "\n\n".join(msg))
 
     def test_spec_v2_draft_workers_do_no_scheduler_bookkeeping(self):
         classes = _base_draft_worker_classes()
         names = {node.name for _, node in classes}
-        # Scanner sanity: if discovery breaks, fail loudly instead of
-        # silently guarding nothing.
+        # Discovery sanity: fail loudly instead of silently guarding nothing.
         self.assertIn("EagleDraftWorker", names)
         self.assertIn("FrozenKVMTPDraftWorker", names)
 
@@ -202,15 +168,11 @@ class TestDecodeBookkeepingOwnership(CustomTestCase):
                 violations.append((rel, f"{node.name}.{scope}", kind))
         self.assertFalse(
             violations,
-            "Spec-v2 draft worker(s) perform scheduler-owned bookkeeping:\n  "
+            "Spec-v2 draft worker(s) repeat scheduler-owned bookkeeping:\n  "
             + "\n  ".join(map(str, sorted(violations)))
-            + "\nUnder spec v2 the scheduler calls "
-            "EagleDraftInputV2Mixin.prepare_for_decode every decode iter, "
-            "which already ticks `decode_batch_idx` and calls "
-            "`maybe_evict_swa`. Doing either again in the worker double-runs "
-            "the bookkeeping (the clock runs 2x fast, SWA eviction fires in "
-            "the first-decode-iter overlap race window, and the SWA prefix "
-            "lock releases early). Remove these calls from the worker.",
+            + "\nEagleDraftInputV2Mixin.prepare_for_decode already ticks "
+            "`decode_batch_idx` and calls `maybe_evict_swa` every decode "
+            "iter; doing either again double-runs them. Remove these calls.",
         )
 
 
