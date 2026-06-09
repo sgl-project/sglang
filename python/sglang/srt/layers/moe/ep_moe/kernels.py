@@ -1115,6 +1115,84 @@ def moe_ep_deepgemm_preprocess(
     )
 
 
+def moe_ep_deepgemm_preprocess_contiguous(
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    block_shape,
+):
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    EXPERT_ALIGNMENT = 128
+
+    if block_shape is None:
+        block_shape = [128, 128]
+    assert len(block_shape) == 2
+    block_k = block_shape[1]
+
+    hidden_states_fp8, scale = per_token_group_quant_fp8(hidden_states, block_k)
+
+    num_tokens = hidden_states.shape[0]
+    K = hidden_states.shape[1]
+
+    num_tokens_per_expert = torch.zeros(
+        num_local_experts, device=topk_ids.device, dtype=torch.int32
+    )
+    flat_ids = topk_ids.view(-1)
+    valid_mask = flat_ids >= 0
+    valid_ids = flat_ids[valid_mask]
+    if valid_ids.numel() > 0:
+        num_tokens_per_expert.scatter_add_(
+            0, valid_ids.to(torch.int64), torch.ones_like(valid_ids, dtype=torch.int32)
+        )
+
+    aligned_per_expert = (
+        (num_tokens_per_expert + EXPERT_ALIGNMENT - 1)
+        // EXPERT_ALIGNMENT
+        * EXPERT_ALIGNMENT
+    )
+    all_tokens = int(aligned_per_expert.sum().item())
+
+    input_tensor = torch.empty(
+        (all_tokens, K), device=hidden_states.device, dtype=hidden_states_fp8.dtype
+    )
+
+    scale_hidden_size = K // block_k
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        input_tensor_scale = torch.zeros(
+            (ceil_div(scale_hidden_size, 4), all_tokens),
+            device=hidden_states.device,
+            dtype=torch.int,
+        ).transpose(0, 1)
+    else:
+        input_tensor_scale = torch.empty(
+            (all_tokens, scale_hidden_size),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    output_index = torch.empty(
+        (num_tokens, top_k), device=topk_ids.device, dtype=torch.int32
+    )
+    expert_start_loc = torch.empty_like(aligned_per_expert)
+
+    ep_scatter(
+        hidden_states_fp8,
+        scale,
+        topk_ids,
+        aligned_per_expert,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+    return input_tensor, input_tensor_scale, m_indices, output_index, all_tokens
+
+
 @triton.jit
 def compute_identity_kernel(
     top_k,

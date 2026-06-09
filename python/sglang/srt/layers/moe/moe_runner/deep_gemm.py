@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -351,6 +352,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.DEEP_GEMM
 
 
+_SGLANG_MOE_CONTIGUOUS_GEMM = bool(
+    int(os.environ.get("SGLANG_MOE_CONTIGUOUS_GEMM", "0"))
+)
+
+
 @register_pre_permute("standard", "deep_gemm")
 def pre_permute_standard_to_deep_gemm(
     dispatch_output: StandardDispatchOutput,
@@ -358,8 +364,6 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
-
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
@@ -369,37 +373,70 @@ def pre_permute_standard_to_deep_gemm(
     hidden_states_shape = hidden_states.shape
     hidden_states_dtype = hidden_states.dtype
     hidden_states_device = hidden_states.device
-    hidden_states_ref = hidden_states
 
-    topk_weights, topk_ids = topk_weights, topk_ids
-
-    # PreReorder
-    masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
-        moe_ep_deepgemm_preprocess(
-            topk_ids,
-            runner_config.num_local_experts,
-            hidden_states,
-            runner_config.top_k,
-            quant_info.block_shape,
+    if _SGLANG_MOE_CONTIGUOUS_GEMM:
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            moe_ep_deepgemm_preprocess_contiguous,
         )
-    )
 
-    dispose_tensor(hidden_states_ref)
+        input_tensor, input_tensor_scale, m_indices, output_index, all_tokens = (
+            moe_ep_deepgemm_preprocess_contiguous(
+                topk_ids,
+                runner_config.num_local_experts,
+                hidden_states,
+                runner_config.top_k,
+                quant_info.block_shape,
+            )
+        )
 
-    running_state["topk_ids"] = topk_ids
-    running_state["topk_weights"] = topk_weights
-    running_state["hidden_states_shape"] = hidden_states_shape
-    running_state["hidden_states_dtype"] = hidden_states_dtype
-    running_state["hidden_states_device"] = hidden_states_device
-    running_state["src2dst"] = src2dst
+        dispose_tensor(hidden_states)
 
-    return DeepGemmRunnerInput(
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        use_masked_gemm=True,
-        masked_m=masked_m,
-        expected_m=expected_m,
-    )
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states_shape
+        running_state["hidden_states_dtype"] = hidden_states_dtype
+        running_state["hidden_states_device"] = hidden_states_device
+        running_state["output_index"] = output_index
+        running_state["all_tokens"] = all_tokens
+        running_state["use_contiguous"] = True
+
+        return DeepGemmRunnerInput(
+            hidden_states=input_tensor,
+            hidden_states_scale=input_tensor_scale,
+            use_masked_gemm=False,
+            m_indices=m_indices,
+        )
+    else:
+        from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
+
+        hidden_states_ref = hidden_states
+
+        masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
+            moe_ep_deepgemm_preprocess(
+                topk_ids,
+                runner_config.num_local_experts,
+                hidden_states,
+                runner_config.top_k,
+                quant_info.block_shape,
+            )
+        )
+
+        dispose_tensor(hidden_states_ref)
+
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states_shape
+        running_state["hidden_states_dtype"] = hidden_states_dtype
+        running_state["hidden_states_device"] = hidden_states_device
+        running_state["src2dst"] = src2dst
+
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
 
 
 @register_post_permute("deep_gemm", "standard")
@@ -409,37 +446,54 @@ def post_permute_deep_gemm_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    hidden_states_shape = running_state["hidden_states_shape"]
-    hidden_states_dtype = running_state["hidden_states_dtype"]
-    hidden_states_device = running_state["hidden_states_device"]
-    src2dst = running_state["src2dst"]
-    topk_ids = running_state["topk_ids"]
-    topk_weights = running_state["topk_weights"]
+    if running_state.get("use_contiguous", False):
+        from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
 
-    output = torch.empty(
-        hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-    )
-    post_reorder_triton_kernel[(hidden_states_shape[0],)](
-        runner_output.hidden_states,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        runner_config.top_k,
-        hidden_states_shape[1],
-        BLOCK_SIZE=512,
-    )
+        hidden_states = runner_output.hidden_states
+        topk_ids = running_state["topk_ids"]
+        topk_weights = running_state["topk_weights"]
+        output_index = running_state["output_index"]
 
-    dispose_tensor(runner_output.hidden_states)
+        gather_out = torch.empty(
+            running_state["hidden_states_shape"],
+            dtype=running_state["hidden_states_dtype"],
+            device=running_state["hidden_states_device"],
+        )
+        ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+        dispose_tensor(hidden_states)
+        dispose_tensor(output_index)
+    else:
+        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+
+        hidden_states_shape = running_state["hidden_states_shape"]
+        hidden_states_dtype = running_state["hidden_states_dtype"]
+        hidden_states_device = running_state["hidden_states_device"]
+        src2dst = running_state["src2dst"]
+        topk_ids = running_state["topk_ids"]
+        topk_weights = running_state["topk_weights"]
+
+        gather_out = torch.empty(
+            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+        )
+        post_reorder_triton_kernel[(hidden_states_shape[0],)](
+            runner_output.hidden_states,
+            gather_out,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            hidden_states_shape[1],
+            BLOCK_SIZE=512,
+        )
+        dispose_tensor(runner_output.hidden_states)
 
     if runner_config.routed_scaling_factor is not None:
-        output *= runner_config.routed_scaling_factor
+        gather_out *= runner_config.routed_scaling_factor
 
     return StandardCombineInput(
-        hidden_states=output,
+        hidden_states=gather_out,
     )
 
 
