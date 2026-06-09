@@ -91,6 +91,7 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_committed_len
         ]
+        # `req.prefix_indices` will be used in `PrefillAdder::add_non_first_chunk_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
     def evict(self, params: EvictParams) -> EvictResult:
