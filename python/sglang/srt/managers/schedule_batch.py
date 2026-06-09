@@ -1192,7 +1192,7 @@ class Req(ReqDllmMixin):
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
-    def tail_str(self) -> str:
+    def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
         if (
             len(self.sampling_params.stop_strs) == 0
@@ -1205,7 +1205,12 @@ class Req(ReqDllmMixin):
             self.sampling_params.stop_regex_max_len + 1,
         )
 
-        tail_len = min(max_len_tail_str, len(self.output_ids))
+        # Spec decode accepts multiple tokens per step; widen the window to cover
+        # the whole accepted chunk so a stop string landing mid-chunk (with more
+        # tokens accepted after it) is not pushed out of view.
+        tail_len = min(
+            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
+        )
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -1261,12 +1266,12 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_str_based_finish(self):
+    def _check_str_based_finish(self, new_accepted_len: int = 1):
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
-            tail_str = self.tail_str()
+            tail_str = self.tail_str(new_accepted_len)
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
@@ -1331,7 +1336,7 @@ class Req(ReqDllmMixin):
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
-        if self._check_str_based_finish():
+        if self._check_str_based_finish(new_accepted_len):
             return
 
     def reset_for_retract(self):
@@ -1667,6 +1672,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
     can_run_dp_cuda_graph: bool = False
+    can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
 
     # For processing logprobs
@@ -2457,10 +2463,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @property
     def is_spec_v2(self):
-        # FIXME: finally deprecate is_spec_v2
-        ret = self.enable_overlap and not self.spec_algorithm.is_none()
-        assert not ret or self.spec_algorithm.supports_spec_v2()
-        return ret
+        # Whether the V2 worker/schema is used. Independent of overlap: the
+        # non-overlap path also drives the V2 worker, just synchronously.
+        return self.spec_algorithm.supports_spec_v2()
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
@@ -2750,6 +2755,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
