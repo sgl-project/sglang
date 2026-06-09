@@ -127,6 +127,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PostProcessWeightsReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -1247,6 +1248,18 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/post_process_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def post_process_weights(req: PostProcessWeightsReqInput, request: Request):
+    """Run optional post-processing for updated weights."""
+    success, message = await _global_state.tokenizer_manager.post_process_weights(
+        req, request
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weight_version")
