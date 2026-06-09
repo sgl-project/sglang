@@ -57,9 +57,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
 # ROCm SDK and PyTorch dependencies
-ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/v2/gfx950-dcgpu/"
+ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/"
 # Pin to a specific ROCm SDK version (e.g. 7.14.0a20260604). Leave empty for latest.
-ARG ROCM_SDK_VERSION="7.14.0a20260604"
+ARG ROCM_SDK_VERSION="7.14.0a20260608"
 ARG TORCH_VERSION="2.10.0"
 ARG TORCHVISION_VERSION="0.25.0"
 ARG TORCHAUDIO_VERSION="2.10.0"
@@ -516,6 +516,8 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       jq \
       libopenmpi-dev \
       libpci-dev \
+      libibverbs-dev \
+      libdrm-dev \
       initramfs-tools \
   && rm -rf /var/lib/apt/lists/*; \
   \
@@ -581,7 +583,23 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   cd /sgl-workspace/mori; \
   git checkout "${MORI_COMMIT}"; \
   git submodule update --init --recursive; \
-  python3 setup.py develop; \
+  \
+  if [ "${GPU_ARCH}" = "gfx950-rocm7_14" ]; then \
+    # Fix for ROCm SDK: add find_package(NUMA) before hsakmt
+    sed -i "/find_package(hsa-runtime64 REQUIRED)/i find_package(NUMA REQUIRED)" src/application/CMakeLists.txt; \
+    \
+    export ROCM_PATH=${ROCM_HOME}; \
+    # Workaround: ROCm SDK hsakmtTargets.cmake contains hardcoded /usr/lib64/libc.so from
+    # the upstream build system, but Ubuntu uses /lib/x86_64-linux-gnu/. Create symlink to
+    # avoid "ninja: error: /usr/lib64/libc.so missing and no known rule to make it"
+    mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so.6 /usr/lib64/libc.so; \
+    # Build with proper CMAKE_PREFIX_PATH to find NUMA and other ROCm SDK dependencies
+    PATH=${ROCM_HOME}/bin:$PATH \
+    CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/rocm_sysdeps/lib/cmake:${ROCM_HOME}/lib/cmake:${ROCM_HOME} \
+    pip install -e . --no-build-isolation; \
+  else \
+    pip install -e .; \
+  fi; \
   python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))" > /etc/ld.so.conf.d/torch.conf; \
   ldconfig; \
   echo "export PYTHONPATH=/sgl-workspace/mori:\${PYTHONPATH}" >> /etc/bash.bashrc; \
