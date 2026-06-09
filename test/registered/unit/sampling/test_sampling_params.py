@@ -1,8 +1,10 @@
 """Unit tests for srt/sampling/sampling_params.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import unittest
 from unittest.mock import MagicMock
@@ -178,8 +180,19 @@ class TestSamplingParamsVerify(CustomTestCase):
 
     # --- repetition_penalty ---
     def test_repetition_penalty_negative_raises(self):
-        """Test that verify() rejects negative repetition_penalty (valid range is [0, 2])."""
+        """Test that verify() rejects negative repetition_penalty (valid range is (0, 2])."""
         sp = self._make(repetition_penalty=-0.1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_repetition_penalty_zero_raises(self):
+        """Test that verify() rejects repetition_penalty=0.
+
+        A value of 0 makes the sampling kernel divide logits by 0, producing
+        inf/NaN in the probability tensor and crashing every TP rank with a
+        device-side assert.
+        """
+        sp = self._make(repetition_penalty=0.0)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
@@ -189,10 +202,13 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
-    def test_repetition_penalty_boundaries_valid(self):
-        """Test that boundary values 0.0 and 2.0 are both accepted."""
-        self._make(repetition_penalty=0.0).verify(self.VOCAB_SIZE)
+    def test_repetition_penalty_boundary_two_valid(self):
+        """Test that the upper boundary value 2.0 is accepted."""
         self._make(repetition_penalty=2.0).verify(self.VOCAB_SIZE)
+
+    def test_repetition_penalty_small_positive_valid(self):
+        """Test that a small positive repetition_penalty (e.g. 1e-3) is accepted."""
+        self._make(repetition_penalty=1e-3).verify(self.VOCAB_SIZE)
 
     # --- min_new_tokens / max_new_tokens ---
     def test_negative_min_new_tokens_raises(self):

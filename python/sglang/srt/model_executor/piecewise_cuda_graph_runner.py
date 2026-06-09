@@ -20,8 +20,7 @@ import gc
 import logging
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
@@ -42,6 +41,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -51,15 +51,26 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_prefill_registry
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    get_bool_env_var,
+    is_hip,
+    is_musa,
+    is_npu,
+    log_info_on_rank0,
+    require_gathered_buffer,
+)
 
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
@@ -67,18 +78,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-
-@dataclass
-class PrefillInputBuffers(ForwardInputBuffers):
-    input_ids: torch.Tensor
-    out_cache_loc: torch.Tensor
-    out_cache_loc_swa: Optional[torch.Tensor]
-    mamba_track_indices: Optional[torch.Tensor]
-    mamba_track_mask: Optional[torch.Tensor]
-    mamba_track_seqlens: Optional[torch.Tensor]
-    positions: torch.Tensor
-    input_embeds: Optional[torch.Tensor]
-    mrope_positions: Optional[torch.Tensor]
+_is_musa = is_musa()
 
 
 @contextmanager
@@ -141,6 +141,13 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
+    if _is_musa:
+        from sglang.srt.hardware_backend.musa.utils.patch_torch import (
+            patch_fx_custom_device,
+        )
+
+        patch_fx_custom_device()
+
 
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
@@ -189,6 +196,21 @@ class PiecewiseCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
+        # When the layer communicator scatters/gathers across the attention TP
+        # group (e.g. with --moe-dense-tp-size 1), the model's reduce_scatter
+        # requires the token count to be divisible by attn_tp_size * attn_cp_size.
+        # Drop captures that would violate this (mirrors the filter used by
+        # the regular CUDA graph runner in get_batch_sizes_to_capture).
+        if require_gathered_buffer(self.model_runner.server_args):
+            mul_base = self.attn_tp_size
+            attn_cp_size = get_attention_cp_size()
+            if mul_base % attn_cp_size != 0:
+                mul_base *= attn_cp_size
+            filtered = [n for n in self.capture_num_tokens if n % mul_base == 0]
+            assert (
+                len(filtered) > 0
+            ), f"No piecewise CUDA graph capture sizes are multiples of {mul_base}"
+            self.capture_num_tokens = filtered
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
@@ -210,69 +232,27 @@ class PiecewiseCudaGraphRunner:
         # CUDA graph capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
-        # Graph inputs
         with torch.device(self.device):
-            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
-            )
-            out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-                if model_runner.is_hybrid_swa
-                else None
-            )
-            mamba_track_indices = (
-                torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_mask = (
-                torch.zeros((self.max_bs,), dtype=torch.bool)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_seqlens = (
-                torch.zeros((self.max_bs,), dtype=torch.int32)
-                if self.mamba_track_enabled
-                else None
-            )
-            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-            if (
-                self.is_multimodal
-            ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
-                # 1. In multimodal, we only compile and capture the language model part.
-                # 2. The embedder is outside of the graph, but cuda graph requires the input embeds to have a fixed memory address.
-                # 3. Input embeds is a pre-allocated buffer. In model.forward, we copy the embed output to this buffer.
-                input_embeds = torch.zeros(
-                    (self.max_num_tokens, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                )
-                mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
-            else:
-                input_embeds = None
-                mrope_positions = None
-
-        self.buffers = PrefillInputBuffers(
-            input_ids=input_ids,
-            out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
-            positions=positions,
-            input_embeds=input_embeds,
-            mrope_positions=mrope_positions,
+        # Registry owns (allocates + pools) the token-axis input buffers.
+        self.buffer_registry = build_prefill_registry(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_tokens,
+            cache_loc_dtype=self._cache_loc_dtype(),
+            is_multimodal=self.is_multimodal,
+            hidden_size=self.model_runner.model_config.hidden_size,
+            embed_dtype=self.model_runner.dtype,
+            enable_mamba_track=self.mamba_track_enabled,
+            share_pool=not is_npu(),
+            source=None,
         )
-        self.buffers.share_buffers()
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -283,8 +263,14 @@ class PiecewiseCudaGraphRunner:
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )
+            layer_model = (
+                language_model.model
+                if hasattr(language_model, "model")
+                and hasattr(language_model.model, "layers")
+                else language_model
+            )
             with patch_model(
-                language_model.model, self.compile_config.compiler
+                layer_model, self.compile_config.compiler
             ) as patched_model:
 
                 # Dummy warmup for jit kernel
@@ -298,21 +284,32 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with enable_piecewise_cuda_graph_compile():
-                    compile_range = (
-                        tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                        if get_tensor_model_parallel_rank() == 0
-                        else reversed(self.capture_num_tokens)
-                    )
-                    for _, num_tokens in enumerate(compile_range):
-                        if get_tensor_model_parallel_rank() == 0:
-                            compile_range.set_description(
-                                f"Compiling num tokens ({num_tokens=})"
-                            )
-                        self.warmup_compile(num_tokens=num_tokens)
+                if _is_hip:
+                    # AMD: single Dynamo trace is sufficient; the capture
+                    # phase does per-shape JIT kernel warmup before each
+                    # CUDA graph recording.  The N-iteration loop is
+                    # redundant and extremely slow on ROCm (~30 min).
+                    with enable_piecewise_cuda_graph_compile():
+                        self.warmup_compile(num_tokens=self.capture_num_tokens[-1])
+                else:
+                    with enable_piecewise_cuda_graph_compile():
+                        compile_range = (
+                            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                            if get_tensor_model_parallel_rank() == 0
+                            else reversed(self.capture_num_tokens)
+                        )
+                        for _, num_tokens in enumerate(compile_range):
+                            if get_tensor_model_parallel_rank() == 0:
+                                compile_range.set_description(
+                                    f"Compiling num tokens ({num_tokens=})"
+                                )
+                            self.warmup_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
+
+                if _use_aiter:
+                    self._pre_warm_aiter_chip_info()
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
@@ -321,34 +318,69 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
+    _aiter_chip_info_cached = False
+
+    @classmethod
+    def _pre_warm_aiter_chip_info(cls):
+        """Pre-populate aiter chip info env vars before CUDA graph capture.
+
+        aiter's get_cu_num_custom_op and get_gfx_custom_op call
+        subprocess.run(rocminfo) to query GPU info. During CUDA graph capture
+        the GPU context is locked, so rocminfo hangs indefinitely. Pre-calling
+        them here caches the results as environment variables so the subprocess
+        is never invoked during capture. Only runs once per process.
+        """
+        if cls._aiter_chip_info_cached:
+            return
+        cls._aiter_chip_info_cached = True
+
+        import os
+
+        try:
+            from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+            if not os.environ.get("CU_NUM"):
+                cu_num = get_cu_num()
+                os.environ["CU_NUM"] = str(cu_num)
+                logger.info(f"Pre-warmed aiter CU_NUM={cu_num}")
+
+            if not os.environ.get("GPU_ARCHS"):
+                gfx = get_gfx()
+                os.environ["GPU_ARCHS"] = gfx
+                logger.info(f"Pre-warmed aiter GPU_ARCHS={gfx}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm aiter chip info: {e}")
+
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
-        buffers = self.buffers
-        input_ids = buffers.input_ids[:num_tokens]
-        input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
-        positions = buffers.positions[:num_tokens]
-        mrope_positions = (
-            buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+        registry = self.buffer_registry
+        bs = 1
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
+        input_embeds = (
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
-        out_cache_loc_swa = (
-            buffers.out_cache_loc_swa[:num_tokens]
-            if buffers.out_cache_loc_swa is not None
-            else None
+        mrope_positions = (
+            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
         )
         mamba_track_indices = (
-            buffers.mamba_track_indices[:1]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:1]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:1]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
         )
         with torch.device(self.device):
@@ -362,11 +394,7 @@ class PiecewiseCudaGraphRunner:
                 next_token_logits_buffer=None,
                 orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                req_to_token_pool=self.model_runner.req_to_token_pool,
-                token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
-                out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=mamba_track_indices,
                 mamba_track_mask=mamba_track_mask,
@@ -396,23 +424,26 @@ class PiecewiseCudaGraphRunner:
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
-        # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
-        with set_forward_context(
-            forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):
-            _ = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
+            with set_forward_context(
                 forward_batch,
-            )
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
+            ):
+                _ = self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -451,9 +482,10 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            graph_capture() as graph_capture_context,
+        ):
             stream = graph_capture_context.stream
             with set_pcg_capture_stream(stream):
                 avail_mem = get_available_gpu_memory(
@@ -481,40 +513,39 @@ class PiecewiseCudaGraphRunner:
                     self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
-        buffers = self.buffers
+        registry = self.buffer_registry
         bs = 1
 
-        # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
-        input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+        # Graph inputs — views into the registry's (adopted) graph-resident
+        # slots; capture burns these addresses into the graph.
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
 
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
-        out_cache_loc_swa = (
-            buffers.out_cache_loc_swa[:num_tokens]
-            if buffers.out_cache_loc_swa is not None
-            else None
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
+        input_embeds = (
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
+        )
+        mrope_positions = (
+            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
         )
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
-        )
-        positions = buffers.positions[:num_tokens]
-        mrope_positions = (
-            buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
 
         global_dp_buffer_len = None
+        global_num_tokens_cpu = None
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -534,11 +565,7 @@ class PiecewiseCudaGraphRunner:
                 next_token_logits_buffer=None,
                 orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                req_to_token_pool=self.model_runner.req_to_token_pool,
-                token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
-                out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=mamba_track_indices,
                 mamba_track_mask=mamba_track_mask,
@@ -567,48 +594,57 @@ class PiecewiseCudaGraphRunner:
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
+        # Setup hooks below read get_attn_backend() and must run inside the
+        # same ForwardContext as the warmup/capture forward.
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
-        if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            if lora_ids is not None:
+                self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        # Run and capture
-        def run_once():
-            # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(
-                global_dp_buffer_len,
-                num_tokens,
-                forward_batch.dp_padding_mode.is_max_len(),
-            )
-            # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
-            # It is True in this context but we need to set it to use low latency deepep mode.
-            set_is_extend_in_batch(False)
-
-            kwargs = {}
-            with set_forward_context(
-                forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-            ):
-                self.model_runner.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
+            # Run and capture
+            def run_once():
+                # Clean intermediate result cache for DP attention
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
+                    None
                 )
-            return
+                set_dp_buffer_len(
+                    global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                    global_num_tokens_cpu,
+                )
+                # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
+                # It is True in this context but we need to set it to use low latency deepep mode.
+                set_is_extend_in_batch(False)
 
-        # run twice for warmup at the first time and cuda graph capture at the second time
-        # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+                kwargs = {}
+                with set_forward_context(
+                    forward_batch,
+                    self.attention_layers,
+                    self.quant_config,
+                    self.moe_layers,
+                    self.moe_fusions,
+                    dsa_indexers=self.dsa_indexers,
+                ):
+                    self.model_runner.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+                return
+
+            # run twice for warmup at the first time and cuda graph capture at the second time
+            # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
         return
 
@@ -617,86 +653,51 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        buffers = self.buffers
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
-        if static_num_tokens != num_tokens:
-            buffers.out_cache_loc.zero_()
-            if buffers.out_cache_loc_swa is not None:
-                buffers.out_cache_loc_swa.zero_()
-            buffers.input_ids[num_tokens:static_num_tokens].zero_()
-            buffers.positions[num_tokens:static_num_tokens].zero_()
-            if self.is_multimodal:
-                buffers.input_embeds[num_tokens:static_num_tokens].zero_()
-            if forward_batch.mrope_positions is not None:
-                buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
-
         bs = forward_batch.batch_size
-
-        buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        if buffers.out_cache_loc_swa is not None:
-            buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
-                self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
-
-        if (
-            buffers.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            buffers.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            buffers.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            buffers.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            buffers.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            buffers.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
-
-        input_ids = buffers.input_ids[:static_num_tokens]
-        positions = buffers.positions[:static_num_tokens]
-        out_cache_loc = buffers.out_cache_loc[:static_num_tokens]
-
-        out_cache_loc_swa = (
-            buffers.out_cache_loc_swa[:static_num_tokens]
-            if buffers.out_cache_loc_swa is not None
-            else None
+        registry = self.buffer_registry
+        # Reset the padded token tail (ZERO) + copy the [:num_tokens] head for
+        # every graph-resident slot in one grouped pass. input_embeds is
+        # reset-only (the model writes embeds into it inside the graph).
+        registry.fill_from(
+            forward_batch,
+            raw_bs=bs,
+            padded_bs=bs,
+            raw_num_tokens=num_tokens,
+            padded_num_tokens=static_num_tokens,
         )
 
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, static_num_tokens)
+
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
         )
-        if forward_batch.mrope_positions is not None:
-            buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
-
-        input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
-            buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
-
         mrope_positions = (
-            buffers.mrope_positions[:, :static_num_tokens]
-            if forward_batch.mrope_positions is not None
+            _slot("mrope_positions")
+            if (
+                registry.has_slot("mrope_positions")
+                and forward_batch.mrope_positions is not None
+            )
             else None
         )
 
@@ -724,11 +725,7 @@ class PiecewiseCudaGraphRunner:
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=forward_batch.seq_lens_sum,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
@@ -758,9 +755,7 @@ class PiecewiseCudaGraphRunner:
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
-            temp_scaled_logprobs=forward_batch.temp_scaled_logprobs,
             temperature=forward_batch.temperature,
-            top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
             return_pooled_hidden_states=(
@@ -768,9 +763,6 @@ class PiecewiseCudaGraphRunner:
                 or forward_batch.return_pooled_hidden_states
             ),
         )
-
-        if out_cache_loc_swa is not None:
-            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
 
         return static_forward_batch
 
@@ -781,6 +773,8 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_num_tokens = len(static_forward_batch.input_ids)
+            raw_num_tokens = self.raw_num_tokens
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -788,8 +782,10 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
+                num_tokens=static_num_tokens,
+                raw_num_tokens=raw_num_tokens,
             ):
-                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
@@ -798,6 +794,18 @@ class PiecewiseCudaGraphRunner:
                     **kwargs,
                 )
                 if isinstance(output, LogitsProcessorOutput):
+                    # Preserve mm_input_embeds when speculative decoding is
+                    # enabled. The speculative draft's prefill path
+                    # (eagle_worker_v2._draft_extend_for_prefill) reads
+                    # mm_input_embeds off this LogitsProcessorOutput to reuse
+                    # the target's encoder embeddings instead of re-embedding
+                    # multimodal placeholder token ids.
+                    mm_input_embeds = None
+                    if (
+                        self.model_runner.spec_algorithm.is_speculative()
+                        and output.mm_input_embeds is not None
+                    ):
+                        mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
                             : self.raw_num_tokens
@@ -807,6 +815,7 @@ class PiecewiseCudaGraphRunner:
                             if output.hidden_states is not None
                             else None
                         ),
+                        mm_input_embeds=mm_input_embeds,
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
@@ -832,10 +841,10 @@ class PiecewiseCudaGraphRunner:
                     draft_token=None,
                     custom_mask=self.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,

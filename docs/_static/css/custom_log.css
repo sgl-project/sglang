@@ -27,3 +27,27 @@ div.output_area.stderr {
 div.output_area.stdout {
     color: #d3d3d3 !important;
 }
+
+.sglang-docs-deprecation-banner {
+    background: #fff4cc;
+    border-bottom: 1px solid #d8a21f;
+    color: #2f2a1f;
+    font-size: 0.95rem;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+    padding: 0.75rem 1.25rem;
+    position: relative;
+    text-align: center;
+    z-index: 1030;
+}
+
+.sglang-docs-deprecation-banner a {
+    color: #1f5fbf;
+    font-weight: 600;
+    text-decoration: underline;
+}
+
+.sglang-docs-deprecation-banner a:focus,
+.sglang-docs-deprecation-banner a:hover {
+    color: #143f80;
+}

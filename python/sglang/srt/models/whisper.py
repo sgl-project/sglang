@@ -1,4 +1,7 @@
-from typing import Any, Iterable, List, Optional, Tuple
+from __future__ import annotations
+
+from array import array
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from transformers import WhisperConfig
@@ -418,14 +421,15 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         # Prepend dummy encoder tokens so that prepare_encoder_info_extend
         # correctly allocates encoder KV cache locations in the KV pool.
         # These dummy tokens are stripped before the model forward receives input_ids.
         encoder_len = self.config.max_source_positions
         mm_inputs.num_image_tokens = encoder_len
-        pad_ids = [0] * encoder_len
-        return pad_ids + input_ids
+        return array("q", [0]) * encoder_len + input_ids
 
     def forward(
         self,

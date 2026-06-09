@@ -16,8 +16,13 @@ ARG CMAKE_VERSION_MINOR=1
 ARG USE_CCACHE=1
 ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
-ARG PYTORCH_MIRROR=download.pytorch.org
+ARG PYTORCH_INDEX_BASE=https://download.pytorch.org/whl
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
+# Optional mirror for the manylinux base image's yum repos (AlmaLinux 8).
+# Pass scheme + host (and optional path prefix), e.g.
+#   --build-arg YUM_MIRROR=https://mirrors.aliyun.com
+# Empty (default) keeps upstream repo.almalinux.org.
+ARG YUM_MIRROR=
 
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
 ENV PATH=/opt/cmake/bin:${PATH}
@@ -28,8 +33,21 @@ ENV FLASHINFER_CUDA_ARCH_LIST="8.0 8.9 9.0a 10.0a 12.0a"
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
 ENV C_INCLUDE_PATH=/usr/local/cuda/include/cccl${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
 
-# Install build dependencies
-RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs -y --nogpgcheck \
+RUN if [ -n "${YUM_MIRROR}" ]; then \
+      set -eux; \
+      sed -i \
+        -e 's|^mirrorlist=|#mirrorlist=|g' \
+        -e 's|^# *baseurl=https://repo.almalinux.org|baseurl='"${YUM_MIRROR}"'|g' \
+        /etc/yum.repos.d/almalinux*.repo; \
+      sed -i 's|^enabled=1|enabled=0|g' /etc/yum.repos.d/epel*.repo; \
+    fi
+
+# Install build dependencies. libzstd-devel + xxhash-devel let ccache's
+# FindZstd.cmake / FindXxhash.cmake skip their hardcoded github.com FetchContent
+# fallbacks — critical when github.com is flaky/blocked. xxhash-devel is in
+# PowerTools (disabled by default on AlmaLinux 8); libzstd-devel is in BaseOS.
+RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs libzstd-devel -y --nogpgcheck \
+ && yum --enablerepo=powertools install xxhash-devel -y --nogpgcheck \
  && ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so \
  && yum clean all && rm -rf /var/cache/yum
 
@@ -79,12 +97,12 @@ RUN set -eux; \
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
-      13.0) TORCH_VER=2.9.1; CU_TAG=cu130 ;; \
-      12.9) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      12.8) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      *)    TORCH_VER=2.9.1; CU_TAG=cu126 ;; \
+      13.0) TORCH_VER=2.11.0; CU_TAG=cu130 ;; \
+      12.9) TORCH_VER=2.11.0; CU_TAG=cu129 ;; \
+      12.8) TORCH_VER=2.11.0; CU_TAG=cu128 ;; \
+      *)    TORCH_VER=2.11.0; CU_TAG=cu126 ;; \
     esac; \
-    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
+    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url ${PYTORCH_INDEX_BASE}/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
 
 # Build stage: copy source and build wheel
@@ -103,6 +121,8 @@ ARG USE_CCACHE=1
 #   NVCC_THREADS: per-compilation-unit NVCC --threads (multi-arch PTXAS)
 ARG BUILD_JOBS=0
 ARG NVCC_THREADS=32
+# Redeclare so CMake third-party FetchContent uses the same mirror as deps stage
+ARG GITHUB_ARTIFACTORY=github.com
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
@@ -131,7 +151,7 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     else \
       export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk '{print ($1 < $2) ? $1 : $2}'); \
     fi; \
-    export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}"; \
+    export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} -DGITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"; \
     if [ -n "${ENABLE_CMAKE_PROFILE:-}" ]; then \
       echo "CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json"; \
       export CMAKE_ARGS="${CMAKE_ARGS} --profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \

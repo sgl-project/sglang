@@ -89,3 +89,8 @@ class WanVAEConfig(VAEConfig):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2
+
+    def get_vae_scale_factor(self):
+        # Wan VAE does not expose block_out_channels like SD-style VAEs.
+        # Its spatial downsample factor is explicitly defined by scale_factor_spatial.
+        return self.arch_config.scale_factor_spatial

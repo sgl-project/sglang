@@ -38,9 +38,9 @@ class TestDeepseekV32DP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
 
@@ -106,9 +106,9 @@ class TestDeepseekV32TP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
 

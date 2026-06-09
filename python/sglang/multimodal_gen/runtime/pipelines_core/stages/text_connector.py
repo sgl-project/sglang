@@ -45,46 +45,59 @@ class LTX2TextConnectorStage(PipelineStage):
                 else None
             )
 
-        # Handle CFG: Concatenate negative and positive inputs
-        if batch.do_classifier_free_guidance:
-
-            # Concatenate: [Negative, Positive]
-            prompt_embeds = torch.cat([neg_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat(
-                [neg_prompt_attention_mask, prompt_attention_mask], dim=0
+        if prompt_embeds is None or prompt_attention_mask is None:
+            raise ValueError(
+                "LTX2TextConnectorStage requires prompt embeddings and "
+                "attention mask."
             )
 
-        # Prepare additive mask for connectors (as per Diffusers implementation)
-        dtype = prompt_embeds.dtype
-
-        additive_attention_mask = (1 - prompt_attention_mask.to(dtype)) * -1000000.0
-
-        # Call connectors
-        # Expects: prompt_embeds, attention_mask, additive_mask=True
-        with set_forward_context(current_timestep=None, attn_metadata=None):
-            connector_prompt_embeds, connector_audio_prompt_embeds, connector_mask = (
-                self.connectors(
-                    prompt_embeds, additive_attention_mask, additive_mask=True
+        if batch.do_classifier_free_guidance:
+            if neg_prompt_embeds is None or neg_prompt_attention_mask is None:
+                raise ValueError(
+                    "LTX2TextConnectorStage requires negative prompt embeddings "
+                    "and attention mask when classifier-free guidance is enabled."
                 )
-            )
 
-        # Split results if CFG was enabled
-        if batch.do_classifier_free_guidance:
-            neg_embeds, pos_embeds = connector_prompt_embeds.chunk(2, dim=0)
-            neg_audio_embeds, pos_audio_embeds = connector_audio_prompt_embeds.chunk(
-                2, dim=0
-            )
-            neg_mask, pos_mask = connector_mask.chunk(2, dim=0)
+            # Official LTX-2.3 processes positive and negative prompts through
+            # the connector independently; batching shifts output numerics.
+            dtype = prompt_embeds.dtype
+            pos_additive_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
+                dtype
+            ) * torch.finfo(dtype).max
+            neg_additive_mask = (neg_prompt_attention_mask.to(torch.int64) - 1).to(
+                dtype
+            ) * torch.finfo(dtype).max
+
+            with set_forward_context(current_timestep=None, attn_metadata=None):
+                pos_embeds, pos_audio_embeds, pos_mask = self.connectors(
+                    prompt_embeds, pos_additive_mask, additive_mask=True
+                )
+                neg_embeds, neg_audio_embeds, neg_mask = self.connectors(
+                    neg_prompt_embeds, neg_additive_mask, additive_mask=True
+                )
 
             batch.prompt_embeds = [pos_embeds]
             batch.audio_prompt_embeds = [pos_audio_embeds]
             batch.prompt_attention_mask = pos_mask
-
             batch.negative_prompt_embeds = [neg_embeds]
             batch.negative_audio_prompt_embeds = [neg_audio_embeds]
             batch.negative_attention_mask = neg_mask
         else:
-            # Update positive fields
+            # Prepare additive mask for connectors (as per diffusers implementation)
+            dtype = prompt_embeds.dtype
+            additive_attention_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
+                dtype
+            ) * torch.finfo(dtype).max
+
+            with set_forward_context(current_timestep=None, attn_metadata=None):
+                (
+                    connector_prompt_embeds,
+                    connector_audio_prompt_embeds,
+                    connector_mask,
+                ) = self.connectors(
+                    prompt_embeds, additive_attention_mask, additive_mask=True
+                )
+
             batch.prompt_embeds = [connector_prompt_embeds]
             batch.audio_prompt_embeds = [connector_audio_prompt_embeds]
             batch.prompt_attention_mask = connector_mask

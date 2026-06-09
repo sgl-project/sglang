@@ -4,13 +4,37 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject changes under legacy docs/
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.base_ref }}"
+          # Refresh origin/<base_ref> with full history; --depth=1 would
+          # shallow the ref and break the merge-base used by `...`.
+          git fetch --no-tags origin "$BASE_REF"
+          # First, verify the diff itself succeeds and check whether any
+          # files changed. A silent failure here would let docs/ changes
+          # through, so the explicit `if !` guard is important.
+          if ! CHANGED=$(git diff --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD"); then
+            echo "git diff origin/${BASE_REF}...HEAD failed; aborting." >&2
+            exit 2
+          fi
+          if [ -z "$CHANGED" ]; then
+            echo "No changed files vs origin/${BASE_REF}; skipping."
+            exit 0
+          fi
+          # Re-emit with -z so xargs can safely handle whitespace in paths.
+          git diff -z --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD" \
+            | xargs -0 python3 scripts/ci/check_no_docs_changes.py
 
       - name: Set up Python
         uses: actions/setup-python@v4

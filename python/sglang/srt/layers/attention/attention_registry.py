@@ -1,4 +1,5 @@
 import logging
+import warnings
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.linear_attn_model_registry import (
@@ -62,6 +63,26 @@ def create_trtllm_mla_backend(runner):
     return TRTLLMMLABackend(runner)
 
 
+@register_attention_backend("tokenspeed_mla")
+def create_tokenspeed_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
+    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+        TokenspeedMLABackend,
+    )
+
+    return TokenspeedMLABackend(runner)
+
+
+@register_attention_backend("cutedsl_mla")
+def create_cutedsl_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("cutedsl_mla backend can only be used with MLA models.")
+    from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+    return TRTLLMMLABackend(runner, backend="cute-dsl")
+
+
 @register_attention_backend("aiter")
 def create_aiter_backend(runner):
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -85,11 +106,44 @@ def create_ascend_backend(runner):
     return AscendAttnBackend(runner)
 
 
-@register_attention_backend("nsa")
-def create_nsa_backend(runner):
-    from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+@register_attention_backend("dsa")
+def create_dsa_backend(runner):
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
-    return NativeSparseAttnBackend(runner)
+    return DeepseekSparseAttnBackend(runner)
+
+
+@register_attention_backend("nsa")
+def _create_nsa_compat(runner):
+    warnings.warn(
+        "attention-backend='nsa' is deprecated; use 'dsa' instead. "
+        "The alias will be removed in a future release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return create_dsa_backend(runner)
+
+
+@register_attention_backend("dsv4")
+def create_dsv4_backend(runner):
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+        )
+
+        logger.info(
+            "Using DeepseekV4HipRadixBackend for compressed attention backend (HIP)."
+        )
+        return DeepseekV4HipRadixBackend(runner)
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        logger.info("Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).")
+        return DeepseekV4AttnBackend(runner)
 
 
 @register_attention_backend("triton")
@@ -200,11 +254,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            HybridLinearAttnBackend,
-            Mamba2AttnBackend,
-        )
-        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
@@ -213,6 +262,23 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             initialize_linear_attn_config,
         )
         from sglang.srt.utils import is_blackwell, is_npu
+
+        if not is_npu():
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+                Mamba2AttnBackend,
+            )
+            from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        else:
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                AscendGDNAttnBackend as GDNAttnBackend,
+            )
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                AscendHybridLinearAttnBackend as HybridLinearAttnBackend,
+            )
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                AscendMamba2AttnBackend as Mamba2AttnBackend,
+            )
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
@@ -248,7 +314,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "If this is a custom hybrid model, use register_linear_attn_model() "
                     "from sglang.srt.configs.linear_attn_model_registry."
                 )
-        full_attn_layers = cfg.full_attention_layer_ids
+        if runner.is_draft_worker:
+            # FIXME: we assume that MTP/NEXTN always use full-attention.
+            full_attn_layers = [0]
+        else:
+            full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers
         )
