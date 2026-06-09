@@ -64,6 +64,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     select_top_k_tokens,
+    spec_stage_span,
 )
 from sglang.srt.utils import empty_context
 from sglang.srt.utils.async_probe import (
@@ -710,6 +711,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
@@ -731,6 +733,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
             ):
                 verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
@@ -745,6 +748,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
