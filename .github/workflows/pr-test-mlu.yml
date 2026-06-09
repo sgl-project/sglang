@@ -1,0 +1,114 @@
+name: PR Test (MLU)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      run_all_tests:
+        description: "Run MLU CI regardless of file changes"
+        required: false
+        type: boolean
+        default: false
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner"
+        required: false
+        type: string
+        default: "ci"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      run_all_tests:
+        description: "Run MLU CI regardless of file changes"
+        required: false
+        type: boolean
+        default: false
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner"
+        required: false
+        type: string
+        default: "ci"
+
+concurrency:
+  group: pr-test-mlu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.mlu_backend == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/pyproject_mlu.toml"
+              - "test/**/!(*.md)"
+              - "scripts/ci/mlu/**"
+              - ".github/workflows/pr-test-mlu.yml"
+            mlu_backend:
+              - "python/pyproject_mlu.toml"
+              - "python/sglang/srt/platforms/mlu.py"
+              - "python/sglang/srt/hardware_backend/mlu/**"
+              - "python/sglang/srt/distributed/device_communicators/mlu_communicator.py"
+              - "test/registered/mlu/**"
+              - "docs/platforms/cambricon_mlu.md"
+              - "scripts/ci/mlu/**"
+              - ".github/workflows/pr-test-mlu.yml"
+
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  pr-test-mlu:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: [cambricon]
+    timeout-minutes: 360
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: true
+
+      - name: Submit MLU CI task to Cambricon Runner
+        env:
+          SGLANG_MLU_CI_REPO_NAME: sglang
+          SGLANG_MLU_CI_TRIGGER_TYPE: ${{ inputs.trigger_type || 'ci' }}
+          SGLANG_MLU_CI_BRIDGE_URL: http://127.0.0.1:14547
+          SGLANG_MLU_CI_TIMEOUT_SECONDS: "21600"
+        run: |
+          bash scripts/ci/mlu/invoke_mlu_ci.sh
