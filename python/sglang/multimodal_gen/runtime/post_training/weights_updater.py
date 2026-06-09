@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
@@ -49,6 +50,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    get_param_names_mapping,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -59,8 +61,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.weight_sync.tensor_bucket import (
+    FlattenedTensorBucket,
+    FlattenedTensorMetadata,
+)
 
 logger = init_logger(__name__)
+_DEFAULT_TENSOR_TARGET_MODULE = "transformer"
 
 
 def get_updatable_modules(pipeline) -> dict[str, torch.nn.Module]:
@@ -115,6 +122,9 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     For offloaded modules, updates CPU buffers directly via
     update_cpu_weights(); non-offloaded parameters use in-place copy.
     """
+    model_params = dict(module.named_parameters())
+    weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
+
     offload_managers: list = []
     if is_layerwise_offloaded_module(module):
         offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
@@ -125,30 +135,92 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
         for manager in offload_managers:
             offloaded_names.update(manager.update_cpu_weights(weight_dict))
         remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
-        load_weights_into_model(remaining, dict(module.named_parameters()))
+        load_weights_into_model(remaining, model_params)
     else:
-        load_weights_into_model(weights_iter, dict(module.named_parameters()))
+        load_weights_into_model(weights_iter, model_params)
 
 
-def load_weights_into_model(weights_iter, model_params: dict) -> None:
+def _build_module_weight_name_mapper(module: torch.nn.Module):
+    """Build a chained regex mapper from mapping dicts exposed by the module."""
+    mapping_fns = []
+    for attr in ("lora_param_names_mapping", "param_names_mapping"):
+        mapping = getattr(module, attr, None)
+        if not mapping:
+            continue
+        mapping_fns.append(get_param_names_mapping(mapping))
+
+    if not mapping_fns:
+        return None
+
+    def map_name(name: str) -> str:
+        mapped_name = name
+        for mapping_fn in mapping_fns:
+            mapped_name = mapping_fn(mapped_name)[0]
+        return mapped_name
+
+    return map_name
+
+
+def _iter_module_weight_updates(
+    module: torch.nn.Module,
+    weights_iter,
+    model_params: dict,
+):
+    map_name = _build_module_weight_name_mapper(module)
+    module_name = type(module).__name__
+
+    for name, loaded_weight in weights_iter:
+        if name in model_params:
+            yield name, loaded_weight
+            continue
+
+        mapped_name = map_name(name) if map_name is not None else name
+        if mapped_name in model_params:
+            yield mapped_name, loaded_weight
+            continue
+
+        logger.warning(
+            "Skipping weight update for %s: parameter %r not found after mapping to %r",
+            module_name,
+            name,
+            mapped_name,
+        )
+
+
+def load_weights_into_model(
+    weights_iter, model_params: dict, module_name: str | None = None
+) -> None:
     """Copy weights from weights_iter into model_params in-place."""
     for name, loaded_weight in weights_iter:
         if name not in model_params:
+            logger.warning("Skipping weight update: parameter %r not found", name)
             continue
         param = model_params[name]
-        if param.shape != loaded_weight.shape:
-            raise ValueError(
-                f"Shape mismatch for {name}: model={param.shape}, loaded={loaded_weight.shape}"
-            )
-        if isinstance(param, DTensor):
-            distributed_weight = distribute_tensor(
-                loaded_weight.to(param.dtype),
-                param.device_mesh,
-                param.placements,
-            )
-            param._local_tensor.copy_(distributed_weight._local_tensor)
+        weight_loader = getattr(param, "weight_loader", None)
+        if callable(weight_loader):
+            weight_loader(param, loaded_weight.to(param.dtype))
         else:
-            param.data.copy_(loaded_weight.to(param.dtype))
+            dtensor_param = param if isinstance(param, DTensor) else None
+            if dtensor_param is None and isinstance(
+                getattr(param, "data", None), DTensor
+            ):
+                dtensor_param = param.data
+
+            if dtensor_param is not None:
+                distributed_weight = distribute_tensor(
+                    loaded_weight.to(param.dtype),
+                    dtensor_param.device_mesh,
+                    dtensor_param.placements,
+                )
+                dtensor_param._local_tensor.copy_(distributed_weight._local_tensor)
+            else:
+                if param.shape != loaded_weight.shape:
+                    module_prefix = f"{module_name}." if module_name else ""
+                    raise ValueError(
+                        f"Shape mismatch for {module_prefix}{name}: "
+                        f"model={param.shape}, loaded={loaded_weight.shape}"
+                    )
+                param.data.copy_(loaded_weight.to(param.dtype))
 
 
 class WeightsUpdater:
@@ -293,3 +365,142 @@ class WeightsUpdater:
                 continue
             weights_iter = _get_weights_iter(str(weights_dir))
             _load_weights_into_module(module, weights_iter)
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: Any,
+        load_format: str | None = None,
+        target_modules: list[str] | None = None,
+    ) -> tuple[bool, str]:
+        if target_modules is None:
+            target_modules = [_DEFAULT_TENSOR_TARGET_MODULE]
+        try:
+            modules_to_update = self._collect_modules(target_modules)
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
+        if not modules_to_update:
+            error_msg = (
+                f"No matching modules found for update. "
+                f"Requested: {target_modules}. "
+                f"Available nn.Module(s): {list(get_updatable_modules(self.pipeline).keys())}"
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+        try:
+            module_payloads = self._resolve_module_payloads(
+                named_tensors=named_tensors,
+                modules_to_update=modules_to_update,
+            )
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
+        updated_modules: list[str] = []
+        for module_name, module in modules_to_update:
+            try:
+                payload = module_payloads[module_name]
+                weights_iter = self._materialize_weights_iter(payload, load_format)
+                _load_weights_into_module(module, weights_iter)
+                updated_modules.append(module_name)
+            except Exception as e:
+                error_msg = (
+                    f"Failed to update module '{module_name}' from tensor: {e}. "
+                    f"The pipeline may be partially updated. "
+                    f"Please discard the whole weights and reload from a known-good checkpoint."
+                )
+                logger.error(error_msg, exc_info=True)
+                return False, error_msg
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        names = ", ".join(updated_modules)
+        message = f"Updated {len(updated_modules)} modules from tensor ({names})."
+        logger.info(message)
+        return True, message
+
+    def _resolve_module_payloads(
+        self,
+        named_tensors: Any,
+        modules_to_update: list[tuple[str, torch.nn.Module]],
+    ) -> dict[str, Any]:
+        module_names = [name for name, _ in modules_to_update]
+        if isinstance(named_tensors, dict):
+            missing = [name for name in module_names if name not in named_tensors]
+            if missing:
+                raise ValueError(
+                    f"Missing tensor payload for module(s): {missing}. "
+                    f"Provided modules: {list(named_tensors.keys())}"
+                )
+            return {name: named_tensors[name] for name in module_names}
+
+        if len(module_names) == 1:
+            return {module_names[0]: named_tensors}
+
+        raise ValueError(
+            "Ambiguous tensor payload for multi-module update. "
+            "Provide a dict mapping module_name -> module payload, "
+            f"requested modules: {module_names}."
+        )
+
+    def _materialize_weights_iter(self, module_payload: Any, load_format: str | None):
+        if load_format == "flattened_bucket":
+            if not isinstance(module_payload, dict):
+                raise ValueError(
+                    "flattened_bucket payload must be a dict with "
+                    "'flattened_tensor' and 'metadata'."
+                )
+            flattened_tensor = module_payload.get("flattened_tensor")
+            metadata = module_payload.get("metadata")
+            if flattened_tensor is None or metadata is None:
+                raise ValueError(
+                    "flattened_bucket payload missing 'flattened_tensor' or 'metadata'."
+                )
+            return self._reconstruct_from_flattened_bucket(flattened_tensor, metadata)
+
+        if isinstance(module_payload, (list, tuple)):
+            return iter(module_payload)
+
+        raise ValueError(
+            f"Unsupported module payload type for load_format={load_format}: "
+            f"{type(module_payload).__name__}"
+        )
+
+    def _reconstruct_from_flattened_bucket(self, flattened_tensor: Any, metadata: Any):
+        if not isinstance(flattened_tensor, torch.Tensor):
+            raise ValueError(
+                "flattened_bucket 'flattened_tensor' must be a torch.Tensor."
+            )
+        if not isinstance(metadata, list):
+            raise ValueError("flattened_bucket 'metadata' must be a list.")
+
+        converted_metadata: list[FlattenedTensorMetadata] = []
+        for meta in metadata:
+            converted_metadata.append(
+                FlattenedTensorMetadata(
+                    name=meta.name,
+                    shape=torch.Size(meta.shape),
+                    dtype=self._normalize_torch_dtype(meta.dtype),
+                    start_idx=int(meta.start_idx),
+                    end_idx=int(meta.end_idx),
+                    numel=int(meta.numel),
+                )
+            )
+
+        bucket = FlattenedTensorBucket(
+            flattened_tensor=flattened_tensor,
+            metadata=converted_metadata,
+        )
+        return bucket.reconstruct_tensors()
+
+    def _normalize_torch_dtype(self, dtype: Any) -> torch.dtype:
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        if isinstance(dtype, str):
+            name = dtype.split(".")[-1]
+            normalized = getattr(torch, name, None)
+            if isinstance(normalized, torch.dtype):
+                return normalized
+        raise ValueError(f"Unsupported dtype in flattened_bucket metadata: {dtype!r}")
