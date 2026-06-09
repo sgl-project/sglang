@@ -558,19 +558,42 @@ class DeepseekV4AttnBackend(
         if not need_compress:
             create = _create_dummy_paged_compress_data
         else:
-            create = functools.partial(
-                create_paged_compressor_data,
-                is_prefill=True,
-                token_to_kv_pool=self.token_to_kv_pool,
-                req_to_token=self.req_to_token,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                extend_lens=extend_seq_lens,
-                extend_lens_cpu=extend_seq_lens_cpu,
-                use_prefill_cuda_graph=use_prefill_cuda_graph,
-                online_state_slot_offset=online_c128_state_slot_offset,
-            )
+            def create(compress_ratio: Literal[4, 128]):
+                # Online c128 uses a different planner that cannot be created in
+                # prefill cuda-graph mode. Keep c4 graph-friendly while matching
+                # c128's existing online path.
+                use_graph_plan = use_prefill_cuda_graph and not (
+                    compress_ratio == 128
+                    and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                )
+                if use_graph_plan:
+                    return create_paged_compressor_data(
+                        compress_ratio=compress_ratio,
+                        is_prefill=True,
+                        token_to_kv_pool=self.token_to_kv_pool,
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=None,
+                        extend_lens=extend_seq_lens,
+                        extend_lens_cpu=None,
+                        use_prefill_cuda_graph=True,
+                        num_q_tokens=out_cache_loc.shape[0],
+                        online_state_slot_offset=online_c128_state_slot_offset,
+                    )
+                return create_paged_compressor_data(
+                    compress_ratio=compress_ratio,
+                    is_prefill=True,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    extend_lens=extend_seq_lens,
+                    extend_lens_cpu=extend_seq_lens_cpu,
+                    use_prefill_cuda_graph=use_graph_plan,
+                    online_state_slot_offset=online_c128_state_slot_offset,
+                )
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -994,7 +1017,12 @@ class DeepseekV4AttnBackend(
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
-        max_seq_len = int(seq_lens_cpu.max().item())
+        max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
+        max_seq_len = (
+            int(seq_lens_cpu.max().item())
+            if max_seq_len_override is None
+            else max_seq_len_override
+        )
         verify_bs = forward_batch.batch_size_before_padding
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
