@@ -128,18 +128,18 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         self,
         image_processor: Any,
         conditioner: Any,
-        vae: Any,
-        model: Any,
         scheduler: Any,
         config: Hunyuan3D2PipelineConfig,
+        latent_shape: tuple[int, ...],
+        guidance_embed: bool,
     ) -> None:
         super().__init__()
         self.image_processor = image_processor
         self.conditioner = conditioner
-        self.vae = vae
-        self.model = model
         self.scheduler = scheduler
         self.config = config
+        self.latent_shape = latent_shape
+        self.guidance_embed = guidance_embed
 
     def _validate_input(self, batch: Req, server_args: ServerArgs) -> None:
         if batch.image_path is None:
@@ -160,9 +160,40 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
     def _prepare_latents(self, batch_size, dtype, device, generator, scheduler):
         from diffusers.utils.torch_utils import randn_tensor
 
-        shape = (batch_size, *self.vae.latent_shape)
+        shape = (batch_size, *self.latent_shape)
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents * getattr(scheduler, "init_noise_sigma", 1.0)
+
+    def _find_conditioner_dtype(self, items_fn_name: str) -> torch.dtype | None:
+        items_fn = getattr(self.conditioner, items_fn_name, None)
+        if not callable(items_fn):
+            return None
+        try:
+            for item in items_fn():
+                if isinstance(item, torch.Tensor) and torch.is_floating_point(item):
+                    return item.dtype
+        except TypeError as exc:
+            logger.warning(
+                "Failed to inspect Hunyuan3D conditioner %s() for runtime dtype; "
+                "falling back to the sample tensor dtype. error=%s",
+                items_fn_name,
+                exc,
+            )
+        return None
+
+    def _resolve_runtime_dtype(
+        self, sample_tensor: torch.Tensor | None = None
+    ) -> torch.dtype:
+        for items_fn_name in ("parameters", "buffers"):
+            dtype = self._find_conditioner_dtype(items_fn_name)
+            if dtype is not None:
+                return dtype
+
+        if isinstance(sample_tensor, torch.Tensor) and torch.is_floating_point(
+            sample_tensor
+        ):
+            return sample_tensor.dtype
+        return torch.float32
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # 1. Input validation
@@ -173,14 +204,14 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         image = cond_inputs.pop("image")
 
         device = self.device
-        dtype = next(self.model.parameters()).dtype
+        dtype = self._resolve_runtime_dtype(
+            image if isinstance(image, torch.Tensor) else None
+        )
         image = _move_to_device(image, device, dtype)
         cond_inputs = _move_to_device(cond_inputs, device, dtype)
 
         # 3. Conditioning with CFG
-        do_cfg = batch.guidance_scale >= 0 and not (
-            hasattr(self.model, "guidance_embed") and self.model.guidance_embed is True
-        )
+        do_cfg = batch.guidance_scale >= 0 and not self.guidance_embed
 
         cond = self.conditioner(image=image, **cond_inputs)
         if do_cfg:
@@ -216,7 +247,7 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         latents = self._prepare_latents(batch_size, dtype, device, generator, scheduler)
 
         guidance = None
-        if hasattr(self.model, "guidance_embed") and self.model.guidance_embed is True:
+        if self.guidance_embed:
             guidance = torch.tensor(
                 [batch.guidance_scale] * batch_size, device=device, dtype=dtype
             )
@@ -416,6 +447,12 @@ class Hunyuan3DShapeExportStage(PipelineStage):
         self.vae = vae
         self.config = config
 
+    @property
+    def role_affinity(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        return RoleType.DECODER
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if self.config.shape_mc_algo is not None:
             try:
@@ -472,6 +509,12 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
         self.config = config
+
+    @property
+    def role_affinity(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        return RoleType.DECODER
 
     def _get_output_paths(self, batch: Req) -> tuple[str, str]:
         output_path = batch.output_file_path() or os.path.join(

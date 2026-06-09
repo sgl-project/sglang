@@ -1,0 +1,113 @@
+---
+title: "Operator Performance Optimizing Guidance"
+metatags:
+    description: "Operator Performance Optimizing Guidance for NPU"
+---
+
+## Performance_benchmark
+
+### Obtaining Performance Data
+
+Before optimizing the performance, you need to obtain accurate performance data, understand the current performance status, and analyze the next optimization direction based on the performance status. MindStudio provides realistic methods for testing the performance of Triton operators.
+
+#### Device-end
+
+The msProf tool is used to collect and analyze key performance indicators of operators running on the Ascend AI Processor. You can use the output performance data to quickly locate the software and hardware performance bottlenecks of operators and improve the efficiency of operator performance analysis.
+
+```bash
+msprof op --kernel-name=xxxxx python3 test_xxxxx.py
+```
+
+| Attribute | Value |
+|------|------|
+| Name | DequantSwigluQuant_int32_high_performance_100000000 |
+| Type | DequantSwigluQuant |
+| OP State | static |
+| Accelerator Core | AI_VECTOR_CORE |
+| Start Time(us) | 1774489226717521.715 |
+| Duration(us) | 102.824 |
+| Wait Time(us) | 0 |
+| Block Dim | 36 |
+| Mix Block Dim | 0 |
+| HF32 Eligible | NO |
+| Input Shapes | 163840,1024;128,1024;163840;;;;128 |
+| Input Data Types | INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64 |
+| Input Formats | ND;ND;ND;NULL;NULL;NULL;ND |
+| Output Shapes | 163840,512;163840 |
+| Output Data Types | INT8;FLOAT |
+| Output Formats | ND;ND |
+| Context ID | N/A |
+| aicore_time(us) | 0 |
+| aic_total_cycles | 0 |
+| aic_mac_time(us) | 0 |
+| aic_mac_ratio | 0 |
+| aic_scalar_time(us) | 0 |
+| aic_scalar_ratio | 0 |
+| aic_mte1_time(us) | 0 |
+| aic_mte1_ratio | 0 |
+| aic_mte2_time(us) | 0 |
+| aic_mte2_ratio | 0 |
+| aic_fixpipe_time(us) | 0 |
+| aic_fixpipe_ratio | 0 |
+| aic_icache_miss_rate | 0 |
+| aiv_time(us) | 59.128 |
+| aiv_total_cycles | 3512188 |
+| aiv_vec_time(us) | 36.708 |
+| aiv_vec_ratio | 0.621 |
+| aiv_scalar_time(us) | 41.403 |
+| aiv_scalar_ratio | 0.7 |
+| aiv_mte2_time(us) | 11.975 |
+| aiv_mte2_ratio | 0.203 |
+| aiv_mte3_time(us) | 9.738 |
+| aiv_mte3_ratio | 0.165 |
+| aiv_icache_miss_rate | 0.005 |
+| cube_utilization(%) | 0 |
+
+
+The Task Duration field indicates the time consumed by each operator. You can sort the operators by Task Duration to find the operators that consume the most time, or sort the operators by Task Type to view the operators that consume the most time on the AI Core or AI CPU.
+
+For some operators, the execution time is too long. As a result, the metric data is inaccurate and no longer has reference value. Such data is set to N/A and is not displayed.
+
+Input Shapes set to an empty value indicates that when the format is "; ; ; ;", the current input is a scalar. Here, ";" serves as the separator for each dimension. The output dimension of the operator follows the same principle.
+
+- **Task Duration (us)**: Time required for running a task, including the time for scheduling a task to the accelerator, execution time on the accelerator, and response end time. The unit is μs.
+
+- **Task Wait Time (us)**: Interval between the end time of the previous task and the start time of the current task. The unit is μs.
+
+- **Block Dim**: Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is L0, this field is not collected and is displayed as 0.
+
+## Optimization
+
+### Specification
+
+#### 1. Ascend core compute units
+
+- AI Core: the core that actually performs matrix/vector computation
+- Vector Unit: responsible for SIMD computation (similar to CUDA Core)
+- Scalar Unit: responsible for control/loop
+- L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64 KB, L1 is 256 KB, and L2 is shared.
+
+#### 2. Ascend memory hierarchy (from fastest to slowest)
+
+- Register → Fastest
+- L0/L1 cache → Very fast
+- On-chip cache (L2) → Fast
+- DDR (host memory) → Slowest
+
+### 3. Characteristics of Ascend instructions
+
+Good at accessing large contiguous memory blocks
+
+Dislikes discrete access, stride access, and random access
+
+Must be 128-bit/256-bit aligned
+
+Must be vectorized.
+
+### Tips
+
+1. Ascend 910 series usually has only 40 or 48 vector cores. If the number of grids exceeds 40 or 48 vector cores, the grids will be delivered in a queue, resulting in a long waiting time. Therefore, the number of cores for high-performance implementation does not exceed the number of vector cores.
+2. Try to use up all the UB as much as possible. Move a large block size at a time to ensure that the bound is in the MTE. No Redundant Copy.
+3. If the offset is a negative number, the current triton-ascend considers it as a discrete memory access scenario. As a result, the performance severely deteriorates, and the data is read from the entire DMA block instead of being read in scalar mode.
+4. The UB of the Ascend hardware requires that the size of the tail axis of the tensor can be exactly divided by 32 bytes. If the length of the tail axis is insufficient, the length of the tail axis is automatically supplemented. For example, the performance deteriorates exponentially due to automatic supplementation for the Tensor whose shape is (2048, 3). In this situation, you can perform the transposition operation to change the alignment axis to a lower dimension. In addition, the transposition operation is affected by the automatic supplement rule. Therefore, special skills are also required to avoid supplementation.
+5. Use Double Buffer, parallelizes computation and data transfer. While computing one block of data, another block of data is being transferred to L1.

@@ -16,7 +16,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=100, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=100, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=400, suite="nightly-kernel-1-gpu", nightly=True)
 
 # =============================================================================
@@ -33,7 +33,7 @@ def create_test_metadata(
     has_flashmla: bool = False,
     device: str = "cuda",
 ):
-    """Create test metadata tensors matching NSA backend structure."""
+    """Create test metadata tensors matching DSA backend structure."""
     # Basic tensors (always present)
     cache_seqlens_src = torch.randint(
         1, max_len, (bs,), dtype=torch.int32, device=device
@@ -44,28 +44,28 @@ def create_test_metadata(
     page_indices_src = torch.randint(
         0, 1000, (bs, max_len), dtype=torch.int32, device=device
     )
-    nsa_cache_seqlens_src = torch.randint(
+    dsa_cache_seqlens_src = torch.randint(
         1, max_len, (seqlens_expanded_size,), dtype=torch.int32, device=device
     )
     seqlens_expanded_src = torch.randint(
         1, max_seqlen_k, (seqlens_expanded_size,), dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_src = torch.zeros(
+    dsa_cu_seqlens_k_src = torch.zeros(
         seqlens_expanded_size + 1, dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_src[1:] = torch.cumsum(nsa_cache_seqlens_src, dim=0)
+    dsa_cu_seqlens_k_src[1:] = torch.cumsum(dsa_cache_seqlens_src, dim=0)
 
     # Destination tensors
     cache_seqlens_dst = torch.zeros(bs, dtype=torch.int32, device=device)
     cu_seqlens_k_dst = torch.zeros(bs + 1, dtype=torch.int32, device=device)
     page_table_1_dst = torch.zeros((bs, max_len + 16), dtype=torch.int32, device=device)
-    nsa_cache_seqlens_dst = torch.zeros(
+    dsa_cache_seqlens_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
-    nsa_seqlens_expanded_dst = torch.zeros(
+    dsa_seqlens_expanded_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_dst = torch.zeros(
+    dsa_cu_seqlens_k_dst = torch.zeros(
         seqlens_expanded_size + 1, dtype=torch.int32, device=device
     )
 
@@ -107,9 +107,9 @@ def create_test_metadata(
             "cache_seqlens": cache_seqlens_src,
             "cu_seqlens_k": cu_seqlens_k_src,
             "page_indices": page_indices_src,
-            "nsa_cache_seqlens": nsa_cache_seqlens_src,
+            "dsa_cache_seqlens": dsa_cache_seqlens_src,
             "seqlens_expanded": seqlens_expanded_src,
-            "nsa_cu_seqlens_k": nsa_cu_seqlens_k_src,
+            "dsa_cu_seqlens_k": dsa_cu_seqlens_k_src,
             "real_page_table": real_page_table_src,
             "flashmla_num_splits": flashmla_num_splits_src,
             "flashmla_metadata": flashmla_metadata_src,
@@ -118,9 +118,9 @@ def create_test_metadata(
             "cache_seqlens": cache_seqlens_dst,
             "cu_seqlens_k": cu_seqlens_k_dst,
             "page_table_1": page_table_1_dst,
-            "nsa_cache_seqlens": nsa_cache_seqlens_dst,
-            "nsa_seqlens_expanded": nsa_seqlens_expanded_dst,
-            "nsa_cu_seqlens_k": nsa_cu_seqlens_k_dst,
+            "dsa_cache_seqlens": dsa_cache_seqlens_dst,
+            "dsa_seqlens_expanded": dsa_seqlens_expanded_dst,
+            "dsa_cu_seqlens_k": dsa_cu_seqlens_k_dst,
             "real_page_table": real_page_table_dst,
             "flashmla_num_splits": flashmla_num_splits_dst,
             "flashmla_metadata": flashmla_metadata_dst,
@@ -134,8 +134,8 @@ def reference_copy_decode(src, dst, max_len):
     dst["cache_seqlens"].copy_(src["cache_seqlens"])
     dst["cu_seqlens_k"][1:].copy_(src["cu_seqlens_k"][1:])
     dst["page_table_1"][:, :max_len].copy_(src["page_indices"])
-    dst["nsa_cache_seqlens"].copy_(src["nsa_cache_seqlens"])
-    dst["nsa_cu_seqlens_k"][1 : bs + 1].copy_(src["nsa_cu_seqlens_k"][1 : bs + 1])
+    dst["dsa_cache_seqlens"].copy_(src["dsa_cache_seqlens"])
+    dst["dsa_cu_seqlens_k"][1 : bs + 1].copy_(src["dsa_cu_seqlens_k"][1 : bs + 1])
 
     if src["real_page_table"] is not None:
         rows, cols = src["real_page_table"].shape
@@ -159,10 +159,10 @@ def reference_copy_target_verify(src, dst, max_seqlen_k, seqlens_expanded_size):
 
     rows, cols = src["page_indices"].shape
     dst["page_table_1"][:rows, :cols].copy_(src["page_indices"])
-    dst["nsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
-    dst["nsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["nsa_cache_seqlens"])
-    dst["nsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
-        src["nsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
+    dst["dsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
+    dst["dsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["dsa_cache_seqlens"])
+    dst["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
+        src["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
     )
 
     if src["real_page_table"] is not None:
@@ -187,10 +187,10 @@ def reference_copy_draft_extend(src, dst, max_seqlen_k, seqlens_expanded_size):
 
     rows, cols = src["page_indices"].shape
     dst["page_table_1"][:rows, :cols].copy_(src["page_indices"])
-    dst["nsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
-    dst["nsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["nsa_cache_seqlens"])
-    dst["nsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
-        src["nsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
+    dst["dsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
+    dst["dsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["dsa_cache_seqlens"])
+    dst["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
+        src["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
     )
 
     if src["real_page_table"] is not None:
@@ -233,13 +233,13 @@ def test_fused_metadata_copy_dtype_validation():
     page_indices_src = torch.randint(
         0, 1000, (bs, max_len), dtype=torch.int32, device=device
     )
-    nsa_cache_seqlens_src = torch.randint(
+    dsa_cache_seqlens_src = torch.randint(
         1, max_len, (seqlens_expanded_size,), dtype=torch.int32, device=device
     )
     seqlens_expanded_src = torch.randint(
         1, max_seqlen_k, (seqlens_expanded_size,), dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_src = torch.zeros(
+    dsa_cu_seqlens_k_src = torch.zeros(
         seqlens_expanded_size + 1, dtype=torch.int32, device=device
     )
 
@@ -247,13 +247,13 @@ def test_fused_metadata_copy_dtype_validation():
     cache_seqlens_dst = torch.zeros(bs, dtype=torch.int32, device=device)
     cu_seqlens_k_dst = torch.zeros(bs + 1, dtype=torch.int32, device=device)
     page_table_1_dst = torch.zeros((bs, max_len + 16), dtype=torch.int32, device=device)
-    nsa_cache_seqlens_dst = torch.zeros(
+    dsa_cache_seqlens_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
-    nsa_seqlens_expanded_dst = torch.zeros(
+    dsa_seqlens_expanded_dst = torch.zeros(
         seqlens_expanded_size, dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_dst = torch.zeros(
+    dsa_cu_seqlens_k_dst = torch.zeros(
         seqlens_expanded_size + 1, dtype=torch.int32, device=device
     )
 
@@ -263,18 +263,18 @@ def test_fused_metadata_copy_dtype_validation():
             cache_seqlens_src_wrong,  # Wrong dtype: int64
             cu_seqlens_k_src,
             page_indices_src,
-            nsa_cache_seqlens_src,
+            dsa_cache_seqlens_src,
             seqlens_expanded_src,
-            nsa_cu_seqlens_k_src,
+            dsa_cu_seqlens_k_src,
             None,  # real_page_table_src
             None,  # flashmla_num_splits_src
             None,  # flashmla_metadata_src
             cache_seqlens_dst,
             cu_seqlens_k_dst,
             page_table_1_dst,
-            nsa_cache_seqlens_dst,
-            nsa_seqlens_expanded_dst,
-            nsa_cu_seqlens_k_dst,
+            dsa_cache_seqlens_dst,
+            dsa_seqlens_expanded_dst,
+            dsa_cu_seqlens_k_dst,
             None,  # real_page_table_dst
             None,  # flashmla_num_splits_dst
             None,  # flashmla_metadata_dst
@@ -296,18 +296,18 @@ def test_fused_metadata_copy_dtype_validation():
             cache_seqlens_src,
             cu_seqlens_k_src,
             page_indices_src,
-            nsa_cache_seqlens_src,
+            dsa_cache_seqlens_src,
             seqlens_expanded_src,
-            nsa_cu_seqlens_k_src,
+            dsa_cu_seqlens_k_src,
             None,
             None,
             None,
             cache_seqlens_dst_wrong,  # Wrong dtype: int64
             cu_seqlens_k_dst,
             page_table_1_dst,
-            nsa_cache_seqlens_dst,
-            nsa_seqlens_expanded_dst,
-            nsa_cu_seqlens_k_dst,
+            dsa_cache_seqlens_dst,
+            dsa_seqlens_expanded_dst,
+            dsa_cu_seqlens_k_dst,
             None,
             None,
             None,
@@ -369,18 +369,18 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
         data["src"]["cache_seqlens"],
         data["src"]["cu_seqlens_k"],
         data["src"]["page_indices"],
-        data["src"]["nsa_cache_seqlens"],
+        data["src"]["dsa_cache_seqlens"],
         data["src"]["seqlens_expanded"],
-        data["src"]["nsa_cu_seqlens_k"],
+        data["src"]["dsa_cu_seqlens_k"],
         data["src"]["real_page_table"],
         data["src"]["flashmla_num_splits"],
         data["src"]["flashmla_metadata"],
         dst_fused["cache_seqlens"],
         dst_fused["cu_seqlens_k"],
         dst_fused["page_table_1"],
-        dst_fused["nsa_cache_seqlens"],
-        dst_fused["nsa_seqlens_expanded"],
-        dst_fused["nsa_cu_seqlens_k"],
+        dst_fused["dsa_cache_seqlens"],
+        dst_fused["dsa_seqlens_expanded"],
+        dst_fused["dsa_cu_seqlens_k"],
         dst_fused["real_page_table"],
         dst_fused["flashmla_num_splits"],
         dst_fused["flashmla_metadata"],
@@ -402,14 +402,14 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
         dst_ref["page_table_1"], dst_fused["page_table_1"]
     ), "page_table_1 mismatch"
     assert torch.equal(
-        dst_ref["nsa_cache_seqlens"], dst_fused["nsa_cache_seqlens"]
-    ), "nsa_cache_seqlens mismatch"
+        dst_ref["dsa_cache_seqlens"], dst_fused["dsa_cache_seqlens"]
+    ), "dsa_cache_seqlens mismatch"
     assert torch.equal(
-        dst_ref["nsa_seqlens_expanded"], dst_fused["nsa_seqlens_expanded"]
-    ), "nsa_seqlens_expanded mismatch"
+        dst_ref["dsa_seqlens_expanded"], dst_fused["dsa_seqlens_expanded"]
+    ), "dsa_seqlens_expanded mismatch"
     assert torch.equal(
-        dst_ref["nsa_cu_seqlens_k"], dst_fused["nsa_cu_seqlens_k"]
-    ), "nsa_cu_seqlens_k mismatch"
+        dst_ref["dsa_cu_seqlens_k"], dst_fused["dsa_cu_seqlens_k"]
+    ), "dsa_cu_seqlens_k mismatch"
 
     if has_real_page_table:
         assert torch.equal(
@@ -458,18 +458,18 @@ def test_fused_metadata_copy_large_batch(bs):
         data["src"]["cache_seqlens"],
         data["src"]["cu_seqlens_k"],
         data["src"]["page_indices"],
-        data["src"]["nsa_cache_seqlens"],
+        data["src"]["dsa_cache_seqlens"],
         data["src"]["seqlens_expanded"],
-        data["src"]["nsa_cu_seqlens_k"],
+        data["src"]["dsa_cu_seqlens_k"],
         data["src"]["real_page_table"],
         data["src"]["flashmla_num_splits"],
         data["src"]["flashmla_metadata"],
         dst_fused["cache_seqlens"],
         dst_fused["cu_seqlens_k"],
         dst_fused["page_table_1"],
-        dst_fused["nsa_cache_seqlens"],
-        dst_fused["nsa_seqlens_expanded"],
-        dst_fused["nsa_cu_seqlens_k"],
+        dst_fused["dsa_cache_seqlens"],
+        dst_fused["dsa_seqlens_expanded"],
+        dst_fused["dsa_cu_seqlens_k"],
         dst_fused["real_page_table"],
         dst_fused["flashmla_num_splits"],
         dst_fused["flashmla_metadata"],
@@ -510,13 +510,13 @@ def create_test_metadata_multi(
     page_indices_src = torch.randint(
         0, 1000, (bs, max_len), dtype=torch.int32, device=device
     )
-    nsa_cache_seqlens_src = torch.randint(
+    dsa_cache_seqlens_src = torch.randint(
         1, max_len, (seqlens_expanded_size,), dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_src = torch.zeros(
+    dsa_cu_seqlens_k_src = torch.zeros(
         seqlens_expanded_size + 1, dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_src[1:] = torch.cumsum(nsa_cache_seqlens_src, dim=0)
+    dsa_cu_seqlens_k_src[1:] = torch.cumsum(dsa_cache_seqlens_src, dim=0)
 
     # Optional tensors
     real_page_table_src = None
@@ -544,10 +544,10 @@ def create_test_metadata_multi(
         page_table_1_dst = torch.zeros(
             (bs, max_len + 16), dtype=torch.int32, device=device
         )
-        nsa_cache_seqlens_dst = torch.zeros(
+        dsa_cache_seqlens_dst = torch.zeros(
             seqlens_expanded_size, dtype=torch.int32, device=device
         )
-        nsa_cu_seqlens_k_dst = torch.zeros(
+        dsa_cu_seqlens_k_dst = torch.zeros(
             seqlens_expanded_size + 1, dtype=torch.int32, device=device
         )
 
@@ -573,8 +573,8 @@ def create_test_metadata_multi(
             "cache_seqlens_int32": cache_seqlens_dst,
             "cu_seqlens_k": cu_seqlens_k_dst,
             "page_table_1": page_table_1_dst,
-            "nsa_cache_seqlens_int32": nsa_cache_seqlens_dst,
-            "nsa_cu_seqlens_k": nsa_cu_seqlens_k_dst,
+            "dsa_cache_seqlens_int32": dsa_cache_seqlens_dst,
+            "dsa_cu_seqlens_k": dsa_cu_seqlens_k_dst,
             "real_page_table": real_page_table_dst,
             "flashmla_num_splits": flashmla_num_splits_dst,
             "flashmla_metadata": flashmla_metadata_dst,
@@ -585,8 +585,8 @@ def create_test_metadata_multi(
             "cache_seqlens": cache_seqlens_src,
             "cu_seqlens_k": cu_seqlens_k_src,
             "page_indices": page_indices_src,
-            "nsa_cache_seqlens": nsa_cache_seqlens_src,
-            "nsa_cu_seqlens_k": nsa_cu_seqlens_k_src,
+            "dsa_cache_seqlens": dsa_cache_seqlens_src,
+            "dsa_cu_seqlens_k": dsa_cu_seqlens_k_src,
             "real_page_table": real_page_table_src,
             "flashmla_num_splits": flashmla_num_splits_src,
             "flashmla_metadata": flashmla_metadata_src,
@@ -604,8 +604,8 @@ def reference_copy_for_loop(src, dst_list, bs, max_len):
         dst["cache_seqlens_int32"].copy_(src["cache_seqlens"])
         dst["cu_seqlens_k"][1:].copy_(src["cu_seqlens_k"][1:])
         dst["page_table_1"][:, :max_len].copy_(src["page_indices"])
-        dst["nsa_cache_seqlens_int32"].copy_(src["nsa_cache_seqlens"])
-        dst["nsa_cu_seqlens_k"][1 : bs + 1].copy_(src["nsa_cu_seqlens_k"][1 : bs + 1])
+        dst["dsa_cache_seqlens_int32"].copy_(src["dsa_cache_seqlens"])
+        dst["dsa_cu_seqlens_k"][1 : bs + 1].copy_(src["dsa_cu_seqlens_k"][1 : bs + 1])
 
         if src["real_page_table"] is not None:
             rows, cols = src["real_page_table"].shape
@@ -641,10 +641,10 @@ def test_fused_metadata_copy_multi_dtype_validation():
     page_indices_src = torch.randint(
         0, 1000, (bs, max_len), dtype=torch.int32, device=device
     )
-    nsa_cache_seqlens_src = torch.randint(
+    dsa_cache_seqlens_src = torch.randint(
         1, max_len, (seqlens_expanded_size,), dtype=torch.int32, device=device
     )
-    nsa_cu_seqlens_k_src = torch.zeros(
+    dsa_cu_seqlens_k_src = torch.zeros(
         seqlens_expanded_size + 1, dtype=torch.int32, device=device
     )
 
@@ -656,10 +656,10 @@ def test_fused_metadata_copy_multi_dtype_validation():
             "page_table_1": torch.zeros(
                 (bs, max_len + 16), dtype=torch.int32, device=device
             ),
-            "nsa_cache_seqlens": torch.zeros(
+            "dsa_cache_seqlens": torch.zeros(
                 seqlens_expanded_size, dtype=torch.int32, device=device
             ),
-            "nsa_cu_seqlens_k": torch.zeros(
+            "dsa_cu_seqlens_k": torch.zeros(
                 seqlens_expanded_size + 1, dtype=torch.int32, device=device
             ),
         }
@@ -674,8 +674,8 @@ def test_fused_metadata_copy_multi_dtype_validation():
             cache_seqlens_src_wrong,  # Wrong dtype: int64
             cu_seqlens_k_src,
             page_indices_src,
-            nsa_cache_seqlens_src,
-            nsa_cu_seqlens_k_src,
+            dsa_cache_seqlens_src,
+            dsa_cu_seqlens_k_src,
             None,  # real_page_table_src
             None,  # flashmla_num_splits_src
             None,  # flashmla_metadata_src
@@ -683,8 +683,8 @@ def test_fused_metadata_copy_multi_dtype_validation():
             dst0["cache_seqlens"],
             dst0["cu_seqlens_k"],
             dst0["page_table_1"],
-            dst0["nsa_cache_seqlens"],
-            dst0["nsa_cu_seqlens_k"],
+            dst0["dsa_cache_seqlens"],
+            dst0["dsa_cu_seqlens_k"],
             None,
             None,
             None,
@@ -692,8 +692,8 @@ def test_fused_metadata_copy_multi_dtype_validation():
             dst1["cache_seqlens"],
             dst1["cu_seqlens_k"],
             dst1["page_table_1"],
-            dst1["nsa_cache_seqlens"],
-            dst1["nsa_cu_seqlens_k"],
+            dst1["dsa_cache_seqlens"],
+            dst1["dsa_cu_seqlens_k"],
             None,
             None,
             None,
@@ -701,8 +701,8 @@ def test_fused_metadata_copy_multi_dtype_validation():
             dst2["cache_seqlens"],
             dst2["cu_seqlens_k"],
             dst2["page_table_1"],
-            dst2["nsa_cache_seqlens"],
-            dst2["nsa_cu_seqlens_k"],
+            dst2["dsa_cache_seqlens"],
+            dst2["dsa_cu_seqlens_k"],
             None,
             None,
             None,
@@ -772,8 +772,8 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         data["src"]["cache_seqlens"],
         data["src"]["cu_seqlens_k"],
         data["src"]["page_indices"],
-        data["src"]["nsa_cache_seqlens"],
-        data["src"]["nsa_cu_seqlens_k"],
+        data["src"]["dsa_cache_seqlens"],
+        data["src"]["dsa_cu_seqlens_k"],
         data["src"]["real_page_table"],
         data["src"]["flashmla_num_splits"],
         data["src"]["flashmla_metadata"],
@@ -781,8 +781,8 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         dst_fused_0["cache_seqlens_int32"],
         dst_fused_0["cu_seqlens_k"],
         dst_fused_0["page_table_1"],
-        dst_fused_0["nsa_cache_seqlens_int32"],
-        dst_fused_0["nsa_cu_seqlens_k"],
+        dst_fused_0["dsa_cache_seqlens_int32"],
+        dst_fused_0["dsa_cu_seqlens_k"],
         dst_fused_0["real_page_table"],
         dst_fused_0["flashmla_num_splits"],
         dst_fused_0["flashmla_metadata"],
@@ -790,8 +790,8 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         dst_fused_1["cache_seqlens_int32"],
         dst_fused_1["cu_seqlens_k"],
         dst_fused_1["page_table_1"],
-        dst_fused_1["nsa_cache_seqlens_int32"],
-        dst_fused_1["nsa_cu_seqlens_k"],
+        dst_fused_1["dsa_cache_seqlens_int32"],
+        dst_fused_1["dsa_cu_seqlens_k"],
         dst_fused_1["real_page_table"],
         dst_fused_1["flashmla_num_splits"],
         dst_fused_1["flashmla_metadata"],
@@ -799,8 +799,8 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         dst_fused_2["cache_seqlens_int32"],
         dst_fused_2["cu_seqlens_k"],
         dst_fused_2["page_table_1"],
-        dst_fused_2["nsa_cache_seqlens_int32"],
-        dst_fused_2["nsa_cu_seqlens_k"],
+        dst_fused_2["dsa_cache_seqlens_int32"],
+        dst_fused_2["dsa_cu_seqlens_k"],
         dst_fused_2["real_page_table"],
         dst_fused_2["flashmla_num_splits"],
         dst_fused_2["flashmla_metadata"],
@@ -836,8 +836,8 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
             "cache_seqlens_int32",
             "cu_seqlens_k",
             "page_table_1",
-            "nsa_cache_seqlens_int32",
-            "nsa_cu_seqlens_k",
+            "dsa_cache_seqlens_int32",
+            "dsa_cu_seqlens_k",
         ]:
             if not torch.equal(dst_ref[key], dst_fused[key]):
                 diff = (
@@ -965,32 +965,32 @@ def test_fused_metadata_copy_multi_large_batch(bs):
             data["src"]["cache_seqlens"],
             data["src"]["cu_seqlens_k"],
             data["src"]["page_indices"],
-            data["src"]["nsa_cache_seqlens"],
-            data["src"]["nsa_cu_seqlens_k"],
+            data["src"]["dsa_cache_seqlens"],
+            data["src"]["dsa_cu_seqlens_k"],
             data["src"]["real_page_table"],
             data["src"]["flashmla_num_splits"],
             data["src"]["flashmla_metadata"],
             dst_fused_0["cache_seqlens_int32"],
             dst_fused_0["cu_seqlens_k"],
             dst_fused_0["page_table_1"],
-            dst_fused_0["nsa_cache_seqlens_int32"],
-            dst_fused_0["nsa_cu_seqlens_k"],
+            dst_fused_0["dsa_cache_seqlens_int32"],
+            dst_fused_0["dsa_cu_seqlens_k"],
             dst_fused_0["real_page_table"],
             dst_fused_0["flashmla_num_splits"],
             dst_fused_0["flashmla_metadata"],
             dst_fused_1["cache_seqlens_int32"],
             dst_fused_1["cu_seqlens_k"],
             dst_fused_1["page_table_1"],
-            dst_fused_1["nsa_cache_seqlens_int32"],
-            dst_fused_1["nsa_cu_seqlens_k"],
+            dst_fused_1["dsa_cache_seqlens_int32"],
+            dst_fused_1["dsa_cu_seqlens_k"],
             dst_fused_1["real_page_table"],
             dst_fused_1["flashmla_num_splits"],
             dst_fused_1["flashmla_metadata"],
             dst_fused_2["cache_seqlens_int32"],
             dst_fused_2["cu_seqlens_k"],
             dst_fused_2["page_table_1"],
-            dst_fused_2["nsa_cache_seqlens_int32"],
-            dst_fused_2["nsa_cu_seqlens_k"],
+            dst_fused_2["dsa_cache_seqlens_int32"],
+            dst_fused_2["dsa_cu_seqlens_k"],
             dst_fused_2["real_page_table"],
             dst_fused_2["flashmla_num_splits"],
             dst_fused_2["flashmla_metadata"],
@@ -1013,32 +1013,32 @@ def test_fused_metadata_copy_multi_large_batch(bs):
         data["src"]["cache_seqlens"],
         data["src"]["cu_seqlens_k"],
         data["src"]["page_indices"],
-        data["src"]["nsa_cache_seqlens"],
-        data["src"]["nsa_cu_seqlens_k"],
+        data["src"]["dsa_cache_seqlens"],
+        data["src"]["dsa_cu_seqlens_k"],
         data["src"]["real_page_table"],
         data["src"]["flashmla_num_splits"],
         data["src"]["flashmla_metadata"],
         dst_fused_0["cache_seqlens_int32"],
         dst_fused_0["cu_seqlens_k"],
         dst_fused_0["page_table_1"],
-        dst_fused_0["nsa_cache_seqlens_int32"],
-        dst_fused_0["nsa_cu_seqlens_k"],
+        dst_fused_0["dsa_cache_seqlens_int32"],
+        dst_fused_0["dsa_cu_seqlens_k"],
         dst_fused_0["real_page_table"],
         dst_fused_0["flashmla_num_splits"],
         dst_fused_0["flashmla_metadata"],
         dst_fused_1["cache_seqlens_int32"],
         dst_fused_1["cu_seqlens_k"],
         dst_fused_1["page_table_1"],
-        dst_fused_1["nsa_cache_seqlens_int32"],
-        dst_fused_1["nsa_cu_seqlens_k"],
+        dst_fused_1["dsa_cache_seqlens_int32"],
+        dst_fused_1["dsa_cu_seqlens_k"],
         dst_fused_1["real_page_table"],
         dst_fused_1["flashmla_num_splits"],
         dst_fused_1["flashmla_metadata"],
         dst_fused_2["cache_seqlens_int32"],
         dst_fused_2["cu_seqlens_k"],
         dst_fused_2["page_table_1"],
-        dst_fused_2["nsa_cache_seqlens_int32"],
-        dst_fused_2["nsa_cu_seqlens_k"],
+        dst_fused_2["dsa_cache_seqlens_int32"],
+        dst_fused_2["dsa_cu_seqlens_k"],
         dst_fused_2["real_page_table"],
         dst_fused_2["flashmla_num_splits"],
         dst_fused_2["flashmla_metadata"],
