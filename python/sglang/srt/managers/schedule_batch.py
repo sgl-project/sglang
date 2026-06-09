@@ -1713,7 +1713,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
 
-    token_type_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
 
@@ -1761,16 +1760,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
-    return_routed_experts: bool = False
-
-    return_indexer_topk: bool = False
-
-    return_pooled_hidden_states: bool = False
-
     # Has grammar
     has_grammar: bool = False
-
-    has_stream: bool = False
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
@@ -1778,8 +1769,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
-
-    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -1791,14 +1780,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
-    temp_scaled_logprobs: bool = False
-    top_p_normalized_logprobs: bool = False
-
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
     encoder_lens_cpu: Optional[List[int]] = None
-
-    dimensions: Optional[list[int]] = None
 
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
@@ -1858,13 +1842,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
-            has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
-            return_routed_experts=any(req.return_routed_experts for req in reqs),
-            return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             dllm_config=dllm_config,
             output_process_mode=output_process_mode,
