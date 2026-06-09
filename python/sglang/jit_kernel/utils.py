@@ -242,13 +242,9 @@ def load_jit(
     if cpp_files or cuda_files:
         module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
 
-    # Pin a deterministic per-module build dir and short-circuit when its .so is
-    # already built. module_name embeds a content hash of all sources (incl.
-    # transitive headers), so an existing .so is content-addressed -- loading it
-    # directly skips the ninja build entirely. Without this, ninja's mtime-based
-    # staleness check refires on every CI run: `pip install` bumps the mtime of
-    # included dependency headers (e.g. tvm_ffi) that the cached .o depends on,
-    # so ninja recompiles (~3min for marlin MoE) even on a content cache hit.
+    # module_name embeds a content hash of all sources, so a built .so under a
+    # deterministic dir is content-addressed: load it directly and skip ninja,
+    # whose mtime check rebuilds every CI run (pip install bumps dep header mtimes).
     if build_directory is None:
         cache_dir = os.environ.get(
             "TVM_FFI_CACHE_DIR", str(pathlib.Path("~/.cache/tvm-ffi").expanduser())
