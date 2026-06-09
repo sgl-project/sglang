@@ -130,58 +130,30 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
-_CEIL_TO_UE8M0_MIN_RECOMPILE_LIMIT = 16
-
-
-@functools.cache
-def _ceil_to_ue8m0_compile_options(dynamic: Optional[bool]) -> dict:
-    import torch._inductor.config as inductor_config
-    options = {}
-    triton_config = getattr(inductor_config, "triton", None)
-    if triton_config is not None and hasattr(triton_config, "enable_pdl"):
-        options["triton.enable_pdl"] = True
-    # Prefill is currently eager mode, cpp wrappers can help reduce CPU overhead.
-    if dynamic is None and hasattr(inductor_config, "cpp_wrapper"):
-        options["cpp_wrapper"] = True
-    return options
-
-
-def _ceil_to_ue8m0_recompile_limit() -> int:
-    def next_power_of_2(value: int) -> int:
-        return 1 << max(value - 1, 0).bit_length()
-
-    # Decode specializes once per CUDA graph bucket; keep one extra eager slot.
-    try:
-        cuda_graph_bs = get_global_server_args().cuda_graph_bs
-    except ValueError:
-        # Unit tests may use this helper before server args exist.
-        cuda_graph_bs = None
-
-    num_cuda_graph_bs = len(cuda_graph_bs or ())
-    return max(
-        _CEIL_TO_UE8M0_MIN_RECOMPILE_LIMIT,
-        next_power_of_2(num_cuda_graph_bs + 1),
-    )
-
-
-def _configure_ceil_to_ue8m0_dynamo_recompile_limit() -> None:
-    import torch._dynamo.config as dynamo_config
-    dynamo_config.recompile_limit = max(
-        dynamo_config.recompile_limit,
-        _ceil_to_ue8m0_recompile_limit(),
-    )
+_CEIL_TO_UE8M0_RECOMPILE_LIMIT = 1024
 
 
 @functools.cache
 def _compiled_deep_gemm_ceil_to_ue8m0(dynamic: Optional[bool]):
     import deep_gemm
+    import torch._dynamo.config as dynamo_config
 
-    _configure_ceil_to_ue8m0_dynamo_recompile_limit()
+    # This helper may run when global torch-compile config was not applied.
+    # Decode specializes one o_s shape per CUDA graph bucket, so keep this
+    # process-global limit aligned with the existing torch compile setup.
+    dynamo_config.recompile_limit = max(
+        dynamo_config.recompile_limit,
+        _CEIL_TO_UE8M0_RECOMPILE_LIMIT,
+    )
+    options = {"triton.enable_pdl": True}
+    # Prefill is currently eager mode, cpp wrappers can help reduce CPU overhead.
+    if dynamic is None:
+        options["cpp_wrapper"] = True
     return torch.compile(
         deep_gemm.ceil_to_ue8m0,
         fullgraph=True,
         dynamic=dynamic,
-        options=_ceil_to_ue8m0_compile_options(dynamic),
+        options=options,
     )
 
 
