@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.test.scripted_runtime.context.http_post import (
     _http_post_and_await_recv_msg,
@@ -30,6 +30,8 @@ class ScriptedContextReqStarter:
         return_logprob: bool = False,
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
+        stop_token_ids: Optional[List[int]] = None,
+        temperature: Optional[float] = None,
         lora_path: Optional[str] = None,
     ) -> ScriptedReqHandle:
         ctx = self._ctx
@@ -39,6 +41,10 @@ class ScriptedContextReqStarter:
             self._req_counter += 1
 
         sampling_params = {"max_new_tokens": max_new_tokens, "ignore_eos": ignore_eos}
+        if stop_token_ids is not None:
+            sampling_params["stop_token_ids"] = stop_token_ids
+        if temperature is not None:
+            sampling_params["temperature"] = temperature
         payload = {
             "input_ids": [prompt_token] * prompt_len,
             "sampling_params": sampling_params,

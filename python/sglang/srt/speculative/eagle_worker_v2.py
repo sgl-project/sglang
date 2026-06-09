@@ -53,7 +53,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
-    fill_accepted_out_cache_loc,
+    fill_accept_out_cache_loc,
     fill_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import (
@@ -71,6 +71,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
+    spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -562,9 +563,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            with forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ), canary_index_ctx:
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -939,6 +945,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
@@ -971,6 +978,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
             ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
@@ -985,6 +993,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
@@ -1271,9 +1280,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
-            self._mamba_verify_update(
-                batch, verify_input, accept_lens, accept_index, bs
-            )
+            self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -1297,7 +1304,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle() and self.topk > 1:
             # topk == 1 needs nothing here: the accepted path is already the front
             # chain, so the whole compaction is an identity transform.
-            predict = self._finalize_accepted_tree_path(
+            predict = self._finalize_accept_tree_path(
                 batch, accept_index, accept_lens, predict, logits_output, bs
             )
 
@@ -1323,7 +1330,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _mamba_verify_update(
         self,
         batch: ScheduleBatch,
-        verify_input: EagleVerifyInput,
         accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
@@ -1331,17 +1337,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Update mamba state for hybrid GDN models after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-            if verify_input.topk != 1:
-                raise ValueError("Spec v2 currently only supports topk = 1.")
-
-            accepted_indices_offset = torch.arange(
+            accept_indices_offset = torch.arange(
                 0,
                 bs * self.speculative_num_draft_tokens,
                 step=self.speculative_num_draft_tokens,
                 dtype=accept_lens.dtype,
                 device=accept_lens.device,
             )
-            last_correct_step_indices = accept_lens - 1
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            # Per-req tree step of the last accepted node, i.e. the step whose
+            # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accept_indices_offset
+            )
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1359,13 +1368,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 to_track_ith = torch.clamp(
                     tracking_point - seq_lens_pre_verify - 1, min=0
                 ).to(torch.int64)
-                req_idx = torch.arange(
-                    bs,
-                    dtype=torch.int64,
-                    device=accept_lens.device,
-                )
                 candidate_track_steps = (
-                    accept_index[req_idx, to_track_ith] - accepted_indices_offset
+                    accept_index[req_idx, to_track_ith] - accept_indices_offset
                 )
                 mamba_steps_to_track = torch.where(
                     to_track_mask,
@@ -1382,7 +1386,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model=self.target_worker.model_runner.model,
             )
 
-    def _finalize_accepted_tree_path(
+    def _finalize_accept_tree_path(
         self,
         batch: ScheduleBatch,
         accept_index: torch.Tensor,
@@ -1396,17 +1400,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         downstream chain-layout code (draft-extend select_index, committed-KV reads)
         assumes. Returns compacted predict; mutates logits_output.hidden_states
         (moved only when present)."""
-        self.move_accepted_tokens_to_target_kvcache(
-            batch, accept_index, accept_lens - 1
-        )
-        predict = self._compact_accepted_to_front(predict, accept_index, bs)
+        self.move_accept_tokens_to_target_kvcache(batch, accept_index, accept_lens - 1)
+        predict = self._compact_accept_to_front(predict, accept_index, bs)
         if logits_output.hidden_states is not None:
-            logits_output.hidden_states = self._compact_accepted_to_front(
+            logits_output.hidden_states = self._compact_accept_to_front(
                 logits_output.hidden_states, accept_index, bs
             )
         return predict
 
-    def move_accepted_tokens_to_target_kvcache(
+    def move_accept_tokens_to_target_kvcache(
         self,
         batch: ScheduleBatch,
         accept_index: torch.Tensor,
@@ -1426,7 +1428,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
         size = bs * accept_index.shape[1]
 
-        # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+        # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
         maybe_detect_oob(
             accept_index,
             -1,
@@ -1439,9 +1441,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dtype=torch.int64,
             device=self.device,
         )
-        accepted_out_cache_loc = torch.zeros(
-            size, dtype=torch.int64, device=self.device
-        )
+        accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=self.device)
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
@@ -1451,17 +1451,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
-        fill_accepted_out_cache_loc[(size,)](
+        fill_accept_out_cache_loc[(size,)](
             accept_index,
             batch.out_cache_loc,
-            accepted_out_cache_loc,
+            accept_out_cache_loc,
             next_power_of_2(size),
         )
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
+            tgt_cache_loc, accept_out_cache_loc
         )
 
-    def _compact_accepted_to_front(
+    def _compact_accept_to_front(
         self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
     ) -> torch.Tensor:
         """Gather the accepted tree path to the front of each per-req block.

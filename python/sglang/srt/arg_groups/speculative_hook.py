@@ -285,42 +285,22 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    # Spec v2 tree drafting supports topk > 1 with page_size == 1 and page_size > 1
-    # (the latter via partial-page duplication; backend-gated below).
-    spec_v1_reason = None
-    # mamba / linear-attn state models only support topk == 1 on spec v2.
-    # mamba2_cache_params exists iff the config carries such state; check the
-    # class descriptor so the property getter is not invoked.
-    text_config = server_args.get_model_config().hf_config.get_text_config()
-    is_mamba_state_model = hasattr(type(text_config), "mamba2_cache_params")
+    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
+    # path instead of the overlap-scheduled one; both run the V2 worker.
     if (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk > 1
-        and is_mamba_state_model
-        and not server_args.disable_overlap_schedule
-    ):
-        # Spec v2 topk > 1 is not supported for mamba/linear-attn state models
-        # (only topk == 1); fall back to v1 for those. page_size > 1 is supported
-        # on v2 (partial-page duplication), so it no longer forces v1.
-        server_args.disable_overlap_schedule = True
-        spec_v1_reason = (
-            "spec v2 topk > 1 is not supported for mamba/linear-attn models"
-        )
-    elif (
         not envs.SGLANG_ENABLE_SPEC_V2.get()
         and not server_args.disable_overlap_schedule
     ):
         server_args.disable_overlap_schedule = True
-        spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
 
     if server_args.disable_overlap_schedule:
         logger.warning(
-            "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
-            spec_v1_reason or "overlap schedule is disabled",
+            "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
+            "speculative decoding."
         )
     else:
         logger.warning(
-            "Spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
+            "Overlap spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
         )
 
     if server_args.enable_mixed_chunk:
