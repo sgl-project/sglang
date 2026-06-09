@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
@@ -89,6 +90,55 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertIn("('nixl', 'mooncake')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
+
+
+class TestDefaultAttentionBackend(unittest.TestCase):
+    def _make_args(self):
+        args = ServerArgs.__new__(ServerArgs)
+        args.speculative_eagle_topk = None
+        args.page_size = 1
+        args.speculative_algorithm = None
+        return args
+
+    def _make_model_config(self, architecture):
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            has_attention_sinks=False,
+        )
+
+    @patch("sglang.srt.server_args.is_mps", return_value=False)
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    @patch("sglang.srt.server_args.is_flashinfer_available", return_value=True)
+    @patch("sglang.srt.server_args.is_hopper_with_cuda_12_3", return_value=True)
+    def test_mistral_architectures_do_not_default_to_fa3_on_hopper(
+        self,
+        _mock_is_hopper,
+        _mock_flashinfer,
+        _mock_sm100,
+        _mock_hip,
+        _mock_mps,
+    ):
+        args = self._make_args()
+
+        for architecture in ("MistralForCausalLM", "MixtralForCausalLM"):
+            with self.subTest(architecture=architecture):
+                backend = args._get_default_attn_backend(
+                    use_mla_backend=False,
+                    model_config=self._make_model_config(architecture),
+                )
+                self.assertEqual(backend, "flashinfer")
+
+    @patch("sglang.srt.server_args.is_hopper_with_cuda_12_3", return_value=True)
+    def test_llama_still_defaults_to_fa3_on_hopper(self, _mock_is_hopper):
+        args = self._make_args()
+
+        backend = args._get_default_attn_backend(
+            use_mla_backend=False,
+            model_config=self._make_model_config("LlamaForCausalLM"),
+        )
+
+        self.assertEqual(backend, "fa3")
 
 
 class TestPortArgs(unittest.TestCase):

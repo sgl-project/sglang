@@ -2996,7 +2996,6 @@ def is_fa3_default_architecture(hf_config):
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
-        "MixtralForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -3013,6 +3012,17 @@ def is_fa3_default_architecture(hf_config):
         "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
+
+
+def is_fa3_default_disabled_architecture(hf_config):
+    architectures = getattr(hf_config, "architectures", None)
+    if not isinstance(architectures, list) or not architectures:
+        return False
+    disabled_archs = {
+        "MistralForCausalLM",
+        "MixtralForCausalLM",
+    }
+    return architectures[0] in disabled_archs
 
 
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
