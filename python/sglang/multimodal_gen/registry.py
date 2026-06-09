@@ -77,6 +77,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -131,6 +132,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -977,6 +979,20 @@ def _register_configs():
         ],
     )
 
+    # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
+    register_configs(
+        sampling_param_cls=SanaWMSamplingParams,
+        pipeline_config_cls=SanaWMPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-WM_bidirectional",
+            "Efficient-Large-Model/SANA-WM_streaming",
+        ],
+        model_detectors=[
+            # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
+            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
+        ],
+    )
+
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
     # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
@@ -1005,7 +1021,13 @@ def _register_configs():
             "Efficient-Large-Model/Sana_1600M_512px_diffusers",
             "Efficient-Large-Model/Sana_600M_512px_diffusers",
         ],
-        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: (
+                "sana" in hf_id.lower()
+                and "sana-wm" not in hf_id.lower()
+                and "sana_wm" not in hf_id.lower()
+            )
+        ],
     )
 
     # FireRed-Image-Edit
