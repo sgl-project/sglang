@@ -145,6 +145,9 @@ class TboAttnBackend(AttentionBackend):
     def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
+    def get_compressor_state(self, layer_id: int, forward_batch: "ForwardBatch"):
+        return self.primary.get_compressor_state(layer_id, forward_batch)
+
 
 def _build_tbo_child_replay_fb_view(
     fb_view,

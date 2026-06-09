@@ -139,6 +139,10 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
 
+    def get_compressor_state(self, layer_id: int, forward_batch: ForwardBatch):
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.get_compressor_state(layer_id, forward_batch)
+
     def forward(
         self,
         q: torch.Tensor = None,

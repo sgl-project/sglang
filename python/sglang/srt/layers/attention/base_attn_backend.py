@@ -10,6 +10,7 @@ from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsv4.compressor import FusedCompressMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
@@ -162,7 +163,30 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run forward on an attention layer."""
+        """Run forward on an attention layer.
+
+        All aux data is sourced from backend-internal channels, NOT
+        ``**kwargs``:
+
+          - ``forward_batch.spec_info`` (e.g. ``spec_info.custom_mask``)
+          - ``self.forward_metadata`` (set in
+            :py:meth:`init_forward_metadata_out_graph`)
+          - ``self.cuda_graph_*`` (backend-private buffers; set in
+            :py:meth:`init_cuda_graph_state`)
+          - :py:meth:`get_indexer_metadata` /
+            :py:meth:`get_compressor_state` (opt-in reverse-query helpers)
+
+        ``**kwargs`` is reserved for **layer-level extras** that the model
+        layer (RadixAttention / RadixLinearAttention) injects per-call —
+        e.g. ``q_rope`` / ``k_rope`` (MLA rotary), ``sinks`` (sink-token
+        attention), ``cos_sin_cache`` / ``is_neox`` / ``llama_4_scaling``
+        (rotary variants), ``topk_indices`` (DSA). It MUST NOT carry spec
+        / mask / page table / indexer / compressor data — those are aux
+        data with explicit channels above.
+
+        TODO: enumerate the layer-level extras explicitly and drop the
+        ``**kwargs`` catch-all once the backend signatures are aligned.
+        """
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
@@ -244,4 +268,23 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
+        return None
+
+    def get_compressor_state(
+        self,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+    ) -> Optional[FusedCompressMetadata]:
+        """Get the per-layer compressor state (DSV4 mhc / hisparse).
+
+        Symmetric opt-in helper to :py:meth:`get_indexer_metadata`. Default
+        ``None`` means this backend does not produce compressor state; the
+        caller (Compressor / mHC layer) should fall back to its own path.
+
+        Backends override to return their per-iter compressor metadata
+        (e.g. ``FusedCompressMetadata`` for DSV4) computed in
+        :py:meth:`init_forward_metadata_out_graph`. This routes compressor
+        data via a backend-internal explicit API instead of leaking it
+        through ``forward(**kwargs)``.
+        """
         return None
