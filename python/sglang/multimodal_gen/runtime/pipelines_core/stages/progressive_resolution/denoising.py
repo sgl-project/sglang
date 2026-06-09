@@ -286,6 +286,29 @@ class ProgressiveDenoisingStage(DenoisingStage):
         """Called after each stage transition. Update resolution-dependent state."""
         pass
 
+    def _refresh_cache_dit_context(
+        self, n_remaining: int, scm_preset: str | None
+    ) -> None:
+        """Refresh cache-dit activations and step counter at a stage transition.
+
+        Override in model-specific subclasses that use more than one transformer
+        (e.g. models with a separate unconditional branch).
+        """
+        if self.transformer_2 is not None:
+            n_high = n_remaining // 2
+            n_low = n_remaining - n_high
+            refresh_context_on_dual_transformer(
+                self.transformer,
+                self.transformer_2,
+                n_high,
+                n_low,
+                scm_preset=scm_preset,
+            )
+        else:
+            refresh_context_on_transformer(
+                self.transformer, n_remaining, scm_preset=scm_preset
+            )
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -572,23 +595,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 # residual-diff decision for the first full-res steps.
                 if self._cache_dit_enabled:
                     n_remaining = n_steps - stage_end
-                    scm_preset = _get_scm_preset()
-                    if self.transformer_2 is not None:
-                        n_high = n_remaining // 2
-                        n_low = n_remaining - n_high
-                        refresh_context_on_dual_transformer(
-                            self.transformer,
-                            self.transformer_2,
-                            n_high,
-                            n_low,
-                            scm_preset=scm_preset,
-                        )
-                    else:
-                        refresh_context_on_transformer(
-                            self.transformer,
-                            n_remaining,
-                            scm_preset=scm_preset,
-                        )
+                    self._refresh_cache_dit_context(n_remaining, _get_scm_preset())
                     logger.info(
                         "cache-dit context refreshed at stage transition "
                         "(step %d, %d steps remaining)",
