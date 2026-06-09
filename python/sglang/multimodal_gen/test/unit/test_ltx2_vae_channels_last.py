@@ -51,6 +51,28 @@ class TestLTX2CausalConvChannelsLast(unittest.TestCase):
     def test_temporal_only_kernel_matches_reference(self):
         self._check(causal=True, kernel_size=(3, 1, 1))
 
+    def test_causal_cache_matches_monolithic_reference(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch.manual_seed(0)
+        conv = LTX2VideoCausalConv3d(4, 5, 3).to(device, torch.float32).eval()
+        conv.conv.weight.data = conv.conv.weight.data.to(
+            memory_format=torch.channels_last_3d
+        )
+        self.assertTrue(conv._weight_is_channels_last_3d())
+        x = torch.randn(1, 4, 6, 3, 3, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            whole = conv(x, causal=True)
+            cache = {}
+            parts = [
+                conv(chunk, causal=True, conv_cache=cache, cache_key="conv")
+                for chunk in (x[:, :, :2], x[:, :, 2:])
+            ]
+            chunked = torch.cat(parts, dim=2)
+
+        self.assertEqual(chunked.shape, whole.shape)
+        torch.testing.assert_close(whole, chunked, rtol=1e-4, atol=1e-4)
+
     def test_pad_replicates_edge_frames_exactly(self):
         # The temporal pad must replicate the first (and, when non-causal, last)
         # frame exactly -- assert against an explicit reference construction.
