@@ -81,9 +81,7 @@ class TestVisionRotaryTriton(CustomTestCase):
         # Build frequency cache (same as Qwen2VisionRotaryEmbedding)
         theta = 10000.0
         dim = half_dim * 2
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         seq = torch.arange(max_grid_size * 2, dtype=torch.float)
         freqs_cached = torch.outer(seq, inv_freq)  # [max_seq, half_dim]
 

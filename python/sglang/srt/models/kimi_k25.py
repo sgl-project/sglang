@@ -674,6 +674,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
+    @property
+    def model(self):
+        # Alias .model to .language_model so this class satisfies the piecewise
+        # CUDA graph gate, which checks `hasattr(model, "model")`.
+        return self.language_model
+
+    def __setattr__(self, name, value):
+        # Skip redundant self.model.model assignment in runner to avoid duplicate
+        # nn.Module registration.
+        if name == "model":
+            return
+        super().__setattr__(name, value)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype

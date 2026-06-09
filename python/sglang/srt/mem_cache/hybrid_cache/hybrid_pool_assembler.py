@@ -679,6 +679,11 @@ class StackStrategy:
         load_cache_event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        storage_backend: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+        prefetch_threshold: int = 256,
+        model_name: Optional[str] = None,
+        enable_storage_metrics: bool = False,
     ) -> StackBuildResult:
         raise NotImplementedError
 
@@ -704,6 +709,11 @@ class _DeepSeekV4Strategy(StackStrategy):
         load_cache_event,
         attn_cp_group=None,
         attn_tp_group=None,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -716,11 +726,15 @@ class _DeepSeekV4Strategy(StackStrategy):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
-            storage_backend=None,
+            storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: cache.evict(EvictParams(swa_num_tokens=n)),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            enable_storage_metrics=enable_storage_metrics,
         )
         sidecars = [
             SidecarPoolSpec(pool_name=name, indices_from_pool=src)
@@ -766,6 +780,11 @@ class _MambaStrategy(StackStrategy):
         load_cache_event,
         attn_cp_group=None,
         attn_tp_group=None,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -783,12 +802,16 @@ class _MambaStrategy(StackStrategy):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
-            storage_backend=None,
+            storage_backend=storage_backend,
             use_mla=kvcache.use_mla,
             host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
             device_mamba_evict_fn=lambda n: cache.evict(EvictParams(mamba_num=n)),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            enable_storage_metrics=enable_storage_metrics,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -834,6 +857,11 @@ class _SwaStrategy(StackStrategy):
         load_cache_event,
         attn_cp_group=None,
         attn_tp_group=None,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -850,12 +878,16 @@ class _SwaStrategy(StackStrategy):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
-            storage_backend=None,
+            storage_backend=storage_backend,
             use_mla=False,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: cache.evict(EvictParams(swa_num_tokens=n)),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            enable_storage_metrics=enable_storage_metrics,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -887,6 +919,11 @@ class _DsaStrategy(StackStrategy):
         load_cache_event,
         attn_cp_group=None,
         attn_tp_group=None,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
@@ -904,7 +941,7 @@ class _DsaStrategy(StackStrategy):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
-            storage_backend=None,
+            storage_backend=storage_backend,
             use_mla=use_mla,
             override_kv_cache_dim=full_kv_pool.kv_cache_dim,
             sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
@@ -913,8 +950,12 @@ class _DsaStrategy(StackStrategy):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             ),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            enable_storage_metrics=enable_storage_metrics,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -961,6 +1002,11 @@ class _PlainKvStrategy(StackStrategy):
         load_cache_event,
         attn_cp_group=None,
         attn_tp_group=None,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
@@ -977,10 +1023,14 @@ class _PlainKvStrategy(StackStrategy):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
-            storage_backend=None,
+            storage_backend=storage_backend,
             use_mla=use_mla,
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            enable_storage_metrics=enable_storage_metrics,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1057,6 +1107,9 @@ def attach_hybrid_pool_to_unified_cache(
     load_cache_event,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    storage_backend: Optional[str] = None,
+    storage_extra_config: Optional[dict] = None,
+    storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     try:
@@ -1071,6 +1124,11 @@ def attach_hybrid_pool_to_unified_cache(
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
+            storage_backend=storage_backend,
+            storage_backend_extra_config=storage_extra_config,
+            prefetch_threshold=storage_prefetch_threshold,
+            model_name=server_args.served_model_name,
+            enable_storage_metrics=cache._enable_metrics_flag,
         )
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:

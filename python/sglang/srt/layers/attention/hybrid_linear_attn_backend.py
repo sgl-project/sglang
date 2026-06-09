@@ -811,8 +811,17 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
-        # Dispatch by the layer's runtime type
+        # Explicit linear-attention subclass → strong linear signal (KDA, GDN,
+        # Qwen3-Next, Qwen3.5 main linear layers).
         if isinstance(layer, RadixLinearAttention):
+            return False
+        # Some hybrid models (Ling-2.5/2.6) wrap their linear layers in plain
+        # `RadixAttention` rather than `RadixLinearAttention`. Those wrappers
+        # set `_is_linear_attention=True` on the attn module so we can
+        # distinguish them from full-attention RadixAttention instances —
+        # including MTP/NEXTN draft layers, which are full and must default to
+        # the full-attn path.
+        if layer is not None and getattr(layer, "_is_linear_attention", False):
             return False
         if isinstance(layer, RadixAttention):
             return True
@@ -823,6 +832,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         return layer_id in self.full_attn_layers
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2 only runs full-attn layers in the draft model,
+            # so skip linear/mamba backend metadata which requires query_start_loc.
+            self.full_attn_backend.init_forward_metadata(forward_batch)
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 

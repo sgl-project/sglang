@@ -704,12 +704,26 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            if forward_mode.is_draft_extend_v2():
+                # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+                # Triton extend kernel receives extend K/V as separate tensors, so
+                # kv_indptr/kv_indices must cover only the prefix portion.
+                extend_seq_lens = (
+                    spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
+                    if spec_info is not None
+                    and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
+                    else torch.zeros(bs, dtype=torch.int32, device=self.device)
+                )
+                kv_lens = (seq_lens - extend_seq_lens).to(torch.int32)
+            else:
+                # DRAFT_EXTEND_V1: seq_lens = prefix only.
+                kv_lens = seq_lens
+            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
-                seq_lens,
+                kv_lens,
                 kv_indptr,
                 None,
                 kv_indices,
@@ -859,12 +873,31 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            if forward_mode.is_draft_extend_v2():
+                # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+                # Triton extend kernel receives extend K/V as separate tensors, so
+                # kv_indptr/kv_indices must cover only the prefix portion.
+                # Clamp at 0 because padded rows (raw_bs..bs) leave seq_lens at
+                # the fill value (1) while extend_seq_lens stays at num_tokens_per_bs,
+                # which would otherwise produce negative kv_lens; padded rows
+                # reference reserved req-pool slot 0 and their output is discarded.
+                assert (
+                    spec_info is not None
+                    and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
+                ), "DRAFT_EXTEND_V2 replay requires spec_info.extend_seq_lens_tensor"
+                kv_lens = torch.clamp(
+                    seq_lens - spec_info.extend_seq_lens_tensor[:bs].to(torch.int32),
+                    min=0,
+                ).to(torch.int32)
+            else:
+                # DRAFT_EXTEND_V1: seq_lens = prefix only.
+                kv_lens = seq_lens
+            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
-                seq_lens,
+                kv_lens,
                 kv_indptr,
                 None,
                 kv_indices,

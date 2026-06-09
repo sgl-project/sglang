@@ -74,6 +74,7 @@ if is_npu():
 from sglang.srt.distributed import (
     get_attn_context_model_parallel_rank,
     get_attn_context_model_parallel_world_size,
+    get_attn_tp_group,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
@@ -162,15 +163,46 @@ if _is_cuda:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        from sglang.srt.layers.deep_gemm_wrapper import entrypoint as deep_gemm_wrapper
-
-        out = torch.empty(
-            (x.shape[0], weight.shape[0]), dtype=torch.float32, device=x.device
-        )
-        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
+
+    @register_custom_op(mutates_args=["topk_indices"])
+    @register_split_op()
+    def broadcast_indexer_topk_from_rank0_(topk_indices: torch.Tensor) -> None:
+        _broadcast_indexer_topk_from_rank0_impl(topk_indices)
+
+
+def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
+    group = get_attn_tp_group()
+    if group.world_size == 1:
+        return
+
+    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        if group.pynccl_comm is None:
+            raise RuntimeError(
+                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
+            )
+        with group.pynccl_comm.change_state(enable=True):
+            group.pynccl_comm.broadcast(topk_indices, src=0)
+    else:
+        group.broadcast(topk_indices, src=0)
+
+
+def _broadcast_indexer_topk_from_rank0(
+    topk_indices: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    # Sync only the finalized indexer output. Internal topk_transform calls can
+    # be chunked differently across ranks, which would make collectives diverge.
+    if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        return topk_indices
+
+    if is_in_piecewise_cuda_graph():
+        broadcast_indexer_topk_from_rank0_(topk_indices)
+    else:
+        _broadcast_indexer_topk_from_rank0_impl(topk_indices)
+    return topk_indices
 
 
 class BaseIndexerMetadata(ABC):
@@ -1307,19 +1339,18 @@ class Indexer(MultiPlatformOp):
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
-            return maybe_capture_indexer_topk(
+            topk_result = self._forward_cuda_k_only(
+                x,
+                positions,
+                forward_batch,
                 layer_id,
-                self._forward_cuda_k_only(
-                    x,
-                    positions,
-                    forward_batch,
-                    layer_id,
-                    act_quant,
-                    enable_dual_stream,
-                    metadata,
-                    return_indices,
-                ),
+                act_quant,
+                enable_dual_stream,
+                metadata,
+                return_indices,
             )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
@@ -1432,15 +1463,14 @@ class Indexer(MultiPlatformOp):
                     #     print(
                     #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                     #     )
-                    return maybe_capture_indexer_topk(
-                        layer_id,
-                        torch.full(
-                            (x_meta.shape[0], self.index_topk),
-                            -1,
-                            dtype=torch.int,
-                            device=x_meta.device,
-                        ),
+                    topk_result = torch.full(
+                        (x_meta.shape[0], self.index_topk),
+                        -1,
+                        dtype=torch.int,
+                        device=x_meta.device,
                     )
+                    topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+                    return maybe_capture_indexer_topk(layer_id, topk_result)
 
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
@@ -1455,10 +1485,14 @@ class Indexer(MultiPlatformOp):
                     forward_batch.attn_cp_metadata is not None
                     and is_dsa_prefill_cp_in_seq_split()
                 ):
-                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev
-                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next
-                    actual_seq_q_prev = forward_batch.attn_cp_metadata.actual_seq_q_prev
-                    actual_seq_q_next = forward_batch.attn_cp_metadata.actual_seq_q_next
+                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev_list[0]
+                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next_list[0]
+                    actual_seq_q_prev = (
+                        forward_batch.attn_cp_metadata.actual_seq_q_prev_list[0]
+                    )
+                    actual_seq_q_next = (
+                        forward_batch.attn_cp_metadata.actual_seq_q_next_list[0]
+                    )
 
                     # TODO support mutil-batch
                     # cp_batch_seq_index_prev = forward_batch.attn_cp_metadata["cp_batch_seq_index_prev"]
@@ -1489,10 +1523,9 @@ class Indexer(MultiPlatformOp):
                         kv_len_next,
                         actual_seq_q_next,
                     )
-                    return maybe_capture_indexer_topk(
-                        layer_id,
-                        torch.cat([topk_result_prev, topk_result_next], dim=0),
-                    )
+                    topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+                    return maybe_capture_indexer_topk(layer_id, topk_result)
                 elif is_in_piecewise_cuda_graph():
                     assert (
                         not enable_dual_stream
@@ -1528,6 +1561,7 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
+        topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
 
     def forward_npu(

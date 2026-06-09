@@ -26,7 +26,7 @@ from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
 )
-from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
@@ -37,6 +37,7 @@ from sglang.srt.configs.step3_vl import (
     Step3VLConfig,
 )
 from sglang.srt.configs.step3p5 import Step3p5Config
+from sglang.srt.configs.step3p7 import Step3p7Config
 
 __all__ = [
     "AfmoeConfig",
@@ -70,10 +71,12 @@ __all__ = [
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
     "NemotronHConfig",
+    "NemotronHPuzzleConfig",
     "NemotronH_Nano_VL_V2_Config",
     "NemotronH_Nano_Omni_Reasoning_V3_Config",
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",
+    "Step3p7Config",
     "Qwen3ASRConfig",
 ]

@@ -65,8 +65,6 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     get_last_loc_large_page_size_large_top_k,
     load_token_map,
-    maybe_detect_nan,
-    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils import (
@@ -78,6 +76,11 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     next_power_of_2,
+)
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -896,6 +899,7 @@ class EAGLEWorker(TpModelWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
+            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
@@ -907,6 +911,8 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
+            maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
             forward_batch.positions.add_(1)
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
@@ -969,6 +975,7 @@ class EAGLEWorker(TpModelWorker):
                 batch.sampling_info.vocab_mask = None
 
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(

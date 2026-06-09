@@ -33,6 +33,10 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.amx_utils import (
+    CPUQuantMethod,
+    _amx_process_weight_after_loading,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
@@ -46,6 +50,8 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
@@ -57,6 +63,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
@@ -138,9 +145,11 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+_is_cpu = is_cpu()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_cpu_amx_available = cpu_has_amx_support()
 _sm120_mxfp4_min_warps_patched = False
 
 if _is_hip:
@@ -849,6 +858,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+        elif _is_cpu and _is_cpu_amx_available:
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if use_intel_amx_backend(layer):
+                packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w13_weight_scale
+                )
+                packed_w2_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w2_weight_scale
+                )
+                layer.w13_weight_scale = Parameter(
+                    packed_w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight_scale = Parameter(
+                    packed_w2_weight_scale, requires_grad=False
+                )
+                if hasattr(layer, "w13_weight_bias"):
+                    layer.w13_weight_bias = Parameter(
+                        layer.w13_weight_bias.float(), requires_grad=False
+                    )
+                if hasattr(layer, "w2_weight_bias"):
+                    layer.w2_weight_bias = Parameter(
+                        layer.w2_weight_bias.float(), requires_grad=False
+                    )
+            return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -1107,6 +1140,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            x, topk_weights = apply_topk_weights_cpu(
+                self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            )
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                CPUQuantMethod.MXFP4,
+                layer.w13_weight_scale,  # w1_scale
+                layer.w2_weight_scale,  # w2_scale
+                None,  # w1_zp
+                None,  # w2_zp
+                None,  # block_size
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
+                True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)

@@ -891,10 +891,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.mlp(hidden_states, state.forward_batch)
-
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             state.pop("hidden_states_mlp_output"),
@@ -1005,7 +1001,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.attn_cp_rank,
                     self.attn_cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
 
         hidden_states = self.model(

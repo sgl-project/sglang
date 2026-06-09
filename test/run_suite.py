@@ -20,6 +20,7 @@ HW_MAPPING = {
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
     "npu": HWBackend.NPU,
+    "xpu": HWBackend.XPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -58,8 +59,8 @@ PER_COMMIT_SUITES = {
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
         "base-c-test-deepep-4-gpu-h100",
-        "base-c-test-dsv4-4-gpu-b200",
-        "base-c-test-dsv4-8-gpu-h200",
+        "base-c-test-deepep-4-gpu-b200",
+        "base-c-test-deepep-8-gpu-h200",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
         # (tests still tagged per-commit but skipped on default PR runs).
         "extra-a-test-1-gpu-small",
@@ -68,6 +69,7 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-4-gpu-b200",
         "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
@@ -76,6 +78,10 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
         "stage-b-test-16-npu-a3",
+    ],
+    HWBackend.XPU: [
+        "stage-a-test-1-gpu-xpu",
+        "stage-b-test-1-gpu-xpu",
     ],
 }
 
@@ -127,6 +133,7 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
+    HWBackend.XPU: [],
 }
 
 
@@ -141,7 +148,7 @@ OTHER_SUITES = {
 }
 
 
-_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU, HWBackend.XPU}
 
 
 def _valid_suites_by_backend() -> dict:

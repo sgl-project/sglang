@@ -65,7 +65,7 @@ class FullComponent(TreeComponent):
         # last_device_node, summing host_value lengths of evicted nodes.
         ct = self.component_type
         kv_host_hit = 0
-        node = result.last_host_node
+        node = result.best_match_node
         root_node = self.cache.root_node
         while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
@@ -155,9 +155,22 @@ class FullComponent(TreeComponent):
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
 
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
+
+        # Only the last host node needs to be protected.
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return result
+            cd.host_lock_ref += 1
+            self.cache._update_evictable_leaf_sets(node)
+            return result
+
         root = self.cache.root_node
         cur = node
 
@@ -185,9 +198,20 @@ class FullComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None or cd.host_lock_ref == 0:
+                return
+            cd.host_lock_ref -= 1
+            self.cache._update_evictable_leaf_sets(node)
+            return
+
         root = self.cache.root_node
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         cur = node
@@ -255,6 +279,7 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        **kw,
     ) -> None:
         ct = self.component_type
 

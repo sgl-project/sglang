@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -270,6 +272,173 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             server_args.layerwise_offload_components, ["transformer", "text_encoder"]
         )
+
+    def test_serve_cli_preserves_config_and_dynamic_unknown_args(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            json.dump({"model_path": "/from/config", "num_gpus": 2}, config_file)
+            config_file.flush()
+            parser = FlexibleArgumentParser()
+            add_multimodal_gen_serve_args(parser)
+            argv = [
+                "--config",
+                config_file.name,
+                "--model-path",
+                "/from/cli",
+                "--vae-path",
+                "/custom/vae",
+                "--component-attention-backends.transformer",
+                "fa3",
+            ]
+
+            with patch.object(sys, "argv", ["sglang", "serve"] + argv):
+                args, unknown_args = parser.parse_known_args(argv)
+                with (
+                    patch.object(
+                        PipelineConfig,
+                        "from_kwargs",
+                        return_value=QwenImagePipelineConfig(),
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.registry.get_model_info",
+                        return_value=None,
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                        return_value=80 * 1024**3,
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                        return_value=80,
+                    ),
+                ):
+                    server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual("/from/cli", server_args.model_path)
+        self.assertEqual(2, server_args.num_gpus)
+        self.assertEqual("/custom/vae", server_args.component_paths["vae"])
+        self.assertEqual(
+            {"transformer": "fa"},
+            server_args.component_attention_backends,
+        )
+
+    def test_serve_cli_defaults_warmup_on(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
+
+        parser = FlexibleArgumentParser()
+        add_multimodal_gen_serve_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang", "serve"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.cli.serve.dispatch_launch"
+            ) as dispatch_launch,
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            execute_serve_cmd(args, unknown_args)
+
+        server_args = dispatch_launch.call_args.args[0]
+        self.assertTrue(server_args.warmup)
+        self.assertTrue(server_args.server_warmup)
+        self.assertFalse(server_args.is_arg_explicitly_set("warmup"))
+        self.assertFalse(server_args.is_arg_explicitly_set("server_warmup"))
+
+    def test_serve_cli_preserves_explicit_warmup_false(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
+
+        parser = FlexibleArgumentParser()
+        add_multimodal_gen_serve_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--warmup",
+            "false",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang", "serve"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.cli.serve.dispatch_launch"
+            ) as dispatch_launch,
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            execute_serve_cmd(args, unknown_args)
+
+        server_args = dispatch_launch.call_args.args[0]
+        self.assertFalse(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
+        self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
+
+    def test_serve_cli_preserves_config_warmup_false(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            json.dump({"model_path": "/fake", "warmup": False}, config_file)
+            config_file.flush()
+
+            parser = FlexibleArgumentParser()
+            add_multimodal_gen_serve_args(parser)
+            argv = [
+                "--config",
+                config_file.name,
+            ]
+
+            with (
+                patch.object(sys, "argv", ["sglang", "serve"] + argv),
+                patch.object(
+                    PipelineConfig,
+                    "from_kwargs",
+                    return_value=QwenImagePipelineConfig(),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.entrypoints.cli.serve.dispatch_launch"
+                ) as dispatch_launch,
+            ):
+                args, unknown_args = parser.parse_known_args(argv)
+                execute_serve_cmd(args, unknown_args)
+
+        server_args = dispatch_launch.call_args.args[0]
+        self.assertFalse(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
+        self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
+
+    def test_disagg_role_disables_server_warmup(self):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            server_args = ServerArgs.from_dict(
+                {
+                    "model_path": "/fake",
+                    "warmup": True,
+                    "server_warmup": True,
+                    "disagg_role": "server",
+                }
+            )
+
+        self.assertTrue(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
 
 
 class TestOffloadDefaults(unittest.TestCase):

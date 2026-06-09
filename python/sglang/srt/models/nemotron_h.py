@@ -358,9 +358,10 @@ class NemotronHMoEDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.mixer = NemotronHMoE(
-            config,
+            layer_config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
@@ -510,6 +511,7 @@ class NemotronHAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
+            sliding_window_size=config.sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -533,9 +535,10 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.mixer = NemotronHAttention(
-            config,
+            layer_config,
             layer_idx,
             quant_config,
             prefix=f"{prefix}.mixer",
@@ -904,7 +907,7 @@ class NemotronHForCausalLM(nn.Module):
             ckpt_gate_proj_name="up_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.max_n_routed_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -1004,7 +1007,11 @@ class NemotronHForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
 
-EntryClass = [NemotronHForCausalLM]
+class NemotronHPuzzleForCausalLM(NemotronHForCausalLM):
+    pass
+
+
+EntryClass = [NemotronHForCausalLM, NemotronHPuzzleForCausalLM]
 
 
 @register_custom_op(mutates_args=["output"])

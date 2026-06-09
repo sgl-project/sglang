@@ -22,6 +22,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -877,8 +878,12 @@ std::vector<at::Tensor> fwd_kvcache_mla(
     const at::Tensor& tile_scheduler_metadata,  // num_sm_parts x TileSchedulerMetaDataSize
     const at::Tensor& num_splits,               // batch_size + 1
     const bool& is_fp8,
-    const std::optional<at::Tensor>& indices  // None, or batch_size x seqlen_q x topk
-);
+    const std::optional<at::Tensor>& indices,  // None, or batch_size x seqlen_q x topk
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& extra_k_cache,
+    const std::optional<at::Tensor>& extra_indices_in_kvcache,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& extra_topk_length);
 
 void FMHACutlassSM100FwdRun(
     at::Tensor workspace_buffer,
@@ -895,8 +900,14 @@ void FMHACutlassSM100FwdRun(
     int64_t max_seqlen_kv,
     bool is_varlen);
 
-std::vector<at::Tensor>
-sparse_prefill_fwd(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices, double sm_scale, int64_t d_v);
+std::vector<at::Tensor> sparse_prefill_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length);
 
 std::vector<at::Tensor> fwd_kvcache_mla_fp8(
     at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
