@@ -1271,13 +1271,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             text_ids = text_ids[:, :max_text_seq_len]
             text_mask = text_mask[:, :max_text_seq_len]
 
-        sound_frames = 0
-        if sound_latents is not None:
-            if self.sp_size > 1:
-                raise NotImplementedError(
-                    "Cosmos3 sound generation does not support sequence parallelism yet"
-                )
-            sound_frames = sound_latents.shape[-1]
+        sound_frames = sound_latents.shape[-1] if sound_latents is not None else 0
 
         action_frames = 0
         if action_latents is not None:
@@ -1293,8 +1287,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     device=action_latents.device,
                 )
 
-        # Check if sequence parallelism is enabled
+        extra_frames = action_frames + sound_frames
         sequence_shard_enabled = self.sp_size > 1
+
+        # Add timestep embedding (computed in float32 for numerical stability, then cast back)
+        time_embed = self.time_embedder(timestep.float())
+        time_embed = time_embed.to(
+            hidden_states.dtype
+        )  # Cast to match hidden_gen dtype
 
         # Patchify and project to hidden dim
         hidden_gen, _ = self.proj_in(self.patchify(hidden_states, T, H, W))
@@ -1313,66 +1313,90 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 .to(hidden_gen.dtype)
             )
 
-        # Shard sequence across GPUs if SP enabled
-        if sequence_shard_enabled:
-            if seq_len_orig % self.sp_size != 0:
-                seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-                pad = torch.zeros(
-                    (batch_size, seq_shard_pad, hidden_gen.shape[2]),
-                    dtype=hidden_gen.dtype,
-                    device=hidden_gen.device,
-                )
-                hidden_gen = torch.cat([hidden_gen, pad], dim=1)
-                if token_noisy_mask is not None:
-                    mask_pad = torch.zeros(
-                        (batch_size, seq_shard_pad, 1),
-                        dtype=token_noisy_mask.dtype,
-                        device=token_noisy_mask.device,
+        if extra_frames == 0:
+            # Video-only: shard the visual tokens, then add the timestep
+            # embedding on the local shard.
+            if sequence_shard_enabled:
+                if seq_len_orig % self.sp_size != 0:
+                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
+                    pad = torch.zeros(
+                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
+                        dtype=hidden_gen.dtype,
+                        device=hidden_gen.device,
                     )
-                    token_noisy_mask = torch.cat([token_noisy_mask, mask_pad], dim=1)
-            local_seq_len = hidden_gen.shape[1] // self.sp_size
-            hidden_gen = hidden_gen.view(
-                batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
-            )
-            hidden_gen = hidden_gen[:, self.sp_rank, :, :]
+                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
+                    if token_noisy_mask is not None:
+                        mask_pad = torch.zeros(
+                            (batch_size, seq_shard_pad, 1),
+                            dtype=token_noisy_mask.dtype,
+                            device=token_noisy_mask.device,
+                        )
+                        token_noisy_mask = torch.cat(
+                            [token_noisy_mask, mask_pad], dim=1
+                        )
+                local_seq_len = hidden_gen.shape[1] // self.sp_size
+                hidden_gen = hidden_gen.view(
+                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                )
+                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
+                if token_noisy_mask is not None:
+                    token_noisy_mask = token_noisy_mask.view(
+                        batch_size, self.sp_size, local_seq_len, 1
+                    )[:, self.sp_rank, :, :]
             if token_noisy_mask is not None:
-                token_noisy_mask = token_noisy_mask.view(
-                    batch_size, self.sp_size, local_seq_len, 1
-                )[:, self.sp_rank, :, :]
-
-        # Add timestep embedding (computed in float32 for numerical stability, then cast back)
-        time_embed = self.time_embedder(timestep.float())
-        time_embed = time_embed.to(
-            hidden_states.dtype
-        )  # Cast to match hidden_gen dtype
-        if token_noisy_mask is not None:
-            hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
-        else:
-            hidden_gen = hidden_gen + time_embed.unsqueeze(1)
-
-        if action_latents is not None:
-            hidden_action = self.action_proj_in(
-                action_latents.to(hidden_gen.dtype), action_domain_ids
-            )
-            hidden_action = hidden_action + self.action_modality_embed.to(
-                hidden_action.dtype
-            )
-            if action_noisy_mask is None:
-                hidden_action = hidden_action + time_embed.unsqueeze(1)
+                hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
             else:
-                hidden_action = hidden_action + time_embed.unsqueeze(
-                    1
-                ) * action_noisy_mask.to(hidden_action.dtype)
-            hidden_gen = torch.cat([hidden_gen, hidden_action], dim=1)
+                hidden_gen = hidden_gen + time_embed.unsqueeze(1)
+        else:
+            # Multi-modal: assemble the full GEN sequence
+            # (video[, action][, sound]) with timestep embeddings, then shard
+            # the combined stream so sequence parallelism splits every modality
+            # evenly. The per-modality output heads run after the post-loop
+            # all-gather reassembles the sequence.
+            if token_noisy_mask is not None:
+                hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
+            else:
+                hidden_gen = hidden_gen + time_embed.unsqueeze(1)
 
-        if sound_latents is not None:
-            packed_sound = sound_latents.permute(0, 2, 1).to(hidden_gen.dtype)
-            hidden_sound, _ = self.audio_proj_in(packed_sound)
-            hidden_sound = hidden_sound + self.audio_modality_embed.to(
-                hidden_sound.dtype
-            )
-            hidden_sound = hidden_sound + time_embed.unsqueeze(1)
-            hidden_gen = torch.cat([hidden_gen, hidden_sound], dim=1)
+            if action_latents is not None:
+                hidden_action = self.action_proj_in(
+                    action_latents.to(hidden_gen.dtype), action_domain_ids
+                )
+                hidden_action = hidden_action + self.action_modality_embed.to(
+                    hidden_action.dtype
+                )
+                if action_noisy_mask is None:
+                    hidden_action = hidden_action + time_embed.unsqueeze(1)
+                else:
+                    hidden_action = hidden_action + time_embed.unsqueeze(
+                        1
+                    ) * action_noisy_mask.to(hidden_action.dtype)
+                hidden_gen = torch.cat([hidden_gen, hidden_action], dim=1)
+
+            if sound_latents is not None:
+                packed_sound = sound_latents.permute(0, 2, 1).to(hidden_gen.dtype)
+                hidden_sound, _ = self.audio_proj_in(packed_sound)
+                hidden_sound = hidden_sound + self.audio_modality_embed.to(
+                    hidden_sound.dtype
+                )
+                hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+                hidden_gen = torch.cat([hidden_gen, hidden_sound], dim=1)
+
+            seq_len_orig = hidden_gen.shape[1]
+            if sequence_shard_enabled:
+                if seq_len_orig % self.sp_size != 0:
+                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
+                    pad = torch.zeros(
+                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
+                        dtype=hidden_gen.dtype,
+                        device=hidden_gen.device,
+                    )
+                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
+                local_seq_len = hidden_gen.shape[1] // self.sp_size
+                hidden_gen = hidden_gen.view(
+                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                )
+                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
 
         self._ensure_cache_dicts()
 
@@ -1441,23 +1465,28 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_gen = hidden_gen + residual
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
-        extra_frames = action_frames + sound_frames
-        if extra_frames > 0:
-            s_video = hidden_gen.shape[1] - extra_frames
-            video_hidden = hidden_gen[:, :s_video, :]
-        else:
-            video_hidden = hidden_gen
-        output, _ = self.proj_out(video_hidden)
-
-        if sequence_shard_enabled:
-            output = sequence_model_parallel_all_gather(output, dim=1)
-            if seq_shard_pad > 0:
-                output = output[:, :seq_len_orig, :]
-
-        video_pred = self.unpatchify(output, T, H, W)
-
         if extra_frames == 0:
-            return video_pred
+            # Video-only: project on the local shard and gather the (much
+            # smaller) patch-space output. With patch_latent_dim ~=
+            # hidden_size / 21 for cosmos3, this cuts the post-loop SP
+            # collective bandwidth ~21x.
+            output, _ = self.proj_out(hidden_gen)
+            if sequence_shard_enabled:
+                output = sequence_model_parallel_all_gather(output, dim=1)
+                if seq_shard_pad > 0:
+                    output = output[:, :seq_len_orig, :]
+            return self.unpatchify(output, T, H, W)
+
+        # Multi-modal: gather the full GEN hidden and drop shard padding, then
+        # split per modality so each output head sees its own contiguous tokens.
+        if sequence_shard_enabled:
+            hidden_gen = sequence_model_parallel_all_gather(hidden_gen, dim=1)
+            if seq_shard_pad > 0:
+                hidden_gen = hidden_gen[:, :seq_len_orig, :]
+
+        s_video = seq_len_orig - extra_frames
+        output, _ = self.proj_out(hidden_gen[:, :s_video, :])
+        video_pred = self.unpatchify(output, T, H, W)
 
         extra_outputs: list[torch.Tensor] = []
         idx = s_video
