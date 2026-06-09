@@ -4353,7 +4353,7 @@ class ServerArgs:
                 )
                 self.enable_lmcache = False
 
-        if not self.pp_size > 1:
+        if self.pp_size > 1:
             logger.warning(
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
