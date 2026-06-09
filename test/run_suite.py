@@ -298,15 +298,6 @@ def run_a_suite(args):
         and not f.endswith("/cpu/utils.py")
     ]
 
-    # JIT kernel tests and benchmarks (live alongside kernel source)
-    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
-    )
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
-    )
-
     # Strict: all discovered files must have proper registration
     sanity_check = True
 

@@ -113,9 +113,6 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
             f"{self.speculative_algorithm.name}."
         )
 
-        # Assistant reads target KV directly, so its context length must match the target.
-        server_args.context_length = target_worker.model_runner.model_config.context_len
-
         # Defer cuda graph capture; we do it ourselves below.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
@@ -670,6 +667,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
 
         # Frozen MTP does not wire the adaptive controller yet.
+        assert (
+            not server_args.speculative_adaptive
+        ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
         self.adaptive_controller = None
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
