@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -119,4 +121,4 @@ def test_sigmoid_gate_mul_broadcast_contiguous_output():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
