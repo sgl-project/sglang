@@ -196,9 +196,9 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -1577,6 +1577,14 @@ class ServerArgs:
                 self.piecewise_cuda_graph_max_tokens = min(
                     self.piecewise_cuda_graph_max_tokens, 4096
                 )
+
+        # Clamp to context_length if explicitly set — prevents PCG warmup
+        # from compiling graphs with more tokens than the model buffers
+        # can hold, which causes illegal memory access (#21112)
+        if self.context_length is not None:
+            self.piecewise_cuda_graph_max_tokens = min(
+                self.piecewise_cuda_graph_max_tokens, self.context_length
+            )
 
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
@@ -4206,10 +4214,11 @@ class ServerArgs:
                 self.enable_flashinfer_allreduce_fusion = False
 
             # Check sampling backend
-            self.sampling_backend = "pytorch"
-            logger.warning(
-                "Sampling backend is set to pytorch for deterministic inference."
-            )
+            if self.sampling_backend != "ascend":
+                self.sampling_backend = "pytorch"
+                logger.warning(
+                    "Sampling backend is set to pytorch for deterministic inference."
+                )
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
@@ -5711,6 +5720,7 @@ class ServerArgs:
                 "aiter_attn",
                 "flashinfer_cudnn",
                 "amx_attn",
+                "xpu_attn",
             ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
