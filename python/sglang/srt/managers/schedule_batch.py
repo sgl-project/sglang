@@ -2739,13 +2739,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        if other.is_extend_intermediate:
-            assert not any(other.is_extend_intermediate), (
-                "merge_batch requires the other batch to be decode-ready; "
-                f"got is_extend_intermediate={other.is_extend_intermediate}"
-            )
-            self.is_extend_intermediate.extend(other.is_extend_intermediate)
-
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -2802,6 +2795,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+
+        if other.is_extend_intermediate:
+            assert not any(other.is_extend_intermediate), (
+                "merge_batch requires the other batch to be decode-ready; "
+                f"got is_extend_intermediate={other.is_extend_intermediate}"
+            )
+            self.is_extend_intermediate.extend(other.is_extend_intermediate)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
