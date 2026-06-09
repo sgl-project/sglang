@@ -35,6 +35,10 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.torch_npu import (
+        TorchNpuDispatchOutput,
+        TorchNpuCombineInput,
+    )
 
 from sglang.srt.layers.moe.utils import (  # fixed import
     MoeRunnerBackend,
