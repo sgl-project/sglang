@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -946,8 +946,8 @@ class Scheduler(
             running_rids <= active_rids
         ), f"running not subset of active: {running_rids - active_rids}"
 
-    def chunked_reqs(self) -> Iterable[Req]:
-        return (r for r in self.active_reqs.values() if r.has_pending_chunk)
+    def chunked_reqs(self) -> List[Req]:
+        return [r for r in self.active_reqs.values() if r.has_pending_chunk]
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2600,7 +2600,7 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        _chunked_in_active = list(self.chunked_reqs())
+        _chunked_in_active = self.chunked_reqs()
         assert len(_chunked_in_active) <= 1, (
             f"single-flight violated: {len(_chunked_in_active)} chunked reqs "
             f"in active ({[r.rid for r in _chunked_in_active]})"
