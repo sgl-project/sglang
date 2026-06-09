@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_draft_model_runner(draft_worker):
-    # DFlashWorker: exposes draft_model_runner directly
+    # DFlash / FrozenKVMTP workers expose draft_model_runner directly
     runner = getattr(draft_worker, "draft_model_runner", None)
     if runner is not None:
         return runner
