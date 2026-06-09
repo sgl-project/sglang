@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -380,22 +381,49 @@ class SWAComponent(TreeComponent):
         page_size = self.cache.page_size
         return ((self.sliding_window_size + page_size - 1) // page_size) * page_size
 
-    def _has_retained_window_child(
-        self, node: UnifiedTreeNode, retain_len: int
-    ) -> bool:
-        if len(node.children) != 1:
-            return False
+    def _is_swa_checkpoint(self, node: UnifiedTreeNode, retain_len: int) -> bool:
+        cd = node.component_data[self.component_type]
+        return cd.value is not None and len(cd.value) >= retain_len
 
-        # A retained suffix can later become internal after extension inserts.
-        child = next(iter(node.children.values()))
-        child_cd = child.component_data[self.component_type]
-        return child_cd.value is not None and len(child_cd.value) == retain_len
+    def _has_checkpoint_within_ancestors(
+        self, node: UnifiedTreeNode, retain_len: int, interval: int
+    ) -> bool:
+        distance = len(node.key)
+        cur = node.parent
+        while (
+            cur is not None
+            and cur is not self.cache.root_node
+            and distance < interval
+        ):
+            if self._is_swa_checkpoint(cur, retain_len):
+                return True
+            distance += len(cur.key)
+            cur = cur.parent
+        return False
+
+    def _has_checkpoint_within_descendants(
+        self, node: UnifiedTreeNode, retain_len: int, interval: int
+    ) -> bool:
+        distance = 0
+        cur = node
+        while len(cur.children) == 1:
+            child = next(iter(cur.children.values()))
+            distance += len(child.key)
+            if distance >= interval:
+                return False
+            if self._is_swa_checkpoint(child, retain_len):
+                return True
+            if len(child.children) > 1:
+                return False
+            cur = child
+        return False
 
     def _swa_evict_target(
         self,
         node: UnifiedTreeNode,
         retain_len: int,
         protect_window: bool,
+        checkpoint_interval: int,
     ) -> Optional[UnifiedTreeNode]:
         cd = node.component_data[self.component_type]
         value_len = len(cd.value)
@@ -403,11 +431,28 @@ class SWAComponent(TreeComponent):
         if not protect_window:
             return node
 
+        is_device_leaf = node in self.cache.evictable_device_leaves
+        if checkpoint_interval == -1:
+            retain_checkpoint = is_device_leaf or len(node.children) > 1
+        elif checkpoint_interval > 0:
+            retain_checkpoint = not (
+                self._has_checkpoint_within_ancestors(
+                    node, retain_len, checkpoint_interval
+                )
+                or self._has_checkpoint_within_descendants(
+                    node, retain_len, checkpoint_interval
+                )
+            )
+        else:
+            retain_checkpoint = False
+
+        if not retain_checkpoint:
+            if is_device_leaf:
+                return None
+            return node
+
         if value_len <= retain_len:
             return None
-
-        if self._has_retained_window_child(node, retain_len):
-            return node
 
         split_len = value_len - retain_len
         assert split_len % self.cache.page_size == 0
@@ -426,6 +471,9 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
         retain_len = self._window_retention_len()
+        checkpoint_interval = (
+            envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.get()
+        )
         x = lru.get_lru_no_lock()
         while tracker[ct] < request and x is not None:
             if not lru.in_list(x):
@@ -442,6 +490,7 @@ class SWAComponent(TreeComponent):
                 x,
                 retain_len=retain_len,
                 protect_window=protect_window,
+                checkpoint_interval=checkpoint_interval,
             )
             if evict_node is None:
                 x = x_next
@@ -469,9 +518,13 @@ class SWAComponent(TreeComponent):
     ) -> None:
         request = params.swa_num_tokens
         ct = self.component_type
-        self._drive_eviction_pass(
-            request=request, tracker=tracker, protect_window=True
+        checkpoint_interval = (
+            envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.get()
         )
+        if checkpoint_interval != 0:
+            self._drive_eviction_pass(
+                request=request, tracker=tracker, protect_window=True
+            )
         if tracker[ct] < request:
             self._drive_eviction_pass(
                 request=request, tracker=tracker, protect_window=False

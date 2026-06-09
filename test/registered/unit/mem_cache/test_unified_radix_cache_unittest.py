@@ -539,6 +539,14 @@ class UnifiedRadixCacheSuite:
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         return tree.insert(params)
 
+    def _evict_with_dense_swa_checkpoints(
+        self, tree, params: EvictParams
+    ) -> EvictResult:
+        # Node keys are page-aligned and at least one token, so interval=1
+        # disables nearby-checkpoint suppression.
+        with envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.override(1):
+            return tree.evict(params)
+
     def test_insert_and_match_basic(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1790,7 +1798,9 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, leaf)
 
         before = tree.swa_evictable_size()
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         prefix_len = len(base) - retain_len
         self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
         self.assertEqual(tree.swa_evictable_size(), before - prefix_len)
@@ -1829,7 +1839,9 @@ class UnifiedRadixCacheSuite:
         self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
 
         before = tree.swa_evictable_size()
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
         self.assertEqual(tree.swa_evictable_size(), before - prefix_len)
         self.assertIs(next(iter(tree.root_node.children.values())), prefix)
@@ -1866,7 +1878,9 @@ class UnifiedRadixCacheSuite:
         self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
 
         before = tree.swa_evictable_size()
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
         self.assertEqual(tree.swa_evictable_size(), before - prefix_len)
         self.assertIs(next(iter(tree.root_node.children.values())), prefix)
@@ -1899,7 +1913,9 @@ class UnifiedRadixCacheSuite:
         old_lru = swa_lru.get_lru_no_lock()
         old_next = old_lru.lru_next[swa_lru._pt]
         old_access_time = old_lru.last_access_time
-        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
 
         suffix = swa_lru.get_lru_no_lock()
         self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
@@ -1921,7 +1937,9 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, base)
         self._insert(tree, allocator, req_to_token_pool, leaf)
 
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         self.assertEqual(result.swa_num_tokens_evicted, ps)
 
         retained = next(iter(tree.root_node.children.values()))
@@ -1947,7 +1965,9 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, base)
         self._insert(tree, allocator, req_to_token_pool, leaf)
 
-        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         split_parent = next(iter(tree.root_node.children.values()))
         suffix = next(iter(split_parent.children.values()))
         child = next(iter(suffix.children.values()))
@@ -1961,7 +1981,9 @@ class UnifiedRadixCacheSuite:
         other = self._make_seq(9000, retain_len // ps + 1)
         self._insert(tree, allocator, req_to_token_pool, other)
 
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         self.assertEqual(result.swa_num_tokens_evicted, len(other))
         self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
         self.assertIn(suffix, tree.evictable_device_leaves)
@@ -1998,7 +2020,9 @@ class UnifiedRadixCacheSuite:
         )
 
         before = tree.swa_evictable_size()
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         evicted_len = prefix_len - retain_len
         self.assertEqual(result.swa_num_tokens_evicted, evicted_len)
         self.assertEqual(tree.swa_evictable_size(), before - evicted_len)
@@ -2017,6 +2041,113 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(match.device_indices), prefix_len)
         tree.sanity_check()
 
+    def test_swa_checkpoint_interval_default_zero_skips_soft_pass(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        before = tree.swa_evictable_size()
+        self.assertEqual(
+            envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.default, 0
+        )
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=before))
+
+        self.assertEqual(result.swa_num_tokens_evicted, before)
+        self.assertEqual(tree.swa_evictable_size(), 0)
+        tree.sanity_check()
+
+    def test_swa_checkpoint_structural_only_candidates(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
+        extended = seq + self._make_seq(9000, 1)
+        branch = seq + self._make_seq(12000, 1)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        self._insert(tree, allocator, req_to_token_pool, extended)
+
+        comp = tree.components[ComponentType.SWA]
+        prefix = next(iter(tree.root_node.children.values()))
+        suffix = next(iter(prefix.children.values()))
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", extended)))
+        ).last_device_node
+
+        self.assertEqual(len(prefix.children), 1)
+        self.assertNotIn(prefix, tree.evictable_device_leaves)
+        self.assertIs(comp._swa_evict_target(prefix, retain_len, True, -1), prefix)
+        self.assertIsNone(comp._swa_evict_target(leaf, retain_len, True, -1))
+
+        self._insert(tree, allocator, req_to_token_pool, branch)
+        self.assertGreater(len(suffix.children), 1)
+        self.assertIsNone(comp._swa_evict_target(suffix, retain_len, True, -1))
+        tree.sanity_check()
+
+    def test_swa_checkpoint_interval_detects_nearby_descendant_checkpoint(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        comp = tree.components[ComponentType.SWA]
+        prefix = next(iter(tree.root_node.children.values()))
+        suffix = next(iter(prefix.children.values()))
+        self.assertEqual(len(suffix.component_data[ComponentType.SWA].value), retain_len)
+
+        self.assertTrue(
+            comp._has_checkpoint_within_descendants(
+                prefix, retain_len, retain_len + ps
+            )
+        )
+        self.assertFalse(comp._has_checkpoint_within_descendants(prefix, retain_len, ps))
+        tree.sanity_check()
+
+    def test_swa_checkpoint_interval_counts_unsplit_swa_nodes(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        comp = tree.components[ComponentType.SWA]
+        prefix = next(iter(tree.root_node.children.values()))
+        suffix = next(iter(prefix.children.values()))
+        self.assertGreater(
+            len(prefix.component_data[ComponentType.SWA].value), retain_len
+        )
+        self.assertEqual(len(suffix.component_data[ComponentType.SWA].value), retain_len)
+
+        self.assertTrue(
+            comp._has_checkpoint_within_ancestors(suffix, retain_len, retain_len + ps)
+        )
+        self.assertFalse(comp._has_checkpoint_within_ancestors(suffix, retain_len, ps))
+        tree.sanity_check()
+
     def test_swa_evict_second_pass_clears_retained_window(self):
         if not self.cfg.has_swa:
             self.skipTest("requires SWA component")
@@ -2033,13 +2164,17 @@ class UnifiedRadixCacheSuite:
 
         # First eviction can satisfy the small request from the leaf while
         # deferring the window-sized internal node.
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=ps))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=ps)
+        )
         self.assertEqual(result.swa_num_tokens_evicted, ps)
         self.assertEqual(tree.swa_evictable_size(), retain_len)
 
         # When pressure remains, the second pass is allowed to evict the
         # retained window.
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=retain_len))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=retain_len)
+        )
         self.assertEqual(result.swa_num_tokens_evicted, retain_len)
         self.assertEqual(tree.swa_evictable_size(), 0)
         tree.sanity_check()
@@ -2056,7 +2191,9 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, base)
         self._insert(tree, allocator, req_to_token_pool, leaf)
 
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         prefix_len = len(base) - retain_len
         self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
 
@@ -2086,7 +2223,9 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, leaf)
         self._simulate_backup_tree(tree)
 
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        result = self._evict_with_dense_swa_checkpoints(
+            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+        )
         prefix_len = len(base) - retain_len
         self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
 
@@ -2122,7 +2261,9 @@ class UnifiedRadixCacheSuite:
         locked = next(iter(tree.root_node.children.values()))
         lock_result = tree.inc_lock_ref(locked)
         try:
-            tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+            self._evict_with_dense_swa_checkpoints(
+                tree, EvictParams(num_tokens=0, swa_num_tokens=1)
+            )
             self.assertIn(locked.key.child_key(ps), tree.root_node.children)
             self.assertEqual(len(locked.key), len(base))
             self.assertIsNotNone(locked.component_data[ComponentType.SWA].value)
