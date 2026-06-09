@@ -266,6 +266,19 @@ def flash_mla_with_kvcache_sm120(**kwargs):
 
 # Lazily initialized FlashInfer wrapper per device (reused across calls).
 _flashinfer_wrapper = {}  # device -> wrapper
+# Scratch buffers reused across decode calls: {(device, name) -> tensor}
+_scratch_bufs = {}
+
+
+def _get_scratch(dev, name, shape, dtype):
+    """Return a scratch buffer, reallocating only when the shape grows."""
+    key = (dev, name)
+    buf = _scratch_bufs.get(key)
+    if buf is None or any(b < s for b, s in zip(buf.shape, shape)):
+        buf = torch.empty(shape, dtype=dtype, device=dev)
+        _scratch_bufs[key] = buf
+    return buf[tuple(slice(0, s) for s in shape)]
+
 
 # --- Page-split utilities: pbs=256 → pbs=64 ---
 # SGLang SWA KV cache footer layout per 256-token page:
@@ -444,20 +457,20 @@ def _flash_mla_flashinfer(
         else extra_indices
     )
 
-    output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=q.device)
-    out_lse = torch.empty(B, H, dtype=torch.float32, device=q.device)
+    output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
 
-    # Pre-allocate split-K scratch for decode-dsv4 fast path.
+    # Reuse scratch buffers across calls to avoid allocator overhead.
     topk = idx.shape[-1]
     extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
     _BI = 64
     num_splits = (topk + _BI - 1) // _BI + (
         (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
     )
-    mid_out = torch.empty(
-        B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=q.device
+    out_lse = _get_scratch(dev, "out_lse", (B, H), torch.float32)
+    mid_out = _get_scratch(
+        dev, "mid_out", (B, H, num_splits, head_dim_v), torch.bfloat16
     )
-    mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=q.device)
+    mid_lse = _get_scratch(dev, "mid_lse", (B, H, num_splits), torch.float32)
 
     wrapper.run(
         q=q,  # (B, 1, H, D) — wrapper handles squeeze
