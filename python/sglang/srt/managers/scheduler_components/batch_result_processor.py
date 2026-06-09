@@ -93,6 +93,12 @@ class SchedulerBatchResultProcessor:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                # The prebuilt batch is no longer filtered before merge, so a
+                # req that finishes immediately would otherwise linger in
+                # active_reqs forever (leak). deactivate_req only pops it from
+                # active_reqs and leaves batch.reqs intact, so the stream_output
+                # below still emits this finished req.
+                self.deactivate_req(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)

@@ -837,6 +837,14 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
+        # The stateless scheduler derives the current chunked req from
+        # chunked_reqs() = active_reqs entries whose has_pending_chunk is True,
+        # and has_pending_chunk ignores req.finished(). An aborted req still
+        # sitting in active_reqs with a non-None extend_range would be re-derived
+        # as a chunked req and crash process_prefill_chunk (req_pool_idx=None).
+        # Remove it from active_reqs and clear the chunk state defensively.
+        req.extend_range = None
+        self._deactivate_req(req)
 
     def handle_pending_bootstrap(
         self: Scheduler, req: Req, poll: KVPoll, defer_release: bool
@@ -1003,6 +1011,12 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
+        # reset_for_retract() clears extend_range, but the req is still in
+        # active_reqs. Since the stateless scheduler derives chunked_reqs() from
+        # active_reqs, a requeued req that also remains active would be
+        # double-tracked (stale chunked req, load/accounting leak). Deactivate it
+        # before re-enqueue; get_next_batch_to_run reactivates it on reschedule.
+        self._deactivate_req(req)
         req.output_ids = array("q")
         req.start_send_idx = 0
         req.tmp_end_idx = -1
