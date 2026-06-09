@@ -138,6 +138,17 @@ def _compiled_deep_gemm_ceil_to_ue8m0(dynamic: Optional[bool]):
     import deep_gemm
     import torch._dynamo.config as dynamo_config
 
+    def ceil_to_ue8m0_for_fp8_einsum(
+        o_s: torch.Tensor, num_tokens: int, num_groups: int
+    ):
+        o_s = deep_gemm.ceil_to_ue8m0(o_s)
+        return (
+            o_s.view(num_tokens, num_groups, o_s.shape[-1])
+            .transpose(0, 1)
+            .contiguous()
+            .transpose(0, 1)
+        )
+
     # This helper may run when global torch-compile config was not applied.
     # Decode specializes one o_s shape per CUDA graph bucket, so keep this
     # process-global limit aligned with the existing torch compile setup.
@@ -150,7 +161,7 @@ def _compiled_deep_gemm_ceil_to_ue8m0(dynamic: Optional[bool]):
     if dynamic is None:
         options["cpp_wrapper"] = True
     return torch.compile(
-        deep_gemm.ceil_to_ue8m0,
+        ceil_to_ue8m0_for_fp8_einsum,
         fullgraph=True,
         dynamic=dynamic,
         options=options,
@@ -1025,11 +1036,11 @@ class MQALayer(nn.Module):
             compile_dynamic = (
                 False if forward_batch.forward_mode.is_decode_or_idle() else None
             )
-            o_s = _compiled_deep_gemm_ceil_to_ue8m0(compile_dynamic)(o_s)
+            o_s = _compiled_deep_gemm_ceil_to_ue8m0(compile_dynamic)(o_s, T, G)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                (o_fp8.view(T, G, D), o_s),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
