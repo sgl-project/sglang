@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.mem_cache.triton_ops.common import (
+    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
+    get_last_loc_kernel as get_last_loc_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
+    get_last_loc_triton,
+    get_last_loc_triton_safe,
+    write_req_to_token_pool_triton,
+)
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 
@@ -22,6 +31,8 @@ if TYPE_CHECKING:
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+# Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
@@ -48,57 +59,6 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
-
-
-@triton.jit
-def write_req_to_token_pool_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices,
-    prefix_tensors,
-    pre_lens,
-    seq_lens,
-    extend_lens,
-    out_cache_loc,
-    req_to_token_ptr_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0)
-
-    req_pool_index = tl.load(req_pool_indices + pid)
-    pre_len = tl.load(pre_lens + pid)
-    seq_len = tl.load(seq_lens + pid)
-    prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int64))
-
-    # write prefix
-    num_loop = tl.cdiv(pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < pre_len
-        value = tl.load(prefix_tensor + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + offset,
-            value,
-            mask=mask,
-        )
-
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_lens + i)
-
-    num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < (seq_len - pre_len)
-        value = tl.load(out_cache_loc + cumsum_start + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + offset
-            + pre_len,
-            value,
-            mask=mask,
-        )
 
 
 def write_cache_indices(
@@ -192,111 +152,62 @@ def get_last_loc_torch(
     )
 
 
-@triton.jit
-def _get_last_loc_safe_kernel(
-    req_to_token,
-    req_pool_indices_tensor,
-    prefix_lens_tensor,
-    result_i32,
-    num_tokens,
-    req_to_token_stride,
-    BLOCK_SIZE: tl.constexpr,
-    PREFIX_DTYPE_IS_I64: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
-    mask = offset < num_tokens
+def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    if server_args is None:
+        server_args = get_global_server_args()
 
-    if PREFIX_DTYPE_IS_I64:
-        prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
-        req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
-        token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
+    if server_args.speculative_algorithm is None:
+        return 1
+
+    # Spec v1:
+    # 1) alloc topk * num_steps when draft decoding and then restore the allocation
+    # 2) alloc num_draft_tokens when verifying the drafts
+    # Sepc v2: allocate max(topk * num_steps, num_draft_tokens)
+
+    spec_steps = server_args.speculative_num_steps or 1
+    spec_topk = server_args.speculative_eagle_topk or 1
+    spec_tokens = server_args.max_speculative_num_draft_tokens
+    page_size = server_args.page_size
+
+    if page_size == 1 or spec_topk == 1:
+        return max(spec_steps * spec_topk, spec_tokens)
     else:
-        prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
-        req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
-        token_index = req_pool_indices.to(tl.int64) * req_to_token_stride + (
-            prefix_lens.to(tl.int64) - 1
-        )
-
-    token_mask = mask & (prefix_lens > 0)
-    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
-    # Result stays int32 (req_to_token dtype); caller promotes after return.
-    tl.store(result_i32 + offset, tokens, mask=mask)
+        # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree
+        # footprint. Per topk branch needs ceil((last_page_len + num_steps) / page)
+        # pages; the partial tail page can be up to page_size - 1, and each branch
+        # gets its own (duplicated) copy -- so reserve for all topk branches.
+        num_new_pages_per_topk = (
+            (page_size - 1) + spec_steps + page_size - 1
+        ) // page_size
+        return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
 
 
-def get_last_loc_triton_safe(
-    req_to_token: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-) -> torch.Tensor:
-    """Fused `last_loc` Triton kernel whose in-kernel result buffer is int32
-    (the dtype of req_to_token). The consumer-dtype promotion happens in
-    torch after the kernel returns, so Triton never issues a mixed-width
-    store — avoiding the HIP int32->int64 store bug hit by the legacy kernel.
+def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    """KV length reserved per request at each decode step.
+
+    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
+    mode; see eagle_info_v2.prepare_for_decode.
     """
-    num_tokens = prefix_lens_tensor.shape[0]
-    BLOCK_SIZE = 256
-    result_i32 = torch.empty(
-        num_tokens, dtype=torch.int32, device=prefix_lens_tensor.device
-    )
-    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
-    _get_last_loc_safe_kernel[grid](
-        req_to_token,
-        req_pool_indices_tensor,
-        prefix_lens_tensor,
-        result_i32,
-        num_tokens,
-        req_to_token.stride(0),
-        BLOCK_SIZE=BLOCK_SIZE,
-        PREFIX_DTYPE_IS_I64=(prefix_lens_tensor.dtype == torch.int64),
-    )
-    return result_i32.to(prefix_lens_tensor.dtype)
+    return 2 * get_alloc_len_per_decode(server_args)
 
 
-@triton.jit
-def get_last_loc_kernel(
-    req_to_token,
-    req_pool_indices_tensor,
-    prefix_lens_tensor,
-    result,
-    num_tokens,
-    req_to_token_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
-    mask = offset < num_tokens
+def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
+    """req_to_token row headroom beyond the model context length.
 
-    prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
-    req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
-
-    token_mask = prefix_lens > 0
-    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
-    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
-
-    tl.store(result + offset, tokens, mask=mask)
-
-
-def get_last_loc_triton(
-    req_to_token: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-) -> torch.Tensor:
-    BLOCK_SIZE = 256
-    num_tokens = prefix_lens_tensor.shape[0]
-    result = torch.empty_like(prefix_lens_tensor)
-    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
-
-    get_last_loc_kernel[grid](
-        req_to_token,
-        req_pool_indices_tensor,
-        prefix_lens_tensor,
-        result,
-        num_tokens,
-        req_to_token.stride(0),
-        BLOCK_SIZE,
-    )
-    return result
+    Sized to hold the decode over-allocation (kv_committed_len +
+    get_alloc_reserve_per_decode). The spec v2 page>1 topk>1 holey draft footprint
+    can outgrow the default num_draft_tokens headroom (PR #26972).
+    """
+    # FIXME(lsyin): this is the temporary fix for the context length issue when
+    # using speculative decoding
+    extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
+    if (
+        server_args.speculative_algorithm is not None
+        and server_args.page_size > 1
+        and (server_args.speculative_eagle_topk or 1) > 1
+    ):
+        extra = max(extra, get_alloc_reserve_per_decode(server_args))
+    return extra
 
 
 def alloc_token_slots(
@@ -403,12 +314,15 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
-        factor = (
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            if tree_cache.supports_mamba()
-            else MAMBA_STATE_PER_REQ_NO_CACHE
-        )
+        mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
+        if tree_cache.supports_mamba():
+            factor = (
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                if req_to_token_pool.enable_mamba_extra_buffer_lazy
+                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            )
+        else:
+            factor = MAMBA_STATE_PER_REQ_NO_CACHE
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
@@ -572,7 +486,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
-            tree_cache.req_to_token_pool.mamba_pool.free(
+            tree_cache.req_to_token_pool.mamba_allocator.free(
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None

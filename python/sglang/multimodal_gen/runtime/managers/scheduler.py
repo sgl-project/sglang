@@ -20,11 +20,14 @@ from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -42,6 +45,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
+    SchedulerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
@@ -68,7 +74,7 @@ _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
 
 
-class Scheduler(SchedulerDisaggMixin):
+class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
@@ -128,8 +134,13 @@ class Scheduler(SchedulerDisaggMixin):
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            ReleaseRealtimeSessionReq: self._handle_release_realtime_session,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
+            UpdateWeightFromTensorCheckerReqInput: (
+                self._handle_update_weights_from_tensor_checker
+            ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
@@ -205,24 +216,9 @@ class Scheduler(SchedulerDisaggMixin):
         self._running = False
         return OutputBatch()
 
-    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
-        """Handle update_weights_from_disk request for RL workflows."""
+    def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
-        success, message = self.worker.update_weights_from_disk(
-            model_path=req.model_path,
-            flush_cache=req.flush_cache,
-            target_modules=req.target_modules,
-        )
-        return OutputBatch(
-            output={"success": success, "message": message},
-            error=None if success else message,
-        )
-
-    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
-        """Handle get_weights_checksum request."""
-        req = reqs[0]
-        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
-        return OutputBatch(output=checksums)
+        return self.worker.release_realtime_session(req.session_id)
 
     @staticmethod
     def _normalize_generation_reqs(reqs: list[Any]) -> list[Req]:
@@ -487,6 +483,10 @@ class Scheduler(SchedulerDisaggMixin):
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
+            return "realtime_session"
         if not isinstance(base_req.prompt, str) or not isinstance(
             candidate_req.prompt, str
         ):
@@ -506,9 +506,18 @@ class Scheduler(SchedulerDisaggMixin):
             or "signature_mismatch"
         )
 
+    @staticmethod
+    def _has_realtime_session(req: Req) -> bool:
+        return bool(req.realtime_session_id) or req.session is not None
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
             return False
 
         if not isinstance(base_req.prompt, str) or not isinstance(
