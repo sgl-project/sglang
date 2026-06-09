@@ -1,0 +1,79 @@
+import os
+import unittest
+from types import SimpleNamespace
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.run_eval import run_eval
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+# Label-gated extra CI (run-ci + run-ci-extra) on the 8x H200 DeepEP runner.
+# Shared-experts fusion only supports n_shared_experts == 1, so this uses the
+# real DeepSeek-V3-Base (n_shared_experts=1) rather than the small CI MLA proxy
+# model (n_shared_experts != 1, which cannot fuse and trips
+# `assert num_fused_shared_experts == 1` in deepseek_weight_loader.py). The
+# 671B FP8 weights need all 8 GPUs.
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-8-gpu-h200")
+
+DEEPSEEK_V3_BASE_MODEL_PATH = "deepseek-ai/DeepSeek-V3-Base"
+
+
+class TestTBOWithSharedExpertsFusion(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEEPSEEK_V3_BASE_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "8",
+                "--enable-dp-attention",
+                "--dp",
+                "8",
+                "--moe-dense-tp-size",
+                "1",
+                "--moe-a2a-backend",
+                "deepep",
+                "--enable-two-batch-overlap",
+                "--enforce-shared-experts-fusion",
+                "--disable-cuda-graph",
+                "--max-running-requests",
+                "512",
+            ],
+            env={
+                **os.environ,
+                "SGLANG_TBO_DEBUG": "1",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(metrics)
+
+        self.assertGreater(metrics["score"], 0.60)
+
+
+if __name__ == "__main__":
+    unittest.main()
