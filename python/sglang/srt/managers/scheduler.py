@@ -2405,6 +2405,9 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def stash_chunked_request(self, req: Req):
+        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2444,9 +2447,6 @@ class Scheduler(
         )
         # todo hisparse, maybe other info to contain for the new batch
         return batch
-
-    def stash_chunked_request(self, req: Req):
-        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._assert_reqs_invariants()
