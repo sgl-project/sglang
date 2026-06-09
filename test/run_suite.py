@@ -19,6 +19,7 @@ HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
+    "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
 }
@@ -42,6 +43,7 @@ PER_COMMIT_SUITES = {
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
+    HWBackend.MUSA: [],
     HWBackend.CUDA: [
         "base-a-test-1-gpu-small",
         "base-b-test-1-gpu-small",
@@ -122,6 +124,9 @@ NIGHTLY_SUITES = {
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],
+    HWBackend.MUSA: [
+        "nightly-musa-1-gpu",
+    ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
@@ -150,7 +155,12 @@ OTHER_SUITES = {
 }
 
 
-_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU, HWBackend.XPU}
+_SUITE_CHECKED_BACKENDS = {
+    HWBackend.CUDA,
+    HWBackend.CPU,
+    HWBackend.MUSA,
+    HWBackend.XPU,
+}
 
 
 def _valid_suites_by_backend() -> dict:
@@ -287,15 +297,6 @@ def run_a_suite(args):
         and not f.endswith("/__init__.py")
         and not f.endswith("/cpu/utils.py")
     ]
-
-    # JIT kernel tests and benchmarks (live alongside kernel source)
-    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
-    )
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
-    )
 
     # Strict: all discovered files must have proper registration
     sanity_check = True

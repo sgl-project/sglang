@@ -196,9 +196,9 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -842,6 +842,10 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    # Port of the standalone EncoderBootstrapServer started by the language-only
+    # tokenizer manager.  Encoder workers register here.
+    encoder_bootstrap_port: int = 8997
+    encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
@@ -1572,6 +1576,14 @@ class ServerArgs:
                     self.piecewise_cuda_graph_max_tokens, 4096
                 )
 
+        # Clamp to context_length if explicitly set — prevents PCG warmup
+        # from compiling graphs with more tokens than the model buffers
+        # can hold, which causes illegal memory access (#21112)
+        if self.context_length is not None:
+            self.piecewise_cuda_graph_max_tokens = min(
+                self.piecewise_cuda_graph_max_tokens, self.context_length
+            )
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -1797,7 +1809,8 @@ class ServerArgs:
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
-        hf_config = self.get_model_config().hf_config
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
@@ -2354,8 +2367,17 @@ class ServerArgs:
             "Gemma4ForCausalLM",
             "Gemma4UnifiedForConditionalGeneration",
         ):
+            is_gemma4_modelopt_fp4 = model_config.quantization == "modelopt_fp4"
+            is_gemma4_moe = getattr(
+                model_config.hf_text_config, "enable_moe_block", False
+            )
+            is_gemma4_modelopt_fp4_moe = is_gemma4_modelopt_fp4 and is_gemma4_moe
+            # TODO: switch Gemma4 modelopt_fp4 MoE back to trtllm_mha by default
+            # after the SM10X trtllm_mha accuracy issue is fixed.
             default_attention_backend = (
-                "trtllm_mha" if is_sm100_supported() else "triton"
+                "trtllm_mha"
+                if is_sm100_supported() and not is_gemma4_modelopt_fp4_moe
+                else "triton"
             )
             if self.is_attention_backend_not_set():
                 self.attention_backend = default_attention_backend
@@ -2380,7 +2402,7 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-                if self.get_model_config().quantization == "modelopt_fp4":
+                if is_gemma4_modelopt_fp4:
                     self.quantization = "modelopt_fp4"
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
@@ -3139,7 +3161,23 @@ class ServerArgs:
 
     def _handle_page_size(self):
         if self.page_size is None:
-            if not is_musa():
+            # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
+            # is tuned for and prefers page_size=64 — making it the default
+            # when the layout flag is set avoids users having to pass
+            # --page-size 64 explicitly. The env var is only consumed by the
+            # ROCm AITER backend, so the auto-bump is gated on HIP; on other
+            # platforms the SHUFFLE 5D pool has no consumer kernels and the
+            # env var is silently ignored (see MHATokenToKVPool).
+            if (
+                is_hip()
+                and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+            ):
+                self.page_size = 64
+                logger.info(
+                    "Setting page_size=64 as default for "
+                    "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
+                )
+            elif not is_musa():
                 self.page_size = 1
             else:
                 self.page_size = 64
@@ -3944,8 +3982,10 @@ class ServerArgs:
             )
 
         if self.language_only and len(self.encoder_urls) == 0:
-            raise ValueError(
-                "requires at least one encoder urls to be set via --encoder-urls"
+            logger.info(
+                "--language-only is set without --encoder-urls. Encoders are "
+                "expected to register dynamically via the "
+                "EncoderBootstrapServer."
             )
 
         # Validate IB devices when mooncake backend is used
@@ -4182,10 +4222,11 @@ class ServerArgs:
                 self.enable_flashinfer_allreduce_fusion = False
 
             # Check sampling backend
-            self.sampling_backend = "pytorch"
-            logger.warning(
-                "Sampling backend is set to pytorch for deterministic inference."
-            )
+            if self.sampling_backend != "ascend":
+                self.sampling_backend = "pytorch"
+                logger.warning(
+                    "Sampling backend is set to pytorch for deterministic inference."
+                )
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
@@ -5687,6 +5728,7 @@ class ServerArgs:
                 "aiter_attn",
                 "flashinfer_cudnn",
                 "amx_attn",
+                "xpu_attn",
             ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
@@ -7021,6 +7063,24 @@ class ServerArgs:
             help="List of encoder server urls.",
         )
         parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port for the EncoderBootstrapServer that runs in the "
+            "language-only tokenizer manager process. Encoders register here, "
+            "and language-only receivers fetch the current URL list from here.",
+        )
+        parser.add_argument(
+            "--encoder-register-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="One or more EncoderBootstrapServer URLs to register this encoder "
+            "with on startup, for dynamic encoder discovery. "
+            "Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. "
+            "Used with --encoder-only servers.",
+        )
+        parser.add_argument(
             "--enable-adaptive-dispatch-to-encoder",
             default=ServerArgs.enable_adaptive_dispatch_to_encoder,
             action="store_true",
@@ -8017,13 +8077,28 @@ class PortArgs:
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+                derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
+                if derived_port > 65535:
+                    derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
+                na = NetworkAddress("127.0.0.1", derived_port)
             else:
                 na = NetworkAddress.parse(server_args.dist_init_addr)
 
             dist_init_host = na.host
             dist_init_port = na.port
-            port_base = dist_init_port + 1
+
+            # We need 5 consecutive ports from port_base for:
+            # port_base, detokenizer, rpc, metrics, scheduler.
+            # In multi-node, all nodes derive ports independently from
+            # dist_init_port, so the derivation must be deterministic
+            # (no availability-based search). If incrementing would
+            # overflow the valid TCP range, decrement instead.
+            NUM_DERIVED_PORTS = 5
+            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+            else:
+                port_base = dist_init_port + 1
+
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3

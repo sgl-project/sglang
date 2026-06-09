@@ -1267,9 +1267,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight.is_shuffled = True
                 w2_weight.is_shuffled = True
 
-            x_padded = torch.nn.functional.pad(
-                x, (0, self.hidden_pad), mode="constant", value=0.0
-            )
+            # Skip the explicit pad if x already arrives at the padded
+            # hidden_size (the upstream RMSNorm fused the pad into its
+            # output — see RMSNorm.x_pad_to_multiple). Saves a separate
+            # zero-pad kernel launch per layer.
+            if x.shape[-1] == self.hidden_size:
+                x_padded = x
+            else:
+                x_padded = torch.nn.functional.pad(
+                    x, (0, self.hidden_pad), mode="constant", value=0.0
+                )
             quant_info = AiterMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,
