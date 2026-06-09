@@ -1498,7 +1498,7 @@ def set_mamba_track_indices_from_reqs(batch):
     )
 
 
-def _decide_is_extend_intermediate(
+def _compute_is_extend_intermediate(
     req: Req,
     dllm_config: Optional[DllmConfig],
     forward_mode: Optional[ForwardMode],
@@ -1763,7 +1763,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_hybrid_swa = True
 
         is_extend_intermediate = [
-            _decide_is_extend_intermediate(req, dllm_config, forward_mode)
+            _compute_is_extend_intermediate(req, dllm_config, forward_mode)
             for req in reqs
         ]
 
