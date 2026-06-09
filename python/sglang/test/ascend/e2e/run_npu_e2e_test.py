@@ -491,27 +491,27 @@ def monitor_pod_logs(
 
 def generate_metrics_json(metrics_data_file, test_case, status):
     log_file = os.path.join(metrics_data_file, "test_output.log")
-    if not os.path.exists(log_file):
-        logger.warning(f"Metrics log file not found: {log_file}")
-        return
 
     metrics = {}
     baselines = {}
 
-    with open(log_file, "r") as f:
-        for line in f:
-            m = re.match(r"\[METRIC\] (\S+)=(\S+)", line.strip())
-            if m:
-                key = m.group(1)
-                value = m.group(2)
-                try:
-                    value = float(value)
-                except ValueError:
-                    pass
-                if key.endswith("_baseline"):
-                    baselines[key[:-9]] = value
-                else:
-                    metrics[key] = value
+    if os.path.exists(log_file):
+        with open(log_file, "r") as f:
+            for line in f:
+                m = re.match(r"\[METRIC\] (\S+)=(\S+)", line.strip())
+                if m:
+                    key = m.group(1)
+                    value = m.group(2)
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass
+                    if key.endswith("_baseline"):
+                        baselines[key[:-9]] = value
+                    else:
+                        metrics[key] = value
+    else:
+        logger.warning(f"Metrics log file not found: {log_file}")
 
     tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
