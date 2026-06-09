@@ -436,10 +436,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
