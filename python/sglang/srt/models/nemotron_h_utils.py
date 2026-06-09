@@ -66,7 +66,7 @@ def _zero_dp_global_padding_rows(
     hidden_states: torch.Tensor, forward_batch: ForwardBatch
 ) -> torch.Tensor:
     """Zero the per-DP-group padding rows after a global (full-TP) gather."""
-    actual_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    actual_tokens = getattr(forward_batch, "global_num_tokens_non_padded_cpu", None)
     padded_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
     if actual_tokens is None or padded_tokens is None:
         return _zero_dp_padding_rows(hidden_states, forward_batch)[0]

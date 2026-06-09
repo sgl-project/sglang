@@ -405,6 +405,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
+    # Per-rank non-padded (spec-adjusted) row counts; independent copy that
+    # survives the in-place DP padding of global_num_tokens_cpu.
+    global_num_tokens_non_padded_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -715,11 +718,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
-            # Independent pre-DP-padding snapshot (prepare_mlp_sync_batch pads
-            # global_num_tokens in place), spec-adjusted to ROW count: a verify
-            # request spans num_draft_tokens rows, and rows in [original_, padded)
-            # are zeroed as DP padding by _zero_dp_global_padding_rows.
-            ret.original_global_num_tokens_cpu = list(global_num_tokens)
+            ret.original_global_num_tokens_cpu = batch.global_num_tokens
+            ret.global_num_tokens_non_padded_cpu = list(global_num_tokens)
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64

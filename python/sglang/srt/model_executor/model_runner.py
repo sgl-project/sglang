@@ -3557,13 +3557,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # should not be further divided by attn_tp_size. MHA-arch prefill CP
             # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
             # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
-            # Also skip under DP attention: attention/Mamba run on a replicated
-            # attn-TP-full local layout, so slicing by attn_tp_size would zero rank 1.
             if (
                 forward_batch.num_token_non_padded is not None
                 and forward_batch.global_num_tokens_gpu is not None
                 and require_gathered_buffer(self.server_args)
-                and not self.server_args.enable_dp_attention
                 and not is_dsa_enable_prefill_cp()
                 and not is_mla_prefill_cp_enabled()
             ):
