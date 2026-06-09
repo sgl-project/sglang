@@ -22,7 +22,10 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -32,6 +35,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
     next_power_of_2,
+    require_gathered_buffer,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +43,24 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
+    """Round ``max_bs`` up to the same alignment cuda-graph capture pads batch
+    sizes to (see ``get_batch_sizes_to_capture``). Per-request index buffers are
+    sized from this so a padded capture/warmup batch -- e.g. DP attention
+    rounding ``req_to_token_pool.size`` 13 -> 16 to keep ``bs * num_tokens_per_bs``
+    a multiple of ``attn_tp_size`` -- does not overflow ``kv_indptr`` /
+    ``kv_last_page_len``. A no-op when ``max_bs`` is already aligned (the common
+    case) or when no gathered buffer / TBO / CP alignment applies."""
+    mul_base = 1
+    if server_args.enable_two_batch_overlap:
+        mul_base *= 2
+    if require_gathered_buffer(server_args):
+        mul_base *= get_attention_tp_size()
+    if mul_base % get_attention_cp_size() != 0:
+        mul_base *= get_attention_cp_size()
+    return (max_bs + mul_base - 1) // mul_base * mul_base
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -212,7 +234,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
-        max_bs = model_runner.req_to_token_pool.size
+        max_bs = _cuda_graph_capture_max_bs(
+            model_runner.server_args, model_runner.req_to_token_pool.size
+        )
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -1524,7 +1548,9 @@ class FlashInferMultiStepDraftBackend:
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
 
-        max_bs = model_runner.req_to_token_pool.size * self.topk
+        max_bs = _cuda_graph_capture_max_bs(
+            model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
+        )
         self.kv_indptr = torch.zeros(
             (
                 self.speculative_num_steps,
