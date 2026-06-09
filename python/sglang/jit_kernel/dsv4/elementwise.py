@@ -8,7 +8,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_fp8_e4m3_dtype, is_hip
 
 from .utils import make_name
 
@@ -141,7 +141,9 @@ def fused_q_indexer_rope_hadamard_quant(
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    q_fp8 = torch.empty(
+        q_input.shape, dtype=get_fp8_e4m3_dtype(q_input.device), device=q_input.device
+    )
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )

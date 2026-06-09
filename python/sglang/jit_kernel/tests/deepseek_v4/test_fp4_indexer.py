@@ -9,6 +9,7 @@ from sglang.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
+    fused_q_indexer_rope_hadamard_quant,
 )
 from sglang.jit_kernel.hadamard import hadamard_transform
 from sglang.srt.layers.attention.dsv4.fp4_indexer import (
@@ -19,6 +20,7 @@ from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     precompute_freqs_cis,
 )
+from sglang.srt.utils import get_fp8_e4m3_dtype
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
@@ -92,6 +94,29 @@ def _ref_store_fp4_index_cache(
             (x_sf[token_id] >> sf_shifts) & 0xFF
         ).to(torch.uint8)
     return expected
+
+
+@pytest.mark.parametrize("batch_size", [1, 5, 17])
+def test_fp8_fused_q_indexer_rope_hadamard_quant_dtype(batch_size: int) -> None:
+    torch.manual_seed(batch_size + 150)
+    num_heads = 16
+    rope_dim = 64
+    weight_scale = HEAD_DIM**-0.5 * num_heads**-0.5
+    q = torch.randn(
+        batch_size, num_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    weight = torch.randn(batch_size, num_heads, device="cuda", dtype=torch.bfloat16)
+    positions = (torch.arange(batch_size, device="cuda", dtype=torch.int32) * 7) % 63
+    freqs_cis = precompute_freqs_cis(rope_dim, 64, 0, 10000, 1, 32, 1).to("cuda")
+
+    q_fp8, weights_out = fused_q_indexer_rope_hadamard_quant(
+        q, weight, weight_scale, freqs_cis, positions
+    )
+
+    assert q_fp8.dtype == get_fp8_e4m3_dtype(q.device)
+    assert q_fp8.shape == q.shape
+    assert weights_out.shape == (batch_size, num_heads, 1)
+    assert torch.isfinite(weights_out).all()
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 96])

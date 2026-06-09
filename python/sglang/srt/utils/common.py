@@ -3654,6 +3654,54 @@ def is_gfx942_supported():
         return False
 
 
+def _normalize_cuda_device_index(
+    device: Optional[Union[int, str, torch.device]],
+) -> int:
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, int):
+        return device
+
+    torch_device = torch.device(device)
+    if torch_device.type != "cuda" or torch_device.index is None:
+        return torch.cuda.current_device()
+    return torch_device.index
+
+
+@lru_cache(maxsize=None)
+def _is_fp8_fnuz_device(device_index: int) -> bool:
+    if not torch.version.hip:
+        return False
+    gcn_arch = torch.cuda.get_device_properties(device_index).gcnArchName
+    return any(
+        gcn_arch.startswith(gfx_arch) for gfx_arch in ("gfx940", "gfx941", "gfx942")
+    )
+
+
+def is_fp8_fnuz(device: Optional[Union[int, str, torch.device]] = None) -> bool:
+    """
+    Returns whether the current FP8 E4M3 format is FNUZ.
+
+    ROCm gfx940/gfx941/gfx942 platforms use E4M3FNUZ, while CUDA and
+    newer ROCm platforms use E4M3FN.
+    """
+    if not torch.version.hip:
+        return False
+    return _is_fp8_fnuz_device(_normalize_cuda_device_index(device))
+
+
+def get_fp8_e4m3_dtype(
+    device: Optional[Union[int, str, torch.device]] = None,
+) -> torch.dtype:
+    return torch.float8_e4m3fnuz if is_fp8_fnuz(device) else torch.float8_e4m3fn
+
+
+def get_fp8_e4m3_dtype_name(
+    device: Optional[Union[int, str, torch.device]] = None,
+) -> str:
+    return "float8_e4m3fnuz" if is_fp8_fnuz(device) else "float8_e4m3fn"
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))

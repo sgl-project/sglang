@@ -4,9 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import get_fp8_e4m3_dtype
 
-fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+fp8_dtype = get_fp8_e4m3_dtype()
 
 # v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +

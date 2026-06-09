@@ -16,7 +16,6 @@ import functools
 import json
 import logging
 import os
-from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -34,8 +33,10 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_device_name,
+    get_fp8_e4m3_dtype,
     is_cpu,
     is_cuda,
+    is_fp8_fnuz,
     is_hip,
     is_musa,
     is_sm100_supported,
@@ -115,19 +116,10 @@ if _is_musa:
 logger = logging.getLogger(__name__)
 
 
-@lru_cache()
-def is_fp8_fnuz() -> bool:
-    if _is_hip:
-        # only device 0 is checked, this assumes MI300 platforms are homogeneous
-        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
-    return False
-
-
+fp8_dtype = get_fp8_e4m3_dtype()
 if is_fp8_fnuz():
-    fp8_dtype = torch.float8_e4m3fnuz
     fp8_max = 224.0
 else:
-    fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
