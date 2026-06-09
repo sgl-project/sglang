@@ -194,6 +194,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     for name in _PREFILL_STATIC_FIELDS
                 }
 
+        # Some attention backends (e.g. DSV4) opt into a captured-metadata
+        # contract under BCG: capture-time builds a per-bucket metadata
+        # object the backend then refreshes in place at replay. We honor
+        # the contract only when the backend is Breakable; FullCG and
+        # TC_PIECEWISE use the eager init_forward_metadata path.
+        if isinstance(self.backend, BreakableCudaGraphBackend):
+            self.use_captured_attn_metadata = (
+                model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            )
+        else:
+            self.use_captured_attn_metadata = False
+        self.attn_metadata_buffers: Optional[Dict[int, object]] = (
+            {} if self.use_captured_attn_metadata else None
+        )
+
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
@@ -252,6 +267,56 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
 
+    def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
+        # DSV4 DP attention / DeepEP collectives need every DP rank to enter
+        # the same replay path. Sparse-DP batches (one or more ranks with
+        # zero local tokens) fall back to eager to avoid hanging ranks.
+        global_num_tokens = forward_batch.global_num_tokens_cpu
+        if global_num_tokens is None:
+            return False
+        return len(global_num_tokens) > 1 and any(
+            int(num_tokens) == 0 for num_tokens in global_num_tokens
+        )
+
+    def _init_forward_metadata_for_capture(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> None:
+        """Capture-time metadata init for the BCG-with-captured-metadata
+        contract. For opt-in backends (DSV4), call the BCG-specific entry
+        and stash the returned per-bucket metadata object; otherwise fall
+        back to the generic eager init that BCG/TC_PIECEWISE use today."""
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_captured_attn_metadata:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+            forward_batch
+        )
+        assert self.attn_metadata_buffers is not None
+        self.attn_metadata_buffers[num_tokens] = metadata
+
+    def _prepare_forward_metadata_for_replay(
+        self,
+        forward_batch: ForwardBatch,
+        static_forward_batch: ForwardBatch,
+        num_tokens: int,
+    ) -> None:
+        """Replay-time metadata refresh for the BCG-with-captured-metadata
+        contract. For opt-in backends, refresh the stashed per-bucket
+        metadata in place against the current batch; otherwise fall back
+        to the generic eager init."""
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_captured_attn_metadata:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        assert self.attn_metadata_buffers is not None
+        metadata = self.attn_metadata_buffers[num_tokens]
+        attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
+
     # -----------------------------------------------------------------
     # can_run
     # -----------------------------------------------------------------
@@ -264,6 +329,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.forward_mode.is_target_verify():
             return False
         if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
+        # BCG-with-captured-metadata under DP attention: every rank must
+        # have local tokens, and the batch must declare itself replayable.
+        # These gates are no-ops for non-DP / non-opt-in paths because
+        # global_num_tokens_cpu stays None.
+        if self._has_inactive_dp_rank(forward_batch):
+            return False
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and not forward_batch.can_run_dp_breakable_cuda_graph
+        ):
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
@@ -453,7 +529,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        attn_backend.init_forward_metadata(forward_batch)
+        self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -599,7 +675,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.orig_seq_lens is not None:
                 s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
 
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        self._prepare_forward_metadata_for_replay(
+            forward_batch, static_forward_batch, static_num_tokens
+        )
 
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
