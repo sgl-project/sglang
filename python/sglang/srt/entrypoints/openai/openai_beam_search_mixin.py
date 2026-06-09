@@ -108,7 +108,9 @@ class OpenAIBeamSearchMixin:
         request_meta_list = []
         all_choices = []
         packed_results = (
-            sorted(results, key=lambda x: x.get("index", 0)) if sort_results else results
+            sorted(results, key=lambda x: x.get("index", 0))
+            if sort_results
+            else results
         )
         for packed in packed_results:
             beam_results = packed.get("meta_info", {}).get("beam_results")
@@ -173,7 +175,9 @@ class OpenAIBeamSearchMixin:
         return f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     @staticmethod
-    def _beam_finish_fields(beam_result: Dict[str, Any]) -> tuple[str, Optional[str], Optional[SglExt]]:
+    def _beam_finish_fields(
+        beam_result: Dict[str, Any],
+    ) -> tuple[str, Optional[str], Optional[SglExt]]:
         """Decode the shared per-beam tail: (finish_reason, matched_stop, sglext)."""
         meta = beam_result.get("meta_info", {})
         finish_reason = meta.get("finish_reason")
@@ -181,7 +185,11 @@ class OpenAIBeamSearchMixin:
         return (
             finish_reason["type"] if finish_reason else "stop",
             finish_reason.get("matched") if finish_reason else None,
-            SglExt(sequence_score=sequence_score) if sequence_score is not None else None,
+            (
+                SglExt(sequence_score=sequence_score)
+                if sequence_score is not None
+                else None
+            ),
         )
 
     # ==================== Chat Completion Beam Search Methods ====================

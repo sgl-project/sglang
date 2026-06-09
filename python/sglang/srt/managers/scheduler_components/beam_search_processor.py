@@ -75,7 +75,9 @@ class SchedulerBeamSearchProcessor:
             elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                 self.scheduler.tree_cache.cache_unfinished_req(req)
 
-        self.scheduler.output_streamer.stream_output(batch.reqs, batch.return_logprob, None)
+        self.scheduler.output_streamer.stream_output(
+            batch.reqs, batch.return_logprob, None
+        )
 
     def process_beam_search_decode_result(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -85,7 +87,9 @@ class SchedulerBeamSearchProcessor:
         Batch layout per request i is [beam_1, ..., beam_width]. Grammar is not
         supported for beam search.
         """
-        self.scheduler.metrics_reporter.num_generated_tokens += len(batch.req_pool_indices)
+        self.scheduler.metrics_reporter.num_generated_tokens += len(
+            batch.req_pool_indices
+        )
 
         beam_output_top_tokens, beam_output_top_logprobs = self._extract_beam_topk_data(
             batch, result
@@ -348,9 +352,7 @@ class SchedulerBeamSearchProcessor:
             device=device,
         )
 
-    def _check_beam_finished(
-        self, req: Req, beam: BeamSearchSequence
-    ) -> bool:
+    def _check_beam_finished(self, req: Req, beam: BeamSearchSequence) -> bool:
         """Check beam against stop tokens/strings/regex, set finish_reason, return done?."""
         if not req.sampling_params.ignore_eos:
             last_token_id = beam.tokens[-1]
@@ -791,9 +793,9 @@ class SchedulerBeamSearchProcessor:
             unique_src_indices, prefix_len:seq_len
         ].clone()
         kvcache_batch = kvcache_batch_unique[inverse_indices]
-        self.scheduler.req_to_token_pool.req_to_token[dst_indices, prefix_len:seq_len] = (
-            kvcache_batch
-        )
+        self.scheduler.req_to_token_pool.req_to_token[
+            dst_indices, prefix_len:seq_len
+        ] = kvcache_batch
         return kvcache_batch_unique.flatten().unique()
 
     def _collect_beam_req_decode_kv_indices(

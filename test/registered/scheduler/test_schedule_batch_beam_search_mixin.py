@@ -52,10 +52,19 @@ def make_req(beam_width=None, start_idx=None, finished=None, last_tokens=None):
 _SENTINEL = object()
 
 
-def make_batch(reqs, *, req_pool_indices=None, seq_lens=None, orig_seq_lens=None,
-               req_to_token=None, alloc_return=_SENTINEL, available_size=None):
+def make_batch(
+    reqs,
+    *,
+    req_pool_indices=None,
+    seq_lens=None,
+    orig_seq_lens=None,
+    req_to_token=None,
+    alloc_return=_SENTINEL,
+    available_size=None,
+):
     """Build a Mock ScheduleBatch wired with CPU tensors. A req_to_token_pool with
-    tracked alloc_by_count/available_size mocks is created when any pool field is set."""
+    tracked alloc_by_count/available_size mocks is created when any pool field is set.
+    """
     batch = Mock()
     batch.device = CPU
     batch.reqs = reqs
@@ -173,7 +182,9 @@ class TestFilterBeamSearchBatch(TensorTestCase):
         )
         batch.has_stream = False
         batch.has_grammar = False
-        ScheduleBatchBeamSearchMixin.filter_beam_search_batch(batch, keep_indices=[0, 2])
+        ScheduleBatchBeamSearchMixin.filter_beam_search_batch(
+            batch, keep_indices=[0, 2]
+        )
         self.assertEqual(batch.reqs, [req1, req3])
         self.assertTensorEqual(batch.req_pool_indices, [0, 1, 3, 4, 5])
         self.assertTensorEqual(batch.seq_lens, [7, 7, 9, 9, 9])
@@ -194,7 +205,10 @@ class TestFilterBeamSearchBatch(TensorTestCase):
         self.assertEqual(len(batch.reqs), 0)
 
     def test_no_change_keeps_all(self):
-        reqs = [make_req(beam_width=2, finished=False), make_req(beam_width=2, finished=False)]
+        reqs = [
+            make_req(beam_width=2, finished=False),
+            make_req(beam_width=2, finished=False),
+        ]
         batch = make_batch(list(reqs))
         ScheduleBatchBeamSearchMixin.filter_beam_search_batch(batch)
         self.assertEqual(batch.reqs, reqs)
@@ -208,19 +222,41 @@ class TestPrepareForNewBeamSearch(TensorTestCase):
         # skipped. KV cache at the prefill src_row is copied to each new beam row dst.
         cases = [
             # single new req: prefill row 0, seq_len 5, alloc beams [1,2,3]
-            dict(name="single_request", reqs_spec=[(3, -1)],
-                 pool=[0], seqs=[5], alloc=[1, 2, 3], rows=5,
-                 exp_pool=[1, 2, 3], exp_seq=[5, 5, 5],
-                 new_start=0, src_row=0, dsts=[1, 2, 3], copy_len=5),
+            dict(
+                name="single_request",
+                reqs_spec=[(3, -1)],
+                pool=[0],
+                seqs=[5],
+                alloc=[1, 2, 3],
+                rows=5,
+                exp_pool=[1, 2, 3],
+                exp_seq=[5, 5, 5],
+                new_start=0,
+                src_row=0,
+                dsts=[1, 2, 3],
+                copy_len=5,
+            ),
             # old req (kept) + new req: skip old's 2 slots, alloc beams [3,4,5]
-            dict(name="multiple_requests_skip_old", reqs_spec=[(2, 0), (3, -1)],
-                 pool=[0, 1, 2], seqs=[7, 7, 8], alloc=[3, 4, 5], rows=6,
-                 exp_pool=[0, 1, 3, 4, 5], exp_seq=[7, 7, 8, 8, 8],
-                 new_start=2, src_row=2, dsts=[3, 4, 5], copy_len=8),
+            dict(
+                name="multiple_requests_skip_old",
+                reqs_spec=[(2, 0), (3, -1)],
+                pool=[0, 1, 2],
+                seqs=[7, 7, 8],
+                alloc=[3, 4, 5],
+                rows=6,
+                exp_pool=[0, 1, 3, 4, 5],
+                exp_seq=[7, 7, 8, 8, 8],
+                new_start=2,
+                src_row=2,
+                dsts=[3, 4, 5],
+                copy_len=8,
+            ),
         ]
         for c in cases:
             with self.subTest(c["name"]):
-                reqs = [make_req(beam_width=bw, start_idx=si) for bw, si in c["reqs_spec"]]
+                reqs = [
+                    make_req(beam_width=bw, start_idx=si) for bw, si in c["reqs_spec"]
+                ]
                 new_req = reqs[-1]
                 pool = torch.arange(c["rows"] * 10, device=CPU).reshape(c["rows"], 10)
                 batch = make_batch(
@@ -297,12 +333,22 @@ class TestStopTokenIds(unittest.TestCase):
     def test_collection_dedup_and_caching(self):
         # (name, stop_token_ids, eos_token_ids, tokenizer(eos, extra) or None, expected)
         cases = [
-            ("basic", [100, 200], [300, 400], (50256, [500, 600]),
-             {100, 200, 300, 400, 50256, 500, 600}),
+            (
+                "basic",
+                [100, 200],
+                [300, 400],
+                (50256, [500, 600]),
+                {100, 200, 300, 400, 50256, 500, 600},
+            ),
             ("empty_sources", None, None, (None, None), set()),
             ("no_tokenizer", [100, 200], [300], None, {100, 200, 300}),
-            ("deduplication", [100, 200], [200, 300], (300, [100, 400]),
-             {100, 200, 300, 400}),
+            (
+                "deduplication",
+                [100, 200],
+                [200, 300],
+                (300, [100, 400]),
+                {100, 200, 300, 400},
+            ),
         ]
         for name, stop, eos, tok, expected in cases:
             with self.subTest(name):

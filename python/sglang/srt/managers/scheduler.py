@@ -162,13 +162,13 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.schedule_batch_beam_search_mixin import (
+    BeamSearchAdmissionError,
+)
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
-)
-from sglang.srt.managers.schedule_batch_beam_search_mixin import (
-    BeamSearchAdmissionError,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,

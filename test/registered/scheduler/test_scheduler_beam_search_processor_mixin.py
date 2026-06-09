@@ -20,6 +20,7 @@ tree_cache, token_to_kv_pool_allocator, req_to_token_pool, output_streamer,
 metrics_reporter. Each test builds a Mock() scheduler carrying those attrs, then
 ``proc = SchedulerBeamSearchProcessor(scheduler=mock)`` and calls methods.
 """
+
 import unittest
 from unittest.mock import Mock, patch
 
@@ -134,7 +135,9 @@ class TestProcessPrefillResult(unittest.TestCase):
         self.release.assert_called_once_with(r2, self.proc.scheduler.tree_cache)
 
     def test_retracted_req_is_skipped(self):
-        self.proc.process_beam_search_prefill_result(*self._batch([make_req(is_retracted=True)]))
+        self.proc.process_beam_search_prefill_result(
+            *self._batch([make_req(is_retracted=True)])
+        )
         self.single.assert_not_called()
         self.proc.scheduler.tree_cache.cache_unfinished_req.assert_not_called()
         self.release.assert_not_called()
@@ -162,8 +165,12 @@ class TestProcessDecodeResult(unittest.TestCase):
         self.m["_calculate_beam_score"].return_value = -1.0
 
     def _run(self, req):
-        batch = Mock(req_pool_indices=T([0]), return_logprob=False, device=CPU, reqs=[req])
-        self.proc.process_beam_search_decode_result(batch, Mock(can_run_cuda_graph=False))
+        batch = Mock(
+            req_pool_indices=T([0]), return_logprob=False, device=CPU, reqs=[req]
+        )
+        self.proc.process_beam_search_decode_result(
+            batch, Mock(can_run_cuda_graph=False)
+        )
 
     def test_basic_unfinished_streams_and_bumps_metrics(self):
         self.m["_process_beam_search_expansion"].return_value = None
@@ -181,7 +188,10 @@ class TestProcessDecodeResult(unittest.TestCase):
 
     def test_finished_without_incomplete_caches_finished(self):
         self.m["_process_beam_search_expansion"].return_value = None
-        req = make_req(finished=Mock(return_value=True), beam_list=Mock(incomplete=[], completed=[]))
+        req = make_req(
+            finished=Mock(return_value=True),
+            beam_list=Mock(incomplete=[], completed=[]),
+        )
         self._run(req)
         self.m["_calculate_beam_score"].assert_not_called()
         self.m["_cache_finished_beam_search"].assert_called_once()
@@ -192,7 +202,10 @@ class TestProcessDecodeResult(unittest.TestCase):
             Mock(beam_score=None, tokens=[1, 2, 3], cum_logprob=-1.5),
             Mock(beam_score=None, tokens=[4, 5, 6, 7], cum_logprob=-2.0),
         ]
-        req = make_req(finished=Mock(return_value=True), beam_list=Mock(incomplete=beams, completed=[]))
+        req = make_req(
+            finished=Mock(return_value=True),
+            beam_list=Mock(incomplete=beams, completed=[]),
+        )
         self._run(req)
         self.assertEqual(self.m["_calculate_beam_score"].call_count, 2)
         self.m["_cache_finished_beam_search"].assert_called_once()
@@ -212,23 +225,41 @@ class TestStaticMethods(unittest.TestCase):
     """sum_beam_completion_tokens + convert_beam_sequences_to_output."""
 
     def test_sum_beam_completion_tokens(self):
-        req = Mock(beam_list=Mock(completed=[
-            BeamSearchSequence(tokens=[1, 2, 3]),
-            BeamSearchSequence(tokens=[4, 5]),
-            BeamSearchSequence(tokens=[6, 7, 8, 9]),
-        ]))
+        req = Mock(
+            beam_list=Mock(
+                completed=[
+                    BeamSearchSequence(tokens=[1, 2, 3]),
+                    BeamSearchSequence(tokens=[4, 5]),
+                    BeamSearchSequence(tokens=[6, 7, 8, 9]),
+                ]
+            )
+        )
         self.assertEqual(P.sum_beam_completion_tokens(req), 9)
 
     def test_sum_beam_completion_tokens_empty(self):
-        self.assertEqual(P.sum_beam_completion_tokens(Mock(beam_list=Mock(completed=[]))), 0)
+        self.assertEqual(
+            P.sum_beam_completion_tokens(Mock(beam_list=Mock(completed=[]))), 0
+        )
 
     def test_convert_beam_sequences_to_output(self):
-        req = Mock(beam_list=Mock(completed=[
-            BeamSearchSequence(tokens=[1, 2, 3], cum_logprob=-5.0, beam_score=-1.67,
-                               finish_reason=FINISH_LENGTH(length=3)),
-            BeamSearchSequence(tokens=[4, 5], cum_logprob=-3.0, beam_score=-1.5,
-                               finish_reason=FINISH_MATCHED_TOKEN(matched=50256)),
-        ]))
+        req = Mock(
+            beam_list=Mock(
+                completed=[
+                    BeamSearchSequence(
+                        tokens=[1, 2, 3],
+                        cum_logprob=-5.0,
+                        beam_score=-1.67,
+                        finish_reason=FINISH_LENGTH(length=3),
+                    ),
+                    BeamSearchSequence(
+                        tokens=[4, 5],
+                        cum_logprob=-3.0,
+                        beam_score=-1.5,
+                        finish_reason=FINISH_MATCHED_TOKEN(matched=50256),
+                    ),
+                ]
+            )
+        )
         out = P.convert_beam_sequences_to_output(req)
         self.assertEqual(len(out.sequences), 2)
         self.assertEqual(out.sequences[0].tokens, [1, 2, 3])
@@ -252,7 +283,9 @@ class TestProcessPrefillSingleReq(unittest.TestCase):
 
     def _run(self, req, mask_fn=None):
         if mask_fn is not None:
-            self.m["_batch_check_prefill_generated_tokens_stop_conditions"].side_effect = mask_fn
+            self.m[
+                "_batch_check_prefill_generated_tokens_stop_conditions"
+            ].side_effect = mask_fn
         self.proc._process_beam_search_prefill_result_single_req(
             req, Mock(device=CPU), torch.randn(100, device=CPU), CPU
         )
@@ -272,14 +305,18 @@ class TestProcessPrefillSingleReq(unittest.TestCase):
         req = make_req(beam_list=BeamSearchList())
         req.sampling_params.max_new_tokens = 1
         self._run(req)  # no mask: max_new_tokens<=1 marks all finished
-        args = self.m["_create_completed_beams_for_insufficient_candidates"].call_args[0]
+        args = self.m["_create_completed_beams_for_insufficient_candidates"].call_args[
+            0
+        ]
         self.assertTrue(all(args[3]))  # finish_mask all True
         self.assertTrue(args[4])  # finish_by_len True
 
     def test_insufficient_candidates_routes_to_completed(self):
         req = make_req(beam_list=BeamSearchList())
         self._run(req, lambda *_: T([True, True, True, False], dtype=torch.bool))
-        args = self.m["_create_completed_beams_for_insufficient_candidates"].call_args[0]
+        args = self.m["_create_completed_beams_for_insufficient_candidates"].call_args[
+            0
+        ]
         self.assertEqual(args[3], [True, True, True, False])
         self.assertFalse(args[4])
 
@@ -298,7 +335,9 @@ class TestBatchCheckPrefillStopConditions(unittest.TestCase):
     def test_stop_strings(self):
         req = make_req()
         req.sampling_params.stop_strs = ["STOP"]
-        req.tokenizer.decode = Mock(side_effect=lambda t, **k: "STOP" if t[0] == 100 else "x")
+        req.tokenizer.decode = Mock(
+            side_effect=lambda t, **k: "STOP" if t[0] == 100 else "x"
+        )
         r = self.proc._batch_check_prefill_generated_tokens_stop_conditions(
             req, T([100, 200, 300], dtype=torch.int64), CPU
         )
@@ -315,8 +354,11 @@ class TestCreateCompletedAndInitialBeams(unittest.TestCase):
         """Crash-fix coverage: top candidate finished -> finished_reason set."""
         req = make_req(beam_list=Mock(), finished_reason=None)
         self.proc._create_completed_beams_for_insufficient_candidates(
-            req, [-1.0, -2.0, -3.0, -4.0], [100, 200, 300, 400],
-            [True, True, True, False], False,
+            req,
+            [-1.0, -2.0, -3.0, -4.0],
+            [100, 200, 300, 400],
+            [True, True, True, False],
+            False,
         )
         self.assertEqual(len(req.beam_list.completed), 2)
         self.assertEqual(len(req.beam_list.incomplete), 0)
@@ -334,8 +376,11 @@ class TestCreateCompletedAndInitialBeams(unittest.TestCase):
         be non-None (adopts first real finish reason from a later beam)."""
         req = make_req(beam_list=Mock(), finished_reason=None)
         self.proc._create_completed_beams_for_insufficient_candidates(
-            req, [-1.0, -2.0, -3.0, -4.0], [100, 200, 300, 400],
-            [False, True, True, True], False,  # top candidate unfinished
+            req,
+            [-1.0, -2.0, -3.0, -4.0],
+            [100, 200, 300, 400],
+            [False, True, True, True],
+            False,  # top candidate unfinished
         )
         self.assertIsNone(req.beam_list.completed[0].finish_reason)
         self.assertIsNotNone(req.finished_reason)
@@ -345,8 +390,11 @@ class TestCreateCompletedAndInitialBeams(unittest.TestCase):
     def test_create_initial_beam_sequences_basic(self):
         req = make_req(beam_list=BeamSearchList())
         self.proc._create_initial_beam_sequences(
-            req, [-1.0, -2.0, -3.0, -4.0, -5.0], [100, 200, 300, 400, 500],
-            [False] * 5, CPU,
+            req,
+            [-1.0, -2.0, -3.0, -4.0, -5.0],
+            [100, 200, 300, 400, 500],
+            [False] * 5,
+            CPU,
         )
         bl = req.beam_list
         self.assertEqual(len(bl.incomplete), 2)
@@ -359,8 +407,11 @@ class TestCreateCompletedAndInitialBeams(unittest.TestCase):
     def test_create_initial_beam_sequences_with_finished_beam(self):
         req = make_req(beam_width=3, beam_candidates=6, beam_list=BeamSearchList())
         self.proc._create_initial_beam_sequences(
-            req, [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0], [100, 200, 300, 400, 500, 600],
-            [True, False, False, False, False, False], CPU,
+            req,
+            [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0],
+            [100, 200, 300, 400, 500, 600],
+            [True, False, False, False, False, False],
+            CPU,
         )
         bl = req.beam_list
         self.assertEqual(len(bl.incomplete), 3)
@@ -450,7 +501,9 @@ class TestExtractBeamTopkData(unittest.TestCase):
         self.assertEqual(logprobs.shape, (6, 8))
         for i in range(6):
             for j in range(7):
-                self.assertGreaterEqual(logprobs[i, j].item(), logprobs[i, j + 1].item())
+                self.assertGreaterEqual(
+                    logprobs[i, j].item(), logprobs[i, j + 1].item()
+                )
 
 
 class TestProcessBeamSearchExpansion(unittest.TestCase):
@@ -459,7 +512,9 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
     def setUp(self):
         self.proc = make_proc()
         self.m = patch_methods(
-            self, "_expand_and_prune_beams", "_create_completed_beams_for_finished_request"
+            self,
+            "_expand_and_prune_beams",
+            "_create_completed_beams_for_finished_request",
         )
         self.top_tokens = T([[100, 200, 300, 400], [500, 600, 700, 800]])
         self.top_logprobs = T([[-1.0, -2.0, -3.0, -4.0], [-1.5, -2.5, -3.5, -4.5]])
@@ -527,8 +582,10 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         for k, v in sp.items():
             setattr(req.sampling_params, k, v)
         req.beam_list = Mock(
-            incomplete=incomplete, completed=[],
-            last_tokens=T(last_tokens), cum_logprobs=T(cum_logprobs),
+            incomplete=incomplete,
+            completed=[],
+            last_tokens=T(last_tokens),
+            cum_logprobs=T(cum_logprobs),
         )
         return req
 
@@ -540,9 +597,14 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         ]
 
     def test_fast_path_no_stop_conditions(self):
-        req = self._req(self._two_beams(), [2, 4], [-2.0, -3.0], ignore_eos=True, stop_strs=[])
+        req = self._req(
+            self._two_beams(), [2, 4], [-2.0, -3.0], ignore_eos=True, stop_strs=[]
+        )
         result = self.proc._expand_and_prune_beams(
-            req, 2, 4, torch.arange(8, device=CPU),
+            req,
+            2,
+            4,
+            torch.arange(8, device=CPU),
             T([-2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, -6.0]),
             T([100, 200, 300, 400, 500, 600, 700, 800]),
         )
@@ -554,16 +616,24 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         self.assertEqual(req.beam_list.last_tokens.tolist(), [100, 200])
 
     def test_eos_vectorized_path(self):
-        req = self._req(self._two_beams(), [2, 4], [-2.0, -3.0], ignore_eos=False, stop_strs=[])
+        req = self._req(
+            self._two_beams(), [2, 4], [-2.0, -3.0], ignore_eos=False, stop_strs=[]
+        )
         req.stop_token_ids = {50256}
         result = self.proc._expand_and_prune_beams(
-            req, 2, 4, T([0, 1, 4, 5]), T([-2.5, -3.0, -3.5, -4.0]),
+            req,
+            2,
+            4,
+            T([0, 1, 4, 5]),
+            T([-2.5, -3.0, -3.5, -4.0]),
             T([50256, 200, 300, 400, 500, 600, 700, 800]),
         )
         self.assertEqual(result, [0, 1])
         self.assertEqual(len(req.beam_list.completed), 1)
         self.assertEqual(req.beam_list.completed[0].tokens, [1, 2, 50256])
-        self.assertIsInstance(req.beam_list.completed[0].finish_reason, FINISH_MATCHED_TOKEN)
+        self.assertIsInstance(
+            req.beam_list.completed[0].finish_reason, FINISH_MATCHED_TOKEN
+        )
         self.assertEqual(req.beam_list.completed[0].beam_score, 0.5)
         self.assertEqual(len(req.beam_list.incomplete), 2)
         self.assertEqual(req.beam_list.incomplete[1].tokens, [3, 4, 500])
@@ -571,7 +641,13 @@ class TestExpandAndPruneBeams(unittest.TestCase):
 
     def test_stop_str_sequential_path(self):
         self.score.return_value = 0.8
-        req = self._req(self._two_beams(), [2, 4], [-2.0, -3.0], ignore_eos=False, stop_strs=["STOP"])
+        req = self._req(
+            self._two_beams(),
+            [2, 4],
+            [-2.0, -3.0],
+            ignore_eos=False,
+            stop_strs=["STOP"],
+        )
 
         def check(_req, beam):
             if beam.tokens[-1] in (100, 200, 300, 400, 500, 600):
@@ -581,7 +657,10 @@ class TestExpandAndPruneBeams(unittest.TestCase):
 
         self.check.side_effect = check
         result = self.proc._expand_and_prune_beams(
-            req, 2, 4, torch.arange(8, device=CPU),
+            req,
+            2,
+            4,
+            torch.arange(8, device=CPU),
             T([-2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, -6.0]),
             T([100, 200, 300, 400, 500, 600, 700, 800]),
         )
@@ -595,13 +674,20 @@ class TestExpandAndPruneBeams(unittest.TestCase):
     def test_insufficient_candidates_returns_none(self):
         self.score.return_value = -1.0
         req = self._req(
-            [BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0)], [2], [-2.0],
-            ignore_eos=False, stop_strs=[],
+            [BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0)],
+            [2],
+            [-2.0],
+            ignore_eos=False,
+            stop_strs=[],
         )
         req.stop_token_ids = {50256}
         result = self.proc._expand_and_prune_beams(
-            req, 3, 6, torch.arange(6, device=CPU),
-            T([-2.5, -3.0, -3.5, -4.0, -4.5, -5.0]), T([50256] * 6),
+            req,
+            3,
+            6,
+            torch.arange(6, device=CPU),
+            T([-2.5, -3.0, -3.5, -4.0, -4.5, -5.0]),
+            T([50256] * 6),
         )
         self.assertIsNone(result)
         self.assertEqual(len(req.beam_list.completed), 6)
@@ -612,20 +698,30 @@ class TestCreateCompletedBeamsForFinishedRequest(unittest.TestCase):
     def test_appends_completed_with_finish_reason(self):
         proc = make_proc()
         existing = BeamSearchSequence(
-            tokens=[5, 6, 7], cum_logprob=-1.5,
-            finish_reason=FINISH_MATCHED_TOKEN(matched=50256), beam_score=-0.5,
+            tokens=[5, 6, 7],
+            cum_logprob=-1.5,
+            finish_reason=FINISH_MATCHED_TOKEN(matched=50256),
+            beam_score=-0.5,
         )
-        req = Mock(beam_list=Mock(
-            incomplete=[
-                BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
-                BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
-            ],
-            completed=[existing], cum_logprobs=T([-2.0, -3.0]),
-        ))
+        req = Mock(
+            beam_list=Mock(
+                incomplete=[
+                    BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
+                    BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
+                ],
+                completed=[existing],
+                cum_logprobs=T([-2.0, -3.0]),
+            )
+        )
         reason = FINISH_LENGTH(length=10)
         proc._create_completed_beams_for_finished_request(
-            req, 2, 4, T([0, 1, 2, 3]), T([-2.5, -3.0, -3.5, -4.0]),
-            T([100, 200, 300, 400, 500, 600, 700, 800]), reason,
+            req,
+            2,
+            4,
+            T([0, 1, 2, 3]),
+            T([-2.5, -3.0, -3.5, -4.0]),
+            T([100, 200, 300, 400, 500, 600, 700, 800]),
+            reason,
         )
         self.assertEqual(len(req.beam_list.completed), 3)
         self.assertEqual(len(req.beam_list.incomplete), 0)
@@ -648,11 +744,14 @@ class TestKVCacheHelpers(unittest.TestCase):
             dtype=torch.int64,
         )
         r = proc._batch_collect_range_kv_indices(
-            T([0, 1, 2], dtype=torch.int64), T([10, 10, 12], dtype=torch.int64),
-            CPU, T([5, 8, 6], dtype=torch.int64),
+            T([0, 1, 2], dtype=torch.int64),
+            T([10, 10, 12], dtype=torch.int64),
+            CPU,
+            T([5, 8, 6], dtype=torch.int64),
         )
-        self.assertEqual(r.cpu().tolist(),
-                         [15, 16, 17, 18, 19, 28, 29, 36, 37, 38, 39, 300, 301])
+        self.assertEqual(
+            r.cpu().tolist(), [15, 16, 17, 18, 19, 28, 29, 36, 37, 38, 39, 300, 301]
+        )
 
     def test_batch_collect_range_kv_indices_no_prefix(self):
         proc = make_proc()
@@ -660,18 +759,26 @@ class TestKVCacheHelpers(unittest.TestCase):
             [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]], dtype=torch.int64
         )
         r = proc._batch_collect_range_kv_indices(
-            T([0, 1], dtype=torch.int64), T([3, 4], dtype=torch.int64), CPU, prefix_lens=None
+            T([0, 1], dtype=torch.int64),
+            T([3, 4], dtype=torch.int64),
+            CPU,
+            prefix_lens=None,
         )
         self.assertEqual(r.tolist(), [10, 11, 12, 20, 21, 22, 23])
 
     def test_handle_beam_kv_cache_frees_pruned_indices(self):
         proc = make_proc()
-        with patch.object(P, "_batch_collect_range_kv_indices") as collect, \
-                patch.object(P, "_copy_kvcache_for_beams") as copy:
-            req = Mock(beam_width=2, beam_list=Mock(
-                batch_slot_start_idx=0, prompt_lens=T([5, 5])))
+        with patch.object(
+            P, "_batch_collect_range_kv_indices"
+        ) as collect, patch.object(P, "_copy_kvcache_for_beams") as copy:
+            req = Mock(
+                beam_width=2,
+                beam_list=Mock(batch_slot_start_idx=0, prompt_lens=T([5, 5])),
+            )
             batch = Mock(seq_lens=T([10, 10]), req_pool_indices=T([0, 1]), device=CPU)
-            proc.scheduler.req_to_token_pool.req_to_token = torch.arange(20, device=CPU).reshape(2, 10)
+            proc.scheduler.req_to_token_pool.req_to_token = torch.arange(
+                20, device=CPU
+            ).reshape(2, 10)
             collect.return_value = T([100, 101, 102, 103, 104, 200, 201, 202, 203, 204])
             copy.return_value = T([100, 101, 102, 103, 104])
             proc._handle_beam_kv_cache(batch, [req], [T([0, 0])])
@@ -685,66 +792,108 @@ class TestKVCacheHelpers(unittest.TestCase):
 
     def test_cache_finished_beam_search(self):
         proc = make_proc()
-        with patch(RELEASE_KV) as release, \
-                patch.object(P, "_collect_beam_req_decode_kv_indices") as collect:
-            req = Mock(beam_width=3, finished=Mock(return_value=True), beam_list=Mock(
-                batch_slot_start_idx=0, prompt_lens=T([5, 5, 5])))
-            batch = Mock(device=CPU, req_pool_indices=T([0, 1, 2]), seq_lens=T([7, 7, 7]), reqs=[req])
+        with patch(RELEASE_KV) as release, patch.object(
+            P, "_collect_beam_req_decode_kv_indices"
+        ) as collect:
+            req = Mock(
+                beam_width=3,
+                finished=Mock(return_value=True),
+                beam_list=Mock(batch_slot_start_idx=0, prompt_lens=T([5, 5, 5])),
+            )
+            batch = Mock(
+                device=CPU,
+                req_pool_indices=T([0, 1, 2]),
+                seq_lens=T([7, 7, 7]),
+                reqs=[req],
+            )
             collect.return_value = (T([105, 106, 205, 206, 305, 306]), T([0, 1, 2]))
             proc._cache_finished_beam_search(batch)
             collect.assert_called_once()
             self.assertEqual(
-                proc.scheduler.token_to_kv_pool_allocator.free.call_args[0][0].cpu().tolist(),
+                proc.scheduler.token_to_kv_pool_allocator.free.call_args[0][0]
+                .cpu()
+                .tolist(),
                 [105, 106, 205, 206, 305, 306],
             )
             self.assertEqual(
-                proc.scheduler.req_to_token_pool.free_by_indices.call_args[0][0], [0, 1, 2])
+                proc.scheduler.req_to_token_pool.free_by_indices.call_args[0][0],
+                [0, 1, 2],
+            )
             release.assert_called_once()
 
     def test_copy_kvcache_for_beams_single_group(self):
         proc = make_proc()
         proc.scheduler.req_to_token_pool.req_to_token = T(
-            [[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25],
-             [30, 31, 32, 33, 34, 35], [40, 41, 42, 43, 44, 45]],
+            [
+                [10, 11, 12, 13, 14, 15],
+                [20, 21, 22, 23, 24, 25],
+                [30, 31, 32, 33, 34, 35],
+                [40, 41, 42, 43, 44, 45],
+            ],
             dtype=torch.int64,
         )
         r = proc._copy_kvcache_for_beams(
-            T([0, 1], dtype=torch.int64), T([2, 3], dtype=torch.int64),
-            T([2, 2], dtype=torch.int64), T([4, 4], dtype=torch.int64), CPU,
+            T([0, 1], dtype=torch.int64),
+            T([2, 3], dtype=torch.int64),
+            T([2, 2], dtype=torch.int64),
+            T([4, 4], dtype=torch.int64),
+            CPU,
         )
         self.assertEqual(r.cpu().tolist(), [12, 13, 22, 23])
 
     def test_copy_kvcache_for_beams_multiple_groups(self):
         proc = make_proc()
         proc.scheduler.req_to_token_pool.req_to_token = T(
-            [[10, 11, 12, 13, 14, 15, 16, 17], [20, 21, 22, 23, 24, 25, 26, 27],
-             [30, 31, 32, 33, 34, 35, 36, 37], [40, 41, 42, 43, 44, 45, 46, 47]],
+            [
+                [10, 11, 12, 13, 14, 15, 16, 17],
+                [20, 21, 22, 23, 24, 25, 26, 27],
+                [30, 31, 32, 33, 34, 35, 36, 37],
+                [40, 41, 42, 43, 44, 45, 46, 47],
+            ],
             dtype=torch.int64,
         )
         r = proc._copy_kvcache_for_beams(
-            T([0, 1], dtype=torch.int64), T([2, 3], dtype=torch.int64),
-            T([2, 3], dtype=torch.int64), T([4, 6], dtype=torch.int64), CPU,
+            T([0, 1], dtype=torch.int64),
+            T([2, 3], dtype=torch.int64),
+            T([2, 3], dtype=torch.int64),
+            T([4, 6], dtype=torch.int64),
+            CPU,
         )
         self.assertEqual(r.cpu().tolist(), [12, 13, 23, 24, 25])
 
     def test_copy_kvcache_group_with_dedup(self):
         proc = make_proc()
         proc.scheduler.req_to_token_pool.req_to_token = T(
-            [[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25], [30, 31, 32, 33, 34, 35]],
+            [
+                [10, 11, 12, 13, 14, 15],
+                [20, 21, 22, 23, 24, 25],
+                [30, 31, 32, 33, 34, 35],
+            ],
             dtype=torch.int64,
         )
         r = proc._copy_kvcache_group(
             T([0, 0], dtype=torch.int64), T([1, 2], dtype=torch.int64), 2, 4
         )
         self.assertEqual(r.cpu().tolist(), [12, 13])
-        self.assertEqual(proc.scheduler.req_to_token_pool.req_to_token[1, 2:4].tolist(), [12, 13])
-        self.assertEqual(proc.scheduler.req_to_token_pool.req_to_token[2, 2:4].tolist(), [12, 13])
+        self.assertEqual(
+            proc.scheduler.req_to_token_pool.req_to_token[1, 2:4].tolist(), [12, 13]
+        )
+        self.assertEqual(
+            proc.scheduler.req_to_token_pool.req_to_token[2, 2:4].tolist(), [12, 13]
+        )
 
     def test_collect_beam_req_decode_kv_indices(self):
         proc = make_proc()
-        batch = Mock(device=CPU, req_pool_indices=T([0, 1, 2, 3, 4]), seq_lens=T([7, 7, 8, 8, 8]))
-        req1 = Mock(beam_width=2, beam_list=Mock(batch_slot_start_idx=0, prompt_lens=T([5, 5])))
-        req2 = Mock(beam_width=3, beam_list=Mock(batch_slot_start_idx=2, prompt_lens=T([6, 6, 6])))
+        batch = Mock(
+            device=CPU, req_pool_indices=T([0, 1, 2, 3, 4]), seq_lens=T([7, 7, 8, 8, 8])
+        )
+        req1 = Mock(
+            beam_width=2, beam_list=Mock(batch_slot_start_idx=0, prompt_lens=T([5, 5]))
+        )
+        req2 = Mock(
+            beam_width=3,
+            beam_list=Mock(batch_slot_start_idx=2, prompt_lens=T([6, 6, 6])),
+        )
         proc.scheduler.req_to_token_pool.req_to_token = T(
             [
                 [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
