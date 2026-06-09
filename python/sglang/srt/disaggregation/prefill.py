@@ -999,6 +999,32 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
+
+        # When staging is enabled and a non-chunked prefill produces more
+        # pages than one staging chunk covers, split the transfer into
+        # staging-chunk-aligned sub-transfers.  Without this, the single
+        # bulk RDMA writes past the staging chunk boundary and intermediate
+        # chunks are never scattered on the decode side, causing a
+        # permanent staging allocator leak and eventual watermark stall.
+        # Use the same chunked_prefill_size as prefetch_staging_reqs to
+        # ensure staging chunk alignment.  The fallback to 8192 matches
+        # the ``cps = chunked_prefill_size or 8192`` in prefetch_staging_reqs.
+        cps = getattr(self, "chunked_prefill_size", None) or 8192
+        if last_chunk and getattr(self, "enable_staging", False) and cps > 0:
+            staging_chunk_pages = max(1, cps // page_size)
+            if staging_chunk_pages > 0 and len(page_indices) > staging_chunk_pages:
+                offset = 0
+                while offset < len(page_indices):
+                    end = min(offset + staging_chunk_pages, len(page_indices))
+                    sub_indices = page_indices[offset:end]
+                    is_final = end == len(page_indices)
+                    req.disagg_kv_sender.send(
+                        sub_indices,
+                        state_indices if is_final else None,
+                    )
+                    offset = end
+                return
+
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
 
