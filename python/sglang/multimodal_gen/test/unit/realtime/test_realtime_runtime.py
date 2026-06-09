@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
     lingbot_world_realtime_adapter as lingbot_realtime,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
+    sana_wm_realtime_adapter as sana_wm_realtime,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
     GenerateSession,
 )
@@ -35,9 +38,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+    RealtimeDiffusionStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
     RealtimeInputValidationStage,
     RealtimeInputValidationState,
+)
+from sglang.multimodal_gen.runtime.realtime.causal_state import (
+    RealtimeCausalDecodeState,
 )
 from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ControlStateTransition,
@@ -63,6 +72,51 @@ class _State(BaseRealtimeState):
 
     def dispose(self) -> None:
         self.disposed = True
+
+
+def test_realtime_diffusion_stage_declares_long_lived_components():
+    stage = RealtimeDiffusionStage()
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(dit_precision="bf16", vae_precision="fp32")
+    )
+
+    uses = stage.component_uses(server_args, stage_name="realtime")
+
+    assert [use.component_name for use in uses] == ["transformer", "vae"]
+    assert [use.stage_name for use in uses] == ["realtime", "realtime"]
+    assert uses[0].target_dtype == torch.bfloat16
+    assert uses[0].memory_intensive
+    assert uses[0].keep_ready_after_warmup
+    assert uses[1].target_dtype == torch.float32
+    assert not uses[1].memory_intensive
+    assert uses[1].keep_ready_after_warmup
+
+
+def test_realtime_diffusion_stage_requires_session():
+    stage = RealtimeDiffusionStage(default_height=480, default_width=832)
+    req = _Req(session=None)
+
+    try:
+        stage.require_session(req, context="test realtime")
+    except ValueError as exc:
+        assert "test realtime requires a realtime session" in str(exc)
+    else:
+        raise AssertionError("expected missing realtime session to fail")
+
+    session = object()
+    req.session = session
+    assert stage.require_session(req) is session
+
+
+def test_realtime_causal_decode_state_dispose_resets_frontier():
+    state = RealtimeCausalDecodeState()
+    state.conv_cache = {"cache": object()}
+    state.next_dec_idx = 7
+
+    state.dispose()
+
+    assert state.conv_cache is None
+    assert state.next_dec_idx == 0
 
 
 def test_realtime_session_cache_reuses_and_releases_state():
@@ -146,6 +200,53 @@ def test_lingbot_realtime_camera_state_compacts_multiple_pending_updates():
 
     assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
     assert state.latest_sampled_event_id == 9
+
+
+def test_sana_wm_realtime_camera_state_uses_sana_normalizer():
+    state = sana_wm_realtime.SanaWMRealtimeAdapterState()
+    result = state.receive_camera_event_payload(
+        {
+            "mode": "state",
+            "transitions": [
+                {"actions": ["W"], "client_ts_ms": 100},
+                {"actions": [], "client_ts_ms": 120},
+            ],
+        },
+        event_id=11,
+    )
+
+    assert result == "kind=camera_actions, mode=state, transitions=2"
+    assert state.sample_camera_actions(10) == [["w"]] * 8 + [[], []]
+    assert state.latest_sampled_event_id == 11
+
+
+def test_sana_wm_realtime_adapter_preserves_requested_size():
+    async def fake_save_image_to_path(image, target_path):
+        return target_path
+
+    old_save_image_to_path = sana_wm_realtime.save_image_to_path
+    old_get_global_server_args = sana_wm_realtime.get_global_server_args
+    sana_wm_realtime.save_image_to_path = fake_save_image_to_path
+    sana_wm_realtime.get_global_server_args = lambda: SimpleNamespace(
+        input_save_path=None
+    )
+    try:
+        adapter = sana_wm_realtime.SanaWMRealtimeAdapter()
+        session = GenerateSession()
+        session.set_adapter(adapter)
+        request = RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+            first_frame=b"fake-image",
+            size="832x480",
+        )
+
+        asyncio.run(adapter.on_init(session, request))
+
+        assert request.size == "832x480"
+    finally:
+        sana_wm_realtime.save_image_to_path = old_save_image_to_path
+        sana_wm_realtime.get_global_server_args = old_get_global_server_args
 
 
 def test_lingbot_realtime_adapter_ingests_generic_events():
