@@ -630,6 +630,31 @@ class SchedulerBatchResultProcessor:
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
+        # Spec-V1 verify flattens logits_output.hidden_states to
+        # [sum(num_accept_per_req), hidden_dim] (one row per accepted token, incl.
+        # bonus, in batch-row order). To attribute rows back to their request we
+        # need per-req boundaries; the legacy `hidden_states[i]` indexing only
+        # ever pulled one row per step.
+        spec_v1_hs_offsets = None
+        spec_v1_hidden_states_list = None
+        if (
+            is_spec_v1
+            and logits_output.hidden_states is not None
+            and result.num_correct_drafts_per_req_cpu is not None
+        ):
+            spec_v1_hs_offsets = [0]
+            for c in result.num_correct_drafts_per_req_cpu:
+                spec_v1_hs_offsets.append(spec_v1_hs_offsets[-1] + c + 1)
+            if spec_v1_hs_offsets[-1] != logits_output.hidden_states.shape[0]:
+                raise RuntimeError(
+                    f"spec-v1 hidden_states offset total {spec_v1_hs_offsets[-1]} "
+                    f"!= hidden_states.shape[0] {logits_output.hidden_states.shape[0]}"
+                )
+            # One GPU->CPU sync for the whole batch instead of N per-request
+            # `.cpu().tolist()` calls in the loop below. `.tolist()` already
+            # copies into fresh Python objects, so `.clone()` is unnecessary.
+            spec_v1_hidden_states_list = logits_output.hidden_states.tolist()
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -646,9 +671,19 @@ class SchedulerBatchResultProcessor:
                     req, batch, result, i, logits_output
                 )
                 if req.return_hidden_states and logits_output.hidden_states is not None:
-                    req.hidden_states.append(
-                        logits_output.hidden_states[i].cpu().clone().tolist()
-                    )
+                    if spec_v1_hs_offsets is not None:
+                        start, end = spec_v1_hs_offsets[i], spec_v1_hs_offsets[i + 1]
+                        req.hidden_states.extend(
+                            spec_v1_hidden_states_list[start:end]
+                        )
+                    else:
+                        # Legacy single-row path for any spec-v1 worker that
+                        # populates hidden_states without num_correct_drafts_per_req_cpu.
+                        # Currently unreachable for known workers; kept as a safety
+                        # fallback.
+                        req.hidden_states.append(
+                            logits_output.hidden_states[i].cpu().tolist()
+                        )
                 if req.grammar is not None:
                     req.grammar.finished = req.finished()
                 continue
