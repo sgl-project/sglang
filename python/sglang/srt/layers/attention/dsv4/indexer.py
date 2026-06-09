@@ -455,13 +455,22 @@ class C4IndexerBackendMixin:
 
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
+        positions = core_metadata.positions
+        num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
+        if x.shape[0] != num_queries:
+            x = x[:num_queries]
+        if q_lora.shape[0] != num_queries:
+            q_lora = q_lora[:num_queries]
+        if positions.shape[0] != num_queries:
+            positions = positions[:num_queries]
+
         if enable_multi_stream:
             q_indexer, weights, c4_indexer_kv_cache = (
                 self._forward_prepare_multi_stream(
                     x=x,
                     q_lora=q_lora,
                     c4_indexer=c4_indexer,
-                    positions=core_metadata.positions,
+                    positions=positions,
                     forward_batch=forward_batch,
                     token_to_kv_pool=token_to_kv_pool,
                     alt_streams=alt_streams,
@@ -474,7 +483,7 @@ class C4IndexerBackendMixin:
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
-                positions=core_metadata.positions,
+                positions=positions,
                 forward_batch=forward_batch,
                 token_to_kv_pool=token_to_kv_pool,
                 skip_compressor=skip_compressor,
@@ -519,7 +528,22 @@ class C4IndexerBackendMixin:
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
-        _c4sl = indexer_metadata.c4_seq_lens
+        query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
+
+        def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
+            if tensor.shape[0] == query_rows:
+                return tensor
+            if tensor.shape[0] > query_rows:
+                return tensor[:query_rows]
+            pad = (0, 0) * (tensor.dim() - 1) + (0, query_rows - tensor.shape[0])
+            return F.pad(tensor, pad, value=value)
+
+        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
+        _c4sl = c4_seq_lens
+        page_table = match_num_queries(indexer_metadata.page_table, value=0)
+        c4_sparse_page_indices = match_num_queries(
+            core_metadata.c4_sparse_page_indices, value=-1
+        )
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
@@ -531,7 +555,7 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache,
             weights,
             _c4sl,
-            indexer_metadata.page_table,
+            page_table,
             indexer_metadata.deep_gemm_metadata,
             indexer_metadata.max_c4_seq_len,
             False,
@@ -551,10 +575,10 @@ class C4IndexerBackendMixin:
 
         raw_indices = None
         if capture_enabled:
-            raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : core_metadata.c4_sparse_page_indices.size(0)
+                : c4_sparse_page_indices.size(0)
             ]
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
@@ -562,27 +586,27 @@ class C4IndexerBackendMixin:
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(
                 logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
             topk_transform_512_v2(
                 logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
             )
         else:
             topk_transform_512(
                 logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )

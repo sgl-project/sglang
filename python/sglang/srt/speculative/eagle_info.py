@@ -57,11 +57,11 @@ logger = logging.getLogger(__name__)
 
 
 def _draft_runner_of(worker):
-    """Draft model_runner accessor that handles v1 / v2 worker naming.
+    """Draft model_runner accessor across worker shapes.
 
-    v1 (`EAGLEWorker` and subclasses) exposes the draft model_runner as
-    `model_runner` (the worker itself runs the draft model);
-    v2 (`EagleDraftWorker` and subclasses) exposes it as `draft_runner`.
+    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
+    model_runner as `draft_runner`; fall back to `model_runner` for workers
+    that run the draft model directly.
     """
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
