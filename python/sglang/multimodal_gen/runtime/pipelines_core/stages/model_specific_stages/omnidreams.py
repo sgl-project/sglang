@@ -33,6 +33,9 @@ import torch
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
     RotaryPositionEmbedding3D,
 )
@@ -98,6 +101,26 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         self.tokenizer = tokenizer
         self.vae = vae
         self.config = config
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        """Declare the text encoder + VAE so the residency manager can stage
+        them on the GPU only around their use-sites (and offload them again
+        afterwards) when ``--text-encoder-cpu-offload`` / ``--vae-cpu-offload``
+        are set. The DiT is only used here via the weightless ``patchify``
+        rearrange, so it is not declared (its weights stay wherever loaded).
+        """
+        stage_name = self._component_stage_name(stage_name)
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        return [
+            ComponentUse(stage_name=stage_name, component_name="text_encoder"),
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="vae",
+                target_dtype=vae_dtype,
+            ),
+        ]
 
     # ----- helpers ---------------------------------------------------------- #
     @torch.no_grad()
@@ -331,16 +354,20 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
 
         # --- text conditioning (100352) ---
         prompt = batch.prompt if isinstance(batch.prompt, str) else str(batch.prompt)
-        text_embeds = self._encode_text(prompt, device).to(dit_dtype)
+        with self.use_declared_component(
+            component_name="text_encoder", module=self.text_encoder
+        ):
+            text_embeds = self._encode_text(prompt, device).to(dit_dtype)
         batch.prompt_embeds = [text_embeds]
         batch.negative_prompt_embeds = None
         batch.image_embeds = []
         batch.do_classifier_free_guidance = False
 
         # --- i2v reference latent -> patchified frame-0 token block ---
-        image_latent = self._encode_reference_image(
-            batch, device, vae_dtype, height, width
-        )
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            image_latent = self._encode_reference_image(
+                batch, device, vae_dtype, height, width
+            )
         if image_latent is not None:
             image_latent = image_latent.to(dit_dtype)
             # [B,16,1,h,w] -> [B, hp*wp, 16*pdim] via the DiT patchify.
@@ -364,9 +391,10 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # --- AR rollout state for the denoising stage ---
         num_chunks = self._compute_num_chunks(batch, len_t)
         # Per-chunk HD-map tokens (None -> AR stage uses zeros / HDMap disabled).
-        hdmap_tokens = self._encode_hdmap(
-            batch, device, vae_dtype, dit_dtype, num_chunks, height, width
-        )
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            hdmap_tokens = self._encode_hdmap(
+                batch, device, vae_dtype, dit_dtype, num_chunks, height, width
+            )
         batch.extra["omnidreams"] = {
             "hp": hp,
             "wp": wp,
@@ -444,6 +472,27 @@ class OmniDreamsDenoisingStage(DenoisingStage):
     def __init__(self, transformer, scheduler, vae=None) -> None:
         super().__init__(transformer, scheduler, vae=vae)
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        """Declare only the DiT for residency scheduling. The base
+        ``DenoisingStage`` would also declare the VAE (this stage receives one
+        to assert ``use_feature_cache``), but the AR rollout never runs the VAE
+        here, so declaring it would needlessly hold it on the GPU through the
+        denoise loop. The VAE encode/decode use-sites live in the before- and
+        decoding-stages instead.
+        """
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="transformer",
+                phase="transformer",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
+        ]
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # Phase 6 guard: TP is supported via column/row parallel layers in the
@@ -473,6 +522,19 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 "OmniDreams AR rollout requires a Wan VAE with "
                 "use_feature_cache=True for correct streaming frame counts."
             )
+
+        # Bring the DiT onto the GPU for the whole AR rollout when it is being
+        # CPU-offloaded (no-op when it is already resident). The manager keeps a
+        # single DiT resident afterwards; on the error path the request-level
+        # finish_request still releases it, so an explicit try/finally is not
+        # needed here.
+        residency_manager = self._component_residency_manager
+        transformer_use = None
+        if residency_manager is not None:
+            transformer_use = self._declared_component_use(
+                component_name="transformer"
+            )
+            residency_manager.begin_use(transformer_use, self.transformer)
 
         config = server_args.pipeline_config
         device = get_local_torch_device()
@@ -658,6 +720,9 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # Phase 6: SP post-process — latents may need gathering when SP is
         # eventually supported. Currently a no-op (SP is guarded at entry).
         batch.latents = self._postprocess_sp_latents(batch, server_args)
+
+        if residency_manager is not None and transformer_use is not None:
+            residency_manager.end_use(transformer_use, self.transformer)
 
         return batch
 

@@ -282,20 +282,40 @@ class OmniDreamsPipeline(ComposedPipelineBase):
         dit_dtype = PRECISION_TO_TYPE[pipeline_config.dit_precision]
         vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
 
+        # Honor the CPU-offload flags at load time: each flagged component is
+        # staged on CPU so the three heavy weights (the 2B DiT, the 7B text
+        # encoder, and the Wan VAE) never need to co-reside on the GPU while
+        # loading. The ComponentResidencyManager then brings each one to the GPU
+        # only around its use-site (declared in the stages' ``component_uses``)
+        # and releases it afterwards. Without this the custom loaders push all
+        # three straight to the GPU, so a small-VRAM card OOMs while loading the
+        # text encoder even though --text-encoder-cpu-offload was requested.
+        cpu_device = torch.device("cpu")
+
+        def _load_device(offload_flag: object) -> torch.device:
+            offload = bool(offload_flag) and not server_args.use_fsdp_inference
+            return cpu_device if offload else device
+
+        dit_device = _load_device(server_args.dit_cpu_offload)
+        vae_device = _load_device(server_args.vae_cpu_offload)
+        text_encoder_device = _load_device(server_args.text_encoder_cpu_offload)
+
         model_path = server_args.model_path
         ckpt_path = self._resolve_ckpt_path(model_path)
         logger.info("OmniDreams: loading flat DiT from %s", ckpt_path)
         transformer = self._load_flat_dit(
-            pipeline_config.dit_config, ckpt_path, device, dit_dtype
+            pipeline_config.dit_config, ckpt_path, dit_device, dit_dtype
         )
 
         vae_path = self._resolve_vae_path(model_path)
         logger.info("OmniDreams: loading Wan 2.1 VAE from %s", vae_path)
         vae = self._load_wan_vae(
-            pipeline_config.vae_config, vae_path, device, vae_dtype
+            pipeline_config.vae_config, vae_path, vae_device, vae_dtype
         )
 
-        text_encoder, tokenizer = self._load_text_encoder(model_path, device)
+        text_encoder, tokenizer = self._load_text_encoder(
+            model_path, text_encoder_device
+        )
 
         scheduler = OmniDreamsFlowMatchScheduler(
             num_inference_steps=len(pipeline_config.denoising_timesteps),
