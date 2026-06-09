@@ -10,6 +10,7 @@ per-request from ``batch.data_type`` and the presence of
 """
 
 import copy
+import json
 from typing import Any
 
 import numpy as np
@@ -131,6 +132,10 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                 getattr(batch.sampling_params, "condition_video_keep", "first")
                 or "first"
             )
+            if keep not in ("first", "last"):
+                raise ValueError(
+                    f"condition_video_keep must be 'first' or 'last', got {keep!r}"
+                )
             cond_indexes = self._resolve_condition_indexes(batch)
             # Encode the full output-length video so that the latent positions
             # we lock match what the decoder will reconstruct at those frame
@@ -553,8 +558,6 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                     "(list[list[float]] of shape [T, D])."
                 )
             if isinstance(raw, str):
-                import json
-
                 raw = json.loads(raw)
             action = torch.as_tensor(np.asarray(raw), dtype=torch.float32)
             if action.ndim == 3 and action.shape[0] == 1:
@@ -1367,12 +1370,16 @@ class Cosmos3DecodingStage(PipelineStage):
         audio = None
         audio_sample_rate = None
         if self.sound_tokenizer is not None and batch.audio_latents is not None:
+            if server_args.vae_cpu_offload:
+                self.sound_tokenizer.to(device)
             with torch.no_grad():
                 decoded_audio = self.sound_tokenizer.decode(
                     batch.audio_latents.to(device)
                 )
             audio = decoded_audio.float().cpu()
             audio_sample_rate = self.sound_tokenizer.sample_rate
+            if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
+                self.sound_tokenizer.to("cpu", non_blocking=True)
             self.log_info(
                 f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
             )

@@ -963,9 +963,10 @@ class SamplingParams:
             "--action",
             type=str,
             help=(
-                "SANA-WM WASD/IJKL action DSL, e.g. "
-                "'w-80,jw-40,w-40,lw-60,w-100'. Model-specific fields are "
-                "ignored by other pipelines."
+                "Action input. SANA-WM uses a WASD/IJKL DSL, e.g. "
+                "'w-80,jw-40,w-40,lw-60,w-100'. Cosmos3 uses a JSON array of "
+                "shape [T, D], e.g. '[[0.1, 0.2, ...], ...]'. Model-specific "
+                "fields are ignored by other pipelines."
             ),
         )
         add_argument(

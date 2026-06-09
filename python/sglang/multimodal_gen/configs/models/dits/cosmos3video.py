@@ -181,7 +181,7 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     reverse_param_names_mapping: dict = field(default_factory=dict)
     lora_param_names_mapping: dict = field(default_factory=dict)
     # FP8 checkpoint quantization_config.ignore uses checkpoint module names;
-    # translate them to model names so _is_layer_ignored matches correctly.
+    # translate them to model names so is_layer_excluded matches correctly.
     quant_ignore_remap: dict = field(
         default_factory=lambda: {"vae2llm": "proj_in", "llm2vae": "proj_out"}
     )

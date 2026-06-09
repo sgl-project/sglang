@@ -196,11 +196,12 @@ def get_quant_config(
             hf_quant_config.get("quant_method") == "modelopt"
             and "FP8" in str(hf_quant_config.get("quant_algo", "")).upper()
         )
-        if quant_ignore_remap and is_modelopt_fp8:
-            return quant_cls.from_config(
-                hf_quant_config, ignore_remap=quant_ignore_remap
-            )
-        return quant_cls.from_config(hf_quant_config)
+        extra_kwargs = (
+            {"ignore_remap": quant_ignore_remap}
+            if quant_ignore_remap and is_modelopt_fp8
+            else {}
+        )
+        return quant_cls.from_config(hf_quant_config, **extra_kwargs)
 
     model_name_or_path = model_config["model_path"]
     hf_folder = model_name_or_path
