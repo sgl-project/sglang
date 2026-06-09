@@ -1268,9 +1268,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         attn_tp_context = get_attn_tp_context()
         input_scattered = attn_tp_context.use_input_scattered(self)
-        if not input_scattered:
+
+        if not input_scattered and not envs.SGLANG_ENABLE_SP.get():
             return
-        assert self.forward_mode.is_extend()
+
+        if envs.SGLANG_ENABLE_SP.get() and not self.forward_mode.is_extend():
+            return
+
+        if input_scattered:
+            assert self.forward_mode.is_extend()
+
         tokens = self.input_ids.shape[0]
         rank_size = get_tensor_model_parallel_world_size()
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size

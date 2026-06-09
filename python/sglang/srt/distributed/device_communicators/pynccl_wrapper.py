@@ -249,6 +249,22 @@ class NCCLLibrary:
                 cudaStream_t,
             ],
         ),
+        # ncclResult_t  ncclAllToAll(
+        #   const void* sendbuff, void* recvbuff, size_t count,
+        #   ncclDataType_t datatype, ncclComm_t comm,
+        #   cudaStream_t stream);
+        Function(
+            "ncclAllToAll",
+            ncclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                ncclDataType_t,
+                ncclComm_t,
+                cudaStream_t,
+            ],
+        ),
         # ncclResult_t  ncclSend(
         #   const void* sendbuff, size_t count, ncclDataType_t datatype,
         #   int dest, ncclComm_t comm, cudaStream_t stream);
@@ -486,6 +502,21 @@ class NCCLLibrary:
         # by ctypes automatically
         self.NCCL_CHECK(
             self._funcs["ncclAllGather"](
+                sendbuff, recvbuff, count, datatype, comm, stream
+            )
+        )
+
+    def ncclAllToAll(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        comm: ncclComm_t,
+        stream: cudaStream_t,
+    ) -> None:
+        self.NCCL_CHECK(
+            self._funcs["ncclAllToAll"](
                 sendbuff, recvbuff, count, datatype, comm, stream
             )
         )

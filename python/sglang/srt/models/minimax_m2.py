@@ -35,9 +35,12 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import (
@@ -284,27 +287,39 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
     def __init__(self, hidden_size: int, num_heads: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
-
-        # Align with QKVParallelLinear pattern
-        if self.attn_tp_size >= num_heads:
-            assert (
-                self.attn_tp_size % num_heads == 0
-            ), f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+        enable_sp = envs.SGLANG_ENABLE_SP.get()
+        if enable_sp:
+            self.weight = nn.Parameter(torch.ones(hidden_size))  # full weight
+            # Set attn_tp_size to 1 to skip all-reduce in forward
+            self.attn_tp_size = 1
+            self.attn_tp_rank = 0
+            # Set dummy values for the other variables (not used in forward when enable_sp)
             self.num_heads = 1
-            self.num_head_replicas = self.attn_tp_size // num_heads
-        else:
-            assert (
-                num_heads % self.attn_tp_size == 0
-            ), f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
-            self.num_heads = num_heads // self.attn_tp_size
             self.num_head_replicas = 1
+            self.head_dim = hidden_size
+        else:
+            self.attn_tp_size = get_attention_tp_size()
+            self.attn_tp_rank = get_attention_tp_rank()
 
-        self.head_dim = hidden_size // num_heads
+            # Align with QKVParallelLinear pattern
+            if self.attn_tp_size >= num_heads:
+                assert (
+                    self.attn_tp_size % num_heads == 0
+                ), f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+                self.num_heads = 1
+                self.num_head_replicas = self.attn_tp_size // num_heads
+            else:
+                assert (
+                    num_heads % self.attn_tp_size == 0
+                ), f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
+                self.num_heads = num_heads // self.attn_tp_size
+                self.num_head_replicas = 1
 
-        # Weight parameter is sharded across TP ranks
-        self.weight = nn.Parameter(torch.ones(self.num_heads * self.head_dim))
+            self.head_dim = hidden_size // num_heads
+
+            # Weight parameter is sharded across TP ranks
+            self.weight = nn.Parameter(torch.ones(self.num_heads * self.head_dim))
+
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
@@ -314,6 +329,11 @@ class MiniMaxM2RMSNormTP(nn.Module):
         loaded_weight: torch.Tensor,
     ) -> None:
         """Custom weight loader that handles TP sharding."""
+        # When enable_sp is enabled, weight is not sharded (full weight)
+        if param.shape[0] == loaded_weight.shape[0]:
+            param.data.copy_(loaded_weight)
+            return
+
         shard_id = self.attn_tp_rank // self.num_head_replicas
         shard_size = param.data.shape[0]
 
@@ -363,6 +383,25 @@ class MiniMaxM2RMSNormTP(nn.Module):
         x = (x * self.weight).to(orig_dtype)
 
         return x
+
+    @staticmethod
+    def forward_qk_sp(
+        q_gathered: torch.Tensor,
+        k_gathered: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        variance_epsilon: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = q_gathered.dtype
+        q_f = q_gathered.float()
+        k_f = k_gathered.float()
+        q_var = q_f.pow(2).mean(dim=-1, keepdim=True)
+        k_var = k_f.pow(2).mean(dim=-1, keepdim=True)
+        q_inv_rms = torch.rsqrt(q_var + variance_epsilon)
+        k_inv_rms = torch.rsqrt(k_var + variance_epsilon)
+        q_out = (q_f * q_inv_rms * q_weight).to(orig_dtype)
+        k_out = (k_f * k_inv_rms * k_weight).to(orig_dtype)
+        return q_out, k_out
 
 
 @register_custom_op(mutates_args=["q", "k"])
@@ -560,11 +599,14 @@ class MiniMaxM2MoE(nn.Module):
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
-            return self.forward_normal(
+            if not envs.SGLANG_ENABLE_SP.get():
+                return self.forward_normal(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
+            return self.forward_normal_sp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
-        else:
-            return self.forward_deepep(hidden_states, forward_batch)
+        return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal(
         self,
@@ -591,6 +633,28 @@ class MiniMaxM2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def forward_normal_sp(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        tp_group = get_tp_group()
+        tp_world = tp_group.world_size
+
+        # All-gather to restore full sequence (token-split → full sequence)
+        gathered = tp_group.all_gather(hidden_states, dim=0)
+
+        # Run standard MoE on full sequence
+        output = self.forward_normal(
+            gathered, should_allreduce_fusion, use_reduce_scatter
+        )
+
+        # Slice local token shard
+        tp_rank = get_tensor_model_parallel_rank()
+        shard = output.chunk(tp_world, dim=0)[tp_rank]
+        return shard.contiguous()
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -754,6 +818,8 @@ class MiniMaxM2Attention(nn.Module):
         )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.q_size_full = self.total_num_heads * self.head_dim
+        self.kv_size_full = self.total_num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
         # RoPE settings - support partial RoPE
@@ -768,28 +834,47 @@ class MiniMaxM2Attention(nn.Module):
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
 
-        self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
+        enable_sp = envs.SGLANG_ENABLE_SP.get()
+        if enable_sp:
+            self.qkv_proj = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("qkv_proj", prefix),
+                tp_rank=0,
+                tp_size=1,
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
 
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=False,
-            reduce_results=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("o_proj", prefix),
-        )
+        if enable_sp:
+            self.o_proj = ReplicatedLinear(
+                self.total_num_heads * self.head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+        else:
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                self.hidden_size,
+                bias=False,
+                reduce_results=False,
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
 
         # Setup RoPE with partial rotary dimension
         self.rotary_emb = get_rope(
@@ -885,6 +970,62 @@ class MiniMaxM2Attention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def forward_prepare_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        tp_group = get_tp_group()
+        tp_world = tp_group.world_size
+
+        # hidden_states is already split by n_tokens at Model level (SP)
+        tokens_per_rank = hidden_states.shape[0]
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split(
+            [self.q_size_full, self.kv_size_full, self.kv_size_full], dim=-1
+        )
+
+        if self.use_qk_norm:
+            q, k = q.contiguous(), k.contiguous()
+            q, k = MiniMaxM2RMSNormTP.forward_qk_sp(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+            )
+        else:
+            q, k = q.contiguous(), k.contiguous()
+
+        q, k = self.rotary_emb(positions, q, k)
+
+        q_rev = q.view(tokens_per_rank, tp_world, self.q_size)
+        k_rev = k.view(tokens_per_rank, tp_world, self.kv_size)
+        v_rev = v.view(tokens_per_rank, tp_world, self.kv_size)
+
+        qkv_rev = torch.cat([q_rev, k_rev, v_rev], dim=-1)
+
+        qkv_rev = qkv_rev.permute(1, 0, 2).contiguous()
+
+        qkv_restored = torch.empty(
+            tp_world,
+            tokens_per_rank,
+            self.q_size + 2 * self.kv_size,
+            device=v.device,
+            dtype=v.dtype,
+        )
+
+        tp_group.all_to_all_single(qkv_restored, qkv_rev)
+        qkv_restored = qkv_restored.view(
+            tokens_per_rank * tp_world, self.q_size + 2 * self.kv_size
+        )
+        q, k, v = qkv_restored.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
@@ -893,32 +1034,73 @@ class MiniMaxM2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def forward_core_sp(self, intermediate_state):
+        _, _, inner_state = intermediate_state
+        attn_output = self.attn(*inner_state)
+
+        tp_group = get_tp_group()
+        tp_world = tp_group.world_size
+        tokens_per_rank = attn_output.shape[0] // tp_world
+
+        attn_output_view = attn_output.view(tp_world, tokens_per_rank, self.q_size)
+        attn_output_restored = torch.empty(
+            tp_world,
+            tokens_per_rank,
+            self.q_size,
+            device=attn_output_view.device,
+            dtype=attn_output_view.dtype,
+        )
+        tp_group.all_to_all_single(attn_output_restored, attn_output_view)
+        attn_output_restored = (
+            attn_output_restored.permute(1, 0, 2)
+            .contiguous()
+            .view(tokens_per_rank, tp_world * self.q_size)
+        )
+
+        output, _ = self.o_proj(attn_output_restored)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not _is_npu:
-            s = self.forward_prepare(
+        if envs.SGLANG_ENABLE_SP.get():
+            s = self.forward_prepare_sp(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            return self.forward_core_sp(s)
         else:
-            s = self.forward_prepare_npu(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-        return self.forward_core(s)
+            if not _is_npu:
+                s = self.forward_prepare(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+            else:
+                s = self.forward_prepare_npu(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+            return self.forward_core(s)
 
     def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
+        if envs.SGLANG_ENABLE_SP.get():
+            state.attn_intermediate_state = self.forward_prepare_sp(
+                positions=state.positions,
+                hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+                forward_batch=state.forward_batch,
+            )
+        else:
+            state.attn_intermediate_state = self.forward_prepare(
+                positions=state.positions,
+                hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+                forward_batch=state.forward_batch,
+            )
 
     def op_core(self, state):
         state.hidden_states_after_attn = self.forward_core(
@@ -939,6 +1121,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self.num_layers = config.num_hidden_layers
 
         # TBO support: All MiniMax layers are sparse (MoE)
         self.is_layer_sparse = True
@@ -990,6 +1173,14 @@ class MiniMaxM2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
+        if envs.SGLANG_ENABLE_SP.get():
+            return self.forward_sp(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+            )
+
         # Self Attention
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -1032,6 +1223,47 @@ class MiniMaxM2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        return hidden_states, residual
+
+    def forward_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # enable_sp path: attention handles its own RMSNorm + communication
+        # via forward_prepare_opt / forward_core_opt
+
+        # Note: forward_prepare_opt does NOT apply input_layernorm to hidden_states.
+        # It only handles QK RMSNorm after qkv_proj. So input_layernorm is needed here.
+
+        # Layer norm + residual pattern (same for all layers)
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            # Residual pattern: fused_add_rmsnorm computes x = rms_norm(x + residual)
+            # and updates residual in-place to x + residual (pre-normalization value)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, None
+            )
+
+        # Self Attention (uses forward_prepare_opt + forward_core_opt internally when enable_sp)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+        # Fully Connected (MLP or MoE)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
 
         return hidden_states, residual
 
@@ -1156,6 +1388,17 @@ class MiniMaxM2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # SP: split hidden_states by n_tokens dimension
+        if envs.SGLANG_ENABLE_SP.get():
+            tp_group = get_tp_group()
+            tp_world = tp_group.world_size
+            tp_rank = tp_group.rank_in_group
+            num_tokens = hidden_states.shape[0]
+            tokens_per_rank = num_tokens // tp_world
+            q_start = tp_rank * tokens_per_rank
+            hidden_states = hidden_states[q_start : q_start + tokens_per_rank]
+            positions = positions[q_start : q_start + tokens_per_rank]
+
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -1197,6 +1440,20 @@ class MiniMaxM2Model(nn.Module):
             else:
                 hidden_states = self.norm(hidden_states)
 
+        if envs.SGLANG_ENABLE_SP.get():
+            # all_gather to restore full hidden_states after SP split
+            tp_group = get_tp_group()
+            tp_world = tp_group.world_size
+            num_tokens_local = hidden_states.shape[0]
+            hidden_states_gathered = torch.empty(
+                num_tokens_local * tp_world,
+                hidden_states.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            tp_group.all_gather_into_tensor(hidden_states_gathered, hidden_states)
+            hidden_states = hidden_states_gathered
+
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -1204,6 +1461,8 @@ class MiniMaxM2Model(nn.Module):
 
 class MiniMaxM2ForCausalLM(nn.Module):
     """MiniMax M2 model for causal language modeling."""
+
+    _supports_attention_backend = True
 
     packed_modules_mapping = {
         "qkv_proj": [

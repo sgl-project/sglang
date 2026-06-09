@@ -480,6 +480,9 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    # Enable sequence parallelism (all-to-all attention + SP MoE)
+    # on Ascend NPU. Set SGLANG_ENABLE_SP=1 to enable.
+    SGLANG_ENABLE_SP = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

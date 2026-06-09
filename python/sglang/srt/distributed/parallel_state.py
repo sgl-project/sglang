@@ -377,7 +377,7 @@ class GroupCoordinator:
             )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if use_pynccl and self.world_size > 1:
+        if use_pynccl and self.world_size > 1 and is_cuda_alike():
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -785,6 +785,37 @@ class GroupCoordinator:
                 output, input, group=self.device_group
             )
         return output
+
+    def _all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+    ) -> torch.Tensor:
+        # NPU
+        if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            return self.npu_communicator.all_to_all_single(output, input)
+        # XPU
+        if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
+            return self.xpu_communicator.all_to_all_single(output, input)
+        # HPU
+        if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
+            return self.hpu_communicator.all_to_all_single(output, input)
+        # PyNccl
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
+                pynccl_comm.all_to_all_single(output, input)
+            return output
+        # Fallback
+        torch.distributed.all_to_all_single(
+            output, input, group=self.device_group
+        )
+        return output
+
+    def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+        return self._all_to_all_single(output, input)
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
