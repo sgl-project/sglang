@@ -9,7 +9,6 @@ from typing import Any, Callable, List
 
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
-    SGLDiffusionProfiler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
@@ -29,11 +28,19 @@ class SyncExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute all pipeline stages sequentially and step the profiler."""
-        for stage in stages:
-            payload = run_stage(stage, payload)
-            profiler = SGLDiffusionProfiler.get_instance()
-            if profiler:
-                profiler.step_stage()
+
+        use_nvtx = self._should_use_stage_nvtx(payload, server_args)
+        with self._component_residency_request(stages, payload, server_args):
+            for stage_index, stage in enumerate(stages):
+                payload = self._run_stage_with_executor_hooks(
+                    stage,
+                    stage_index,
+                    payload,
+                    server_args,
+                    run_stage,
+                    use_nvtx,
+                )
+                self._step_stage_profiler()
         return payload
 
     def run_profile_all_stages(

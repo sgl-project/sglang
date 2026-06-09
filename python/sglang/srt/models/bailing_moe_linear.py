@@ -57,6 +57,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
@@ -100,7 +101,7 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sglang.srt.layers.quantization.awq_triton import (
+    from sglang.srt.layers.quantization.awq.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 else:
@@ -243,9 +244,11 @@ class BailingMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
         prefix: str = "moe",
+        alt_stream=None,
     ):
         super().__init__()
 
+        self.alt_stream = alt_stream
         self.layer_id = layer_id
 
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -338,15 +341,35 @@ class BailingMoE(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self.num_shared_experts > 0:
-            shared_output = self.shared_experts(hidden_states)
 
-        router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if (
+            self.alt_stream is not None
+            and self.num_shared_experts > 0
+            and hidden_states.shape[0] > 0
+            and get_is_capture_mode()
+        ):
+            with torch.no_grad():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                # Main stream: shared experts (smaller computation)
+                shared_output = self.shared_experts(hidden_states)
+                # Alt stream: gate + topk + routed experts
+                with torch.cuda.stream(self.alt_stream):
+                    router_logits = self.gate(hidden_states)
+                    topk_output = self.topk(hidden_states, router_logits)
+                    final_hidden_states = self.experts(hidden_states, topk_output)
+                current_stream.wait_stream(self.alt_stream)
+                final_hidden_states = final_hidden_states + shared_output
+        else:
+            if self.num_shared_experts > 0:
+                shared_output = self.shared_experts(hidden_states)
 
-        if self.num_shared_experts > 0:
-            final_hidden_states = final_hidden_states + shared_output
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+
+            if self.num_shared_experts > 0:
+                final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -398,9 +421,11 @@ class BailingMoELinearAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
         prefix: str = "linear_attn",
+        alt_stream=None,
     ):
         super().__init__()
 
+        self.alt_stream = alt_stream
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
@@ -530,8 +555,6 @@ class BailingMoELinearAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
-        # logger.warning(f"===={self.layer_id=}, 1-1 {qkv.shape=}")
-        # use rotary_emb support fp32
         qkv = qkv.to(torch.float32)
         if self.linear_silu:
             qkv = F.silu(qkv)
@@ -544,20 +567,40 @@ class BailingMoELinearAttention(nn.Module):
         if self.use_qk_norm:
             q = q.reshape(-1, self.tp_heads, self.head_dim)
             k = k.reshape(-1, self.tp_kv_heads, self.head_dim)
-            q = layernorm_fn(
-                q,
-                self.query_layernorm.weight.data,
-                bias=None,
-                eps=self.rms_norm_eps,
-                is_rms_norm=True,
-            )
-            k = layernorm_fn(
-                k,
-                self.key_layernorm.weight.data,
-                bias=None,
-                eps=self.rms_norm_eps,
-                is_rms_norm=True,
-            )
+            if self.alt_stream is not None and get_is_capture_mode():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                q = layernorm_fn(
+                    q,
+                    self.query_layernorm.weight.data,
+                    bias=None,
+                    eps=self.rms_norm_eps,
+                    is_rms_norm=True,
+                )
+                with torch.cuda.stream(self.alt_stream):
+                    k = layernorm_fn(
+                        k,
+                        self.key_layernorm.weight.data,
+                        bias=None,
+                        eps=self.rms_norm_eps,
+                        is_rms_norm=True,
+                    )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                q = layernorm_fn(
+                    q,
+                    self.query_layernorm.weight.data,
+                    bias=None,
+                    eps=self.rms_norm_eps,
+                    is_rms_norm=True,
+                )
+                k = layernorm_fn(
+                    k,
+                    self.key_layernorm.weight.data,
+                    bias=None,
+                    eps=self.rms_norm_eps,
+                    is_rms_norm=True,
+                )
             q = q.reshape(-1, self.q_size_per_rank)
             k = k.reshape(-1, self.kv_size_per_rank)
 
@@ -571,23 +614,18 @@ class BailingMoELinearAttention(nn.Module):
 
         if self.linear_scale:
             q = q * self.scaling
-        # q = q.to(torch.float32)
-        # k = k.to(torch.float32)
-        # v = v.to(torch.float32)
         hidden = self.attn(q, k, v, forward_batch).to(hidden_states.dtype)
         gate, _ = self.g_proj(hidden_states)
-        # logger.warning(
-        #     f"===={self.layer_id=}, 1-3 {gate.shape=}, {hidden.shape=}, {gate.dtype=}, {hidden_states.dtype=}, {hidden.dtype=}"
-        # )
+
         if self.group_norm_size > 1:
             hidden = self.g_norm(hidden, gate)
         else:
             hidden = self.g_norm(hidden)
             hidden = F.sigmoid(gate) * hidden
-        # logger.warning(f"===={self.layer_id=}, 1-4 {hidden.shape=}")
+
         hidden = hidden.data.to(hidden_states.dtype)
         hidden, _ = self.dense(hidden)
-        # logger.warning(f"===={self.layer_id=}, 1-5 {hidden.shape=}")
+
         return hidden
 
 
@@ -709,12 +747,11 @@ class BailingMoELinearDecoderLayer(nn.Module):
         layer_id: int = 0,
         prefix: str = "layer",
         is_nextn: bool = False,
+        alt_stream=None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.use_mla = getattr(config, "full_attention_type", "mla") == "mla"
-        alt_stream = None  # tptest
-        # todo nextn
 
         if config.attention_type == 0:  # Linear layer
             self.attention = BailingMoELinearAttention(
@@ -722,6 +759,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=self.layer_id,
                 prefix=prefix + ".attention",
+                alt_stream=alt_stream,
             )
         elif config.attention_type == 1:  # softmax layer
             if self.use_mla:
@@ -776,6 +814,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     layer_id=self.layer_id,
                     prefix=add_prefix("mlp", prefix),
+                    alt_stream=alt_stream,
                 )
             else:
                 # dense layer
@@ -921,6 +960,8 @@ class BailingMoELinearModel(nn.Module):
         else:
             self.word_embeddings = PPMissingLayer()
 
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+
         def layer_fn(idx, prefix):
             layer_idx = idx
             layer_config = copy.deepcopy(config)
@@ -928,7 +969,10 @@ class BailingMoELinearModel(nn.Module):
 
             decoder_kwargs = {"quant_config": quant_config, "layer_id": layer_idx}
             return BailingMoELinearDecoderLayer(
-                layer_config, **decoder_kwargs, prefix=prefix
+                layer_config,
+                **decoder_kwargs,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
             )
 
         self.layers, self.start_layer, self.end_layer = make_layers(

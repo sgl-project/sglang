@@ -24,7 +24,9 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     auto_config_device,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 # Model weights storage directory
@@ -55,6 +57,9 @@ DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH = os.path.join(
 )
 DEEPSEEK_CODER_1_3_B_BASE_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-coder-1.3b-base"
+)
+ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-32B-w4a4-LAOS"
 )
 ERNIE_4_5_21B_A3B_PT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "baidu/ERNIE-4.5-21B-A3B-PT"
@@ -89,6 +94,9 @@ LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 LLAMA_3_2_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-1B")
 LLAMA_4_SCOUT_17B_16E_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+)
+LLaDA2_0_MINI_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "inclusionAI/LLaDA2.0-mini"
 )
 META_LLAMA_3_1_8B_INSTRUCT = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Meta-Llama-3.1-8B-Instruct"
@@ -149,11 +157,15 @@ QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"
 )
 QWQ_32B_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "vllm-ascend/QWQ-32B-W8A8")
+REDHATAI_QWEN2_5_0_5B_INSTRUCT_QUANTIZED_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
+)
 SMOLLM_1_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "HuggingFaceTB/SmolLM-1.7B")
 STABLELM_2_1_6B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "stabilityai/stablelm-2-1_6b"
 )
 XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-MoE-A36B")
+TRINITY_MINI_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/Trinity-Mini")
 MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-BF16")
 
 # VLM model weights path
@@ -162,7 +174,7 @@ GLM_4_5V_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.5V")
 JANUS_PRO_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-1B")
 JANUS_PRO_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-7B")
 KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Kimi/Kimi-VL-A3B-Instruct"
+    MODEL_WEIGHTS_DIR, "moonshotai/Kimi-VL-A3B-Instruct"
 )
 LLAMA_3_2_11B_VISION_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-11B-Vision-Instruct"
@@ -430,6 +442,7 @@ def get_benchmark_args(
         gsp_num_turns=gsp_num_turns,
         header=header,
         max_concurrency=max_concurrency,
+        ready_check_timeout_sec=0,
     )
 
 
@@ -555,3 +568,45 @@ def run_bench_serving(
 
     assert res["completed"] == num_prompts
     return res
+
+
+HEADER = """
+| Model | Server | Client | Output Throughput | Expected Output Throughput | Latency | Expected Latency | Accuracy | Expected Accuracy | Status |
+| ----- | ------ | ------ | -------- | ------------------ | ------- | ---------------- | -------- | --------- | ------ |
+"""
+
+
+def write_results_to_github_step_summary(results: dict):
+    if not is_in_ci():
+        return
+
+    write_github_step_summary_once(HEADER)
+
+    get_float = lambda metrics, item, precision: (
+        f"{metrics[item]:.{precision}f}"
+        if isinstance(metrics.get(item, "-"), (int, float))
+        else metrics.get(item, "-")
+    )
+
+    summary = ""
+    for model, metrics in results.items():
+        model = model.replace(MODEL_WEIGHTS_DIR, "").replace(HF_MODEL_WEIGHTS_DIR, "")
+        output_throughput = get_float(metrics, "output_throughput", 2)
+        output_throughput_threshold = metrics.get("output_throughput_threshold", "N/A")
+        accuracy = get_float(metrics, "accuracy", 4)
+        accuracy_threshold = metrics.get("accuracy_threshold", "N/A")
+        latency = get_float(metrics, "latency", 4)
+        latency_threshold = metrics.get("latency_threshold", "N/A")
+        server = metrics.get("server", "N/A")
+        client = metrics.get("client", "N/A")
+        error = metrics.get("error", "")
+        status = "✅" if error == "" else "❌ " + str(error)
+        summary += f"| {model} | {server} | {client} | {output_throughput} | {output_throughput_threshold} | {latency} | {latency_threshold} | {accuracy} | {accuracy_threshold} | {status} |\n"
+    write_github_step_summary(summary)
+
+
+def write_github_step_summary_once(summary: str):
+    if getattr(write_github_step_summary_once, "has_written", False):
+        return
+    write_github_step_summary_once.has_written = True
+    write_github_step_summary(summary)
