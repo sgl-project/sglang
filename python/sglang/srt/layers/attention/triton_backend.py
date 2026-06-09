@@ -553,6 +553,7 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return None
         n = out_cache_loc.shape[0]
+        self.cuda_graph_swa_out_cache_loc[n:].zero_()
         self.cuda_graph_swa_out_cache_loc[:n].copy_(
             self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
         )
