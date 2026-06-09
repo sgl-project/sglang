@@ -3,6 +3,7 @@ from __future__ import annotations
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import (
+    Range,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
     is_pin_memory_available,
@@ -747,18 +748,8 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Rebuilt at the top of each init_next_round_input; admission only
-        # updates fill_len, never mutates this array's length.
-        self.full_untruncated_fill_ids = array("q")
-        # Length cursor into full_untruncated_fill_ids: the prefix length (from
-        # sequence start) the KV cache should cover after this extend step. The
-        # tokens to fill this round are full_untruncated_fill_ids[:fill_len], and
-        # fill_len == len(prefix_indices) + extend_input_len (cached prefix plus
-        # newly computed tokens). Equals the full sequence length for an unchunked
-        # request; for chunked prefill / DLLM it is the current chunk's cutoff and
-        # advances toward the sequence end chunk by chunk.
-        self.fill_len: int = 0
+        self.extend_range: Optional[Range] = None
+        self.dllm_initialized: bool = False
 
         self.session = session
         self.input_embeds = input_embeds
@@ -869,8 +860,6 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        # Number of tokens to run prefill.
-        self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
         # TODO(ispobock): rename to last_device_node
@@ -1032,8 +1021,8 @@ class Req(ReqDllmMixin):
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
-        # kv_send(req.input_ids[req.start_send_idx:req.fill_len])
-        # start_send_idx = req.fill_len
+        # kv_send(req.input_ids[req.start_send_idx:req.extend_range.end])
+        # start_send_idx = req.extend_range.end
         self.start_send_idx: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
@@ -1091,14 +1080,11 @@ class Req(ReqDllmMixin):
 
     def _scheduled_extend_len_bound_for_value(self, value: int) -> int:
         origin_len = len(self.origin_input_ids)
-        if (
-            self.retracted_stain
-            and self.full_untruncated_fill_ids
-            and len(self.full_untruncated_fill_ids) > origin_len
-        ):
-            return len(self.full_untruncated_fill_ids)
-        if self.full_untruncated_fill_ids and value > origin_len:
-            return len(self.full_untruncated_fill_ids)
+        full_len = self.get_full_untruncated_fill_len()
+        if self.retracted_stain and full_len > origin_len:
+            return full_len
+        if value > origin_len:
+            return full_len
         return origin_len
 
     def set_scheduled_extend_len(self, value: int) -> None:
@@ -1198,8 +1184,28 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_full_untruncated_fill_ids(self) -> array:
+        ids = self.origin_input_ids
+        if self.output_ids:
+            ids = ids + self.output_ids
+        if self.is_dllm():
+            ids = ids + array(
+                "q", [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
+        return ids
+
+    def get_full_untruncated_fill_len(self) -> int:
+        length = len(self.origin_input_ids) + len(self.output_ids)
+        if self.is_dllm():
+            length += self.dllm_config.block_size
+        return length
+
+    def set_extend_range(self, start: int, end: int) -> None:
+        self.extend_range = Range(start, end)
+        self._recompute_extend_logprob_start_len()
+
     def get_fill_ids(self) -> array:
-        return self.full_untruncated_fill_ids[: self.fill_len]
+        return self.get_full_untruncated_fill_ids()[: self.extend_range.end]
 
     def init_next_round_input(
         self,
@@ -1209,10 +1215,9 @@ class Req(ReqDllmMixin):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
-        else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
-        input_len = len(self.full_untruncated_fill_ids)
+        full_fill_ids = self.get_full_untruncated_fill_ids()
+        input_len = self.get_full_untruncated_fill_len()
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1230,9 +1235,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
-            : self._compute_max_prefix_len(input_len)
-        ]
+        token_ids_to_match = full_fill_ids[: self._compute_max_prefix_len(input_len)]
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -1294,8 +1297,6 @@ class Req(ReqDllmMixin):
                     self.multimodal_inputs.mrope_positions, len(self.output_ids)
                 )
             )
-
-        self.set_extend_input_len(input_len - len(self.prefix_indices))
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1480,7 +1481,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
-        self.extend_input_len = 0
+        self.extend_range = None
+        self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1517,7 +1519,6 @@ class Req(ReqDllmMixin):
         # new row on re-prefill.
         self.start_send_idx = 0
         self.tmp_end_idx = -1
-        self.fill_len = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1567,22 +1568,21 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_extend_input_len(self, extend_input_len: int):
+    def _recompute_extend_logprob_start_len(self):
         # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
         #
         # Key variables:
         # - logprob_start_len: Absolute position in full sequence where logprob computation begins
         # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
-        self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.full_untruncated_fill_ids)
+            logprob_start_len = self.get_full_untruncated_fill_len()
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
         self.extend_logprob_start_len = min(
             logprob_start_len - len(self.prefix_indices),
-            self.extend_input_len,
+            self.extend_range.length,
         )
 
     def set_finish_with_abort(self, error_msg: str):
@@ -1737,13 +1737,13 @@ def _compute_chunked_req_next_prompt_token(
 ) -> Optional[int]:
     if chunked_req is None:
         return None
-    fill_len = chunked_req.fill_len
-    if fill_len >= chunked_req.scheduled_extend_len_bound():
+    extend_fill_len = chunked_req.extend_range.end
+    if extend_fill_len >= chunked_req.scheduled_extend_len_bound():
         return None
-    fill_ids = chunked_req.full_untruncated_fill_ids
-    if fill_len >= len(fill_ids):
+    fill_ids = chunked_req.get_full_untruncated_fill_ids()
+    if extend_fill_len >= len(fill_ids):
         return None
-    return int(fill_ids[fill_len])
+    return int(fill_ids[extend_fill_len])
 
 
 @dataclasses.dataclass
@@ -2038,17 +2038,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 input_ids[i] = input_ids[i][encoder_len:]
                 encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
+                    self.out_cache_loc[pt + encoder_len : pt + req.extend_range.length]
                 )
                 self.extend_lens[i] -= encoder_len
                 self.extend_num_tokens -= encoder_len
             else:
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt : pt + req.extend_input_len]
+                    self.out_cache_loc[pt : pt + req.extend_range.length]
                 )
                 self.prefix_lens[i] -= encoder_len
 
-            pt += req.extend_input_len
+            pt += req.extend_range.length
 
         # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned);
         # resolve_forward_inputs will H2D this on forward stream. self.input_ids
@@ -2083,7 +2083,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for i, req in enumerate(self.reqs):
                 encoder_len = self.encoder_lens_cpu[i]
                 old_start_len = self.extend_logprob_start_lens[i]
-                old_contribution = req.extend_input_len - old_start_len
+                old_contribution = req.extend_range.length - old_start_len
 
                 if len(req.prefix_indices) < encoder_len:
                     tokens_to_strip = max(0, encoder_len - old_start_len)
@@ -2114,7 +2114,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if encoder_len == 0:
                 continue
             if len(req.prefix_indices) < encoder_len:
-                req.extend_input_len -= encoder_len
+                assert len(req.prefix_indices) == 0
+                req.extend_range = req.extend_range._replace(
+                    start=req.extend_range.start + encoder_len
+                )
                 req.extend_logprob_start_len = max(
                     0, req.extend_logprob_start_len - encoder_len
                 )
@@ -2131,10 +2134,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = [r.fill_len for r in reqs]
-        orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
+        seq_lens = [r.extend_range.end for r in reqs]
+        orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        extend_lens = [r.extend_range.length for r in reqs]
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -2174,7 +2177,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            assert seq_len - pre_len == req.extend_input_len
+            assert seq_len - pre_len == req.extend_range.length
 
             req.extend_batch_idx += 1
 
@@ -2185,9 +2188,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
-                # fill_len/extend_input_len on chunk overflow but not input_embeds.
+                # extend_fill_len/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
-                    req.input_embeds[pre_len : pre_len + req.extend_input_len]
+                    req.input_embeds[pre_len : pre_len + req.extend_range.length]
                 )
 
             if req.positional_embed_overrides is not None:
@@ -2199,7 +2202,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.positional_embed_overrides.positions
                 ):
                     extend_pos = pos - pre_len
-                    if extend_pos < 0 or extend_pos >= req.extend_input_len:
+                    if extend_pos < 0 or extend_pos >= req.extend_range.length:
                         continue  # Outside current extend chunk, skip
                     embeds_to_add.append((embed_idx, input_id_pointer + extend_pos))
                 if embeds_to_add:
@@ -2268,7 +2271,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # extend_input_logprob_token_id = [4, 0]
                 global_start_idx, global_end_idx = (
                     len(req.prefix_indices),
-                    req.fill_len,
+                    req.extend_range.end,
                 )
                 if req.logprob_start_len == -1:
                     logprob_start_len = len(req.origin_input_ids)
@@ -2283,12 +2286,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                # We will need req.extend_input_len - req.extend_logprob_start_len number of
+                # We will need req.extend_range.length - req.extend_logprob_start_len number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
-                        req.extend_input_len
+                        req.extend_range.length
                         - req.extend_logprob_start_len
                         - len(logprob_token_ids)
                     )
@@ -2398,7 +2401,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_input_len >= mamba_cache_chunk_size
+        mask = req.extend_range.length >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2409,13 +2412,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
+            mamba_track_seqlen = len(req.prefix_indices) + req.extend_range.length
 
             # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // mamba_cache_chunk_size)
+                + (req.extend_range.length // mamba_cache_chunk_size)
                 * mamba_cache_chunk_size
             )
 
@@ -2425,7 +2428,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // mamba_cache_chunk_size)
+                + (req.extend_range.length // mamba_cache_chunk_size)
                 * mamba_cache_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
@@ -2498,9 +2501,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_input_len(1)
+            full_len = req.get_full_untruncated_fill_len()
+            req.set_extend_range(full_len - 1, full_len)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
@@ -2713,6 +2715,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        for req in self.reqs:
+            req.extend_range = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None

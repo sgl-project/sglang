@@ -727,11 +727,17 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                is_propagated = False
                 try:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
-                logger.warning(error_message)
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+                # Mute error message for propagated exceptions to avoid duplicate logging
+                if is_propagated:
+                    logger.debug(error_message)
+                else:
+                    logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 self._deactivate(req)
@@ -809,11 +815,17 @@ class SchedulerDisaggregationPrefillMixin:
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
+        is_propagated = False
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
             error_message += f" with exception {e}"
-        logger.warning(error_message)
+            is_propagated = getattr(e, "is_from_another_rank", False)
+        # Mute error message for propagated exceptions to avoid duplicate logging
+        if is_propagated:
+            logger.debug(error_message)
+        else:
+            logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
             release_kv_cache(req, self.tree_cache)
@@ -884,7 +896,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     chunked_req.tmp_end_idx = min(
-                        chunked_req.fill_len,
+                        chunked_req.extend_range.end,
                         len(chunked_req.origin_input_ids),
                     )
                 else:
@@ -916,7 +928,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(req.fill_len, len(req.origin_input_ids))
+            else min(req.extend_range.end, len(req.origin_input_ids))
         )
 
         if not last_chunk:
@@ -947,7 +959,7 @@ class SchedulerDisaggregationPrefillMixin:
             # length here avoids emitting an extra state page when the sampled
             # token crosses a page boundary, which mismatched src/dst lengths in
             # group_concurrent_contiguous.
-            seq_len = min(req.fill_len, len(req.origin_input_ids))
+            seq_len = min(req.extend_range.end, len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [

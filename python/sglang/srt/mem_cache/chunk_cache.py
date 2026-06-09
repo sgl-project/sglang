@@ -86,6 +86,9 @@ class ChunkCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         # Bound row read by kv_committed_len; see radix_cache.py for rationale.
+        assert (
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_committed_len
         ]

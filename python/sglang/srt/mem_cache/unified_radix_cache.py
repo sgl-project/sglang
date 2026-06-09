@@ -724,8 +724,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Bound row read by kv_committed_len; see radix_cache.py for rationale.
         assert req.kv_committed_len >= req.cache_protected_len
+        assert (
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         read_len = req.kv_committed_len
-        token_ids = req.full_untruncated_fill_ids[:read_len]
+        token_ids = req.get_full_untruncated_fill_ids()[:read_len]
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -2261,9 +2264,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_write_queue:
@@ -2286,8 +2288,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
-        if cc is None or not self.ongoing_load_back:
+        if cc is None:
             return
+        # Every rank must enter the all_reduce below; ongoing_load_back can
+        # diverge across ranks.
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_load_queue:

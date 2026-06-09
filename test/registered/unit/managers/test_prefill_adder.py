@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -82,7 +83,8 @@ class TestPrefillAdder(CustomTestCase):
         req = MagicMock(spec=Req)
         req.rid = str(rid)
         req.priority = priority
-        req.extend_input_len = 0
+        req.prefix_indices = []
+        req.get_full_untruncated_fill_len.return_value = 0
         req.extend_logprob_start_len = 0
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
@@ -126,8 +128,7 @@ class TestPrefillAdder(CustomTestCase):
         req.dllm_config = None
         req.origin_input_ids = array("q", range(origin_len))
         req.output_ids = array("q", range(origin_len, origin_len + output_len))
-        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-        req.fill_len = scheduled_extend_len
+        req.extend_range = Range(0, scheduled_extend_len)
         req.scheduled_extend_len = 0
         req.scheduled_extend_target_len = 0
         req.retracted_stain = True
@@ -151,7 +152,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(_compute_chunked_req_next_prompt_token(req), 600)
 
         req.set_scheduled_extend_len(805)
-        req.fill_len = 805
+        req.extend_range = Range(0, 805)
 
         self.assertFalse(req.has_pending_chunk)
         self.assertEqual(
@@ -167,8 +168,7 @@ class TestPrefillAdder(CustomTestCase):
         req.dllm_config = None
         req.origin_input_ids = array("q", range(128))
         req.output_ids = array("q", range(128, 132))
-        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-        req.fill_len = len(req.origin_input_ids)
+        req.extend_range = Range(0, len(req.origin_input_ids))
         req.scheduled_extend_len = 0
         req.scheduled_extend_target_len = 0
         req.retracted_stain = False
@@ -464,11 +464,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Add a prefill that exactly consumes the chunk budget
         req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
-        req1.extend_input_len = 56
         req1.host_hit_length = 0
         req1.prefix_indices = []
-        req1.full_untruncated_fill_ids = list(range(56))
-        req1.fill_len = 56
+        req1.get_full_untruncated_fill_len.return_value = 56
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
@@ -497,11 +495,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Same prefill no longer exhausts the chunk budget
         req2 = self.create_mock_req("req2", priority=0, max_new_tokens=64)
-        req2.extend_input_len = 56
         req2.host_hit_length = 0
         req2.prefix_indices = []
-        req2.full_untruncated_fill_ids = list(range(56))
-        req2.fill_len = 56
+        req2.get_full_untruncated_fill_len.return_value = 56
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
@@ -513,11 +509,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Fit last small prefill request
         req3 = self.create_mock_req("req3", priority=0, max_new_tokens=16)
-        req3.extend_input_len = 3
         req3.host_hit_length = 0
         req3.prefix_indices = []
-        req3.full_untruncated_fill_ids = list(range(3))
-        req3.fill_len = 3
+        req3.get_full_untruncated_fill_len.return_value = 3
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 

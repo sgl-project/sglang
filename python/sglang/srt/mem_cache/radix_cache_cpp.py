@@ -212,8 +212,11 @@ class RadixCacheCpp(BasePrefixCache):
         assert req.req_pool_idx is not None
         # Bound row read by kv_committed_len; see radix_cache.py for rationale.
         assert req.kv_committed_len >= req.cache_protected_len
+        assert (
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         prefill_len = req.kv_committed_len
-        token_ids = req.full_untruncated_fill_ids[:prefill_len]
+        token_ids = req.get_full_untruncated_fill_ids()[:prefill_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)

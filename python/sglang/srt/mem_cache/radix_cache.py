@@ -467,13 +467,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         # Bound the row read by kv_committed_len (the actually-written prefix
-        # length on the row), not by fill_len. They are equal in the
-        # common path, but init_next_round_input resets fill_len to the full
-        # origin + output length while the row only holds KV up to
-        # kv_committed_len — reading beyond that yields garbage slot indices.
+        # length on the row). In the extend_range model it equals
+        # extend_range.end; the sanity assert guards that invariant.
         assert req.kv_committed_len >= req.cache_protected_len
+        assert (
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         read_len = req.kv_committed_len
-        token_ids = req.full_untruncated_fill_ids[:read_len]
+        token_ids = req.get_full_untruncated_fill_ids()[:read_len]
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :read_len]
 
         radix_key = RadixKey(

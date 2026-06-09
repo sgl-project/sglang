@@ -1335,7 +1335,7 @@ class Scheduler(
             request_lengths = []
             for req in batch.reqs:
                 start = len(req.prefix_indices)
-                end = start + req.extend_input_len
+                end = start + req.extend_range.length
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
@@ -2261,7 +2261,7 @@ class Scheduler(
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:]
+                new_input_tokens = req.get_full_untruncated_fill_ids()[matched_len:]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2915,7 +2915,9 @@ class Scheduler(
         assert (
             len(chunked_in_batch) <= 1
         ), "single-flight invariant: at most one chunked-resume req per batch"
-        chunk_deduct = chunked_in_batch[0].extend_input_len if chunked_in_batch else 0
+        chunk_deduct = (
+            chunked_in_batch[0].extend_range.length if chunked_in_batch else 0
+        )
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -3296,8 +3298,11 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob:
+                # Decode reqs have no extend_range (it is only consumed for
+                # input-logprob processing on extend/mixed reqs).
                 batch_result.extend_input_len_per_req = [
-                    req.extend_input_len for req in batch.reqs
+                    req.extend_range.length if req.extend_range is not None else 0
+                    for req in batch.reqs
                 ]
                 batch_result.extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs

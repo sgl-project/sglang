@@ -487,11 +487,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
         # Bound the row read by kv_committed_len, not len(fill_ids); see
-        # radix_cache.py:cache_unfinished_req for the rationale (SWA early-
-        # return + init_next_round_input leaves fill_ids longer than the row).
+        # radix_cache.py:cache_unfinished_req for the rationale. In the
+        # extend_range model kv_committed_len equals extend_range.end.
         assert req.kv_committed_len >= req.cache_protected_len
         read_len = req.kv_committed_len
         if self.disable:
+            assert (
+                req.extend_range.end == req.kv_committed_len
+            ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :read_len
             ]
@@ -500,7 +503,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = kv_indices
             return
 
-        token_ids = req.full_untruncated_fill_ids[:read_len]
+        assert (
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
+        token_ids = req.get_full_untruncated_fill_ids()[:read_len]
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :read_len]
 
         radix_key = RadixKey(

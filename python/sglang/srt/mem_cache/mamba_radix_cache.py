@@ -613,6 +613,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         read_len = req.kv_committed_len
 
         def _skip_cache_unfinished_req(req: Req) -> None:
+            assert (
+                req.extend_range.end == req.kv_committed_len
+            ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :read_len
             ]
@@ -621,7 +624,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        token_ids = req.full_untruncated_fill_ids[:read_len]
+        assert (
+            req.extend_range.end == req.kv_committed_len
+        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
+        token_ids = req.get_full_untruncated_fill_ids()[:read_len]
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
