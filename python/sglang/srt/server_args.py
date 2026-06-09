@@ -2962,6 +2962,8 @@ class ServerArgs:
             if self.prefill_attention_backend is None:
                 self.prefill_attention_backend = "trtllm_mla"
 
+        self._warn_flashinfer_mla_on_sm100()
+
         if (
             self.attention_backend == "trtllm_mha"
             or self.decode_attention_backend == "trtllm_mha"
@@ -3181,6 +3183,25 @@ class ServerArgs:
                 self.page_size = 1
             else:
                 self.page_size = 64
+
+    def _warn_flashinfer_mla_on_sm100(self):
+        if not is_sm100_supported():
+            return
+        if not self.use_mla_backend():
+            return
+        if "flashinfer" not in (
+            self.attention_backend,
+            self.decode_attention_backend,
+            self.prefill_attention_backend,
+        ):
+            return
+        logger.warning(
+            "flashinfer attention backend on MLA models falls back to fa2 "
+            "inside BatchMLAPagedAttentionWrapper on SM100. trtllm_mla is "
+            "much faster on this platform (B200, DeepSeek MLA decode, "
+            "bs=128, page=64, bf16: fa2 4.41 ms vs trtllm-gen 1.12 ms at "
+            "seq=32768). Consider --attention-backend trtllm_mla."
+        )
 
     def _handle_amd_specifics(self):
         if is_hip():

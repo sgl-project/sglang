@@ -621,6 +621,56 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
+class TestFlashInferMlaSm100Warning(CustomTestCase):
+    LOGGER_NAME = "sglang.srt.server_args"
+
+    def _make_args(self, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch.object(ServerArgs, "use_mla_backend", return_value=True)
+    def test_warns_when_flashinfer_on_mla_sm100(self, *_):
+        args = self._make_args(attention_backend="flashinfer")
+        with self.assertLogs(self.LOGGER_NAME, level="WARNING") as cm:
+            args._warn_flashinfer_mla_on_sm100()
+        self.assertTrue(
+            any("trtllm_mla" in msg for msg in cm.output),
+            f"warning not emitted: {cm.output}",
+        )
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch.object(ServerArgs, "use_mla_backend", return_value=True)
+    def test_warns_when_flashinfer_set_via_decode_only(self, *_):
+        args = self._make_args(decode_attention_backend="flashinfer")
+        with self.assertLogs(self.LOGGER_NAME, level="WARNING") as cm:
+            args._warn_flashinfer_mla_on_sm100()
+        self.assertTrue(any("trtllm_mla" in msg for msg in cm.output))
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    @patch.object(ServerArgs, "use_mla_backend", return_value=True)
+    def test_silent_when_not_sm100(self, *_):
+        args = self._make_args(attention_backend="flashinfer")
+        with self.assertNoLogs(self.LOGGER_NAME, level="WARNING"):
+            args._warn_flashinfer_mla_on_sm100()
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
+    def test_silent_when_not_mla(self, *_):
+        args = self._make_args(attention_backend="flashinfer")
+        with self.assertNoLogs(self.LOGGER_NAME, level="WARNING"):
+            args._warn_flashinfer_mla_on_sm100()
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch.object(ServerArgs, "use_mla_backend", return_value=True)
+    def test_silent_when_trtllm_mla(self, *_):
+        args = self._make_args(attention_backend="trtllm_mla")
+        with self.assertNoLogs(self.LOGGER_NAME, level="WARNING"):
+            args._warn_flashinfer_mla_on_sm100()
+            
+            
 class TestCutedslMoeMaxNumTokens(unittest.TestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution."""
