@@ -11,8 +11,8 @@ metatags:
 SANA-WM ships in two checkpoints: a **bidirectional** checkpoint (dense, one-shot) and a **streaming** checkpoint (chunk-causal, autoregressive — generated chunk-by-chunk, reusing causal DiT state across chunks for bounded memory → long, even endless, clips). From a single first frame, a text prompt, and a camera trajectory, this cookbook covers **all three serving modes** SGLang exposes:
 
 - **(A) Dense bidirectional** (§4) — the `SANA-WM_bidirectional` checkpoint generated in one shot (no chunking) via **`SanaWMTwoStagePipeline`** over the standard **`/v1/videos`** HTTP API. Highest single-clip quality (full bidirectional attention + dense LTX-2 refiner); matches the NVlabs dense reference.
-- **(B) Batch streaming** (§5) — the `SANA-WM_streaming` checkpoint generated chunk-by-chunk in one request via the same **`SanaWMTwoStagePipeline`** + `--streaming` over **`/v1/videos`**. The official-matching, pixel-exact streaming path (the whole clip is produced chunk-by-chunk internally, then returned).
-- **(C) Live realtime** (§6–7) — the streaming pipeline exposed as **`SanaWMRealtimePipeline`** over a **WebSocket API** at `/v1/realtime_video/generate`, so a browser/client streams camera-action events frame-by-frame and receives video chunks back in real time. (Realtime is official-*quality* but, being an incremental execution mode, not bit-identical to the offline path.)
+- **(B) Batch streaming** (§5) — the `SANA-WM_streaming` checkpoint generated chunk-by-chunk in one request via the same **`SanaWMTwoStagePipeline`** + `--streaming` over **`/v1/videos`**. This is SGLang's offline chunk-causal streaming path: the whole clip is produced chunk-by-chunk internally, then returned.
+- **(C) Live realtime** (§6–7) — the streaming pipeline exposed as **`SanaWMRealtimePipeline`** over a **WebSocket API** at `/v1/realtime_video/generate`, so a browser/client streams camera-action events frame-by-frame and receives video chunks back in real time. Realtime uses the same streaming checkpoint, but the incremental session path is not bit-identical to offline batch streaming.
 
 All three modes share the camera action DSL (§8) and the configuration knobs (§9). Modes (B) and (C) share the streaming checkpoint and the chunk-causal pipeline.
 
@@ -117,7 +117,7 @@ curl -s http://127.0.0.1:30000/v1/videos \
 
 ## 5. Batch streaming (offline `/v1/videos`)
 
-The **streaming** checkpoint generates a **full camera-controlled clip in one request** — no websocket. This is the **official-matching, pixel-exact** streaming path: the whole clip is generated chunk-by-chunk internally, refined, decoded, and returned as one video.
+The **streaming** checkpoint generates a **full camera-controlled clip in one request** — no websocket. This is SGLang's offline streaming path: the whole clip is generated chunk-by-chunk internally, refined, decoded, and returned as one video.
 
 Launch with the two-stage pipeline + the streaming flags:
 
@@ -130,7 +130,7 @@ python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
 ```
 
 - `--streaming` — chunk-causal `forward_long` Stage-1 (vs the dense one-shot path of §4).
-- `--refiner-chunked` — chunk-wise streaming LTX-2 refiner (the official path, **on by default**). To use the whole-clip dense refiner instead (also valid, higher peak memory), pass `--refiner-chunked false` — simply omitting the flag keeps the default chunked refiner.
+- `--refiner-chunked` — chunk-wise streaming LTX-2 refiner (**on by default**). To use the whole-clip dense refiner instead (also valid, higher peak memory), pass `--refiner-chunked false` — simply omitting the flag keeps the default chunked refiner.
 - `--num-frame-per-block N` — latent frames per chunk (default `3`).
 
 Then POST to **`/v1/videos`** (JSON body shown below; multipart/form-data with an uploaded `input_reference` file also works). Camera control goes in `diffusers_kwargs` — the action-DSL string (§8) and the intrinsics:
@@ -173,9 +173,16 @@ python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
   --host 127.0.0.1 --port 30000
 ```
 
-Single-GPU and CPU-offload variants:
+Common launch variants:
 
 ```bash Command
+# recommended multi-GPU realtime profile
+python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
+  --model-path Efficient-Large-Model/SANA-WM_streaming \
+  --pipeline-class-name SanaWMRealtimePipeline \
+  --num-gpus 8 --sp-degree 8 \
+  --host 127.0.0.1 --port 30000
+
 # single GPU
 python -m sglang.multimodal_gen.runtime.entrypoints.cli.main serve \
   --model-path Efficient-Large-Model/SANA-WM_streaming \
@@ -194,6 +201,8 @@ Notes on launch behavior:
 
 - **Default endpoint** is `127.0.0.1:30000` (`--host` / `--port` override).
 - **CPU offload flags are optional.** `--dit-cpu-offload`, `--text-encoder-cpu-offload`, and `--image-encoder-cpu-offload` are available; defaults are auto-adjusted from GPU memory (GPUs under 30 GB get more aggressive offloading).
+- **Multi-GPU realtime.** Prefer explicit sequence parallelism (`--sp-degree` equal to the number of GPUs for a single session). Do not enable CFG parallel for the realtime profile: the default realtime request uses `guidance_scale=1.0`, while CFG parallel requires active cond/uncond branches.
+- **FSDP.** Use `--use-fsdp-inference` only when you specifically need weight sharding for memory. For the low-latency realtime profile, prefer keeping components resident and using SP first.
 - **Warmup.** Server warmup is **automatically skipped** for the realtime pipeline — a synthetic warmup request has no WebSocket session, so the server detects the registered realtime adapter and skips it. No `--warmup` flag is needed.
 
 Once up, the realtime WebSocket endpoint lives at `ws://127.0.0.1:30000/v1/realtime_video/generate` (use the Python client in §7 to connect — plain `curl` does not speak the `ws://` upgrade).
@@ -228,7 +237,7 @@ The server streams **frame batches** back. Each chunk arrives as one or more `fr
 | `condition_inputs` | dict | Camera/conditioning inputs (see below) |
 | `num_frames` | int | Total frames to generate. **Omit it for an open-ended, continuous session** — the adapter leaves `num_frames` unset and flags an open-ended run (`condition_inputs["sana_wm_open_ended"] = True`), generating uniform chunks indefinitely (until `max_chunks` or the client disconnects). Provide an integer for a fixed-length clip |
 | `seed` | int | RNG seed (default `42`) |
-| `size` | str | `"WIDTHxHEIGHT"`; forced to `"1280x704"` for SANA-WM at init |
+| `size` | str | `"WIDTHxHEIGHT"`; realtime requests default to `"832x480"` for latency. Pass `"1280x704"` for the native landscape resolution |
 | `max_chunks` | int | Optional cap on total chunks generated |
 | `num_inference_steps` | int | Default `4` for SANA-WM (realtime adapter) |
 | `guidance_scale` | float | Default `1.0` |
@@ -243,15 +252,16 @@ The server streams **frame batches** back. Each chunk arrives as one or more `fr
 | `camera_actions` | `list[list[str]]` or `{mode: "state", transitions: [...]}` | Frame-by-frame camera actions, or state-based transitions |
 | `action` | str | Action-DSL string, e.g. `"w-10,none-5,a-8"` (see §8) |
 | `intrinsics_path` | str | Server-side path to a camera-intrinsics **`.npy`** file (loaded via `np.load`; shapes `(4,)`, `(3,3)`, or `(F,3,3)`) |
+| `intrinsics` | list | Inline intrinsics with shape `(4,)`, `(3,3)`, `(F,4)`, or `(F,3,3)` |
 
-If you omit both `intrinsics_path` and `intrinsics`, the server estimates intrinsics from the first frame with **Pi3X** ([`github.com/yyfz/Pi3`](https://github.com/yyfz/Pi3); auto-downloads `yyfz233/Pi3X`) — install it (`pip install git+https://github.com/yyfz/Pi3.git`) or always pass intrinsics, otherwise the request fails with "Pi3X is not installed".
+If you omit both `intrinsics_path` and `intrinsics`, SGLang uses a centered heuristic intrinsic matrix derived from the first-frame size. Pass explicit intrinsics when you need closer camera parity with a prepared trajectory.
 
 ```json INIT (msgpack dict) — open-ended (omit num_frames)
 {
   "type": "init",
   "prompt": "beautiful landscape video",
   "first_frame": "<bytes or url>",
-  "size": "1280x704",
+  "size": "832x480",
   "seed": 42,
   "max_chunks": 10,
   "realtime_output_format": "raw",
@@ -371,7 +381,7 @@ async def run():
             "type": "init",
             "prompt": "a camera moving forward and turning right",
             "first_frame": first_frame,
-            "size": "1280x704",
+            "size": "832x480",
             "seed": 42,
             "max_chunks": 10,
             "realtime_output_format": "raw",
@@ -379,7 +389,7 @@ async def run():
             "guidance_scale": 1.0,
             "condition_inputs": {
                 "action": "w-100,wd-50,d-30",
-                "intrinsics_path": "/path/to/intrinsics.npy",  # omit only if Pi3X is installed
+                "intrinsics_path": "/path/to/intrinsics.npy",  # optional; centered heuristic if omitted
             },
         }))
 
@@ -473,11 +483,11 @@ These are server-launch knobs (set via the `--streaming` / `--refiner-chunked` /
 
 ### Realtime adapter init overrides — `SanaWMRealtimeAdapter`
 
-At WebSocket `init` the realtime adapter forces SANA-WM defaults that differ from the request/sampling defaults above:
+At WebSocket `init` the realtime adapter fills SANA-WM defaults that differ from the request/sampling defaults above:
 
 | Field | Realtime default | Note |
 |---|---|---|
-| `size` | `1280x704` | Always forced |
+| `size` | `832x480` | Realtime request default; pass `1280x704` for native landscape output |
 | `num_frames` | *(unset)* | Omitting → open-ended continuous session (§7) |
 | `num_inference_steps` | `4` | Distilled few-step |
 | `guidance_scale` | `1.0` | CFG off |
