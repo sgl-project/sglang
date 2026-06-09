@@ -49,10 +49,12 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     make_layers,
     set_weight_attrs,
 )
+from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +62,11 @@ from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_c
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 if _is_npu:
@@ -819,8 +823,15 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if _use_aiter:
+                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    sigmoid_gate_mul,
+                )
+
+                attn_output = sigmoid_gate_mul(attn_output, gate)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
