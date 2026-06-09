@@ -5710,6 +5710,7 @@ class ServerArgs:
                 "aiter_attn",
                 "flashinfer_cudnn",
                 "amx_attn",
+                "xpu_attn",
             ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
