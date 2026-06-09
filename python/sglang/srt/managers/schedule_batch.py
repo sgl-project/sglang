@@ -1587,14 +1587,6 @@ def compute_extend_logprob_start_len(
     extend_len: int,
     full_untruncated_fill_len: int,
 ) -> int:
-    """Relative position within an extend window where input-logprob computation starts.
-
-    Pure function of the extend forward inputs; it holds no Req state. Callers snapshot
-    the result at forward-assembly time into ScheduleBatch.extend_logprob_start_lens,
-    because the value is bound to one extend forward, not to live Req state (under
-    overlap scheduling the Req's prefix_indices/extend_range/logprob_start_len are
-    overwritten by the next round before the current forward's output is processed).
-    """
     # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
     #
     # Key variables:
@@ -1969,9 +1961,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_range.length for r in reqs]
-        # Snapshot the per-req input-logprob start (relative to the extend window).
-        # Encoder-decoder stripping adjusts this list in place in
-        # prepare_encoder_info_extend; do not recompute it afterwards.
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
                 logprob_start_len=r.logprob_start_len,

@@ -3136,9 +3136,6 @@ class Scheduler(
                     req.extend_range.length if req.extend_range is not None else 0
                     for req in batch.reqs
                 ]
-                # Forward-time, encoder-adjusted snapshot owned by the batch. Only
-                # prefill processing consumes it (where it is always aligned with reqs);
-                # decode carries it through unread, so no alignment guard is needed.
                 batch_result.extend_logprob_start_len_per_req = (
                     batch.extend_logprob_start_lens
                 )
