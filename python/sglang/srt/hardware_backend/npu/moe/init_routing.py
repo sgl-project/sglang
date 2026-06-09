@@ -89,7 +89,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 quant_mode=self.quant_mode,
             )
         )
-        if quant_mode == -1:
+        if self.quant_mode == -1:
             pertoken_scale = None
         expert_tokens = expert_tokens.to(torch.int64)
         return hidden_states, expanded_row_idx, expert_tokens, pertoken_scale
