@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -73,15 +72,12 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):

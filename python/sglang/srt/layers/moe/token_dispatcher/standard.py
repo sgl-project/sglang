@@ -44,9 +44,12 @@ if TYPE_CHECKING:
 
 
 try:
-    from flashinfer import fp4_quantize as fp4_quantize_flashinfer
     from flashinfer import (
         nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
+    )
+
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        fp4_quantize as fp4_quantize_flashinfer,
     )
 except ImportError:
     fp4_quantize_flashinfer = None
@@ -96,6 +99,8 @@ class StandardDispatcher(BaseDispatcher):
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
+            or backend.is_flashinfer_trtllm()
+            or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or self.enable_flashinfer_mxfp4_moe
         )
@@ -217,7 +222,10 @@ class StandardDispatcher(BaseDispatcher):
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
