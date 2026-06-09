@@ -54,7 +54,6 @@ from sglang.srt.utils import (
     make_layers,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +65,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 if _is_npu:
@@ -823,7 +821,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _use_aiter:
+            if _is_hip:
                 from sglang.jit_kernel.triton.sigmoid_gate_mul import (
                     sigmoid_gate_mul,
                 )
