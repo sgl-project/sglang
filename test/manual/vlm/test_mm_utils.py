@@ -12,9 +12,7 @@ from sglang.srt.managers.schedule_batch import (
 
 
 def _make_proxy_with_reconstruct_result(tensor: torch.Tensor):
-    proxy = mm_utils.CudaIpcTensorTransportProxy.__new__(
-        mm_utils.CudaIpcTensorTransportProxy
-    )
+    proxy = mm_utils.CudaIpcTensorTransportProxy.__new__(mm_utils.CudaIpcTensorTransportProxy)
     proxy.reconstruct_on_target_device = Mock(return_value=tensor)
     return proxy
 

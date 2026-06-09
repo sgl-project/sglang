@@ -30,14 +30,16 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import SimpleCudaIpcProxy
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    CudaIpcTensorTransportProxy,
+    start_ipc_collect_sweeper,
+)
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
-_IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
 @dataclasses.dataclass
@@ -254,9 +256,10 @@ class BaseMultimodalProcessor(ABC):
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
-            # SimpleCudaIpcProxy uses per-tensor CUDA IPC handles instead of a
-            # pre-allocated memory pool.  No pool allocation is needed.
+            # Per-tensor CUDA IPC (no pool); start the producer-side reclaimer so
+            # the IPC limbo is swept and producer GPU memory stays bounded.
             logger.info("CUDA IPC transport enabled (per-tensor mode, no memory pool)")
+            start_ipc_collect_sweeper()
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -1193,7 +1196,7 @@ class BaseMultimodalProcessor(ABC):
             return tensor
 
         try:
-            return SimpleCudaIpcProxy.from_tensor(tensor)
+            return CudaIpcTensorTransportProxy.from_tensor(tensor)
         except Exception as e:
             logger.warning("Failed to create CUDA IPC proxy: %s", e)
             return tensor.cpu()

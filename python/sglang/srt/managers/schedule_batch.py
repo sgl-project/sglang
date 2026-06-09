@@ -106,10 +106,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    CudaIpcTensorTransportProxy,
-    SimpleCudaIpcProxy,
-)
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -349,7 +346,7 @@ class MultimodalDataItem:
         return ret
 
     def _is_ipc_proxy(self, obj):
-        return isinstance(obj, (CudaIpcTensorTransportProxy, SimpleCudaIpcProxy))
+        return isinstance(obj, CudaIpcTensorTransportProxy)
 
     def has_cuda_ipc_proxy(self):
         return (

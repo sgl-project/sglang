@@ -616,9 +616,9 @@ class Envs:
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
-    SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
-    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
-    SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
+    # With CUDA IPC on, set to 1 to keep the feature on device (zero-copy view)
+    # instead of copying it to host at receipt (see CudaIpcTensorTransportProxy).
+    SGLANG_CUDA_IPC_KEEP_ON_DEVICE = EnvBool(False)
 
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")

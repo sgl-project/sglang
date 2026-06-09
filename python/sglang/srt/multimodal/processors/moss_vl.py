@@ -25,7 +25,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import SimpleCudaIpcProxy
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 logger = logging.getLogger(__name__)
 
@@ -558,7 +558,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                 for item in mm_items:
                     if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
                         try:
-                            item.feature = SimpleCudaIpcProxy.from_tensor(item.feature)
+                            item.feature = CudaIpcTensorTransportProxy.from_tensor(item.feature)
                         except Exception as e:
                             logger.warning("Failed to create CUDA IPC proxy: %s", e)
                     elif (
@@ -567,7 +567,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                     ):
                         try:
                             item.precomputed_embeddings = (
-                                SimpleCudaIpcProxy.from_tensor(
+                                CudaIpcTensorTransportProxy.from_tensor(
                                     item.precomputed_embeddings
                                 )
                             )
