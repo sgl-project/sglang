@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 from contextlib import nullcontext
@@ -129,6 +130,28 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+
+
+@functools.cache
+def _ceil_to_ue8m0_compile_options() -> dict:
+    options = {}
+    inductor_config = torch._inductor.config
+    triton_config = getattr(inductor_config, "triton", None)
+    if triton_config is not None and hasattr(triton_config, "enable_pdl"):
+        options["triton.enable_pdl"] = True
+    return options
+
+
+@functools.cache
+def _compiled_deep_gemm_ceil_to_ue8m0(dynamic: Optional[bool]):
+    import deep_gemm
+
+    return torch.compile(
+        deep_gemm.ceil_to_ue8m0,
+        fullgraph=True,
+        dynamic=dynamic,
+        options=_ceil_to_ue8m0_compile_options(),
+    )
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -996,7 +1019,10 @@ class MQALayer(nn.Module):
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
             )
-            o_s = deep_gemm.ceil_to_ue8m0(o_s)
+            compile_dynamic = (
+                False if forward_batch.forward_mode.is_decode_or_idle() else None
+            )
+            o_s = _compiled_deep_gemm_ceil_to_ue8m0(compile_dynamic)(o_s)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
