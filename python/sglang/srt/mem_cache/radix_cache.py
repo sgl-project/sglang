@@ -469,7 +469,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         assert (
             req.fill_len == req.kv_committed_len
         ), f"Sanity check since migrating fill_len to kv_committed_len: {req.fill_len=} {req.kv_committed_len=}"
-        token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
+        token_ids = req.get_full_untruncated_fill_ids()[
+            : min(req.kv_committed_len, len(req.origin_input_ids))
+        ]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
