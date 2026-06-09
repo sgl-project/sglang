@@ -1202,39 +1202,35 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
 
 
 def _dataset_specific_args(args: argparse.Namespace) -> Dict[str, Any]:
-    """Return only the dataset-shaping args relevant to ``args.dataset_name``.
+    """Return dataset-shaping args relevant to ``args.dataset_name``.
 
-    Keeps the benchmark result from advertising unrelated defaults (e.g.
-    ``random_input_len`` for a ``generated-shared-prefix`` run), which is
-    misleading for downstream consumers reading the dumped result.
+    This is primarily used with the CLI-parsed ``bench_serving`` namespace,
+    where all referenced argparse fields are guaranteed to exist. For
+    programmatic/manual namespaces, missing dataset-relevant fields are
+    tolerated and surfaced as ``None`` instead of raising ``AttributeError``.
     """
-    if args.dataset_name in ("random", "random-ids", "image"):
+    dataset_name = getattr(args, "dataset_name", None)
+    if dataset_name in ("random", "random-ids", "image"):
         return {
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
+            "random_input_len": getattr(args, "random_input_len", None),
+            "random_output_len": getattr(args, "random_output_len", None),
+            "random_range_ratio": getattr(args, "random_range_ratio", None),
         }
-    if args.dataset_name == "mmmu":
-        return {"random_output_len": args.random_output_len}
-    if args.dataset_name == "generated-shared-prefix":
+    if dataset_name == "mmmu":
+        return {"random_output_len": getattr(args, "random_output_len", None)}
+    if dataset_name == "generated-shared-prefix":
         return {
-            "gsp_num_groups": args.gsp_num_groups,
-            "gsp_prompts_per_group": args.gsp_prompts_per_group,
-            "gsp_system_prompt_len": args.gsp_system_prompt_len,
-            "gsp_question_len": args.gsp_question_len,
-            "gsp_output_len": args.gsp_output_len,
-            "gsp_range_ratio": args.gsp_range_ratio,
-            "gsp_group_distribution": args.gsp_group_distribution,
-            "gsp_zipf_alpha": args.gsp_zipf_alpha,
+            "gsp_num_groups": getattr(args, "gsp_num_groups", None),
+            "gsp_prompts_per_group": getattr(args, "gsp_prompts_per_group", None),
+            "gsp_system_prompt_len": getattr(args, "gsp_system_prompt_len", None),
+            "gsp_question_len": getattr(args, "gsp_question_len", None),
+            "gsp_output_len": getattr(args, "gsp_output_len", None),
+            "gsp_range_ratio": getattr(args, "gsp_range_ratio", None),
+            "gsp_group_distribution": getattr(args, "gsp_group_distribution", None),
+            "gsp_zipf_alpha": getattr(args, "gsp_zipf_alpha", None),
         }
-    if args.dataset_name in (
-        "sharegpt",
-        "custom",
-        "autobench",
-        "openai",
-        "longbench_v2",
-    ):
-        return {"sharegpt_output_len": args.sharegpt_output_len}
+    if dataset_name in ("sharegpt", "custom", "autobench", "openai", "longbench_v2"):
+        return {"sharegpt_output_len": getattr(args, "sharegpt_output_len", None)}
     return {}
 
 
