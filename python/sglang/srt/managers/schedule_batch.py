@@ -1077,20 +1077,12 @@ class Req(ReqDllmMixin):
             length += self.dllm_config.block_size
         return length
 
-    @property
-    def extend_fill_len(self) -> int:
-        return self.extend_range.end
-
-    @property
-    def extend_input_len(self) -> int:
-        return self.extend_range.length
-
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
         self._recompute_extend_logprob_start_len()
 
     def get_fill_ids(self) -> array:
-        return self.get_full_untruncated_fill_ids()[: self.extend_fill_len]
+        return self.get_full_untruncated_fill_ids()[: self.extend_range.end]
 
     def init_next_round_input(
         self,
@@ -1453,7 +1445,7 @@ class Req(ReqDllmMixin):
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
         self.extend_logprob_start_len = min(
             logprob_start_len - len(self.prefix_indices),
-            self.extend_input_len,
+            self.extend_range.length,
         )
 
     def set_finish_with_abort(self, error_msg: str):
@@ -1571,7 +1563,7 @@ def _compute_chunked_req_next_prompt_token(
 ) -> Optional[int]:
     if chunked_req is None:
         return None
-    extend_fill_len = chunked_req.extend_fill_len
+    extend_fill_len = chunked_req.extend_range.end
     if extend_fill_len >= len(chunked_req.origin_input_ids):
         return None
     return int(chunked_req.origin_input_ids[extend_fill_len])
@@ -1828,17 +1820,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 input_ids[i] = input_ids[i][encoder_len:]
                 encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
+                    self.out_cache_loc[pt + encoder_len : pt + req.extend_range.length]
                 )
                 self.extend_lens[i] -= encoder_len
                 self.extend_num_tokens -= encoder_len
             else:
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt : pt + req.extend_input_len]
+                    self.out_cache_loc[pt : pt + req.extend_range.length]
                 )
                 self.prefix_lens[i] -= encoder_len
 
-            pt += req.extend_input_len
+            pt += req.extend_range.length
 
         # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned);
         # resolve_forward_inputs will H2D this on forward stream. self.input_ids
@@ -1873,7 +1865,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for i, req in enumerate(self.reqs):
                 encoder_len = self.encoder_lens_cpu[i]
                 old_start_len = self.extend_logprob_start_lens[i]
-                old_contribution = req.extend_input_len - old_start_len
+                old_contribution = req.extend_range.length - old_start_len
 
                 if len(req.prefix_indices) < encoder_len:
                     tokens_to_strip = max(0, encoder_len - old_start_len)
@@ -1924,10 +1916,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = [r.extend_fill_len for r in reqs]
-        orig_seq_lens = [max(r.extend_fill_len, len(r.origin_input_ids)) for r in reqs]
+        seq_lens = [r.extend_range.end for r in reqs]
+        orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        extend_lens = [r.extend_range.length for r in reqs]
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -1967,7 +1959,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            assert seq_len - pre_len == req.extend_input_len
+            assert seq_len - pre_len == req.extend_range.length
 
             req.extend_batch_idx += 1
 
@@ -1980,7 +1972,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Slice to match extend_input_len — PrefillAdder truncates
                 # extend_fill_len/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
-                    req.input_embeds[pre_len : pre_len + req.extend_input_len]
+                    req.input_embeds[pre_len : pre_len + req.extend_range.length]
                 )
 
             if req.positional_embed_overrides is not None:
@@ -1992,7 +1984,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.positional_embed_overrides.positions
                 ):
                     extend_pos = pos - pre_len
-                    if extend_pos < 0 or extend_pos >= req.extend_input_len:
+                    if extend_pos < 0 or extend_pos >= req.extend_range.length:
                         continue  # Outside current extend chunk, skip
                     embeds_to_add.append((embed_idx, input_id_pointer + extend_pos))
                 if embeds_to_add:
@@ -2061,7 +2053,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # extend_input_logprob_token_id = [4, 0]
                 global_start_idx, global_end_idx = (
                     len(req.prefix_indices),
-                    req.extend_fill_len,
+                    req.extend_range.end,
                 )
                 if req.logprob_start_len == -1:
                     logprob_start_len = len(req.origin_input_ids)
@@ -2081,7 +2073,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
-                        req.extend_input_len
+                        req.extend_range.length
                         - req.extend_logprob_start_len
                         - len(logprob_token_ids)
                     )
@@ -2191,7 +2183,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_input_len >= mamba_cache_chunk_size
+        mask = req.extend_range.length >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2202,13 +2194,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
+            mamba_track_seqlen = len(req.prefix_indices) + req.extend_range.length
 
             # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // mamba_cache_chunk_size)
+                + (req.extend_range.length // mamba_cache_chunk_size)
                 * mamba_cache_chunk_size
             )
 
@@ -2218,7 +2210,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // mamba_cache_chunk_size)
+                + (req.extend_range.length // mamba_cache_chunk_size)
                 * mamba_cache_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
