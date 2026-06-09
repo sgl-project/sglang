@@ -184,7 +184,7 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
-class DeepEPOutputDtype(Enum):
+class DispatcherOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
 
@@ -200,7 +200,7 @@ class DeepEPOutputDtype(Enum):
     NVFP4 = "nvfp4"
 
 
-def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
+def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     """
     Automatically choose the dispatch output dtype for DeepEP.
 
@@ -217,7 +217,7 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     # 0. Parse server argument.
     server_args = get_global_server_args()
     if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
-        return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
+        return DispatcherOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
     # 1. Parse deprecated environment variables.
     if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
@@ -226,32 +226,32 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
             "and will be removed in future releases. Please use a new "
             "`--deepep-dispatcher-output-dtype bf16` argument instead."
         )
-        return DeepEPOutputDtype.BF16
+        return DispatcherOutputDtype.BF16
 
     # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
-            return DeepEPOutputDtype.NVFP4
+            return DispatcherOutputDtype.NVFP4
 
         # 3. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
-            return DeepEPOutputDtype(dispatcher_output_dtype)
+            return DispatcherOutputDtype(dispatcher_output_dtype)
 
     # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
     ):
-        return DeepEPOutputDtype.BF16
+        return DispatcherOutputDtype.BF16
 
     # 5. Default on NPU → BF16
     if _is_npu:
-        return DeepEPOutputDtype.BF16
+        return DispatcherOutputDtype.BF16
 
     # 6. Default → FP8
-    return DeepEPOutputDtype.FP8
+    return DispatcherOutputDtype.FP8
 
 
 def get_ascend_dispatcher_output_dtype(self):
@@ -263,11 +263,11 @@ def get_ascend_dispatcher_output_dtype(self):
     if self.quant_config is not None:
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
-            return dispatcher_output_dtype
+            return DispatcherOutputDtype(dispatcher_output_dtype)
 
     # 2. Default on NPU → BF16
     if _is_npu:
-        return DeepEPOutputDtype.BF16
+        return DispatcherOutputDtype.BF16
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
