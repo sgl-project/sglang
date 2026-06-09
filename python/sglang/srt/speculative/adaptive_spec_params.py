@@ -62,7 +62,7 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     if server_args.enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
-            "(MultiLayerEagleWorker does not implement adaptive)"
+            "(MultiLayerEagleWorkerV2 does not implement adaptive)"
         )
     if server_args.enable_two_batch_overlap:
         return (
