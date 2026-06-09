@@ -659,28 +659,13 @@ class SchedulerBatchResultProcessor:
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             else:
-                # Check stop conditions per-token so that tail_str() window can catch stop strings that appear in the middle of the accepted sequence (not just the last token) in spec v2.
-                kept_token_ids = []
-                for tok in next_token_id:
-                    req.output_ids.append(tok)
-                    kept_token_ids.append(tok)
-                    req.update_finish_state()
-                    if req.finished():
-                        break
-                dropped_cnt = len(next_token_id) - len(kept_token_ids)
-                if dropped_cnt > 0:
-                    # _resolve_spec_v2_tokens has already advanced kv_committed_len by the full accept_lens.
-                    # If we stop early, roll back the tail tokens that are not kept. Otherwise memory leaks.
-                    req.kv_committed_len -= dropped_cnt
-                next_token_id = kept_token_ids
+                req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
             req.time_stats.set_last_decode_finish_time()
-            if batch.spec_algorithm.is_none():
-                req.update_finish_state(new_accepted_len)
-            # else: already called update_finish_state per-token in the loop above
+            req.update_finish_state(new_accepted_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
