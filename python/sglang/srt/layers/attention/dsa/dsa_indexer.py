@@ -615,7 +615,7 @@ class Indexer(MultiPlatformOp):
             if not out_cache_loc.is_contiguous():
                 out_cache_loc = out_cache_loc.contiguous()
             fused_k_indexer_norm_rope_store(
-                key_raw.contiguous(),
+                key_raw,
                 pool.get_index_k_with_scale_buffer(layer_id=layer_id),
                 out_cache_loc,
                 self.k_norm.weight,
@@ -630,7 +630,7 @@ class Indexer(MultiPlatformOp):
 
         # Fallback: separate K kernel (-> bf16) + store kernel.
         key = fused_k_indexer_norm_rope_first_hadamard(
-            key_raw.contiguous(),
+            key_raw,
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.variance_epsilon,
@@ -665,7 +665,7 @@ class Indexer(MultiPlatformOp):
             q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             return fused_q_indexer_rope_first_hadamard_quant(
                 q.contiguous(),
-                weights_raw.contiguous(),
+                weights_raw,
                 q_scale_gate,
                 self._indexer_freqs_cis,
                 positions,
@@ -700,7 +700,7 @@ class Indexer(MultiPlatformOp):
 
         q_fp8, weights = fused_q_indexer_rope_first_hadamard_quant(
             q.contiguous(),
-            weights_raw.contiguous(),
+            weights_raw,
             q_scale_gate,
             self._indexer_freqs_cis,
             positions,

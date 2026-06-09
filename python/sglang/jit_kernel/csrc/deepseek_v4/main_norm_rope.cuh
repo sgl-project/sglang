@@ -425,6 +425,10 @@ struct FusedQIndexerRopeHadamardQuantParams {
   float weight_scale;                   // scalar c4_indexer.weight_scale
   const float* __restrict__ freqs_cis;  // (max_pos, 64) fp32
   const void* __restrict__ positions;   // (B,) PosT
+  // Row stride for `weight` in elements: lets the caller pass the non-contiguous
+  // wk slice kw[:, head_dim:] directly (stride = head_dim + n_heads) without a copy.
+  // Equals num_heads when weight is contiguous, recovering the old flat indexing.
+  int64_t weight_stride_batch;
   uint32_t batch_size;
   uint32_t num_heads;
 };
@@ -467,7 +471,9 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
 
   PDLWaitPrimary<kUsePDL>();
   Float4 data, freq;
-  const auto weight_val = cast<float>(static_cast<const DType*>(params.weight)[work_id]);
+  const uint32_t head_id = work_id - batch_id * params.num_heads;
+  const auto weight_val =
+      cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
 
   // part 1: load (no norm). Each lane owns a 4-elem pack.
   {
@@ -588,6 +594,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .with_device(device_)
         .verify(q_fp8);
     TensorMatcher({B, H})  //
+        .with_strides({-1, 1})
         .with_dtype<DType>()
         .with_device(device_)
         .verify(weight);
@@ -629,6 +636,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .weight_scale = static_cast<float>(weight_scale),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
+        .weight_stride_batch = weight.stride(0),
         .batch_size = batch_size,
         .num_heads = num_heads,
     };
@@ -655,6 +663,8 @@ struct FusedKIndexerNormRopeHadamardParams {
   const float* __restrict__ bias;       // (128,) fp32  -- LayerNorm beta
   const float* __restrict__ freqs_cis;  // (max_pos, 64) fp32
   const void* __restrict__ positions;   // (B,) PosT
+  // Row stride for `k_input` in elements (caller passes the wk slice directly).
+  int64_t k_input_stride_batch;
   uint32_t batch_size;
   float eps;
 };
@@ -683,7 +693,7 @@ Q_KERNEL void fused_k_indexer_norm_rope_hadamard(const __grid_constant__ FusedKI
 
   if (work_id >= params.batch_size) return;
 
-  const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * kHeadDim;
+  const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
@@ -802,7 +812,7 @@ struct FusedKIndexerNormRopeHadamardKernel {
     device_.set_options<kDLCUDA>();
 
     TensorMatcher({B, kHeadDim})  //
-        .with_strides({kHeadDim, 1})
+        .with_strides({-1, 1})
         .with_dtype<DType>()
         .with_device(device_)
         .verify(k_input);
@@ -839,6 +849,7 @@ struct FusedKIndexerNormRopeHadamardKernel {
         .bias = static_cast<const float*>(bias.data_ptr()),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
+        .k_input_stride_batch = k_input.stride(0),
         .batch_size = batch_size,
         .eps = static_cast<float>(eps),
     };
@@ -868,6 +879,9 @@ struct FusedKIndexerNormRopeStoreParams {
   const float* __restrict__ bias;       // (128,) fp32  -- LayerNorm beta
   const float* __restrict__ freqs_cis;  // (max_pos, 64) fp32
   const void* __restrict__ positions;   // (B,) PosT
+  // Row stride for `k_input` in elements: the caller passes the non-contiguous
+  // wk slice kw[:, :128] (stride = head_dim + n_heads), avoiding a copy.
+  int64_t k_input_stride_batch;
   uint32_t batch_size;
   float eps;
 };
@@ -896,7 +910,7 @@ Q_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKInde
 
   if (work_id >= params.batch_size) return;
 
-  const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * kHeadDim;
+  const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
@@ -951,7 +965,7 @@ Q_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKInde
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 3: 128-point Hadamard (V3.2 omits it; kHadamard=false).
+  // part 3 (store kernel): 128-point Hadamard (V3.2 omits it; kHadamard=false).
   if constexpr (kHadamard) {
     {
       const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
@@ -1037,7 +1051,7 @@ struct FusedKIndexerNormRopeStoreKernel {
     device_.set_options<kDLCUDA>();
 
     TensorMatcher({B, kHeadDim})  //
-        .with_strides({kHeadDim, 1})
+        .with_strides({-1, 1})
         .with_dtype<DType>()
         .with_device(device_)
         .verify(k_input);
@@ -1079,6 +1093,7 @@ struct FusedKIndexerNormRopeStoreKernel {
         .bias = static_cast<const float*>(bias.data_ptr()),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
+        .k_input_stride_batch = k_input.stride(0),
         .batch_size = batch_size,
         .eps = static_cast<float>(eps),
     };

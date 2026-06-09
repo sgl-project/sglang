@@ -312,7 +312,8 @@ def fused_k_indexer_norm_rope_first_hadamard(
     applies the fp8 quant). hadamard=False skips the rotation (V3.2 default).
     """
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    k_out = torch.empty_like(k_input)
+    # k_input may be a non-contiguous wk slice; output is always contiguous.
+    k_out = torch.empty(k_input.shape, dtype=k_input.dtype, device=k_input.device)
     module = (
         _jit_main_k_indexer_norm_rope_first_hadamard_module(k_input.dtype)
         if hadamard
