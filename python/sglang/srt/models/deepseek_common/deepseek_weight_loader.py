@@ -209,9 +209,8 @@ class DeepseekV2WeightLoaderMixin:
                 if "rotary_emb.inv_freq" in name:
                     continue
 
-                # On CUDA, wk and weights_proj are fused into one bf16
-                # wk_weights_proj GEMM: wk fills the top head_dim rows (dequantized
-                # from block-fp8 if needed) and weights_proj the bottom n_heads rows.
+                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj: wk in
+                # the top head_dim rows (dequant from block-fp8), weights_proj below.
                 if ".indexer.wk." in name or ".indexer.weights_proj." in name:
                     base = name.rsplit(".indexer.", 1)[0] + ".indexer."
                     fused_name = base + "wk_weights_proj.weight"

@@ -391,11 +391,8 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        # Fused q path (CUDA): one kernel for rope (+ optional Hadamard) + fp8 quant
-        # + head-gate fold. freqs_cis is the complex form of the (interleaved) rope
-        # cos/sin cache, built from the fp32 cache before any forward casts it to bf16.
-        # V3.2 skips the Hadamard rotation (matches vLLM): it is logit-preserving
-        # (orthonormal, applied to both q and k) and only aids fp8 quant accuracy.
+        # V3.2 skips the Hadamard rotation (matches vLLM); it is logit-preserving.
+        # freqs_cis is built from the fp32 cos/sin cache before any forward casts it to bf16.
         self._indexer_use_hadamard = False
         self._indexer_freqs_cis: Optional[torch.Tensor] = None
         if _is_cuda:
@@ -601,9 +598,6 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         act_quant,
     ) -> None:
-        # Prefer the all-in-one kernel: LayerNorm + rope (+ Hadamard) + fp8 quant +
-        # paged cache write in one launch, so the whole K side is a single kernel
-        # that overlaps the Q kernel with no trailing store on the critical path.
         out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
         page_size = pool.page_size
@@ -628,7 +622,7 @@ class Indexer(MultiPlatformOp):
             )
             return
 
-        # Fallback: separate K kernel (-> bf16) + store kernel.
+        # Fallback: separate K kernel + store kernel.
         key = fused_k_indexer_norm_rope_first_hadamard(
             key_raw,
             self.k_norm.weight,
@@ -672,12 +666,8 @@ class Indexer(MultiPlatformOp):
                 hadamard=self._indexer_use_hadamard,
             )
 
-        # Two layers of overlap, with the returned q tensors kept on the current
-        # stream (the K kernel + cache store are the offloaded-to-alt work, as in
-        # the dual-stream path):
-        #   1. wq_b GEMM (alt) runs concurrently with the wk_weights_proj GEMM (current).
-        #   2. the fused Q kernel (current) runs concurrently with the fused K
-        #      kernel + cache store (alt).
+        # Two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
+        # then fused Q kernel (current) || fused K kernel + cache store (alt).
         # wait_stream calls are ordered by issue position so each side waits only
         # on the GEMMs it consumes, not on the other side's fused kernel.
         current_stream = torch.cuda.current_stream()
@@ -688,10 +678,7 @@ class Indexer(MultiPlatformOp):
         kw, _ = self.wk_weights_proj(x)
         key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
 
-        # Pull q (from the alt wq_b GEMM) onto the current stream; issued before
-        # the K work below so the current stream does not wait on it.
         current_stream.wait_stream(self.alt_stream)
-        # Hand key (from the current wk GEMM) to the alt stream for the K kernel.
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
             self._fused_k_prepare_and_store(
