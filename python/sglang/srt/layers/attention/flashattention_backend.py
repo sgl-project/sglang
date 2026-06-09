@@ -808,7 +808,16 @@ class FlashAttentionBackend(AttentionBackend):
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
                     cp_allgather_and_save_kv_cache(
-                        forward_batch, layer, k, v, self.attn_cp_size
+                        forward_batch,
+                        layer,
+                        k,
+                        v,
+                        self.attn_cp_size,
+                        swa_loc=(
+                            self.forward_metadata.swa_out_cache_loc
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
                     )
                 elif self.use_sliding_window_kv_pool:
                     self.token_to_kv_pool.set_kv_buffer(

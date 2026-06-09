@@ -286,7 +286,16 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     )
             if is_cp_mode:
                 cp_allgather_and_save_kv_cache(
-                    forward_batch, layer, k, v, self.attn_cp_size
+                    forward_batch,
+                    layer,
+                    k,
+                    v,
+                    self.attn_cp_size,
+                    swa_loc=(
+                        self.forward_metadata.swa_out_cache_loc
+                        if self.use_sliding_window_kv_pool
+                        else None
+                    ),
                 )
 
         metadata = self.forward_metadata
