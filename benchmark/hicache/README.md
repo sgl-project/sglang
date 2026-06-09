@@ -125,7 +125,7 @@ servers. Use `--base-url` when the server is not on the backend's default port.
 
 | Backend | Endpoint | Default port |
 | --- | --- | --- |
-| `sglang` | `/v1/chat/completions` (legacy alias) | 30000 |
+| `sglang` | `/generate` (native, token-id level) | 30000 |
 | `sglang-oai` | `/v1/completions` | 30000 |
 | `sglang-oai-chat` | `/v1/chat/completions` | 30000 |
 | `vllm` | `/v1/completions` | 8000 |
