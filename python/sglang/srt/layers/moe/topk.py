@@ -1511,6 +1511,11 @@ def _post_process_topk_ids(
         # routing weights for padded tokens so their MoE output contributes
         # nothing to the hidden state after the weighted sum.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+    elif _is_cpu:
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids, expert_location_dispatch_info
+        )
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
