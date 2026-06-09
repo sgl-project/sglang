@@ -70,7 +70,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_npu,
+    log_info_on_rank0,
+    require_attn_tp_gather,
+    require_mlp_tp_gather,
+)
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
@@ -166,6 +172,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
+        self.dp_size = model_runner.server_args.dp_size
+        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+
         # --- backend ---------------------------------------------------
         # When the backend is Breakable, captured segments need stable
         # tensor addresses, so we own a set of static int64 buffers here
@@ -207,7 +217,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
         """Run model.forward inside the prefill set_tc_piecewise_forward_context."""
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
+        set_dp_buffer_len(
+            forward_batch.global_dp_buffer_len,
+            num_tokens,
+            forward_batch.dp_padding_mode.is_max_len(),
+            forward_batch.global_num_tokens_cpu,
+        )
         set_is_extend_in_batch(False)
 
         with forward_context(
@@ -315,6 +330,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         def _slot(name):
             return registry.get_slot(name).slice_for(bs, num_tokens)
 
+        if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
+        elif self.require_attn_tp_gather:
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=self.device
+            )
+            global_num_tokens_gpu = num_tokens_tensor
+            global_num_tokens_for_logprob_gpu = num_tokens_tensor
+        else:
+            global_dp_buffer_len = None
+            global_num_tokens_gpu = None
+            global_num_tokens_for_logprob_gpu = None
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -355,10 +389,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=_slot("positions"),
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+                global_num_tokens_cpu=global_num_tokens_cpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=(
                     _slot("mrope_positions")
                     if registry.has_slot("mrope_positions")
