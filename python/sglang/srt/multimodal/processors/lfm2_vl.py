@@ -32,6 +32,7 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
     """
 
     models = [Lfm2VlForConditionalGeneration]
+    gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -67,7 +68,7 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
                 "im_token_id": self.IMAGE_TOKEN_ID,
             }
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,

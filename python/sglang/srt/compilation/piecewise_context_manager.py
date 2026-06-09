@@ -71,7 +71,9 @@ class ForwardContext:
         self.quant_config = None
         self.moe_layers = None
         self.moe_fusions = None
+        self.dsa_indexers = None
         self.num_tokens: Optional[int] = None
+        self.raw_num_tokens: Optional[int] = None
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
@@ -87,6 +89,9 @@ class ForwardContext:
 
     def set_moe_fusions(self, fusions: List[Any]):
         self.moe_fusions = fusions
+
+    def set_dsa_indexers(self, indexers: List[Any]):
+        self.dsa_indexers = indexers
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -105,7 +110,9 @@ def set_forward_context(
     quant_config: Any,
     moe_layers: List[Any],
     moe_fusions: List[Any],
+    dsa_indexers: Optional[List[Any]] = None,
     num_tokens: Optional[int] = None,
+    raw_num_tokens: Optional[int] = None,
 ):
     global _forward_context
     _forward_context = ForwardContext()
@@ -114,7 +121,10 @@ def set_forward_context(
     _forward_context.set_quant_config(quant_config)
     _forward_context.set_moe_layers(moe_layers)
     _forward_context.set_moe_fusions(moe_fusions)
+    if dsa_indexers is not None:
+        _forward_context.set_dsa_indexers(dsa_indexers)
     _forward_context.num_tokens = num_tokens
+    _forward_context.raw_num_tokens = raw_num_tokens
     try:
         yield
     finally:
