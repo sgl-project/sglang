@@ -208,6 +208,7 @@ class RMSNorm(MultiPlatformOp):
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
+        x_pad_to_multiple: int = 0,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -223,7 +224,25 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
+        # When > 0, fuse a zero-pad of the last dim out to a multiple of
+        # this value into the rmsnorm kernel via aiter's
+        # `fused_add_rmsnorm_pad` Triton kernel. The padded output has
+        # shape (M, ceil(N/x_pad_to_multiple)*x_pad_to_multiple); the
+        # residual_out stays at the original (M, N) shape.
+
         if _use_aiter:
+            self.x_pad_to_multiple = x_pad_to_multiple
+            self._fused_pad_kernel = None
+
+            if x_pad_to_multiple > 0:
+                try:
+                    from aiter.ops.triton.fused_add_rmsnorm_pad import (
+                        fused_add_rmsnorm_pad as _fused_add_rmsnorm_pad,
+                    )
+
+                    self._fused_pad_kernel = _fused_add_rmsnorm_pad
+                except ImportError:
+                    self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
@@ -345,6 +364,22 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         elif not x.is_contiguous():
             x = x.contiguous()
+        # Fused (add +) rmsnorm + zero-pad path. Triggered when caller
+        # constructed RMSNorm with x_pad_to_multiple > 0. Output last
+        # dim is padded up; residual_out stays at original width. Used
+        # by callers (e.g. GPT-OSS MXFP4 MoE) whose immediate consumer
+        # needs a padded hidden_size — folding the pad in here removes a
+        # separate launch.
+        if self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0:
+            if post_residual_addition is not None and residual is not None:
+                residual = residual + post_residual_addition
+            return self._fused_pad_kernel(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                residual,
+                self.x_pad_to_multiple,
+            )
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
