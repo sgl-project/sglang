@@ -55,10 +55,38 @@ def _optional_env_str(name: str) -> Optional[str]:
     return value if value is not None and value != "" else None
 
 
-def _bool_from_any(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "off"})
+
+
+def _strict_bool(value: Any, key: str) -> bool:
+    """Strict boolean parse; raises rather than silently inverting (bool("false") is True)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+    elif isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in _TRUE_STRINGS:
+            return True
+        if norm in _FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"extra_config[{key!r}] must be a boolean-like value "
+        f"(true/false, 1/0, yes/no, on/off), got {value!r}"
+    )
+
+
+def _cast_like(current: Any, value: Any, key: str) -> Any:
+    """Cast ``value`` to match the type of an existing config attribute."""
+    if isinstance(current, bool):
+        return _strict_bool(value, key)
+    if isinstance(current, int):
+        return int(value)
+    if isinstance(current, float):
+        return float(value)
+    return str(value)
 
 
 def _default_node_address() -> str:
@@ -95,6 +123,105 @@ def _select_rank_config_value(
     if auto_increment_scalar:
         selected = cast_type(selected + rank_index)
     return selected
+
+
+# extra_config is an explicit allow-list grouped by the scope in which each key
+# takes effect (distributed mode is enabled by master_address). Advanced SPDK
+# knobs outside this list go through the "spdk_passthrough" escape hatch.
+_COMMON_EXTRA_KEYS = frozenset(
+    {
+        "dram_capacity_bytes",
+        "ssd_enabled",
+        "ssd_storage_dir",
+        "ssd_capacity_bytes",
+        "ssd_segment_size_bytes",
+        "ssd_queue_depth",
+        "ssd_io_backend",
+        "ssd_durability_mode",
+        "ssd_backend",
+        "ssd_high_watermark",
+        "ssd_low_watermark",
+        "ssd_copy_queue_depth",
+        "ssd_copy_worker_threads",
+        "spdk_nvme_pci_addr",
+        "spdk_proxy_shm_name",
+        "spdk_proxy_startup_timeout_ms",
+        "spdk_proxy_bin",
+        "spdk_proxy_tenant_id",
+        "spdk_proxy_tenant_id_base",
+        "spdk_proxy_tenant_quota_bytes",
+        "spdk_proxy_max_channels",
+        "spdk_proxy_data_per_channel_mb",
+        "spdk_proxy_auto_start",
+        "spdk_proxy_idle_exit_timeout_ms",
+        "spdk_proxy_allow_borrow",
+        "spdk_proxy_reserved_shared_bytes",
+        "spdk_passthrough",
+        "kv_events_subscriber",
+        "kv_events_endpoint",
+        "kv_events_topic",
+    }
+)
+
+# No-op in distributed mode (PeerSsdManager/SsdCopyPipeline have no equivalent).
+_STANDALONE_ONLY_EXTRA_KEYS = frozenset(
+    {
+        "ssd_copy_async",
+        "ssd_copy_batch_max_ops",
+        "eviction_policy",
+        "eviction_candidate_window",
+        "auto_promote_on_read",
+    }
+)
+
+_DISTRIBUTED_ONLY_EXTRA_KEYS = frozenset(
+    {
+        "master_address",
+        "node_address",
+        "node_id",
+        "auto_heartbeat",
+        "io_engine_host",
+        "io_engine_port",
+        "staging_buffer_size",
+        "ssd_staging_buffer_size",
+        "ssd_staging_buffer_slots",
+        "peer_service_port",
+        "cache_remote_fetches",
+        "dram_page_size",
+        "disable_zero_copy_register",
+    }
+)
+
+_KNOWN_EXTRA_KEYS = (
+    _COMMON_EXTRA_KEYS | _STANDALONE_ONLY_EXTRA_KEYS | _DISTRIBUTED_ONLY_EXTRA_KEYS
+)
+
+
+def _warn_extra_config_scope(extra: dict, distributed_enabled: bool) -> None:
+    """Warn about unknown keys and keys set in a mode where they are no-op."""
+    for key in extra:
+        if key not in _KNOWN_EXTRA_KEYS:
+            logger.warning(
+                "UMBPStore: unknown extra_config key %r is ignored. Check for a "
+                "typo; advanced SPDK knobs go through extra_config['spdk_passthrough'].",
+                key,
+            )
+    if distributed_enabled:
+        for key in _STANDALONE_ONLY_EXTRA_KEYS:
+            if key in extra:
+                logger.warning(
+                    "UMBPStore: extra_config[%r] is a standalone-only knob and has "
+                    "no effect in distributed mode (master_address set).",
+                    key,
+                )
+    else:
+        for key in _DISTRIBUTED_ONLY_EXTRA_KEYS:
+            if key in extra and key != "master_address":
+                logger.warning(
+                    "UMBPStore: extra_config[%r] only applies in distributed mode "
+                    "(master_address) and is ignored in standalone/local mode.",
+                    key,
+                )
 
 
 class UMBPStore(HiCacheStorage):
@@ -176,51 +303,64 @@ class UMBPStore(HiCacheStorage):
         if "dram_capacity_bytes" in extra:
             cfg.dram.capacity_bytes = int(extra["dram_capacity_bytes"])
         if "ssd_enabled" in extra:
-            cfg.ssd.enabled = bool(extra["ssd_enabled"])
+            cfg.ssd.enabled = _strict_bool(extra["ssd_enabled"], "ssd_enabled")
         if "ssd_storage_dir" in extra:
             cfg.ssd.storage_dir = str(extra["ssd_storage_dir"])
         if "ssd_capacity_bytes" in extra:
             cfg.ssd.capacity_bytes = int(extra["ssd_capacity_bytes"])
-        if "copy_to_ssd_async" in extra:
-            cfg.copy_pipeline.async_enabled = bool(extra["copy_to_ssd_async"])
-        if "copy_to_ssd_queue_depth" in extra:
-            cfg.copy_pipeline.queue_depth = int(extra["copy_to_ssd_queue_depth"])
+        if "ssd_copy_async" in extra:
+            cfg.copy_pipeline.async_enabled = _strict_bool(
+                extra["ssd_copy_async"], "ssd_copy_async"
+            )
+        if "ssd_copy_queue_depth" in extra:
+            cfg.copy_pipeline.queue_depth = int(extra["ssd_copy_queue_depth"])
         if "ssd_segment_size_bytes" in extra:
             cfg.ssd.segment_size_bytes = int(extra["ssd_segment_size_bytes"])
-        if "ssd_batch_max_ops" in extra:
-            cfg.copy_pipeline.batch_max_ops = int(extra["ssd_batch_max_ops"])
+        if "ssd_copy_batch_max_ops" in extra:
+            cfg.copy_pipeline.batch_max_ops = int(extra["ssd_copy_batch_max_ops"])
         if "ssd_queue_depth" in extra:
             cfg.ssd.io.queue_depth = int(extra["ssd_queue_depth"])
-        if "ssd_writer_threads" in extra:
-            cfg.copy_pipeline.worker_threads = int(extra["ssd_writer_threads"])
-        if "ssd_enable_background_gc" in extra:
-            cfg.ssd.durability.enable_background_gc = bool(
-                extra["ssd_enable_background_gc"]
-            )
+        if "ssd_copy_worker_threads" in extra:
+            cfg.copy_pipeline.worker_threads = int(extra["ssd_copy_worker_threads"])
         if "auto_promote_on_read" in extra:
-            cfg.eviction.auto_promote_on_read = bool(extra["auto_promote_on_read"])
+            cfg.eviction.auto_promote_on_read = _strict_bool(
+                extra["auto_promote_on_read"], "auto_promote_on_read"
+            )
         if "eviction_policy" in extra:
             cfg.eviction.policy = str(extra["eviction_policy"])
         if "eviction_candidate_window" in extra:
             cfg.eviction.candidate_window = int(extra["eviction_candidate_window"])
-        if "ssd_io_backend" in extra and UMBPIoBackend is not None:
-            backend = str(extra["ssd_io_backend"]).lower()
-            if backend in ("pthread", "posix"):
-                cfg.ssd.io.backend = UMBPIoBackend.PThread
-            elif backend in ("io_uring", "uring"):
-                cfg.ssd.io.backend = UMBPIoBackend.IoUring
-        if "ssd_durability_mode" in extra and UMBPDurabilityMode is not None:
-            durability = str(extra["ssd_durability_mode"]).lower()
-            if durability in ("strict", "sync"):
-                cfg.ssd.durability.mode = UMBPDurabilityMode.Strict
-            elif durability in ("relaxed", "async"):
-                cfg.ssd.durability.mode = UMBPDurabilityMode.Relaxed
+        if "ssd_io_backend" in extra:
+            backend = str(extra["ssd_io_backend"]).strip().lower()
+            if backend not in ("posix", "io_uring"):
+                raise ValueError(
+                    "extra_config['ssd_io_backend'] must be one of: posix, io_uring"
+                )
+            if UMBPIoBackend is not None:
+                cfg.ssd.io.backend = (
+                    UMBPIoBackend.Posix
+                    if backend == "posix"
+                    else UMBPIoBackend.IoUring
+                )
+        if "ssd_durability_mode" in extra:
+            # Validate even when the enum is unavailable (older mori / mocks).
+            durability = str(extra["ssd_durability_mode"]).strip().lower()
+            if durability not in ("strict", "sync", "relaxed", "async"):
+                raise ValueError(
+                    "extra_config['ssd_durability_mode'] must be one of: "
+                    "strict, sync, relaxed, async"
+                )
+            if UMBPDurabilityMode is not None:
+                if durability in ("strict", "sync"):
+                    cfg.ssd.durability.mode = UMBPDurabilityMode.Strict
+                else:
+                    cfg.ssd.durability.mode = UMBPDurabilityMode.Relaxed
         if "ssd_backend" in extra:
             ssd_backend = str(extra["ssd_backend"]).strip().lower()
-            if ssd_backend not in ("posix", "spdk", "spdk_proxy"):
+            if ssd_backend not in ("file", "spdk", "spdk_proxy"):
                 raise ValueError(
                     "extra_config['ssd_backend'] must be one of: "
-                    "posix, spdk, spdk_proxy"
+                    "file, spdk, spdk_proxy"
                 )
             cfg.ssd.ssd_backend = ssd_backend
         if "spdk_nvme_pci_addr" in extra:
@@ -246,17 +386,56 @@ class UMBPStore(HiCacheStorage):
                 extra["spdk_proxy_data_per_channel_mb"]
             )
         if "spdk_proxy_auto_start" in extra:
-            cfg.ssd.spdk_proxy_auto_start = bool(extra["spdk_proxy_auto_start"])
+            cfg.ssd.spdk_proxy_auto_start = _strict_bool(
+                extra["spdk_proxy_auto_start"], "spdk_proxy_auto_start"
+            )
         if "spdk_proxy_idle_exit_timeout_ms" in extra:
             cfg.ssd.spdk_proxy_idle_exit_timeout_ms = int(
                 extra["spdk_proxy_idle_exit_timeout_ms"]
             )
         if "spdk_proxy_allow_borrow" in extra:
-            cfg.ssd.spdk_proxy_allow_borrow = bool(extra["spdk_proxy_allow_borrow"])
+            cfg.ssd.spdk_proxy_allow_borrow = _strict_bool(
+                extra["spdk_proxy_allow_borrow"], "spdk_proxy_allow_borrow"
+            )
         if "spdk_proxy_reserved_shared_bytes" in extra:
             cfg.ssd.spdk_proxy_reserved_shared_bytes = int(
                 extra["spdk_proxy_reserved_shared_bytes"]
             )
+
+        # Expert escape hatch for advanced SPDK knobs outside the stable
+        # extra_config surface, forwarded to UMBPSsdConfig as-is.
+        if "spdk_passthrough" in extra:
+            overrides = extra["spdk_passthrough"]
+            if not isinstance(overrides, dict):
+                raise ValueError(
+                    "extra_config['spdk_passthrough'] must be a dict of "
+                    "spdk_* field overrides"
+                )
+            applied = []
+            for field_name, field_value in overrides.items():
+                if not field_name.startswith("spdk_") or not hasattr(
+                    cfg.ssd, field_name
+                ):
+                    raise ValueError(
+                        f"spdk_passthrough: unknown SSD config field {field_name!r} "
+                        "(must be an existing spdk_* field on UMBPSsdConfig)"
+                    )
+                current = getattr(cfg.ssd, field_name)
+                setattr(
+                    cfg.ssd,
+                    field_name,
+                    _cast_like(current, field_value, field_name),
+                )
+                applied.append(field_name)
+            if applied:
+                logger.warning(
+                    "UMBPStore: using spdk_passthrough expert escape hatch for "
+                    "fields %s; these are advanced backend knobs forwarded directly "
+                    "to UMBPSsdConfig and are not part of the stable extra_config "
+                    "surface.",
+                    applied,
+                )
+
         if "ssd_high_watermark" in extra and hasattr(cfg.ssd, "high_watermark"):
             cfg.ssd.high_watermark = float(extra["ssd_high_watermark"])
         if "ssd_low_watermark" in extra and hasattr(cfg.ssd, "low_watermark"):
@@ -273,7 +452,7 @@ class UMBPStore(HiCacheStorage):
             _optional_env_str("UMBP_DISABLE_ZERO_COPY_REGISTER"),
         )
         self._disable_zero_copy_register = (
-            _bool_from_any(disable_zero_copy_register)
+            _strict_bool(disable_zero_copy_register, "disable_zero_copy_register")
             if disable_zero_copy_register is not None
             else False
         )
@@ -281,9 +460,14 @@ class UMBPStore(HiCacheStorage):
         master_address = extra.get(
             "master_address", _optional_env_str("UMBP_MASTER_ADDRESS")
         )
+
+        _warn_extra_config_scope(extra, distributed_enabled=bool(master_address))
         if master_address and UMBPDistributedConfig is not None:
             dist_cfg = UMBPDistributedConfig()
             dist_cfg.master_config.master_address = str(master_address)
+
+            if "ssd_copy_worker_threads" not in extra:
+                cfg.copy_pipeline.worker_threads = 1
 
             node_address = extra.get(
                 "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
@@ -314,8 +498,8 @@ class UMBPStore(HiCacheStorage):
                 )
 
             if "auto_heartbeat" in extra:
-                dist_cfg.master_config.auto_heartbeat = _bool_from_any(
-                    extra["auto_heartbeat"]
+                dist_cfg.master_config.auto_heartbeat = _strict_bool(
+                    extra["auto_heartbeat"], "auto_heartbeat"
                 )
 
             io_engine_host = extra.get(
@@ -375,7 +559,9 @@ class UMBPStore(HiCacheStorage):
                 _optional_env_str("UMBP_CACHE_REMOTE_FETCHES"),
             )
             if cache_remote_fetches is not None:
-                dist_cfg.cache_remote_fetches = _bool_from_any(cache_remote_fetches)
+                dist_cfg.cache_remote_fetches = _strict_bool(
+                    cache_remote_fetches, "cache_remote_fetches"
+                )
 
             # Auto-compute master's PageBitmapAllocator page_size so every
             # UMBPStore Put/Get maps to exactly one master page (no partial
@@ -647,7 +833,9 @@ class UMBPStore(HiCacheStorage):
         _dp_rank = dp_rank_hint if dp_rank_hint is not None else 0
 
         self._kv_events_subscriber: Optional[KVEventsSubscriber] = None
-        if _bool_from_any(extra.get("kv_events_subscriber", False)):
+        if _strict_bool(
+            extra.get("kv_events_subscriber", False), "kv_events_subscriber"
+        ):
             # DP mode: all DP clients subscribe (filter by dp_rank in on_event).
             # TP-only mode: only rank 0 subscribes.
             if _is_dp_mode or self.local_rank == 0:
