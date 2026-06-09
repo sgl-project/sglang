@@ -2669,6 +2669,10 @@ class ServerArgs:
         bool,
         "Start seed server via transfer engine backend for remote instance weight loader.",
     ] = False
+    enable_engine_info_bootstrap: A[
+        bool,
+        "Start the EngineInfoBootstrapServer and register per-rank parallelism config WITHOUT the mooncake/verbs P2P transfer-engine seeding. Used by RDT (NIXL) weight sync, which needs /parallelism_config but not P2P memory registration.",
+    ] = False
     engine_info_bootstrap_port: A[
         int,
         "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",
@@ -8090,6 +8094,24 @@ class ServerArgs:
             return True
         else:
             return False
+
+    def needs_engine_info_bootstrap(self) -> bool:
+        """Host the EngineInfoBootstrapServer on this node (rank 0). True for the
+        transfer-engine seed, and for RDT/NIXL weight sync (which needs the server
+        to expose parallelism config to the trainer, but not the P2P memory seeding)."""
+        return (
+            self.remote_instance_weight_loader_start_seed_via_transfer_engine
+            or self.enable_engine_info_bootstrap
+        )
+
+    def registers_parallelism_config(self) -> bool:
+        """Publish this rank's parallelism config to the bootstrap server (hosted
+        locally by the seed, or remotely). True whenever a transfer engine is in use,
+        and for RDT/NIXL weight sync."""
+        return (
+            self.remote_instance_weight_loader_use_transfer_engine()
+            or self.enable_engine_info_bootstrap
+        )
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
