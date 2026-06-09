@@ -242,29 +242,30 @@ def _fused_linear_compact_state_replay_with_mask_kernel(
     )
     b_h = tl.load(dst_ptr + dst_base, mask=mask_h, other=0.0).to(tl.float32)
 
-    for t in range(0, src_step_size):
-        if t <= step_idx:
-            k_norm_base = (
-                ((pid_layer * src_req_size + pid_req) * src_step_size + t) * NUM_HEADS
-                + pid_head
-            ) * K + offs_k
-            delta_v_base = (
-                ((pid_layer * src_req_size + pid_req) * src_step_size + t) * NUM_HEADS
-                + pid_head
-            ) * V + offs_v
+    # Compact replay inputs are cached in dense request order, matching
+    # fused_mamba_state_scatter_with_mask; base_idx selects the SSM state slot.
+    for t in tl.range(0, step_idx + 1):
+        k_norm_base = (
+            ((pid_layer * src_req_size + pid_req) * src_step_size + t) * NUM_HEADS
+            + pid_head
+        ) * K + offs_k
+        delta_v_base = (
+            ((pid_layer * src_req_size + pid_req) * src_step_size + t) * NUM_HEADS
+            + pid_head
+        ) * V + offs_v
 
-            b_k_norm = tl.load(k_norm_ptr + k_norm_base, mask=mask_k, other=0.0).to(
-                tl.float32
-            )
-            b_delta_v = tl.load(delta_v_ptr + delta_v_base, mask=mask_v, other=0.0).to(
-                tl.float32
-            )
-            b_decay = tl.load(decay_ptr + k_norm_base, mask=mask_k, other=1.0).to(
-                tl.float32
-            )
+        b_k_norm = tl.load(k_norm_ptr + k_norm_base, mask=mask_k, other=0.0).to(
+            tl.float32
+        )
+        b_delta_v = tl.load(delta_v_ptr + delta_v_base, mask=mask_v, other=0.0).to(
+            tl.float32
+        )
+        b_decay = tl.load(decay_ptr + k_norm_base, mask=mask_k, other=1.0).to(
+            tl.float32
+        )
 
-            b_h *= b_decay[:, None]
-            b_h += b_k_norm[:, None] * b_delta_v[None, :]
+        b_h *= b_decay[:, None]
+        b_h += b_k_norm[:, None] * b_delta_v[None, :]
 
     dst_out = (
         ((pid_layer * dst_req_size + dst_idx) * NUM_HEADS + pid_head) * V * K
@@ -341,6 +342,8 @@ def _fused_linear_compact_state_replay_with_track_kernel(
     )
     b_h = tl.load(dst_ptr + dst_base, mask=mask_h, other=0.0).to(tl.float32)
 
+    # Compact replay inputs are cached in dense request order, matching
+    # fused_mamba_state_scatter_with_mask; base_idx selects the SSM state slot.
     if track_valid:
         for t in tl.range(0, track_step + 1):
             k_norm_base = (
