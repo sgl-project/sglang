@@ -184,7 +184,6 @@ class NixlFileManager:
             self.base_dirs = [base_dir] if base_dir else []
         else:
             self.base_dirs = [d for d in base_dir if d]
-        self.base_dir = self.base_dirs[0] if self.base_dirs else ""
         self.use_direct_io = use_direct_io
         self._created_bucket_dirs: set[str] = set()
         if not self.base_dirs:
