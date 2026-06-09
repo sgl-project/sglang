@@ -142,31 +142,27 @@ if _is_cuda:
             topk_result,
         )
 
-    def _logits_head_gate_pcg_fake_impl(
-        x: torch.Tensor,
-        weight: torch.Tensor,
+    def _scale_head_gate_pcg_fake_impl(
+        weights_raw: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty(
-            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+            (weights_raw.shape[0], weights_raw.shape[1], q_scale.shape[-1]),
             dtype=torch.float32,
-            device=x.device,
+            device=weights_raw.device,
         )
 
-    @register_custom_op(fake_impl=_logits_head_gate_pcg_fake_impl)
-    def logits_head_gate_pcg(
-        x: torch.Tensor,
-        weight: torch.Tensor,
+    @register_custom_op(fake_impl=_scale_head_gate_pcg_fake_impl)
+    def scale_head_gate_pcg(
+        weights_raw: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
-        weights = out * n_heads_inv_sqrt
-        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
-        return weights
+        weights = weights_raw * n_heads_inv_sqrt
+        return weights.unsqueeze(-1) * q_scale * softmax_scale
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
@@ -351,20 +347,29 @@ class Indexer(MultiPlatformOp):
             prefix=add_prefix("wq_b", prefix),
         )
 
-        self.wk = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("weights_proj", prefix),
-        )
+        if _is_cuda:
+            self.wk_weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim + self.n_heads,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("wk_weights_proj", prefix),
+            )
+        else:
+            self.wk = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wk", prefix),
+            )
+            self.weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("weights_proj", prefix),
+            )
         self.k_norm = LayerNorm(
             self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
         )
@@ -436,6 +441,20 @@ class Indexer(MultiPlatformOp):
     ):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
+    @torch.compile(dynamic=True)
+    def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
+        weights = weights_raw * self.n_heads**-0.5
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+    def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cuda:
+            return x
+        return rotate_activation(x)
+
+    def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        kw, _ = self.wk_weights_proj(x)
+        return kw.split([self.head_dim, self.n_heads], dim=-1)
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -444,6 +463,7 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        weights_raw = None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -460,7 +480,10 @@ class Indexer(MultiPlatformOp):
                 )
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
-                key, _ = self.wk(x)
+                if _is_cuda:
+                    key, weights_raw = self._fused_k_weights(x)
+                else:
+                    key, _ = self.wk(x)
                 key = self.k_norm(key)
 
                 k_rope, _ = torch.split(
@@ -476,7 +499,10 @@ class Indexer(MultiPlatformOp):
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
-            key, _ = self.wk(x)
+            if _is_cuda:
+                key, weights_raw = self._fused_k_weights(x)
+            else:
+                key, _ = self.wk(x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -490,20 +516,20 @@ class Indexer(MultiPlatformOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            query = self._maybe_rotate(query)
 
             with torch.cuda.stream(self.alt_stream):
-                key = rotate_activation(key)
+                key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
         elif (
             self.alt_stream is not None
             and forward_batch.attn_cp_metadata is not None
             and self.dsa_enable_prefill_cp
         ):
-            key = rotate_activation(key)
+            key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            query = self._maybe_rotate(query)
 
             with torch.cuda.stream(self.alt_stream):
                 key = cp_all_gather_rerange_output(
@@ -513,10 +539,10 @@ class Indexer(MultiPlatformOp):
                     torch.cuda.current_stream(),
                 )
             current_stream.wait_stream(self.alt_stream)
-            return query, key
+            return query, key, weights_raw
         else:
-            query = rotate_activation(query)
-            key = rotate_activation(key)
+            query = self._maybe_rotate(query)
+            key = self._maybe_rotate(key)
 
         # allgather+rerrange
         if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
@@ -526,7 +552,7 @@ class Indexer(MultiPlatformOp):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        return query, key
+        return query, key, weights_raw
 
     def _get_k_bf16(
         self,
@@ -535,7 +561,10 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream: bool,
     ):
         # Compute only key, skip query
-        key, _ = self.wk(x)
+        if _is_cuda:
+            key, _ = self._fused_k_weights(x)
+        else:
+            key, _ = self.wk(x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -543,7 +572,7 @@ class Indexer(MultiPlatformOp):
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = rotate_activation(key)
+        key = self._maybe_rotate(key)
 
         return key
 
@@ -1385,8 +1414,9 @@ class Indexer(MultiPlatformOp):
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            weights = self._project_and_scale_head_gates(x)
-            query, key = self._get_q_k_bf16(
+            if not _is_cuda:
+                weights = self._project_and_scale_head_gates(x)
+            query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
@@ -1398,9 +1428,12 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+            if _is_cuda:
+                weights = self._scale_head_gates(weights_raw, q_scale)
+            else:
+                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
-            query, key = self._get_q_k_bf16(
+            query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
 
@@ -1472,13 +1505,14 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if is_in_piecewise_cuda_graph():
-                weights = logits_head_gate_pcg(
-                    x_for_gate,
-                    self.weights_proj.weight,
+                weights = scale_head_gate_pcg(
+                    weights_raw,
                     self.n_heads**-0.5,
                     self.softmax_scale,
                     q_scale,
                 )
+            elif _is_cuda:
+                weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 

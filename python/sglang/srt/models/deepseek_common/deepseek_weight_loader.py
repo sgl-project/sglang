@@ -147,6 +147,8 @@ class DeepseekV2WeightLoaderMixin:
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
+        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
@@ -206,6 +208,46 @@ class DeepseekV2WeightLoaderMixin:
 
                 if "rotary_emb.inv_freq" in name:
                     continue
+
+                # On CUDA, wk and weights_proj are fused into one bf16
+                # wk_weights_proj GEMM: wk fills the top head_dim rows (dequantized
+                # from block-fp8 if needed) and weights_proj the bottom n_heads rows.
+                if ".indexer.wk." in name or ".indexer.weights_proj." in name:
+                    base = name.rsplit(".indexer.", 1)[0] + ".indexer."
+                    fused_name = base + "wk_weights_proj.weight"
+                    fused_param = params_dict.get(fused_name)
+                    if fused_param is not None and fused_param.dtype == torch.bfloat16:
+                        if ".indexer.weights_proj." in name:
+                            w = _clone_if_runai_streamed_tensor(loaded_weight)
+                            fused_param.data[-w.shape[0] :].copy_(w)
+                            continue
+                        is_wk_scale = name.endswith(".weight_scale_inv")
+                        is_wk_fp8 = (
+                            not is_wk_scale
+                            and loaded_weight.dtype == torch.float8_e4m3fn
+                        )
+                        if not is_wk_scale and not is_wk_fp8:
+                            w = _clone_if_runai_streamed_tensor(loaded_weight)
+                            fused_param.data[: w.shape[0]].copy_(w)
+                            continue
+                        entry = pending_indexer_wk.setdefault(fused_name, {})
+                        entry["scale" if is_wk_scale else "weight"] = (
+                            _clone_if_runai_streamed_tensor(loaded_weight)
+                        )
+                        if "weight" not in entry or "scale" not in entry:
+                            continue
+                        pending_indexer_wk.pop(fused_name)
+                        weight_block_size = getattr(
+                            self.quant_config, "weight_block_size", None
+                        ) or [128, 128]
+                        wk_bf16 = block_quant_dequant(
+                            entry["weight"],
+                            entry["scale"],
+                            weight_block_size,
+                            torch.bfloat16,
+                        )
+                        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+                        continue
 
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
