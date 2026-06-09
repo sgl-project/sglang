@@ -39,7 +39,6 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 | `laser_attn` | `LASER_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
 | `block_sparse_attn` | `BLOCK_SPARSE_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
 | `rain_fusion_attn` | `RAIN_FUSION_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
-| `lite_attention` | `LITE_ATTENTION` | [LiteAttention](https://github.com/moonmath-ai/LiteAttention) temporal sparse self-attention on FA3. Hopper (H100/H200) only. Cross-attention runs dense FA3 (skipping disabled). |
 
 ## Selection priority
 
@@ -72,18 +71,6 @@ Some backends require additional configuration. You can pass these parameters vi
 | Parameter | Type | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `sparsity` | `float` | Validation sparsity (0.0 - 1.0). | `0.0` |
-
-**LiteAttention (`lite_attention`)**
-
-| Parameter | Type | Description | Default |
-| :--- | :--- | :--- | :--- |
-| `threshold` | `float` | Log-space QK skip threshold (negative). Lower = more aggressive skips. | `-10.0` |
-| `max_batch_size` | `int` | Max batch size for skip-mask workspace. | `2` |
-| `reverse_skip_list` | `bool` | Use reversed skip-list layout (upstream default). | `true` |
-| `use_int8` | `bool` | INT8 Q/K quantization inside LiteAttention. | `false` |
-| `enable_skipping` | `bool` | Force skip on/off for all layers. If unset, self-attn skips and cross-attn does not. | unset |
-
-Install: clone https://github.com/moonmath-ai/LiteAttention and run `cd hopper && pip install .` (CUDA >= 12.8).
 
 **V-MoBA (`vmoba_attn`)**
 
