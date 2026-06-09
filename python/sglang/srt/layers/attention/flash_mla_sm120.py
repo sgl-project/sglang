@@ -193,29 +193,10 @@ def _sm120_sparse_decode_fwd(
     return out.to(torch.bfloat16), lse.permute(0, 2, 1)
 
 
-# SM120 FlashMLA backend selection.
-# "flashinfer" uses FlashInfer's native SM120 sparse MLA (requires flashinfer >= 0.6.12).
-#   Page-split at call site converts SGLang's swa_page_size=256 to FlashInfer's pbs=64.
-# "triton" uses the custom Triton kernel.
-# "torch" uses the pure-PyTorch fallback.
-# Controlled by SGLANG_SM120_FLASHMLA_BACKEND env var (auto/flashinfer/triton/torch).
-# Legacy: SGLANG_SM120_TRITON_FLASHMLA=0 maps to "torch" for backward compat.
-def _detect_sm120_backend():
-    env = os.environ.get("SGLANG_SM120_FLASHMLA_BACKEND", "auto")
-    if env != "auto":
-        return env
-    # Backward compat: honor legacy env var if new one is not set
-    legacy = os.environ.get("SGLANG_SM120_TRITON_FLASHMLA")
-    if legacy is not None:
-        return "torch" if legacy == "0" else "triton"
-    try:
-        from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_paged_attention  # noqa: F401
-        return "flashinfer"
-    except ImportError:
-        return "triton"
-
-
-_sm120_default_backend = _detect_sm120_backend()
+# SM120 FlashMLA backend: default "flashinfer" (CUTLASS SM120 sparse MLA).
+# Page-split at call site converts SGLang's swa_page_size=256 to FlashInfer's pbs=64.
+# Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
+_sm120_default_backend = os.environ.get("SGLANG_SM120_FLASHMLA_BACKEND", "flashinfer")
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
@@ -403,23 +384,6 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
     )
 
 
-def _remap_indices_to_64(idx: torch.Tensor, src_pbs: int) -> torch.Tensor:
-    """Remap token indices from pbs=N addressing to pbs=64 addressing.
-
-    Invalid indices (-1) are preserved.
-    """
-    if src_pbs == _PBS_DST:
-        return idx
-    ratio = src_pbs // _PBS_DST
-    valid_mask = idx >= 0
-    page_src = torch.where(valid_mask, idx // src_pbs, torch.zeros_like(idx))
-    offset_src = torch.where(valid_mask, idx % src_pbs, torch.zeros_like(idx))
-    sub_page = offset_src // _PBS_DST
-    offset64 = offset_src % _PBS_DST
-    fi_idx = (page_src * ratio + sub_page) * _PBS_DST + offset64
-    return torch.where(valid_mask, fi_idx, idx)
-
-
 def _flash_mla_flashinfer(
     q, k_cache, indices, topk_length, attn_sink,
     head_dim_v, softmax_scale,
@@ -429,7 +393,7 @@ def _flash_mla_flashinfer(
 
     SGLang SWA pool uses page_size=256 (footer format: 256*576 bytes data + 256*8 bytes scale).
     FlashInfer decode_dsv4 fast path requires page_block_size=64 (footer: 64*576 + 64*8).
-    We split 256-token pages into 4 virtual 64-token pages and remap indices.
+    We split 256-token pages into 4 virtual 64-token pages.
     """
     from flashinfer.sparse_mla_sm120 import BatchSparseMLAPagedAttentionWrapper
 
@@ -459,24 +423,22 @@ def _flash_mla_flashinfer(
     # so pass extra cache as-is without splitting.
     extra_kv_64 = extra_kv_u8
 
-    # --- Index remapping: pbs=N token index -> pbs=64 token index ---
+    # Token indices are invariant under page-split (identity mapping):
+    # page256*256 + off == (page256*4 + off//64)*64 + off%64
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
-    idx_64 = _remap_indices_to_64(idx, src_pbs) if src_pbs != _PBS_DST else idx
 
     extra_idx = (
         extra_indices.squeeze(1)
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
-    # Extra indices also passed as-is (extra cache not split).
-    extra_idx_64 = extra_idx
 
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=q.device)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=q.device)
 
     # Pre-allocate split-K scratch for decode-dsv4 fast path.
-    topk = idx_64.shape[-1]
-    extra_topk = extra_idx_64.shape[-1] if extra_idx_64 is not None else 0
+    topk = idx.shape[-1]
+    extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
     _BI = 64
     num_splits = (topk + _BI - 1) // _BI + (
         (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
@@ -487,13 +449,13 @@ def _flash_mla_flashinfer(
     wrapper.run(
         q=q,  # (B, 1, H, D) — wrapper handles squeeze
         kv_cache=kv_64,
-        indices=idx_64,
+        indices=idx,
         output=output,
         sm_scale=softmax_scale,
         topk_length=topk_length,
         attn_sink=attn_sink,
         extra_kv_cache=extra_kv_64,
-        extra_indices=extra_idx_64,
+        extra_indices=extra_idx,
         extra_topk_length=extra_topk_length,
         out_lse=out_lse,
         mid_out=mid_out,
