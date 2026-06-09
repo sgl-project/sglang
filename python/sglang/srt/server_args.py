@@ -801,11 +801,6 @@ class ServerArgs:
     kv_canary: str = "none"
     kv_canary_real_data: str = "none"
     kv_canary_sweep_interval: int = 0
-    # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
-    # Deprecated boolean kept for backwards compatibility; new code should read
-    # enable_prefill_cp.
-    enable_dsa_prefill_context_parallel: bool = False
-    dsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -813,12 +808,14 @@ class ServerArgs:
     # Context parallelism (unified API)
     enable_prefill_cp: bool = False
     # "zigzag" is former in-seq-split; "interleave" is former round-robin-split.
-    cp_strategy: str = "zigzag"
+    cp_strategy: Optional[str] = None
 
     # Context parallelism (deprecated aliases)
+    enable_dsa_prefill_context_parallel: bool = False
+    dsa_prefill_cp_mode: str = "round-robin-split"
     enable_prefill_context_parallel: bool = False
     prefill_cp_mode: str = "in-seq-split"
-    # Parser-only markers consumed by _handle_context_parallelism() so
+    # Parser-only markers consumed by _handle_legacy_cp_arguments() so
     # deprecated mode-only invocations can still enable CP.
     _legacy_dsa_prefill_cp_mode: Optional[str] = None
     _legacy_prefill_cp_mode: Optional[str] = None
@@ -925,21 +922,23 @@ class ServerArgs:
 
         handle_pd_disaggregation(self)
 
-        # Validate --prefill-only-disable-kv-cache args early (before dummy-model
-        # short-circuit). The backend check is run later after backends settle.
-        self._validate_prefill_only_disable_kv_cache_args()
+        # Normalize deprecated CP aliases before validations or model-specific
+        # defaults inspect enable_prefill_cp/cp_strategy.
+        self._handle_legacy_cp_arguments()
+
+        if self.enable_prefill_cp and self.cp_strategy is None:
+            raise ValueError(
+                "--cp-strategy must be set when --enable-prefill-cp is enabled."
+            )
 
         if self.model_path.lower() in ["none", "dummy"]:
+            self._handle_context_parallelism()
+            self._validate_prefill_only_disable_kv_cache_args()
             # Skip for dummy models
             return
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
-
-        # Normalize deprecated CP aliases before model-specific defaults inspect
-        # enable_prefill_cp/cp_strategy. Full topology validation runs later
-        # after data-parallel defaults settle.
-        self._handle_context_parallelism(validate_topology=False)
 
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
@@ -984,6 +983,14 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+
+        # Handle context parallelism before validating prefill-only KV cache
+        # constraints so deprecated CP aliases have normalized to enable_prefill_cp.
+        self._handle_context_parallelism()
+
+        # Validate --prefill-only-disable-kv-cache args before the backend-specific
+        # half runs below.
+        self._validate_prefill_only_disable_kv_cache_args()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -1063,26 +1070,6 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
-
-        # Mirror unified CP args back into deprecated fields so the existing
-        # runtime paths keep working while the strategy refactor lands.
-        self._sync_cp_legacy_aliases()
-
-    def _sync_cp_legacy_aliases(self) -> None:
-        if not self.enable_prefill_cp:
-            return
-
-        if getattr(self, "_is_dsa_model_arch", False):
-            self.enable_dsa_prefill_context_parallel = True
-        else:
-            self.enable_prefill_context_parallel = True
-
-        mode = {
-            "zigzag": "in-seq-split",
-            "interleave": "round-robin-split",
-        }[self.cp_strategy]
-        self.dsa_prefill_cp_mode = mode
-        self.prefill_cp_mode = mode
 
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):
@@ -1900,7 +1887,6 @@ class ServerArgs:
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
-                self._is_dsa_model_arch = True
                 index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
                 if self.enable_two_batch_overlap and (
@@ -3298,7 +3284,7 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-    def _handle_context_parallelism(self, validate_topology: bool = True):
+    def _handle_legacy_cp_arguments(self):
         if (
             self.enable_prefill_context_parallel
             or self.enable_dsa_prefill_context_parallel
@@ -3309,6 +3295,11 @@ class ServerArgs:
             "in-seq-split": "zigzag",
             "round-robin-split": "interleave",
         }
+        if self.enable_prefill_context_parallel and self.cp_strategy is None:
+            self.cp_strategy = legacy_mode_to_strategy[self.prefill_cp_mode]
+        if self.enable_dsa_prefill_context_parallel and self.cp_strategy is None:
+            self.cp_strategy = legacy_mode_to_strategy[self.dsa_prefill_cp_mode]
+
         if self._legacy_dsa_prefill_cp_mode is not None:
             self.enable_prefill_cp = True
             self.cp_strategy = legacy_mode_to_strategy[self._legacy_dsa_prefill_cp_mode]
@@ -3318,8 +3309,11 @@ class ServerArgs:
             self.cp_strategy = legacy_mode_to_strategy[self._legacy_prefill_cp_mode]
             self.prefill_cp_mode = self._legacy_prefill_cp_mode
 
-        if not validate_topology:
-            return
+    def _handle_context_parallelism(self):
+        if self.enable_prefill_cp and self.cp_strategy is None:
+            raise ValueError(
+                "--cp-strategy must be set when --enable-prefill-cp is enabled."
+            )
 
         if (
             self.enable_prefill_context_parallel
@@ -3370,6 +3364,24 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+        if not self.enable_prefill_cp:
+            return
+
+        mode = {
+            "zigzag": "in-seq-split",
+            "interleave": "round-robin-split",
+        }[self.cp_strategy]
+        use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
+            self, "attention_backend", None
+        ) in ("dsa", "dsv4")
+        if use_dsa_legacy_aliases:
+            self.enable_dsa_prefill_context_parallel = True
+            self.enable_prefill_context_parallel = False
+        else:
+            self.enable_prefill_context_parallel = True
+        self.dsa_prefill_cp_mode = mode
+        self.prefill_cp_mode = mode
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -3771,11 +3783,7 @@ class ServerArgs:
                 "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
                 "which the no-op pool intentionally rejects."
             )
-        if (
-            self.enable_prefill_cp
-            or self.enable_prefill_context_parallel
-            or self.enable_dsa_prefill_context_parallel
-        ):
+        if self.enable_prefill_cp:
             raise ValueError(
                 "--prefill-only-disable-kv-cache is incompatible with "
                 "--enable-prefill-cp: the prefill-CP path stages K/V through "
@@ -6944,21 +6952,21 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-dsa-prefill-context-parallel",
-            dest="enable_prefill_cp",
+            dest="enable_dsa_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
             new_flag="--enable-prefill-cp",
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
             "--enable-nsa-prefill-context-parallel",
-            dest="enable_prefill_cp",
+            dest="enable_dsa_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
             new_flag="--enable-prefill-cp",
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
             "--enable-prefill-context-parallel",
-            dest="enable_prefill_cp",
+            dest="enable_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
             new_flag="--enable-prefill-cp",
             help="[Deprecated] Use --enable-prefill-cp instead.",
