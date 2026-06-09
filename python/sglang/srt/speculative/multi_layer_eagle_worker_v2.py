@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -833,3 +834,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        return self.target_worker.model_runner.update_weights_from_distributed_to_model_runners(
+            self.draft_worker.draft_runner_list + [self.target_worker.model_runner],
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
+        )

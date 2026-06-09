@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -1263,3 +1264,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             load_format=recv_req.load_format,
         )
         return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        return self.target_worker.model_runner.update_weights_from_distributed_to_model_runners(
+            [
+                self.draft_worker.draft_runner,
+                self.target_worker.model_runner,
+            ],
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
+        )

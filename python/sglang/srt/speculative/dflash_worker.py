@@ -6,6 +6,7 @@ from typing import Optional, Union
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -342,6 +343,16 @@ class DFlashWorker:
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        # Spelled out instead of falling through `__getattr__` so the gap is
+        # visible: this only updates the target. The DFlash draft model
+        # (`self.draft_model_runner`) is NOT refreshed and goes stale after a
+        # distributed weight update.
+        # TODO(dflash): fan out to the draft runner like EAGLEWorker does.
+        return self.target_worker.update_weights_from_distributed(recv_req)
 
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
