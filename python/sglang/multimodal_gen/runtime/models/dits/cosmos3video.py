@@ -520,6 +520,7 @@ class Cosmos3CrossAttention(nn.Module):
             num_kv_heads=num_key_value_heads,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            is_cross_attention=True,
             prefix=add_prefix("attn", prefix),
         )
 
