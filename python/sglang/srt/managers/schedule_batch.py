@@ -1094,7 +1094,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
 
-        full_untruncated_fill_ids = self.get_full_untruncated_fill_ids()
+        full_fill_ids = self.get_full_untruncated_fill_ids()
         input_len = self.get_full_untruncated_fill_len()
 
         # Streaming sessions reuse committed KV from the session slot, so
@@ -1113,9 +1113,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = full_untruncated_fill_ids[
-            : self._compute_max_prefix_len(input_len)
-        ]
+        token_ids_to_match = full_fill_ids[: self._compute_max_prefix_len(input_len)]
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -1609,10 +1607,10 @@ def _compute_chunked_req_next_prompt_token(
     extend_fill_len = chunked_req.extend_range.end
     if extend_fill_len >= chunked_req.get_full_untruncated_fill_len():
         return None
-    full_untruncated_fill_ids = chunked_req.get_full_untruncated_fill_ids()
-    if extend_fill_len >= len(full_untruncated_fill_ids):
+    fill_ids = chunked_req.get_full_untruncated_fill_ids()
+    if extend_fill_len >= len(fill_ids):
         return None
-    return int(full_untruncated_fill_ids[extend_fill_len])
+    return int(fill_ids[extend_fill_len])
 
 
 @dataclasses.dataclass
