@@ -164,7 +164,6 @@ class NemotronHMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
-            params_dtype=torch.float32,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
@@ -172,16 +171,6 @@ class NemotronHMoE(nn.Module):
             torch.empty(config.n_routed_experts, dtype=torch.float32)
         )
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            use_grouped_topk=True,
-            topk_group=config.topk_group,
-            num_expert_group=config.n_group,
-            renormalize=config.norm_topk_prob,
-            scoring_func="sigmoid",
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=1.0,
-        )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -195,6 +184,18 @@ class NemotronHMoE(nn.Module):
             layer_id=layer_idx,
             is_gated=False,
             routing_method_type=RoutingMethodType.DeepSeekV3,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            use_grouped_topk=True,
+            topk_group=config.topk_group,
+            num_expert_group=config.n_group,
+            renormalize=config.norm_topk_prob,
+            scoring_func="sigmoid",
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -243,7 +244,10 @@ class NemotronHMoE(nn.Module):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # router_scores: [num_tokens, num_experts]
-        router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+        # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
+        router_logits = torch.mm(
+            hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+        )
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         else:
@@ -269,7 +273,10 @@ class NemotronHMoE(nn.Module):
 
         with self.device_module.stream(alt_stream):
             # router_scores: [num_tokens, num_experts]
-            router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+            # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
+            router_logits = torch.mm(
+                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+            )
             topk_output = self.topk(hidden_states, router_logits)
             if self.use_latent_moe:
                 hidden_states, _ = self.fc1_latent_proj(hidden_states)
@@ -280,14 +287,9 @@ class NemotronHMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
+        # routed_scaling_factor is fused into the experts call (applied by the
+        # MoE runner / topk), so final_hidden_states is already scaled.
         final_hidden_states, shared_output = self._forward_core(hidden_states)
-
-        # Fix FP16 overflow
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states *= self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            assert shared_output is not None
-            shared_output *= 1.0 / self.routed_scaling_factor
 
         if self.use_latent_moe:
             final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
@@ -358,9 +360,10 @@ class NemotronHMoEDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.mixer = NemotronHMoE(
-            config,
+            layer_config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
@@ -413,20 +416,18 @@ class NemotronHMambaDecoderLayer(nn.Module):
     def _forward_mamba(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        """Core Mamba forward logic, called directly or via split op."""
-        output = torch.empty_like(hidden_states)
+        """Core Mamba forward logic for the eager path; returns the result."""
         attn_backend = get_attn_backend()
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
-        attn_backend.linear_attn_backend.forward(
+        return attn_backend.linear_attn_backend.forward(
             mixer=self.mixer,
             layer_id=self.layer_id,
             hidden_states=hidden_states,
-            output=output,
+            output=None,
             forward_batch=forward_batch,
             use_triton_causal_conv=True,
         )
-        return output
 
     def forward(
         self,
@@ -510,6 +511,7 @@ class NemotronHAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
+            sliding_window_size=config.sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -533,9 +535,10 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.mixer = NemotronHAttention(
-            config,
+            layer_config,
             layer_idx,
             quant_config,
             prefix=f"{prefix}.mixer",
@@ -904,7 +907,7 @@ class NemotronHForCausalLM(nn.Module):
             ckpt_gate_proj_name="up_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.max_n_routed_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -1004,7 +1007,11 @@ class NemotronHForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
 
-EntryClass = [NemotronHForCausalLM]
+class NemotronHPuzzleForCausalLM(NemotronHForCausalLM):
+    pass
+
+
+EntryClass = [NemotronHForCausalLM, NemotronHPuzzleForCausalLM]
 
 
 @register_custom_op(mutates_args=["output"])

@@ -12,6 +12,11 @@ import { Qwen35Deployment } from '/src/snippets/autoregressive/qwen35-deployment
 
 Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts architecture (397B total parameters, 17B activated), delivering high-throughput inference with minimal latency. It supports multimodal inputs (text, image, video) and natively handles context lengths of up to 262,144 tokens, extensible to over 1M tokens.
 
+**Architecture details:**
+- **Hybrid Attention:** Gated Delta Networks (linear, O(n) complexity) combined with full attention every 4th layer — linear layers provide low-cost long-context processing while periodic full attention ensures high associative recall.
+- **MoE routing:** Top-10 active out of 512 routed experts plus a dedicated shared expert for universal features, keeping 17B parameters active from 397B total.
+- **Native multimodal:** DeepStack Vision Transformer with Conv3d temporal encoding for image and video understanding without separate visual encoders.
+
 **Key Features:**
 
 - **Unified Vision-Language Foundation**: Early fusion training on multimodal tokens achieves cross-generational parity with Qwen3 and outperforms Qwen3-VL models
@@ -95,7 +100,7 @@ SGLang from the main branch is required for Qwen3.5. You can install from source
 uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 # Or use Docker (NVIDIA GPUs)
-docker pull lmsysorg/sglang:nightly-dev-20260216-d3bae71e
+docker pull lmsysorg/sglang:latest
 
 # Or use Docker (AMD MI300X/MI325X)
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
@@ -105,6 +110,8 @@ docker pull lmsysorg/sglang:v0.5.9-rocm720-mi35x
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
 
 ## 3. Model Deployment
 
@@ -119,6 +126,9 @@ This section provides deployment configurations optimized for different hardware
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
+- **H100 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings.
+- **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `--attention-backend triton`. Both the full attention layers and the Gated Delta Net (linear attention) layers use Triton-based kernels on ROCm. Example: `SGLANG_USE_AITER=1 python3 -m sglang.launch_server --model-path Qwen/Qwen3.5-397B-A17B --tp 8 --attention-backend triton --trust-remote-code`. See [AMD's Day-0 support article](https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-qwen-3-5-on-amd-instinct-gpus.html) for details.
+- **Watchdog timeout:** Increase `--watchdog-timeout` to `1200` or higher for this large model, as weight loading can take significant time.
 - **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
   - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64).
@@ -216,6 +226,8 @@ This section provides deployment configurations optimized for different hardware
 <Warning>
 **FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is not included in the generated commands above; add it manually only if memory constraints require the trade-off.
 </Warning>
+
+- For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
@@ -774,7 +786,22 @@ Latency: 31.784 s
 Output throughput: 998.166 token/s
 ```
 
-#### 5.1.2 MMMU Benchmark
+#### 5.1.2 GSM8K with lm-eval (5-shot)
+
+Evaluate using the industry-standard `lm-eval` harness for reproducible accuracy reporting:
+
+```bash Command
+pip install lm-eval[api]
+
+lm_eval --model local-completions \
+    --model_args '{"base_url": "http://localhost:30000/v1/completions", "model": "Qwen/Qwen3.5-397B-A17B", "num_concurrent": 256, "max_retries": 10, "max_gen_toks": 2048}' \
+    --tasks gsm8k \
+    --batch_size auto \
+    --num_fewshot 5 \
+    --trust_remote_code
+```
+
+#### 5.1.3 MMMU Benchmark
 
 - Benchmark Command
 ```bash Command
@@ -842,7 +869,7 @@ SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
   --port 30000
 ```
 
-#### 5.3.1 Latency Benchmark
+#### 5.2.1 Latency Benchmark
 
 ```bash Command
 python3 -m sglang.bench_serving \
@@ -897,7 +924,7 @@ Max ITL (ms):                            58.03
 ==================================================
 ```
 
-#### 5.3.2 Throughput Benchmark
+#### 5.2.2 Throughput Benchmark
 
 ```bash Command
 python3 -m sglang.bench_serving \

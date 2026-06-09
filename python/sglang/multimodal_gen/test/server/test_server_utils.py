@@ -4,6 +4,7 @@ Server management and performance validation for diffusion tests.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import shlex
@@ -28,6 +29,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.server.realtime_consistency import (
+    build_realtime_init_payload,
+    collect_realtime_output,
+    encode_realtime_frames_to_mp4,
+    prepare_realtime_first_frame,
+    realtime_ws_url,
+    record_realtime_key_frames,
+    record_realtime_perf_stats,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     PerformanceSummary,
@@ -986,7 +996,7 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = sampling_params.output_format
         req_background = None  # Not specified in current request
 
         # Build extra_body for optional features
@@ -998,6 +1008,7 @@ def get_generate_fn(
             n=n,
             size=output_size,
             response_format="b64_json",
+            output_format=req_output_format,
             extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
@@ -1304,6 +1315,55 @@ def get_generate_fn(
                 },
             )
 
+    def generate_realtime_video(case_id, client) -> tuple[str, bytes]:
+        """Realtime video generation folded back into mp4 for consistency checks."""
+        if not sampling_params.prompt:
+            pytest.skip(f"{case_id}: no realtime prompt configured")
+        if sampling_params.realtime_num_chunks is None:
+            pytest.skip(f"{case_id}: realtime_num_chunks is not configured")
+        if sampling_params.realtime_num_chunks <= 0:
+            pytest.fail(f"{case_id}: realtime_num_chunks must be positive")
+
+        first_frame = prepare_realtime_first_frame(sampling_params.image_path)
+        init_payload = build_realtime_init_payload(
+            model_path=model_path,
+            sampling_params=sampling_params,
+            output_size=output_size,
+            first_frame=first_frame,
+        )
+        realtime_output = asyncio.run(
+            collect_realtime_output(
+                ws_url=realtime_ws_url(client),
+                init_payload=init_payload,
+                events=list(sampling_params.realtime_events),
+                num_chunks=sampling_params.realtime_num_chunks,
+                require_chunk_stats=bool(sampling_params.realtime_perf_thresholds),
+            )
+        )
+        record_realtime_perf_stats(case_id, realtime_output.chunk_stats)
+        record_realtime_key_frames(case_id, realtime_output.frames)
+        fps = int(sampling_params.fps or 24)
+        video_bytes = encode_realtime_frames_to_mp4(realtime_output.frames, fps=fps)
+        validate_openai_video(video_bytes)
+
+        rid = f"{case_id}-realtime"
+        expected_filename = f"{rid}.mp4"
+        tmp_path = expected_filename
+        Path(tmp_path).write_bytes(video_bytes)
+        expected_width, expected_height = parse_dimensions(output_size)
+        validate_video_file(
+            tmp_path, expected_filename, expected_width, expected_height
+        )
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+            origin_file_path=sampling_params.image_path,
+        )
+        os.remove(tmp_path)
+        return (rid, video_bytes)
+
     def generate_mesh(case_id, client) -> tuple[str, bytes]:
         """I2M: Image to Mesh generation using async /v1/meshes API."""
         import requests as http_requests
@@ -1401,7 +1461,9 @@ def get_generate_fn(
     if modality == "3d":
         fn = generate_mesh
     elif modality == "video":
-        if sampling_params.image_path and sampling_params.prompt:
+        if sampling_params.realtime_num_chunks is not None:
+            fn = generate_realtime_video
+        elif sampling_params.image_path and sampling_params.prompt:
             if getattr(sampling_params, "direct_url_test", False):
                 fn = generate_text_url_image_to_video
             else:
