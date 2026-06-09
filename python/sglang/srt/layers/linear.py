@@ -48,7 +48,7 @@ if TYPE_CHECKING:
         QuantizationConfig,
         QuantizeMethodBase,
     )
-    from sglang.srt.layers.utils.cp_decode_attn_tp import DecodeAttnTpContext
+    from sglang.srt.layers.utils.cp_decode_attn_tp import CpDecodeAttnTpContext
 
 _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
@@ -1379,7 +1379,7 @@ class RowParallelLinear(LinearBase):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
-        decode_attn_tp_ctx: Optional["DecodeAttnTpContext"] = None,
+        cp_decode_tp_ctx: Optional["CpDecodeAttnTpContext"] = None,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1397,7 +1397,7 @@ class RowParallelLinear(LinearBase):
             tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank, self.tp_size = tp_rank, tp_size
 
-        self.decode_attn_tp_ctx = decode_attn_tp_ctx
+        self.cp_decode_tp_ctx = cp_decode_tp_ctx
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
@@ -1537,8 +1537,8 @@ class RowParallelLinear(LinearBase):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
 
         use_decode_attn_tp = (
-            self.decode_attn_tp_ctx is not None
-            and self.decode_attn_tp_ctx.use_decode_attn_tp
+            self.cp_decode_tp_ctx is not None
+            and self.cp_decode_tp_ctx.use_decode_attn_tp
         )
 
         if self.use_dp_attention_reduce:

@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class DecodeAttnTpContext:
+class CpDecodeAttnTpContext:
     """Context for managing CP-mode decode attention TP partitioning.
 
     This class encapsulates the logic for determining whether decode attention TP
@@ -173,7 +173,7 @@ class DecodeAttnTpContext:
 
         if isinstance(linear_instance, RowParallelLinear):
             dim = 1
-            assert linear_instance.decode_attn_tp_ctx is not None
+            assert linear_instance.cp_decode_tp_ctx is not None
         elif isinstance(linear_instance, ColumnParallelLinear):
             dim = 0
         else:

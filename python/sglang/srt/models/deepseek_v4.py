@@ -75,7 +75,7 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils.cp_decode_attn_tp import DecodeAttnTpContext
+from sglang.srt.layers.utils.cp_decode_attn_tp import CpDecodeAttnTpContext
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_round_robin_input_ids,
@@ -453,7 +453,7 @@ class MQALayer(nn.Module):
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
 
         # Create decode attention TP context for CP-mode weight partitioning
-        self.decode_attn_tp_ctx = DecodeAttnTpContext()
+        self.cp_decode_tp_ctx = CpDecodeAttnTpContext()
 
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -489,7 +489,7 @@ class MQALayer(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            decode_attn_tp_ctx=self.decode_attn_tp_ctx,
+            cp_decode_tp_ctx=self.cp_decode_tp_ctx,
         )
 
         self.attn_mqa = RadixAttention(
@@ -513,34 +513,34 @@ class MQALayer(nn.Module):
     @property
     def n_local_heads(self) -> int:
         """Number of local attention heads, accounting for decode attn TP mode."""
-        if self.decode_attn_tp_ctx.use_decode_attn_tp:
-            return self.n_heads // self.decode_attn_tp_ctx.decode_tp_size
+        if self.cp_decode_tp_ctx.use_decode_attn_tp:
+            return self.n_heads // self.cp_decode_tp_ctx.decode_tp_size
         return self._n_local_heads
 
     @property
     def n_local_groups(self) -> int:
         """Number of local output groups, accounting for decode attn TP mode."""
-        if self.decode_attn_tp_ctx.use_decode_attn_tp:
-            return self.n_groups // self.decode_attn_tp_ctx.decode_tp_size
+        if self.cp_decode_tp_ctx.use_decode_attn_tp:
+            return self.n_groups // self.cp_decode_tp_ctx.decode_tp_size
         return self._n_local_groups
 
     @property
     def tp_rank(self) -> int:
         """Current tensor parallel rank, accounting for decode attn TP mode."""
-        if self.decode_attn_tp_ctx.use_decode_attn_tp:
-            return self.decode_attn_tp_ctx.decode_tp_rank
+        if self.cp_decode_tp_ctx.use_decode_attn_tp:
+            return self.cp_decode_tp_ctx.decode_tp_rank
         return self._tp_rank
 
     @property
     def tp_size(self) -> int:
         """Current tensor parallel size, accounting for decode attn TP mode."""
-        if self.decode_attn_tp_ctx.use_decode_attn_tp:
-            return self.decode_attn_tp_ctx.decode_tp_size
+        if self.cp_decode_tp_ctx.use_decode_attn_tp:
+            return self.cp_decode_tp_ctx.decode_tp_size
         return self._tp_size
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
-        with self.decode_attn_tp_ctx.maybe_use_decode_attn_tp(
+        with self.cp_decode_tp_ctx.maybe_use_decode_attn_tp(
             forward_batch, [self.wq_b, self.wo_a, self.wo_b]
         ):
             yield
