@@ -147,9 +147,7 @@ export const GLM51Deployment = () => {
     const memFraction = hwConfig.mem;
     const enableSpec = values.speculative === 'enabled';
 
-    let cmd = '';
-    if (enableSpec) cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
-    cmd += 'sglang serve \\\n';
+    let cmd = 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 

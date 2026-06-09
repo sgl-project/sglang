@@ -97,7 +97,7 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
 Deploy GLM-5.1 with the following command (FP8 on H200, all features enabled):
 
 ```shell Command
-SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+sglang serve \
   --model-path zai-org/GLM-5.1-FP8 \
   --tp 8 \
   --tool-call-parser glm47 \
@@ -116,7 +116,7 @@ SGLANG_ENABLE_SPEC_V2=1 sglang serve \
 #### B300
 
 ```shell Command
-SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+sglang serve \
   --model-path nvidia/GLM-5.1-NVFP4 \
   --tp 8 \
   --quantization modelopt_fp4 \
@@ -135,7 +135,7 @@ SGLANG_ENABLE_SPEC_V2=1 sglang serve \
 #### GB300
 
 ```shell Command
-SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+sglang serve \
   --model-path nvidia/GLM-5.1-NVFP4 \
   --tp 4 \
   --quantization modelopt_fp4 \
