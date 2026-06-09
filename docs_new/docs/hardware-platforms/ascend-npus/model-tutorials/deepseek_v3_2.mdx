@@ -33,10 +33,8 @@ recommended to use v0.5.10 or a later version.
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 ## Prerequisites
 
@@ -65,16 +63,13 @@ online platform. You can directly pull it.
 We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -109,7 +104,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -133,6 +128,12 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
   </Tab>
 </Tabs>
 
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
 ## Online service deployment
 
 ### Multi-node PD disaggregation deployment
@@ -147,6 +148,16 @@ This configuration uses 2 nodes for prefill (TP=32 across 2 nodes) and 2 nodes f
 1. Run the following command on both prefill and decode nodes.
 
 ```bash Prefill node
+#============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port (e.g., tcp://192.168.1.1:24667)
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME (decode section): network interface name for HCCL
+#   GLOO_SOCKET_IFNAME (decode section): network interface name for Gloo
+#============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -166,11 +177,11 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24670"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
-D_IP=('your decode ip1' 'your decode ip2')
-MODEL_PATH=xxx
+P_IP=(<your prefill ip>)
+D_IP=(<your decode ip>)
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -268,11 +279,17 @@ done
 2. Launch the SGLang Router (on any reachable node):
 
 ```bash Router
+#============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+#============================================================
+
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP1:8000 8995 \
-    --decode http://D_IP1:8001 \
+    --prefill http://<your prefill ip>:8000 8995 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -324,9 +341,7 @@ on the Best Practice page.
 |------------------------|-------------------|------------|----------------|
 | Low latency (128K+1K)  | PD disaggregation | 32 (A3)    | W8A8 INT8      |
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 ## Performance tuning
 

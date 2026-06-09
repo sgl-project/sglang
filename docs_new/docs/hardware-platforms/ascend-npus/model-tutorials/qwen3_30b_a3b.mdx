@@ -31,10 +31,8 @@ v0.5.10 or a later version.
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | PrefixCache                   | `--disable-radix-cache`                                                                       |
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 ## Prerequisites
 
@@ -64,16 +62,13 @@ online platform. You can directly pull it.
 We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -91,6 +86,12 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
   </Tab>
 </Tabs>
 
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
 ## Online service deployment
 
 ### Single-node online deployment
@@ -99,6 +100,11 @@ Single-node deployment completes both prefill and decode within the same node (P
 with limited hardware resources. The following command is based on the W8A8 quantized model with 2 NPUs on a single Atlas 800I A3 node.
 
 ```bash Launch server
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -114,7 +120,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 export SGLANG_SET_CPU_AFFINITY=1
 export ASCEND_LAUNCH_BLOCKING=0
@@ -149,9 +155,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --dtype bfloat16
 ```
 
-<Tip>
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
-</Tip>
 
 ## Functional verification
 
@@ -199,9 +203,7 @@ on the Best Practice page.
 | Low latency (1K+0.3K)         | PD mixed        | 1 (A3)     | W8A8 INT8      |
 | High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8 INT8      |
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 ## Performance tuning
 

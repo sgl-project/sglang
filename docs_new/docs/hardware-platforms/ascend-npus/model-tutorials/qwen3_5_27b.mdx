@@ -30,10 +30,8 @@ v0.5.10 or a later version.
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0`                          |
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 ## Prerequisites
 
@@ -62,16 +60,13 @@ online platform. You can directly pull it.
 We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -103,6 +98,12 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
   </Tab>
 </Tabs>
 
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
 ## Online service deployment
 
 ### Single-node online deployment
@@ -111,6 +112,11 @@ Single-node deployment completes both prefill and decode within the same node (P
 with limited hardware resources. The following command is based on the W8A8 quantized model.
 
 ```bash Launch server
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#============================================================
+
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -137,7 +143,7 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 python -m sglang.launch_server --model-path ${MODEL_PATH} \
     --attention-backend ascend \
@@ -157,9 +163,7 @@ python -m sglang.launch_server --model-path ${MODEL_PATH} \
     --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
 
-<Tip>
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
-</Tip>
 
 ## Functional verification
 
@@ -210,9 +214,7 @@ on the Best Practice page.
 | High throughput (16K+1K)      | PD mixed        | 2 (A3)     | W8A8 INT8      |
 | High throughput (64K+1K)      | PD mixed        | 2 (A3)     | W8A8 INT8      |
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 ## Performance tuning
 
