@@ -75,6 +75,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -106,7 +107,19 @@ pub async fn chat_completions(
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
-    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
+    // Sticky-session routing key. When the sticky policy is configured,
+    // read the routing key from the operator-chosen header into the
+    // selection context; the policy pins it to a worker. Other policies
+    // leave `routing_key` `None` and ignore it.
+    let routing_key = ctx
+        .config
+        .model
+        .sticky
+        .as_ref()
+        .and_then(|s| headers.get(s.header_name.as_str()))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty());
+    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key);
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -396,6 +409,37 @@ pub async fn chat_completions(
     };
     ctx.metrics
         .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
+
+    // Per-request access log — always on at INFO so incoming traffic and its
+    // status are visible without DEBUG. `request_id` is the client/gateway
+    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
+    // selected. The cache-aware routing rationale is logged separately at
+    // DEBUG by the policy.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let http_status = match &result {
+        Ok(resp) => resp.status().as_u16(),
+        Err(e) => e.status_code().as_u16(),
+    };
+    let outcome_str = match outcome {
+        RequestOutcome::Success => "success",
+        RequestOutcome::Error => "error",
+        RequestOutcome::Cancelled => "cancelled",
+    };
+    tracing::info!(
+        request_id = %request_id,
+        method = "POST",
+        path = "/v1/chat/completions",
+        model = %metrics_model,
+        worker = %metrics_worker_url,
+        outcome = outcome_str,
+        http_status,
+        stream = streaming,
+        latency_ms = start.elapsed().as_millis() as u64,
+        "chat_completions",
+    );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
     // external tests / sidecars can observe PD decode affinity without

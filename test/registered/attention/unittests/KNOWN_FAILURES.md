@@ -6,7 +6,7 @@ unit-test suite, **organized by the action needed to address it**.
 
 Anything failing that is not listed here should be treated as a regression.
 
-Last updated: 2026-05-29
+Last updated: 2026-06-05
 
 ## Reference runs
 
@@ -161,8 +161,6 @@ fixture investigation; no test in the suite).
 
 | Backend | Mode | Status | Root cause |
 |---|---|---|---|
-| FA3 | `DRAFT_EXTEND_V2` CUDA-graph replay | `[gated]` `dense/test_fa3.py::test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases` | `init_forward_metadata_replay_cuda_graph` sets `cache_seqlens_int32 = seq_lens` (prefix only); effective KV extent must be `prefix + extend` for DRAFT_EXTEND_V2. Kernel reads prefix-only KV → ~82% wrong values. Fix: `cache_seqlens = seq_lens + extend_seq_lens` in `flashattention_backend.py`. |
-| FA4 | `DRAFT_EXTEND_V2` CUDA-graph replay | `[gated]` `dense/test_fa4.py::test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases` | Same root cause as FA3 (FA4 inherits the same `init_forward_metadata_replay_cuda_graph` path). |
 | FlashInfer MLA | EAGLE draft CG, chain | `[gated on SM≥10]` `mla/test_flashinfer.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases` | FlashInfer MLA decode kernel in container targets SM9x; on Blackwell falls back to a generic path that doesn't restore metadata buffers under graph replay (~22 abs-diff vs reference) |
 | FlashMLA | MLA `DRAFT_EXTEND` CUDA-graph replay | `[no test]` (`mla/README.md` Next Work) | Capture falls through to `FlashInferMLAAttnBackend.init_forward_metadata_capture_cuda_graph` (1D `cuda_graph_kv_indices`); FlashMLA decode uses 2D `[max_bs, (max_context + PAGE_SIZE) // PAGE_SIZE]` layout — buffer mismatch |
 | GDN / KDA / Lightning / Mamba2 | `DRAFT_EXTEND` and `DRAFT_EXTEND_V2` graph capture | `[no test]` for CG; eager-only paths covered | `HybridLinearAttnBackend` raises `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:509,572` |
@@ -184,8 +182,6 @@ moment production is fixed; no test method invokes them today.
 
 | Citation | Symptom | Trigger | Status |
 |---|---|---|---|
-| `dual_chunk_flashattention_backend.py:1110-1132` | `RuntimeError: The size of tensor a (4) must match the size of tensor b (5)` at `vertical_buffer.copy_()` | `vertical_size ≤ 5`: fallback `torch.arange(0, intra_K_size, max(1, intra_K_size/5))` returns up to 5 elements into `vertical_size=4` buffer when `intra_vertical_indices.nelement() == 0` | `[no test]` (`dual_chunk/README.md`); smoke helper `run_dual_chunk_sparse_sub_window_case` wired but not invoked |
-| `_vertical_slash_sparse_attention` (`convert_vertical_slash_indexes` block math) | `cudaErrorIllegalAddress` deep inside the kernel | `vertical_size=8` with `seq_len ≥ 128`: unstated invariant that `vertical_size + slash_size >= chunk_len_blocks` | `[no test]` (same smoke helper) |
 | Triton dense `DRAFT_EXTEND` (non-V2) | Eager fixture/reference mismatch on narrow accepted-token layouts | Test omitted | `[no test]` (`dense/README.md`) |
 
 ## C.6. DSA-specific structural gaps
