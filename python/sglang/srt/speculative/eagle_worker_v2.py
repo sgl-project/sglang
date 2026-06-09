@@ -76,6 +76,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
+    spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -954,6 +955,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
@@ -986,6 +988,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
             ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
@@ -1000,6 +1003,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
