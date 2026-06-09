@@ -26,7 +26,6 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_moe_runner_backend,
 )
 
 
@@ -170,6 +169,7 @@ class AWQAscendMoEKernel:
         moe_runner_config: "MoeRunnerConfig",
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe import get_moe_runner_backend
         self.moe_runner_config = moe_runner_config
         layer.w13_kernel = self.w13_kernel
         layer.w2_kernel = self.w2_kernel
