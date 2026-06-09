@@ -345,6 +345,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
+    can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
     batch_size_before_padding: Optional[int] = None
 
@@ -648,6 +649,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             batch_size_before_padding=len(batch.seq_lens),
             is_prefill_only=batch.is_prefill_only,
