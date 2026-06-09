@@ -298,14 +298,6 @@ def run_a_suite(args):
         and not f.endswith("/cpu/utils.py")
     ]
 
-    # JIT kernel benchmarks (live alongside kernel source). The correctness
-    # tests now live under test/registered/jit/ and are picked up by the
-    # registered glob above; only benchmarks are collected from here.
-    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
-    )
-
     # Strict: all discovered files must have proper registration
     sanity_check = True
 

@@ -3,17 +3,13 @@
 Pre-commit hook: reject CI-registered tests that live inside the importable
 `sglang` package (python/sglang/).
 
-Registered correctness tests must live under test/registered/ (e.g.
-test/registered/jit/ for JIT kernel tests) so they are not shipped in the
-wheel and are collected by run_suite.py's registered glob. A registered test
-placed inside the package would be shipped to users AND silently dropped by
-run_suite.py (which no longer globs the package for tests) -- it would never
-run in CI. This guard turns that silent skip into a hard failure.
-
-The only in-package files allowed to carry a CI registry are the JIT kernel
-benchmarks under python/sglang/jit_kernel/benchmark/bench_*.py, which
-run_suite.py collects from there on purpose (they live alongside the kernel
-source).
+Registered tests and benchmarks must live under test/registered/ (e.g.
+test/registered/jit/ for JIT kernel tests and test/registered/jit/benchmark/
+for JIT kernel benchmarks) so they are not shipped in the wheel and are
+collected by run_suite.py's registered glob. A registered file placed inside
+the package would be shipped to users AND silently dropped by run_suite.py
+(which no longer globs the package) -- it would never run in CI. This guard
+turns that silent skip into a hard failure.
 
 Reuses ut_parse_one_file() from ci_register.py (AST-based) so the registry
 detection matches run_suite.py's collect_tests() exactly.
@@ -36,15 +32,6 @@ _MARKERS = (
 )
 
 
-def _is_allowed(path: str) -> bool:
-    # JIT kernel benchmarks intentionally live alongside the kernel source and
-    # are collected by run_suite.py's benchmark glob (benchmark/**/bench_*.py).
-    norm = path.replace(os.sep, "/")
-    return "/jit_kernel/benchmark/" in norm and os.path.basename(norm).startswith(
-        "bench_"
-    )
-
-
 def main() -> int:
     # Import ci_register directly to avoid pulling in all of sglang.
     spec = importlib.util.spec_from_file_location(
@@ -56,8 +43,6 @@ def main() -> int:
 
     offenders = []
     for f in sorted(glob.glob("python/sglang/**/*.py", recursive=True)):
-        if _is_allowed(f):
-            continue
         try:
             with open(f, "r", encoding="utf-8") as fh:
                 source = fh.read()
@@ -75,13 +60,14 @@ def main() -> int:
             offenders.append(f)
 
     if offenders:
-        print("ERROR: CI-registered test(s) found inside the sglang package:")
         print(
-            "  Registered tests must live under test/registered/ (e.g.\n"
-            "  test/registered/jit/ for JIT kernel tests) so they are not\n"
-            "  shipped in the wheel and are collected by run_suite.py.\n"
-            "  Only JIT kernel benchmarks (jit_kernel/benchmark/bench_*.py)\n"
-            "  may carry a CI registry inside the package.\n"
+            "ERROR: CI-registered test(s)/benchmark(s) found inside the sglang package:"
+        )
+        print(
+            "  Registered tests and benchmarks must live under test/registered/\n"
+            "  (e.g. test/registered/jit/ for JIT kernel tests and\n"
+            "  test/registered/jit/benchmark/ for JIT kernel benchmarks) so they\n"
+            "  are not shipped in the wheel and are collected by run_suite.py.\n"
         )
         for f in offenders:
             print(f"  {f}")
