@@ -45,6 +45,7 @@ class NGRAMWorker:
         target_worker: TpModelWorker,
     ):
         self.server_args = server_args
+        self.enable_overlap = not server_args.disable_overlap_schedule
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
@@ -207,12 +208,17 @@ class NGRAMWorker:
         batch_tokens = []
         total_lens = []
         assert len(batch.reqs) == len(self.prev_accept_lens)
+        # Overlap mode processes results one iteration behind, so the last
+        # round's accepted tokens are not yet in req.output_ids and must be
+        # spliced in from spec_info. Sync mode and grammar batches process
+        # results before the next draft prep, so output_ids is already
+        # complete and splicing would duplicate the tail.
+        use_prev_tokens = self.enable_overlap and not batch.has_grammar
         i = 0
         for req in batch.reqs:
-            # grammar doesn't support overlap and output_ids will be complete.
             prev_tokens = (
                 self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
-                if not batch.has_grammar
+                if use_prev_tokens
                 else []
             )
             check_token = self._efficient_concat_last_n(
@@ -315,6 +321,9 @@ class NGRAMWorker:
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
+        # Same splice condition as _prepare_draft_tokens: only overlap mode
+        # has accepted tokens missing from req.output_ids.
+        use_prev_tokens = self.enable_overlap and not batch.has_grammar
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
@@ -323,7 +332,7 @@ class NGRAMWorker:
             # else:
             prev_tokens = (
                 self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
-                if not batch.has_grammar
+                if use_prev_tokens
                 else []
             )
             put_ids = self._efficient_concat_last_n(
@@ -476,6 +485,10 @@ class NGRAMWorker:
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
+            # Consumed by the non-overlap V2 scheduler branch to advance
+            # batch.seq_lens after the isolation restore; overlap mode relays
+            # it via on_publish instead.
+            new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
         )
