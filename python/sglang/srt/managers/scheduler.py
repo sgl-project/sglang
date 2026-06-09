@@ -929,7 +929,7 @@ class Scheduler(
         self.active_reqs.pop(req.rid, None)
 
     def _assert_reqs_invariants(self) -> None:
-        if not os.environ.get("DEBUG_INVARIANTS"):
+        if not envs.SGLANG_DEBUG_REQS_INVARIANTS.get():
             return
         if self.disaggregation_mode != DisaggregationMode.NULL:
             return
