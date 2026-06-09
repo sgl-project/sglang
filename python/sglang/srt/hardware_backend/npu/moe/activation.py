@@ -155,6 +155,7 @@ class NPUGeluAndMul(BaseActivation):
           (e.g. certain non‑silu MoE variants).
         - The downstream code expects the same ``(hidden_states, scale)`` interface.
     """
+
     def __init__(self):
         self._gelu = GeluAndMul()
 
