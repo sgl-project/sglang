@@ -17,6 +17,7 @@ from sglang.jit_kernel.tests.deepseek_v4.common import (
     to_seq_extend,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import get_device
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="nightly-amd-kernel-1-gpu", nightly=True)
@@ -113,7 +114,12 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
 
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
+        ctx,
+        pool,
+        kv_in_cpu.to(get_device()),
+        ape_cpu.to(get_device()),
+        seq_lens_cpu,
+        extend_lens_cpu,
     )
 
     # Compact prefill output: row per compress plan, in CPU-planner order.
@@ -145,8 +151,8 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
         _run_prefill(
             ctx,
             pool,
-            kv_full_cpu[:prefix_len].cuda(),
-            ape_cpu.cuda(),
+            kv_full_cpu[:prefix_len].to(get_device()),
+            ape_cpu.to(get_device()),
             seq_lens_cpu,
             extend_lens_cpu,
         )
@@ -154,9 +160,11 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
     final_out = None
     for k in range(RATIO):
         cur_seq_len = prefix_len + k + 1
-        seq_lens_gpu = torch.tensor([cur_seq_len], dtype=torch.int64, device="cuda")
-        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].cuda()
-        out = _run_decode(ctx, pool, kv_step, ape_cpu.cuda(), seq_lens_gpu)
+        seq_lens_gpu = torch.tensor(
+            [cur_seq_len], dtype=torch.int64, device=get_device()
+        )
+        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(get_device())
+        out = _run_decode(ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu)
         if cur_seq_len % RATIO == 0:
             final_out = out
 
@@ -190,8 +198,8 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
     _run_prefill(
         ctx,
         pool,
-        kv_full_cpu[:prefix_len].cuda(),
-        ape_cpu.cuda(),
+        kv_full_cpu[:prefix_len].to(get_device()),
+        ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
     )
@@ -200,8 +208,8 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
     out = _run_prefill(
         ctx,
         pool,
-        kv_full_cpu[prefix_len:].cuda(),
-        ape_cpu.cuda(),
+        kv_full_cpu[prefix_len:].to(get_device()),
+        ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
     )
@@ -228,7 +236,12 @@ def test_prefill_multibatch(mode: str) -> None:
     kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99)
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
-        ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
+        ctx,
+        pool,
+        kv_in_cpu.to(get_device()),
+        ape_cpu.to(get_device()),
+        seq_lens_cpu,
+        extend_lens_cpu,
     )
 
     # Compact: walk batches in order, then positions in order; matches the
