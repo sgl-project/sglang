@@ -2007,7 +2007,7 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
         self.requests_received_total = Counter(
             name="sglang:encoder_requests_received_total",
             documentation="Total requests received by encoder (at receive time), per DP rank.",
-            labelnames=list(labels.keys()) + ["dp_rank", "modality"],
+            labelnames=list(labels.keys()) + ["modality"],
         )
 
         # Multimodal items per batch histogram
@@ -2158,11 +2158,12 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
             **self.labels, modality=modality, status=status
         ).inc()
 
-    def inc_requests_received(self, dp_rank: int = 0, modality: str = "image") -> None:
-        """Increment the received-requests counter at request-arrival time."""
-        self.requests_received_total.labels(
-            **self.labels, dp_rank=str(dp_rank), modality=modality
-        ).inc()
+    def inc_requests_received(self, modality: str = "image") -> None:
+        """Increment the received-requests counter at request-arrival time.
+
+        dp_rank is supplied via self.labels (set per process at construction).
+        """
+        self.requests_received_total.labels(**self.labels, modality=modality).inc()
 
     def observe_e2e_latency(
         self, latency_seconds: float, modality: str = "image"
