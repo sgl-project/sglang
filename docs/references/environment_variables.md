@@ -20,7 +20,6 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_REQ_RUNNING_TIMEOUT`              | Timeout (in seconds) for requests running in the decode batch                                                                    | `-1`                         |
 | `SGLANG_CACHE_DIR`                        | Cache directory for model weights and other data | `~/.cache/sglang` |
 | `SGLANG_PREFETCH_BLOCK_SIZE_MB`           | Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap | `16` |
-| `SGLANG_DEEPSEEK_LOAD_MAX_WORKERS`        | Maximum number of worker threads used by the DeepSeek-style checkpoint weight loader. Unset keeps Python's `ThreadPoolExecutor` default; set a smaller value to reduce aggregate host I/O pressure across ranks for very large MoE checkpoints. | `None` |
 
 ## Performance Tuning
 
