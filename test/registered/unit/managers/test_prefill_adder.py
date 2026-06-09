@@ -169,9 +169,7 @@ class TestPrefillAdder(CustomTestCase):
         last_chunk_req.dllm_config = None
         last_chunk_req.origin_input_ids = array("q", range(128))
         last_chunk_req.output_ids = array("q", [])
-        last_chunk_req.extend_range = Range(
-            0, len(last_chunk_req.origin_input_ids)
-        )
+        last_chunk_req.extend_range = Range(0, len(last_chunk_req.origin_input_ids))
         last_chunk_req.retracted_stain = False
 
         self.assertEqual(last_chunk_req.get_full_untruncated_fill_len(), 128)
