@@ -101,9 +101,9 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_hadamard_quant
+    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.jit_kernel.dsv32 import (
-        fused_k_indexer_norm_rope_first_hadamard,
+        fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
     from sglang.srt.compilation.compilation_config import register_split_op
@@ -391,10 +391,7 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        # V3.2 skips the Hadamard rotation; it is logit-preserving (orthonormal H
-        # applied to both q and k, so (Hq)·(Hk) = q·k) and only aids fp8 quant.
         # freqs_cis is built from the fp32 cos/sin cache before any forward casts it to bf16.
-        self._indexer_use_hadamard = False
         self._indexer_freqs_cis: Optional[torch.Tensor] = None
         if _is_cuda:
             c = self.rotary_emb.cos_sin_cache.to(torch.float32)
@@ -463,9 +460,6 @@ class Indexer(MultiPlatformOp):
         weights = weights_raw * self.n_heads**-0.5
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
-    def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
-        return rotate_activation(x)
-
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
@@ -531,20 +525,20 @@ class Indexer(MultiPlatformOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = self._maybe_rotate(query)
+            query = rotate_activation(query)
 
             with torch.cuda.stream(self.alt_stream):
-                key = self._maybe_rotate(key)
+                key = rotate_activation(key)
             current_stream.wait_stream(self.alt_stream)
         elif (
             self.alt_stream is not None
             and forward_batch.attn_cp_metadata is not None
             and self.dsa_enable_prefill_cp
         ):
-            key = self._maybe_rotate(key)
+            key = rotate_activation(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = self._maybe_rotate(query)
+            query = rotate_activation(query)
 
             with torch.cuda.stream(self.alt_stream):
                 key = cp_all_gather_rerange_output(
@@ -556,8 +550,8 @@ class Indexer(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
-            query = self._maybe_rotate(query)
-            key = self._maybe_rotate(key)
+            query = rotate_activation(query)
+            key = rotate_activation(key)
 
         # allgather+rerrange
         if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
@@ -587,7 +581,7 @@ class Indexer(MultiPlatformOp):
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = self._maybe_rotate(key)
+        key = rotate_activation(key)
 
         return key
 
@@ -619,19 +613,17 @@ class Indexer(MultiPlatformOp):
                 self._indexer_freqs_cis,
                 positions,
                 page_size,
-                hadamard=self._indexer_use_hadamard,
             )
             return
 
         # Fallback: separate K kernel + store kernel.
-        key = fused_k_indexer_norm_rope_first_hadamard(
+        key = fused_k_indexer_norm_rope(
             key_raw,
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.variance_epsilon,
             self._indexer_freqs_cis,
             positions,
-            hadamard=self._indexer_use_hadamard,
         )
         self._store_index_k_cache(
             forward_batch=forward_batch,
@@ -658,13 +650,12 @@ class Indexer(MultiPlatformOp):
                 key, positions, forward_batch, layer_id, act_quant
             )
             q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
-            return fused_q_indexer_rope_first_hadamard_quant(
+            return fused_q_indexer_rope_first_quant(
                 q.contiguous(),
                 weights_raw,
                 q_scale_gate,
                 self._indexer_freqs_cis,
                 positions,
-                hadamard=self._indexer_use_hadamard,
             )
 
         # Two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
@@ -686,13 +677,12 @@ class Indexer(MultiPlatformOp):
                 key, positions, forward_batch, layer_id, act_quant
             )
 
-        q_fp8, weights = fused_q_indexer_rope_first_hadamard_quant(
+        q_fp8, weights = fused_q_indexer_rope_first_quant(
             q.contiguous(),
             weights_raw,
             q_scale_gate,
             self._indexer_freqs_cis,
             positions,
-            hadamard=self._indexer_use_hadamard,
         )
 
         current_stream.wait_stream(self.alt_stream)

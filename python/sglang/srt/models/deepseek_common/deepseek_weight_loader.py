@@ -87,7 +87,6 @@ def _load_fused_indexer_wk(
     param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
     weights_proj the bottom n_heads rows.
 
-    Returns True if the shard was consumed (caller should skip normal loading).
     Returns False when there is no fused param (non-CUDA, where wk and
     weights_proj are separate) so the caller falls through to per-tensor loading.
     """

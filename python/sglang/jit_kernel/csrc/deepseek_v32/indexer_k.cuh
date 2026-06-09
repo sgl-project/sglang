@@ -1,20 +1,12 @@
 // DeepSeek-V3.2 only.
 //
 // DSA indexer K kernels: single-head LayerNorm (not RMS), ropes the leading
-// dims (kRopeFirst), and drops the Hadamard rotation by default.
+// kRopeDim dims, and fp8-quantizes the un-rotated activations. V3.2 drops the
+// Hadamard incoherence rotation; it is logit-preserving (see main_norm_rope.cuh).
 //
-// Why the Hadamard can be dropped: the normalized Hadamard H is orthonormal
-// (H^T H = I) and is applied to both q and k, so the indexer logit -- a plain
-// dot product -- is unchanged:
-//     (H q) . (H k) = (H q)^T (H k) = q^T (H^T H) k = q^T k = q . k
-// The rotation exists only as fp8-quant incoherence processing; dropping it is
-// exactly logit-preserving and only changes fp8 quant accuracy, so V3.2
-// quantizes the un-rotated activations directly (kHadamard=false).
-//
-// NOTE: this is independent of the wk + weights_proj GEMM fusion (done in
-// dsa_indexer.py): that just merges two projections into one bf16 GEMM to cut
-// launches, and `k_input` here is the non-contiguous wk slice kw[:, :head_dim]
-// read via k_input_stride_batch (no copy).
+// Independent of the wk + weights_proj GEMM fusion (dsa_indexer.py): `k_input`
+// here is the non-contiguous wk slice kw[:, :head_dim] read via
+// k_input_stride_batch (no copy).
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -41,8 +33,8 @@ constexpr uint32_t kFusedKIndexerNumWarps = kFusedKIndexerBlockSize / device::kW
 
 #define K_INDEXER_KERNEL __global__ __launch_bounds__(kFusedKIndexerBlockSize, 16)
 
-// Indexer K: LayerNorm + RoPE (+ optional Hadamard) -> bf16.
-struct FusedKIndexerNormRopeHadamardParams {
+// Indexer K: LayerNorm + RoPE -> bf16.
+struct FusedKIndexerNormRopeParams {
   const void* __restrict__ k_input;     // (B, 128) DType
   void* __restrict__ k_out;             // (B, 128) DType
   const float* __restrict__ weight;     // (128,) fp32  -- LayerNorm gamma
@@ -55,9 +47,8 @@ struct FusedKIndexerNormRopeHadamardParams {
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
-K_INDEXER_KERNEL void
-fused_k_indexer_norm_rope_hadamard(const __grid_constant__ FusedKIndexerNormRopeHadamardParams params) {
+template <typename DType, typename PosT, bool kUsePDL>
+K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIndexerNormRopeParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;
@@ -74,9 +65,7 @@ fused_k_indexer_norm_rope_hadamard(const __grid_constant__ FusedKIndexerNormRope
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
   const auto work_id = blockIdx.x * kFusedKIndexerNumWarps + warp_id;
-  // V4 ropes the trailing kRopeDim dims (kRopeFirst=false); V3.2 ropes the
-  // leading kRopeDim dims (kRopeFirst=true). Select the owning lanes per layout.
-  const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
+  const bool is_rope_lane = lane_id < kRopeSize;
 
   if (work_id >= params.batch_size) return;
 
@@ -93,7 +82,7 @@ fused_k_indexer_norm_rope_hadamard(const __grid_constant__ FusedKIndexerNormRope
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, kRopeFirst ? lane_id : (lane_id - (kWarpThreads - kRopeSize)));
+    if (is_rope_lane) freq.load(freqs_cis, lane_id);
 
     float sum = 0.0f;
 #pragma unroll
@@ -135,36 +124,6 @@ fused_k_indexer_norm_rope_hadamard(const __grid_constant__ FusedKIndexerNormRope
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 3: 128-point Hadamard. V3.2 omits it (kHadamard=false).
-  if constexpr (kHadamard) {
-    {
-      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
-      data[0] = a0 + a1;
-      data[1] = a0 - a1;
-      data[2] = a2 + a3;
-      data[3] = a2 - a3;
-    }
-    {
-      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
-      data[0] = a0 + a2;
-      data[1] = a1 + a3;
-      data[2] = a0 - a2;
-      data[3] = a1 - a3;
-    }
-#pragma unroll
-    for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
-#pragma unroll
-      for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
-        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
-      }
-    }
-    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
-#pragma unroll
-    for (int i = 0; i < kVecSize; ++i)
-      data[i] *= kHadamardScale;
-  }
-
   {
     Storage out_vec;
 #pragma unroll
@@ -175,10 +134,10 @@ fused_k_indexer_norm_rope_hadamard(const __grid_constant__ FusedKIndexerNormRope
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
-struct FusedKIndexerNormRopeHadamardKernel {
+template <typename DType, bool kUsePDL>
+struct FusedKIndexerNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_k_indexer_norm_rope_hadamard<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
+  static constexpr auto kernel = fused_k_indexer_norm_rope<DType, PosT, kUsePDL>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,
@@ -227,7 +186,7 @@ struct FusedKIndexerNormRopeHadamardKernel {
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     if (batch_size == 0) return;
 
-    const auto params = FusedKIndexerNormRopeHadamardParams{
+    const auto params = FusedKIndexerNormRopeParams{
         .k_input = k_input.data_ptr(),
         .k_out = k_out.data_ptr(),
         .weight = static_cast<const float*>(weight.data_ptr()),
@@ -247,9 +206,9 @@ struct FusedKIndexerNormRopeHadamardKernel {
   }
 };
 
-// Indexer K + fused store: LayerNorm + RoPE (+ Hadamard) + fp8 quant + paged
-// store in one launch. Page layout matches fused_store_index_cache.cuh: each
-// page is 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales).
+// Indexer K + fused store: LayerNorm + RoPE + fp8 quant + paged store in one
+// launch. Page layout matches fused_store_index_cache.cuh: each page is
+// 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales).
 struct FusedKIndexerNormRopeStoreParams {
   const void* __restrict__ k_input;     // (B, 128) DType
   void* __restrict__ cache;             // (num_pages, 132*page_size) uint8
@@ -264,7 +223,7 @@ struct FusedKIndexerNormRopeStoreParams {
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst, bool kHadamard, int32_t kPageBits>
+template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKIndexerNormRopeStoreParams params) {
   using namespace device;
 
@@ -284,7 +243,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
   const auto work_id = blockIdx.x * kFusedKIndexerNumWarps + warp_id;
-  const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
+  const bool is_rope_lane = lane_id < kRopeSize;
 
   if (work_id >= params.batch_size) return;
 
@@ -301,7 +260,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, kRopeFirst ? lane_id : (lane_id - (kWarpThreads - kRopeSize)));
+    if (is_rope_lane) freq.load(freqs_cis, lane_id);
 
     float sum = 0.0f;
 #pragma unroll
@@ -343,37 +302,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 3: 128-point Hadamard. V3.2 omits it (kHadamard=false).
-  if constexpr (kHadamard) {
-    {
-      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
-      data[0] = a0 + a1;
-      data[1] = a0 - a1;
-      data[2] = a2 + a3;
-      data[3] = a2 - a3;
-    }
-    {
-      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
-      data[0] = a0 + a2;
-      data[1] = a1 + a3;
-      data[2] = a0 - a2;
-      data[3] = a1 - a3;
-    }
-#pragma unroll
-    for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
-#pragma unroll
-      for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
-        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
-      }
-    }
-    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
-#pragma unroll
-    for (int i = 0; i < kVecSize; ++i)
-      data[i] *= kHadamardScale;
-  }
-
-  // part 4: fp8 act-quant + paged store. Round through bf16 first so the fp8
+  // part 3: fp8 act-quant + paged store. Round through bf16 first so the fp8
   // scale matches the un-fused path.
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i)
@@ -401,15 +330,14 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst, bool kHadamard, uint32_t kPageSize>
+template <typename DType, bool kUsePDL, uint32_t kPageSize>
 struct FusedKIndexerNormRopeStoreKernel {
   static constexpr int32_t kPageBits = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132ll * kPageSize;
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
   template <typename PosT>
-  static constexpr auto kernel =
-      fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kPageBits>;
+  static constexpr auto kernel = fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,
