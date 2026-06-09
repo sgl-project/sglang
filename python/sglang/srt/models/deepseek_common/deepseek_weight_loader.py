@@ -76,6 +76,52 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _load_fused_indexer_wk(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+    pending: Dict[str, Dict[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
+    param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
+    weights_proj the bottom n_heads rows.
+
+    Returns True if the shard was consumed (caller should skip normal loading).
+    Returns False when there is no fused param (non-CUDA, where wk and
+    weights_proj are separate) so the caller falls through to per-tensor loading.
+    """
+    fused_name = name.rsplit(".indexer.", 1)[0] + ".indexer.wk_weights_proj.weight"
+    fused_param = params_dict.get(fused_name)
+    if fused_param is None or fused_param.dtype != torch.bfloat16:
+        return False
+
+    if ".indexer.weights_proj." in name:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[-w.shape[0] :].copy_(w)
+        return True
+
+    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    is_scale = name.endswith(".weight_scale_inv")
+    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[: w.shape[0]].copy_(w)
+        return True
+
+    entry = pending.setdefault(fused_name, {})
+    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+        loaded_weight
+    )
+    if "weight" in entry and "scale" in entry:
+        pending.pop(fused_name)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        wk_bf16 = block_quant_dequant(
+            entry["weight"], entry["scale"], block_size, torch.bfloat16
+        )
+        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+    return True
+
+
 @dataclass(frozen=True)
 class NextNEnabledConfig:
     num_nextn_layers: int
@@ -209,44 +255,18 @@ class DeepseekV2WeightLoaderMixin:
                 if "rotary_emb.inv_freq" in name:
                     continue
 
-                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj: wk in
-                # the top head_dim rows (dequant from block-fp8), weights_proj below.
-                if ".indexer.wk." in name or ".indexer.weights_proj." in name:
-                    base = name.rsplit(".indexer.", 1)[0] + ".indexer."
-                    fused_name = base + "wk_weights_proj.weight"
-                    fused_param = params_dict.get(fused_name)
-                    if fused_param is not None and fused_param.dtype == torch.bfloat16:
-                        if ".indexer.weights_proj." in name:
-                            w = _clone_if_runai_streamed_tensor(loaded_weight)
-                            fused_param.data[-w.shape[0] :].copy_(w)
-                            continue
-                        is_wk_scale = name.endswith(".weight_scale_inv")
-                        is_wk_fp8 = (
-                            not is_wk_scale
-                            and loaded_weight.dtype == torch.float8_e4m3fn
-                        )
-                        if not is_wk_scale and not is_wk_fp8:
-                            w = _clone_if_runai_streamed_tensor(loaded_weight)
-                            fused_param.data[: w.shape[0]].copy_(w)
-                            continue
-                        entry = pending_indexer_wk.setdefault(fused_name, {})
-                        entry["scale" if is_wk_scale else "weight"] = (
-                            _clone_if_runai_streamed_tensor(loaded_weight)
-                        )
-                        if "weight" not in entry or "scale" not in entry:
-                            continue
-                        pending_indexer_wk.pop(fused_name)
-                        weight_block_size = getattr(
-                            self.quant_config, "weight_block_size", None
-                        ) or [128, 128]
-                        wk_bf16 = block_quant_dequant(
-                            entry["weight"],
-                            entry["scale"],
-                            weight_block_size,
-                            torch.bfloat16,
-                        )
-                        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
-                        continue
+                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
+                # helper returns True once it has consumed the shard.
+                if (
+                    ".indexer.wk." in name or ".indexer.weights_proj." in name
+                ) and _load_fused_indexer_wk(
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    pending_indexer_wk,
+                    self.quant_config,
+                ):
+                    continue
 
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
