@@ -302,13 +302,14 @@ class OpenAIBeamSearchMixin:
             if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
-                    or self._get_enable_thinking_from_request(request)
+                    or self._get_reasoning_from_request(request)
                 )
                 try:
                     parser = ReasoningParser(
                         model_type=reasoning_parser,
                         stream_reasoning=False,
                         force_reasoning=is_force_reasoning,
+                        request=request,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
