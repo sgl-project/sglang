@@ -29,6 +29,7 @@ from sglang.srt.configs.nano_nemotron_vl import (
 )
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
+from sglang.srt.configs.pi05 import Pi05Config
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
@@ -80,4 +81,5 @@ __all__ = [
     "Step3p5Config",
     "Step3p7Config",
     "Qwen3ASRConfig",
+    "Pi05Config",
 ]

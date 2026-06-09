@@ -253,6 +253,10 @@ class GenerateReqInput(BaseReq):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # Extra request payload for model-specific extensions.
+    # VLA models use this to pass state / num_inference_steps / state_norm_stats.
+    extra_body: Optional[Dict[str, Any]] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
