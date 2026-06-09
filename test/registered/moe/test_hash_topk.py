@@ -61,6 +61,26 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     assert torch.allclose(output.topk_weights[:, -1], torch.full((2,), 0.4))
 
 
+def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
+    monkeypatch.setattr(
+        hash_topk_module, "uses_per_rank_fused_shared_slots", lambda *_args: True
+    )
+
+    topk = HashTopK(
+        topk=7,
+        num_experts=256,
+        num_fused_shared_experts=1,
+        vocab_size=2,
+        scoring_func="softmax",
+    )
+
+    output = topk.empty_topk_output(torch.device("cpu"))
+
+    assert output.topk_ids.shape == (0, 7)
+    assert output.topk_weights.shape == (0, 7)
+    assert output.router_logits.shape == (0, 6)
+
+
 def test_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     monkeypatch.setattr(topk_module, "get_moe_expert_parallel_world_size", lambda: 4)
     monkeypatch.setattr(topk_module, "get_moe_expert_parallel_rank", lambda: 2)

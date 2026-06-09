@@ -85,10 +85,18 @@ class HashTopK(nn.Module):
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
-        return self._apply_deepep_waterfill(
-            StandardTopKOutput(topk_weights, topk_ids, router_logits),
-            num_tokens=0,
-        )
+        topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        if self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+            n = self.num_fused_shared_experts
+            topk_output = topk_output._replace(
+                topk_ids=topk_output.topk_ids.new_empty(
+                    (0, topk_output.topk_ids.shape[-1] + n)
+                ),
+                topk_weights=topk_output.topk_weights.new_empty(
+                    (0, topk_output.topk_weights.shape[-1] + n)
+                ),
+            )
+        return self._apply_deepep_waterfill(topk_output, num_tokens=0)
 
     def _apply_deepep_waterfill(
         self, topk_output: StandardTopKOutput, num_tokens: int
