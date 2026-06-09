@@ -3,19 +3,12 @@
 
 from __future__ import annotations
 
-import json
 import math
-from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors.torch import load_file
 from torch import nn
 from torch.nn.utils import weight_norm
-
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 class Snake1d(nn.Module):
@@ -140,7 +133,9 @@ class Cosmos3AVAEAudioTokenizer(nn.Module):
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
-        self.sample_rate = int(_cfg(config, "sampling_rate", "sample_rate", default=48000))
+        self.sample_rate = int(
+            _cfg(config, "sampling_rate", "sample_rate", default=48000)
+        )
         self.audio_channels = int(
             _cfg(
                 config,
@@ -152,9 +147,15 @@ class Cosmos3AVAEAudioTokenizer(nn.Module):
         self.latent_channels = int(
             _cfg(config, "vocoder_input_dim", "io_channels", "latent_ch", default=64)
         )
-        dec_strides = [int(s) for s in _cfg(config, "dec_strides", default=[2, 4, 5, 6, 8])]
+        dec_strides = [
+            int(s) for s in _cfg(config, "dec_strides", default=[2, 4, 5, 6, 8])
+        ]
         self.hop_size = int(
-            _cfg(config, "hop_size", default=math.prod(dec_strides) if dec_strides else 1920)
+            _cfg(
+                config,
+                "hop_size",
+                default=math.prod(dec_strides) if dec_strides else 1920,
+            )
         )
         stride_product = math.prod(dec_strides)
         if stride_product != self.hop_size:
@@ -176,7 +177,9 @@ class Cosmos3AVAEAudioTokenizer(nn.Module):
             input_channels=self.latent_channels,
             audio_channels=self.audio_channels,
             upsampling_ratios=list(reversed(dec_strides)),
-            channel_multiples=list(_cfg(config, "dec_c_mults", default=[1, 2, 4, 8, 16])),
+            channel_multiples=list(
+                _cfg(config, "dec_c_mults", default=[1, 2, 4, 8, 16])
+            ),
         )
 
     @property
@@ -214,33 +217,6 @@ class Cosmos3AVAEAudioTokenizer(nn.Module):
         z = self._denormalize_latent(latent.to(decoder_device)).to(decoder_dtype)
         audio = self.decoder(z).clamp(-1.0, 1.0).to(latent.dtype)
         return audio.squeeze(0) if squeeze else audio
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        path: str | Path,
-        *,
-        dtype: torch.dtype = torch.bfloat16,
-        device: torch.device | str = "cpu",
-    ) -> "Cosmos3AVAEAudioTokenizer":
-        path = Path(path)
-        with open(path / "config.json", encoding="utf-8") as f:
-            config = json.load(f)
-        model = cls(config)
-        state_dict = load_file(
-            str(path / "diffusion_pytorch_model.safetensors"), device="cpu"
-        )
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        unexpected = [k for k in unexpected if not k.startswith("encoder.")]
-        if missing:
-            logger.warning("Cosmos3 AVAE missing keys: %s", missing[:8])
-        if unexpected:
-            logger.warning("Cosmos3 AVAE unexpected keys: %s", unexpected[:8])
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad = False
-        model.to(device=device, dtype=dtype)
-        return model
 
 
 EntryClass = Cosmos3AVAEAudioTokenizer
