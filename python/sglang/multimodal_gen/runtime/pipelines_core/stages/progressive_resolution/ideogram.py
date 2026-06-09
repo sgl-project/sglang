@@ -19,6 +19,7 @@ from __future__ import annotations
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.sample.ideogram import IDEOGRAM4_PRESETS
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_transformer,
 )
@@ -34,6 +35,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.i
     OUTPUT_IMAGE_INDICATOR,
     Ideogram4DenoisingStage,
     Ideogram4Scheduler,
+    get_schedule_for_resolution,
+    make_step_intervals,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
@@ -402,18 +405,38 @@ class Ideogram4ProgressiveDenoisingStage(
         # Persist original LLM features so _on_resolution_change can restore
         # them (with re-adapted image-token count) when the latent is upsampled.
         ctx.extra["ideogram4_full_res_llm_features"] = full_res_llm
-        # Ideogram4Scheduler has no .sigmas attribute; expose a sigma_NOISE tensor
-        # so stage-transition logic can find the right step and DWT gets the correct
-        # noise level.
+
+        # _prepare_denoising_loop (parent) reads batch.height = init_h_pixel (low-res)
+        # and computes the schedule at that resolution.  The reference always uses the
+        # TARGET full-resolution schedule throughout denoising, even during coarse steps.
+        # Recompute schedule_values and schedule_deltas at the original full-res.
+        levels = int(getattr(batch, "progressive_levels", 1))
+        orig_h = batch.height * (2**levels)
+        orig_w = batch.width * (2**levels)
+        preset = getattr(batch, "preset", "V4_DEFAULT_20")
+        preset_cfg = IDEOGRAM4_PRESETS[preset]
+        full_res_schedule = get_schedule_for_resolution(
+            (orig_h, orig_w),
+            known_mean=float(preset_cfg["mu"]),
+            std=float(preset_cfg["std"]),
+        )
+        device = ctx.extra["ideogram4_schedule_values"].device
+        step_intervals = make_step_intervals(int(preset_cfg["num_steps"])).to(device)
+        full_res_schedule_values = full_res_schedule(step_intervals)
+        ctx.extra["ideogram4_schedule_values"] = full_res_schedule_values
+        ctx.extra["ideogram4_schedule_deltas"] = (
+            full_res_schedule_values[:-1] - full_res_schedule_values[1:]
+        )
+
+        # Expose a sigma_NOISE tensor for stage-transition logic (find_transition_steps)
+        # and DWT upsample (sigma_t = sigmas[stage_end]).
         #
-        # schedule_values convention: sigma_clean values, index 0 = clean end (≈1),
+        # schedule_values convention: sigma_clean, index 0 = clean end (≈1),
         # index N = noisy end (≈0). Step step_index k uses internal index i = N-1-k,
         # so sigma_NOISE at step k = 1 - schedule_values[N-k].
         # flip(1 - schedule_values) gives sigmas[k] = 1 - schedule_values[N-k],
-        # which decreases from ≈1 (noisy, step 0) to ≈0 (clean, step N) — the
-        # convention expected by find_transition_steps and apply_upsample (sigma_t).
-        schedule_values = ctx.extra["ideogram4_schedule_values"]
-        ctx.scheduler.sigmas = torch.flip(1.0 - schedule_values, [0])
+        # which decreases from ≈1 (noisy, step 0) to ≈0 (clean, step N).
+        ctx.scheduler.sigmas = torch.flip(1.0 - full_res_schedule_values, [0])
         return ctx
 
     # ------------------------------------------------------------------
