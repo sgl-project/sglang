@@ -2075,12 +2075,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                # We will need extend_len - extend_logprob_start_len number of
+                # We will need req.extend_input_len - req.extend_logprob_start_len number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
-                        extend_lens[i]
+                        req.extend_range.length
                         - extend_logprob_start_lens[i]
                         - len(logprob_token_ids)
                     )
