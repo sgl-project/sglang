@@ -43,11 +43,12 @@ def _rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
 
 def _apply_proj(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
     B, H, N, D = feats.shape
-    return torch.einsum(
+    out = torch.einsum(
         "bnij,bhnkj->bhnki",
-        matrix,
-        feats.reshape(B, H, N, -1, 4),
+        matrix.float(),
+        feats.reshape(B, H, N, -1, 4).float(),
     ).reshape(B, H, N, D)
+    return out.to(feats.dtype)
 
 
 def _apply_rope_ref(x: torch.Tensor, rotary_emb: torch.Tensor) -> torch.Tensor:

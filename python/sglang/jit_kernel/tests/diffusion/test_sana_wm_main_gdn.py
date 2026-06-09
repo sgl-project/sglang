@@ -63,7 +63,8 @@ def _gdn_scan_forward_ref(
     beta: torch.Tensor,
     decay: torch.Tensor,
     eps: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del eps
     B, H, D, N = q.shape
     T = beta.shape[2]
     S = N // T
@@ -105,7 +106,7 @@ def _gdn_scan_forward_ref(
     den = torch.stack(den_list, dim=2)
     num = num.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
     den = den.permute(0, 1, 3, 2, 4).reshape(B, H, 1, N)
-    return num / (den + eps)
+    return num, den
 
 
 def _gdn_scan_bidi_ref(
@@ -118,7 +119,7 @@ def _gdn_scan_bidi_ref(
     decay: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    out_fwd = _gdn_scan_forward_ref(q, k, v, q_rot, k_rot, beta, decay, eps)
+    num_fwd, den_fwd = _gdn_scan_forward_ref(q, k, v, q_rot, k_rot, beta, decay, eps)
     B, H, D, N = q.shape
     T = beta.shape[2]
     S = N // T
@@ -134,7 +135,7 @@ def _gdn_scan_bidi_ref(
     v_t = to_time(v)
     q_rot_t = to_time(q_rot)
     k_rot_t = to_time(k_rot)
-    out_bwd_flipped = _gdn_scan_forward_ref(
+    num_bwd_flipped, den_bwd_flipped = _gdn_scan_forward_ref(
         from_time(torch.flip(q_t, dims=[2])),
         from_time(_flip_and_shift(k_t, dim=2, shift_val=0.0)),
         from_time(_flip_and_shift(v_t, dim=2, shift_val=0.0)),
@@ -144,11 +145,17 @@ def _gdn_scan_bidi_ref(
         _flip_and_shift(decay, dim=2, shift_val=1.0),
         eps,
     )
-    out_bwd = torch.flip(
-        out_bwd_flipped.view(B, H, D, T, S),
-        dims=[3],
-    ).reshape(B, H, D, N)
-    return out_fwd + out_bwd
+
+    def flip_back(x: torch.Tensor) -> torch.Tensor:
+        d_actual = x.shape[2]
+        return torch.flip(
+            x.view(B, H, d_actual, T, S),
+            dims=[3],
+        ).reshape(B, H, d_actual, N)
+
+    num_bwd = flip_back(num_bwd_flipped)
+    den_bwd = flip_back(den_bwd_flipped)
+    return (num_fwd + num_bwd) / (den_fwd + den_bwd + eps)
 
 
 def _reference(

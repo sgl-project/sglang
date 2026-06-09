@@ -1398,15 +1398,9 @@ def fused_bigdn_bidi_chunkwise(
     sampling (chunk 0 = full bidi with state save; chunks > 0 seed forward scan
     from saved state). Reverse always seeds from zero per upstream convention.
 
-    Pipeline (2026-04-25 restructure): Phase A once → Phase B direction=0 with
-    combined_history=True (fwd seeded with init_state and saves final state;
-    rev zero-seeded; rev output summed into fwd buffer in-kernel via read-
-    add-store so on exit M_hist[f] = M_fwd[f] + M_rev[f]) → Phase C ONCE on
-    M_hist. Phase C linearity `Q @ (M_fwd + M_rev) = Q @ M_fwd + Q @ M_rev`
-    makes the in-kernel sum exact.
-
-    Replaces the prior 2× Phase B + 2× Phase C pattern. Saves one Phase C
-    launch + one Q+RoPE HBM pass and one M-shape buffer per call.
+    This mirrors Sana's baseline BidirectionalGDN: run the forward and exclusive
+    reverse recurrences, combine their numerator/denominator components, then
+    apply the final normalization once.
     """
     I_P_kv, A, I_P_z, B_z = phase_a(
         qkv,
