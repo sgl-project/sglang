@@ -3670,15 +3670,18 @@ class ServerArgs:
         if not self.prefill_only_disable_kv_cache:
             return
 
-        # This flag is intentionally scoped to embedding mode for now. Other
-        # prefill-only paths (for example scoring and MIS) can benefit from
-        # the same idea later, but some of them still stage K/V through the
-        # paged cache today.
-        if not self.is_embedding:
+        # The flag covers two prefill-only modes today:
+        #  - --is-embedding (FA fa_skip_kv_cache path)
+        #  - --enable-mis (flashinfer ragged-MIS path; see
+        #    FlashInferAttnBackend.fi_skip_kv_cache)
+        # Other prefill-only paths (e.g. CausalLM scoring with max_new_tokens=0)
+        # can be added once their attention paths stop touching the paged pool.
+        if not (self.is_embedding or self.enable_mis):
             raise ValueError(
-                "--prefill-only-disable-kv-cache currently requires --is-embedding. "
-                "Other prefill-only workloads may be supported in a future change once "
-                "their attention paths stop reading or writing the paged KV cache."
+                "--prefill-only-disable-kv-cache currently requires --is-embedding "
+                "or --enable-mis. Other prefill-only workloads may be supported in "
+                "a future change once their attention paths stop reading or writing "
+                "the paged KV cache."
             )
         if self.kv_cache_dtype == "fp4_e2m1":
             raise ValueError(
@@ -3748,11 +3751,20 @@ class ServerArgs:
         )
 
         prefill_backend, _ = self.get_attention_backends()
-        if prefill_backend not in ("fa3", "fa4"):
+        # FA fa_skip_kv_cache covers fa3/fa4 (--is-embedding path).
+        # Flashinfer fi_skip_kv_cache covers --enable-mis (see
+        # FlashInferAttnBackend.fi_skip_kv_cache). Other prefill-only workloads
+        # and backends may be supported in a future change.
+        if prefill_backend in ("fa3", "fa4"):
+            pass
+        elif prefill_backend == "flashinfer" and self.enable_mis:
+            pass
+        else:
             raise ValueError(
-                "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
-                f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
-                "workloads and backends may be supported in a future change."
+                "--prefill-only-disable-kv-cache currently supports prefill backends "
+                "fa3/fa4 (for --is-embedding) and flashinfer combined with --enable-mis. "
+                f"Got prefill backend {prefill_backend!r}; other backends and prefill-only "
+                "workloads may be supported in a future change."
             )
 
     def _handle_hicache(self):

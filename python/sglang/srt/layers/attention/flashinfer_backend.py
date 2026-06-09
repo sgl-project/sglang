@@ -167,6 +167,18 @@ class FlashInferAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_mis = model_runner.server_args.enable_mis
+        # Skip per-layer KV pool reads/writes when --prefill-only-disable-kv-cache
+        # is on AND the structural preconditions for the ragged-MIS path hold.
+        # _handle_multi_item_scoring already enforces chunked_prefill_size=-1
+        # and disable_radix_cache for MIS, so the structural checks here are
+        # effectively redundant — they mirror FlashAttentionBackend.fa_skip_kv_cache
+        # for symmetry. The actual gate is enable_mis + prefill_only_disable_kv_cache.
+        self.fi_skip_kv_cache = (
+            model_runner.server_args.prefill_only_disable_kv_cache
+            and model_runner.server_args.enable_mis
+            and model_runner.server_args.chunked_prefill_size == -1
+            and model_runner.server_args.disable_radix_cache
+        )
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -280,7 +292,11 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
 
         fmha_backend = "auto"
-        if is_sm100_supported():
+        # Cutlass and cudnn FMHA paths in flashinfer drop the MIS attention
+        # params (prefix_len_ptr / token_pos_in_items_ptr / max_item_len_ptr)
+        # silently — see flashinfer/prefill.py:3082-3134. Force "auto" on MIS
+        # so the ragged-MIS path lands on FA2/FA3 where the params are honored.
+        if is_sm100_supported() and not self.enable_mis:
             if not model_runner.server_args.disable_piecewise_cuda_graph:
                 logger.info(
                     "CUTLASS backend is disabled when piecewise cuda graph is enabled "
@@ -579,16 +595,24 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis:
-                # use_ragged = False: Multi-item scoring requires the paged wrapper because:
-                # 1. Ragged wrapper doesn't support the specialized multi-item parameters
-                #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
-                # 2. Paged wrapper provides better control over attention masking needed
-                #    for respecting item boundaries in multi-item sequences
-                # 3. Custom masking logic conflicts with ragged wrapper's assumptions
+            # Multimodal still uses the paged wrapper.
+            if self.is_multimodal:
                 use_ragged = False
                 extend_no_prefix = False
+            elif self.enable_mis:
+                # MIS is prefill-only (max_new_tokens=0), and
+                # _handle_multi_item_scoring auto-enforces disable_radix_cache=True
+                # and chunked_prefill_size=-1. So there is no prefix to merge and
+                # K/V is transient per request — the ragged wrapper is the right
+                # tool. Flashinfer's ragged wrapper accepts prefix_len_ptr,
+                # token_pos_in_items_ptr, token_pos_in_items_len, and
+                # max_item_len_ptr natively (see flashinfer/prefill.py:2596-2630
+                # and the kernel call at 3174-3186), so MIS attention masks are
+                # honored end-to-end. Routing MIS through ragged also makes
+                # fi_skip_kv_cache work because the ragged path doesn't touch
+                # the paged KV pool — see forward_extend below.
+                use_ragged = True
+                extend_no_prefix = True
             else:
                 use_ragged = (
                     not self.enable_deterministic
@@ -761,7 +785,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
-                if save_kv_cache:
+                if save_kv_cache and not self.fi_skip_kv_cache:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
@@ -853,7 +877,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
-            if save_kv_cache:
+            if save_kv_cache and not self.fi_skip_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
@@ -1477,27 +1501,11 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
 
-        # extend part
-        if use_ragged:
-            wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                q_data_type=self.q_data_type,
-            )
-
-        if use_sliding_window_kv_pool:
-            kv_last_index = kv_indptr[-1]
-            kv_indices[:kv_last_index] = (
-                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                    kv_indices[:kv_last_index]
-                )
-            )
-
-        # cached part
-        # Conditionally set multi-item parameters
+        # Compute MIS params first so both ragged and paged begin_forward
+        # can consume them. Flashinfer's ragged wrapper accepts the full MIS
+        # parameter surface natively in current versions
+        # (flashinfer/prefill.py:2596-2630, kernel call at 3174-3186), which
+        # is what unblocks routing MIS through ragged.
         if multi_item_params is not None and multi_item_params.is_enabled():
             # Multi-item scoring is active - use specialized parameters and disable generic custom_mask
             use_custom_mask = None
@@ -1513,6 +1521,30 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        # extend part
+        if use_ragged:
+            wrapper_ragged.begin_forward(
+                qo_indptr,
+                qo_indptr,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_data_type=self.q_data_type,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+            )
+
+        if use_sliding_window_kv_pool:
+            kv_last_index = kv_indptr[-1]
+            kv_indices[:kv_last_index] = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    kv_indices[:kv_last_index]
+                )
+            )
+
+        # cached part — MIS params consumed above; just hand them to the paged wrapper.
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
