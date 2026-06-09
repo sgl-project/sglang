@@ -31,8 +31,25 @@ def _server_args_for_transformer_component(
     server_args: ServerArgs, component_name: str
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
-    if component_name != "transformer_2":
+    if component_name not in ("transformer_2", "unconditional_transformer"):
         return server_args
+
+    # Some pipelines have secondary DiT components with their own quantized
+    # weight file. Keep the mapping model-owned and the loader generic.
+    component_weights_paths = getattr(
+        server_args, "component_transformer_weights_paths", {}
+    )
+    component_weights_path = component_weights_paths.get(component_name)
+    if component_weights_path is not None:
+        component_server_args = copy.copy(server_args)
+        component_server_args.transformer_weights_path = component_weights_path
+        component_server_args.nunchaku_config = None
+        logger.info(
+            "Using transformer_weights_path override for %s: %s",
+            component_name,
+            component_weights_path,
+        )
+        return component_server_args
 
     if (
         server_args.transformer_weights_path is None
@@ -54,7 +71,12 @@ def _server_args_for_transformer_component(
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
-    component_names = ["transformer", "audio_dit", "video_dit"]
+    component_names = [
+        "transformer",
+        "unconditional_transformer",
+        "audio_dit",
+        "video_dit",
+    ]
     expected_library = "diffusers"
 
     def load_customized(
@@ -76,7 +98,7 @@ class TransformerLoader(ComponentLoader):
         # Config from Diffusers supersedes sgl_diffusion's model config
         component_name = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "video_dit"):
+        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
             pipeline_dit_config_attr = "dit_config"
         elif component_name in ("audio_dit",):
             pipeline_dit_config_attr = "audio_dit_config"
@@ -115,7 +137,7 @@ class TransformerLoader(ComponentLoader):
             and component_server_args.transformer_weights_path is not None
         ):
             logger.warning(
-                f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
+                "transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
             )
         else:
             logger.debug("quantization config: %s", init_params["quant_config"])

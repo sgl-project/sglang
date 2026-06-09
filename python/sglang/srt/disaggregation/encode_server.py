@@ -8,6 +8,7 @@ import logging
 import multiprocessing as mp
 import os
 import pickle
+import threading
 import time
 import traceback
 from collections import defaultdict
@@ -16,6 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
+import requests as http_requests
 import torch
 import uvicorn
 import zmq
@@ -3127,6 +3129,107 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
         traceback.print_exc()
 
 
+def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
+    """Asynchronously register this encoder with each bootstrap URL.
+
+    Spawns a daemon thread that retries each URL independently with bounded
+    backoff.  The encoder's own startup is not blocked: if some bootstrap
+    server is slow or unreachable, only the background worker waits.
+
+    Inspired by ``_ensure_prefill_info`` in disaggregation/decode.py: each
+    target keeps its own retry count and is retried at a fixed interval
+    instead of serialising sleeps in a single thread.
+    """
+
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    payload = {"url": encoder_url}
+    bootstrap_urls = list(server_args.encoder_register_urls)
+    if not bootstrap_urls:
+        return
+
+    max_retries = 30
+    retry_interval = 5.0
+    request_timeout = 5.0
+
+    def _try_register_once(bootstrap_url: str) -> bool:
+        try:
+            resp = http_requests.post(
+                f"{bootstrap_url}/register_encoder_url",
+                json=payload,
+                timeout=request_timeout,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered encoder URL '{encoder_url}' with bootstrap "
+                    f"at {bootstrap_url}"
+                )
+                return True
+            logger.warning(
+                f"Bootstrap {bootstrap_url} returned {resp.status_code}: {resp.text}"
+            )
+        except Exception as e:
+            logger.debug(f"Register attempt to {bootstrap_url} failed: {e}")
+        return False
+
+    def _worker():
+        pending = list(bootstrap_urls)
+        retry_count = {url: 0 for url in pending}
+        while pending:
+            still_pending = []
+            for bootstrap_url in pending:
+                if _try_register_once(bootstrap_url):
+                    continue
+                retry_count[bootstrap_url] += 1
+                if retry_count[bootstrap_url] >= max_retries:
+                    logger.error(
+                        f"Giving up on bootstrap {bootstrap_url} after "
+                        f"{max_retries} attempts. Encoder discovery via this "
+                        f"bootstrap will be incomplete."
+                    )
+                    continue
+                still_pending.append(bootstrap_url)
+            pending = still_pending
+            if pending:
+                time.sleep(retry_interval)
+
+    threading.Thread(
+        target=_worker, daemon=True, name="encoder-bootstrap-register"
+    ).start()
+
+
+def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    payload = {"url": encoder_url}
+
+    for bootstrap_url in server_args.encoder_register_urls:
+        try:
+            resp = http_requests.delete(
+                f"{bootstrap_url}/unregister_encoder_url",
+                json=payload,
+                timeout=2.0,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    f"Unregistered encoder URL '{encoder_url}' from "
+                    f"bootstrap at {bootstrap_url}"
+                )
+            else:
+                logger.warning(
+                    f"Bootstrap {bootstrap_url} returned "
+                    f"{resp.status_code} on unregister: {resp.text}"
+                )
+        except Exception as e:
+            logger.debug(f"Unregister from {bootstrap_url} failed: {e}")
+
+
 def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
     if server_args.dp_size > 1:
@@ -3156,6 +3259,14 @@ def launch_server(server_args: ServerArgs):
             daemon=True,
         ).start()
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+
+    # Register this encoder's URL with prefill server(s) if configured.
+    if server_args.encoder_register_urls:
+        import atexit
+
+        _register_encoder_url_with_bootstrap(server_args)
+        atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
+
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
@@ -3227,6 +3338,13 @@ def _launch_server_dp(server_args: ServerArgs):
         result_socket,
         worker_processes,
     )
+
+    # Register this encoder's URL with prefill server(s) if configured.
+    if server_args.encoder_register_urls:
+        import atexit
+
+        _register_encoder_url_with_bootstrap(server_args)
+        atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 

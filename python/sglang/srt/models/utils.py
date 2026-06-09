@@ -275,7 +275,15 @@ class AutoWeightsLoader:
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    """Enable fused set_kv_buffer on CUDA with bfloat16 KV cache and HIP with bf16/fp16/fp8 KV cache.
+
+    SHUFFLE 5D pools on HIP also work — the underlying triton kernel
+    (`fused_qk_rope_reshape_and_cache`) natively supports the 5D
+    SHUFFLE layout (key_cache.ndim==5, value_cache.ndim==5). We just need
+    the per-layer arg builder to pass the raw 5D buffers without the
+    `.view(-> 4D NHD)` reshape, and let the rotary forward pass
+    `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
+    """
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
@@ -313,16 +321,26 @@ def create_fused_set_kv_buffer_arg(
             if layer.sliding_window_size > 0
             else None
         )
+        # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
+        # fused_qk_rope_reshape_and_cache via flash_layout=False. For the
+        # legacy NHD 3D pool we reshape to the (num_blocks, page_size, H, D)
+        # paged view the kernel expects under flash_layout=True.
+        if k_buffer.ndim == 5:
+            key_cache = k_buffer
+            value_cache = v_buffer
+        else:
+            key_cache = k_buffer.view(
+                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            )
+            value_cache = v_buffer.view(
+                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            )
         return {
             "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
             "k_scale": layer.k_scale,
             "v_scale": layer.v_scale,
-            "key_cache": k_buffer.view(
-                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
-            ),
-            "value_cache": v_buffer.view(
-                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
-            ),
+            "key_cache": key_cache,
+            "value_cache": value_cache,
             "slot_mapping": forward_batch.out_cache_loc,
             "swa_slot_mapping": slot_mapping_swa,
         }

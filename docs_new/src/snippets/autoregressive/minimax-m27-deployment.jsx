@@ -13,7 +13,8 @@ export const MiniMaxM27Deployment = () => {
         { id: 'h100',   label: 'H100',   default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon',  label: 'XEON',  default: false }
       ]
     },
     gpuCount: {
@@ -23,6 +24,12 @@ export const MiniMaxM27Deployment = () => {
         const hw = values.hardware;
         const isAMD = hw === 'mi300x' || hw === 'mi325x' || hw === 'mi355x';
         const isGB300 = hw === 'gb300';
+        const isXeon = hw === 'xeon';
+        if (isXeon) {
+          return [
+            { id: 'tp6', label: 'TP=6', default: true, disabled: false }
+          ];
+        }
         const canUse2GPU = isAMD || isGB300;
         return [
           { id: '2gpu', label: '2', default: canUse2GPU,  disabled: !canUse2GPU },
@@ -112,6 +119,7 @@ export const MiniMaxM27Deployment = () => {
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
     const isGB300 = hardware === 'gb300';
+    const isXeon = hardware === 'xeon';
     const canUse2GPU = isAMD || isGB300;
 
     if (gpuCount === '2gpu' && !canUse2GPU) {
@@ -123,7 +131,11 @@ export const MiniMaxM27Deployment = () => {
     let cmd = 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
 
-    if (gpuCount === '8gpu') {
+    if (isXeon) {
+      cmd += ' \\\n  --device cpu';
+      cmd += ' \\\n  --disable-overlap-schedule';
+      cmd += ' \\\n  --tp 6';
+    } else if (gpuCount === '8gpu') {
       cmd += ' \\\n  --tp 8';
       cmd += ' \\\n  --ep 8';
     } else if (gpuCount === '4gpu') {
@@ -138,9 +150,11 @@ export const MiniMaxM27Deployment = () => {
     if (thinking === 'enabled') cmd += ' \\\n  --reasoning-parser minimax-append-think';
 
     cmd += ' \\\n  --trust-remote-code';
-    cmd += ' \\\n  --mem-fraction-static 0.85';
+    if (!isXeon) {
+      cmd += ' \\\n  --mem-fraction-static 0.85';
+    }
 
-    if (isAMD) {
+    if (!isXeon && isAMD) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
       cmd += ' \\\n  --attention-backend triton';
     }

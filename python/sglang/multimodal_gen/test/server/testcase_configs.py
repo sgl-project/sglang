@@ -427,6 +427,61 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
+
+IDEOGRAM4_CI_PROMPT = json.dumps(
+    {
+        "high_level_description": IDEOGRAM4_CI_TEXT_PROMPT,
+        "style_description": {
+            "aesthetics": "warm, peaceful, vibrant",
+            "lighting": "bright afternoon sunlight, long soft shadows",
+            "photo": "shallow depth of field, eye-level, 85mm lens",
+            "medium": "photograph",
+            "color_palette": [
+                "#F5C542",
+                "#87CEEB",
+                "#4A4A4A",
+                "#FFFFFF",
+                "#2E8B57",
+            ],
+        },
+        "compositional_deconstruction": {
+            "background": (
+                "A sunlit garden path with green hedges and a wooden bench. "
+                "Dappled light filters through overhead trees."
+            ),
+            "elements": [
+                {
+                    "type": "obj",
+                    "bbox": [260, 260, 760, 780],
+                    "desc": (
+                        "A small tabby cat sitting calmly on a wooden bench, "
+                        "looking toward the camera."
+                    ),
+                },
+                {
+                    "type": "obj",
+                    "bbox": [180, 580, 840, 840],
+                    "desc": (
+                        "A weathered wooden garden bench with soft sunlight "
+                        "falling across the seat."
+                    ),
+                },
+            ],
+        },
+    },
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
+
+IDEOGRAM4_CI_sampling_params = replace(
+    T2I_sampling_params,
+    prompt=IDEOGRAM4_CI_PROMPT,
+    output_size="1024x1024",
+    output_format="png",
+    extras={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",
@@ -488,6 +543,15 @@ TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
     direct_url_test=True,
+)
+
+SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=TI2V_sampling_params.prompt,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+    output_size="384x640",
+    num_frames=17,
+    extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(

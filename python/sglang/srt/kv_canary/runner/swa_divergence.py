@@ -149,6 +149,13 @@ class SwaDivergenceLog:
             return None
         return cls(**json.loads(last_match.group(1))), last_match.group(0)
 
+    @classmethod
+    def find_all(cls, text: str) -> list[tuple["SwaDivergenceLog", str]]:
+        return [
+            (cls(**json.loads(match.group(1))), match.group(0))
+            for match in _SWA_DIVERGENCE_LINE_RE.finditer(text)
+        ]
+
 
 def compute_swa_out_of_window_tokens(
     *,

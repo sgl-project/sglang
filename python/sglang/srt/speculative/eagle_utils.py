@@ -48,30 +48,6 @@ def per_step_draft_out_cache_loc(
     )
 
 
-def apply_eagle_prefill_input_rotation(
-    batch: ScheduleBatch, next_token_ids: torch.Tensor
-) -> None:
-    """EAGLE input rotation for draft prefill.
-
-    Each req's slice [t_0..t_{n-1}] -> [t_1..t_{n-1}, t_n] with
-    t_n = next_token_ids[i]. Aligns draft's position-i hidden with
-    target's label at i+1 — the basis of EAGLE chain prediction.
-    Vectorized: one whole-tensor left shift + scatter at segment tails.
-    """
-    if batch.forward_mode.is_idle():
-        return
-    assert len(next_token_ids) == len(batch.seq_lens)
-    extend_lens = torch.tensor(
-        batch.extend_lens, dtype=torch.int64, device=batch.device
-    )
-    seg_ends = extend_lens.cumsum(0) - 1
-    rotated = torch.empty_like(batch.input_ids)
-    rotated[:-1] = batch.input_ids[1:]
-    # TODO: chunked-prefill chain divergence at non-final-chunk seg end; fix per PR #26329.
-    rotated[seg_ends] = next_token_ids.to(batch.input_ids.dtype)
-    batch.input_ids = rotated
-
-
 def _eagle_prefill_tail_tokens(
     batch: ScheduleBatch, next_token_ids: torch.Tensor
 ) -> torch.Tensor:

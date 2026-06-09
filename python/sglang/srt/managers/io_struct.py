@@ -270,6 +270,9 @@ class GenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
+    # Snapshot of encoder URLs at the time tokenizer-side computed
+    # ``num_items_assigned``.
+    encoder_urls: Optional[List[str]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -815,6 +818,10 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
+    # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
+    # encoder_idx assignments stay consistent in the scheduler subprocess.
+    # Internal IPC only.
+    encoder_urls: Optional[List[str]] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -1866,6 +1873,7 @@ class ParseFunctionCallReq(BaseReq):
 class SeparateReasoningReqInput(BaseReq):
     text: str  # The text to parse.
     reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+    return_blocks: bool = False  # If True, also return segmented reasoning blocks.
 
 
 @dataclass

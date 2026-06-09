@@ -244,9 +244,9 @@ class StreamingSession(BasePrefixCache):
         req = params.req
         slot.restore_to_req(req)
 
-        # token_ids = fill_ids[:input_len-1] (1-token logit reserve already
-        # applied). min handles retract retry where committed_len can
-        # exceed len(token_ids) by 1.
+        # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
+        # already applied). min handles retract retry where committed_len
+        # can exceed len(token_ids) by 1.
         prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
 
         # Streaming sessions are append-only (session_controller rollback
@@ -353,7 +353,7 @@ class StreamingSession(BasePrefixCache):
             return False
         if chunked:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.fill_len
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
@@ -500,14 +500,14 @@ class StreamingSession(BasePrefixCache):
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""
-        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
-        if mamba_pool is None:
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is None:
             return
         if slot.mamba_pool_idx is not None:
-            mamba_pool.free(slot.mamba_pool_idx.unsqueeze(0))
+            mamba_allocator.free(slot.mamba_pool_idx.unsqueeze(0))
             slot.mamba_pool_idx = None
         if slot.mamba_ping_pong_track_buffer is not None:
-            mamba_pool.free(slot.mamba_ping_pong_track_buffer)
+            mamba_allocator.free(slot.mamba_ping_pong_track_buffer)
             slot.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --

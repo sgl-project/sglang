@@ -564,7 +564,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
 
-        self._patch_mistral_skip_special_tokens(request)
+        self._patch_reasoning_skip_special_tokens(request)
 
         thinking_mode = self._get_reasoning_from_request(request)
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
@@ -1546,11 +1546,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
-    def _patch_mistral_skip_special_tokens(
+    def _patch_reasoning_skip_special_tokens(
         self, request: ChatCompletionRequest
     ) -> None:
-        """Mistral uses special tokens ([THINK]/[/THINK]) for reasoning markers,
-        which get stripped when skip_special_tokens=True."""
+        """Keep parser-specific reasoning markers in the decoded text.
+
+        Some reasoning parsers rely on special-token delimiters that would be
+        removed during detokenization when ``skip_special_tokens=True``.
+        """
+        if self.reasoning_parser == "apertus2509":
+            request.skip_special_tokens = False
+
         if (
             self.reasoning_parser in ["mistral"]
             and request.reasoning_effort is not None

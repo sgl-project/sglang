@@ -52,7 +52,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all,
     _usp_input_all_to_all_varlen,
+    _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
@@ -87,6 +89,18 @@ from sglang.srt.utils import add_prefix
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
+
+def _safe_tensor_version(tensor: torch.Tensor) -> int:
+    """Return ``tensor._version``, or ``0`` for inference-mode tensors.
+
+    Tensors created under ``torch.inference_mode`` do not track a version
+    counter, so reading ``tensor._version`` raises ``RuntimeError``. The value
+    is only used as a cache-invalidation hint for the camera conditioner, so a
+    constant fallback is safe for such tensors.
+    """
+    return 0 if tensor.is_inference() else tensor._version
+
+
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
@@ -95,6 +109,12 @@ def _compute_sequence_splits(total_len: int, world_size: int) -> list[int]:
     base = total_len // world_size
     remainder = total_len % world_size
     return [base + (1 if rank < remainder else 0) for rank in range(world_size)]
+
+
+def _sequence_splits_are_uniform(seq_splits: list[int]) -> bool:
+    return len(seq_splits) <= 1 or all(
+        seq_len == seq_splits[0] for seq_len in seq_splits
+    )
 
 
 def _sequence_shard_tensor(
@@ -111,6 +131,9 @@ def _sequence_all_gather_varlen(
     group: dist.ProcessGroup,
 ) -> torch.Tensor:
     rank = get_sp_parallel_rank()
+    if _sequence_splits_are_uniform(seq_splits):
+        return sequence_model_parallel_all_gather(x.contiguous(), dim=1)
+
     max_seq = max(seq_splits)
     local_seq = seq_splits[rank]
     if local_seq < max_seq:
@@ -132,8 +155,20 @@ class LingBotWorldCamConditioner(nn.Module):
         self.cam_scale_layer = nn.Linear(dim, dim)
         self.cam_shift_layer = nn.Linear(dim, dim)
 
+    def compute_scale_shift(
+        self, c2ws_plucker_emb: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        c2ws_hidden_states = self.cam_injector(c2ws_plucker_emb)
+        c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
+        cam_scale = self.cam_scale_layer(c2ws_hidden_states)
+        cam_shift = self.cam_shift_layer(c2ws_hidden_states)
+        return cam_scale, cam_shift
+
     def forward(
-        self, hidden_states: torch.Tensor, c2ws_plucker_emb: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        c2ws_plucker_emb: torch.Tensor | None,
+        scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if c2ws_plucker_emb is None:
             return hidden_states
@@ -142,10 +177,9 @@ class LingBotWorldCamConditioner(nn.Module):
                 "c2ws_plucker_emb shape must match hidden_states shape, "
                 f"got {tuple(c2ws_plucker_emb.shape)} vs {tuple(hidden_states.shape)}"
             )
-        c2ws_hidden_states = self.cam_injector(c2ws_plucker_emb)
-        c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
-        cam_scale = self.cam_scale_layer(c2ws_hidden_states)
-        cam_shift = self.cam_shift_layer(c2ws_hidden_states)
+        if scale_shift is None:
+            scale_shift = self.compute_scale_shift(c2ws_plucker_emb)
+        cam_scale, cam_shift = scale_shift
         return (1.0 + cam_scale) * hidden_states + cam_shift
 
 
@@ -204,6 +238,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
         forward_batch = get_forward_context().forward_batch
         seq_splits = None
+        uniform_seq_splits = False
         sequence_shard_enabled = (
             kv_cache is not None
             and forward_batch is not None
@@ -234,9 +269,14 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                     "LingBot causal sequence sharding requires forward_batch.sequence_shard_splits."
                 )
             seq_splits = list(seq_splits)
+            uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
             # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
-            qkv = _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
+            qkv = (
+                _usp_input_all_to_all(qkv, head_dim=2)
+                if uniform_seq_splits
+                else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
+            )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
         cache_view = kv_cache.update_and_get_attention_kv(
@@ -255,7 +295,11 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         if sequence_shard_enabled:
             assert seq_splits is not None
-            x = _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
+            x = (
+                _usp_output_all_to_all(x, head_dim=2)
+                if uniform_seq_splits
+                else _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
+            )
         return x
 
 
@@ -918,6 +962,48 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         hidden_states, _ = attn2.to_out(hidden_states)
         return hidden_states
 
+    def _cam_conditioner_scale_shift(
+        self,
+        c2ws_plucker_emb: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if c2ws_plucker_emb is None:
+            return None
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+        if not CausalLingBotWorldTransformer3DModel._should_cache_cam_conditioner(
+            forward_batch
+        ):
+            return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
+
+        cache = CausalLingBotWorldTransformer3DModel._get_request_cache(
+            forward_batch, "lingbot_cam_conditioner"
+        )
+        if cache is None:
+            return self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
+
+        source_key = (
+            c2ws_plucker_emb.data_ptr(),
+            tuple(c2ws_plucker_emb.shape),
+            tuple(c2ws_plucker_emb.stride()),
+            c2ws_plucker_emb.dtype,
+            c2ws_plucker_emb.device.type,
+            c2ws_plucker_emb.device.index,
+            _safe_tensor_version(c2ws_plucker_emb),
+        )
+        if cache.get("source_key") != source_key:
+            cache.clear()
+            cache["source_key"] = source_key
+            cache["entries"] = {}
+
+        entries = cache["entries"]
+        entry_key = id(self.cam_conditioner)
+        scale_shift = entries.get(entry_key)
+        if scale_shift is None:
+            scale_shift = self.cam_conditioner.compute_scale_shift(c2ws_plucker_emb)
+            entries[entry_key] = scale_shift
+        return scale_shift
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -930,6 +1016,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         current_start: int = 0,
         cache_start: int | None = None,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        cam_conditioner_scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
         update_cache_only: bool = False,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
@@ -983,7 +1070,13 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             hidden_states, attn_output, gate_msa, residual_zero, residual_zero
         )
         hidden_states = self.cam_conditioner(
-            hidden_states.to(orig_dtype), c2ws_plucker_emb
+            hidden_states.to(orig_dtype),
+            c2ws_plucker_emb,
+            (
+                cam_conditioner_scale_shift
+                if cam_conditioner_scale_shift is not None
+                else self._cam_conditioner_scale_shift(c2ws_plucker_emb)
+            ),
         )
         norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
             orig_dtype
@@ -1129,6 +1222,14 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         if extra is None:
             return None
         return extra.setdefault(name, {})
+
+    @staticmethod
+    def _should_cache_cam_conditioner(forward_batch) -> bool:
+        return (
+            forward_batch is not None
+            and getattr(forward_batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        )
 
     @staticmethod
     def _all_crossattn_caches_initialized(
@@ -1285,6 +1386,52 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             cache[cache_key] = (temb, timestep_proj)
         return temb, timestep_proj
 
+    def _prepare_cam_conditioner_scale_shifts(
+        self,
+        c2ws_plucker_emb: torch.Tensor | None,
+        forward_batch,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        if c2ws_plucker_emb is None:
+            return None
+
+        forward_context = get_forward_context()
+        if forward_context.current_timestep < 0:
+            return None
+
+        if not self._should_cache_cam_conditioner(forward_batch):
+            return None
+
+        cache = self._get_request_cache(forward_batch, "lingbot_cam_conditioner")
+        if cache is None:
+            return None
+
+        source_key = (
+            c2ws_plucker_emb.data_ptr(),
+            tuple(c2ws_plucker_emb.shape),
+            tuple(c2ws_plucker_emb.stride()),
+            c2ws_plucker_emb.dtype,
+            c2ws_plucker_emb.device.type,
+            c2ws_plucker_emb.device.index,
+            _safe_tensor_version(c2ws_plucker_emb),
+        )
+        if cache.get("source_key") != source_key:
+            cache.clear()
+            cache["source_key"] = source_key
+            cache["entries"] = {}
+
+        entries = cache["entries"]
+        scale_shifts = []
+        for block in self.blocks:
+            entry_key = id(block.cam_conditioner)
+            scale_shift = entries.get(entry_key)
+            if scale_shift is None:
+                scale_shift = block.cam_conditioner.compute_scale_shift(
+                    c2ws_plucker_emb
+                )
+                entries[entry_key] = scale_shift
+            scale_shifts.append(scale_shift)
+        return scale_shifts
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1392,6 +1539,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             if current_platform.is_mps()
             else encoder_hidden_states
         )
+        cam_conditioner_scale_shifts = self._prepare_cam_conditioner_scale_shifts(
+            c2ws_plucker_emb, forward_batch
+        )
 
         for block_index, block in enumerate(self.blocks):
             hidden_states = block(
@@ -1405,6 +1555,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 current_start=current_start,
                 cache_start=cache_start,
                 c2ws_plucker_emb=c2ws_plucker_emb,
+                cam_conditioner_scale_shift=(
+                    None
+                    if cam_conditioner_scale_shifts is None
+                    else cam_conditioner_scale_shifts[block_index]
+                ),
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
             )

@@ -10,8 +10,8 @@ from sglang.srt.utils.numa_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb200")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="8-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestIsNumaAvailable(unittest.TestCase):
@@ -249,36 +249,44 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
         _mock_gpu.assert_not_called()
 
 
-def _get_gpu_name():
+def _get_gpu_info():
     try:
         import pynvml
 
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name = name.decode()
+        count = pynvml.nvmlDeviceGetCount()
         pynvml.nvmlShutdown()
-        return name
+        return name, count
     except Exception:
-        return ""
+        return "", 0
 
 
-_gpu_name = _get_gpu_name()
+_gpu_name, _gpu_count = _get_gpu_info()
 
 
-@unittest.skipUnless("GB200" in _gpu_name, "Requires GB200 hardware")
-class TestGB200NumaTopology(unittest.TestCase):
-    """Hardware test validating expected NUMA topology on GB200 (2 NUMA nodes, 4 GPUs)."""
+def _query_single_numa_node_for_gpu(gpu_id: int):
+    nodes = _query_numa_node_for_gpu(gpu_id)
+    if len(nodes) != 1:
+        raise AssertionError(f"GPU {gpu_id}: expected one NUMA node, got {nodes}")
+    return nodes[0]
 
-    def _make_server_args(self):
-        args = MagicMock()
-        args.numa_node = None
-        return args
+
+@unittest.skipUnless(
+    ("GB200" in _gpu_name or "GB300" in _gpu_name) and _gpu_count == 4,
+    "Requires 4-GPU Grace Blackwell hardware",
+)
+class TestGraceBlackwellNumaTopology(unittest.TestCase):
+    """Hardware test validating expected NUMA topology on 4-GPU GB200/GB300."""
 
     def test_gpu_numa_mapping(self):
+        self.assertEqual(_gpu_count, 4)
         expected = {0: 0, 1: 0, 2: 1, 3: 1}
-        args = self._make_server_args()
         for gpu_id, expected_node in expected.items():
-            result = get_numa_node_if_available(args, gpu_id)
+            result = _query_single_numa_node_for_gpu(gpu_id)
             self.assertEqual(
                 result,
                 expected_node,
@@ -286,25 +294,23 @@ class TestGB200NumaTopology(unittest.TestCase):
             )
 
 
-@unittest.skipUnless("B200" in _gpu_name, "Requires B200 hardware")
+@unittest.skipUnless(
+    "B200" in _gpu_name and _gpu_count == 4,
+    "Requires 4-GPU B200 hardware",
+)
 class TestB200NumaTopology(unittest.TestCase):
-    """Hardware test validating expected NUMA topology on B200 (2 NUMA nodes, 8 GPUs)."""
-
-    def _make_server_args(self):
-        args = MagicMock()
-        args.numa_node = None
-        return args
+    """Hardware test validating expected NUMA topology on 4-GPU B200."""
 
     def test_gpu_numa_mapping(self):
-        expected = {0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 1}
-        args = self._make_server_args()
-        for gpu_id, expected_node in expected.items():
-            result = get_numa_node_if_available(args, gpu_id)
-            self.assertEqual(
-                result,
-                expected_node,
-                f"GPU {gpu_id}: expected NUMA node {expected_node}, got {result}",
-            )
+        self.assertEqual(_gpu_count, 4)
+        numa_nodes = {
+            _query_single_numa_node_for_gpu(gpu_id) for gpu_id in range(_gpu_count)
+        }
+        self.assertEqual(
+            len(numa_nodes),
+            1,
+            f"Expected all visible 4-GPU B200 devices on one NUMA node, got {numa_nodes}",
+        )
 
 
 if __name__ == "__main__":

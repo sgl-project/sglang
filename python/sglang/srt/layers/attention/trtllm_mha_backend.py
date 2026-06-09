@@ -125,9 +125,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
-        # separate index spaces; SWA layers need a translated page_table. Resolve
-        # the pool from the allocator (stable at construction), not from
-        # token_to_kv_pool, which FROZEN_KV MTP swaps per forward call.
+        # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
 
         # Forward metadata
@@ -147,14 +145,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
 
-        Read it from the allocator: in FROZEN_KV MTP the draft shares the
-        target's SWA allocator while its own token_to_kv_pool stays non-SWA
-        until swapped per call. The getattr only tolerates the minimal
-        allocator stub used by attention test fixtures.
+        EAGLE draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's
+        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
+        draft path reads target KV directly, so it still needs the allocator
+        pool when the active pool is not SWA.
         """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+
         allocator = model_runner.token_to_kv_pool_allocator
-        get_kvcache = getattr(allocator, "get_kvcache", None)
-        kvcache = get_kvcache() if get_kvcache is not None else None
+        kvcache = allocator.get_kvcache()
         return kvcache if isinstance(kvcache, SWAKVPool) else None
 
     def _maybe_translate_swa(
@@ -484,7 +490,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
         elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)

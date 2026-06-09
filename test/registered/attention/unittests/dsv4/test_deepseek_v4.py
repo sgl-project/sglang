@@ -338,6 +338,172 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 run_dsv4_eagle_draft_extend_cuda_graph_runner_case(self, case)
 
 
+class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
+    """CPU-only checks for the DSV4 BCG metadata replay contract."""
+
+    def _make_core_metadata(self, base: int):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
+
+        metadata = DSV4AttnMetadata(
+            page_size=256,
+            page_table=torch.tensor(
+                [[base + 1, base + 2], [base + 3, base + 4]], dtype=torch.int32
+            ),
+            raw_out_loc=torch.tensor([base + 5, base + 6], dtype=torch.int32),
+            cuda_int32_kwargs={"dtype": torch.int32},
+            seq_lens_casual=torch.tensor([base + 7, base + 8], dtype=torch.int32),
+            positions_casual=torch.tensor([base + 9, base + 10], dtype=torch.int32),
+            swa_page_indices=torch.tensor(
+                [[base + 11, base + 12], [base + 13, base + 14]], dtype=torch.int32
+            ),
+            swa_topk_lengths=torch.tensor([base + 15, base + 16], dtype=torch.int32),
+            c4_sparse_topk=128,
+        )
+        metadata.c4_out_loc = torch.tensor([base + 17, base + 18], dtype=torch.int32)
+        metadata.c128_out_loc = torch.tensor([base + 19, base + 20], dtype=torch.int32)
+        metadata.c4_topk_lengths_raw = torch.tensor(
+            [base + 21, base + 22], dtype=torch.int32
+        )
+        metadata.c4_topk_lengths_clamp1 = torch.tensor(
+            [base + 23, base + 24], dtype=torch.int32
+        )
+        metadata.c4_sparse_topk_lengths = torch.tensor(
+            [base + 25, base + 26], dtype=torch.int32
+        )
+        metadata.c4_sparse_page_indices = torch.tensor(
+            [[base + 27, base + 28], [base + 29, base + 30]], dtype=torch.int32
+        )
+        metadata.c4_sparse_raw_indices = torch.tensor(
+            [[base + 31, base + 32], [base + 33, base + 34]], dtype=torch.int32
+        )
+        metadata.c128_page_indices = torch.tensor(
+            [[base + 35, base + 36], [base + 37, base + 38]], dtype=torch.int32
+        )
+        metadata.c128_topk_lengths_clamp1 = torch.tensor(
+            [base + 39, base + 40], dtype=torch.int32
+        )
+        metadata.c1_flashmla_metadata = object()
+        metadata.c4_flashmla_metadata = object()
+        metadata.c128_flashmla_metadata = object()
+        return metadata
+
+    def test_bcg_is_explicit_and_dsv4_backend_opt_in_only(self):
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        self.assertFalse(ServerArgs(model_path="dummy").enable_breakable_cuda_graph)
+        self.assertFalse(
+            AttentionBackend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.assertTrue(
+            DeepseekV4AttnBackend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+
+    def test_refresh_replay_metadata_preserves_captured_tensor_storage(self):
+        capture_metadata = self._make_core_metadata(0)
+        replay_metadata = self._make_core_metadata(1000)
+
+        tensor_copy_fields = [
+            "raw_out_loc",
+            "seq_lens_casual",
+            "positions_casual",
+            "c4_out_loc",
+            "c128_out_loc",
+            "c4_topk_lengths_raw",
+            "c4_topk_lengths_clamp1",
+            "c4_sparse_topk_lengths",
+        ]
+        reference_assign_fields = [
+            "page_table",
+            "swa_page_indices",
+            "swa_topk_lengths",
+            "c128_page_indices",
+            "c128_topk_lengths_clamp1",
+            "c1_flashmla_metadata",
+            "c4_flashmla_metadata",
+            "c128_flashmla_metadata",
+        ]
+
+        captured_tensor_objects = {
+            field: getattr(capture_metadata, field) for field in tensor_copy_fields
+        }
+        captured_sparse_pages = capture_metadata.c4_sparse_page_indices
+        captured_sparse_pages_value = captured_sparse_pages.clone()
+
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
+
+        for field in tensor_copy_fields:
+            self.assertIs(
+                getattr(capture_metadata, field), captured_tensor_objects[field]
+            )
+            self.assertTrue(
+                torch.equal(
+                    getattr(capture_metadata, field), getattr(replay_metadata, field)
+                ),
+                f"{field} should be copied from the replay metadata",
+            )
+
+        for field in reference_assign_fields:
+            self.assertIs(
+                getattr(capture_metadata, field),
+                getattr(replay_metadata, field),
+                f"{field} should use the replay metadata reference",
+            )
+
+        self.assertIs(capture_metadata.c4_sparse_page_indices, captured_sparse_pages)
+        self.assertTrue(
+            torch.equal(
+                capture_metadata.c4_sparse_page_indices, captured_sparse_pages_value
+            )
+        )
+
+    def test_backend_replay_keeps_captured_metadata_active(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        capture_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        replay_metadata = DSV4Metadata(
+            self._make_core_metadata(1000), indexer_metadata=None
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        calls = []
+
+        def fake_build_forward_metadata(
+            forward_batch, *, max_seq_len_override, use_prefill_cuda_graph
+        ):
+            calls.append((forward_batch, max_seq_len_override, use_prefill_cuda_graph))
+            return replay_metadata
+
+        backend._build_forward_metadata = fake_build_forward_metadata
+        forward_batch = SimpleNamespace(name="live")
+        static_forward_batch = SimpleNamespace(name="static")
+
+        backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            capture_metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
+
+        self.assertIs(calls[0][0], static_forward_batch)
+        self.assertEqual(calls[0][1], backend.MAX_SEQ_LEN_FOR_CAPTURE)
+        self.assertTrue(calls[0][2])
+        self.assertIs(backend.forward_metadata, capture_metadata)
+        self.assertTrue(
+            torch.equal(
+                capture_metadata.core_attn_metadata.seq_lens_casual,
+                replay_metadata.core_attn_metadata.seq_lens_casual,
+            )
+        )
+
+
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
 

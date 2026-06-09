@@ -39,6 +39,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    can_run_breakable_cuda_graph: bool
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -57,6 +58,7 @@ class MLPSyncBatchInfo:
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
+                int(self.can_run_breakable_cuda_graph),
             ],
             device=device,
             dtype=dtype,
@@ -71,6 +73,7 @@ class MLPSyncBatchInfo:
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
+                0,  # can_run_breakable_cuda_graph
             ],
             device=device,
             dtype=dtype,
@@ -79,7 +82,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 7),
             dtype=torch.int64,
             device=device,
         )
@@ -95,7 +98,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -106,6 +109,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+        self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -132,6 +136,7 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
+    batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_breakable_cuda_graph
 
 
 def prepare_mlp_sync_batch_raw(
@@ -178,6 +183,11 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    can_run_breakable_cuda_graph = (
+        local_batch is not None
+        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        and not disable_cuda_graph
+    )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -206,6 +216,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
     )
 
     if not skip_all_gather:

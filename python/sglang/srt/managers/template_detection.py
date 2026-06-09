@@ -150,6 +150,10 @@ REASONING_MODE_RULES = (
 # ---------------------------------------------------------------------------
 
 
+def _is_apertus2509(ctx):
+    return ctx.has_vocab("<|inner_prefix|>")
+
+
 def _is_gemma4(ctx):
     return ctx.has_text("<|channel>")
 
@@ -250,6 +254,7 @@ def _is_deepseek_r1_think_tags(ctx):
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
+    DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="kimi", value="kimi", predicate=_is_kimi),
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
@@ -277,6 +282,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),

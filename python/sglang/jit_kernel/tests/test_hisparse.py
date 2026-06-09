@@ -3,7 +3,11 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse import (
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+    transfer_cache_dsv4_mla,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -26,6 +30,12 @@ PADDED_BUFFER_SIZE = HOT_BUFFER_SIZE + 1
 HOST_CACHE_SIZE = 16
 DEVICE_CACHE_SIZE = 16
 ITEM_SIZE_BYTES = KV_DIM * torch.empty((), dtype=DTYPE).element_size()
+DSV4_PAGE_SIZE = 64
+DSV4_VALUE_BYTES = 576
+DSV4_SCALE_BYTES = 8
+DSV4_ITEM_BYTES = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
+DSV4_PAGE_BYTES = ((DSV4_ITEM_BYTES * DSV4_PAGE_SIZE + 575) // 576) * 576
+DSV4_SCALE_OFFSET = DSV4_VALUE_BYTES * DSV4_PAGE_SIZE
 
 
 def _host_cache() -> torch.Tensor:
@@ -34,6 +44,46 @@ def _host_cache() -> torch.Tensor:
     )
     host_cache.copy_(torch.arange(host_cache.numel(), dtype=DTYPE).view_as(host_cache))
     return host_cache
+
+
+def _dsv4_token_pattern(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    value = (
+        (torch.arange(DSV4_VALUE_BYTES, dtype=torch.int16) + seed)
+        .remainder(256)
+        .to(torch.uint8)
+    )
+    scale = (
+        (torch.arange(DSV4_SCALE_BYTES, dtype=torch.int16) + seed + 17)
+        .remainder(256)
+        .to(torch.uint8)
+    )
+    return value, scale
+
+
+def _write_dsv4_token(cache: torch.Tensor, loc: int, seed: int) -> None:
+    page = loc // DSV4_PAGE_SIZE
+    offset = loc % DSV4_PAGE_SIZE
+    value, scale = _dsv4_token_pattern(seed)
+    cache[page, offset * DSV4_VALUE_BYTES : (offset + 1) * DSV4_VALUE_BYTES].copy_(
+        value.to(cache.device)
+    )
+    scale_start = DSV4_SCALE_OFFSET + offset * DSV4_SCALE_BYTES
+    cache[page, scale_start : scale_start + DSV4_SCALE_BYTES].copy_(
+        scale.to(cache.device)
+    )
+
+
+def _read_dsv4_token(cache: torch.Tensor, loc: int) -> torch.Tensor:
+    page = loc // DSV4_PAGE_SIZE
+    offset = loc % DSV4_PAGE_SIZE
+    value = cache[page, offset * DSV4_VALUE_BYTES : (offset + 1) * DSV4_VALUE_BYTES]
+    scale_start = DSV4_SCALE_OFFSET + offset * DSV4_SCALE_BYTES
+    scale = cache[page, scale_start : scale_start + DSV4_SCALE_BYTES]
+    return torch.cat([value, scale])
+
+
+def _dsv4_ptrs(cache: torch.Tensor) -> torch.Tensor:
+    return torch.tensor([cache.data_ptr()], dtype=torch.uint64, device=DEVICE)
 
 
 def _run_kernel(
@@ -130,6 +180,83 @@ def _make_state(
         "lru_slots": lru_slots,
         "host_cache_locs": host_cache_locs,
     }
+
+
+@pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
+def test_transfer_cache_dsv4_mla_copies_paged_token() -> None:
+    src_cache = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
+    dst_cache = torch.zeros(
+        (2, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
+    )
+    src_loc = DSV4_PAGE_SIZE + 6
+    dst_loc = DSV4_PAGE_SIZE + 1
+    _write_dsv4_token(src_cache, src_loc, seed=41)
+
+    transfer_cache_dsv4_mla(
+        src_ptrs=_dsv4_ptrs(src_cache),
+        dst_ptrs=_dsv4_ptrs(dst_cache),
+        src_indices=torch.tensor([src_loc], dtype=torch.int64, device=DEVICE),
+        dst_indices=torch.tensor([dst_loc], dtype=torch.int64, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        _read_dsv4_token(dst_cache, dst_loc).to(DEVICE),
+        _read_dsv4_token(src_cache, src_loc),
+    )
+
+
+@pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
+def test_dsv4_swap_in_reads_paged_host_layout() -> None:
+    host_cache = torch.zeros(
+        (2, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
+    )
+    device_buffer = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
+    host_loc = DSV4_PAGE_SIZE + 1
+    swap_loc = DSV4_PAGE_SIZE + 12
+    _write_dsv4_token(host_cache, host_loc, seed=41)
+
+    top_k_tokens = torch.tensor([[3]], dtype=torch.int32, device=DEVICE)
+    device_buffer_tokens = torch.full(
+        (1, PADDED_BUFFER_SIZE), -1, dtype=torch.int32, device=DEVICE
+    )
+    host_cache_locs = torch.zeros((1, 8), dtype=torch.int64, device=DEVICE)
+    host_cache_locs[0, 3] = host_loc
+    device_buffer_locs = torch.tensor(
+        [[swap_loc, swap_loc + 1, swap_loc + 2, swap_loc + 3, swap_loc + 4]],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    lru_slots = torch.arange(HOT_BUFFER_SIZE, dtype=torch.int16, device=DEVICE).view(
+        1, -1
+    )
+    out = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_dsv4_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_slots,
+        item_size_bytes=DSV4_ITEM_BYTES,
+        num_top_k=1,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    assert out.item() == swap_loc
+    assert torch.equal(
+        _read_dsv4_token(device_buffer, swap_loc),
+        _read_dsv4_token(host_cache, host_loc).to(DEVICE),
+    )
 
 
 def _long_case():

@@ -36,10 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.layers.dp_attention import (
-    set_dp_buffer_len,
-    set_is_extend_in_batch,
-)
+from sglang.srt.layers.dp_attention import set_dp_buffer_len, set_is_extend_in_batch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
@@ -123,6 +120,10 @@ class BreakableCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
+        self.use_captured_attn_metadata = (
+            model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.attn_metadata_buffers = {} if self.use_captured_attn_metadata else None
 
         # Resolve the inner transformer-stack module (the same boundary PCG draws
         # via patch_model). At replay we monkey-patch this module's forward with
@@ -166,6 +167,18 @@ class BreakableCudaGraphRunner:
         self._capture_all()
 
         self.raw_num_tokens = 0
+
+    def _has_inactive_dp_rank(self, forward_batch: "ForwardBatch") -> bool:
+        global_num_tokens = forward_batch.global_num_tokens_cpu
+        if global_num_tokens is None:
+            return False
+
+        # DSV4 DP attention / DeepEP collectives need every DP rank to enter
+        # the same replay path. Sparse-DP batches fall back to eager to avoid
+        # hanging ranks that have zero local tokens.
+        return len(global_num_tokens) > 1 and any(
+            int(num_tokens) == 0 for num_tokens in global_num_tokens
+        )
 
     def _init_buffers(self, model_runner):
         """Initialize input buffers."""
@@ -317,11 +330,46 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_forward_context(
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+            ),
         ):
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
             self._run_forward(forward_batch, num_tokens)
+
+    def _init_forward_metadata_for_capture(self, forward_batch, num_tokens):
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_captured_attn_metadata:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+            forward_batch
+        )
+        assert self.attn_metadata_buffers is not None
+        self.attn_metadata_buffers[num_tokens] = metadata
+
+    def _prepare_forward_metadata_for_replay(
+        self, forward_batch, static_forward_batch, num_tokens
+    ):
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_captured_attn_metadata:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        assert self.attn_metadata_buffers is not None
+        metadata = self.attn_metadata_buffers[num_tokens]
+        attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
@@ -364,6 +412,13 @@ class BreakableCudaGraphRunner:
             return False
         if forward_batch.replace_embeds is not None:
             return False
+        if self._has_inactive_dp_rank(forward_batch):
+            return False
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and not forward_batch.can_run_dp_breakable_cuda_graph
+        ):
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -377,7 +432,7 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -450,7 +505,9 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                self._prepare_forward_metadata_for_replay(
+                    forward_batch, static_forward_batch, static_num_tokens
+                )
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,

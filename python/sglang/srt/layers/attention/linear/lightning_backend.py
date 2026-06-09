@@ -38,6 +38,16 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # seg_la processes draft tokens as a chain -- it has no parent-indices
+        # plumbing for tree-shaped drafts, so spec v2 tree verify (topk > 1) would
+        # commit wrong mamba states silently. Fail fast instead of mis-decoding.
+        if self.topk > 1:
+            raise NotImplementedError(
+                "Lightning (seg_la) linear-attention backend does not support "
+                f"speculative decoding with topk > 1 (got topk={self.topk}); "
+                "seg_la verifies a draft tree as a chain. Use "
+                "--speculative-eagle-topk 1."
+            )
         # lightning attn does not need conv cache, but to keep the interface for mamba cache
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape

@@ -439,10 +439,17 @@ async def _close_realtime_websocket(
         pass
 
 
+async def _wait_for_server_warmup(websocket: WebSocket) -> None:
+    warmup_done = getattr(websocket.app.state, "server_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set():
+        await warmup_done.wait()
+
+
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
     await websocket.accept()
+    await _wait_for_server_warmup(websocket)
     if _ACTIVE_SESSION_IDS and not await _wait_for_active_session_slot():
         logger.warning(
             "reject realtime session because another session is active: %s",

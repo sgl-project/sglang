@@ -180,6 +180,37 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
+# -----------------------
+# MORI
+# The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
+# bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
+# the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
+if docker exec ci_sglang test -d /sgl-workspace/mori; then
+  MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
+  MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
+
+  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+    MORI_GPU_ARCHS="gfx950"
+  else
+    MORI_GPU_ARCHS="gfx942"
+  fi
+
+  echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
+  docker exec ci_sglang bash -c "
+    set -euo pipefail
+    export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
+    rm -rf /sgl-workspace/mori
+    git clone '${MORI_REPO}' /sgl-workspace/mori
+    cd /sgl-workspace/mori
+    git checkout '${MORI_COMMIT}'
+    git submodule update --init --recursive
+    python3 setup.py develop
+    python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
+    ldconfig
+  "
+  echo "[MORI] Done."
+fi
+
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
   exit 0
 fi

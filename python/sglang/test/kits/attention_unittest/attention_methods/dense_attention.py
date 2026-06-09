@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import set_global_server_args_for_scheduler
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from ..mock_server_args import make_mock_server_args
 
@@ -316,6 +317,8 @@ class MockModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.is_draft_worker = False
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
@@ -367,7 +370,10 @@ class MockModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            get_kvcache=lambda: self.token_to_kv_pool,
+        )
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None

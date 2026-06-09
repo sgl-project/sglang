@@ -54,6 +54,7 @@ This repo now contains:
 - diffusion-side NVFP4 loading from ModelOpt exports
 - FLUX.2 packed-QKV detection that distinguishes packed NVFP4 checkpoints from standard diffusers exports
 - automatic protection against incompatible FP8 CPU offload while keeping layerwise DiT offload available
+- separate online diffusion quantization paths such as `--quantization fp8` / `mxfp4`; keep those out of this ModelOpt PTQ/export workflow unless the user explicitly asks for runtime quantization
 - FP8 transformer build:
   [`python/sglang/multimodal_gen/tools/build_modelopt_fp8_transformer.py`](../../../tools/build_modelopt_fp8_transformer.py)
 - NVFP4 mixed transformer build:
@@ -67,6 +68,11 @@ Validated documentation and CI coverage currently center on these ModelOpt diffu
 - NVFP4: FLUX.1-dev, FLUX.2-dev, Wan2.2
 
 Treat a new family, a new precision, or a new checkpoint layout as unsupported until it has a documented matrix row and a matching validation story.
+Current B200 CI also contains an Ideogram4 NVFP4 native load case
+(`ideogram4_nvfp4_t2i` via `Comfy-Org/Ideogram-4`). Treat that as source
+evidence for an existing NVFP4 path, but do not expand the ModelOpt support
+matrix to Ideogram4 unless `docs/diffusion/quantization.md` is updated with the
+exact checkpoint, loader path, quality check, and benchmark scope.
 Before writing CLI examples, re-read the active branch's `docs/diffusion/quantization.md`: FLUX.2 NVFP4 is an official `black-forest-labs/*` repo rather than a `lmsys/*` converted repo, and its preferred flag depends on the current documented loader flow. Use `--transformer-path` for a component override directory with `config.json`; use `--transformer-weights-path` when the repo or path should be probed as raw weights.
 
 B200 CI coverage can include loose BF16-vs-quantized quality checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
@@ -78,9 +84,9 @@ you are explicitly testing a historical branch.
 
 ## Related PR Watchlist
 
-As of 2026-05-04, these related SGLang PRs are relevant to ModelOpt diffusion
-support. Treat unmerged items as future support or migration work until the
-docs/CI matrix is updated.
+These related SGLang PRs are useful as ModelOpt diffusion support history.
+Re-check the PR state and the active source tree before treating any item as
+current behavior, and keep the docs/CI matrix as the support boundary.
 
 - #23155 added Qwen Image ModelOpt FP8 support.
 - #23199 adds HunyuanVideo ModelOpt FP8 support.

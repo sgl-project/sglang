@@ -9,6 +9,7 @@ export const DeepSeekOCR2Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false },
       ]
     },
     quantization: {
@@ -24,8 +25,8 @@ export const DeepSeekOCR2Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' }
       ]
     },
   };
@@ -39,6 +40,9 @@ export const DeepSeekOCR2Deployment = () => {
 
     let cmd = 'sglang serve \\\n';
     cmd += `  --model-path ${modelPath}`;
+    if (hardware === 'xeon') {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --trust-remote-code`;
+    }
     cmd += ` \\\n  --enable-multimodal`;
 
     if (strategyArray.includes('tp')) {
@@ -120,7 +124,20 @@ export const DeepSeekOCR2Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware') {
+        const strategyItems = options.strategy.items || [];
+        const current = Array.isArray(next.strategy) ? next.strategy : [];
+        next.strategy = current.filter((id) => {
+          const item = strategyItems.find((s) => s.id === id);
+          if (!item) return false;
+          if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) return false;
+          return true;
+        });
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {

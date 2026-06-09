@@ -64,7 +64,8 @@ export const Qwen35Deployment = () => {
           { id: 'b300',   label: 'B300',   default: isNvfp4,   disabled: false },
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
-          { id: 'mi355x', label: 'MI355X', default: false,     disabled: isNvfp4 }
+          { id: 'mi355x', label: 'MI355X', default: false,     disabled: isNvfp4 },
+          { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 }
         ];
       }
     },
@@ -74,12 +75,13 @@ export const Qwen35Deployment = () => {
       getDynamicItems: (values) => {
         const hasFp8 = FP8_MODELS.has(values.model);
         const hasFp4 = values.model === '397b';
+        const isXeon = values.hardware === 'xeon';
         return [
-          { id: 'bf16', label: 'BF16', default: !hasFp8 },
-          { id: 'fp8',  label: 'FP8',  default: hasFp8,  disabled: !hasFp8,
+          { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon },
+          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon, disabled: !hasFp8,
             disabledReason: 'No FP8 variant available for this model' },
-          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4,
-            disabledReason: 'FP4 is only available for Qwen3.5-397B-A17B' }
+          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon,
+            disabledReason: isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B' }
         ];
       }
     },
@@ -102,6 +104,7 @@ export const Qwen35Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -110,7 +113,7 @@ export const Qwen35Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => MOE_MODELS.has(values.model),
+      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon',
       getDynamicItems: (currentValues) => {
         const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
         const isAmdGpu = amdGpus.includes(currentValues.hardware);
@@ -149,7 +152,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 4,  mem: 0.8 }, fp8: { tp: 2, mem: 0.8 }, fp4: { tp: 2, mem: 0.8 } },
       mi300x: { bf16: { tp: 8, mem: 0.8 }, fp8: { tp: 4, mem: 0.8 } },
       mi325x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
-      mi355x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } }
+      mi355x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
+      xeon:   { bf16: { tp: 6 },           fp8: { tp: 6 } }
     },
     '122b': {
       h100:   { bf16: { tp: 4, mem: 0.88 }, fp8: { tp: 2, mem: 0.8 } },
@@ -158,7 +162,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 2 },           fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } }
+      mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      xeon:   { bf16: { tp: 6 },           fp8: { tp: 6 } }
     },
     '35b': {
       h100:   { bf16: { tp: 1, mem: 0.88 }, fp8: { tp: 1, mem: 0.8 } },
@@ -167,7 +172,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } }
+      mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      xeon:   { bf16: { tp: 3 }, fp8: { tp: 3 } }
     },
     '27b': {
       h100:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -176,7 +182,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } }
+      mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      xeon:   { bf16: { tp: 6 }, fp8: { tp: 6 } }
     },
     '9b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -185,7 +192,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
-      mi355x: { bf16: { tp: 1, mem: 0.8 } }
+      mi355x: { bf16: { tp: 1, mem: 0.8 } },
+      xeon:   { bf16: { tp: 3 } }
     },
     '4b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -194,7 +202,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
-      mi355x: { bf16: { tp: 1, mem: 0.8 } }
+      mi355x: { bf16: { tp: 1, mem: 0.8 } },
+      xeon:   { bf16: { tp: 3 } }
     },
     '2b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -203,7 +212,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
-      mi355x: { bf16: { tp: 1, mem: 0.8 } }
+      mi355x: { bf16: { tp: 1, mem: 0.8 } },
+      xeon:   { bf16: { tp: 3 } }
     },
     '0.8b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -212,7 +222,8 @@ export const Qwen35Deployment = () => {
       b300:   { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
-      mi355x: { bf16: { tp: 1, mem: 0.8 } }
+      mi355x: { bf16: { tp: 1, mem: 0.8 } },
+      xeon:   { bf16: { tp: 3 } }
     }
   };
 
@@ -322,12 +333,16 @@ export const Qwen35Deployment = () => {
 
     // Initialize the base command
     let cmd = `sglang serve --model-path ${modelName}`;
+    if (hardware === 'xeon') {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
     if (tpValue > 1) {
       cmd += ` \\\n  --tp ${tpValue}`;
     }
     if (epValue) {
       cmd += ` \\\n  --expert-parallel-size ${epValue}`;
     }
+
     // Multi-node wiring goes right after --tp / --expert-parallel-size so the
     // distributed-init flags sit next to the parallelism flags they configure.
     if (isMultinode) {
@@ -336,7 +351,7 @@ export const Qwen35Deployment = () => {
       }
     }
 
-    // Force Mamba V1 for AMD GPUs (V2 requires FLA backend).
+    // Force Mamba V1 for AMD GPUs and Xeon CPUs (V2 requires FLA backend).
     // Force Mamba V2 when MTP is enabled.
     // Dense models with MTP off: force V1 — values.mambaCache is not
     // re-resolved on a speculative toggle (useEffect deps are hardware/model),
@@ -344,8 +359,8 @@ export const Qwen35Deployment = () => {
     // would emit a spurious --mamba-scheduler-strategy extra_buffer. The UI
     // radio is hidden for dense models, so users can't manually correct it.
     // MoE keeps the old behavior — the UI radio is the recovery path there.
-    const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
-    const actualMambaCache = amdGpus.includes(hardware)
+    const mamba_v1_dev = ['mi300x', 'mi325x', 'mi355x', 'xeon'];
+    const actualMambaCache = mamba_v1_dev.includes(hardware)
       ? 'v1'
       : (speculative === 'enabled' ? 'v2' : (MOE_MODELS.has(model) ? mambaCache : 'v1'));
 
@@ -389,7 +404,7 @@ export const Qwen35Deployment = () => {
     }
 
     // Enable allreduce fusion for all Qwen3.5 configs (skip for FP4: benchmark only enables this for TP>=8).
-    if (quantization !== 'fp4') {
+    if (quantization !== 'fp4' && hardware !== 'xeon') {
       cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
     }
 

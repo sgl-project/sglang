@@ -107,7 +107,19 @@ pub async fn chat_completions(
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
-    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
+    // Sticky-session routing key. When the sticky policy is configured,
+    // read the routing key from the operator-chosen header into the
+    // selection context; the policy pins it to a worker. Other policies
+    // leave `routing_key` `None` and ignore it.
+    let routing_key = ctx
+        .config
+        .model
+        .sticky
+        .as_ref()
+        .and_then(|s| headers.get(s.header_name.as_str()))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty());
+    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key);
     let worker =
         policy
             .select(&workers, &selection_ctx)

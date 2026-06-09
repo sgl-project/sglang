@@ -42,11 +42,16 @@ def _jit_activation_module(dtype: torch.dtype) -> Module:
                 "run_activation_filtered",
                 f"ActivationKernel<{args}>::run_activation_filtered",
             ),
+            (
+                "run_unary_activation",
+                f"ActivationKernel<{args}>::run_unary_activation",
+            ),
         ],
     )
 
 
 SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
+SUPPORTED_UNARY_ACTIVATIONS = {"relu2"}
 
 
 @register_custom_op(mutates_args=["out"])
@@ -98,6 +103,42 @@ def run_activation(
     else:
         _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
     return out
+
+
+@register_custom_op(mutates_args=["out"])
+def _run_unary_activation_inplace(
+    op_name: str, input: torch.Tensor, out: torch.Tensor
+) -> None:
+    last = input.shape[-1]
+    module = _jit_activation_module(input.dtype)
+    module.run_unary_activation(input.view(-1, last), out.view(-1, last), op_name)
+
+
+def run_unary_activation(
+    op_name: str,
+    input: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply a standalone (non-gated) element-wise activation: ``out = act(input)``.
+
+    Unlike :func:`run_activation`, there is no gate/up split — ``input`` and
+    ``out`` share the same shape.
+    """
+    assert (
+        op_name in SUPPORTED_UNARY_ACTIVATIONS
+    ), f"Unsupported unary activation: {op_name}"
+    if out is None:
+        out = torch.empty_like(input)
+    _run_unary_activation_inplace(op_name, input, out)
+    return out
+
+
+def relu2(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Squared ReLU: ``out = max(0, input) ** 2`` (element-wise)."""
+    return run_unary_activation("relu2", input, out)
 
 
 def silu_and_mul(

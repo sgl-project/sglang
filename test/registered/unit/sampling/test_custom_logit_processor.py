@@ -7,6 +7,7 @@ register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 import json
 import unittest
+from array import array
 from unittest.mock import MagicMock
 
 import torch
@@ -25,8 +26,8 @@ from sglang.test.test_utils import CustomTestCase
 # Helper: mock a Req object (used by ThinkingBudget and NGram processors)
 def _make_req(origin_input_ids=None, output_ids=None):
     req = MagicMock()
-    req.origin_input_ids = origin_input_ids or []
-    req.output_ids = output_ids or []
+    req.origin_input_ids = array("q", origin_input_ids or [])
+    req.output_ids = array("q", output_ids or [])
     return req
 
 

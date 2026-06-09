@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "ddaad3fca6eba761b0c9692972b8f22b7c463a4d"
+SGL_TEST_FILES_CI_DATA_REVISION = "caa56302ccf2d289e4488ed06d952edf5d2314cf"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -153,6 +153,12 @@ DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers
 
 # MOVA video generation models
 DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
+
+# SANA-WM world model (TI2V with optional camera conditioning)
+DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirectional"
+DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/SANA-WM_streaming"
+)
 
 
 def print_value_formatted(description: str, value: int | float | str):

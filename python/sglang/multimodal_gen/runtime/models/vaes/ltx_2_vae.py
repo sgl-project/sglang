@@ -87,14 +87,47 @@ class LTX2VideoCausalConv3d(nn.Module):
             padding_mode=spatial_padding_mode,
         )
 
-    def forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        causal: bool = True,
+        conv_cache: Optional[dict] = None,
+        cache_key: Optional[str] = None,
+    ) -> torch.Tensor:
         time_kernel_size = self.kernel_size[0]
 
         if causal:
-            pad_left = hidden_states[:, :, :1, :, :].repeat(
-                (1, 1, time_kernel_size - 1, 1, 1)
-            )
-            hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
+            if (
+                conv_cache is not None
+                and cache_key is not None
+                and time_kernel_size > 1
+            ):
+                # Streaming: prepend the previous chunk's last (k-1) frames of the
+                # PADDED conv input (first chunk: replicate frame 0, the "sink"),
+                # then store the last (k-1) frames of THIS padded input for the next
+                # chunk. Storing the padded tail (not the raw input) keeps exactly
+                # k-1 frames even for short chunks. Left-pad k-1 with temporal pad 0 /
+                # stride 1 keeps the output T invariant.
+                prev = conv_cache.get(cache_key)
+                if prev is None:
+                    pad_left = hidden_states[:, :, :1, :, :].repeat(
+                        (1, 1, time_kernel_size - 1, 1, 1)
+                    )
+                else:
+                    pad_left = prev.to(
+                        device=hidden_states.device, dtype=hidden_states.dtype
+                    )
+                hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
+                conv_cache[cache_key] = (
+                    hidden_states[:, :, -(time_kernel_size - 1) :, :, :]
+                    .detach()
+                    .clone()
+                )
+            else:
+                pad_left = hidden_states[:, :, :1, :, :].repeat(
+                    (1, 1, time_kernel_size - 1, 1, 1)
+                )
+                hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
         else:
             pad_left = hidden_states[:, :, :1, :, :].repeat(
                 (1, 1, (time_kernel_size - 1) // 2, 1, 1)
@@ -200,6 +233,8 @@ class LTX2VideoResnetBlock3d(nn.Module):
         temb: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         causal: bool = True,
+        conv_cache: Optional[dict] = None,
+        cache_key: Optional[str] = None,
     ) -> torch.Tensor:
         hidden_states = inputs
 
@@ -214,7 +249,12 @@ class LTX2VideoResnetBlock3d(nn.Module):
             hidden_states = hidden_states * (1 + scale_1) + shift_1
 
         hidden_states = self.nonlinearity(hidden_states)
-        hidden_states = self.conv1(hidden_states, causal=causal)
+        hidden_states = self.conv1(
+            hidden_states,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=None if cache_key is None else f"{cache_key}.conv1",
+        )
 
         if self.per_channel_scale1 is not None:
             spatial_shape = hidden_states.shape[-2:]
@@ -236,7 +276,12 @@ class LTX2VideoResnetBlock3d(nn.Module):
 
         hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.conv2(hidden_states, causal=causal)
+        hidden_states = self.conv2(
+            hidden_states,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=None if cache_key is None else f"{cache_key}.conv2",
+        )
 
         if self.per_channel_scale2 is not None:
             spatial_shape = hidden_states.shape[-2:]
@@ -343,8 +388,26 @@ class LTXVideoUpsampler3d(nn.Module):
             spatial_padding_mode=spatial_padding_mode,
         )
 
-    def forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        causal: bool = True,
+        conv_cache: Optional[dict] = None,
+        cache_key: Optional[str] = None,
+    ) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+
+        # The temporal pixel-shuffle expands 1 latent frame -> stride[0] sample
+        # frames, then drops the first (stride[0]-1) frames as the causal "anchor".
+        # Under chunking that drop must happen ONLY at the true clip start, else a
+        # frame is lost at every chunk boundary. trim_start is read once and applied
+        # to BOTH the residual and shuffle branches (mirrors the reference).
+        trim_start = self.stride[0] - 1
+        if conv_cache is not None and cache_key is not None:
+            if conv_cache.get(f"{cache_key}.trim_applied", False):
+                trim_start = 0
+            else:
+                conv_cache[f"{cache_key}.trim_applied"] = True
 
         if self.residual:
             residual = hidden_states.reshape(
@@ -367,9 +430,11 @@ class LTXVideoUpsampler3d(nn.Module):
                 self.stride[0] * self.stride[1] * self.stride[2]
             ) // self.upscale_factor
             residual = residual.repeat(1, repeats, 1, 1, 1)
-            residual = residual[:, :, self.stride[0] - 1 :]
+            residual = residual[:, :, trim_start:]
 
-        hidden_states = self.conv(hidden_states, causal=causal)
+        hidden_states = self.conv(
+            hidden_states, causal=causal, conv_cache=conv_cache, cache_key=cache_key
+        )
         hidden_states = hidden_states.reshape(
             batch_size,
             -1,
@@ -386,7 +451,7 @@ class LTXVideoUpsampler3d(nn.Module):
             .flatten(4, 5)
             .flatten(2, 3)
         )
-        hidden_states = hidden_states[:, :, self.stride[0] - 1 :]
+        hidden_states = hidden_states[:, :, trim_start:]
 
         if self.residual:
             hidden_states = hidden_states + residual
@@ -597,6 +662,8 @@ class LTX2VideoMidBlock3d(nn.Module):
         temb: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         causal: bool = True,
+        conv_cache: Optional[dict] = None,
+        cache_key: Optional[str] = None,
     ) -> torch.Tensor:
         r"""Forward method of the `LTXMidBlock3D` class."""
 
@@ -616,7 +683,14 @@ class LTX2VideoMidBlock3d(nn.Module):
                     resnet, hidden_states, temb, generator, causal
                 )
             else:
-                hidden_states = resnet(hidden_states, temb, generator, causal=causal)
+                hidden_states = resnet(
+                    hidden_states,
+                    temb,
+                    generator,
+                    causal=causal,
+                    conv_cache=conv_cache,
+                    cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
+                )
 
         return hidden_states
 
@@ -782,9 +856,18 @@ class LTX2VideoUpBlock3d(nn.Module):
         temb: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         causal: bool = True,
+        conv_cache: Optional[dict] = None,
+        cache_key: Optional[str] = None,
     ) -> torch.Tensor:
         if self.conv_in is not None:
-            hidden_states = self.conv_in(hidden_states, temb, generator, causal=causal)
+            hidden_states = self.conv_in(
+                hidden_states,
+                temb,
+                generator,
+                causal=causal,
+                conv_cache=conv_cache,
+                cache_key=None if cache_key is None else f"{cache_key}.conv_in",
+            )
 
         if self.time_embedder is not None:
             temb = self.time_embedder(
@@ -797,8 +880,15 @@ class LTX2VideoUpBlock3d(nn.Module):
             temb = temb.view(hidden_states.size(0), -1, 1, 1, 1)
 
         if self.upsamplers is not None:
-            for upsampler in self.upsamplers:
-                hidden_states = upsampler(hidden_states, causal=causal)
+            for j, upsampler in enumerate(self.upsamplers):
+                hidden_states = upsampler(
+                    hidden_states,
+                    causal=causal,
+                    conv_cache=conv_cache,
+                    cache_key=(
+                        None if cache_key is None else f"{cache_key}.upsamplers.{j}"
+                    ),
+                )
 
         for i, resnet in enumerate(self.resnets):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -806,7 +896,14 @@ class LTX2VideoUpBlock3d(nn.Module):
                     resnet, hidden_states, temb, generator, causal
                 )
             else:
-                hidden_states = resnet(hidden_states, temb, generator, causal=causal)
+                hidden_states = resnet(
+                    hidden_states,
+                    temb,
+                    generator,
+                    causal=causal,
+                    conv_cache=conv_cache,
+                    cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
+                )
 
         return hidden_states
 
@@ -1116,10 +1213,17 @@ class LTX2VideoDecoder3d(nn.Module):
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
+        conv_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         causal = causal or self.is_causal
+        _ck = (lambda k: k) if conv_cache is not None else (lambda k: None)
 
-        hidden_states = self.conv_in(hidden_states, causal=causal)
+        hidden_states = self.conv_in(
+            hidden_states,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=_ck("conv_in"),
+        )
 
         if self.timestep_scale_multiplier is not None:
             temb = temb * self.timestep_scale_multiplier
@@ -1134,10 +1238,22 @@ class LTX2VideoDecoder3d(nn.Module):
                     up_block, hidden_states, temb, None, causal
                 )
         else:
-            hidden_states = self.mid_block(hidden_states, temb, causal=causal)
+            hidden_states = self.mid_block(
+                hidden_states,
+                temb,
+                causal=causal,
+                conv_cache=conv_cache,
+                cache_key=_ck("mid_block"),
+            )
 
-            for up_block in self.up_blocks:
-                hidden_states = up_block(hidden_states, temb, causal=causal)
+            for i, up_block in enumerate(self.up_blocks):
+                hidden_states = up_block(
+                    hidden_states,
+                    temb,
+                    causal=causal,
+                    conv_cache=conv_cache,
+                    cache_key=_ck(f"up_blocks.{i}"),
+                )
 
         hidden_states = self.norm_out(hidden_states)
 
@@ -1155,7 +1271,12 @@ class LTX2VideoDecoder3d(nn.Module):
             hidden_states = hidden_states * (1 + scale) + shift
 
         hidden_states = self.conv_act(hidden_states)
-        hidden_states = self.conv_out(hidden_states, causal=causal)
+        hidden_states = self.conv_out(
+            hidden_states,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=_ck("conv_out"),
+        )
 
         p = self.patch_size
         p_t = self.patch_size_t
@@ -1990,4 +2111,38 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         return dec
 
 
-EntryClass = AutoencoderKLLTX2Video
+class AutoencoderKLCausalLTX2Video(AutoencoderKLLTX2Video):
+    """Streaming causal LTX-2 VAE.
+
+    Same weights / architecture as ``AutoencoderKLLTX2Video`` but loaded with
+    ``decoder_causal=True`` (the checkpoint config.json flips it automatically),
+    plus a chunk-by-chunk ``decode_chunk`` that threads a per-conv ``conv_cache``
+    across chunks so frames decode causally as the streaming denoise produces
+    them -- the ``decode_per_frame_with_cache`` equivalent at chunk granularity.
+    The streaming VAE config.json's ``_class_name`` is
+    ``AutoencoderKLCausalLTX2Video``, so this name must be registered.
+    """
+
+    @staticmethod
+    def reset_decoder_cache() -> dict:
+        """Fresh decoder cache (per-conv feat tails + upsampler trim flags)."""
+        return {}
+
+    def decode_chunk(
+        self,
+        z_chunk: torch.Tensor,
+        conv_cache: dict,
+        *,
+        temb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Causally decode one chunk of latents, carrying ``conv_cache`` across calls.
+
+        ``z_chunk`` is ``(B, C_latent, T_chunk, h, w)`` and must already be
+        de-normalized (the stage applies the latents scale/shift). Returns the
+        pixel chunk ``(B, 3, T_out, h*sf, w*sf)`` and mutates ``conv_cache`` in
+        place. Bypasses the tiled/framewise ``decode`` dispatch on purpose.
+        """
+        return self.decoder(z_chunk, temb, causal=True, conv_cache=conv_cache)
+
+
+EntryClass = [AutoencoderKLLTX2Video, AutoencoderKLCausalLTX2Video]

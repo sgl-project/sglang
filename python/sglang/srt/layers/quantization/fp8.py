@@ -95,6 +95,7 @@ from sglang.srt.utils import (
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_intel_xpu_backend,
 )
 
 if TYPE_CHECKING:
@@ -534,11 +535,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 should_deepgemm_weight_requant_ue8m0,
             )
 
+            # Only requantize to UE8M0 if DeepGEMM can actually run
+            # this layer. If the dtype or shape is unsupported, the GEMM
+            # falls back to triton at runtime, which needs float32 scales.
             if (
                 should_deepgemm_weight_requant_ue8m0(
                     weight_block_size=getattr(
                         self.quant_config, "weight_block_size", None
                     ),
+                    output_dtype=getattr(layer, "orig_dtype", None),
+                    weight_shape=layer.weight.shape,
                 )
                 and (
                     self.w8a8_block_fp8_linear
@@ -1847,6 +1853,43 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
+
+        if use_intel_xpu_backend():
+            # sgl-kernel-xpu path
+            from sgl_kernel import fused_experts
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            assert layer.w13_weight.dtype == layer.w2_weight.dtype
+            use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
+            use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
+            assert self.is_fp4_expert == use_mxfp4_w4a16
+            output = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                use_mxfp4_w4a16=use_mxfp4_w4a16,
+                use_fp8_w8a8=use_fp8_w8a8,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                activation=moe_runner_config.activation,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8

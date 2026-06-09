@@ -436,4 +436,5 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.raw_frame_batches = None
         self.noise_pred = None

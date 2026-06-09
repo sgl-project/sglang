@@ -47,7 +47,6 @@ class TestFrozenKVMTP(CustomTestCase):
     def _server_env(cls) -> dict[str, str]:
         env = dict(os.environ)
         env["SGLANG_ENABLE_SPEC_V2"] = "0"
-        env["SGLANG_ENABLE_ASYNC_ASSERT"] = "1"
         return env
 
     @classmethod

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
@@ -61,10 +62,19 @@ class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
         assert_all_success: bool = True,
         max_new_tokens: int = 100,
         timeout: float = 60.0,
+        distinct_prompts: bool = False,
     ) -> list[dict]:
+        if distinct_prompts:
+            # Diverge at the very first token (request index before the per-call
+            # nonce) so requests share no radix-dedupable prefix beyond a
+            # tokenizer-added BOS, and retries never hit earlier attempts' cache.
+            nonce = uuid.uuid4().hex[:8]
+            prompts = [f"{i} {nonce} {_SHORT_PROMPT_BODY}" for i in range(n)]
+        else:
+            prompts = [_SHORT_PROMPT_BODY] * n
         results = post_parallel_generate(
             url=self.lb_url + "/generate",
-            prompts=[_SHORT_PROMPT_BODY] * n,
+            prompts=prompts,
             max_new_tokens=max_new_tokens,
             timeout=timeout,
         )

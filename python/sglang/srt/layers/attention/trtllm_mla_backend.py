@@ -568,7 +568,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.disable_chunked_prefix_cache and has_prefix
         ) or is_in_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
-            super().init_mha_chunk_metadata(forward_batch)
+            super().init_mha_chunk_metadata(
+                forward_batch, disable_flashinfer_ragged=True
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -705,9 +707,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
             return super().init_forward_metadata(forward_batch)
-
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
-        super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
     def pad_draft_extend_query(
         self,

@@ -2,11 +2,13 @@
 
 Use this guide when mapping a diffusion bottleneck to an existing fused path or
 distributed overlap pattern in `sglang.multimodal_gen`. Prefer reuse and
-configuration first before handing the problem to a specialized kernel-optimization skill.
+configuration first before handing the problem to a kernel, Nsight, or
+framework-specific optimization workflow.
 
 **Key Files**
 - `python/sglang/multimodal_gen/runtime/layers/layernorm.py`
 - `python/sglang/multimodal_gen/runtime/layers/elementwise.py`
+- `python/sglang/multimodal_gen/runtime/layers/fused_scale_shift_gate.py`
 - `python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py`
 - `python/sglang/jit_kernel/diffusion/triton/scale_shift.py`
 - `python/sglang/jit_kernel/diffusion/group_norm_silu.py`
@@ -14,8 +16,14 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - `python/sglang/jit_kernel/diffusion/triton/norm.py`
 - `python/sglang/jit_kernel/diffusion/triton/rmsnorm_onepass.py`
 - `python/sglang/jit_kernel/diffusion/triton/rotary.py`
+- `python/sglang/jit_kernel/diffusion/triton/ltx2_rotary.py`
+- `python/sglang/jit_kernel/diffusion/triton/varlen_pack_pad.py`
 - `python/sglang/jit_kernel/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
+- `python/sglang/jit_kernel/tests/diffusion/test_qwen_image_modulation.py`
 - `python/sglang/jit_kernel/tests/diffusion/test_group_norm_silu.py`
+- `python/sglang/jit_kernel/tests/diffusion/test_varlen_pack_pad.py`
+- `python/sglang/jit_kernel/tests/diffusion/test_varlen_uspattn_equivalence.py`
+- `python/sglang/jit_kernel/benchmark/diffusion/bench_qwen_image_modulation.py`
 - `python/sglang/jit_kernel/benchmark/diffusion/bench_group_norm_silu.py`
 - `python/sglang/jit_kernel/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
@@ -24,10 +32,10 @@ configuration first before handing the problem to a specialized kernel-optimizat
 
 **Core Fusion Patterns**
 
-1. Scale/Shift elementwise fusion (AdaLN modulation)
-- Kernels: `fuse_scale_shift_kernel`, `fuse_scale_shift_gate_select01_kernel`
-- Locations: `elementwise.py`, `layernorm.py`, `qwen_image.py`, `triton/scale_shift.py`
-- Use cases: `x * (1 + scale) + shift` and `a * (k + b) + c`
+1. Scale/Shift elementwise and gate fusion (AdaLN modulation)
+- Kernels: `fuse_scale_shift_kernel`, `fuse_layernorm_scale_shift_gate_select01_kernel`, `fuse_residual_layernorm_scale_shift_gate_select01_kernel`
+- Locations: `elementwise.py`, `layernorm.py`, `fused_scale_shift_gate.py`, `qwen_image.py`, `triton/scale_shift.py`
+- Use cases: `x * (1 + scale) + shift`, `a * (k + b) + c`, and Qwen-style `(layernorm/residual layernorm) + scale/shift + gate select`.
 - Constraints: `x` must be CUDA and contiguous. `scale/shift` support 0D/1D/2D/3D/4D broadcast. 4D `[B, F, 1, C]` requires `L % F == 0`.
 - NPU fallback: `scale_shift.py` swaps to `npu_fallback` native path.
 - Validation: `python/sglang/jit_kernel/tests/diffusion/test_qwen_image_modulation.py`.
@@ -72,11 +80,18 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - NPU fallback: `npu_fallback.apply_rotary_embedding_native`.
 - Validation: `python/sglang/jit_kernel/tests/test_rope.py`.
 
-7. HunyuanVideo VAE GroupNorm + SiLU fusion
+7. LTX2 split RoPE fusion
+- Kernel: `apply_ltx2_split_rotary_emb`
+- Locations: `triton/ltx2_rotary.py`, `runtime/models/dits/ltx_2.py`
+- Use case: LTX-2 split rotary embedding over `[B, S, num_heads * head_dim]` with separate `cos` and `sin` tensors.
+- Constraints: `cos` and `sin` shapes must match `[B, H, S, head_dim / 2]`, and `inner_dim == H * head_dim`.
+- Workflow rule: if LTX-2 traces show a large split-RoPE PyTorch chain, check whether the LTX2-specific Triton path was disabled by shape or dtype before proposing a new RoPE kernel.
+
+8. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
 - Kernel: `triton_group_norm_silu`
-- Locations: `diffusion/group_norm_silu.py`, `triton/group_norm_silu.py`, `runtime/models/vaes/hunyuanvae.py`
+- Locations: `diffusion/group_norm_silu.py`, `triton/group_norm_silu.py`, `runtime/models/vaes/hunyuanvae.py`, `runtime/models/upsampler/latent_upsampler.py`
 - Use case: `activation(group_norm(x))` when the activation is non-inplace `nn.SiLU` and the GroupNorm is affine.
-- Enablement: mainline uses `apply_group_norm_silu(...)` in HunyuanVideo VAE paths by default; there is no env toggle. The wrapper dispatches to Triton only when guards pass.
+- Enablement: mainline uses `apply_group_norm_silu(...)` in HunyuanVideo VAE paths and LTX latent upsampler paths by default; there is no env toggle. The wrapper dispatches to Triton only when guards pass.
 - Constraints: CUDA inference path only; no grad, `x.requires_grad == False`, `nn.GroupNorm`, `nn.SiLU(inplace=False)`, affine norm with weight and bias. Unsupported cases fall back to native `activation(norm(x))`.
 - Validation: `python/sglang/jit_kernel/tests/diffusion/test_group_norm_silu.py`.
 - Microbench: `python/sglang/jit_kernel/benchmark/diffusion/bench_group_norm_silu.py`.
@@ -98,6 +113,12 @@ configuration first before handing the problem to a specialized kernel-optimizat
 3. FlashInfer RoPE (Q/K inplace)
 - Location: `rotary_embedding/utils.py`
 - Behavior: `flashinfer.rope.apply_rope_with_cos_sin_cache_inplace` when available, otherwise Triton RoPE fallback.
+
+4. Varlen USP attention pack/scatter
+- Locations: `runtime/layers/attention/layer.py`, `triton/varlen_pack_pad.py`
+- Behavior: masked `USPAttention.forward` can gather dense Q/K/V into packed `[total_valid, H, D]` rows with `fused_pack_qkv`, run varlen attention, then scatter back with `fused_scatter_to_padded`.
+- Validation: `python/sglang/jit_kernel/tests/diffusion/test_varlen_pack_pad.py` and `test_varlen_uspattn_equivalence.py`.
+- Workflow rule: if a masked attention trace spends time in Python/advanced indexing pack or scatter, first check whether this fused varlen path should have engaged.
 
 **QK Norm Optimization**
 
@@ -125,7 +146,7 @@ configuration first before handing the problem to a specialized kernel-optimizat
   - Supported head dims: `64, 128, 256`.
 - Behavior: `apply_qk_norm_rope` prefers the fused JIT kernel when all guards pass; otherwise it falls back to `apply_qk_norm(...)` plus `apply_flashinfer_rope_qk_inplace(...)`.
 - Validation: `python/sglang/jit_kernel/tests/diffusion/test_qknorm_rope.py`.
-- Watchlist: PR #24025 adds LTX2-specific QK norm fusion work. Until merged, treat LTX2 traces that miss the generic fused path as an enablement/shape-guard issue first, not proof that the PR path exists locally.
+- Workflow rule: treat LTX2 traces that miss the generic fused path as an enablement/shape-guard issue first, and check the separate LTX2 split-RoPE path before proposing new attention-prep kernels.
 
 **Nunchaku Fused GELU MLP**
 
@@ -144,11 +165,13 @@ configuration first before handing the problem to a specialized kernel-optimizat
 
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
-- Qwen-Image gating: `fuse_scale_shift_gate_select01_kernel` in `qwen_image.py`.
+- Qwen-Image gating: `fuse_layernorm_scale_shift_gate_select01_kernel` and `fuse_residual_layernorm_scale_shift_gate_select01_kernel` through `fused_scale_shift_gate.py` and `qwen_image.py`.
 - Z-Image residual-form modulation: `fused_norm_tanh_mul_add` and `fused_norm_tanh_mul_add_norm_scale` in `zimage.py`.
-- HunyuanVideo VAE GroupNorm+SiLU: `apply_group_norm_silu` in `hunyuanvae.py`; default-eligible when wrapper guards pass.
+- HunyuanVideo VAE and LTX upsampler GroupNorm+SiLU: `apply_group_norm_silu` in `hunyuanvae.py` and `latent_upsampler.py`; default-eligible when wrapper guards pass.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
+- LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
+- Varlen USP attention: `fused_pack_qkv` and `fused_scatter_to_padded` in `attention/layer.py`.
 - Nunchaku fused GELU MLP: `_fused_gelu_mlp` in `flux.py` for quantized FLUX-family checkpoints.
 - NVFP4 / packed QKV attention: `to_qkv`, `to_added_qkv`, and `to_qkv_mlp_proj` in FLUX-family quantized paths.
 - RoPE: `_apply_rotary_emb` prefers Triton; Q/K RoPE prefers FlashInfer when present.
@@ -161,11 +184,11 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
 - Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
 
-**Open PR Watchlist**
+**Historical PR Watchlist**
 
-As of 2026-05-02, these SGLang PRs were still open. Use them as upstream
-direction and prior art, not as current-main behavior. Re-check the PR state
-before relying on any file path or flag.
+These SGLang PRs are useful as upstream direction and prior art, not as
+current-main behavior. Re-check the PR state and the active source tree before
+relying on any file path, flag, or claim about whether the work has merged.
 
 - Norm, modulation, and packed projection fusions:
   - #24025 LTX2 QK norm fusion.
@@ -211,4 +234,4 @@ before relying on any file path or flag.
 - Keep CuTe compile cache keys aligned to `(dtype, ndim, D)`.
 - Avoid implicit broadcasts that force hidden `contiguous()` copies.
 - Preserve NPU and ROCm fallback paths.
-- If none of the families above match, package the evidence from the benchmark/profile skill and hand the kernel work to a specialized optimization skill such as `sglang-diffusion-ako4all-kernel`.
+- If none of the families above match, package the evidence from the benchmark/profile skill and hand the kernel work to the appropriate kernel, Nsight, or framework-specific optimization workflow.

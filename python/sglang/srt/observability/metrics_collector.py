@@ -394,6 +394,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Weight update
+        # =================================================================
+        self.weight_load_duration_seconds = Gauge(
+            name="sglang:weight_load_duration_seconds",
+            documentation=(
+                "Wall time of the most recent update_weights_from_<source> call on "
+                "this scheduler rank (seconds). `source` label is one of: disk, "
+                "distributed, tensor, ipc. Event-detection via "
+                "changes(...[<range>]) > 0 — no separate counter needed."
+            ),
+            labelnames=[*labels.keys(), "source"],
+            multiprocess_mode="mostrecent",
+        )
+
+        # =================================================================
         # Speculative decoding
         # =================================================================
         self.spec_accept_length = Gauge(
@@ -1123,6 +1138,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def observe_weight_load(self, duration_seconds: float, source: str) -> None:
+        # Edge-triggered: engine is paused during the update, so log_stats
+        # won't fire — write the gauge inline at end of update_weights_from_*.
+        # `source` is "disk" | "distributed" | "tensor" | "ipc".
+        self.weight_load_duration_seconds.labels(**self.labels, source=source).set(
+            duration_seconds
+        )
 
     def observe_prefill_delayer_outcome(
         self,

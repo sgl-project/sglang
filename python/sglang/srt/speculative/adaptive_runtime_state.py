@@ -1,4 +1,3 @@
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -14,8 +13,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
         EAGLEDraftExtendCudaGraphRunner,
     )
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,7 +49,10 @@ class AdaptiveSpecWorker(Protocol):
     speculative_num_steps: int
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ) -> SpecRuntimeState: ...
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None: ...
@@ -62,13 +62,13 @@ class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
 
     Works with any worker that implements ``AdaptiveSpecWorker`` protocol:
-      - ``build_adaptive_runtime_state(steps, draft_tokens)`` → runtime state
-      - ``apply_runtime_state(state)`` → apply it to the worker
+      - ``build_adaptive_runtime_state()`` → runtime state
+      - ``apply_runtime_state()`` → apply it to the worker
 
     The worker only needs to:
       1. Call ``register()`` for the initial state, then ``init_states()``
          once during startup.
-      2. Call ``on_verify_complete(num_correct_drafts_per_req)`` after each decode verify.
+      2. Call ``on_verify_complete()`` after each decode verify.
     """
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
@@ -91,22 +91,39 @@ class AdaptiveController:
         key = steps if steps is not None else state.speculative_num_steps
         self._states[key] = state
 
-    def init_states(self) -> None:
+    def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps."""
-        for steps in self.params.candidate_steps:
+        self.params.set_cuda_graph_bs(cuda_graph_bs)
+
+        for steps in self.candidate_steps:
             if steps in self._states:
                 continue
+
+            pruned_bs = self.params.cuda_graph_bs_for_step(steps)
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
                 speculative_num_draft_tokens=steps + 1,
+                cuda_graph_bs=pruned_bs,
             )
             self._states[steps] = state
-        self._activate(self.params.current_steps)
 
-    def on_verify_complete(self, num_correct_drafts_per_req: list[int]) -> None:
+        # Start on the initial step.
+        self._activate(self.worker.speculative_num_steps)
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        target = self.params.get_steps_for_batch(batch_size)
+        if target != self.worker.speculative_num_steps:
+            self._activate(target)
+
+    def on_verify_complete(
+        self, num_correct_drafts_per_req: list[int], batch_size: int
+    ) -> None:
         """Feed verify results; switch runtime state if EMA warrants it."""
-        if self.params.update(num_correct_drafts_per_req):
-            self._activate(self.params.current_steps)
+        new_step = self.params.on_verify_complete(
+            num_correct_drafts_per_req, batch_size
+        )
+        if new_step is not None:
+            self._activate(new_step)
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

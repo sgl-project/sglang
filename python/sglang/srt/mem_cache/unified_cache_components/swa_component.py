@@ -128,20 +128,29 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
+        swa_host_hit = 0
         node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
-            if cd.value is None and cd.host_value is not None:
-                # TODO(ispobock): refactor host_hit_length usage
-                return result._replace(host_hit_length=max(result.host_hit_length, 1))
             if cd.value is not None:
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
+                # TODO(hzh): load_back may currently restore a full host-tombstone
+                # segment whose length exceeds sliding_window_size. Once
+                # load_back is constrained to fetch only one sliding window
+                # worth of pages, cap swa_host_hit at sliding_window_size
+                # here so the scheduler budget matches the actual device-pool
+                # consumption.
+                swa_host_hit += len(cd.host_value)
                 n_swa += len(cd.host_value)
             else:
                 break
             node = node.parent
+        if swa_host_hit > 0:
+            return result._replace(
+                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
+            )
         return result
 
     def update_component_on_insert_overlap(

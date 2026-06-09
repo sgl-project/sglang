@@ -437,6 +437,18 @@ jobs:
         with:
           submodules: "recursive"
 
+      - name: Clean stale torchada extension locks
+        run: |
+          if ps -eo comm=,args= | grep -E '(^|[[:space:]])(mcc|ninja)([[:space:]]|$)|torchada_cpp_ops' | grep -v grep; then
+            echo "::error::Active torchada extension build detected; refusing to remove lock files"
+            exit 1
+          fi
+          find "${HOME}/.cache/torch_extensions" \
+            -path '*/torchada_cpp_ops/lock' \
+            -type f \
+            -print \
+            -delete 2>/dev/null || true
+
       - name: Build wheels
         run: |
           cd sgl-kernel

@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
+from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+    gptq_marlin_moe_repack,
+)
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4DynamicMoEMethod,
 )
@@ -16,7 +19,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
     marlin_moe_permute_scales,

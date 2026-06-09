@@ -462,20 +462,11 @@ class CudaGraphBufferRegistry:
         padded_num_tokens: int,
         forward_batch_template: "ForwardBatch",
     ) -> "ForwardBatch":
-        """Return a FB view backed by registry slot buffers.
-
-        ``forward_batch_template`` provides the non-slot fields
-        (``forward_mode`` / ``spec_info`` / ``sampling_info`` /
-        ``capture_hidden_mode`` / ``dp_*`` / ``lora_ids`` / ...). Slot
-        fields are replaced with views into the registry buffers via
-        ``dataclasses.replace`` — the template itself is not mutated.
-
-        NOTE: currently parked / unused. It is NOT a drop-in for the decode
-        replay path's ``build_replay_fb_view``: it returns the *padded*
-        out_cache_loc slot slice (vs the raw ``fb.out_cache_loc`` that path
-        keeps), does not recompute ``seq_lens_sum`` for the padded tail, and
-        does not split ``forward_mode`` vs ``actual_forward_mode``. Reconcile
-        those before wiring it into any replay path.
+        """Return a FB view (``dataclasses.replace`` of ``forward_batch_template``)
+        whose slot fields are buffer views and whose non-slot fields are carried
+        from the template. A plain copy slot whose FB field is ``None`` this iter
+        is carried (not exposed as a stale buffer); computed slots are always
+        exposed.
         """
         import dataclasses
 
@@ -487,6 +478,14 @@ class CudaGraphBufferRegistry:
             # top-level FB attributes — their data is consumed in place off the
             # adopted backing object, not re-attached to the FB view here.
             if "." in slot.name:
+                continue
+            is_computed = slot.post_fill is not None or not slot.copy_from_fb
+            if (
+                not is_computed
+                and slot.source_fn is None
+                and getattr(forward_batch_template, slot.name, None) is None
+            ):
+                # Absent this iter (fill_from skipped it): carry the template.
                 continue
             replace_kwargs[slot.name] = slot.slice_for(padded_bs, padded_num_tokens)
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
@@ -507,6 +506,7 @@ def build_decode_registry(
     enable_prefill_cp: bool = False,
     require_mlp_tp_gather: bool = False,
     dp_size: int = 1,
+    register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
@@ -643,28 +643,34 @@ def build_decode_registry(
             )
         )
 
-    def _global_num_tokens_post_fill(buf, fb, ctx):
-        # Filled with the padded token count on the gathered (DP) path; left
-        # untouched otherwise. Not an FB copy (copy_from_fb=False).
-        if require_gathered_buffer:
-            buf.fill_(ctx.padded_num_tokens)
+    # Computed slots, always exposed by extract_buffer; callers that already set
+    # global_num_tokens_* on the batch pass register_global_num_tokens=False.
+    if register_global_num_tokens:
 
-    _global_shape = (
-        (lambda _bs, _mt: (dp_size,))
-        if require_mlp_tp_gather
-        else (lambda _bs, _mt: (1,))
-    )
-    for _global_name in ("global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu"):
-        slots.append(
-            GraphSlot(
-                _global_name,
-                _global_shape,
-                torch.int32,
-                axis="none",
-                copy_from_fb=False,
-                post_fill=_global_num_tokens_post_fill,
-            )
+        def _global_num_tokens_post_fill(buf, fb, ctx):
+            # Only the gathered (DP) path writes a value; otherwise left as init.
+            if require_gathered_buffer:
+                buf.fill_(ctx.padded_num_tokens)
+
+        _global_shape = (
+            (lambda _bs, _mt: (dp_size,))
+            if require_mlp_tp_gather
+            else (lambda _bs, _mt: (1,))
         )
+        for _global_name in (
+            "global_num_tokens_gpu",
+            "global_num_tokens_for_logprob_gpu",
+        ):
+            slots.append(
+                GraphSlot(
+                    _global_name,
+                    _global_shape,
+                    torch.int32,
+                    axis="none",
+                    copy_from_fb=False,
+                    post_fill=_global_num_tokens_post_fill,
+                )
+            )
 
     for slot in slots:
         bind = None
@@ -760,11 +766,16 @@ def build_prefill_registry(
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
+    register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable (prefill) cuda-graph runners.
+
+    ``register_input_embeds`` (default ``True``) registers the multimodal
+    ``input_embeds`` slot; the eager extend path passes ``False`` so it is
+    carried from the batch (a read input) rather than written in-graph.
 
     Padding policies match the inline copy/zero in
     ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
@@ -828,16 +839,17 @@ def build_prefill_registry(
                 slice_fn=lambda buf, n: buf[:, :n],
             )
         )
-        slots.append(
-            GraphSlot(
-                "input_embeds",
-                lambda _bs2, mt: (mt, hidden_size),
-                embed_dtype,
-                axis="tokens",
-                padding_policy=PaddingPolicy.ZERO,
-                copy_from_fb=False,
+        if register_input_embeds:
+            slots.append(
+                GraphSlot(
+                    "input_embeds",
+                    lambda _bs2, mt: (mt, hidden_size),
+                    embed_dtype,
+                    axis="tokens",
+                    padding_policy=PaddingPolicy.ZERO,
+                    copy_from_fb=False,
+                )
             )
-        )
     if enable_mamba_track:
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
