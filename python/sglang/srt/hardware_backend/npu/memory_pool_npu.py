@@ -9,7 +9,6 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
 )
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -111,30 +110,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     self.v_buffer.append(v_buffer_layer)
 
     def _init_kv_copy_and_warmup(self):
-        # NPU uses a layout-aware native move_kv_cache (below) instead of the
-        # Triton tiled-copy kernel, so there is nothing to warm up. The base
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Used by speculative decoding (e.g. MTP) to relocate verified KV slots.
-        # Buffers are paged (num_pages, page_size, head_num, head_dim); flatten
-        # the page dims so tgt/src slot indices address tokens directly.
-        if tgt_loc.numel() == 0:
-            return
-
-        size_limit = self.size + self.page_size
-        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
-        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
-
-        tgt = tgt_loc.view(-1).long()
-        src = src_loc.view(-1).long()
-        for layer_idx in range(self.layer_num):
-            k_layer = self.k_buffer[layer_idx].view(-1, self.head_num, self.head_dim)
-            v_layer = self.v_buffer[layer_idx].view(-1, self.head_num, self.head_dim)
-            k_layer[tgt] = k_layer[src]
-            v_layer[tgt] = v_layer[src]
 
     # for disagg
     def get_contiguous_buf_infos(self):
