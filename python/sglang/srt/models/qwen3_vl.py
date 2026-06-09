@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_MAX_SEQLEN_BUCKETS,
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
+    VisionAttentionMetadata,
 )
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
@@ -219,25 +220,10 @@ class Qwen3_VisionBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
-        output_ws: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[torch.Tensor] = None,
-        sequence_lengths: Optional[torch.Tensor] = None,
+        forward_metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
-        hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
-        attn = self.attn(
-            hidden_states,
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb_cos=rotary_pos_emb_cos,
-            rotary_pos_emb_sin=rotary_pos_emb_sin,
-            output_ws=output_ws,
-            max_seqlen=max_seqlen,
-            sequence_lengths=sequence_lengths,
-        )
-        attn = rearrange(attn, "b s ... -> s b ...")
+        attn = self.attn(hidden_states, forward_metadata=forward_metadata)
         x += attn
         norm2 = self.norm2(x)
         mlp = self.mlp(norm2)
@@ -830,24 +816,35 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
             else:
                 cu_seqlens = cu_seqlens.to("cpu")
-            max_seqlen = None
+            # Pre-compute max_seqlen once to avoid per-layer .item() sync
+            _seq_lens_np = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
+            max_seqlen = int(_seq_lens_np.max()) if len(_seq_lens_np) > 0 else 0
 
         x = x.unsqueeze(1)
 
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
+        # Pre-expand cos/sin for half-dim rotary to avoid per-layer torch.cat
+        head_dim = self.hidden_size // self.num_heads
+        if rotary_pos_emb_cos.size(-1) * 2 == head_dim:
+            rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
+            rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
+
+        # Build metadata once for all layers
+        forward_metadata = VisionAttentionMetadata(
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            sequence_lengths=sequence_lengths,
+            input_layout="sb",
+        )
+
         deepstack_feature_lists = []
         num_deepstack_captured = 0
 
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(
-                x,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb_cos=rotary_pos_emb_cos,
-                rotary_pos_emb_sin=rotary_pos_emb_sin,
-                max_seqlen=max_seqlen,
-                sequence_lengths=sequence_lengths,
-            )
+            x = blk(x, forward_metadata=forward_metadata)
 
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
