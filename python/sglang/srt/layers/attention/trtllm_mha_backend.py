@@ -65,6 +65,10 @@ class TRTLLMMHAMetadata:
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
+    # CUDA-graph replay and eager init derive max_seq_len_k from GPU tensors
+    # via _replay_max_len / _max_seq_len; no host seq_lens mirror needed.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -416,6 +420,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         return metadata
 
+    def _replay_max_len(
+        self, seq_lens: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]
+    ) -> int:
+        """Max seq_len for CG replay page-table sizing; GPU fallback if CPU absent."""
+        if seq_lens_cpu is not None:
+            return seq_lens_cpu.max().item()
+        return int(seq_lens.max())
+
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -430,7 +442,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
         metadata = None
         if forward_mode.is_decode_or_idle():
@@ -454,7 +467,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
+                max_len = self._replay_max_len(seq_lens, seq_lens_cpu)
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
@@ -476,8 +489,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata = self.target_verify_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item() + metadata.max_seq_len_q
-            max_len = seq_lens_cpu.max().item()
+            max_len = self._replay_max_len(seq_lens, seq_lens_cpu)
+            metadata.max_seq_len_k = max_len + metadata.max_seq_len_q
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -494,8 +507,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            max_len = seq_lens_cpu.max().item()
+            max_len = self._replay_max_len(seq_lens, seq_lens_cpu)
+            metadata.max_seq_len_k = max_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -620,6 +633,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
+    def _max_seq_len(self, forward_batch: ForwardBatch) -> int:
+        """Sync-free max of seq_lens; falls back to GPU .max() if CPU mirror absent."""
+        if forward_batch.seq_lens_cpu is not None:
+            return forward_batch.seq_lens_cpu.max().item()
+        return int(forward_batch.seq_lens.max())
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
@@ -635,7 +654,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                metadata.max_seq_len_k = self._max_seq_len(forward_batch) + (
                     self.speculative_step_id + 1
                 )
                 metadata.cu_seqlens_q = torch.arange(
@@ -653,7 +672,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -670,9 +689,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.int32
             )
             metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
-            )
+            metadata.max_seq_len_k = self._max_seq_len(forward_batch) + tokens_per_req
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 batch_size * tokens_per_req + 1,
@@ -690,7 +707,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = self._max_seq_len(forward_batch)
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -698,16 +715,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(
-                forward_batch.extend_prefix_lens_cpu
-            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            has_prefix = (
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            if has_prefix:
                 extend_seq_lens = forward_batch.extend_seq_lens
-                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
-                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
-                max_q = max(forward_batch.extend_seq_lens_cpu)
-                metadata.max_seq_len_q = (
-                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
-                )
+                if forward_batch.extend_seq_lens_cpu is not None:
+                    # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+                    # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+                    max_q = max(forward_batch.extend_seq_lens_cpu)
+                    metadata.max_seq_len_q = (
+                        int(max_q.item())
+                        if isinstance(max_q, torch.Tensor)
+                        else int(max_q)
+                    )
+                else:
+                    metadata.max_seq_len_q = int(forward_batch.extend_seq_lens.max())
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
@@ -926,6 +950,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
 class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
+
+    # Same rationale as TRTLLMHAAttnBackend: GPU-path max_seq_len_k sizing.
+    needs_cpu_seq_lens: bool = False
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
