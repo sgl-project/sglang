@@ -116,7 +116,8 @@ diffusion = [
 ]
 
 ray = [
-  "ray[default]>=2.54.0",
+  # RDT weight sync uses ray.experimental.set_target_for_ref, added in Ray 2.55.1.
+  "ray[default]>=2.55.1",
 ]
 
 tracing = [

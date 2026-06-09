@@ -650,6 +650,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
+        # Compute the per-rank parallelism config whenever it will be published to the
+        # bootstrap server (transfer engine, or RDT/NIXL which needs it without one).
+        if self.server_args.registers_parallelism_config():
             self.parallelism_config = RankParallelismConfig.from_parallel_state(
                 self.tp_rank
             )
@@ -722,7 +725,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Register parallelism config with the bootstrap server
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            self.server_args.registers_parallelism_config()
             and self.parallelism_config is not None
         ):
             self._register_parallelism_config_to_bootstrap()
