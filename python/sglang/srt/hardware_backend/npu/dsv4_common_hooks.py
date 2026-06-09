@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
 def maybe_write_dsv4_extend(
@@ -257,3 +257,66 @@ def _write_per_req_slice(
             int(seq_lens_cpu[i].item()) // ratio,
         ),
     )
+
+
+def maybe_evict_dsv4_state(batch: "ScheduleBatch", req: "Req", pre_len: int) -> None:
+    """Per-decode evict for the DSV4-NPU compress-state pools, independent of
+    SWA evict cadence. Called every decode step from ``ScheduleBatch``.
+
+    The state pool is small (~2 pages c4 / ~3 pages c128 of raw positions per
+    req) — with a large sliding_window (SWA evict fires every
+    ``eviction_interval`` and needs ``pre_len > sliding_window + page_size`` to
+    free anything) the pool exhausts before the first SWA frontier advance, so
+    we drain it here on its own cadence.
+
+    Retention windows (kernel read window + decode lookahead margin) mirror
+    reference (iforgetmyname/sglang dsv4_release chunk_cache.py:140-144):
+    c4 = 8 + 16, c128 = 128 + 64 raw positions — intentionally smaller than one
+    SWA page so the first eviction fires before the small pool fills. Watermarks
+    are page-aligned so freed slots are whole pages reclaimable by the paged
+    allocator. ``req.c{4,128}_state_alloc_offset`` (read/written via getattr/
+    setattr) is the low-water mark. No-op on non-DSV4-NPU paths.
+    """
+    allocator = batch.token_to_kv_pool_allocator
+    pool = batch.req_to_token_pool
+    if not hasattr(allocator, "c4_state_attn_allocator") or (
+        allocator.c4_state_attn_allocator is None
+        and allocator.c128_state_attn_allocator is None
+    ):
+        return
+
+    page_size = batch.tree_cache.page_size
+    c4_watermark = ((max(0, pre_len - (8 + 16))) // page_size) * page_size
+    c128_watermark = ((max(0, pre_len - (128 + 64))) // page_size) * page_size
+
+    _free_state_range(
+        allocator.c4_state_attn_allocator, pool, "req_to_token_c4_state",
+        req, "c4_state_alloc_offset", c4_watermark,
+    )
+    _free_state_range(
+        allocator.c128_state_attn_allocator, pool, "req_to_token_c128_state",
+        req, "c128_state_alloc_offset", c128_watermark,
+    )
+
+
+def _free_state_range(
+    state_allocator,
+    pool,
+    table_attr: str,
+    req: "Req",
+    offset_attr: str,
+    watermark: int,
+) -> None:
+    """Free ``[alloc_offset, watermark)`` raw-position state slots for ``req``
+    and advance its low-water mark. No-op when the allocator/table is absent or
+    the watermark hasn't advanced past the current offset."""
+    offset = getattr(req, offset_attr, 0)
+    if (
+        state_allocator is None
+        or not hasattr(pool, table_attr)
+        or watermark <= offset
+    ):
+        return
+    free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
+    state_allocator.free(free_slots.to(torch.int64))
+    setattr(req, offset_attr, watermark)

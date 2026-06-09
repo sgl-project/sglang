@@ -24,13 +24,16 @@ lookups read back.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4StateLens
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 def get_last_loc(
@@ -323,6 +326,124 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             out_c128_loc=out_c128_loc,
             out_c4_state_loc=out_c4_state_loc,
             out_c128_state_loc=out_c128_state_loc,
+        )
+
+    def compute_dsv4_state_lens_extend(
+        self, reqs: List["Req"], seq_lens: List[int]
+    ) -> Optional[DSV4StateLens]:
+        """Per-req c{4,128}_state pool alloc lens for extend (tail-only).
+
+        State pool stores only the trailing portion of each sequence (the c{N}
+        compressor's read/write window); the tail length depends on raw
+        seq_len's alignment to the SWA page boundary (128)::
+
+            c4_alloc_len  = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
+            c128_alloc_len = tail                  where tail = seq_len % 128
+
+        Long prefills allocate only the trailing partial window, not slots for
+        already-compressed positions, so the small paged state pool (~256
+        slots/req) stays sufficient even for 28k-token prompts.
+
+        Mutates per-req cumulative state via getattr/setattr so the community
+        ``Req`` needs no DSV4 field declarations:
+          * ``req.c{4,128}_state_kv_len`` — cumulative slot count (prefix for
+            the paged allocator; never decreases on eviction).
+          * ``req.c{4,128}_state_alloc_offset`` — low-water raw-position mark
+            for eviction (see ``dsv4_common_hooks.maybe_evict_dsv4_state``).
+
+        Returns None when this model has no paged state pools (CUDA / non-V4 /
+        zero budget) — callers pass that straight through as ``dsv4_state_lens``.
+        Reference: iforgetmyname/sglang dsv4_release schedule_batch.py L1742-1747.
+        """
+        if self.c4_state_attn_allocator is None:
+            return None
+        c4_prefix: List[int] = []
+        c4_seq: List[int] = []
+        c128_prefix: List[int] = []
+        c128_seq: List[int] = []
+        for req, seq_len in zip(reqs, seq_lens):
+            tail = seq_len % 128
+            c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
+            c128_alloc_len = tail
+
+            prev_c4 = getattr(req, "c4_state_kv_len", 0)
+            prev_c128 = getattr(req, "c128_state_kv_len", 0)
+            new_c4 = prev_c4 + c4_alloc_len
+            new_c128 = prev_c128 + c128_alloc_len
+
+            c4_prefix.append(prev_c4)
+            c4_seq.append(new_c4)
+            c128_prefix.append(prev_c128)
+            c128_seq.append(new_c128)
+
+            req.c4_state_kv_len = new_c4
+            req.c128_state_kv_len = new_c128
+            req.c4_state_alloc_offset = seq_len - c4_alloc_len
+            req.c128_state_alloc_offset = seq_len - c128_alloc_len
+
+        return self._pack_state_lens(
+            c4_prefix, c4_seq, c128_prefix, c128_seq,
+            c4_extend_num_tokens=int(sum(s - p for s, p in zip(c4_seq, c4_prefix))),
+            c128_extend_num_tokens=int(
+                sum(s - p for s, p in zip(c128_seq, c128_prefix))
+            ),
+        )
+
+    def compute_dsv4_state_lens_decode(
+        self, reqs: List["Req"]
+    ) -> Optional[DSV4StateLens]:
+        """Per-req c{4,128}_state pool alloc lens for decode: exactly 1 new
+        state slot per req per pool. ``c{N}_state_alloc_offset`` does NOT
+        advance here (only eviction advances it). Returns None when there are
+        no paged state pools."""
+        if self.c4_state_attn_allocator is None:
+            return None
+        c4_prefix: List[int] = []
+        c4_seq: List[int] = []
+        c128_prefix: List[int] = []
+        c128_seq: List[int] = []
+        for req in reqs:
+            prev_c4 = getattr(req, "c4_state_kv_len", 0)
+            prev_c128 = getattr(req, "c128_state_kv_len", 0)
+            c4_prefix.append(prev_c4)
+            c4_seq.append(prev_c4 + 1)
+            c128_prefix.append(prev_c128)
+            c128_seq.append(prev_c128 + 1)
+            req.c4_state_kv_len = prev_c4 + 1
+            req.c128_state_kv_len = prev_c128 + 1
+
+        bs = len(reqs)
+        return self._pack_state_lens(
+            c4_prefix, c4_seq, c128_prefix, c128_seq,
+            c4_extend_num_tokens=bs,
+            c128_extend_num_tokens=bs,
+        )
+
+    def _pack_state_lens(
+        self,
+        c4_prefix: List[int],
+        c4_seq: List[int],
+        c128_prefix: List[int],
+        c128_seq: List[int],
+        *,
+        c4_extend_num_tokens: int,
+        c128_extend_num_tokens: int,
+    ) -> DSV4StateLens:
+        c4_prefix_cpu = torch.tensor(c4_prefix, dtype=torch.int64)
+        c4_seq_cpu = torch.tensor(c4_seq, dtype=torch.int64)
+        c128_prefix_cpu = torch.tensor(c128_prefix, dtype=torch.int64)
+        c128_seq_cpu = torch.tensor(c128_seq, dtype=torch.int64)
+        return DSV4StateLens(
+            c4_prefix_lens=c4_prefix_cpu.to(self.device, non_blocking=True),
+            c4_prefix_lens_cpu=c4_prefix_cpu,
+            c4_seq_lens=c4_seq_cpu.to(self.device, non_blocking=True),
+            c4_seq_lens_cpu=c4_seq_cpu,
+            c4_extend_num_tokens=c4_extend_num_tokens,
+            c128_prefix_lens=c128_prefix_cpu.to(self.device, non_blocking=True),
+            c128_prefix_lens_cpu=c128_prefix_cpu,
+            c128_seq_lens=c128_seq_cpu.to(self.device, non_blocking=True),
+            c128_seq_lens_cpu=c128_seq_cpu,
+            c128_extend_num_tokens=c128_extend_num_tokens,
         )
 
     def alloc_extend(

@@ -1413,7 +1413,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     # DSV4-NPU: bundled per-pool slots produced by DSV4NPUTokenToKVPoolAllocator
-    # (None on non-DSV4 paths). See hardware_backend/npu/dsv4_schedule_hooks.py.
+    # (None on non-DSV4 paths). See hardware_backend/npu/dsv4_common_hooks.py.
     # The c4/c128 compress-state alloc lens ride on ``batch.dsv4_state_lens``,
     # set dynamically by those hooks (read via getattr in mem_cache/common.py).
     out_cache_loc_dsv4: Optional[Any] = None
@@ -1752,15 +1752,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # DSV4-NPU only (no-op elsewhere): compute per-req tail-only
-        # c{4,128}_state pool alloc lens before the allocator runs.
-        from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
-            maybe_compute_dsv4_state_lens_extend,
-        )
-
-        maybe_compute_dsv4_state_lens_extend(self, reqs, seq_lens)
-
-        # Allocate memory
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
             self
         )
@@ -2343,15 +2336,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # DSV4-NPU only (no-op elsewhere): bump per-req c{4,128}_state
-        # cumulative lens by 1 before the allocator runs.
-        from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
-            maybe_compute_dsv4_state_lens_decode,
-        )
-
-        maybe_compute_dsv4_state_lens_decode(self, bs)
-
-        # Allocate memory
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
@@ -2698,7 +2684,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # DSV4-NPU only (no-op elsewhere): the small paged
                     # compress-state pool needs draining every decode step,
                     # independent of SWA evict cadence.
-                    from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
+                    from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
                         maybe_evict_dsv4_state,
                     )
 
@@ -2766,14 +2752,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
-
-            # DSV4-NPU only (no-op elsewhere): compress-state slots at raw
-            # positions < swa_evicted_seqlen ride along with SWA eviction.
-            from sglang.srt.hardware_backend.npu.dsv4_schedule_hooks import (
-                maybe_evict_dsv4_state_on_swa,
-            )
-
-            maybe_evict_dsv4_state_on_swa(self, req, new_swa_evicted_seqlen)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):
@@ -2848,7 +2826,7 @@ class ModelWorkerBatch:
 
     # DSV4-NPU: bundled per-pool allocation slots (None for non-DSV4 paths).
     # Typed as Any to avoid an import cycle with forward_batch_info. See
-    # hardware_backend/npu/dsv4_schedule_hooks.py.
+    # hardware_backend/npu/dsv4_common_hooks.py.
     out_cache_loc_dsv4: Optional[Any] = None
 
     # For corss-encoder model
