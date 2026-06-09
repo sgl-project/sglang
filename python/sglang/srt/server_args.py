@@ -6077,10 +6077,12 @@ class ServerArgs:
             default=None,
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
-                "When not set the feature is disabled. "
-                "'auto': choose mnnvl on SM100 and trtllm otherwise. "
-                "'trtllm': single-node only. "
-                "'mnnvl': single-node and multi-node via MNNVL fabric (SM100). "
+                "Defaults to auto. "
+                "'auto': choose mnnvl on SM90 single-node systems and "
+                "SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. "
+                "'trtllm': available on single-node systems only. "
+                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
+                "single-node or multi-node systems via MNNVL fabric. "
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),
         )
