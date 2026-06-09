@@ -2448,9 +2448,9 @@ class ServerArgs:
                 if self.hicache_mem_layout != "page_first_direct":
                     logger.warning(
                         f"Force hicache_mem_layout to 'page_first_direct' for "
-                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); only "
-                        f"page_first / page_first_direct support asymmetric "
-                        f"K/V allocation."
+                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
+                        f"hicache_io_backend='direct' requires layout="
+                        f"'page_first_direct'."
                     )
                     self.hicache_mem_layout = "page_first_direct"
         elif (
