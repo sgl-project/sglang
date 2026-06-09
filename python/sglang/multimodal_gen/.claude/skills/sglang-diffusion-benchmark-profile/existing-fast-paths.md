@@ -64,7 +64,7 @@ framework-specific optimization workflow.
 - Locations: `triton/norm.py`, `layernorm.py`
 - Use cases: fp32 RMSNorm with residual/dropout/rowscale/x1 branches, and inference-friendly `norm_infer`.
 - Constraints: last dim must be contiguous, and `N * element_size < 64KB`.
-- Validation: `python/sglang/jit_kernel/tests/test_rmsnorm.py`.
+- Validation: `test/registered/jit/test_rmsnorm.py`.
 
 5. Triton one-pass RMSNorm (small hidden size fast path)
 - Kernel: `triton_one_pass_rms_norm`
@@ -78,7 +78,7 @@ framework-specific optimization workflow.
 - Use case: GPT-J style RoPE when not Neox.
 - Constraints: `head_size` must be even.
 - NPU fallback: `npu_fallback.apply_rotary_embedding_native`.
-- Validation: `python/sglang/jit_kernel/tests/test_rope.py`.
+- Validation: `test/registered/jit/test_rope.py`.
 
 7. LTX2 split RoPE fusion
 - Kernel: `apply_ltx2_split_rotary_emb`
@@ -130,7 +130,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
-- Validation: `python/sglang/jit_kernel/tests/test_qknorm.py` and `python/sglang/jit_kernel/tests/test_qknorm_across_heads.py`.
+- Validation: `test/registered/jit/test_qknorm.py` and `test/registered/jit/test_qknorm_across_heads.py`.
 
 **QK Norm + RoPE Optimization**
 

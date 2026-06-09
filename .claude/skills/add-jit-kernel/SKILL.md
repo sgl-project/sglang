@@ -433,7 +433,7 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 ## Step 4: Write tests (required)
 
-JIT kernel tests live under `python/sglang/jit_kernel/tests/`. **CI does not run `pytest` in that directory directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` there (and every `bench_*.py` under `benchmark/`), collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
+JIT kernel correctness tests live under `test/registered/jit/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook, except for benchmarks). JIT kernel benchmarks still live alongside the kernel source under `python/sglang/jit_kernel/benchmark/`. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` under `test/registered/` (and every `bench_*.py` under `jit_kernel/benchmark/`), collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
 - **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-1-gpu-large` on H100 and `base-b-kernel-unit-1-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-8-gpu-h200`.
 - **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
@@ -464,7 +464,7 @@ Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but
 
 For fast iteration you can still run `pytest` on a single file locally; CI coverage is via `run_suite.py`.
 
-Create `python/sglang/jit_kernel/tests/test_scale.py`:
+Create `test/registered/jit/test_scale.py`:
 
 ```python
 import pytest
@@ -617,7 +617,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-
 ## References
 
 - `docs/developer_guide/development_jit_kernel_guide.md`
-- `test/run_suite.py` — suite names, discovery of `jit_kernel/tests/` and `jit_kernel/benchmark/`, execution entrypoint for CI
+- `test/run_suite.py` — suite names, discovery of `test/registered/` and `jit_kernel/benchmark/`, execution entrypoint for CI
 - `python/sglang/test/ci/ci_register.py` — `register_cuda_ci` and AST registration rules
 - `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`
 - `python/sglang/jit_kernel/include/sgl_kernel/tensor.h` — `TensorMatcher`, `SymbolicSize/DType/Device`
@@ -643,6 +643,6 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-
 ```
 python/sglang/jit_kernel/csrc/elementwise/scale.cuh   # NEW: CUDA kernel
 python/sglang/jit_kernel/scale.py                     # NEW: Python wrapper
-python/sglang/jit_kernel/tests/test_scale.py          # NEW: Tests
+test/registered/jit/test_scale.py                     # NEW: Tests
 python/sglang/jit_kernel/benchmark/bench_scale.py     # NEW: Benchmark
 ```
