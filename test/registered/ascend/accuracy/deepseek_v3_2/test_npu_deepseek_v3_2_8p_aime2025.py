@@ -1,9 +1,9 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
-from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH
+from sglang.test.ascend.test_npu_utils import DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -28,7 +28,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestNPUDeepSeek_V3_2_8P_AIME2025(TestAscendAccuracyTestCaseBase):
+class TestNPUDeepSeek_V3_2_8P_AIME2025(TestNpuAccuracyTestCaseBase):
 
     model = DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH
     other_args = OTHER_ARGS

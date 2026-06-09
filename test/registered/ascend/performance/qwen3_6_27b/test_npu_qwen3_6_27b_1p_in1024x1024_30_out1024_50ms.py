@@ -4,7 +4,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_MM_CUSTOM_GEN,
     BENCHMARK_TOOL_DEFAULT,
     QWEN3_6_27B_MODEL_PATH,
-    TestAscendPerformanceTestCaseBase,
+    TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -84,7 +84,7 @@ QWEN3_6_27B_1024_OTHER_ARGS = [
 
 
 class TestNPUQwen3_6_27B_1P_In1024x1024_30_Out1024_50ms(
-    TestAscendPerformanceTestCaseBase
+    TestNpuPerformanceTestCaseBase
 ):
     """Test NPU performance for Qwen3.6-27B 1p in1024x1024 30 out1024 50ms"""
 

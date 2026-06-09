@@ -1,14 +1,14 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     QWEN3_30B_A3B_W8A8_VLLM_MODEL_PATH,
     QWEN3_A3B_EAGLE_MODEL_PATH,
-    TestAscendPerformanceTestCaseBase,
+    TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -90,7 +90,7 @@ QWEN3_30B_A3B_OTHER_ARGS = [
 ]
 
 
-class TestQwen30B(TestAscendPerformanceTestCaseBase):
+class TestQwen30B(TestNpuPerformanceTestCaseBase):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_30B_A3B_W8A8_VLLM_MODEL_PATH
@@ -109,7 +109,7 @@ class TestQwen30B(TestAscendPerformanceTestCaseBase):
         self.run_throughput()
 
 
-class TestQwen30B_A3B_aime25(TestAscendAccuracyTestCaseBase):
+class TestQwen30B_A3B_aime25(TestNpuAccuracyTestCaseBase):
     model = QWEN3_30B_A3B_W8A8_VLLM_MODEL_PATH
     envs = QWEN3_30B_A3B_ENVS
     other_args = QWEN3_30B_A3B_OTHER_ARGS

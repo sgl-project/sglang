@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     QWEN3_32B_EAGLE_MODEL_PATH,
@@ -68,7 +68,7 @@ QWEN3_32B_OTHER_ARGS = [
 ]
 
 
-class TestQwen32B_GPQA(TestAscendAccuracyTestCaseBase):
+class TestQwen32B_GPQA(TestNpuAccuracyTestCaseBase):
     model = QWEN3_32B_MODEL_PATH
     envs = QWEN3_32B_ENVS
     other_args = QWEN3_32B_OTHER_ARGS

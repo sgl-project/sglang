@@ -229,7 +229,7 @@ def assert_metrics(self, metrics):
         )
 
 
-class TestAscendAccuracyTestCaseBase(CustomTestCase):
+class TestNpuAccuracyTestCaseBase(CustomTestCase):
     model = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
@@ -300,7 +300,7 @@ class TestAscendAccuracyTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestAscendAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
+class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     model_config = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
@@ -388,7 +388,7 @@ class TestAscendAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestAscendAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
+class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     model_config = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"

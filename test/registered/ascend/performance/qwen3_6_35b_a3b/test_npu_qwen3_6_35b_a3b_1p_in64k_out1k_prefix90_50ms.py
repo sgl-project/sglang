@@ -1,13 +1,13 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     DEFAULT_URL_FOR_TEST,
     QWEN3_6_35B_A3B_MODEL_PATH,
-    TestAscendPerformanceTestCaseBase,
+    TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -86,7 +86,7 @@ QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestAscendAccuracyTestCaseBase):
+class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestNpuAccuracyTestCaseBase):
     """Test NPU accuracy for Qwen3.6-35B-A3B 1p on AIME2026"""
 
     model = QWEN3_6_35B_A3B_MODEL_PATH
@@ -112,7 +112,7 @@ class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestAscendAccuracyTestCaseBase):
 
 
 class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
-    TestAscendPerformanceTestCaseBase
+    TestNpuPerformanceTestCaseBase
 ):
     """Test NPU performance for Qwen3.6-35B-A3B 1p in64k out1k prefix90 50ms"""
 

@@ -691,7 +691,7 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
         time.sleep(check_interval)
 
 
-class TestAscendMultiNodePdMixTestCaseBase(CustomTestCase):
+class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
     model_config = None
 
     @classmethod
@@ -795,7 +795,7 @@ class TestAscendMultiNodePdMixTestCaseBase(CustomTestCase):
         )
 
 
-class TestAscendMultiNodePdSepTestCaseBase(CustomTestCase):
+class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
     model_config = None
 
     @classmethod

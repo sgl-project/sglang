@@ -1,14 +1,14 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyMultiNodePdSepTestCaseBase,
+    TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     GLM_5_1_W4A8_MODEL_PATH,
-    TestAscendPerfMultiNodePdSepTestCaseBase,
+    TestNpuPerfMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -162,7 +162,7 @@ GLM_5_1_PD_SEP_MODEL_CONFIG = {
 }
 
 
-class TestNPUGLM5_1_W4A8_PD_SEP_AIME2026(TestAscendAccuracyMultiNodePdSepTestCaseBase):
+class TestNPUGLM5_1_W4A8_PD_SEP_AIME2026(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for GLM-5.1-w4a8 PD separation on AIME2026"""
 
     model_config = GLM_5_1_PD_SEP_MODEL_CONFIG
@@ -176,7 +176,7 @@ class TestNPUGLM5_1_W4A8_PD_SEP_AIME2026(TestAscendAccuracyMultiNodePdSepTestCas
         self.run_accuracy()
 
 
-class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestAscendPerfMultiNodePdSepTestCaseBase):
+class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBase):
     """Test NPU performance for GLM-5.1-w4a8 PD separation 4 nodes in3k5 out1k5"""
 
     model_config = GLM_5_1_PD_SEP_MODEL_CONFIG

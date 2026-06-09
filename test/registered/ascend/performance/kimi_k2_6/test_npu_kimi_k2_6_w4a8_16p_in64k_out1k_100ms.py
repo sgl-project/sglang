@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyMultiNodePdMixTestCaseBase,
+    TestNpuAccuracyMultiNodePdMixTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
@@ -9,7 +9,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     KIMI_K2_6_EAGLE3_MODEL_PATH,
     KIMI_K2_6_W4A8_MODEL_PATH,
-    TestAscendPerfMultiNodePdMixTestCaseBase,
+    TestNpuPerfMultiNodePdMixTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -85,7 +85,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestAscendAccuracyMultiNodePdMixTestCaseBase):
+class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestNpuAccuracyMultiNodePdMixTestCaseBase):
 
     model = KIMI_K2_6_W4A8_MODEL_PATH
     other_args = OTHER_ARGS
@@ -101,7 +101,7 @@ class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestAscendAccuracyMultiNodePdMixTestCase
 
 
 class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(
-    TestAscendPerfMultiNodePdMixTestCaseBase
+    TestNpuPerfMultiNodePdMixTestCaseBase
 ):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT

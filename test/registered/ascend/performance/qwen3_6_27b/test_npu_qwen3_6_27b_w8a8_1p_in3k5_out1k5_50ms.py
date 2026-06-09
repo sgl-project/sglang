@@ -1,13 +1,13 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     QWEN3_6_27B_W8A8_MODEL_PATH,
-    TestAscendPerformanceTestCaseBase,
+    TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -80,7 +80,7 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_50ms(TestAscendPerformanceTestCaseBase):
+class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for Qwen3.6-27B-w8a8 1p in3k5 out1k5 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
@@ -102,7 +102,7 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_50ms(TestAscendPerformanceTestCaseBase)
         self.run_throughput()
 
 
-class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestAscendAccuracyTestCaseBase):
+class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
     model = QWEN3_6_27B_W8A8_MODEL_PATH
     envs = QWEN3_6_27B_3K5_1K5_ENVS
     other_args = QWEN3_6_27B_3K5_1K5_OTHER_ARGS

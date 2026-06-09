@@ -2,13 +2,13 @@ import os
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     MINIMAX_M2_5_EAGLE3_MODEL_PATH,
     MINIMAX_M2_5_W8A8_MODEL_PATH,
-    TestAscendPerformanceTestCaseBase,
+    TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -92,7 +92,7 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
 
 
 class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
-    TestAscendPerformanceTestCaseBase
+    TestNpuPerformanceTestCaseBase
 ):
     """MiniMax-M2.5-w8a8 4p (4 cards) 64k input 1k output with 90% prefix cache performance test"""
 
@@ -116,7 +116,7 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
         self.run_throughput()
 
 
-class TestNPUMiniMaxM2_5_W8A8_4P_In3k5_Out1k5_aime25(TestAscendAccuracyTestCaseBase):
+class TestNPUMiniMaxM2_5_W8A8_4P_In3k5_Out1k5_aime25(TestNpuAccuracyTestCaseBase):
     model = MINIMAX_M2_5_W8A8_MODEL_PATH
     other_args = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS
     envs = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS

@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import GLM_4_6V_FLASH_MODEL_PATH
 from sglang.test.ci.ci_register import register_npu_ci
@@ -53,7 +53,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestQwen3(TestAscendAccuracyTestCaseBase):
+class TestQwen3(TestNpuAccuracyTestCaseBase):
     model = GLM_4_6V_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

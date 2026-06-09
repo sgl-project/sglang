@@ -1,14 +1,14 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     DEFAULT_URL_FOR_TEST,
     QWEN3_32B_EAGLE_MODEL_PATH,
     QWEN3_32B_W8A8_MODEL_PATH,
-    TestAscendPerformanceTestCaseBase,
+    TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -87,7 +87,7 @@ QWEN3_32B_OTHER_ARGS = [
 ]
 
 
-class TestQwen32B_GPQA(TestAscendAccuracyTestCaseBase):
+class TestQwen32B_GPQA(TestNpuAccuracyTestCaseBase):
     """Test NPU accuracy for Qwen3-32B-W8A8 on qpqa"""
 
     model = QWEN3_32B_W8A8_MODEL_PATH
@@ -108,7 +108,7 @@ class TestQwen32B_GPQA(TestAscendAccuracyTestCaseBase):
         self.run_accuracy()
 
 
-class TestQwen32B(TestAscendPerformanceTestCaseBase):
+class TestQwen32B(TestNpuPerformanceTestCaseBase):
     base_url = DEFAULT_URL_FOR_TEST
     aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_32B_W8A8_MODEL_PATH
