@@ -36,10 +36,11 @@ MNK_FACTORS = [
 
 @pytest.mark.parametrize("k_chunk", [128])
 @pytest.mark.parametrize("n_chunk", [64, 256])
-@pytest.mark.parametrize("quant_type", [scalar_types.uint4, scalar_types.uint4b8])
+@pytest.mark.parametrize("quant_type", [scalar_types.uint4, scalar_types.uint4b8, scalar_types.uint8b128])
 @pytest.mark.parametrize("group_size", [-1, 128])
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
 @pytest.mark.parametrize("act_order", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_gptq_marlin_gemm(
     k_chunk,
     n_chunk,
@@ -47,6 +48,7 @@ def test_gptq_marlin_gemm(
     group_size,
     mnk_factors,
     act_order,
+    dtype,
 ):
     m_factor, n_factor, k_factor = mnk_factors
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
@@ -66,8 +68,8 @@ def test_gptq_marlin_gemm(
     if size_k % group_size != 0:
         return
 
-    a_input = torch.randn((size_m, size_k), dtype=torch.float16, device="cuda")
-    b_weight = torch.randn((size_k, size_n), dtype=torch.float16, device="cuda")
+    a_input = torch.randn((size_m, size_k), dtype=dtype, device="cuda")
+    b_weight = torch.randn((size_k, size_n), dtype=dtype, device="cuda")
 
     if has_zp:
         w_ref, marlin_q_w, marlin_s, marlin_zp = awq_marlin_quantize(

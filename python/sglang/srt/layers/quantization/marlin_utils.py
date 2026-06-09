@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -435,16 +436,14 @@ def maybe_warn_marlin_atomic_add(device, dtype):
 def maybe_warn_marlin_atomic_add_env():
     if torch.compiler.is_dynamo_compiling():
         return
-    # TODO(yiyun): Need to add sglang's MARLIN_USE_ATOMIC_ADD: bool = False
-    if True:
+    use_atomic_add = os.environ.get("SGLANG_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    if use_atomic_add:
         return
-    # if envs.VLLM_MARLIN_USE_ATOMIC_ADD:
-    #     return
     logger.info_once(
         "Marlin kernel can achieve better performance for small size_n "
         "with experimental use_atomic_add feature. "
         "You can consider set environment variable "
-        "VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible."
+        "SGLANG_MARLIN_USE_ATOMIC_ADD to 1 if possible."
     )
 
 
@@ -458,9 +457,9 @@ def should_use_atomic_add_reduce(
         return False
 
     # disable atomicAdd reduce by default,
-    # one can enable it with VLLM_MARLIN_USE_ATOMIC_ADD=1
-    # TODO: Need to add sglang's MARLIN_USE_ATOMIC_ADD: bool = False
-    if not True:
+    # one can enable it with SGLANG_MARLIN_USE_ATOMIC_ADD=1
+    use_atomic_add = os.environ.get("SGLANG_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    if not use_atomic_add:
         maybe_warn_marlin_atomic_add_env()
         return False
 
