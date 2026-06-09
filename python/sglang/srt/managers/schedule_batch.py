@@ -1005,8 +1005,9 @@ class Req(ReqDllmMixin):
     def has_pending_chunk(self) -> bool:
         if self.is_dllm():
             return False
-        n = self.scheduled_extend_len_bound()
-        return 0 < self.scheduled_extend_len < n
+        if self.extend_range is None:
+            return False
+        return 0 < self.extend_range.end < self.get_full_untruncated_fill_len()
 
     def scheduled_extend_len_bound(self) -> int:
         scheduled_extend_target_len = getattr(self, "scheduled_extend_target_len", 0)
