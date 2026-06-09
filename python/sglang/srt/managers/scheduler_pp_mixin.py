@@ -610,7 +610,6 @@ class SchedulerPPMixin:
                 req.set_extend_range(
                     len(req.prefix_indices), req.get_full_untruncated_fill_len()
                 )
-                req.scheduled_extend_len = len(req.origin_input_ids)
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(

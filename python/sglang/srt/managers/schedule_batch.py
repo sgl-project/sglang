@@ -849,9 +849,6 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
-        self.scheduled_extend_len: int = 0
-        self.scheduled_extend_target_len: int = 0
-
         # For retraction
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
@@ -1008,31 +1005,6 @@ class Req(ReqDllmMixin):
         if self.extend_range is None:
             return False
         return 0 < self.extend_range.end < self.get_full_untruncated_fill_len()
-
-    def scheduled_extend_len_bound(self) -> int:
-        scheduled_extend_target_len = getattr(self, "scheduled_extend_target_len", 0)
-        if scheduled_extend_target_len:
-            return scheduled_extend_target_len
-        return len(self.origin_input_ids)
-
-    def _scheduled_extend_len_bound_for_value(self, value: int) -> int:
-        origin_len = len(self.origin_input_ids)
-        full_len = self.get_full_untruncated_fill_len()
-        if self.retracted_stain and full_len > origin_len:
-            return full_len
-        if value > origin_len:
-            return full_len
-        return origin_len
-
-    def set_scheduled_extend_len(self, value: int) -> None:
-        if not self.is_dllm():
-            n = self._scheduled_extend_len_bound_for_value(value)
-            assert 0 <= value <= n, (
-                f"scheduled_extend_len {value} out of bounds [0, {n}] "
-                f"for req {self.rid}"
-            )
-            self.scheduled_extend_target_len = n
-        self.scheduled_extend_len = value
 
     @property
     def is_prefill_only(self) -> bool:
@@ -1411,8 +1383,6 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
-        self.scheduled_extend_len = 0
-        self.scheduled_extend_target_len = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None

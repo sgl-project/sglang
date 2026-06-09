@@ -683,7 +683,6 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
-        req.set_scheduled_extend_len(req.extend_range.end)
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -740,7 +739,6 @@ class PrefillAdder:
             ),
             req.retracted_stain,
         )
-        req.set_scheduled_extend_len(req.extend_range.end)
 
         return self.budget_state()
 
@@ -861,8 +859,6 @@ class PrefillAdder:
             )
             self.can_run_list.append(req)
             self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
-
-        req.set_scheduled_extend_len(req.extend_range.end)
 
         return self.budget_state()
 
@@ -1036,8 +1032,6 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len, trunc_len, 0, req.retracted_stain
                 )
-
-        req.set_scheduled_extend_len(req.extend_range.end)
 
         return self.budget_state()
 
