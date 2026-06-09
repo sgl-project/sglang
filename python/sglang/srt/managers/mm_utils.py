@@ -27,9 +27,10 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_hip, is_npu, print_warning_once
 from sglang.utils import logger
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -624,6 +625,71 @@ def _batch_encode_per_image_misses(
     return hash_to_embedding
 
 
+def _get_chunked_embedding_by_item(
+    data_embedding_func: DataEmbeddingFunc,
+    embedding_items_per_req: List[MultimodalDataItem],
+    items_offset: List[Tuple[int, int]],
+    extend_prefix_len: int,
+    extend_seq_len: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Per-image chunk-aware encoding for one request.
+    Items must already be split per-image (each item has exactly one offset).
+    """
+    chunk_start = extend_prefix_len
+    chunk_end = extend_prefix_len + extend_seq_len  # exclusive
+
+    if extend_seq_len <= 0:
+        return None
+
+    overlapping = []
+    for idx, (item, (start, end)) in enumerate(
+        zip(embedding_items_per_req, items_offset)
+    ):
+        if end >= chunk_start and start < chunk_end:
+            overlapping.append((idx, item, start, end))
+
+    if not overlapping:
+        return None
+
+    cached_embeddings = {}
+    miss_items = []
+    for idx, item, start, end in overlapping:
+        cached = embedding_cache.get_single(item.hash)
+        if cached is not None:
+            cached_embeddings[idx] = cached.embedding
+        else:
+            miss_items.append((idx, item, start, end))
+
+    if miss_items:
+        miss_item_list = [item for _, item, _, _ in miss_items]
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(miss_item_list, device)
+        all_miss_embedding = data_embedding_func(miss_item_list)
+        all_miss_embedding = all_miss_embedding.reshape(
+            -1, all_miss_embedding.shape[-1]
+        )
+
+        token_counts = [end - start + 1 for _, _, start, end in miss_items]
+        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+
+        for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
+            cached_embeddings[idx] = emb
+            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+
+    chunk_slices = []
+    for idx, _, start, end in overlapping:
+        emb = cached_embeddings[idx]
+        overlap_start = max(start, chunk_start)
+        overlap_end = min(end, chunk_end - 1)  # inclusive
+        local_start = overlap_start - start
+        local_end = overlap_end - start + 1  # exclusive for slicing
+        chunk_slices.append(emb[local_start:local_end])
+
+    return torch.cat(chunk_slices, dim=0)
+
+
 def _assemble_per_image_chunk(
     overlapping: List[Tuple[int, MultimodalDataItem, int, int]],
     hash_to_embedding: Dict[int, torch.Tensor],
@@ -673,6 +739,7 @@ def _get_chunked_prefill_embedding(
     # Phase 0: classify requests into per-image vs full/EVS path
     per_image_requests = []  # batched ViT encoding
     full_path_requests = []  # per-request encoding (EVS etc.)
+    all_chunks: List[Tuple[int, torch.Tensor]] = []
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
@@ -700,7 +767,21 @@ def _get_chunked_prefill_embedding(
 
         is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
         if is_per_image:
-            per_image_requests.append(req_info)
+            if _is_hip:
+                # ROCm CI regressed with one large cross-request ViT batch; keep
+                # the previous per-request path on HIP while CUDA uses batching.
+                chunk = _get_chunked_embedding_by_item(
+                    data_embedding_func,
+                    embedding_items_per_req,
+                    items_offset,
+                    extend_prefix_len,
+                    extend_seq_len,
+                    device,
+                )
+                if chunk is not None:
+                    all_chunks.append((i, chunk))
+            else:
+                per_image_requests.append(req_info)
         else:
             full_path_requests.append(req_info)
 
@@ -712,8 +793,6 @@ def _get_chunked_prefill_embedding(
         )
 
     # Phase 2: assemble per-request chunks in original request order
-    all_chunks: List[Tuple[int, torch.Tensor]] = []
-
     for req_info in per_image_requests:
         chunk = _assemble_per_image_chunk(
             req_info.overlapping,
