@@ -20,7 +20,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import get_ascend_dispatcher_output_dtype
+from sglang.srt.layers.moe.utils import (
+    get_ascend_dispatcher_output_dtype,
+    DispatcherOutputDtype,
+)
 
 
 class TorchNpuDispatchOutput(NamedTuple):
@@ -74,7 +77,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         """
         self.ascend_dispatcher_output_dtype = get_ascend_dispatcher_output_dtype(self)
 
-        if self.ascend_dispatcher_output_dtype == "bf16":
+        if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
             # Prefill
             self.init_routing_prefill = NPUMoEInitRouting_v2()
             self.finalize_routing_prefill = NPUFinalizeRouting()
@@ -85,7 +88,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             self.finalize_routing_decode = NPUMoETokenUnpermute()  # example
             self.group_list_type = 1
 
-        elif self.ascend_dispatcher_output_dtype == "int8":
+        elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             # Prefill
             self.init_routing_prefill = NPUMoEInitRouting_Quant()
             self.finalize_routing_prefill = NPUMoETokenUnpermute()
