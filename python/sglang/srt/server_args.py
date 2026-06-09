@@ -1597,20 +1597,21 @@ class ServerArgs:
                 reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
-            # For cuda graphs
-            reserved_mem += self.cuda_graph_max_bs * 2
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
-            if self.enable_dp_attention:
-                # DP attention needs more padding for some operations
-                reserved_mem += self.cuda_graph_max_bs * self.dp_size * 3
+            # For cuda graphs
+            if not self.disable_cuda_graph:
+                reserved_mem += self.cuda_graph_max_bs * 2
+                if self.enable_dp_attention:
+                    # DP attention needs more padding for some operations
+                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 3
 
-                # DP attention uses much more memory for large cuda graph max bs,
-                # likely due to some inefficiencies in torch allocator or our implementation.
-                # So we need to reserve more memory.
-                if self.cuda_graph_max_bs > 300:
-                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
+                    # DP attention uses much more memory for large cuda graph max bs,
+                    # likely due to some inefficiencies in torch allocator or our implementation.
+                    # So we need to reserve more memory.
+                    if self.cuda_graph_max_bs > 300:
+                        reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
             if not self.disable_piecewise_cuda_graph:
