@@ -363,7 +363,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert torch.cuda.current_device() == layer._load_device.index
 
             # Materialize FP8 parameters on first load from meta device. Adds a small but manageable overhead compared to materializing one by one - but weights are loaded in order layer by layer so it is fine.
-            # TODO: handle bias!!!!
             with layer._fp8_loading_lock:
 
                 if not layer._fp8_materialized:

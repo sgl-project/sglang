@@ -118,7 +118,6 @@ class QuarkConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         # Check if the layer is skipped for quantization.
-
         if should_ignore_layer(
             prefix,
             ignore=self.exclude_layers,
@@ -268,7 +267,7 @@ class QuarkConfig(QuantizationConfig):
 
         # Exclusion for accuracy adapted from
         # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
-        if model_type == "deepseek_v3":
+        if model_type in ["deepseek_v3", "deepseek_v32"]:
             exclude.extend(
                 [
                     "re:.*model.layers.61.*",

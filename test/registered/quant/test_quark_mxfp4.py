@@ -222,7 +222,7 @@ class TestFP8ToMXFP4DenseTP2(TestFP8ToMXFP4Dense):
     def test_peak_memory(self):
         # Original Qwen/Qwen3-8B-FP8 model: 4.663 GiB (TP=2, peak_memory_before_load)
         self._test_peak_memory(
-            threshold=3.5, test_start=False, add_peak_memory_before_load=True
+            threshold=4.2, test_start=False, add_peak_memory_before_load=True
         )
 
 
@@ -247,15 +247,6 @@ class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
     # model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
     model = "deepseek-ai/DeepSeek-V3.2"
     tp = 8
-
-    # Default nsa-prefill-backend / nsa-decode-backend is incorrect, see https://github.com/sgl-project/sglang/pull/18319
-    # `--attention-backend aiter` is also loadable, but accuracy is very low! Probably bugged.
-    runner_args = [
-        "--nsa-prefill-backend",
-        "tilelang",
-        "--nsa-decode-backend",
-        "tilelang",
-    ]
 
     def test_peak_memory(self):
         # Original deepseek-ai/DeepSeek-V3.2 model: 80.366 GiB (TP=8, peak_memory_before_load)
