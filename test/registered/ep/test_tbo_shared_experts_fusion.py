@@ -12,12 +12,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Label-gated extra CI (run-ci + run-ci-extra) on the 8x H200 DeepEP runner.
-# Shared-experts fusion only supports n_shared_experts == 1, so this uses the
-# real DeepSeek-V3-Base (n_shared_experts=1) rather than the small CI MLA proxy
-# model (n_shared_experts != 1, which cannot fuse and trips
-# `assert num_fused_shared_experts == 1` in deepseek_weight_loader.py). The
-# 671B FP8 weights need all 8 GPUs.
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-8-gpu-h200")
 
 DEEPSEEK_V3_BASE_MODEL_PATH = "deepseek-ai/DeepSeek-V3-Base"
