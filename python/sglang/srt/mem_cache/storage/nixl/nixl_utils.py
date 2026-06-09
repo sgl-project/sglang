@@ -186,6 +186,7 @@ class NixlFileManager:
             self.base_dirs = [d for d in base_dir if d]
         self.base_dir = self.base_dirs[0] if self.base_dirs else ""
         self.use_direct_io = use_direct_io
+        self._created_bucket_dirs: set[str] = set()
         if not self.base_dirs:
             logger.debug(
                 f"Initialized file manager without a base directory. Direct I/O: {use_direct_io}"
@@ -203,16 +204,18 @@ class NixlFileManager:
             logger.warning("Base directories are empty, skipping clear operation")
             return
 
-        try:
-            for base in self.base_dirs:
+        for base in self.base_dirs:
+            try:
                 for root, _dirs, files in os.walk(base):
                     for file in files:
-                        os.remove(os.path.join(root, file))
-            logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
-        except Exception as e:
-            logger.error(
-                f"Failed to clear files in base directories {self.base_dirs}: {e}"
-            )
+                        file_path = os.path.join(root, file)
+                        try:
+                            os.remove(file_path)
+                        except OSError as e:
+                            logger.warning(f"Failed to remove file {file_path}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to clear base directory {base}: {e}")
+        logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
 
     def iter_all_base_dirs(self) -> list[str]:
         """Return base directories that may contain NIXL FILE cache entries."""
@@ -246,8 +249,9 @@ class NixlFileManager:
         try:
             if create:
                 parent = os.path.dirname(file_path)
-                if parent:
+                if parent and parent not in self._created_bucket_dirs:
                     os.makedirs(parent, exist_ok=True)
+                    self._created_bucket_dirs.add(parent)
             return os.open(file_path, flags, 0o644)
         except Exception as e:
             logger.error(f"Failed to open file {file_path}: {e}")
