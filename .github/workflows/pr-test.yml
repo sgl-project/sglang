@@ -80,9 +80,10 @@ jobs:
     secrets: inherit
 
   call-pr-test-extra:
-    if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true
+    if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true
     uses: ./.github/workflows/pr-test-extra.yml
     with:
+      git_ref: ${{ inputs.git_ref || '' }}
       run_all_tests: true
     secrets: inherit
 
