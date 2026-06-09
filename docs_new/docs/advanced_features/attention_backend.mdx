@@ -14,7 +14,7 @@ If you don't specify `--attention-backend`, SGLang makes a best effort to automa
 
 ## Support Matrix
 
-The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](../basic_usage/deepseek_v3#multi-head-latent-attention-mla-throughput-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
+The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#4-2-4-mla-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
 
 ### MHA Backends
 
@@ -289,7 +289,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 
 <Note>
 - FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). FA4 MLA supports `page_size = 1`; FA4 MHA requires `page_size = 128`. On SM100, this is auto-enforced by the server; on SM90, users must set `--page-size 128` manually.
-- DSA is specifically designed for [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend](#dsa-attention-backend) section and [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32) for details.
+- DSA is specifically designed for [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). See the [DSA Attention Backend](#dsa-attention-backend) section and [DeepSeek V3.2 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2) for details.
 </Note>
 
 <Warning>
@@ -455,7 +455,7 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
   </tbody>
 </table>
 
-For deployment examples, see the [DeepSeek V3.2 deployment guide](../basic_usage/deepseek_v32).
+For deployment examples, see the [DeepSeek V3.2 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2).
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 

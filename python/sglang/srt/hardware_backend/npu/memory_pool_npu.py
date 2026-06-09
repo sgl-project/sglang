@@ -109,6 +109,11 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     self.k_buffer.append(k_buffer_layer)
                     self.v_buffer.append(v_buffer_layer)
 
+    def _init_kv_copy_and_warmup(self):
+        # implementation relies on self.data_strides / self.data_ptrs, which the
+        # NPU paged buffer layout never builds.
+        self._kv_copy_config = None
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # layer_num x [seq_len, head_num, head_dim]
