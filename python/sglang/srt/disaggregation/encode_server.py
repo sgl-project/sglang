@@ -3141,7 +3141,11 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     instead of serialising sleeps in a single thread.
     """
 
-    encoder_url = server_args.url()
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
     payload = {"url": encoder_url}
     bootstrap_urls = list(server_args.encoder_register_urls)
     if not bootstrap_urls:
@@ -3197,6 +3201,35 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     ).start()
 
 
+def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    payload = {"url": encoder_url}
+
+    for bootstrap_url in server_args.encoder_register_urls:
+        try:
+            resp = http_requests.delete(
+                f"{bootstrap_url}/unregister_encoder_url",
+                json=payload,
+                timeout=2.0,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    f"Unregistered encoder URL '{encoder_url}' from "
+                    f"bootstrap at {bootstrap_url}"
+                )
+            else:
+                logger.warning(
+                    f"Bootstrap {bootstrap_url} returned "
+                    f"{resp.status_code} on unregister: {resp.text}"
+                )
+        except Exception as e:
+            logger.debug(f"Unregister from {bootstrap_url} failed: {e}")
+
+
 def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
     if server_args.dp_size > 1:
@@ -3229,7 +3262,10 @@ def launch_server(server_args: ServerArgs):
 
     # Register this encoder's URL with prefill server(s) if configured.
     if server_args.encoder_register_urls:
+        import atexit
+
         _register_encoder_url_with_bootstrap(server_args)
+        atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
@@ -3305,7 +3341,10 @@ def _launch_server_dp(server_args: ServerArgs):
 
     # Register this encoder's URL with prefill server(s) if configured.
     if server_args.encoder_register_urls:
+        import atexit
+
         _register_encoder_url_with_bootstrap(server_args)
+        atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 

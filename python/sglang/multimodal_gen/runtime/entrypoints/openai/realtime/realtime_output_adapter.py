@@ -124,6 +124,7 @@ def _frame_shape_from_metadata(
 
 
 RAW_RGB_FRAMES_PER_WS_MESSAGE = 16
+ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE = 6
 FRAME_BATCH_PACK_OFFLOAD_BYTES = 64 * 1024
 WEBP_DEFAULT_QUALITY = 90
 JPEG_DEFAULT_QUALITY = 95
@@ -139,12 +140,15 @@ class _TransportPayload:
     metadata: dict[str, int | str | bool | list[int]]
 
 
-def _split_frame_batch(frames: list[bytes]) -> list[list[bytes]]:
+def _split_frame_batch(
+    frames: list[bytes],
+    frames_per_message: int = RAW_RGB_FRAMES_PER_WS_MESSAGE,
+) -> list[list[bytes]]:
     if not frames:
         return [frames]
     return [
-        frames[i : i + RAW_RGB_FRAMES_PER_WS_MESSAGE]
-        for i in range(0, len(frames), RAW_RGB_FRAMES_PER_WS_MESSAGE)
+        frames[i : i + frames_per_message]
+        for i in range(0, len(frames), frames_per_message)
     ]
 
 
@@ -495,7 +499,7 @@ class RawRGBRealtimeOutputAdapter:
         stats = empty_frame_send_stats(content_type)
         for frames in frame_batches:
             split_batches = (
-                [frames]
+                _split_frame_batch(frames, ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE)
                 if _is_encoded_preview_transport(
                     content_type=content_type,
                     output_format=output_format,
