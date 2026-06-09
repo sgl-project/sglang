@@ -1654,11 +1654,16 @@ def select_experts(
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        if scoring_func == "sqrtsoftplus":
+        # ``sigmoid`` is routed through the JIT/Triton fused gate
+        # (biased_topk_jit_kernel_impl -> moe_fused_gate) only when the flag is
+        # on; otherwise it falls through to fused_topk -> topk_sigmoid (the
+        # historical path), keeping flag-off behavior byte-identical.
+        use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+        if scoring_func == "sqrtsoftplus" or (
+            scoring_func == "sigmoid" and use_jit_fused_gate
+        ):
             _biased_topk = (
-                biased_topk_jit_kernel_impl
-                if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
-                else biased_topk_impl
+                biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
             )
 
             topk_weights, topk_ids = _biased_topk(

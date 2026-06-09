@@ -940,6 +940,21 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
+        # KV cache memory layout. NHD (default): [num_pages, page_size, head_num,
+        # head_dim] (slot-major, i.e. buffer shape [size, head_num, head_dim]). HND
+        # (SGLANG_USE_HND_KVCACHE): [num_pages, head_num, page_size, head_dim], which
+        # paged backends (trtllm_mha) consume directly and which lets a (page, head)
+        # pair be folded into one paged index for per-kv-head sparse page tables.
+        self.use_hnd = envs.SGLANG_USE_HND_KVCACHE.get()
+        if self.use_hnd:
+            total_slots = self.size + self.page_size
+            assert total_slots % self.page_size == 0, (
+                f"HND KV cache needs (size+page_size) divisible by page_size, got "
+                f"size={self.size}, page_size={self.page_size}"
+            )
+            self.num_pages = total_slots // self.page_size
+        self.kv_cache_layout = "HND" if self.use_hnd else "NHD"
+
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -951,7 +966,9 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
-        if enable_kv_cache_copy:
+        if enable_kv_cache_copy and not self.use_hnd:
+            # The tiled byte copy assumes NHD slot-rows; HND uses a (page, off)
+            # gather in move_kv_cache instead, so skip the slot-row copy config.
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
@@ -1021,22 +1038,36 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                # NHD: [size, head_num, head_dim] = [num_pages, page_size, head_num,
+                # head_dim]; HND: [num_pages, head_num, page_size, head_dim] for each
+                # layer. The padded page (slot 0's page) absorbs dummy padded-token
+                # writes.
+                if self.use_hnd:
+                    k_shape = (
+                        self.num_pages,
+                        self.head_num,
+                        self.page_size,
+                        self.head_dim,
                     )
+                    v_shape = (
+                        self.num_pages,
+                        self.head_num,
+                        self.page_size,
+                        self.v_head_dim,
+                    )
+                else:
+                    k_shape = (self.size + self.page_size, self.head_num, self.head_dim)
+                    v_shape = (
+                        self.size + self.page_size,
+                        self.head_num,
+                        self.v_head_dim,
+                    )
+                self.k_buffer = [
+                    torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
                     for _ in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
+                    torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
                     for _ in range(self.layer_num)
                 ]
 
@@ -1076,6 +1107,10 @@ class MHATokenToKVPool(KVCache):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        assert not self.use_hnd, (
+            "PD-disaggregation KV transfer assumes NHD slot-row layout; "
+            "HND KV cache (SGLANG_USE_HND_KVCACHE) is not supported with disagg yet."
+        )
         # layer_num x [seq_len, head_num, head_dim]
         # layer_num x [page_num, page_size, head_num, head_dim]
         kv_data_ptrs = [
@@ -1102,6 +1137,10 @@ class MHATokenToKVPool(KVCache):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        assert not self.use_hnd, (
+            "CPU KV offload indexes by slot (NHD); HND KV cache "
+            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
+        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -1120,6 +1159,10 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        assert not self.use_hnd, (
+            "CPU KV offload indexes by slot (NHD); HND KV cache "
+            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
+        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1190,6 +1233,17 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
+        if self.use_hnd:
+            # HND buffer [num_pages, head_num, page_size, head_dim]: a slot is at
+            # [page, :, off, :], not a contiguous row, so scatter by (page, off).
+            k_buf = self.k_buffer[layer_id - self.start_layer]
+            v_buf = self.v_buffer[layer_id - self.start_layer]
+            pages = loc // self.page_size
+            offs = loc % self.page_size
+            k_buf[pages, :, offs, :] = cache_k
+            v_buf[pages, :, offs, :] = cache_v
+            return
+
         _set_kv_buffer_impl(
             cache_k,
             cache_v,
@@ -1212,6 +1266,14 @@ class MHATokenToKVPool(KVCache):
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
+        if self.use_hnd:
+            pages_t, offs_t = tgt_loc // self.page_size, tgt_loc % self.page_size
+            pages_s, offs_s = src_loc // self.page_size, src_loc % self.page_size
+            for kb, vb in zip(self.k_buffer, self.v_buffer):
+                kb[pages_t, :, offs_t, :] = kb[pages_s, :, offs_s, :]
+                vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
+            return
 
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
@@ -1281,6 +1343,10 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
     """
 
     def _create_buffers(self):
+        # No-op pool keeps tiny NHD placeholders regardless of SGLANG_USE_HND_KVCACHE
+        # (no real KV is stored), so force NHD here to keep the store/move fast paths.
+        self.use_hnd = False
+        self.kv_cache_layout = "NHD"
         # Allocate minimal placeholder buffers. They exist purely so that code
         # paths holding `k_buffer` / `v_buffer` references (pointer tables,
         # layer-transfer counters, stride arithmetic) keep working without
@@ -2684,6 +2750,86 @@ class MiniMaxSparseKVPool(KVCache):
         if sub_pool.store_dtype != sub_pool.dtype:
             cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
         sub_pool.k_buffer[mapped_id][loc] = cache_idx_k
+
+    def _can_fuse_kv_index_store(
+        self,
+        index_pool: "MHATokenToKVPool",
+        cache_k: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+    ) -> bool:
+        """Fast-path precondition: CUDA, no per-store quantization, and a single
+        head byte size shared by the main and index caches (see
+        ``set_fused_kv_index_buffer``)."""
+        main = self.main_pool
+        return (
+            envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
+            and _is_cuda
+            # No dtype conversion / fp8 scaling on either side (the fused kernel
+            # is a raw byte copy, it does not quantize).
+            and main.store_dtype == main.dtype
+            and index_pool.store_dtype == index_pool.dtype
+            and cache_k.dtype == main.dtype
+            and cache_idx_k.dtype == index_pool.dtype
+            # Uniform head byte size collapses head_dim + dtype into one constant.
+            and main.dtype == index_pool.dtype
+            and main.head_dim == index_pool.head_dim
+            # 128-bit vector copy requires a 16-byte-aligned head size.
+            and (main.head_dim * main.dtype.itemsize) % 16 == 0
+        )
+
+    def set_fused_kv_index_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+        cache_idx_v: Optional[torch.Tensor],
+    ) -> None:
+        """Store main K/V + index K (+ optional index V) for a sparse layer.
+
+        When enabled and applicable, writes all caches in one fused JIT launch;
+        otherwise falls back to the separate ``set_kv_buffer`` /
+        ``set_index_k_buffer`` / ``set_index_kv_buffer`` calls. ``cache_idx_v``
+        is None for value-disabled (block-selector) layers.
+        """
+        disable_value = cache_idx_v is None
+        index_pool = self.index_k_pool if disable_value else self.index_kv_pool
+
+        if index_pool is not None and self._can_fuse_kv_index_store(
+            index_pool, cache_k, cache_idx_k
+        ):
+            from sglang.jit_kernel.minimax_store_kv_index import store_kv_index
+
+            main = self.main_pool
+            head_bytes = main.head_dim * main.dtype.itemsize
+            if disable_value:
+                idx_k_cache = self.get_index_k_buffer(layer.layer_id).flatten(1)
+                idx_v_cache = None
+            else:
+                ik, iv = self.get_index_kv_buffer(layer.layer_id)
+                idx_k_cache, idx_v_cache = ik.flatten(1), iv.flatten(1)
+            store_kv_index(
+                cache_k.flatten(1),
+                cache_v.flatten(1),
+                main.get_key_buffer(layer.layer_id).flatten(1),
+                main.get_value_buffer(layer.layer_id).flatten(1),
+                cache_idx_k.flatten(1),
+                idx_k_cache,
+                None if disable_value else cache_idx_v.flatten(1),
+                idx_v_cache,
+                loc,
+                num_kv_heads=main.head_num,
+                head_bytes=head_bytes,
+            )
+            return
+
+        # Fallback: separate stores (identical semantics).
+        self.set_kv_buffer(layer, loc, cache_k, cache_v)
+        if disable_value:
+            self.set_index_k_buffer(layer, loc, cache_idx_k)
+        else:
+            self.set_index_kv_buffer(layer, loc, cache_idx_k, cache_idx_v)
 
     def get_kv_size_bytes(self):
         sub_pools = [self.main_pool, self.index_kv_pool, self.index_k_pool]

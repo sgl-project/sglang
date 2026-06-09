@@ -1,6 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -114,9 +114,13 @@ def minimax_sparse_decode(
     idx_sm_scale: Optional[float] = None,
     score_type: str = "max",
     disable_index_value: bool = False,
-):
-    # Step 1: Flash decode with topk index (using index head)
-    idx_o, topk_idx = flash_decode_with_topk_idx(
+    dense_main_attn_fn: Optional[Callable] = None,
+    page_size: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Step 1: Flash decode with topk index (using index head). When the dense main
+    # attention is used, the indexer emits the page table directly (fused
+    # transform) instead of block ids, plus the per-query effective KV length.
+    idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
         q=idx_q,
         sink=idx_sink,
         k_cache=idx_k_cache,
@@ -132,26 +136,35 @@ def minimax_sparse_decode(
         sm_scale=idx_sm_scale,
         score_type=score_type,
         disable_index_value=disable_index_value,
+        use_dense_main_attn=dense_main_attn_fn is not None,
+        page_size=page_size,
     )
-    # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
     idx_group_size = num_idx_heads // num_kv_heads
-    if idx_group_size > 1:
-        topk_idx = topk_index_reduce(
-            topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+    if dense_main_attn_fn is not None:
+        # topk_idx is the page table; real_seq_lens is the per-query cache_seqlens
+        assert idx_group_size == 1
+        o = dense_main_attn_fn(q, topk_idx, real_seq_lens)
+    else:
+        # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
+        if idx_group_size > 1:
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+            )
+        # Step 3: Sparse attention using topk index (main head). main_attn_fn, when
+        # provided, replaces the custom kernel with a dense paged backend driven by a
+        # per-query page table gathered from topk_idx (see MiniMaxSparseAttnBackend).
+        o = flash_decode_with_gqa_share_sparse(
+            q=q,
+            sink=sink,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            slot_ids=slot_ids,
+            block_size=block_size_k,
+            topk_idx=topk_idx,
+            sm_scale=sm_scale,
         )
-    # Step 3: Sparse attention using topk index (main head)
-    o = flash_decode_with_gqa_share_sparse(
-        q=q,
-        sink=sink,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        req_to_token=req_to_token,
-        seq_lens=seq_lens,
-        slot_ids=slot_ids,
-        block_size=block_size_k,
-        topk_idx=topk_idx,
-        sm_scale=sm_scale,
-    )
     return idx_o, o

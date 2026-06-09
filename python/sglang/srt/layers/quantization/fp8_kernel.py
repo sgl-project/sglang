@@ -537,9 +537,32 @@ def sglang_per_token_group_quant_fp8(
     if enable_v2 is None:
         enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
 
+    # Optimized JIT kernel for the plain (no silu-fuse, no masked-layout) path;
+    # byte-identical to AOT v2 but faster. silu/masked variants stay on AOT v2.
+    from sglang.srt.environ import envs
+
+    use_jit_quant = (
+        envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get()
+        and not fuse_silu_and_mul
+        and masked_m is None
+        and x.dim() == 2
+        and group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+    )
+
     if x.shape[0] > 0:
         # Temporary
-        if enable_sgl_per_token_group_quant_8bit:
+        if use_jit_quant:
+            sgl_per_token_group_quant_8bit_jit(
+                input=x,
+                output_q=x_q,
+                output_s=x_s,
+                group_size=group_size,
+                eps=eps,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=scale_ue8m0,
+            )
+        elif enable_sgl_per_token_group_quant_8bit:
             if enable_v2:
                 sgl_per_token_group_quant_8bit(
                     x,

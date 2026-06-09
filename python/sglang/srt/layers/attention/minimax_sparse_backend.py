@@ -27,10 +27,10 @@ logger = logging.getLogger(__name__)
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: "ModelRunner"):
-
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.kv_pool = runner.token_to_kv_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token
+        self.max_context_len = int(runner.model_config.context_len)
 
         hf_config = runner.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(hf_config)
@@ -68,6 +68,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
 
+        from sglang.srt.environ import envs
+
+        self.page_size = self.kv_pool.page_size
+        self.use_dense_sparse_decode = (
+            envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
+            and self.block_size_k % self.page_size == 0
+        )
+        # The page table + effective KV length are allocated and returned by the
+        # fused decode top-k kernel each layer, so the backend keeps no metadata.
+        self.dense_backend: Optional[AttentionBackend] = None
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
@@ -88,7 +99,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
-        self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        if in_capture and forward_batch.forward_mode.is_decode_or_idle():
+            self._max_seqlen_k = self.max_context_len
+        else:
+            self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         pass
@@ -139,25 +153,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_v: Optional[torch.Tensor],
     ):
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        self.kv_pool.set_kv_buffer(
+        self.kv_pool.set_fused_kv_index_buffer(
             layer,
             forward_batch.out_cache_loc,
             k,
             v,
+            idx_k,
+            None if disable_value else idx_v,
         )
-        if disable_value:
-            self.kv_pool.set_index_k_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                idx_k,
-            )
-        else:
-            self.kv_pool.set_index_kv_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                idx_k,
-                idx_v,
-            )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
@@ -241,6 +244,42 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             o.reshape(original_num_tokens, -1).contiguous(),
         )
 
+    def _dense_sparse_main_decode(
+        self,
+        q: torch.Tensor,  # [bs, num_q_heads, head_dim]
+        page_table: torch.Tensor,  # [bs, max_sparse_pages] int32 (from the indexer)
+        real_seq_lens: torch.Tensor,  # [bs] int32, effective KV length per query
+        k_cache: torch.Tensor,  # [max_slots, 1, head_dim]
+        v_cache: torch.Tensor,  # [max_slots, 1, head_dim]
+        layer,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        if isinstance(self.dense_backend, TRTLLMHAAttnBackend):
+            import flashinfer
+
+            ps = self.page_size
+            nkv = 1
+            head_dim = q.size(-1)
+            # [max_slots, nkv, D] -> [num_pages, page_size, nkv, D]
+            #                     -> [num_pages, nkv, page_size, D] (HND, trtllm default)
+            kc = k_cache.view(-1, ps, nkv, head_dim).permute(0, 2, 1, 3)
+            vc = v_cache.view(-1, ps, nkv, head_dim).permute(0, 2, 1, 3)
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(  # type: ignore
+                query=q.contiguous(),
+                kv_cache=(kc, vc),
+                workspace_buffer=self.dense_backend.workspace_buffer,
+                block_tables=page_table,
+                seq_lens=real_seq_lens,
+                max_seq_len=self.topk_blocks * self.block_size_k,
+                bmm1_scale=layer.scaling,
+                bmm2_scale=1.0,
+            )
+        raise NotImplementedError(
+            "dense sparse decode currently supports trtllm_mha only (fa3 is TODO)"
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -253,33 +292,36 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_q: torch.Tensor,
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
+        **kwargs,
     ):
+        assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        self.kv_pool.set_kv_buffer(
+        self.kv_pool.set_fused_kv_index_buffer(
             layer,
             forward_batch.out_cache_loc,
             k,
             v,
+            idx_k,
+            None if disable_value else idx_v,
         )
-        if disable_value:
-            self.kv_pool.set_index_k_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                idx_k,
-            )
-        else:
-            self.kv_pool.set_index_kv_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                idx_k,
-                idx_v,
-            )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
+
+        attn_fn = None
+        if self.use_dense_sparse_decode and k_cache.shape[1] == 1:
+            attn_fn = lambda main_q, page_table, real_seq_lens: self._dense_sparse_main_decode(
+                main_q,
+                page_table,
+                real_seq_lens,
+                k_cache,
+                v_cache,
+                layer,
+                forward_batch,
+            )
 
         idx_o, o = minimax_sparse_decode(
             q,
@@ -301,6 +343,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.local_blocks,
             score_type=self.score_type,
             disable_index_value=disable_value,
+            dense_main_attn_fn=attn_fn,
+            page_size=self.page_size,
         )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
@@ -320,6 +364,8 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.dense = dense_backend
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
+        # Let the sparse decode reuse the dense paged backend (page table + workspace).
+        self.sparse.dense_backend = dense_backend
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.

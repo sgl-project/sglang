@@ -478,7 +478,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     grp=num_groups,
                 )
 
-        # Act
+        # Act.
+        # For the standard-dispatch (TP) mxfp8+swigluoai path, the activation can
+        # emit the packed-UE8M0 MN-major scale directly (fused transpose/pack); we
+        # pass num_real_tokens so it can launch topk work-blocks per real token.
+        # topk_ids is [num_real_tokens, top_k] for standard dispatch (gated on
+        # src2dst, which only that path sets). num_real_tokens also doubles as the
+        # enable-flag for the fused-pack path: only the mxfp8 (1,32)+ue8m0 recipe
+        # consumes the packed MN-major scale, so non-mxfp8 paths pass None.
+        topk_ids_rs = running_state.get("topk_ids")
+        num_real_tokens = (
+            topk_ids_rs.shape[0]
+            if (
+                use_mxfp8
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and topk_ids_rs is not None
+                and "src2dst" in running_state
+            )
+            else None
+        )
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
             gateup_output,
             masked_m,
@@ -488,6 +506,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swizzle=self.use_swizzle,
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+            num_real_tokens=num_real_tokens,
         )
         del gateup_output
 
@@ -501,7 +520,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if use_mxfp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if (
+            use_mxfp8
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and down_input_scale.dtype != torch.int32
+        ):
+            # Already-packed int32 (from the fused-pack activation above) skips this.
             import deep_gemm.utils.layout
 
             down_input_scale = (
@@ -691,7 +715,7 @@ def post_permute_deep_gemm_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+    from sglang.srt.environ import envs
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states_shape = running_state["hidden_states_shape"]
@@ -704,21 +728,44 @@ def post_permute_deep_gemm_to_standard(
     output = torch.empty(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
-    post_reorder_triton_kernel[(hidden_states_shape[0],)](
-        runner_output.hidden_states,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        runner_config.top_k,
-        hidden_states_shape[1],
-        BLOCK_SIZE=512,
-    )
+    if envs.SGLANG_OPT_USE_FUSED_DEEPGEMM_POST_REORDER.get():
+        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_deepgemm
 
-    dispose_tensor(runner_output.hidden_states)
+        # Fused 2-D-grid + fp32 accumulation + routed_scaling_factor folded in.
+        post_reorder_deepgemm(
+            runner_output.hidden_states,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            hidden_states_shape[0],
+            hidden_states_shape[1],
+            (
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+        )
+        dispose_tensor(runner_output.hidden_states)
+    else:
+        from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
 
-    if runner_config.routed_scaling_factor is not None:
-        output *= runner_config.routed_scaling_factor
+        post_reorder_triton_kernel[(hidden_states_shape[0],)](
+            runner_output.hidden_states,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            hidden_states_shape[1],
+            BLOCK_SIZE=512,
+        )
+
+        dispose_tensor(runner_output.hidden_states)
+
+        if runner_config.routed_scaling_factor is not None:
+            output *= runner_config.routed_scaling_factor
 
     return StandardCombineInput(
         hidden_states=output,
@@ -901,6 +948,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     swizzle: bool = False,
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
+    num_real_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
     from sglang.srt.layers.quantization.fp8_kernel import (
@@ -936,6 +984,46 @@ def _varlen_deep_gemm_silu_mul_quant(
     D = D_2 // 2
     del D_2
     G = D // group_size
+
+    # Fused swiglu+mul+quant + UE8M0 transpose/pack: when the activation is
+    # swigluoai (gemm1_alpha) on the ue8m0 standard-dispatch path, emit the packed
+    # int32 MN-major scale directly so GroupGemm-1 skips
+    # get_mn_major_tma_aligned_packed_ue8m0_tensor. Needs 4 groups per packed int32.
+    if (
+        gemm1_alpha is not None
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and num_real_tokens is not None
+        and G % 4 == 0
+        and D % (group_size * 4) == 0
+    ):
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_post_quant_packed_fwd,
+        )
+
+        assert (
+            swiglu_limit is None
+        ), "swiglu_limit and gemm1_alpha are mutually exclusive"
+        assert not swizzle, "swizzle is not supported with gemm1_alpha"
+        down_input = torch.empty(
+            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+        )
+        # Physical [E, G//4, m_max]; the GEMM consumes its .transpose(-1,-2) view.
+        down_input_scale_packed = torch.empty(
+            (E, G // 4, N), device=hidden_states_device, dtype=torch.int32
+        )
+        silu_and_mul_masked_post_quant_packed_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale_packed,
+            group_size,
+            masked_m,
+            num_real_tokens=num_real_tokens,
+            topk=topk,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+        )
+        return down_input, down_input_scale_packed.transpose(-1, -2)
+
     down_input = torch.empty(
         (E, N, D),
         device=hidden_states_device,

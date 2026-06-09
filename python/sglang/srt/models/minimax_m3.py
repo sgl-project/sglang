@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
@@ -50,7 +51,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -150,6 +150,70 @@ class MultiHeadRMSNorm(nn.Module):
             x = x * self.weight[None, ...]
         x = x.view(-1, self.num_heads_per_tp * self.head_dim)
         return x.to(orig_dtype)
+
+
+class _FusedQKVIndexProj(nn.Module):
+    """One GEMM for the main ``qkv_proj`` and the sparse ``index_qkv_proj``.
+
+    Both projections consume the same hidden input, so their weights are
+    concatenated along the output dim (and, for mxfp8, their raw UE8M0 scales)
+    and run through the *shared* quant_method once: the activation is quantized
+    a single time and one matmul produces ``[q | k | v | idx_q | idx_k (| idx_v)]``.
+
+    This is built after weight loading from the two already-loaded linears. The
+    raw fp8 weight + uint8 scale are final right after ``load_weights`` (the
+    mxfp8 ``process_weights_after_loading`` only *derives* the packed deep_gemm
+    scale, it does not mutate the raw tensors), so the build needs no separate
+    post-process hook; the backend scale layout is derived here once.
+
+    Only the unquantized bf16 path and mxfp8 are supported as a single concat
+    GEMM; other quant methods make the caller fall back to two GEMMs.
+    """
+
+    def __init__(
+        self,
+        quant_method,
+        weight: torch.Tensor,
+        weight_scale_inv: Optional[torch.Tensor],
+        input_size_per_partition: int,
+        logical_widths: List[int],
+        orig_dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        # Stored as ``_qm`` (not ``quant_method``) so the model loader's
+        # post-process loop -- which keys off a ``quant_method`` attribute --
+        # skips this module: its scale layout is already finalized below.
+        self._qm = quant_method
+        self.register_parameter("weight", nn.Parameter(weight, requires_grad=False))
+        self.input_size_per_partition = input_size_per_partition
+        self.output_size_per_partition = weight.shape[0]
+        self.logical_widths = logical_widths
+        self.orig_dtype = orig_dtype
+        self.input_scale = None
+        if weight_scale_inv is not None:
+            self.register_parameter(
+                "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
+            )
+            self.weight_scale_inv.format_ue8m0 = True
+            # Derive the backend scale layout (deep_gemm packed / swizzled) once,
+            # exactly as process_weights_after_loading would for a real linear.
+            quant_method._process_mxfp8_linear_weight_scale(self)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._qm.apply(self, x, None)
+
+
+def build_minimax_fused_qkv_index(model: nn.Module) -> None:
+    """Build the fused qkv+index GEMM for every sparse MiniMax-M3 attention.
+
+    Called at the end of ``load_weights`` (before the loader's per-module
+    ``process_weights_after_loading`` pass and before CUDA graph capture). A
+    no-op for layers where the fusion is disabled or the quant method is
+    unsupported (those keep the two separate projections).
+    """
+    for module in model.modules():
+        if isinstance(module, MiniMaxM3Attention):
+            module.maybe_build_fused_qkv_index()
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -301,11 +365,12 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.shared_experts = None
 
+        self.bf16_router_gemm = envs.SGLANG_OPT_USE_BF16_ROUTER_GEMM.get()
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16 if self.bf16_router_gemm else torch.float32,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
@@ -343,7 +408,7 @@ class MiniMaxM3MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            router_logits = self._compute_router_logits(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
         else:
             shared_output = None
@@ -364,7 +429,7 @@ class MiniMaxM3MoE(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            router_logits = self._compute_router_logits(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -385,6 +450,14 @@ class MiniMaxM3MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
+
+    def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.bf16_router_gemm:
+            return torch.mm(
+                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+            )
+        router_logits, _ = self.gate(hidden_states.to(torch.float32))
+        return router_logits
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
@@ -528,41 +601,31 @@ class MiniMaxM3Attention(nn.Module):
         # when this layer is sparse so dense layers / dense models stay
         # parameter-identical to the original implementation.
         if self.is_sparse_attention_layer:
-            # Always use Column/RowParallel for index_q_proj / index_o_proj
-            # along the idx-head TP group. When idx_replica_size > 1 (i.e.
-            # total_idx_heads < attn_tp_size), multiple ranks in a replica
-            # group load the same per-head weight slice (GQA-style); the
-            # double-count introduced by the layer-level all-reduce is
-            # compensated by dividing idx_o by idx_replica_size in
-            # forward_core (quantization-safe runtime scaling).
-            self.index_q_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.total_idx_heads * self.idx_head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("index_q_proj", prefix),
-                tp_rank=self.idx_head_rank,
-                tp_size=self.idx_head_tp_size,
-            )
-            self.index_k_proj = ReplicatedLinear(
+            # Index q (total_idx_heads heads) + a single replicated k/v head have
+            # GQA-with-one-kv-head structure, so they merge into one
+            # QKVParallelLinear: q sharded across the idx-head TP group, k/v
+            # replicated. The shard placement matches a separate ColumnParallel(q)
+            # + Replicated(k/v), so it stays correct under TP / DP-attn / PP / EP.
+            # Checkpoints store the three separately; restacked at load (see
+            # load_weights). Value-disabled layers have no v (v_head_size == 0).
+            self.index_qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.idx_head_dim,
+                self.total_idx_heads,
+                total_num_kv_heads=1,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("index_k_proj", prefix),
+                v_head_size=(0 if self.disable_index_value else self.idx_head_dim),
+                tp_rank=self.idx_head_rank,
+                tp_size=self.idx_head_tp_size,
+                prefix=add_prefix("index_qkv_proj", prefix),
             )
 
+            # Output projection for the index value path; independent of the
+            # fused vs unfused input projection above.
             if self.disable_index_value:
-                self.index_v_proj = None
                 self.index_o_proj = None
             else:
-                self.index_v_proj = ReplicatedLinear(
-                    self.hidden_size,
-                    self.idx_head_dim,
-                    bias=False,
-                    quant_config=quant_config,
-                    prefix=add_prefix("index_v_proj", prefix),
-                )
                 self.index_o_proj = RowParallelLinear(
                     self.total_idx_heads * self.idx_head_dim,
                     self.hidden_size,
@@ -641,6 +704,57 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+
+        # Fused GemmaRMSNorm + partial NeoX RoPE (minimax_qknorm_rope) is a CUDA
+        # JIT kernel, valid only for the exact verified config: per-head gemma
+        # norm, head_dim=128, rotary_dim=64 (so rotary_dim/2 == warpSize), NeoX
+        # style, no output gate. Everything else (incl. ROCm) falls back to the
+        # _qk_norm_rope path. The fp32 cos_sin_cache requirement is re-checked at
+        # call time.
+        self._use_fused_qknorm_rope = (
+            _is_cuda
+            and envs.SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE.get()
+            and self.qk_norm_type == "per_head"
+            and self.use_gemma_norm
+            and self.head_dim == 128
+            and self.rotary_dim == 64
+            and not self.attention_output_gate
+            and getattr(self.rotary_emb, "is_neox_style", False)
+        )
+
+        # Fuse the main qkv_proj and the sparse index_qkv_proj into one GEMM
+        # (both project the same hidden input). Built after weight load via
+        # maybe_build_fused_qkv_index(); falls back to two GEMMs when the quant
+        # method does not support a safe output-dim concat (only unquantized
+        # bf16 and mxfp8 are fused; anything else keeps the two projections).
+        self._fuse_qkv_index_enabled = self.is_sparse_attention_layer and _is_cuda
+        self._fused_qkv_index = None
+        # Per-token main width (q | k | v), in elements; index columns follow it
+        # in the fused output. Sparse layers never use the attention output gate.
+        self._fused_main_size = self.q_size + 2 * self.kv_size
+
+        # A single combined GemmaRMSNorm+RoPE launch over the fused output (main
+        # Q/K + index Q/K) is valid under the same conditions as the main fused
+        # qknorm, plus a 128-dim index head and an fp32 rotary cache (the index
+        # branch reuses the main rotary_emb). The V / index-V heads are skipped.
+        self._combined_qknorm_ok = (
+            self.is_sparse_attention_layer
+            and self._use_fused_qknorm_rope
+            and self.idx_head_dim == 128
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+        )
+        if self.is_sparse_attention_layer:
+            # (head_offset, head_count) of each normed group in the fused output,
+            # in head units (head_dim == idx_head_dim == 128 -> a uniform grid):
+            # q | k | v | idx_q | idx_k (| idx_v). v and idx_v are not groups.
+            off_iq = self.num_heads + 2 * self.num_kv_heads
+            off_ik = off_iq + self.num_idx_heads
+            self._qknorm_group_meta = (
+                (0, self.num_heads),
+                (self.num_heads, self.num_kv_heads),
+                (off_iq, self.num_idx_heads),
+                (off_ik, 1),
+            )
 
     def _can_use_rocm_qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
@@ -748,13 +862,126 @@ class MiniMaxM3Attention(nn.Module):
         idx_k = self.index_k_norm(idx_k).reshape(idx_k_shape)
         return idx_q, idx_k
 
+    def _split_index_qkv(
+        self, idx_qkv: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        # Split the fused index projection output into per-rank q (num_idx_heads
+        # heads), the single replicated k head, and (when enabled) the single v
+        # head. The slices are views; downstream norm/rope and the reshape in
+        # forward_core handle the (non-)contiguity.
+        q_size = self.num_idx_heads * self.idx_head_dim
+        if self.disable_index_value:
+            idx_q, idx_k = idx_qkv.split([q_size, self.idx_head_dim], dim=-1)
+            idx_v = None
+        else:
+            idx_q, idx_k, idx_v = idx_qkv.split(
+                [q_size, self.idx_head_dim, self.idx_head_dim], dim=-1
+            )
+        return idx_q, idx_k, idx_v
+
+    def maybe_build_fused_qkv_index(self) -> None:
+        """Build the single-GEMM fused qkv+index projection (idempotent).
+
+        Concatenates the main ``qkv_proj`` and the sparse ``index_qkv_proj``
+        weights (and, for mxfp8, raw UE8M0 scales) along the output dim and
+        wraps them in a :class:`_FusedQKVIndexProj`. The two source projections'
+        large tensors are freed and their ``quant_method`` dropped, so the
+        loader's post-process loop skips them and no extra weight memory is
+        held. A no-op (keeps the two separate GEMMs) when disabled or when the
+        quant method is not a supported output-dim concat.
+        """
+        if not self._fuse_qkv_index_enabled or self._fused_qkv_index is not None:
+            return
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qp, ip = self.qkv_proj, self.index_qkv_proj
+        qm = qp.quant_method
+        # Both projections must share the same quant method/layout to concat.
+        if type(ip.quant_method) is not type(qm):
+            return
+
+        weight = torch.cat([qp.weight.data, ip.weight.data], dim=0).contiguous()
+        if isinstance(qm, UnquantizedLinearMethod):
+            scale = None
+        elif getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv"):
+            scale = torch.cat(
+                [qp.weight_scale_inv.data, ip.weight_scale_inv.data], dim=0
+            ).contiguous()
+        else:
+            # Unsupported quant (e.g. non-mxfp8 fp8 block) -> keep two GEMMs.
+            return
+
+        # input_size_per_partition / orig_dtype are set by the quant method's
+        # create_weights (fp8) but not by UnquantizedLinearMethod; fall back to
+        # the always-present linear attrs (input isn't sharded for column TP).
+        holder = _FusedQKVIndexProj(
+            qm,
+            weight,
+            scale,
+            getattr(qp, "input_size_per_partition", qp.input_size),
+            [qp.output_size_per_partition, ip.output_size_per_partition],
+            getattr(qp, "orig_dtype", qp.params_dtype),
+        )
+        self.add_module("fused_qkv_index_proj", holder)
+        self._fused_qkv_index = holder
+
+        # Reclaim the originals: free their data and drop quant_method so the
+        # loader's post-process loop ignores them (the separate GEMMs are dead).
+        for m in (qp, ip):
+            m.quant_method = None
+            for attr in ("weight", "weight_scale_inv"):
+                p = getattr(m, attr, None)
+                if isinstance(p, nn.Parameter):
+                    p.data = torch.empty(0, dtype=p.dtype, device=p.data.device)
+
+    def _qknorm_groups(self):
+        # (norm weight, head offset, head count) for the combined qknorm+rope
+        # over the fused output: main Q, main K, index Q, index K.
+        weights = (
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+        )
+        return [
+            (w, off, cnt) for w, (off, cnt) in zip(weights, self._qknorm_group_meta)
+        ]
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
+        # Single fused GEMM for main qkv + sparse index qkv when available;
+        # otherwise the standalone main qkv_proj (index is projected below).
+        fused_out = None
+        if self._fused_qkv_index is not None:
+            fused_out = self.fused_qkv_index_proj(hidden_states)
+            qkv = fused_out[:, : self._fused_main_size]
+
+            # Combined main+index GemmaRMSNorm + partial NeoX RoPE in one launch
+            # over the whole fused tensor (q, k, idx_q, idx_k groups; v / idx_v
+            # left untouched), then split both branches out of the fused buffer.
+            if self._combined_qknorm_ok:
+                from sglang.jit_kernel.minimax_qknorm_rope import (
+                    minimax_qknorm_rope_grouped,
+                )
+
+                minimax_qknorm_rope_grouped(
+                    fused_out,
+                    self._qknorm_groups(),
+                    self.rotary_emb.cos_sin_cache,
+                    positions,
+                    self.q_norm.variance_epsilon,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                idx_qkv = fused_out[:, self._fused_main_size :]
+                idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                inner_state = (q, k, v, None, idx_q, idx_k, idx_v, forward_batch)
+                return None, forward_batch, inner_state
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attention_output_gate:
             q_gate, k, v = qkv.split(
@@ -768,20 +995,64 @@ class MiniMaxM3Attention(nn.Module):
             gate = q_gate[..., 1::2, :, :]
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
+            q, k = self._qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
+        elif self._use_fused_qknorm_rope:
+            # Fused per-head GemmaRMSNorm + partial NeoX RoPE, in place on qkv.
+            from sglang.jit_kernel.minimax_qknorm_rope import minimax_qknorm_rope
+
+            minimax_qknorm_rope(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.q_norm.variance_epsilon,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
-
-        q, k = self._qk_norm_rope(positions, q, k)
+            q, k = self._qk_norm_rope(positions, q, k)
 
         if self.is_sparse_attention_layer:
-            idx_q, _ = self.index_q_proj(hidden_states)
-            idx_k, _ = self.index_k_proj(hidden_states)
-            if self.disable_index_value:
-                idx_v = None
+            use_fused_norm_rope = (
+                self._use_fused_qknorm_rope
+                and self.idx_head_dim == 128
+                and self.index_rotary_emb.cos_sin_cache.dtype == torch.float32
+            )
+            if fused_out is not None:
+                idx_qkv = fused_out[:, self._fused_main_size :]
             else:
-                idx_v, _ = self.index_v_proj(hidden_states)
-            idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+                idx_qkv, _ = self.index_qkv_proj(hidden_states)
+            if use_fused_norm_rope:
+                # One fused GemmaRMSNorm + partial NeoX RoPE pass over the
+                # whole [q | k | v] tensor: q_weight norms the first
+                # num_idx_heads heads, k_weight norms the single k head,
+                # both get rope; the optional v head is left untouched.
+                from sglang.jit_kernel.minimax_qknorm_rope import (
+                    minimax_qknorm_rope,
+                )
+
+                minimax_qknorm_rope(
+                    idx_qkv,
+                    self.index_q_norm.weight,
+                    self.index_k_norm.weight,
+                    self.index_rotary_emb.cos_sin_cache,
+                    positions,
+                    self.num_idx_heads,
+                    1,
+                    0 if self.disable_index_value else 1,
+                    self.index_q_norm.variance_epsilon,
+                )
+                idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+            else:
+                idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
             inner_state = (q, k, v, gate, idx_q, idx_k, idx_v, forward_batch)
         else:
             inner_state = (q, k, v, gate, forward_batch)
@@ -798,10 +1069,12 @@ class MiniMaxM3Attention(nn.Module):
             q = q.view(q.shape[0], self.num_heads, self.head_dim)
             k = k.view(k.shape[0], self.num_kv_heads, self.head_dim)
             v = v.view(v.shape[0], self.num_kv_heads, self.head_dim)
-            idx_q = idx_q.view(idx_q.shape[0], self.num_idx_heads, self.idx_head_dim)
-            idx_k = idx_k.view(idx_k.shape[0], 1, self.idx_head_dim)
+            # reshape (not view): the index q/k/v are non-contiguous slices of
+            # the single fused index_qkv_proj output tensor.
+            idx_q = idx_q.reshape(idx_q.shape[0], self.num_idx_heads, self.idx_head_dim)
+            idx_k = idx_k.reshape(idx_k.shape[0], 1, self.idx_head_dim)
             if idx_v is not None:
-                idx_v = idx_v.view(idx_v.shape[0], 1, self.idx_head_dim)
+                idx_v = idx_v.reshape(idx_v.shape[0], 1, self.idx_head_dim)
             idx_o, attn_output = self.attn(
                 q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v
             )
@@ -1275,15 +1548,27 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            # Leading "." prevents falsely matching the sparse-attention
-            # ``index_q_proj`` / ``index_k_proj`` / ``index_v_proj`` weights,
-            # which contain ``q_proj`` / ``k_proj`` / ``v_proj`` as substrings.
+            # Leading "." prevents the main qkv mapping from falsely matching
+            # the sparse-attention ``index_q_proj`` / ``index_k_proj`` /
+            # ``index_v_proj`` weights, which contain ``q_proj`` / ``k_proj`` /
+            # ``v_proj`` as substrings (those are remapped separately below).
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
+
+        # Sparse models merge the index branch q/k/v into one index_qkv_proj
+        # (see MiniMaxM3Attention.__init__), so the checkpoint's separate
+        # index_q/k/v projections are restacked here. Value-disabled layers have
+        # no ".index_v_proj" weight, so that entry never matches.
+        if getattr(self.config, "sparse_attention_config", None) is not None:
+            stacked_params_mapping += [
+                (".index_qkv_proj", ".index_q_proj", "q"),
+                (".index_qkv_proj", ".index_k_proj", "k"),
+                (".index_qkv_proj", ".index_v_proj", "v"),
+            ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1401,6 +1686,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+
+        # Fuse main qkv_proj + sparse index_qkv_proj into one GEMM. The raw fp8
+        # weight + uint8 scale are final at this point (the mxfp8 post-process
+        # only derives the packed scale), so this runs deterministically before
+        # the loader's process pass and CUDA graph capture.
+        build_minimax_fused_qkv_index(self)
         return loaded_params
 
     @classmethod

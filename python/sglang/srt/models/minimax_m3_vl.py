@@ -33,6 +33,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     MiniMaxM3SparseForCausalLM,
+    build_minimax_fused_qkv_index,
     get_spec_layer_idx_from_weight_name,
 )
 from sglang.srt.models.minimax_vl_common import (
@@ -253,6 +254,19 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
+        # Mirror the LLM's fused index projection (see MiniMaxM3.load_weights):
+        # restack the separate index_q/k/v projections into one index_qkv_proj.
+        # The leading "." makes these match only the index_*_proj weights.
+        if (
+            getattr(self.config.text_config, "sparse_attention_config", None)
+            is not None
+        ):
+            llm_stacked_params_mapping += [
+                (".index_qkv_proj", ".index_q_proj", "q"),
+                (".index_qkv_proj", ".index_k_proj", "k"),
+                (".index_qkv_proj", ".index_v_proj", "v"),
+            ]
+
         num_experts = getattr(self.config.text_config, "num_local_experts", 0)
         expert_params_mapping = (
             FusedMoE.make_expert_params_mapping(
@@ -288,6 +302,10 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             )
 
         merge_vit_qkv_weights(vit_qkv_weights, vit_qkv_biases, params_dict)
+
+        # Fuse main qkv_proj + sparse index_qkv_proj into one GEMM per sparse
+        # attention layer (see MiniMaxM3.load_weights for the rationale).
+        build_minimax_fused_qkv_index(self)
 
     def _load_llm_weight(
         self,
