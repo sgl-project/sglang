@@ -292,7 +292,7 @@ def _initialize_model(
     return model_class(**kwargs)
 
 
-def _post_load_weights(model: nn.Module) -> None:
+def post_load_weights(model: nn.Module) -> None:
     # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
     # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
     # would normally do it internally. NextN subclasses override the method to fill in
@@ -1342,7 +1342,7 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            _post_load_weights(model)
+            post_load_weights(model)
 
         return model.eval()
 
@@ -1485,7 +1485,7 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-            _post_load_weights(model)
+            post_load_weights(model)
 
         return model.eval()
 
@@ -2248,7 +2248,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             torch.cuda.synchronize()
 
-            _post_load_weights(model)
+            post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -2311,7 +2311,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        _post_load_weights(model)
+        post_load_weights(model)
 
         return True
 
@@ -2432,7 +2432,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 model, transfer_engine, source_worker, tp_rank
             )
 
-        _post_load_weights(model)
+        post_load_weights(model)
 
         logger.info("ModelExpress: weight transfer complete for tp_rank=%d", tp_rank)
 
@@ -2662,7 +2662,7 @@ class RemoteModelLoader(BaseModelLoader):
         if state_dict:
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-        _post_load_weights(model)
+        post_load_weights(model)
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig

@@ -184,11 +184,23 @@ class RayDataParallelController(DataParallelController):
                     actor = SchedulerActor.options(
                         num_cpus=0,
                         num_gpus=1,
+                        # Allow pull_weights() (RDT) to run while run_event_loop() blocks.
+                        max_concurrency=4,
+                        # Embed the unique http port so the trainer can discover this
+                        # engine's scheduler actors by name without an HTTP round-trip.
                         name=(
                             f"sglang_scheduler_node{self.rank0_node_ip}"
                             f"_dp{actual_dp_rank}_pp{pp_rank}_tp{tp_rank}"
-                            f"_pg{self.pg.id.hex()[:8]}_bundle{bundle_idx}"
+                            f"_port{server_args.port}_pg{self.pg.id.hex()[:8]}_bundle{bundle_idx}"
                         ),
+                        # Detached so the trainer (different Ray job) can discover these
+                        # for RDT pull_weights; killed in RayEngine.shutdown.
+                        lifetime="detached",
+                        # NOSET so the absolute GPU id from get_accelerator_ids() is valid
+                        # (Ray must not remap CUDA_VISIBLE_DEVICES for these actors).
+                        runtime_env={
+                            "env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+                        },
                         scheduling_strategy=PlacementGroupSchedulingStrategy(
                             placement_group=self.pg,
                             placement_group_bundle_index=bundle_idx,
