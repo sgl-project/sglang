@@ -178,7 +178,7 @@ class ScriptedSchedulerHook:
     def on_run_batch(self, batch) -> None:
         if not self._is_driver:
             return
-        chunked = next(iter(self.scheduler.chunked_reqs()), None)
+        chunked = next(iter(self.scheduler.partially_extended_reqs()), None)
         self._batch_log.append(
             ScriptedBatchRecord(
                 forward_iter=batch.forward_iter,

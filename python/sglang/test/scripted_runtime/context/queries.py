@@ -7,13 +7,16 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
+# TODO: scripted runtime still uses chunk-era vocabulary (`_chunked_req`,
+# `is_chunking`, `chunked_rid`). The scheduler concept was renamed to
+# "partially extended"; do a larger scripted-runtime rename pass later to align.
 def _chunked_req(s) -> Optional["Req"]:
-    return next(iter(s.chunked_reqs()), None)
+    return next(iter(s.partially_extended_reqs()), None)
 
 
 def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
     s = ctx.scheduler
-    yield from s.chunked_reqs()
+    yield from s.partially_extended_reqs()
     yield from s.waiting_queue
     if s.ps.pp_size > 1:
         for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
@@ -91,7 +94,7 @@ def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
 
 def is_chunking(ctx: "ScriptedContext", rid: str) -> bool:
     s = ctx.scheduler
-    return any(r.rid == rid for r in s.chunked_reqs())
+    return any(r.rid == rid for r in s.partially_extended_reqs())
 
 
 def status(ctx: "ScriptedContext", rid: str) -> str:

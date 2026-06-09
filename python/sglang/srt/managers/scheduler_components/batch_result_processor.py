@@ -283,8 +283,8 @@ class SchedulerBatchResultProcessor:
                         )
 
                 else:
-                    # being chunked reqs' prefill is not finished
-                    # There is only at most one request being currently chunked.
+                    # being partially-extended reqs' prefill is not finished
+                    # There is only at most one request being currently partially extended.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
@@ -339,7 +339,7 @@ class SchedulerBatchResultProcessor:
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
-                    # being chunked reqs' prefill is not finished
+                    # being partially-extended reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.output_streamer.stream_output(

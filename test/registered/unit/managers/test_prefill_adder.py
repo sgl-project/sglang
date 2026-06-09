@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 from sglang.srt.managers.schedule_batch import (
     Req,
-    _compute_chunked_req_next_prompt_token,
+    _compute_next_extend_prompt_token,
     _compute_is_extend_intermediate,
 )
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -89,7 +89,7 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.finished.return_value = False
-        req.has_pending_chunk = False
+        req.is_partially_extended = False
         req.is_dllm.return_value = False
         req.host_hit_length = 0
         req.needs_host_load_back.return_value = False
@@ -129,20 +129,20 @@ class TestPrefillAdder(CustomTestCase):
             extend_end=600,
         )
 
-        self.assertTrue(req.has_pending_chunk)
+        self.assertTrue(req.is_partially_extended)
         self.assertEqual(req.get_full_untruncated_fill_len(), 805)
         self.assertTrue(
             _compute_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
         )
-        self.assertEqual(_compute_chunked_req_next_prompt_token(req), 600)
+        self.assertEqual(_compute_next_extend_prompt_token(req), 600)
 
         req.extend_range = Range(0, 805)
 
-        self.assertFalse(req.has_pending_chunk)
+        self.assertFalse(req.is_partially_extended)
         self.assertFalse(
             _compute_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
         )
-        self.assertIsNone(_compute_chunked_req_next_prompt_token(req))
+        self.assertIsNone(_compute_next_extend_prompt_token(req))
 
     def test_decoded_req_output_ids_do_not_extend_chunked_prefill_bound(self):
         req = Req.__new__(Req)
@@ -156,7 +156,7 @@ class TestPrefillAdder(CustomTestCase):
         # None and it never counts as having a pending chunk, regardless of how
         # many output_ids have accumulated past the prompt length.
         req.extend_range = None
-        self.assertFalse(req.has_pending_chunk)
+        self.assertFalse(req.is_partially_extended)
 
         # A fresh single-chunk prefill whose extend_range already covers the full
         # prompt (no output yet) is the last chunk: not pending, no next token.
@@ -169,13 +169,13 @@ class TestPrefillAdder(CustomTestCase):
         last_chunk_req.retracted_stain = False
 
         self.assertEqual(last_chunk_req.get_full_untruncated_fill_len(), 128)
-        self.assertFalse(last_chunk_req.has_pending_chunk)
+        self.assertFalse(last_chunk_req.is_partially_extended)
         self.assertFalse(
             _compute_is_extend_intermediate(
                 last_chunk_req, dllm_config=None, forward_mode=None
             )
         )
-        self.assertIsNone(_compute_chunked_req_next_prompt_token(last_chunk_req))
+        self.assertIsNone(_compute_next_extend_prompt_token(last_chunk_req))
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
@@ -465,7 +465,7 @@ class TestPrefillAdder(CustomTestCase):
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
-        result1 = adder.add_first_chunk_req(req1, truncation_align_size=None)
+        result1 = adder.add_first_extend_req(req1, truncation_align_size=None)
 
         self.assertEqual(len(adder.can_run_list), 1)
         self.assertEqual(adder.rem_chunk_tokens, 0)  # 56 - 56
@@ -496,7 +496,7 @@ class TestPrefillAdder(CustomTestCase):
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
-        result2 = adder2.add_first_chunk_req(req2, truncation_align_size=None)
+        result2 = adder2.add_first_extend_req(req2, truncation_align_size=None)
 
         self.assertEqual(len(adder2.can_run_list), 1)
         self.assertEqual(adder2.rem_chunk_tokens, 3)  # 59 - 56 = 3 remaining
@@ -510,7 +510,7 @@ class TestPrefillAdder(CustomTestCase):
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
-        result3 = adder2.add_first_chunk_req(req3, truncation_align_size=None)
+        result3 = adder2.add_first_extend_req(req3, truncation_align_size=None)
 
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0

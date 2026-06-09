@@ -945,8 +945,8 @@ class Scheduler(
             running_rids <= active_rids
         ), f"running not subset of active: {running_rids - active_rids}"
 
-    def chunked_reqs(self) -> List[Req]:
-        return [r for r in self.active_reqs.values() if r.has_pending_chunk]
+    def partially_extended_reqs(self) -> List[Req]:
+        return [r for r in self.active_reqs.values() if r.is_partially_extended]
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1747,7 +1747,7 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
-            get_chunked_reqs=self.chunked_reqs,
+            get_partially_extended_reqs=self.partially_extended_reqs,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
@@ -2404,7 +2404,7 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def stash_chunked_request(self, req: Req):
+    def stash_partially_extended_req(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -2458,15 +2458,15 @@ class Scheduler(
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+                self.stash_partially_extended_req(req)
 
-        for req in self.chunked_reqs():
+        for req in self.partially_extended_reqs():
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A chunk that committed no new KV
             # leaves extend_range.end == len(prefix_indices), so caching would
             # be a no-op; skip it to avoid a wasted insert pass.
             if req.extend_range.end > len(req.prefix_indices):
-                self.stash_chunked_request(req)
+                self.stash_partially_extended_req(req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -2602,23 +2602,23 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        chunked_in_active = self.chunked_reqs()
-        assert len(chunked_in_active) <= 1, (
-            f"single-flight violated: {len(chunked_in_active)} chunked reqs "
-            f"in active ({[r.rid for r in chunked_in_active]})"
+        partially_extended_in_active = self.partially_extended_reqs()
+        assert len(partially_extended_in_active) <= 1, (
+            f"single-flight violated: {len(partially_extended_in_active)} partially-extended reqs "
+            f"in active ({[r.rid for r in partially_extended_in_active]})"
         )
-        chunked_req = chunked_in_active[0] if chunked_in_active else None
+        partially_extended_req = partially_extended_in_active[0] if partially_extended_in_active else None
 
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and chunked_req is None:
+        ) and partially_extended_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)
 
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and chunked_req is None
+            and partially_extended_req is None
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2635,8 +2635,8 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if chunked_req is not None and self.enable_dynamic_chunking:
-            history_len = len(chunked_req.prefix_indices)
+        if partially_extended_req is not None and self.enable_dynamic_chunking:
+            history_len = len(partially_extended_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -2660,9 +2660,9 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
-        if chunked_req is not None:
-            chunked_req.init_next_round_input()
-            adder.add_non_first_chunk_req(chunked_req)
+        if partially_extended_req is not None:
+            partially_extended_req.init_next_round_input()
+            adder.add_resumed_extend_req(partially_extended_req)
 
         if self.enable_lora:
             running_loras = {
@@ -2712,7 +2712,7 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_first_chunk_req(
+            res = adder.add_first_extend_req(
                 req,
                 truncation_align_size=self.truncation_align_size,
             )
@@ -2765,12 +2765,12 @@ class Scheduler(
                 self._deactivate_req(req)
                 self._add_request_to_queue(req)
 
-        chunked_in_batch = [r for r in can_run_list if r.has_pending_chunk]
+        partially_extended_in_batch = [r for r in can_run_list if r.is_partially_extended]
         assert (
-            len(chunked_in_batch) <= 1
-        ), "single-flight invariant: at most one chunked-resume req per batch"
+            len(partially_extended_in_batch) <= 1
+        ), "single-flight invariant: at most one partially-extended req per batch"
         chunk_deduct = (
-            chunked_in_batch[0].extend_range.length if chunked_in_batch else 0
+            partially_extended_in_batch[0].extend_range.length if partially_extended_in_batch else 0
         )
 
         set_time_batch(can_run_list, "set_forward_entry_time")
@@ -2787,7 +2787,7 @@ class Scheduler(
         )
 
         new_batch.contains_last_prefill_chunk = (
-            not chunked_in_batch or len(can_run_list) != 1
+            not partially_extended_in_batch or len(can_run_list) != 1
         )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
@@ -3805,7 +3805,7 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
 
-            retract_reqs = [*self.running_batch.reqs, *self.chunked_reqs()]
+            retract_reqs = [*self.running_batch.reqs, *self.partially_extended_reqs()]
 
             for idx, req in enumerate(retract_reqs):
                 release_req(

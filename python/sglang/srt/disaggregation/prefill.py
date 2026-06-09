@@ -552,7 +552,7 @@ class SchedulerDisaggregationPrefillMixin:
         optimistic_reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
-            if req.pending_bootstrap and not req.has_pending_chunk
+            if req.pending_bootstrap and not req.is_partially_extended
         ]
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -626,7 +626,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     req.grammar.finished = req.finished()
             else:
-                # being chunked reqs' prefill is not finished
+                # being partially-extended reqs' prefill is not finished
 
                 # Overlap deferred release for optimistic requests stopped in process_prefill_chunk
                 if req.pending_bootstrap:
@@ -837,12 +837,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        # The stateless scheduler derives the current chunked req from
-        # chunked_reqs() = active_reqs entries whose has_pending_chunk is True,
-        # and has_pending_chunk ignores req.finished(). An aborted req still
+        # The stateless scheduler derives the current partially-extended req from
+        # partially_extended_reqs() = active_reqs entries whose is_partially_extended is True,
+        # and is_partially_extended ignores req.finished(). An aborted req still
         # sitting in active_reqs with a non-None extend_range would be re-derived
-        # as a chunked req and crash process_prefill_chunk (req_pool_idx=None).
-        # Remove it from active_reqs and clear the chunk state defensively.
+        # as a partially-extended req and crash process_prefill_chunk (req_pool_idx=None).
+        # Remove it from active_reqs and clear the extend state defensively.
         req.extend_range = None
         self._deactivate_req(req)
 
@@ -887,18 +887,18 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     def process_prefill_chunk(self: Scheduler) -> None:
-        chunked_req = next(iter(self.chunked_reqs()), None)
-        if chunked_req is not None:
-            maybe_cache_unfinished_req(chunked_req, self.tree_cache, chunked=True)
-            if self.check_bootstrap(chunked_req):
+        partially_extended_req = next(iter(self.partially_extended_reqs()), None)
+        if partially_extended_req is not None:
+            maybe_cache_unfinished_req(partially_extended_req, self.tree_cache, chunked=True)
+            if self.check_bootstrap(partially_extended_req):
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                    chunked_req.tmp_end_idx = min(
-                        chunked_req.extend_range.end,
-                        len(chunked_req.origin_input_ids),
+                    partially_extended_req.tmp_end_idx = min(
+                        partially_extended_req.extend_range.end,
+                        len(partially_extended_req.origin_input_ids),
                     )
                 else:
-                    self.send_kv_chunk(chunked_req)
+                    self.send_kv_chunk(partially_extended_req)
                 self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1012,9 +1012,9 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
         # reset_for_retract() clears extend_range, but the req is still in
-        # active_reqs. Since the stateless scheduler derives chunked_reqs() from
+        # active_reqs. Since the stateless scheduler derives partially_extended_reqs() from
         # active_reqs, a requeued req that also remains active would be
-        # double-tracked (stale chunked req, load/accounting leak). Deactivate it
+        # double-tracked (stale partially-extended req, load/accounting leak). Deactivate it
         # before re-enqueue; get_next_batch_to_run reactivates it on reschedule.
         self._deactivate_req(req)
         req.output_ids = array("q")

@@ -54,7 +54,7 @@ def _eagle_prefill_tail_tokens(
     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
     from sglang.srt.managers.schedule_batch import (
-        _compute_chunked_req_next_prompt_token,
+        _compute_next_extend_prompt_token,
     )
 
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
@@ -63,7 +63,7 @@ def _eagle_prefill_tail_tokens(
     ):
         if not (is_extend_intermediate and not req.is_dllm()):
             continue
-        next_prompt_token = _compute_chunked_req_next_prompt_token(req)
+        next_prompt_token = _compute_next_extend_prompt_token(req)
         if next_prompt_token is not None:
             tail_tokens = tail_tokens.clone()
             tail_tokens[i] = next_prompt_token

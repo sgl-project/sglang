@@ -175,15 +175,15 @@ class SchedulerInvariantChecker:
         ):
             req_groups.append(list(running_batch.reqs))
         seen_ids = {id(req) for group in req_groups for req in group}
-        chunked_in_active = [
+        partially_extended_in_active = [
             req
             for req in self.get_active_reqs().values()
-            if req.has_pending_chunk
+            if req.is_partially_extended
             and req.req_pool_idx is not None
             and id(req) not in seen_ids
         ]
-        if chunked_in_active:
-            req_groups.append(chunked_in_active)
+        if partially_extended_in_active:
+            req_groups.append(partially_extended_in_active)
 
         full_uncached = 0
         swa_uncached = 0

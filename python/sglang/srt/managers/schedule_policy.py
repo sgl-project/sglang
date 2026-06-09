@@ -702,8 +702,8 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_non_first_chunk_req(self, req: Req) -> AddReqResult:
-        assert req.has_pending_chunk and not req.is_dllm(), f"non-resume req {req.rid}"
+    def add_resumed_extend_req(self, req: Req) -> AddReqResult:
+        assert req.is_partially_extended and not req.is_dllm(), f"non-resume req {req.rid}"
 
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
@@ -715,7 +715,7 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+            # The partially_extended_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
@@ -862,11 +862,11 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_first_chunk_req(
+    def add_first_extend_req(
         self, req: Req, truncation_align_size: Optional[int]
     ) -> AddReqResult:
-        assert not req.has_pending_chunk or req.is_dllm(), (
-            f"add_first_chunk_req called on chunked-resume req {req.rid}; "
+        assert not req.is_partially_extended or req.is_dllm(), (
+            f"add_first_extend_req called on partially-extended req {req.rid}; "
             f"scheduler-side dispatch broken"
         )
 

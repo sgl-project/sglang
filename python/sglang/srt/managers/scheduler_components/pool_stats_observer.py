@@ -176,7 +176,7 @@ class SchedulerPoolStatsObserver:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
         for req in self.get_active_reqs().values():
-            if req.has_pending_chunk and req.req_pool_idx is not None:
+            if req.is_partially_extended and req.req_pool_idx is not None:
                 idxs.add(req.req_pool_idx)
         return idxs
 

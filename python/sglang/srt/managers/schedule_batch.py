@@ -983,7 +983,7 @@ class Req(ReqDllmMixin):
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
-    def has_pending_chunk(self) -> bool:
+    def is_partially_extended(self) -> bool:
         if self.is_dllm():
             return False
         if self.extend_range is None:
@@ -1600,15 +1600,15 @@ def compute_extend_logprob_start_len(
     return min(resolved_start - prefix_len, extend_len)
 
 
-def _compute_chunked_req_next_prompt_token(
-    chunked_req: Optional[Req],
+def _compute_next_extend_prompt_token(
+    partially_extended_req: Optional[Req],
 ) -> Optional[int]:
-    if chunked_req is None:
+    if partially_extended_req is None:
         return None
-    extend_fill_len = chunked_req.extend_range.end
-    if extend_fill_len >= chunked_req.get_full_untruncated_fill_len():
+    extend_fill_len = partially_extended_req.extend_range.end
+    if extend_fill_len >= partially_extended_req.get_full_untruncated_fill_len():
         return None
-    fill_ids = chunked_req.get_full_untruncated_fill_ids()
+    fill_ids = partially_extended_req.get_full_untruncated_fill_ids()
     if extend_fill_len >= len(fill_ids):
         return None
     return int(fill_ids[extend_fill_len])
