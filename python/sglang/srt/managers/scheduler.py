@@ -3718,7 +3718,16 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        for req in list(self.active_reqs.values()):
+        # Delete requests in the running batch. active_reqs is the source of
+        # truth for scheduler-owned reqs (sync, disagg prefill/decode). DLLM reqs
+        # are owned by DllmManager and never enter active_reqs, so add its
+        # waiting_queue, which holds every in-flight DLLM req across denoising
+        # rounds (staging_queue is a subset).
+        reqs = list(self.active_reqs.values())
+        if self.dllm_config is not None:
+            reqs = reqs + self.dllm_manager.waiting_queue
+
+        for req in reqs:
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
