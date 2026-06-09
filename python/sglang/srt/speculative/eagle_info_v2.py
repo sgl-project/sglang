@@ -37,7 +37,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_draft_cache_locs_page_size_1 as assign_draft_cache_locs_page_size_1,
+    assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs as assign_extend_cache_locs,
@@ -46,7 +46,7 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accepted_out_cache_loc as fill_accepted_out_cache_loc,
+    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
 )
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
@@ -241,7 +241,7 @@ class EagleDraftInputV2Mixin:
                     device=batch.device,
                 )
                 # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_page_size_1[(bs,)](
+                assign_draft_cache_locs_contiguous[(bs,)](
                     batch.req_pool_indices,
                     req_to_token_pool.req_to_token,
                     batch.seq_lens,
