@@ -1,11 +1,19 @@
 import logging
 import math
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Optional
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    get_attention_dp_rank,
+    get_attention_tp_group,
+    get_attention_tp_size,
+)
+from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -28,7 +36,11 @@ from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_verify_mask_policy,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    draft_tp_context,
+)
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -95,6 +107,8 @@ class DFlashWorker:
         target_req_to_token_pool, target_token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self._target_req_to_token_pool = target_req_to_token_pool
+        self._target_token_to_kv_pool_allocator = target_token_to_kv_pool_allocator
         shared_req_to_token_pool = (
             None if self.use_compact_draft_cache else target_req_to_token_pool
         )
@@ -141,26 +155,40 @@ class DFlashWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
-        saved_server_args = get_global_server_args()
-        self.draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-            req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
-            memory_pool_config=target_worker.model_runner.memory_pool_config,
+        backup_disable_cuda_graph = draft_server_args.disable_cuda_graph
+        draft_server_args.disable_cuda_graph = True
+        init_ctx = (
+            draft_tp_context(get_attention_tp_group())
+            if server_args.enable_dp_attention
+            else nullcontext()
         )
+        saved_server_args = get_global_server_args()
+        with init_ctx:
+            self.draft_worker = TpModelWorker(
+                server_args=draft_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=0,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                dp_rank=dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+                req_to_token_pool=shared_req_to_token_pool,
+                token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
+            )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         # Keep the same alias that other spec-v2 workers expose.
         self.draft_worker.draft_runner = self.draft_model_runner
+        self.draft_tp_context = (
+            draft_tp_context if server_args.enable_dp_attention else nullcontext
+        )
+        self.draft_model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        with self.draft_tp_context(self.draft_model_runner.tp_group):
+            self.draft_model_runner.init_device_graphs()
         self.draft_model = self.draft_model_runner.model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -241,6 +269,327 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+        self._dp_token_metadata_cache: dict[
+            tuple[int, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._dflash_dp_max_pad_bs = max(
+            1, int(server_args.max_running_requests or 1)
+        )
+        self._dflash_dp_max_pad_tokens = self._dflash_dp_max_pad_bs * int(
+            self.block_size
+        )
+        self._dflash_dp_max_pad_alloc_tokens = ceil_align(
+            self._dflash_dp_max_pad_tokens, int(self.page_size)
+        )
+        self._dflash_dp_pad_alloc_cache_loc: Optional[torch.Tensor] = None
+        self._dflash_dp_uncached_kv_cache_tokens = 0
+        self._dflash_dp_pad_input_ids = torch.full(
+            (self._dflash_dp_max_pad_tokens,),
+            int(self._mask_token_id),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._dflash_dp_pad_seq_lens = torch.zeros(
+            (self._dflash_dp_max_pad_bs,), dtype=torch.int64, device=self.device
+        )
+        self._dflash_dp_pad_seq_lens_cpu = torch.zeros(
+            (self._dflash_dp_max_pad_bs,), dtype=torch.int64, device="cpu"
+        )
+        self._dflash_dp_pad_req_pool_indices = torch.zeros(
+            (self._dflash_dp_max_pad_bs,), dtype=torch.int64, device=self.device
+        )
+        self._dflash_dp_pad_out_cache_loc = torch.zeros(
+            (self._dflash_dp_max_pad_tokens,), dtype=torch.int64, device=self.device
+        )
+        self._init_dp_attention_verify_padding_cache()
+        self._dflash_dp_pad_positions = torch.arange(
+            int(self.block_size), dtype=torch.int64, device=self.device
+        ).repeat(self._dflash_dp_max_pad_bs)
+
+    def _init_dp_attention_verify_padding_cache(self) -> None:
+        if not self.server_args.enable_dp_attention:
+            return
+
+        pad_alloc_cache_loc = self._target_token_to_kv_pool_allocator.alloc(
+            self._dflash_dp_max_pad_alloc_tokens
+        )
+        if pad_alloc_cache_loc is None:
+            raise RuntimeError(
+                "DFLASH DP attention could not reserve scratch KV slots for "
+                "verify padding. Requested "
+                f"{self._dflash_dp_max_pad_alloc_tokens} slots."
+            )
+        self._dflash_dp_pad_alloc_cache_loc = pad_alloc_cache_loc
+        self._dflash_dp_pad_out_cache_loc = pad_alloc_cache_loc[
+            : self._dflash_dp_max_pad_tokens
+        ]
+        self._dflash_dp_uncached_kv_cache_tokens = int(pad_alloc_cache_loc.numel())
+        self._target_req_to_token_pool.req_to_token[
+            0, : int(self.block_size)
+        ] = self._dflash_dp_pad_out_cache_loc[: int(self.block_size)].to(
+            self._target_req_to_token_pool.req_to_token.dtype
+        )
+
+    def uncached_kv_cache_tokens(self) -> int:
+        return int(self._dflash_dp_uncached_kv_cache_tokens)
+
+    def _sync_dp_attention_target_verify(self) -> None:
+        if not self.server_args.enable_dp_attention:
+            return
+
+        tp_group = self.target_worker.model_runner.tp_group
+        if tp_group.world_size <= 1:
+            return
+
+        torch.distributed.barrier(group=tp_group.cpu_group)
+
+    def _has_uneven_dp_attention_tokens(
+        self, global_num_tokens_cpu: Optional[list[int]]
+    ) -> bool:
+        if global_num_tokens_cpu is None or len(global_num_tokens_cpu) <= 1:
+            return False
+        return len({int(num_tokens) for num_tokens in global_num_tokens_cpu}) > 1
+
+    def _attach_dp_attention_token_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        *,
+        gather_global_num_tokens: bool = True,
+    ) -> Optional[list[int]]:
+        if not self.server_args.enable_dp_attention:
+            return None
+
+        num_tokens = int(num_tokens)
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_algorithm == SpeculativeAlgorithm.DFLASH
+        ):
+            forward_batch.is_extend_in_batch = True
+
+        tp_group = self.target_worker.model_runner.tp_group
+        if gather_global_num_tokens and tp_group.world_size > 1:
+            global_num_tokens_cpu = [
+                int(token_count)
+                for token_count in tp_group.all_gather_object(num_tokens)
+            ]
+        else:
+            global_num_tokens_cpu = [num_tokens] * int(self.server_args.dp_size)
+        metadata_key = tuple(global_num_tokens_cpu)
+        metadata = self._dp_token_metadata_cache.get(metadata_key)
+        if metadata is None:
+            global_num_tokens_gpu = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int64, device=self.device
+            )
+            global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int64, device=self.device
+            )
+            num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, device=self.device
+            )
+            metadata = (
+                global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu,
+                num_token_non_padded,
+            )
+            self._dp_token_metadata_cache[metadata_key] = metadata
+
+        forward_batch.can_run_dp_cuda_graph = False
+        forward_batch.original_global_num_tokens_cpu = global_num_tokens_cpu
+        forward_batch.global_num_tokens_cpu = global_num_tokens_cpu
+        forward_batch.global_num_tokens_gpu = metadata[0]
+        forward_batch.global_num_tokens_for_logprob_cpu = global_num_tokens_cpu
+        forward_batch.global_num_tokens_for_logprob_gpu = metadata[1]
+        forward_batch.num_token_non_padded_cpu = num_tokens
+        forward_batch.num_token_non_padded = metadata[2]
+        return global_num_tokens_cpu
+
+    def _pad_dp_attention_input_embeds(
+        self,
+        forward_batch: ForwardBatch,
+        global_num_tokens_cpu: Optional[list[int]],
+    ) -> None:
+        if (
+            global_num_tokens_cpu is None
+            or forward_batch.input_embeds is None
+            or len(global_num_tokens_cpu) <= 1
+        ):
+            return
+
+        global_num_tokens = [
+            ceil_align(int(num_tokens), get_attention_tp_size())
+            for num_tokens in global_num_tokens_cpu
+        ]
+        cp_align_size = get_cp_padding_align_size()
+        global_num_tokens = [
+            ceil_align(num_tokens, cp_align_size)
+            for num_tokens in global_num_tokens
+        ]
+        padding_mode = DpPaddingMode.get_dp_padding_mode(
+            forward_batch.is_extend_in_batch, global_num_tokens
+        )
+        if padding_mode.is_max_len():
+            padded_num_tokens = max(global_num_tokens)
+        else:
+            padded_num_tokens = global_num_tokens[get_attention_dp_rank()]
+
+        cur_num_tokens = int(forward_batch.input_embeds.shape[0])
+        if padded_num_tokens <= cur_num_tokens:
+            return
+
+        pad_shape = (
+            padded_num_tokens - cur_num_tokens,
+            *forward_batch.input_embeds.shape[1:],
+        )
+        forward_batch.input_embeds = torch.cat(
+            [
+                forward_batch.input_embeds,
+                forward_batch.input_embeds.new_zeros(pad_shape),
+            ],
+            dim=0,
+        )
+
+    def _pad_dp_attention_dflash_verify_batch(
+        self,
+        forward_batch: ForwardBatch,
+        global_num_tokens_cpu: Optional[list[int]],
+    ) -> int:
+        if (
+            global_num_tokens_cpu is None
+            or not self.server_args.enable_dp_attention
+            or forward_batch.spec_info is None
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
+            return int(forward_batch.input_ids.shape[0])
+
+        padded_num_tokens = max(int(x) for x in global_num_tokens_cpu)
+        cur_num_tokens = int(forward_batch.input_ids.shape[0])
+        if padded_num_tokens <= cur_num_tokens:
+            return cur_num_tokens
+
+        draft_token_num = int(forward_batch.spec_info.draft_token_num)
+        if padded_num_tokens % draft_token_num != 0:
+            raise RuntimeError(
+                "DFLASH DP attention verify padding expected token counts to be "
+                f"multiples of draft_token_num={draft_token_num}, got {padded_num_tokens}."
+            )
+
+        padded_bs = padded_num_tokens // draft_token_num
+        pad_bs = padded_bs - int(forward_batch.batch_size)
+        if pad_bs <= 0:
+            return cur_num_tokens
+
+        pad_tokens = padded_num_tokens - cur_num_tokens
+        if pad_bs > self._dflash_dp_pad_req_pool_indices.shape[0]:
+            raise RuntimeError(
+                "DFLASH DP attention verify padding buffers are too small. "
+                f"Requested {pad_bs} slots."
+            )
+        pad_out_cache_loc = self._dflash_dp_pad_out_cache_loc[:pad_tokens].to(
+            forward_batch.out_cache_loc.dtype
+        )
+        pad_req_pool_indices = self._dflash_dp_pad_req_pool_indices[:pad_bs].to(
+            forward_batch.req_pool_indices.dtype
+        )
+
+        pad_input_ids = self._dflash_dp_pad_input_ids[:pad_tokens].to(
+            forward_batch.input_ids.dtype
+        )
+        forward_batch.input_ids = torch.cat(
+            [
+                forward_batch.input_ids,
+                pad_input_ids,
+            ],
+            dim=0,
+        )
+        forward_batch.req_pool_indices = torch.cat(
+            [
+                forward_batch.req_pool_indices,
+                pad_req_pool_indices,
+            ],
+            dim=0,
+        )
+        forward_batch.seq_lens = torch.cat(
+            [
+                forward_batch.seq_lens,
+                self._dflash_dp_pad_seq_lens[:pad_bs].to(forward_batch.seq_lens.dtype),
+            ],
+            dim=0,
+        )
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_cpu = torch.cat(
+                [
+                    forward_batch.seq_lens_cpu,
+                    self._dflash_dp_pad_seq_lens_cpu[:pad_bs].to(
+                        forward_batch.seq_lens_cpu.dtype
+                    ),
+                ],
+                dim=0,
+            )
+        setattr(
+            forward_batch,
+            "_original_batch_size",
+            getattr(forward_batch, "_original_batch_size", forward_batch.batch_size),
+        )
+        forward_batch.batch_size = padded_bs
+
+        forward_batch.out_cache_loc = torch.cat(
+            [
+                forward_batch.out_cache_loc,
+                pad_out_cache_loc,
+            ],
+            dim=0,
+        )
+        pad_positions = self._dflash_dp_pad_positions[:pad_tokens].to(
+            forward_batch.positions.dtype
+        )
+        forward_batch.positions = torch.cat(
+            [forward_batch.positions, pad_positions], dim=0
+        )
+        forward_batch.spec_info.draft_token = torch.cat(
+            [forward_batch.spec_info.draft_token, pad_input_ids], dim=0
+        )
+        forward_batch.spec_info.positions = torch.cat(
+            [forward_batch.spec_info.positions, pad_positions], dim=0
+        )
+        forward_batch.spec_info.num_tokens_per_batch = padded_num_tokens
+        forward_batch.lora_ids.extend([None] * pad_bs)
+        return padded_num_tokens
+
+    def _prepare_dp_attention_dflash_verify_batch(
+        self,
+        forward_batch: ForwardBatch,
+        local_num_tokens: int,
+    ) -> int:
+        """Attach DP metadata after DFLASH verify padding has finalized shape."""
+        global_num_tokens_cpu = self._attach_dp_attention_token_metadata(
+            forward_batch, num_tokens=local_num_tokens
+        )
+        padded_num_tokens = self._pad_dp_attention_dflash_verify_batch(
+            forward_batch, global_num_tokens_cpu
+        )
+        if padded_num_tokens != local_num_tokens or self._has_uneven_dp_attention_tokens(
+            global_num_tokens_cpu
+        ):
+            self._attach_dp_attention_token_metadata(
+                forward_batch,
+                num_tokens=padded_num_tokens,
+                gather_global_num_tokens=False,
+            )
+        return padded_num_tokens
+
+    def _free_dp_attention_dflash_verify_padding(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        return
+
+    def _is_local_prefill_batch(self, batch: ScheduleBatch) -> bool:
+        return batch.forward_mode.is_extend_without_speculative() or (
+            batch.is_extend_in_batch
+            and batch.extend_lens is not None
+            and batch.prefix_lens is not None
+        )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -358,15 +707,21 @@ class DFlashWorker:
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
 
-    def on_verify_complete_cpu(self, num_accepted_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_accepted_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
         pass
 
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
-        # to flush here.
-        pass
+        # to flush here. DP-attention target-verify padding uses a tiny target
+        # KV scratch region, so reserve it again after the target allocator is
+        # cleared.
+        self._dflash_dp_pad_alloc_cache_loc = None
+        self._dflash_dp_uncached_kv_cache_tokens = 0
+        self._init_dp_attention_verify_padding_cache()
 
     def _gather_req_to_token_masked(
         self,
@@ -671,9 +1026,17 @@ class DFlashWorker:
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
+                lora_ids=[None] * bs,
             )
+            global_num_tokens_cpu = self._attach_dp_attention_token_metadata(
+                forward_batch,
+                num_tokens=bs * self.block_size,
+            )
+            self._pad_dp_attention_input_embeds(forward_batch, global_num_tokens_cpu)
 
-            with torch.inference_mode():
+            with torch.inference_mode(), self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ):
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
@@ -1342,7 +1705,7 @@ class DFlashWorker:
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
             )
 
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        if self._is_local_prefill_batch(batch):
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_result = self.target_worker.forward_batch_generation(batch, **kwargs)
             logits_output, next_token_ids = (
@@ -1390,6 +1753,37 @@ class DFlashWorker:
                 next_token_ids=next_token_ids,
                 num_correct_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            )
+
+        if batch.forward_mode.is_idle():
+            target_batch_result = None
+            if self.server_args.enable_dp_attention:
+                spec_info_backup = batch.spec_info
+                can_run_dp_cuda_graph_backup = batch.can_run_dp_cuda_graph
+                batch.spec_info = None
+                batch.can_run_dp_cuda_graph = False
+                try:
+                    target_batch_result = self.target_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
+                finally:
+                    batch.spec_info = spec_info_backup
+                    batch.can_run_dp_cuda_graph = can_run_dp_cuda_graph_backup
+            return GenerationBatchResult(
+                logits_output=(
+                    target_batch_result.logits_output
+                    if target_batch_result is not None
+                    else None
+                ),
+                next_token_ids=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                num_correct_drafts=0,
+                can_run_cuda_graph=(
+                    target_batch_result.can_run_cuda_graph
+                    if target_batch_result is not None
+                    else False
+                ),
             )
 
         # Decode / target-verify stage.

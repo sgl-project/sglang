@@ -54,6 +54,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_extra_uncached_tokens: Callable[[], int] = lambda: 0
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -201,6 +202,7 @@ class SchedulerInvariantChecker:
 
         ps = self.pool_stats_observer.get_pool_stats()
         full_uncached, swa_uncached = self._get_total_uncached_sizes()
+        full_uncached += int(self.get_extra_uncached_tokens())
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
@@ -267,6 +269,7 @@ class SchedulerInvariantChecker:
         """Check memory invariant across all pools. Returns (has_leak, messages)."""
         has_leak = False
         messages = []
+        uncached += int(self.get_extra_uncached_tokens())
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
         has_leak |= full_leak

@@ -175,11 +175,14 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
+    num_tokens_per_req: int = -1
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
+        if self.num_tokens_per_req == -1:
+            self.num_tokens_per_req = int(self.draft_token_num)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -262,35 +265,35 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: "TpModelWorker",
+        *,
+        force_target_verify: bool = False,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         Unlike spec-v1, the overlap path already computes and stores
         `batch.out_cache_loc` before this method is called. This helper only
-        packages the verify forward and pre-initializes either CUDA-graph replay
-        metadata or eager attention metadata so the actual forward can run with
-        `skip_attn_backend_init=True`.
+        packages the verify forward. CUDA-graph replay is pre-prepared here;
+        eager attention metadata is initialized by the normal forward path after
+        DP-attention padding has finalized the batch shapes.
         """
         batch.input_ids = self.draft_token
         batch.spec_info = self
         batch.forward_mode = (
             ForwardMode.IDLE
-            if batch.forward_mode.is_idle()
+            if batch.forward_mode.is_idle() and not force_target_verify
             else ForwardMode.TARGET_VERIFY
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         can_run_cuda_graph = bool(
-            target_worker.model_runner.graph_runner
+            not target_worker.model_runner.server_args.enable_dp_attention
+            and target_worker.model_runner.graph_runner
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
-        elif not batch.forward_mode.is_idle():
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
+            verify_forward_batch.mark_forward_metadata_ready()
 
         return verify_forward_batch, can_run_cuda_graph
 

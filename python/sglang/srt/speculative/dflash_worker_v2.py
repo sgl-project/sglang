@@ -6,6 +6,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -145,12 +146,33 @@ class DFlashWorkerV2(DFlashWorker):
             )
             self._warned_sampling_fallback = True
 
+    def _should_clamp_dp_attention_commit_lens(
+        self, bs: int, commit_lens_cpu: torch.Tensor
+    ) -> bool:
+        """Prevent rank-local DFLASH accepts from desynchronizing DP schedulers."""
+        if not self.server_args.enable_dp_attention or bs <= 1:
+            return False
+
+        local_commit_lens = tuple(int(commit_len) for commit_len in commit_lens_cpu)
+        tp_group = self.target_worker.model_runner.tp_group
+        if tp_group.world_size <= 1:
+            return False
+
+        global_commit_lens = [
+            tuple(commit_lens)
+            for commit_lens in tp_group.all_gather_object(local_commit_lens)
+        ]
+        return any(
+            commit_lens != local_commit_lens for commit_lens in global_commit_lens
+        )
+
     def _make_next_draft_input_prefill(
         self,
         *,
         verified_id: torch.Tensor,
         seq_lens: torch.Tensor,
         verify_done: Optional[torch.cuda.Event] = None,
+        committed_seq_lens_cpu: Optional[torch.Tensor] = None,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DFlashDraftInputV2:
         bs = int(seq_lens.numel())
@@ -162,6 +184,7 @@ class DFlashWorkerV2(DFlashWorker):
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
+            committed_seq_lens_cpu=committed_seq_lens_cpu,
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
@@ -171,6 +194,7 @@ class DFlashWorkerV2(DFlashWorker):
         verified_id: torch.Tensor,
         new_seq_lens: torch.Tensor,
         verify_done: Optional[torch.cuda.Event] = None,
+        committed_seq_lens_cpu: Optional[torch.Tensor] = None,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DFlashDraftInputV2:
         bs = int(new_seq_lens.numel())
@@ -182,6 +206,7 @@ class DFlashWorkerV2(DFlashWorker):
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
+            committed_seq_lens_cpu=committed_seq_lens_cpu,
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
@@ -201,7 +226,12 @@ class DFlashWorkerV2(DFlashWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            is_local_prefill = self._is_local_prefill_batch(model_worker_batch)
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if is_local_prefill
+                else CaptureHiddenMode.NULL
+            )
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
@@ -211,8 +241,22 @@ class DFlashWorkerV2(DFlashWorker):
                 batch_output.next_token_ids,
             )
             batch_output.new_seq_lens = model_worker_batch.seq_lens
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+
+            if not is_local_prefill:
+                device = model_worker_batch.seq_lens.device
+                verified_id = torch.empty((0,), dtype=torch.int32, device=device)
+                batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                    verified_id=verified_id,
+                    seq_lens=model_worker_batch.seq_lens,
+                    committed_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+                    cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+                )
+                verify_done = torch.get_device_module(device).Event()
+                verify_done.record()
+                batch_output.next_draft_input.verify_done = verify_done
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
+                return batch_output
 
             if logits_output.hidden_states is None:
                 raise RuntimeError(
@@ -261,11 +305,14 @@ class DFlashWorkerV2(DFlashWorker):
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 verified_id=next_token_ids,
                 seq_lens=model_worker_batch.seq_lens,
+                committed_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
                 cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
             )
             verify_done = torch.get_device_module(device).Event()
             verify_done.record()
             batch_output.next_draft_input.verify_done = verify_done
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
             return batch_output
 
         # Decode / target-verify stage.
@@ -281,6 +328,153 @@ class DFlashWorkerV2(DFlashWorker):
             )
 
         if model_worker_batch.forward_mode.is_idle():
+            block_size = int(self.block_size)
+
+            idle_draft_tokens = block_size
+
+            scratch_cache_loc = alloc_token_slots(
+                model_worker_batch.tree_cache, 2 * block_size
+            )
+            scratch_prefix_len = 1
+            scratch_verify_out_cache_loc = scratch_cache_loc[
+                scratch_prefix_len : scratch_prefix_len + block_size
+            ]
+            scratch_req_pool_indices = torch.zeros(
+                (1,), dtype=torch.int64, device=self.device
+            )
+            scratch_verify_seq_lens = torch.full(
+                (1,), scratch_prefix_len, dtype=torch.int64, device=self.device
+            )
+            scratch_verify_seq_lens_cpu = torch.full(
+                (1,), scratch_prefix_len, dtype=torch.int64
+            )
+            scratch_start = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            scratch_end = torch.full(
+                (1,),
+                scratch_prefix_len + block_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            assign_req_to_token_pool_func(
+                scratch_req_pool_indices,
+                self.model_runner.req_to_token_pool.req_to_token,
+                scratch_start,
+                scratch_end,
+                scratch_cache_loc[: scratch_prefix_len + block_size],
+                1,
+            )
+
+            idle_input_ids = torch.full(
+                (idle_draft_tokens,),
+                int(self._mask_token_id),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            idle_positions = torch.arange(
+                scratch_prefix_len,
+                scratch_prefix_len + idle_draft_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            idle_input_embeds = (
+                self.target_worker.model_runner.model.get_input_embeddings()(
+                    idle_input_ids
+                )
+            )
+
+            draft_forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=1,
+                input_ids=idle_input_ids,
+                req_pool_indices=scratch_req_pool_indices,
+                seq_lens=scratch_verify_seq_lens,
+                out_cache_loc=scratch_verify_out_cache_loc,
+                seq_lens_sum=scratch_prefix_len,
+                seq_lens_cpu=scratch_verify_seq_lens_cpu,
+                positions=idle_positions,
+                input_embeds=idle_input_embeds,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                spec_info=self._draft_block_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                lora_ids=[None],
+            )
+            global_num_tokens_cpu = self._attach_dp_attention_token_metadata(
+                draft_forward_batch,
+                num_tokens=idle_draft_tokens,
+            )
+            self._pad_dp_attention_input_embeds(
+                draft_forward_batch, global_num_tokens_cpu
+            )
+            with torch.inference_mode(), self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ):
+                draft_logits_output = self.draft_model_runner.forward(
+                    draft_forward_batch
+                ).logits_output
+
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH idle draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(1, int(self.block_size), -1)
+            target_lm_head = getattr(
+                self.target_worker.model_runner.model, "lm_head", None
+            )
+            if target_lm_head is None or not hasattr(target_lm_head, "weight"):
+                raise RuntimeError(
+                    "DFLASH requires the target model to expose `lm_head` with `weight`."
+                )
+            self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=target_lm_head,
+            )
+
+            verify_input = DFlashVerifyInput(
+                draft_token=torch.full(
+                    (block_size,),
+                    int(self._mask_token_id),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                positions=torch.arange(
+                    scratch_prefix_len,
+                    scratch_prefix_len + block_size,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                draft_token_num=block_size,
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            verify_forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=1,
+                input_ids=verify_input.draft_token,
+                req_pool_indices=scratch_req_pool_indices,
+                seq_lens=scratch_verify_seq_lens,
+                out_cache_loc=scratch_verify_out_cache_loc,
+                seq_lens_sum=scratch_prefix_len,
+                seq_lens_cpu=scratch_verify_seq_lens_cpu,
+                positions=verify_input.positions,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                spec_info=verify_input,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                lora_ids=[None],
+            )
+            self._prepare_dp_attention_dflash_verify_batch(
+                verify_forward_batch, local_num_tokens=block_size
+            )
+            self._sync_dp_attention_target_verify()
+            try:
+                target_batch_output = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=verify_forward_batch,
+                    is_verify=True,
+                )
+            finally:
+                self._free_dp_attention_dflash_verify_padding(verify_forward_batch)
+            self._sync_dp_attention_target_verify()
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -291,14 +485,20 @@ class DFlashWorkerV2(DFlashWorker):
                 on_publish(next_draft_input.new_seq_lens)
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
+            # The idle companion uses temporary KV slots only to make every DP
+            # rank participate in the same draft/verify collectives. Fence the
+            # stream before returning those slots to the shared allocator.
+            verify_done.synchronize()
+            model_worker_batch.token_to_kv_pool_allocator.free(scratch_cache_loc)
             next_draft_input.verify_done = verify_done
             return GenerationBatchResult(
-                logits_output=None,
+                logits_output=target_batch_output.logits_output,
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=target_batch_output.can_run_cuda_graph,
                 speculative_num_draft_tokens=int(self.block_size),
+                extra_keep_alive_refs=[verify_forward_batch],
             )
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
@@ -330,6 +530,10 @@ class DFlashWorkerV2(DFlashWorker):
 
         block_ids = self._draft_block_ids_buf[:bs]
         prefix_lens = model_worker_batch.seq_lens
+        if draft_input.committed_seq_lens_cpu is not None:
+            prefix_lens = draft_input.committed_seq_lens_cpu.to(
+                device=device, dtype=prefix_lens.dtype
+            )
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
         if self._use_triton_prepare_block:
@@ -432,15 +636,12 @@ class DFlashWorkerV2(DFlashWorker):
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
             # Non-windowed path uses the shared overallocated mapping directly.
-            # Backend planning only needs a safe upper bound for the committed
-            # prefix lengths, not the full allocator reservation length.
+            # DFLASH attention metadata receives committed prefix lengths and
+            # internally appends the fixed draft block.
             draft_seq_lens = prefix_lens
-            if draft_input.planning_seq_lens_cpu is not None:
-                seq_lens_cpu.copy_(draft_input.planning_seq_lens_cpu)
-                draft_seq_lens_sum = int(draft_input.planning_seq_lens_sum)
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
-                draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            if draft_input.committed_seq_lens_cpu is not None:
+                seq_lens_cpu.copy_(draft_input.committed_seq_lens_cpu)
+                draft_seq_lens_sum = int(draft_input.committed_seq_lens_cpu.sum().item())
             elif model_worker_batch.seq_lens_cpu is not None:
                 seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
                 draft_seq_lens_sum = (
@@ -466,9 +667,17 @@ class DFlashWorkerV2(DFlashWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            lora_ids=[None] * bs,
         )
+        global_num_tokens_cpu = self._attach_dp_attention_token_metadata(
+            forward_batch,
+            num_tokens=bs * int(self.block_size),
+        )
+        self._pad_dp_attention_input_embeds(forward_batch, global_num_tokens_cpu)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ):
             draft_logits_output = self.draft_model_runner.forward(
                 forward_batch
             ).logits_output
@@ -509,27 +718,36 @@ class DFlashWorkerV2(DFlashWorker):
         seq_lens_pre_verify = (
             model_worker_batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
-        seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
-        seq_lens_sum_backup = model_worker_batch.seq_lens_sum
-        if draft_input.planning_seq_lens_cpu is not None:
-            model_worker_batch.seq_lens_cpu = draft_input.planning_seq_lens_cpu
-            model_worker_batch.seq_lens_sum = int(draft_input.planning_seq_lens_sum)
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+        can_run_dp_cuda_graph_backup = model_worker_batch.can_run_dp_cuda_graph
+        model_worker_batch.can_run_dp_cuda_graph = False
+        try:
+            if draft_input.committed_seq_lens_cpu is not None:
+                model_worker_batch.seq_lens = prefix_lens
+                model_worker_batch.seq_lens_cpu = draft_input.committed_seq_lens_cpu
+                model_worker_batch.seq_lens_sum = int(
+                    draft_input.committed_seq_lens_cpu.sum().item()
+                )
 
-        verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
-            model_worker_batch, self.target_worker
-        )
-        model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
-        model_worker_batch.seq_lens_sum = seq_lens_sum_backup
+            verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
+                model_worker_batch, self.target_worker
+            )
+            local_verify_num_tokens = bs * int(self.block_size)
+            self._prepare_dp_attention_dflash_verify_batch(
+                verify_forward_batch, local_num_tokens=local_verify_num_tokens
+            )
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+            self._sync_dp_attention_target_verify()
+            try:
+                target_out = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=verify_forward_batch,
+                    is_verify=True,
+                )
+            finally:
+                self._free_dp_attention_dflash_verify_padding(verify_forward_batch)
+            self._sync_dp_attention_target_verify()
+        finally:
+            model_worker_batch.can_run_dp_cuda_graph = can_run_dp_cuda_graph_backup
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -625,6 +843,24 @@ class DFlashWorkerV2(DFlashWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        remaining_lens_cpu = [
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0)
+            for req in model_worker_batch.reqs
+        ]
+        remaining_lens = torch.tensor(
+            remaining_lens_cpu, dtype=commit_lens.dtype, device=device
+        )
+        commit_lens = torch.minimum(commit_lens, remaining_lens)
+        commit_lens_cpu = commit_lens.detach().to(device="cpu", dtype=torch.int64)
+        if self._should_clamp_dp_attention_commit_lens(bs, commit_lens_cpu):
+            # Keep DFLASH target-verify progress shape-symmetric across DP ranks.
+            # Rank-local multi-token accepts can otherwise leave one scheduler in
+            # a different next-step state than its DP peers.
+            commit_lens.clamp_(max=1)
+            commit_lens_cpu.clamp_(max=1)
+        if new_seq_lens is not None:
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -633,6 +869,11 @@ class DFlashWorkerV2(DFlashWorker):
                 commit_lens=commit_lens,
             )
 
+        committed_seq_lens_cpu = (
+            model_worker_batch.seq_lens_cpu.to(dtype=torch.int64) + commit_lens_cpu
+            if model_worker_batch.seq_lens_cpu is not None
+            else None
+        )
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
@@ -660,6 +901,7 @@ class DFlashWorkerV2(DFlashWorker):
         next_draft_input = self._make_next_draft_input_decode(
             verified_id=bonus,
             new_seq_lens=new_seq_lens,
+            committed_seq_lens_cpu=committed_seq_lens_cpu,
             cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
         )
         verify_done = torch.get_device_module(device).Event()

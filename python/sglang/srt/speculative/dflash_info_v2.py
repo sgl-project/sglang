@@ -51,6 +51,7 @@ class DFlashDraftInputV2(SpecInput):
     verify_done: Optional[torch.cuda.Event] = None
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
+    committed_seq_lens_cpu: Optional[torch.Tensor] = None
     cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None
     planning_seq_lens_cpu: Optional[torch.Tensor] = None
     planning_seq_lens_sum: Optional[int] = None
@@ -284,6 +285,8 @@ class DFlashDraftInputV2(SpecInput):
             self.cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu[
                 new_indices.cpu()
             ]
+        if self.committed_seq_lens_cpu is not None:
+            self.committed_seq_lens_cpu = self.committed_seq_lens_cpu[new_indices.cpu()]
         if self.planning_seq_lens_cpu is not None:
             self.planning_seq_lens_cpu = self.planning_seq_lens_cpu[new_indices.cpu()]
             self.planning_seq_lens_sum = int(self.planning_seq_lens_cpu.sum().item())
@@ -310,6 +313,14 @@ class DFlashDraftInputV2(SpecInput):
             )
         elif spec_info.cur_allocated_seq_lens_cpu is not None:
             self.cur_allocated_seq_lens_cpu = spec_info.cur_allocated_seq_lens_cpu
+
+        if self.committed_seq_lens_cpu is not None:
+            assert spec_info.committed_seq_lens_cpu is not None
+            self.committed_seq_lens_cpu = torch.cat(
+                [self.committed_seq_lens_cpu, spec_info.committed_seq_lens_cpu]
+            )
+        elif spec_info.committed_seq_lens_cpu is not None:
+            self.committed_seq_lens_cpu = spec_info.committed_seq_lens_cpu
 
         if self.planning_seq_lens_cpu is not None:
             assert spec_info.planning_seq_lens_cpu is not None

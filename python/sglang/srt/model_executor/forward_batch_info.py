@@ -1287,29 +1287,34 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.req_pool_indices = self.req_pool_indices[:bs]
                 if self.seq_lens_cpu is not None:
                     self.seq_lens_cpu = self.seq_lens_cpu[:bs]
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
                 self.spec_info.num_correct_drafts = self.spec_info.num_correct_drafts[
                     :bs
                 ]
                 self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[:bs]
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):
@@ -1318,7 +1323,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.out_cache_loc = self.output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
-            logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+            if logits_output.next_token_logits is not None:
+                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():

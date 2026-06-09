@@ -26,7 +26,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
@@ -554,16 +554,39 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
+            if (
+                forward_batch.spec_info is not None
+                and forward_batch.spec_info.spec_input_type
+                == SpecInputType.DFLASH_VERIFY
+            ):
+                prefix_lens = forward_batch.seq_lens
+                draft_token_num = int(forward_batch.spec_info.draft_token_num)
+                seq_lens = prefix_lens + draft_token_num
+                seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu + draft_token_num
+                    if forward_batch.seq_lens_cpu is not None
+                    else None
+                )
+                seq_lens_sum = forward_batch.seq_lens_sum + (
+                    draft_token_num * int(forward_batch.batch_size)
+                )
+                spec_info = None
+            else:
+                prefix_lens = None
+                seq_lens = forward_batch.seq_lens
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                seq_lens_sum = forward_batch.seq_lens_sum
+                spec_info = forward_batch.spec_info
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
+                seq_lens,
+                seq_lens_cpu,
+                seq_lens_sum,
+                prefix_lens=prefix_lens,
                 prefill_wrappers=self.prefill_wrappers_verify,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
+                spec_info=spec_info,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False

@@ -3328,7 +3328,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # called from the idle path can re-read a prior batch's req_pool
         # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
-            if not self.server_args.enable_pdmux:
+            skip_eager_copy = (
+                forward_batch.spec_algorithm == SpeculativeAlgorithm.DFLASH
+                and forward_batch.input_embeds is not None
+            )
+            if not self.server_args.enable_pdmux and not skip_eager_copy:
                 forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
             self.attn_backend.init_forward_metadata(forward_batch)
         else:
@@ -3337,6 +3341,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        if forward_batch.input_embeds is not None:
+            kwargs["input_embeds"] = forward_batch.input_embeds
         ctx = (
             self.device_timer.wrap(metadata={"category": "idle"})
             if self.device_timer
@@ -3541,29 +3547,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.hisparse_coordinator is not None:
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
-            # Forward without cuda graph
-            if forward_batch.forward_mode.is_decode():
-                ret = self.forward_decode(
-                    forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
-            elif forward_batch.forward_mode.is_split_prefill():
-                ret = self.forward_split_prefill(
-                    forward_batch,
-                    reinit_attn_backend=reinit_attn_backend,
-                    forward_count=split_forward_count,
-                )
-            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-                ret, can_run_graph = self.forward_extend(
-                    forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
-            elif forward_batch.forward_mode.is_idle():
-                ret = self.forward_idle(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
-            else:
-                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+            spec_info_for_idle_padding = None
+            if (
+                forward_batch.forward_mode.is_idle()
+                and forward_batch.spec_algorithm == SpeculativeAlgorithm.DFLASH
+                and forward_batch.spec_info is not None
+            ):
+                spec_info_for_idle_padding = forward_batch.spec_info
+                forward_batch.spec_info = None
+
+            try:
+                # Forward without cuda graph
+                if forward_batch.forward_mode.is_decode():
+                    ret = self.forward_decode(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
+                elif forward_batch.forward_mode.is_split_prefill():
+                    ret = self.forward_split_prefill(
+                        forward_batch,
+                        reinit_attn_backend=reinit_attn_backend,
+                        forward_count=split_forward_count,
+                    )
+                elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                    ret, can_run_graph = self.forward_extend(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
+                elif forward_batch.forward_mode.is_idle():
+                    ret = self.forward_idle(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
+                else:
+                    raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+            finally:
+                if spec_info_for_idle_padding is not None:
+                    forward_batch.spec_info = spec_info_for_idle_padding
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

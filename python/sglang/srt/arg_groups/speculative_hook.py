@@ -131,11 +131,6 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
 
 def _handle_dflash(server_args: "ServerArgs") -> None:
-    if server_args.enable_dp_attention:
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
-        )
-
     if server_args.pp_size != 1:
         raise ValueError(
             "Currently DFLASH speculative decoding only supports pp_size == 1."
@@ -246,6 +241,17 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
     else:
         logger.warning("Spec v2 is enabled by default for DFLASH speculative decoding.")
+
+    if (
+        server_args.enable_dp_attention
+        and not server_args.enable_dp_attention_local_control_broadcast
+    ):
+        server_args.enable_dp_attention_local_control_broadcast = True
+        logger.warning(
+            "DP attention local control broadcast is enabled because DFLASH "
+            "spec-v2 runs an inner target verify forward that needs every DP "
+            "scheduler to produce its active or idle companion batch."
+        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False

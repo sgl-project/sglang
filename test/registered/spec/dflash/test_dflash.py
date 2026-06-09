@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=360, stage="extra-b", runner_config="2-gpu-large")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
@@ -155,6 +156,57 @@ class TestDFlashServerSpecV2(TestDFlashServerBase):
 
 class TestDFlashServerSpecV2PlanStream(TestDFlashServerSpecV2):
     overlap_plan_stream = True
+
+
+class TestDFlashServerSpecV2DPAttention(TestDFlashServerSpecV2):
+    model = "Qwen/Qwen3-8B"
+    draft_model = "z-lab/Qwen3-8B-DFlash-b16"
+    max_running_requests = 16
+    other_launch_args = [
+        "--tp-size",
+        "2",
+        "--dp-size",
+        "2",
+        "--enable-dp-attention",
+        "--mem-fraction-static",
+        "0.8",
+    ]
+
+    def test_finish_stop_eos(self):
+        qwen_format_prompt = """\
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+What is 2 + 2?<|im_end|>
+<|im_start|>assistant
+"""
+        qwen_eos_token_ids = [151643, 151645]
+        self._run_completions_generation(
+            prompt=qwen_format_prompt,
+            max_tokens=1000,
+            finish_reason="stop",
+            matched_stop=qwen_eos_token_ids,
+        )
+        self._run_chat_completions_generation(
+            prompt="What is 2 + 2?",
+            max_tokens=1000,
+            finish_reason="stop",
+            matched_stop=qwen_eos_token_ids,
+        )
+
+    @unittest.skip(
+        "Qwen DP-attention coverage is a distributed DFLASH smoke; "
+        "GSM8K accuracy is covered by the base DFLASH classes."
+    )
+    def test_gsm8k(self):
+        pass
+
+    @unittest.skip(
+        "Qwen DP-attention coverage is a distributed DFLASH smoke; "
+        "radix stress is covered by the base DFLASH spec-v2 class."
+    )
+    def test_radix_attention(self):
+        pass
 
 
 if __name__ == "__main__":

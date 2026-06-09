@@ -662,6 +662,31 @@ class TestCutedslMoeMaxNumTokens(unittest.TestCase):
         self.assertEqual(args.cutedsl_moe_max_num_tokens(), 512)
 
 
+class TestDFlashServerArgs(unittest.TestCase):
+    def test_dflash_allows_dp_attention(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="dummy-draft",
+            speculative_num_draft_tokens=4,
+            tp_size=2,
+            dp_size=2,
+            enable_dp_attention=True,
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=MagicMock(architectures=[]),
+        ):
+            handle_speculative_decoding(server_args)
+
+        self.assertEqual(server_args.speculative_algorithm, "DFLASH")
+        self.assertTrue(server_args.enable_dp_attention)
+        self.assertEqual(server_args.speculative_num_steps, 1)
+        self.assertEqual(server_args.speculative_eagle_topk, 1)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 4)
+        self.assertTrue(server_args.enable_dp_attention_local_control_broadcast)
+
+
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
     """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
 

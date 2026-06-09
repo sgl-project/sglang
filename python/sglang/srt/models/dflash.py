@@ -154,7 +154,9 @@ class DFlashAttention(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
+            q, k = q.contiguous(), k.contiguous()
             q, k = self.rotary_emb(positions, q, k)
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -177,12 +179,12 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-            return k, v
+            return k.contiguous(), v.contiguous()
 
         # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
         qkv, _ = self.qkv_proj(hidden_states)
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        return k, v
+        return k.contiguous(), v.contiguous()
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
         k_by_head = k.reshape(-1, self.head_dim)
@@ -193,7 +195,7 @@ class DFlashAttention(nn.Module):
         # Match K shape so RoPE kernel head-count check passes on all backends.
         dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
-        return k
+        return k.contiguous()
 
 
 class DFlashMLP(nn.Module):

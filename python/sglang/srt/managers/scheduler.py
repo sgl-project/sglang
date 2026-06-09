@@ -1434,8 +1434,11 @@ class Scheduler(
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # DFLASH fences its shared req_to_token writes with verify_done /
         # plan-stream deps, so the global WAR barrier only serializes plan
-        # overlap. TODO: generalize this global-barrier enablement policy.
-        self._war_barrier_enabled = is_cuda() and not self.spec_algorithm.is_dflash()
+        # overlap. DP attention adds cross-rank planning/MLP synchronization,
+        # so keep the WAR barrier for DFLASH in that mode.
+        self._war_barrier_enabled = is_cuda() and (
+            not self.spec_algorithm.is_dflash() or self.server_args.enable_dp_attention
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1704,6 +1707,12 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_extra_uncached_tokens=lambda: (
+                int(self.draft_worker.uncached_kv_cache_tokens())
+                if self.draft_worker is not None
+                and hasattr(self.draft_worker, "uncached_kv_cache_tokens")
+                else 0
+            ),
         )
 
     def init_kv_events_publisher(self) -> None:
