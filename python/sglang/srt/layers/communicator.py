@@ -444,7 +444,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
-        force_layernorm_after_dp_gather: bool = False,
+        force_layernorm_before_dp_gather: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -452,7 +452,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
-        self.force_layernorm_after_dp_gather = force_layernorm_after_dp_gather
+        self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -688,8 +688,8 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        self._context.force_layernorm_after_dp_gather = (
-            self.force_layernorm_after_dp_gather
+        self._context.force_layernorm_before_dp_gather = (
+            self.force_layernorm_before_dp_gather
         )
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
@@ -788,7 +788,7 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
-    force_layernorm_after_dp_gather: bool = False
+    force_layernorm_before_dp_gather: bool = False
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1031,7 +1031,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            use_layer_norm_before_gather = not context.force_layernorm_after_dp_gather
+            # Default (other DP models): layernorm before the gather only when
+            # attn_tp_size == 1 (smaller data, no attn-TP reduce needed). Models
+            # that need layernorm-before-gather at attn_tp_size > 1 opt in via
+            # force_layernorm_before_dp_gather (e.g. Nemotron-H).
+            use_layer_norm_before_gather = (
+                context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
+            )
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
                 if context.attn_tp_size > 1:
                     hidden_states = attention_tensor_model_parallel_all_reduce(

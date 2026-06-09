@@ -1545,15 +1545,17 @@ class RowParallelLinear(LinearBase):
         # exists for global-TP numerical parity (batch-invariance / train-inference
         # consistency). Other layers never set the attribute and skip this path.
         emulate_global_tp_chunks = 1
-        # Local import to avoid a circular import at module load time.
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        # Opt-in only: layers that never set the attribute (the common case, all
+        # non-DP-attention models) skip the import and computation entirely and
+        # take the unchanged single-GEMM path below.
+        if getattr(self, "emulate_global_tp_chunks", False):
+            # Local import to avoid a circular import at module load time.
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
-        if getattr(self, "emulate_global_tp_chunks", False) and isinstance(
-            self.quant_method, UnquantizedLinearMethod
-        ):
-            global_tp_size = get_tensor_model_parallel_world_size()
-            if global_tp_size > self.tp_size and global_tp_size % self.tp_size == 0:
-                emulate_global_tp_chunks = global_tp_size // self.tp_size
+            if isinstance(self.quant_method, UnquantizedLinearMethod):
+                global_tp_size = get_tensor_model_parallel_world_size()
+                if global_tp_size > self.tp_size and global_tp_size % self.tp_size == 0:
+                    emulate_global_tp_chunks = global_tp_size // self.tp_size
 
         with symm_ctx:
             if emulate_global_tp_chunks > 1:
