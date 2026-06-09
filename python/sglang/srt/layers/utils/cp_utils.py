@@ -16,6 +16,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
 
@@ -438,26 +439,14 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
 
-    pool = get_token_to_kv_pool()
-    if swa_loc is not None:
-        pool.set_kv_buffer(
-            layer,
-            cache_loc,
-            key_cache_full,
-            value_cache_full,
-            layer.k_scale,
-            layer.v_scale,
-            swa_loc=swa_loc,
-        )
-    else:
-        pool.set_kv_buffer(
-            layer,
-            cache_loc,
-            key_cache_full,
-            value_cache_full,
-            layer.k_scale,
-            layer.v_scale,
-        )
+    get_token_to_kv_pool().set_kv_buffer(
+        layer,
+        KVWriteLoc(cache_loc, swa_loc),
+        key_cache_full,
+        value_cache_full,
+        layer.k_scale,
+        layer.v_scale,
+    )
 
 
 def cp_attn_forward_extend(
