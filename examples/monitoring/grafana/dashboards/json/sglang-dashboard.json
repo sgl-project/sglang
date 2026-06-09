@@ -823,7 +823,7 @@
         "default": true,
         "type": "prometheus"
       },
-      "description": "\u5206\u5c42 Cache \u547d\u4e2d\u7387\u3002\u603b\u547d\u4e2d\u7387 = (L1+L2+L3) / (L1+L2+L3+Miss)\u3002\u5404\u5c42\u5360\u6bd4\u4f7f\u7528\u65e0 page \u5bf9\u9f50\u7684\u539f\u59cb token \u6570\u3002",
+      "description": "Per-tier cache hit rate. Total hit rate = (L1+L2+L3) / (L1+L2+L3+Miss). Each tier's share uses raw token counts without page alignment.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -908,9 +908,9 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total[$__rate_interval]))) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "expr": "(sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "\u603b\u547d\u4e2d\u7387 (L1+L2+L3)",
+          "legendFormat": "Total Hit Rate (L1+L2+L3)",
           "range": true,
           "refId": "A"
         },
@@ -920,9 +920,9 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "L1 \u547d\u4e2d\u7387 (GPU)",
+          "legendFormat": "L1 Hit Rate (GPU)",
           "range": true,
           "refId": "B"
         },
@@ -932,9 +932,9 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "L2 \u547d\u4e2d\u7387 (Host DRAM)",
+          "legendFormat": "L2 Hit Rate (Host DRAM)",
           "range": true,
           "refId": "C"
         },
@@ -944,14 +944,14 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
+          "expr": "sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) / clamp_min((sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l1_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l2_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:cache_hit_tokens_l3_total{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval])) + sum without (dp_rank, tp_rank, pp_rank, moe_ep_rank, instance, job) (rate(sglang:uncached_prompt_tokens_histogram_sum{instance=~\"$instance\",model_name=~\"$model_name\"}[$__rate_interval]))), 1e-9)",
           "instant": false,
-          "legendFormat": "L3 \u547d\u4e2d\u7387 (Storage)",
+          "legendFormat": "L3 Hit Rate (Storage)",
           "range": true,
           "refId": "D"
         }
       ],
-      "title": "Cache Hit Rate (\u5206\u5c42)",
+      "title": "Cache Hit Rate (Per-Tier)",
       "type": "timeseries"
     },
     {
@@ -1071,7 +1071,7 @@
           "type": "prometheus"
         },
         "definition": "label_values(instance)",
-        "includeAll": false,
+        "includeAll": true,
         "label": "instance",
         "name": "instance",
         "options": [],
@@ -1082,7 +1082,8 @@
         },
         "refresh": 1,
         "regex": "",
-        "type": "query"
+        "type": "query",
+        "allValue": ".*"
       },
       {
         "current": {
@@ -1093,7 +1094,7 @@
           "type": "prometheus"
         },
         "definition": "label_values(model_name)",
-        "includeAll": false,
+        "includeAll": true,
         "label": "model name",
         "name": "model_name",
         "options": [],
@@ -1104,7 +1105,8 @@
         },
         "refresh": 1,
         "regex": "",
-        "type": "query"
+        "type": "query",
+        "allValue": ".*"
       }
     ]
   },
