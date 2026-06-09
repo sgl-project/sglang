@@ -19,7 +19,8 @@ from sglang.srt.utils.common import (
 )
 
 _is_npu = is_npu()
-
+if _is_npu:
+    import torch_npu
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -1003,8 +1004,6 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
-        import torch_npu
-
         from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
             npu_add_rms_norm_batch_invariant,
             npu_fused_infer_attention_score_batch_invariant,
