@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cosmos3 sampling parameters.
 
-A single ``SamplingParams`` class serves T2V, I2V, V2V, and T2I — the
-per-request mode is dispatched in the pipeline from ``num_frames``
-(``== 1`` → T2I), ``image_path`` (set → I2V), and ``video_path`` (set →
-V2V). For ``num_frames == 1`` the output ``data_type`` flips to ``IMAGE``
+A single ``SamplingParams`` class serves T2V, I2V, V2V, T2I, and
+action-conditioned variants.  Per-request mode is dispatched in the pipeline
+from ``num_frames`` (``== 1`` → T2I), ``image_path`` (set → I2V),
+``video_path`` (set → V2V), and ``action_mode`` (set → action-conditioned).
+For ``num_frames == 1`` the output ``data_type`` flips to ``IMAGE``
 so the file extension and decode path agree.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -50,6 +52,17 @@ class Cosmos3SamplingParams(SamplingParams):
             (1024, 1024),
         ]
     )
+
+    # Action modality (requires action_gen=True in the model checkpoint)
+    # action_mode: "forward_dynamics" | "policy" | "inverse_dynamics"
+    action_mode: str | None = None
+    domain_id: int | None = None
+    domain_name: str | None = None
+    raw_action_dim: int | None = None
+    action_fps: float | None = None
+    # Action data for forward_dynamics: [T, D] nested list (API) or JSON string
+    # (CLI via --action). Ignored by the other action modes.
+    action: Any = None
 
     def _set_output_file_name(self) -> None:
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to

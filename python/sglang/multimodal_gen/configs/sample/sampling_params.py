@@ -1000,6 +1000,47 @@ class SamplingParams:
             ),
         )
         add_argument(
+            "--action-mode",
+            type=str,
+            dest="action_mode",
+            help=(
+                "Cosmos3 action mode: 'forward_dynamics' (predict next frame "
+                "from action), 'policy' (predict action from frame), or "
+                "'inverse_dynamics' (predict action from two frames)."
+            ),
+        )
+        add_argument(
+            "--domain-id",
+            type=int,
+            dest="domain_id",
+            help="Action embodiment domain ID (integer). Overrides --domain-name.",
+        )
+        add_argument(
+            "--domain-name",
+            type=str,
+            dest="domain_name",
+            help="Action embodiment domain name (e.g. 'av', 'camera_pose', 'umi').",
+        )
+        add_argument(
+            "--raw-action-dim",
+            type=int,
+            dest="raw_action_dim",
+            help=(
+                "Number of active action dimensions to predict; remaining "
+                "dimensions are zero-padded. Required for 'policy' and "
+                "'inverse_dynamics' modes."
+            ),
+        )
+        add_argument(
+            "--action-fps",
+            type=float,
+            dest="action_fps",
+            help=(
+                "Frame rate used for action token temporal mRoPE positions. "
+                "Defaults to the video fps when not set."
+            ),
+        )
+        add_argument(
             "--moba-config-path",
             type=str,
             help="Path to a JSON file containing V-MoBA specific configurations.",
