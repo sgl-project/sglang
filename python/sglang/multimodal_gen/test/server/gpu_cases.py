@@ -380,6 +380,9 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         run_perf_check=False,
         run_consistency_check=False,
+        # LongCat-Video ships a non-standard diffusers layout that is not yet
+        # supported by the component accuracy harness.
+        run_component_accuracy_check=False,
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(

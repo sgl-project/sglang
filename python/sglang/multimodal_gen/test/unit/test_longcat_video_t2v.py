@@ -1,4 +1,5 @@
 import json
+import sys
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -271,6 +272,53 @@ def test_longcat_registry_does_not_resolve_avatar_variant():
     )
 
     assert info is None
+
+
+def test_longcat_is_excluded_from_component_accuracy_suite(monkeypatch):
+    testcase_configs = import_module(
+        "sglang.multimodal_gen.test.server.testcase_configs"
+    )
+    monkeypatch.setattr(
+        testcase_configs, "_infer_modality_from_model_path", lambda _: "video"
+    )
+    monkeypatch.setattr(
+        testcase_configs,
+        "get_default_sampling_params_for_server_args",
+        lambda _: testcase_configs.T2V_sampling_params,
+    )
+
+    case_module_names = (
+        "sglang.multimodal_gen.test.server.gpu_cases",
+        "sglang.multimodal_gen.test.server.accuracy_testcase_configs",
+    )
+    missing = object()
+    previous_modules = {
+        name: sys.modules.get(name, missing) for name in case_module_names
+    }
+
+    try:
+        for name in case_module_names:
+            sys.modules.pop(name, None)
+
+        gpu_cases = import_module("sglang.multimodal_gen.test.server.gpu_cases")
+        accuracy_cases = import_module(
+            "sglang.multimodal_gen.test.server.accuracy_testcase_configs"
+        )
+
+        longcat_case = next(
+            case for case in gpu_cases.ONE_GPU_CASES if case.id == "longcat_video_t2v"
+        )
+
+        assert longcat_case.run_component_accuracy_check is False
+        assert "longcat_video_t2v" not in {
+            case.id for case in accuracy_cases.ACCURACY_ONE_GPU_CASES
+        }
+    finally:
+        for name, previous_module in previous_modules.items():
+            if previous_module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous_module
 
 
 # --- Error path tests ---
