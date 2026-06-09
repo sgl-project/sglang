@@ -1148,10 +1148,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     os.environ["LOCAL_SIZE"] = str(self.tp_size)
                     torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
 
-                    @torch.library.register_fake("sgl_kernel::shm_allgather")
-                    def _(data, dim):
-                        return torch.cat([data] * self.tp_size, dim=dim)
-
                 else:
                     logger.warning(
                         "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
