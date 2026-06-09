@@ -26,6 +26,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mimo_detector import MiMoDetector, _MiMoStreamingSAX
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -4481,6 +4482,241 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+
+class TestMiMoDetectorStreaming(unittest.TestCase):
+    """
+    Per-token SAX-based streaming in MiMoDetector.
+
+    The detector emits arguments as incremental JSON fragments while the
+    model is still generating. These tests pin three things:
+      1. functional correctness of the streaming fragments,
+      2. that streaming output reassembles to exactly what the one-shot
+         ``detect_and_parse`` produces (alignment), and
+      3. streaming-only failure modes (unknown tool, parser error).
+    """
+
+    def setUp(self):
+        self.write_tool = Tool(
+            type="function",
+            function=Function(
+                name="write",
+                description="Write a file",
+                parameters={
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            ),
+        )
+        self.calc_tool = Tool(
+            type="function",
+            function=Function(
+                name="calc",
+                description="Calculate",
+                parameters={
+                    "properties": {
+                        "shape": {"type": "string"},
+                        "dims": {"type": "object"},
+                        "precision": {"type": "integer"},
+                    }
+                },
+            ),
+        )
+        self.bash_tool = Tool(
+            type="function",
+            function=Function(
+                name="bash",
+                description="Run command",
+                parameters={"properties": {"command": {"type": "string"}}},
+            ),
+        )
+
+    def _collect_streaming(self, chunks, tools):
+        """Feed chunks one by one, accumulating per-tool name/params/text."""
+        detector = MiMoDetector()
+        text = ""
+        tool_calls = {}
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            text += result.normal_text
+            for call in result.calls:
+                idx = call.tool_index
+                if idx is None:
+                    continue
+                tc = tool_calls.setdefault(
+                    idx, {"name": "", "params": "", "chunk_count": 0}
+                )
+                if call.name:
+                    tc["name"] = call.name
+                if call.parameters:
+                    tc["params"] += call.parameters
+                    tc["chunk_count"] += 1
+        return text, tool_calls
+
+    # --- functional behavior -------------------------------------------------
+
+    def test_streaming_per_token_string(self):
+        """A string param is streamed as multiple incremental fragments
+        (not buffered into one), and reassembles to valid JSON."""
+        chunks = [
+            "<tool_call>",
+            "\n<function=write>",
+            "\n<parameter=path>/tmp/test.html</parameter>",
+            "\n<parameter=content>",
+            "<div>",
+            "Hello",
+            " World",
+            "</div>",
+            "</parameter>",
+            "\n</function>",
+            "\n</tool_call>",
+        ]
+        _, tool_calls = self._collect_streaming(chunks, [self.write_tool])
+        self.assertEqual(len(tool_calls), 1)
+        tc = tool_calls[0]
+        self.assertEqual(tc["name"], "write")
+        params = json.loads(tc["params"])
+        self.assertEqual(params["path"], "/tmp/test.html")
+        self.assertEqual(params["content"], "<div>Hello World</div>")
+        # Per-token streaming yields many fragments; the old buffered
+        # implementation would have produced exactly one.
+        self.assertGreater(tc["chunk_count"], 3)
+
+    def test_streaming_deferred_complex_type(self):
+        """object/array params can't be streamed incrementally as valid JSON,
+        so they are buffered until </parameter> and emitted at once."""
+        chunks = [
+            "<tool_call>\n<function=calc>\n<parameter=shape>rect</parameter>",
+            '\n<parameter=dims>{"w": 10, "h": 20}</parameter>',
+            "\n<parameter=precision>2</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+        _, tool_calls = self._collect_streaming(chunks, [self.calc_tool])
+        params = json.loads(tool_calls[0]["params"])
+        self.assertEqual(params["shape"], "rect")
+        self.assertEqual(params["dims"], {"w": 10, "h": 20})
+        self.assertEqual(params["precision"], 2)
+
+    def test_streaming_html_with_angle_brackets(self):
+        """`<`/`>`/`&` inside a string param must not confuse the XML parser
+        even when split across chunk boundaries."""
+        content = (
+            '<!DOCTYPE html><html><body><div class="x">Test &amp; Go'
+            "</div></body></html>"
+        )
+        chunks = [
+            "<tool_call>\n<function=write>\n",
+            "<parameter=path>/tmp/t.html</parameter>\n",
+            "<parameter=content>",
+        ]
+        chunks += [content[i : i + 10] for i in range(0, len(content), 10)]
+        chunks.append("</parameter>\n</function>\n</tool_call>")
+        _, tool_calls = self._collect_streaming(chunks, [self.write_tool])
+        params = json.loads(tool_calls[0]["params"])
+        self.assertEqual(params["content"], content)
+
+    def test_streaming_entity_not_unescaped(self):
+        """HTML entities are preserved verbatim. Guards against re-adding
+        html.unescape(), which would corrupt e.g. ``&current``."""
+        chunks = [
+            "<tool_call>\n<function=write>",
+            "\n<parameter=path>/tmp/e.html</parameter>",
+            "\n<parameter=content>&copy; 2026 &amp; more &current</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+        _, tool_calls = self._collect_streaming(chunks, [self.write_tool])
+        params = json.loads(tool_calls[0]["params"])
+        self.assertEqual(params["content"], "&copy; 2026 &amp; more &current")
+
+    def test_streaming_multi_tool_call(self):
+        """Two consecutive tool calls get distinct tool_index values and the
+        text between them is surfaced as normal_text."""
+        chunks = [
+            "Let me run then write.",
+            "<tool_call>\n<function=bash>",
+            "\n<parameter=command>ls</parameter>",
+            "\n</function>\n</tool_call>",
+            "\n<tool_call>\n<function=write>",
+            "\n<parameter=path>/tmp/f.txt</parameter>",
+            "\n<parameter=content>hi</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+        text, tool_calls = self._collect_streaming(
+            chunks, [self.bash_tool, self.write_tool]
+        )
+        self.assertIn("Let me run then write.", text)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "bash")
+        self.assertEqual(tool_calls[1]["name"], "write")
+        self.assertEqual(json.loads(tool_calls[0]["params"])["command"], "ls")
+        self.assertEqual(json.loads(tool_calls[1]["params"])["content"], "hi")
+
+    # --- alignment: streaming must equal non-streaming -----------------------
+
+    def test_streaming_matches_non_streaming(self):
+        """For a range of inputs and chunk granularities, the reassembled
+        streaming arguments must equal one-shot detect_and_parse output."""
+        tools = [self.write_tool, self.calc_tool, self.bash_tool]
+        cases = [
+            "<tool_call>\n<function=bash>\n<parameter=command>ls -la</parameter>"
+            "\n</function>\n</tool_call>",
+            "text before<tool_call>\n<function=write>\n"
+            "<parameter=path>/a.py</parameter>\n"
+            '<parameter=content>print("hi")\nx = 1</parameter>\n'
+            "</function>\n</tool_call>",
+            "<tool_call>\n<function=calc>\n<parameter=shape>box</parameter>\n"
+            '<parameter=dims>{"w": 1, "h": 2}</parameter>\n'
+            "<parameter=precision>3</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=write>\n<parameter=path>/u.txt</parameter>\n"
+            "<parameter=content>你好 😀 &amp; <b>x</b></parameter>\n"
+            "</function>\n</tool_call>",
+        ]
+        for text in cases:
+            ns = MiMoDetector().detect_and_parse(text, tools)
+            ns_args = {c.name: json.loads(c.parameters) for c in ns.calls}
+            for size in (1, 7, len(text)):  # char-by-char, token-sized, single-shot
+                chunks = [text[i : i + size] for i in range(0, len(text), size)]
+                _, tcs = self._collect_streaming(chunks, tools)
+                st_args = {v["name"]: json.loads(v["params"]) for v in tcs.values()}
+                self.assertEqual(
+                    ns_args,
+                    st_args,
+                    f"alignment mismatch at chunk size {size} for: {text!r}",
+                )
+
+    # --- streaming-only failure modes ----------------------------------------
+
+    def test_streaming_unknown_tool_suppressed(self):
+        """An unknown function name must not surface a tool_call; its raw
+        bytes flow back as normal_text (mirrors detect_and_parse)."""
+        text = (
+            "prefix <tool_call>\n<function=evil_unknown>\n"
+            "<parameter=command>rm -rf /</parameter>\n</function>\n</tool_call>"
+        )
+        chunks = [text[i : i + 1] for i in range(len(text))]
+        normal_text, tool_calls = self._collect_streaming(chunks, [self.bash_tool])
+        self.assertEqual(tool_calls, {})
+        self.assertIn("evil_unknown", normal_text)
+
+    def test_streaming_fail_closed_on_parse_error(self):
+        """If expat raises, the SAX must emit nothing, mark itself completed,
+        and flag suppression so the detector treats consumed bytes as text."""
+
+        class _AlwaysFailExpat:
+            def Parse(self, s, end):
+                import xml.parsers.expat as expat
+
+                raise expat.ExpatError("synthetic parse failure")
+
+        sax = _MiMoStreamingSAX([self.bash_tool])
+        sax._parser = _AlwaysFailExpat()
+        calls = sax.feed_chunk("<tool_call><function=bash><parameter=command>")
+        self.assertEqual(calls, [])
+        self.assertTrue(sax.tool_call_completed)
+        self.assertTrue(sax._tool_call_suppressed)
 
 
 if __name__ == "__main__":
