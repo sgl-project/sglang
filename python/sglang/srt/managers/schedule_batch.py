@@ -1572,7 +1572,7 @@ def _decide_output_process_mode(
     ):
         return OutputProcessMode.DECODE
 
-    if req.scheduled_extend_len >= req.scheduled_extend_len_bound():
+    if req.extend_range.end >= req.get_full_untruncated_fill_len():
         return OutputProcessMode.EXTEND_LAST_CHUNK
     return OutputProcessMode.EXTEND_MIDDLE_CHUNK
 
@@ -1630,7 +1630,7 @@ def _compute_chunked_req_next_prompt_token(
     if chunked_req is None:
         return None
     extend_fill_len = chunked_req.extend_range.end
-    if extend_fill_len >= chunked_req.scheduled_extend_len_bound():
+    if extend_fill_len >= chunked_req.get_full_untruncated_fill_len():
         return None
     fill_ids = chunked_req.get_full_untruncated_fill_ids()
     if extend_fill_len >= len(fill_ids):
