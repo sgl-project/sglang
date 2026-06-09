@@ -1214,6 +1214,8 @@ def _dataset_specific_args(args: argparse.Namespace) -> Dict[str, Any]:
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
         }
+    if args.dataset_name == "mmmu":
+        return {"random_output_len": args.random_output_len}
     if args.dataset_name == "generated-shared-prefix":
         return {
             "gsp_num_groups": args.gsp_num_groups,
@@ -1222,8 +1224,16 @@ def _dataset_specific_args(args: argparse.Namespace) -> Dict[str, Any]:
             "gsp_question_len": args.gsp_question_len,
             "gsp_output_len": args.gsp_output_len,
             "gsp_range_ratio": args.gsp_range_ratio,
+            "gsp_group_distribution": args.gsp_group_distribution,
+            "gsp_zipf_alpha": args.gsp_zipf_alpha,
         }
-    if args.dataset_name in ("sharegpt", "custom"):
+    if args.dataset_name in (
+        "sharegpt",
+        "custom",
+        "autobench",
+        "openai",
+        "longbench_v2",
+    ):
         return {"sharegpt_output_len": args.sharegpt_output_len}
     return {}
 
