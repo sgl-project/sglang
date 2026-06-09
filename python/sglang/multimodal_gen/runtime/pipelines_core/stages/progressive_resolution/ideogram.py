@@ -50,40 +50,26 @@ IDEOGRAM_SPECTRUM_A: float = 203.615097
 IDEOGRAM_SPECTRUM_BETA: float = 1.915461
 
 
-def _resize_llm_features(
+def _adapt_llm_features(
     llm_features: torch.Tensor,
     max_text_tokens: int,
-    orig_grid_h: int,
-    orig_grid_w: int,
-    new_grid_h: int,
-    new_grid_w: int,
+    new_num_image_tokens: int,
 ) -> torch.Tensor:
-    """Bilinearly rescale the image portion of LLM features to a new grid size.
+    """Adapt LLM features to a different image-token count.
 
-    The text encoder (IdeogramQwen3VLTextEncoder) produces features for the
-    full concatenated sequence: [text_tokens | image_tokens].  When the
-    progressive loop starts at a coarser resolution, the image portion of
-    these features must be downsampled to match the initial low-res grid so
-    that llm_features and x=pos_z share the same sequence length inside the
-    DiT forward pass.  On stage transitions, _on_resolution_change calls this
-    again to restore the original full-res features (or any intermediate size).
+    The text encoder produces [text_tokens | image_tokens] features at full-res.
+    For progressive denoising the grid size changes between stages, so the
+    image portion must be resized.  Following the reference Ideogram inference
+    code (run_experiment.py), we keep the text portion intact and use zeros for
+    image positions at the new resolution — the unconditional transformer always
+    receives zero image features anyway, so the model is designed to handle this.
     """
-    if new_grid_h == orig_grid_h and new_grid_w == orig_grid_w:
+    existing_image_tokens = llm_features.shape[1] - max_text_tokens
+    if existing_image_tokens == new_num_image_tokens:
         return llm_features
     B, _T, D = llm_features.shape
-    text_feat = llm_features[:, :max_text_tokens]  # [B, T_text, D]
-    image_feat = llm_features[:, max_text_tokens:]  # [B, orig_H*orig_W, D]
-    # Lay image features out as a spatial map, interpolate, then flatten.
-    image_spatial = image_feat.permute(0, 2, 1).reshape(B, D, orig_grid_h, orig_grid_w)
-    image_spatial = torch.nn.functional.interpolate(
-        image_spatial.float(),
-        size=(new_grid_h, new_grid_w),
-        mode="bilinear",
-        align_corners=False,
-    ).to(llm_features.dtype)
-    image_feat_new = image_spatial.reshape(B, D, new_grid_h * new_grid_w).permute(
-        0, 2, 1
-    )
+    text_feat = llm_features[:, :max_text_tokens]
+    image_feat_new = llm_features.new_zeros(B, new_num_image_tokens, D)
     return torch.cat([text_feat, image_feat_new], dim=1)
 
 
@@ -310,13 +296,12 @@ class Ideogram4ProgressiveDenoisingStage(
             }
         )
 
-        # Resize LLM features to match the new grid so that llm_features and
-        # x=pos_z share the same sequence length in the DiT forward pass.
+        # Adapt LLM features to the new grid: keep text portion, use zeros for
+        # image positions at the new resolution (mirrors run_experiment.py).
         full_res_llm = ctx.extra.get("ideogram4_full_res_llm_features")
         if full_res_llm is not None:
-            orig_grid_h, orig_grid_w = ctx.extra["ideogram4_full_res_grid"]
-            batch.prompt_embeds[0] = _resize_llm_features(
-                full_res_llm, max_text_tokens, orig_grid_h, orig_grid_w, grid_h, grid_w
+            batch.prompt_embeds[0] = _adapt_llm_features(
+                full_res_llm, max_text_tokens, num_image_tokens
             )
 
         logger.info(
@@ -409,18 +394,14 @@ class Ideogram4ProgressiveDenoisingStage(
         # (H_lat // downsample) * latent_scale before calling us, so:
         #   orig_grid_{h,w} = grid_{h,w} * downsample  (downsample = 2^levels)
         full_res_llm = batch.prompt_embeds[0]
-        downsample = 2 ** int(getattr(batch, "progressive_levels", 1))
-        orig_grid_h = grid_h * downsample
-        orig_grid_w = grid_w * downsample
-        batch.prompt_embeds[0] = _resize_llm_features(
-            full_res_llm, max_text_tokens, orig_grid_h, orig_grid_w, grid_h, grid_w
+        batch.prompt_embeds[0] = _adapt_llm_features(
+            full_res_llm, max_text_tokens, num_image_tokens
         )
 
         ctx = Ideogram4DenoisingStage._prepare_denoising_loop(self, batch, server_args)
-        # Persist original LLM features and grid so _on_resolution_change can
-        # restore / resize them when the latent is upsampled.
+        # Persist original LLM features so _on_resolution_change can restore
+        # them (with re-adapted image-token count) when the latent is upsampled.
         ctx.extra["ideogram4_full_res_llm_features"] = full_res_llm
-        ctx.extra["ideogram4_full_res_grid"] = (orig_grid_h, orig_grid_w)
         # Ideogram4Scheduler has no .sigmas attribute; expose the logit-normal
         # schedule_values tensor so stage-transition logic can find the right step.
         ctx.scheduler.sigmas = ctx.extra["ideogram4_schedule_values"]
