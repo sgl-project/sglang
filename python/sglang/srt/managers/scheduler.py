@@ -2445,6 +2445,9 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def stash_chunked_request(self, req: Req):
+        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._assert_reqs_invariants()
         if self.enable_fpm:
@@ -2456,7 +2459,7 @@ class Scheduler(
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             for req in self.dllm_manager.staging_queue:
-                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+                self.stash_chunked_request(req)
 
         for req in self.chunked_reqs():
             # Stash (cache) the previous chunk only when it produced new KV
@@ -2464,7 +2467,7 @@ class Scheduler(
             # leaves extend_range.end == len(prefix_indices), so caching would
             # be a no-op; skip it to avoid a wasted insert pass.
             if req.extend_range.end > len(req.prefix_indices):
-                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+                self.stash_chunked_request(req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
