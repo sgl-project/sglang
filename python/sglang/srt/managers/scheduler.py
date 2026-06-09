@@ -2603,12 +2603,12 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        _chunked_in_active = self.chunked_reqs()
-        assert len(_chunked_in_active) <= 1, (
-            f"single-flight violated: {len(_chunked_in_active)} chunked reqs "
-            f"in active ({[r.rid for r in _chunked_in_active]})"
+        chunked_in_active = self.chunked_reqs()
+        assert len(chunked_in_active) <= 1, (
+            f"single-flight violated: {len(chunked_in_active)} chunked reqs "
+            f"in active ({[r.rid for r in chunked_in_active]})"
         )
-        chunked_req = _chunked_in_active[0] if _chunked_in_active else None
+        chunked_req = chunked_in_active[0] if chunked_in_active else None
 
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
