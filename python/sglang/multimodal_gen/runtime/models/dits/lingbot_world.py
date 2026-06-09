@@ -89,6 +89,18 @@ from sglang.srt.utils import add_prefix
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
+
+def _safe_tensor_version(tensor: torch.Tensor) -> int:
+    """Return ``tensor._version``, or ``0`` for inference-mode tensors.
+
+    Tensors created under ``torch.inference_mode`` do not track a version
+    counter, so reading ``tensor._version`` raises ``RuntimeError``. The value
+    is only used as a cache-invalidation hint for the camera conditioner, so a
+    constant fallback is safe for such tensors.
+    """
+    return 0 if tensor.is_inference() else tensor._version
+
+
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
@@ -977,7 +989,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             c2ws_plucker_emb.dtype,
             c2ws_plucker_emb.device.type,
             c2ws_plucker_emb.device.index,
-            c2ws_plucker_emb._version,
+            _safe_tensor_version(c2ws_plucker_emb),
         )
         if cache.get("source_key") != source_key:
             cache.clear()
@@ -1400,7 +1412,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             c2ws_plucker_emb.dtype,
             c2ws_plucker_emb.device.type,
             c2ws_plucker_emb.device.index,
-            c2ws_plucker_emb._version,
+            _safe_tensor_version(c2ws_plucker_emb),
         )
         if cache.get("source_key") != source_key:
             cache.clear()
