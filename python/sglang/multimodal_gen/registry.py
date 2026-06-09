@@ -777,6 +777,8 @@ def _register_configs():
         sampling_param_cls=LongLive2SamplingParams,
         pipeline_config_cls=LongLive2T2VConfig,
         hf_model_paths=[
+            # Since LongLive-2.0-5B does not have official diffusers release
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
             "Efficient-Large-Model/LongLive-2.0-5B",
         ],
     )
