@@ -208,6 +208,7 @@ class GptOssSparseMoeBlock(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
         self.activation = config.hidden_act
         self.gemm1_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.gemm1_clamp_limit = config.swiglu_limit
@@ -291,7 +292,7 @@ class GptOssSparseMoeBlock(nn.Module):
         # is then trimmed back to the unpadded width so postprocess_layer
         # can pair it with the (M, hidden_dim_unpadded) residual.
         num_tokens = hidden_states.shape[0]
-        hidden_dim_unpadded = self.experts.hidden_size
+        hidden_dim_unpadded = self.hidden_size
         is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
         if is_prepadded:
             router_input = hidden_states[..., :hidden_dim_unpadded]
