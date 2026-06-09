@@ -429,7 +429,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL>
+template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -448,9 +448,9 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
   const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
-  // Last `kRopeSize` lanes own the rope tail; their 4-elem packs cover the
-  // trailing kRopeDim elements.
-  const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+  // V4 ropes the trailing kRopeDim dims (kRopeFirst=false); V3.2 ropes the
+  // leading kRopeDim dims (kRopeFirst=true). Select the owning lanes per layout.
+  const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
 
   const uint32_t total_works = params.batch_size * params.num_heads;
   if (work_id >= total_works) return;
@@ -473,7 +473,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   {
     Storage input_vec;
     input_vec.load(input_ptr, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+    if (is_rope_lane) freq.load(freqs_cis, kRopeFirst ? lane_id : (lane_id - (kWarpThreads - kRopeSize)));
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
       data[i] = cast<float>(input_vec[i]);
@@ -550,10 +550,10 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   }
 }
 
-template <typename DType, bool kUsePDL>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,

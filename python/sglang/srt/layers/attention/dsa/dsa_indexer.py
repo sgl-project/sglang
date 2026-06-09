@@ -101,6 +101,7 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda:
+    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_hadamard_quant
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
 
@@ -386,6 +387,17 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        # Fused q path (CUDA): one kernel for rope + Hadamard + fp8 quant + head-gate
+        # fold. freqs_cis is the complex form of the (interleaved) rope cos/sin cache,
+        # built from the fp32 cache before any forward casts it to bf16.
+        self._indexer_freqs_cis: Optional[torch.Tensor] = None
+        if _is_cuda:
+            c = self.rotary_emb.cos_sin_cache.to(torch.float32)
+            half = c.shape[-1] // 2
+            self._indexer_freqs_cis = torch.complex(
+                c[:, :half].contiguous(), c[:, half:].contiguous()
+            )
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -447,8 +459,6 @@ class Indexer(MultiPlatformOp):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_cuda:
-            return x
         return rotate_activation(x)
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -575,6 +585,54 @@ class Indexer(MultiPlatformOp):
         key = self._maybe_rotate(key)
 
         return key
+
+    def _fused_q_prepare_and_store(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Overlap the q projection (wq_b) with the k norm/rope/store so the GEMM
+        # stays hidden, as the old dual-stream path did.
+        overlap = self.alt_stream is not None
+        if overlap:
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+
+        kw, _ = self.wk_weights_proj(x)
+        key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+        key = self.k_norm(key)
+        k_rope, _ = torch.split(
+            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        key = rotate_activation(key)
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+        )
+
+        if overlap:
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+
+        q_fp8, weights = fused_q_indexer_rope_first_hadamard_quant(
+            q.contiguous(),
+            weights_raw.contiguous(),
+            self.softmax_scale * self.n_heads**-0.5,
+            self._indexer_freqs_cis,
+            positions,
+        )
+        return q_fp8, weights
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -1411,7 +1469,15 @@ class Indexer(MultiPlatformOp):
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
-        if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
+        if (
+            _is_cuda
+            and not is_in_piecewise_cuda_graph()
+            and forward_batch.attn_cp_metadata is None
+        ):
+            q_fp8, weights = self._fused_q_prepare_and_store(
+                x, q_lora, positions, forward_batch, layer_id, act_quant
+            )
+        elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if not _is_cuda:
