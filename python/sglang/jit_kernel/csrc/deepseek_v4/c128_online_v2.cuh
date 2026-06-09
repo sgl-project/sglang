@@ -285,8 +285,7 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
   const uint32_t position = plan.seq_len - 1;
   const uint32_t pos_in_chunk_end = (position % 128u) + 1u;     // exclusive, in [1, 128]
   const uint32_t chunk_offset = pos_in_chunk_end - window_len;  // in [0, 127]
-  const int32_t chunk_start_ragged =
-      static_cast<int32_t>(plan.ragged_id) - static_cast<int32_t>(pos_in_chunk_end) + 1;
+  const int32_t chunk_start_ragged = static_cast<int32_t>(plan.ragged_id) - static_cast<int32_t>(pos_in_chunk_end) + 1;
 
   // --- Stage 1: load kv / score / bias for this warp's 8 chunk positions.
   PrefillStorage kv[kElementsPerWarp];
@@ -799,10 +798,8 @@ inline OnlinePrefillPlan plan_online_prefill(
   }
 
   const auto [num_c, num_w] = _plan_prefill_partial(stage0_params);
-  const auto num_c_padded =
-      use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_c;
-  const auto num_w_padded =
-      use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_w;
+  const auto num_c_padded = use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_c;
+  const auto num_w_padded = use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_w;
 
   if (kGuard) {
     // Verify stage 0 wrote ONLY to the [0, num_c*16) and [0, num_w*16) prefix.
@@ -873,10 +870,8 @@ inline OnlinePrefillPlan plan_online_prefill(
         RuntimeDeviceCheck(::cudaMemcpyAsync(dst, src, bytes, ::cudaMemcpyHostToDevice, stream));
       }
     };
-    if (num_c_padded)
-      copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c_padded);
-    if (num_w_padded)
-      copy_to_device(plan_w_dev_ptr, plan_w_pin.data_ptr(), num_w_padded);
+    if (num_c_padded) copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c_padded);
+    if (num_w_padded) copy_to_device(plan_w_dev_ptr, plan_w_pin.data_ptr(), num_w_padded);
 
     const auto stage1_params = OnlinePrefillStage1Params{
         .plan_c = plan_c_dev_ptr,

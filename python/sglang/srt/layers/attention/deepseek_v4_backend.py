@@ -35,6 +35,7 @@ else:
         create_paged_compressor_data,
     )
 
+from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
@@ -51,7 +52,6 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
@@ -86,6 +86,7 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     if forward_batch.forward_mode.is_idle():
         return forward_batch.forward_mode
     return getattr(forward_batch, "_original_forward_mode", forward_batch.forward_mode)
+
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
 
@@ -432,21 +433,11 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
-        self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
         self.online_c128_mtp = OnlineC128MTPController(self)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
-
-    def _target_verify_lengths_cpu(
-        self, seq_lens_cpu: List[int]
-    ) -> Tuple[List[int], List[int]]:
-        num_draft_tokens = self.speculative_num_draft_tokens
-        return (
-            [int(x) + num_draft_tokens for x in seq_lens_cpu],
-            [num_draft_tokens] * len(seq_lens_cpu),
-        )
 
     def _make_target_verify_c128_metadata(
         self,
@@ -460,7 +451,9 @@ class DeepseekV4AttnBackend(
         if not self.online_c128_mtp.enabled():
             return None
 
-        seq_lens_cpu, extend_lens_cpu = self._target_verify_lengths_cpu(seq_lens_cpu)
+        num_draft_tokens = self.speculative_num_draft_tokens
+        seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
+        extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
         return create_paged_compressor_data(
             compress_ratio=128,
             is_prefill=True,
@@ -685,11 +678,10 @@ class DeepseekV4AttnBackend(
             raise RuntimeError(
                 "target verify cuda graph path requires CPU seq_lens planner inputs"
             )
-        seq_lens_cpu, extend_lens_cpu = self._target_verify_lengths_cpu(seq_lens_cpu)
+        seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
+        extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
         seq_lens_planner = torch.tensor(seq_lens_cpu, dtype=torch.int64)
-        extend_seq_lens_planner = torch.tensor(
-            extend_lens_cpu, dtype=torch.int64
-        )
+        extend_seq_lens_planner = torch.tensor(extend_lens_cpu, dtype=torch.int64)
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
