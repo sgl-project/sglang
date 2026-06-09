@@ -12,7 +12,9 @@ The ImageUpscaler wrapper and integration code are original work.
 import math
 import os
 import time
+from hashlib import sha256
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -27,12 +29,26 @@ logger = init_logger(__name__)
 # Default HuggingFace repo and filename for Real-ESRGAN weights
 _DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
 _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
+_DEFAULT_REALESRGAN_FILENAMES_BY_SCALE = {
+    2: "RealESRGAN_x2.pth",
+    4: "RealESRGAN_x4.pth",
+    8: "RealESRGAN_x8.pth",
+}
 _LOW_MEMORY_TILED_UPSCALE_FREE_BYTES = 2 * 1024**3
 _REALESRGAN_TILE_SIZE = 256
 _REALESRGAN_TILE_PAD = 32
 
 # Module-level cache: model_path -> UpscalerModel instance
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
+_RESOLVED_MODEL_PATH_CACHE: dict[str, str] = {}
+
+
+def _default_model_path_for_scale(scale: int) -> str:
+    filename = _DEFAULT_REALESRGAN_FILENAMES_BY_SCALE.get(
+        int(scale),
+        _DEFAULT_REALESRGAN_FILENAME,
+    )
+    return f"{_DEFAULT_REALESRGAN_HF_REPO}:{filename}"
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +212,17 @@ def _build_net_from_state_dict(state_dict: dict) -> nn.Module:
     if "conv_first.weight" in state_dict:
         # RRDBNet (e.g., RealESRGAN_x4plus)
         num_feat = state_dict["conv_first.weight"].shape[0]
+        in_channels = state_dict["conv_first.weight"].shape[1]
+        if in_channels == 3:
+            scale = 4
+        elif in_channels == 12:
+            scale = 2
+        elif in_channels == 48:
+            scale = 1
+        else:
+            raise ValueError(
+                f"Unsupported RRDBNet conv_first input channels: {in_channels}"
+            )
         num_block = sum(
             1
             for k in state_dict
@@ -203,15 +230,16 @@ def _build_net_from_state_dict(state_dict: dict) -> nn.Module:
         )
         num_grow_ch = state_dict["body.0.rdb1.conv1.weight"].shape[0]
         logger.info(
-            "Detected RRDBNet: num_feat=%d, num_block=%d, num_grow_ch=%d",
+            "Detected RRDBNet: num_feat=%d, num_block=%d, num_grow_ch=%d, scale=%d",
             num_feat,
             num_block,
             num_grow_ch,
+            scale,
         )
         return RRDBNet(
             num_in_ch=3,
             num_out_ch=3,
-            scale=4,
+            scale=scale,
             num_feat=num_feat,
             num_block=num_block,
             num_grow_ch=num_grow_ch,
@@ -544,7 +572,7 @@ class ImageUpscaler:
 
     def _ensure_model_loaded(self) -> UpscalerModel:
         """Download/load Real-ESRGAN weights, detect arch, and cache globally."""
-        model_path = self._model_path or _DEFAULT_REALESRGAN_HF_REPO
+        model_path = self._model_path or _default_model_path_for_scale(self._scale)
 
         # Resolve: local .pth pass-through, or HF repo → download single file
         resolved_path = _resolve_model_path(model_path)
@@ -663,13 +691,38 @@ def _resolve_model_path(model_path: str) -> str:
 
     Accepts:
     - An existing local file path (pass-through).
+    - An http(s) URL to a .pth file, downloaded into the local cache.
     - A HuggingFace ``repo_id`` → downloads the default weight file
       (``RealESRGAN_x4.pth``).
     - A HuggingFace ``repo_id:filename`` → downloads *filename* from *repo_id*,
       allowing users to specify custom weight files hosted on HF.
     """
+    cached_path = _RESOLVED_MODEL_PATH_CACHE.get(model_path)
+    if cached_path is not None:
+        return cached_path
+
     if os.path.isfile(model_path):
+        _RESOLVED_MODEL_PATH_CACHE[model_path] = model_path
         return model_path
+
+    parsed_url = urlparse(model_path)
+    if parsed_url.scheme in ("http", "https"):
+        filename = (
+            os.path.basename(unquote(parsed_url.path)) or _DEFAULT_REALESRGAN_FILENAME
+        )
+        cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "sglang", "realesrgan"
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = sha256(model_path.encode("utf-8")).hexdigest()[:12]
+        local_path = os.path.join(cache_dir, f"{cache_key}-{filename}")
+        if not os.path.isfile(local_path):
+            tmp_path = f"{local_path}.tmp"
+            logger.info("Downloading Real-ESRGAN weights from URL %s", model_path)
+            torch.hub.download_url_to_file(model_path, tmp_path, progress=False)
+            os.replace(tmp_path, local_path)
+        _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
+        return local_path
 
     # Parse optional "repo_id:filename" syntax; fall back to default filename.
     if ":" in model_path and not model_path.startswith("/"):
@@ -704,6 +757,7 @@ def _resolve_model_path(model_path: str) -> str:
             f"'repo_id:filename' format (e.g. 'my-org/my-esrgan:weights.pth'). "
             f"Original error: {e}"
         ) from e
+    _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
     return local_path
 
 

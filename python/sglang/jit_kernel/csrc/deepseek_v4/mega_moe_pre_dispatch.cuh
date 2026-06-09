@@ -155,8 +155,10 @@ struct MegaMoEPreDispatchKernel {
         .with_dtype<float>()
         .with_device(device)
         .verify(topk_weights);
+    // DeepGEMM versions expose this fp8 dispatch buffer either as raw int8
+    // storage or as torch.float8_e4m3fn; the kernel writes fp8 bytes in both.
     TensorMatcher({P, H})  // buf.x
-        .with_dtype<int8_t>()
+        .with_dtype<int8_t, fp8_e4m3_t>()
         .with_device(device)
         .verify(buf_x);
     // buf.x_sf is the contiguous row-major int32 view from DeepGEMM's mega
