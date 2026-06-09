@@ -196,9 +196,9 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -4204,10 +4204,11 @@ class ServerArgs:
                 self.enable_flashinfer_allreduce_fusion = False
 
             # Check sampling backend
-            self.sampling_backend = "pytorch"
-            logger.warning(
-                "Sampling backend is set to pytorch for deterministic inference."
-            )
+            if self.sampling_backend != "ascend":
+                self.sampling_backend = "pytorch"
+                logger.warning(
+                    "Sampling backend is set to pytorch for deterministic inference."
+                )
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
