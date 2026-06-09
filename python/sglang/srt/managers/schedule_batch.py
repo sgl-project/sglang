@@ -1205,10 +1205,8 @@ class Req(ReqDllmMixin):
             self.sampling_params.stop_regex_max_len + 1,
         )
 
-        # Spec decode commits up to num_draft_tokens per step. A stop string can
-        # land mid-chunk (more tokens accepted after it); widen the window by the
-        # newly accepted count so it is still seen, else the fixed tail slides
-        # past it and the stop is missed (over-generation).
+        # Spec decode commits multiple tokens per step; widen the window by the
+        # accepted count so a stop string landing mid-chunk is not skipped.
         tail_len = min(max_len_tail_str + num_new_tokens - 1, len(self.output_ids))
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
