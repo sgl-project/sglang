@@ -58,23 +58,19 @@ def _make_req(output_ids, stop=None, stop_regex=None):
 
 
 class TestStopStrSpeculative(unittest.TestCase):
-    # --- detection ---
-    def test_stop_str_midchunk_finishes(self):
-        req = _make_req(MIDCHUNK, stop=["STOP"])
-        req.update_finish_state(new_accepted_len=6)
-        self.assertTrue(req.finished())
-        self.assertEqual(req.finished_reason.matched, "STOP")
-
-    def test_no_stop_str_does_not_finish(self):
+    def test_no_stop_does_not_finish(self):
         req = _make_req([10, 11, 12, 20, 21, 22, 23, 24], stop=["STOP"])
         req.update_finish_state(new_accepted_len=6)
         self.assertFalse(req.finished())
 
-    # --- _locate_str_stop_finished_len: found-in-loop / fallback / empty loop ---
-    def test_stop_str_midchunk_trims_emit_boundary(self):
-        # Loop match: finished_len just past "STOP" (index 3); 5 trailing tokens dropped.
+    # --- _locate_str_stop_finished_len: loop match / fallback / empty loop / span ---
+    def test_stop_str_midchunk(self):
+        # Loop match: "STOP" (index 3) finishes; finished_len lands just past it,
+        # so the 5 trailing tokens are dropped.
         req = _make_req(MIDCHUNK, stop=["STOP"])
         req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "STOP")
         self.assertEqual(req.finished_len, 4)
 
     def test_stop_str_at_chunk_end_uses_full_len(self):
@@ -86,38 +82,43 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_len, 6)
 
     def test_stop_str_non_spec_single_token(self):
-        # new_accepted_len == 1: locate's range is empty -> fallback. finished_len
-        # is the full length (non-spec behavior preserved, no extra decode).
+        # new_accepted_len == 1: locate's range is empty -> fallback (non-spec
+        # path preserved, no extra decode).
         req = _make_req([10, 11, STOP_ID], stop=["STOP"])
         req.update_finish_state(new_accepted_len=1)
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_len, 3)
 
     def test_stop_str_spanning_two_tokens(self):
-        # "XY" only completes once both tokens (70,71) are decoded -> finished_len
-        # covers both, trailing tokens dropped.
+        # "XY" completes only once both tokens (70, 71) are decoded -> finished_len
+        # covers both; trailing tokens dropped.
         req = _make_req([10, 11, 70, 71, 20, 21], stop=["XY"])
         req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
         self.assertEqual(req.finished_len, 4)
 
-    # --- regex branch (matched() regex path) ---
-    def test_stop_regex_midchunk_trims(self):
+    # --- regex matched() branch ---
+    def test_stop_regex_midchunk(self):
         req = _make_req([10, 11, 70, 71, 20, 21], stop_regex=[r"XY"])
         req.update_finish_state(new_accepted_len=6)
         self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, r"XY")
         self.assertEqual(req.finished_len, 4)
 
     def test_stop_regex_end_anchored_trims_at_first_match(self):
-        # Documents end-anchored ($) over-truncation: text "a.b." matches `\.$` at
-        # the chunk end, but locate scans growing prefixes and stops at the FIRST
-        # period ("a."), so finished_len == 2 and "b." is dropped.
+        # Documents current behavior: text "a.b." matches `\.$` at the chunk end,
+        # but locate scans growing prefixes and stops at the FIRST period ("a."),
+        # so finished_len == 2 and "b." is dropped.
         req = _make_req([60, 61, 62, 63], stop_regex=[r"\.$"])
         req.update_finish_state(new_accepted_len=4)
         self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, r"\.$")
         self.assertEqual(req.finished_len, 2)
 
-    # --- decoded_text-only branch: finishes but does NOT set finished_len ---
+    # --- decoded_text-only branch ---
     def test_stop_str_only_in_decoded_text_sets_no_finished_len(self):
+        # Documents current behavior: when the stop is only in decoded_text (not
+        # the tail), the request finishes but finished_len is left unset.
         req = _make_req([10, 11, 12], stop=["STOP"])  # no STOP in output tokens
         req.decoded_text = "earlier STOP text"
         req.update_finish_state(new_accepted_len=3)
