@@ -215,45 +215,27 @@ class FrozenKVMTPCudaGraphRunner:
         bonus_tokens = buffers.bonus_tokens[:request_bs]
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
-            )
-            global_num_tokens = buffers.global_num_tokens_gpu
-            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
-            global_dp_buffer_len = expanded_bs * self.dp_size
+            global_num_tokens_cpu = [expanded_bs] * self.dp_size
         elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs],
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
+            global_num_tokens_cpu = [expanded_bs]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu,
+                dtype=torch.int32,
+                device=buffers.positions.device,
             )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [expanded_bs],
-                    dtype=torch.int32,
-                    device=buffers.positions.device,
-                )
-            )
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
             global_num_tokens = buffers.global_num_tokens_gpu
             global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
-            global_dp_buffer_len = expanded_bs
         else:
+            global_dp_buffer_len = None
             global_num_tokens = None
             global_num_tokens_for_logprob = None
-            global_dp_buffer_len = None
 
         spec_info = FrozenKVMTPDraftInput(
             topk_p=topk_p,
@@ -288,21 +270,19 @@ class FrozenKVMTPCudaGraphRunner:
         )
 
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 expanded_bs,
                 forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
 
             hidden_states_backup = forward_batch.spec_info.hidden_states
-            ret = self.frozen_kv_mtp_worker.draft_forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            # The capture batch is marked by the capture metadata helper
+            # below, so draft_forward skips its eager plan.
+            ret = self.frozen_kv_mtp_worker.draft_forward(forward_batch)
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
