@@ -51,10 +51,9 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
     transfer_backend_name = "nixl"
     model_name = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
     # mxfp4 gpt-oss with the 512-token eval cap truncates reasoning, so
-    # absolute gsm8k accuracy is low (~0.55). Single pass to keep the manual
-    # run short; multi-turn cache reuse is covered by the cache-hit test.
+    # absolute gsm8k accuracy is low (~0.55), hence the lower min score. The
+    # second gsm8k pass hits the decode radix cache (the reuse correctness check).
     gsm8k_min_score = 0.45
-    gsm8k_num_passes = 1
     extra_prefill_args = SWA_SERVER_ARGS
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",

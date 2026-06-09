@@ -350,9 +350,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
-    # SWA caches expose full-pool sizes via full_*() and make the flat
-    # accessors raise; the SWA-tail budget is tracked separately in the
-    # prealloc loop. These select the full-pool view for SWA, flat otherwise.
+    # SWA caches make the flat size accessors raise and expose full-pool sizes
+    # via full_*() instead; pick the full-pool view for SWA, flat otherwise.
     def _radix_full_evictable(self) -> int:
         if self.scheduler.tp_worker.is_hybrid_swa:
             return self.tree_cache.full_evictable_size()
@@ -367,11 +366,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.scheduler.tp_worker.is_hybrid_swa:
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
-
-    def _release_prefix_lock(self, req: Req) -> None:
-        self.tree_cache.dec_lock_ref(
-            req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
-        )
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -938,11 +932,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self._release_prefix_lock(decode_req.req)
+                    self.tree_cache.dec_lock_ref(
+                        decode_req.req.last_node,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                        ),
+                    )
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self._release_prefix_lock(decode_req.req)
+                    self.tree_cache.dec_lock_ref(
+                        decode_req.req.last_node,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                        ),
+                    )
                 break
 
             if uses_swa_tail_prealloc:
@@ -960,7 +964,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self._release_prefix_lock(decode_req.req)
+                        self.tree_cache.dec_lock_ref(
+                            decode_req.req.last_node,
+                            DecLockRefParams(
+                                swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                            ),
+                        )
                     break
 
             dst_kv_indices = self._pre_alloc(
@@ -1383,11 +1392,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Full-attention layers extend from the (reused) prefix; SWA
                 # layers allocate only the window tail.
                 swa_tail_len = self._swa_tail_len(fill_len)
-                # Tokens before the window have no SWA slot here, so mark them
-                # SWA-evicted: cache_(un)finished_req then inserts them as SWA
-                # tombstones instead of counting phantom swa_evictable tokens
-                # (otherwise the SWA pool accounting leaks). window_start
-                # (fill_len - swa_tail_len) is page-aligned by construction.
+                # Tokens before the window have no SWA slot, so mark them
+                # SWA-evicted: cache_(un)finished_req inserts them as tombstones
+                # instead of phantom swa_evictable tokens (else the SWA pool
+                # leaks). window_start (fill_len - swa_tail_len) is page-aligned.
                 req.swa_evicted_seqlen = max(
                     req.swa_evicted_seqlen, fill_len - swa_tail_len
                 )

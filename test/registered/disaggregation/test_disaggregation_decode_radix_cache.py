@@ -50,7 +50,6 @@ class DisaggregationDecodeRadixCacheTestMixin:
     transfer_backend_name = None
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     gsm8k_min_score = 0.80
-    gsm8k_num_passes = 2
 
     @classmethod
     def setUpClass(cls):
@@ -101,10 +100,8 @@ class DisaggregationDecodeRadixCacheTestMixin:
         self._assert_process_healthy("prefill", self.process_prefill, self.prefill_url)
         self._assert_process_healthy("decode", self.process_decode, self.decode_url)
 
-    def test_gsm8k_accuracy(self):
-        """Run GSM8K (twice by default) to verify decode radix cache does not
-        degrade accuracy. The second pass hits the populated cache, so the
-        pass-to-pass drop check is the cache-correctness signal."""
+    def test_gsm8k_accuracy_two_passes(self):
+        """Run GSM8K twice to verify decode radix cache does not degrade accuracy."""
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
@@ -116,22 +113,23 @@ class DisaggregationDecodeRadixCacheTestMixin:
             num_shots=6,
         )
 
-        scores = []
-        for pass_idx in range(self.gsm8k_num_passes):
-            metrics = run_eval(args)
-            print(f"Pass {pass_idx + 1} metrics: {metrics}")
-            self.assertGreater(metrics["score"], self.gsm8k_min_score)
-            scores.append(metrics["score"])
+        metrics_first = run_eval(args)
+        print(f"First run metrics: {metrics_first}")
 
-        if len(scores) > 1:
-            accuracy_drop = scores[0] - scores[1]
-            self.assertLessEqual(
-                accuracy_drop,
-                0.03,
-                f"Second pass accuracy dropped by {accuracy_drop:.4f} "
-                f"(first={scores[0]:.4f}, second={scores[1]:.4f}), "
-                f"exceeds 3% threshold",
-            )
+        metrics_second = run_eval(args)
+        print(f"Second run metrics: {metrics_second}")
+
+        self.assertGreater(metrics_first["score"], self.gsm8k_min_score)
+        self.assertGreater(metrics_second["score"], self.gsm8k_min_score)
+
+        accuracy_drop = metrics_first["score"] - metrics_second["score"]
+        self.assertLessEqual(
+            accuracy_drop,
+            0.03,
+            f"Second run accuracy dropped by {accuracy_drop:.4f} "
+            f"(first={metrics_first['score']:.4f}, second={metrics_second['score']:.4f}), "
+            f"exceeds 3% threshold",
+        )
 
 
 @unittest.skipUnless(
