@@ -1,6 +1,7 @@
 """Regression: under speculative decoding (multi-token commits) a stop string
-committed mid-chunk must still trigger the finish check, else the request
-over-generates. Drives the real `Req.update_finish_state`; pure CPU."""
+committed mid-chunk must (1) trigger the finish check and (2) set finished_len so
+the emitted output is trimmed at the stop, not leaking tokens accepted after it.
+Drives the real `Req.update_finish_state`; pure CPU."""
 
 import unittest
 from array import array
@@ -49,6 +50,13 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.update_finish_state(new_accepted_len=6)
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, "STOP")
+
+    def test_stop_str_midchunk_trims_emit_boundary(self):
+        # finished_len points just past "STOP" (index 3), so the 5 tokens
+        # accepted after it are not emitted.
+        req = _make_req(MIDCHUNK, stop=["STOP"])
+        req.update_finish_state(new_accepted_len=6)
+        self.assertEqual(req.finished_len, 4)
 
     def test_no_stop_str_does_not_finish(self):
         req = _make_req([10, 11, 12, 20, 21, 22, 23, 24], stop=["STOP"])
