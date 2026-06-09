@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -352,9 +351,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.DEEP_GEMM
 
 
-_SGLANG_MOE_CONTIGUOUS_GEMM = bool(
-    int(os.environ.get("SGLANG_MOE_CONTIGUOUS_GEMM", "0"))
-)
+_SGLANG_MOE_CONTIGUOUS_GEMM = get_bool_env_var("SGLANG_MOE_CONTIGUOUS_GEMM")
 
 
 @register_pre_permute("standard", "deep_gemm")

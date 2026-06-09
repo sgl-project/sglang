@@ -1136,16 +1136,12 @@ def moe_ep_deepgemm_preprocess_contiguous(
     num_tokens = hidden_states.shape[0]
     K = hidden_states.shape[1]
 
-    num_tokens_per_expert = torch.zeros(
-        num_local_experts, device=topk_ids.device, dtype=torch.int32
-    )
-    flat_ids = topk_ids.view(-1)
+    flat_ids = topk_ids.reshape(-1)
     valid_mask = flat_ids >= 0
     valid_ids = flat_ids[valid_mask]
-    if valid_ids.numel() > 0:
-        num_tokens_per_expert.scatter_add_(
-            0, valid_ids.to(torch.int64), torch.ones_like(valid_ids, dtype=torch.int32)
-        )
+    num_tokens_per_expert = torch.bincount(
+        valid_ids, minlength=num_local_experts
+    )[:num_local_experts].to(torch.int32)
 
     aligned_per_expert = (
         (num_tokens_per_expert + EXPERT_ALIGNMENT - 1)
