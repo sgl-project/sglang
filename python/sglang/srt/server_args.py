@@ -1839,6 +1839,17 @@ class ServerArgs:
                 # sparse attention is accuracy-sensitive, so default to native
                 # Apex RoPE unless the user explicitly opts back into AITER.
                 os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
+                if (
+                    self.ep_size > 1
+                    and self.moe_a2a_backend == "none"
+                    and self.enable_aiter_allreduce_fusion
+                ):
+                    logger.warning(
+                        "Disable --enable-aiter-allreduce-fusion for MiniMax-M3 "
+                        "standard EP on ROCm because the deferred fused all-reduce "
+                        "corrupts sparse MoE partial outputs."
+                    )
+                    self.enable_aiter_allreduce_fusion = False
                 if not self.enable_aiter_allreduce_fusion:
                     self.disable_custom_all_reduce = True
 

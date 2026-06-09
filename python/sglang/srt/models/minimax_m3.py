@@ -1268,6 +1268,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch
             )
         )
+        if (
+            _is_hip
+            and self.is_layer_sparse
+            and get_moe_a2a_backend().is_none()
+            and get_moe_expert_parallel_world_size() > 1
+        ):
+            # Standard EP computes partial expert outputs on each rank and
+            # needs the normal immediate all-reduce in MiniMaxM3MoE.forward_normal.
+            # The deferred AITER all-reduce fusion corrupts those sparse partials.
+            should_allreduce_fusion = False
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch

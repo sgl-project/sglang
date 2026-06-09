@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Native MXFP8 (1x32 block, E8M0 scale) MoE for AMD CDNA4 (gfx950).
 
 Replaces the prior SGLang MXFP8 MoE family (dense / hybrid / packed /
@@ -15,6 +13,8 @@ gather, a materialized intermediate, a separate activation quant, and a
   * GEMM2 applies the top-k weight inside the kernel and writes each route to a
     distinct output row (no atomics); the final reduction is a strided sum.
 """
+
+from __future__ import annotations
 
 import os
 from typing import Optional
@@ -44,6 +44,7 @@ def _mxfp8_grouped_gemm_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    E,
     N,
     K,
     num_valid_tokens,
@@ -76,6 +77,7 @@ def _mxfp8_grouped_gemm_kernel(
     offs_token = tl.load(sorted_token_ids_ptr + offs_tid).to(tl.int64)
     token_mask = offs_token < num_valid_tokens
     off_e = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    valid_expert = (off_e >= 0) & (off_e < E)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
@@ -101,9 +103,9 @@ def _mxfp8_grouped_gemm_kernel(
     n_mask = offs_n < N
     for _ in range(0, tl.cdiv(K, BLOCK_K)):
         a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
-        b = tl.load(b_ptrs, mask=n_mask[:, None], other=0.0)
+        b = tl.load(b_ptrs, mask=valid_expert & n_mask[:, None], other=0.0)
         asc = tl.load(as_ptrs, mask=token_mask[:, None], other=0)
-        bsc = tl.load(bs_ptrs, mask=n_mask[:, None], other=0)
+        bsc = tl.load(bs_ptrs, mask=valid_expert & n_mask[:, None], other=0)
         acc += tl.dot_scaled(a, asc, "e4m3", b.T, bsc, "e4m3")
 
         a_ptrs += BLOCK_K * stride_ak
@@ -162,6 +164,7 @@ def _grouped_gemm_mxfp8(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        E,
         N,
         K,
         num_valid_tokens,
@@ -252,13 +255,14 @@ def fused_moe_mxfp8_native(
     w2: torch.Tensor,  # [E, H, I] fp8
     w2_scale: torch.Tensor,  # [E, H, I//32] uint8
     topk_weights: torch.Tensor,  # [T, top_k]
-    topk_ids: torch.Tensor,  # [T, top_k] (local expert ids)
+    topk_ids: torch.Tensor,  # [T, top_k] (local expert ids; -1 for non-local EP)
     *,
     alpha: float,
     beta: float,
     limit: Optional[float],
     global_num_experts: int,
     no_combine: bool = False,
+    expert_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Lazy import: the jit_kernel package pulls in Triton at first use; importing
     # at call time avoids any import-time cycle with the moe runner package.
@@ -267,10 +271,23 @@ def fused_moe_mxfp8_native(
     T, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     M = T * top_k
+    local_num_experts = w13.shape[0]
+
+    if expert_map is not None:
+        valid_global = (topk_ids >= 0) & (topk_ids < expert_map.numel())
+        topk_ids = expert_map[topk_ids.clamp(0, expert_map.numel() - 1).long()].to(
+            torch.int32
+        )
+        topk_ids.masked_fill_(
+            ~valid_global | (topk_ids < 0) | (topk_ids >= local_num_experts), -1
+        )
+    else:
+        topk_ids = topk_ids.to(torch.int32, copy=True)
+        topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
 
     block_m = 64
     sorted_ids, expert_ids, num_post = moe_align_block_size(
-        topk_ids, block_m, global_num_experts
+        topk_ids, block_m, local_num_experts
     )
 
     # GEMM1: x (mxfp8) @ w13^T -> [M, 2I]. The activation is quantized ONCE over
@@ -364,6 +381,7 @@ def fused_experts_mxfp8(
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
     interleaved: bool = True,
+    expert_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Native MXFP8 MoE entry (CDNA4 ``dot_scaled``).
 
@@ -410,6 +428,7 @@ def fused_experts_mxfp8(
         limit=limit,
         global_num_experts=num_experts,
         no_combine=no_combine,
+        expert_map=expert_map,
     )
 
     if no_combine:

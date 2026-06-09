@@ -137,6 +137,8 @@ def _ref_moe(x, w13, w2, topk_weights, topk_ids, alpha, beta, limit):
     for t in range(T):
         for j in range(top_k):
             e = int(topk_ids[t, j].item())
+            if e < 0 or e >= w13.shape[0]:
+                continue
             g1 = x[t].float() @ w13[e].float().T  # [2I]
             gate = g1[:inter]
             up = g1[inter:]
@@ -189,6 +191,66 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
     w13_deq = dequant_mxfp8_to_bf16(w13_fp8, w13_scale)
     w2_deq = dequant_mxfp8_to_bf16(w2_fp8, w2_scale)
     ref = _ref_moe(x, w13_deq, w2_deq, topk_weights, topk_ids, alpha, beta, limit)
+    assert got.shape == (T, H)
+    assert _relerr(got, ref) < 5e-2
+
+
+@requires_gfx950
+@torch.inference_mode()
+def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
+    from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe import (
+        fused_moe_mxfp8_native,
+    )
+
+    torch.manual_seed(0)
+    T, H, inter = 4, 256, 512
+    local_E, global_E = 3, 6
+    alpha, beta, limit = 1.702, 1.0, 7.0
+
+    w13_bf16 = (
+        torch.randn(local_E, 2 * inter, H, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    )
+    w2_bf16 = torch.randn(local_E, H, inter, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    w13_fp8, w13_scale = _mxfp8_e4m3_quantize_torch(w13_bf16)
+    w2_fp8, w2_scale = _mxfp8_e4m3_quantize_torch(w2_bf16)
+
+    x = torch.randn(T, H, device=DEVICE, dtype=torch.bfloat16) * 0.5
+    topk_ids_global = torch.tensor(
+        [[0, 1, 4], [2, 3, 5], [4, 0, 3], [5, 1, 2]],
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.50, 0.25, 0.25],
+            [0.40, 0.30, 0.30],
+            [0.70, 0.20, 0.10],
+            [0.60, 0.30, 0.10],
+        ],
+        device=DEVICE,
+        dtype=torch.float32,
+    )
+    expert_map = torch.tensor([0, -1, 1, -1, 2, -1], device=DEVICE, dtype=torch.int32)
+
+    got = fused_moe_mxfp8_native(
+        x,
+        w13_fp8,
+        w13_scale,
+        w2_fp8,
+        w2_scale,
+        topk_weights,
+        topk_ids_global,
+        alpha=alpha,
+        beta=beta,
+        limit=limit,
+        global_num_experts=global_E,
+        expert_map=expert_map,
+    )
+
+    topk_ids_local = expert_map[topk_ids_global.long()]
+    w13_deq = dequant_mxfp8_to_bf16(w13_fp8, w13_scale)
+    w2_deq = dequant_mxfp8_to_bf16(w2_fp8, w2_scale)
+    ref = _ref_moe(x, w13_deq, w2_deq, topk_weights, topk_ids_local, alpha, beta, limit)
     assert got.shape == (T, H)
     assert _relerr(got, ref) < 5e-2
 
