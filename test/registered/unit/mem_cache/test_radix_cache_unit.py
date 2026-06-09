@@ -26,6 +26,7 @@ register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 import random
 import time
+import types
 import unittest
 import unittest.mock
 from array import array
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
@@ -321,6 +323,57 @@ class TestTreeNode(unittest.TestCase):
 
         self.assertTrue(node1 < node2)
         self.assertFalse(node2 < node1)
+
+
+class TestHiRadixCacheLoadBack(unittest.TestCase):
+    """Regression tests for HiRadix load-back host-page lifetime handling."""
+
+    def setUp(self):
+        """Reset the node id counter before each test."""
+        TreeNode.counter = 0
+
+    def test_load_back_survives_host_value_clear_during_load(self):
+        """Load-back uses a host-value snapshot until device restore completes."""
+        cache = object.__new__(HiRadixCache)
+        cache.load_back_threshold = 1
+        cache.evictable_host_leaves = set()
+        cache.evictable_size_ = 0
+        cache.metrics_collector = None
+        cache.ongoing_load_back = {}
+        cache.inc_lock_ref = lambda node: types.SimpleNamespace(delta=0)
+        cache.dec_lock_ref = lambda node: None
+        cache.evict = lambda params: None
+        cache._get_extra_pools = lambda: {}
+        cache._record_store_event = lambda *args, **kwargs: None
+        cache._update_host_leaf_status = lambda node: None
+
+        root = TreeNode()
+        root.key = RadixKey(array("q", []))
+        root.value = torch.empty(0, dtype=torch.int64)
+
+        ancestor = TreeNode()
+        ancestor.parent = root
+        ancestor.key = RadixKey(array("q", [1]))
+        ancestor.value = torch.tensor([1], dtype=torch.int64)
+
+        child = TreeNode()
+        child.parent = ancestor
+        child.key = RadixKey(array("q", [2, 3, 4]))
+        child.value = None
+        child.host_value = torch.tensor([10, 11, 12], dtype=torch.int64)
+
+        def load_and_clear_host(**kwargs):
+            child.host_value = None
+            return torch.tensor([20, 21, 22], dtype=torch.int64)
+
+        cache.cache_controller = types.SimpleNamespace(load=load_and_clear_host)
+
+        loaded = cache.load_back(child)
+
+        self.assertTrue(torch.equal(loaded, torch.tensor([20, 21, 22])))
+        self.assertTrue(torch.equal(child.value, torch.tensor([20, 21, 22])))
+        self.assertEqual(child.host_ref_counter, 0)
+        self.assertIn(child.id, cache.ongoing_load_back)
 
 
 class TestRadixCache(unittest.TestCase):
