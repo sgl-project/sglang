@@ -88,6 +88,65 @@ def _ideogram4_pack(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(B, C, H * W).permute(0, 2, 1)
 
 
+def _build_ideogram4_seq_tensors(
+    data: dict,
+    grid_h: int,
+    grid_w: int,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build full-sequence position_ids, segment_ids, indicator for a grid.
+
+    Keeps the text prefix from data unchanged and appends new image-token rows.
+    Returns (position_ids, segment_ids, indicator), each shaped [B, T+S, ...].
+    """
+    max_text_tokens = data["max_text_tokens"]
+    num_image_tokens = grid_h * grid_w
+    h_idx = (
+        torch.arange(grid_h, device=device)
+        .view(-1, 1)
+        .expand(grid_h, grid_w)
+        .reshape(-1)
+    )
+    w_idx = (
+        torch.arange(grid_w, device=device)
+        .view(1, -1)
+        .expand(grid_h, grid_w)
+        .reshape(-1)
+    )
+    image_pos = (
+        torch.stack([torch.zeros_like(h_idx), h_idx, w_idx], dim=1)
+        + IMAGE_POSITION_OFFSET
+    )
+    position_ids = torch.cat(
+        [
+            data["position_ids"][:, :max_text_tokens],
+            image_pos.unsqueeze(0).expand(batch_size, -1, -1),
+        ],
+        dim=1,
+    )
+    segment_ids = torch.cat(
+        [
+            data["segment_ids"][:, :max_text_tokens],
+            torch.ones(batch_size, num_image_tokens, dtype=torch.long, device=device),
+        ],
+        dim=1,
+    )
+    indicator = torch.cat(
+        [
+            data["indicator"][:, :max_text_tokens],
+            torch.full(
+                (batch_size, num_image_tokens),
+                OUTPUT_IMAGE_INDICATOR,
+                dtype=torch.long,
+                device=device,
+            ),
+        ],
+        dim=1,
+    )
+    return position_ids, segment_ids, indicator
+
+
 class Ideogram4ProgressiveDenoisingStage(
     ProgressiveDenoisingStage, Ideogram4DenoisingStage
 ):
@@ -213,6 +272,9 @@ class Ideogram4ProgressiveDenoisingStage(
         the upsampled resolution.  Patches batch.extra["ideogram4"] and ctx.extra
         in-place so that _run_denoising_step sees correctly-sized tensors.
         """
+        if ctx.cfg_policy is None:
+            return
+
         cfg = server_args.pipeline_config
         patch = cfg.patch_size * cfg.ae_scale_factor  # 16
         grid_h = new_h_pixel // patch
@@ -224,53 +286,8 @@ class Ideogram4ProgressiveDenoisingStage(
         batch_size = ctx.latents.shape[0]
         device = ctx.latents.device
 
-        # Build new image position IDs for the upsampled grid.
-        h_idx = (
-            torch.arange(grid_h, device=device)
-            .view(-1, 1)
-            .expand(grid_h, grid_w)
-            .reshape(-1)
-        )
-        w_idx = (
-            torch.arange(grid_w, device=device)
-            .view(1, -1)
-            .expand(grid_h, grid_w)
-            .reshape(-1)
-        )
-        image_pos = (
-            torch.stack([torch.zeros_like(h_idx), h_idx, w_idx], dim=1)
-            + IMAGE_POSITION_OFFSET
-        )  # [S_new, 3]
-
-        # Grow full-sequence tensors: the text portion (first max_text_tokens
-        # positions) is invariant; only the image tail changes size.
-        new_position_ids = torch.cat(
-            [
-                data["position_ids"][:, :max_text_tokens],  # [B, T, 3]
-                image_pos.unsqueeze(0).expand(batch_size, -1, -1),  # [B, S_new, 3]
-            ],
-            dim=1,
-        )
-        new_segment_ids = torch.cat(
-            [
-                data["segment_ids"][:, :max_text_tokens],  # [B, T]
-                torch.ones(
-                    batch_size, num_image_tokens, dtype=torch.long, device=device
-                ),
-            ],
-            dim=1,
-        )
-        new_indicator = torch.cat(
-            [
-                data["indicator"][:, :max_text_tokens],  # [B, T]
-                torch.full(
-                    (batch_size, num_image_tokens),
-                    OUTPUT_IMAGE_INDICATOR,
-                    dtype=torch.long,
-                    device=device,
-                ),
-            ],
-            dim=1,
+        new_position_ids, new_segment_ids, new_indicator = _build_ideogram4_seq_tensors(
+            data, grid_h, grid_w, batch_size, device
         )
         new_attn_mask = new_segment_ids > 0
 
@@ -349,49 +366,8 @@ class Ideogram4ProgressiveDenoisingStage(
         device = data["position_ids"].device
         batch_size = data["position_ids"].shape[0]
 
-        h_idx = (
-            torch.arange(grid_h, device=device)
-            .view(-1, 1)
-            .expand(grid_h, grid_w)
-            .reshape(-1)
-        )
-        w_idx = (
-            torch.arange(grid_w, device=device)
-            .view(1, -1)
-            .expand(grid_h, grid_w)
-            .reshape(-1)
-        )
-        image_pos = (
-            torch.stack([torch.zeros_like(h_idx), h_idx, w_idx], dim=1)
-            + IMAGE_POSITION_OFFSET
-        )
-        data["position_ids"] = torch.cat(
-            [
-                data["position_ids"][:, :max_text_tokens],
-                image_pos.unsqueeze(0).expand(batch_size, -1, -1),
-            ],
-            dim=1,
-        )
-        data["segment_ids"] = torch.cat(
-            [
-                data["segment_ids"][:, :max_text_tokens],
-                torch.ones(
-                    batch_size, num_image_tokens, dtype=torch.long, device=device
-                ),
-            ],
-            dim=1,
-        )
-        data["indicator"] = torch.cat(
-            [
-                data["indicator"][:, :max_text_tokens],
-                torch.full(
-                    (batch_size, num_image_tokens),
-                    OUTPUT_IMAGE_INDICATOR,
-                    dtype=torch.long,
-                    device=device,
-                ),
-            ],
-            dim=1,
+        data["position_ids"], data["segment_ids"], data["indicator"] = (
+            _build_ideogram4_seq_tensors(data, grid_h, grid_w, batch_size, device)
         )
         data["num_image_tokens"] = num_image_tokens
         data["grid_h"] = grid_h
