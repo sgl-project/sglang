@@ -62,6 +62,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
+    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
 logger = logging.getLogger(__name__)
@@ -572,9 +573,9 @@ class DeepseekV2WeightLoaderMixin:
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
-                and self.config.architectures
-                and self.config.architectures[0]
-                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
+                # Only post-process if quark actually quantized to mxfp4
+                # If kv_b_proj gets UnquantizedLinearMethod, it must be skipped.
+                and isinstance(self_attn.kv_b_proj.quant_method, QuarkLinearMethod)
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
