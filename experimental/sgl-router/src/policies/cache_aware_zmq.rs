@@ -360,6 +360,7 @@ mod tests {
                 policy: crate::config::PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                sticky: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
