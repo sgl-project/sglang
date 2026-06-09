@@ -120,10 +120,8 @@ v0.5.10 or a later version.
 5. 上方表格中的3行仅为格式示例，生成时应删除示例行并替换为完整的特性列表
 */}
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 {/* INSTRUCTION: 特性组合兼容性说明，保持不变即可。 */}
 
@@ -174,18 +172,13 @@ For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/as
 
 {/* INSTRUCTION: 版本说明，保持不变。 */}
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
-{/* INSTRUCTION: 挂载说明，保持不变。 */}
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -220,7 +213,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -243,6 +236,12 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
   </Tab>
 </Tabs>
+
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
 
 {/* INSTRUCTION: Docker 镜像和容器命令规则
 
@@ -280,6 +279,11 @@ with limited hardware resources. The following command is based on the W4A8 quan
 */}
 
 ```bash Launch server
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -308,7 +312,7 @@ export HCCL_BUFFSIZE=1600
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
@@ -340,9 +344,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
   如果匹配不到任何 Mixed Mode 配置，参见本章节开头的条件指令处理
 */}
 
-<Tip>
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
-</Tip>
 
 {/* INSTRUCTION: FAQ 引用，保持不变。 */}
 
@@ -368,6 +370,16 @@ The prefill node and decode node will each run on one Atlas 800I A3.
 1. Run the following command on both prefill and decode nodes.
 
 ```bash Prefill node
+#============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port (e.g., tcp://192.168.1.1:24667)
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME (decode section): network interface name for HCCL
+#   GLOO_SOCKET_IFNAME (decode section): network interface name for Gloo
+#============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -386,13 +398,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24667"
+P_IP=(<your prefill ip>)
+D_IP=(<your decode ip>)
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24667"
 
-P_IP=('your prefill ip1')
-
-D_IP=('your decode ip1')
-
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
@@ -457,11 +467,17 @@ done
 2. Launch the SGLang Router (on any reachable node):
 
 ```bash Router
+#============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+#============================================================
+
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -594,9 +610,7 @@ For complete optimal configurations with deployment scripts and benchmark comman
 保留所有匹配行，不做删减。上方的8行示例为 DeepSeek-R1 的数据，生成时应全部替换为目标模型的数据。
 */}
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 {/* INSTRUCTION: 表头字段说明，保持不变。 */}
 
