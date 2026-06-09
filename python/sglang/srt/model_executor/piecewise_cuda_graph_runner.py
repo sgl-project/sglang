@@ -61,12 +61,16 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
+    is_hip,
     is_musa,
     is_npu,
     log_info_on_rank0,
     require_gathered_buffer,
 )
 
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
@@ -280,21 +284,32 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with enable_piecewise_cuda_graph_compile():
-                    compile_range = (
-                        tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                        if get_tensor_model_parallel_rank() == 0
-                        else reversed(self.capture_num_tokens)
-                    )
-                    for _, num_tokens in enumerate(compile_range):
-                        if get_tensor_model_parallel_rank() == 0:
-                            compile_range.set_description(
-                                f"Compiling num tokens ({num_tokens=})"
-                            )
-                        self.warmup_compile(num_tokens=num_tokens)
+                if _is_hip:
+                    # AMD: single Dynamo trace is sufficient; the capture
+                    # phase does per-shape JIT kernel warmup before each
+                    # CUDA graph recording.  The N-iteration loop is
+                    # redundant and extremely slow on ROCm (~30 min).
+                    with enable_piecewise_cuda_graph_compile():
+                        self.warmup_compile(num_tokens=self.capture_num_tokens[-1])
+                else:
+                    with enable_piecewise_cuda_graph_compile():
+                        compile_range = (
+                            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                            if get_tensor_model_parallel_rank() == 0
+                            else reversed(self.capture_num_tokens)
+                        )
+                        for _, num_tokens in enumerate(compile_range):
+                            if get_tensor_model_parallel_rank() == 0:
+                                compile_range.set_description(
+                                    f"Compiling num tokens ({num_tokens=})"
+                                )
+                            self.warmup_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
+
+                if _use_aiter:
+                    self._pre_warm_aiter_chip_info()
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
@@ -302,6 +317,41 @@ class PiecewiseCudaGraphRunner:
                 self.capture()
 
         self.raw_num_tokens = 0
+
+    _aiter_chip_info_cached = False
+
+    @classmethod
+    def _pre_warm_aiter_chip_info(cls):
+        """Pre-populate aiter chip info env vars before CUDA graph capture.
+
+        aiter's get_cu_num_custom_op and get_gfx_custom_op call
+        subprocess.run(rocminfo) to query GPU info. During CUDA graph capture
+        the GPU context is locked, so rocminfo hangs indefinitely. Pre-calling
+        them here caches the results as environment variables so the subprocess
+        is never invoked during capture. Only runs once per process.
+        """
+        if cls._aiter_chip_info_cached:
+            return
+        cls._aiter_chip_info_cached = True
+
+        import os
+
+        try:
+            from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+            if not os.environ.get("CU_NUM"):
+                cu_num = get_cu_num()
+                os.environ["CU_NUM"] = str(cu_num)
+                logger.info(f"Pre-warmed aiter CU_NUM={cu_num}")
+
+            if not os.environ.get("GPU_ARCHS"):
+                gfx = get_gfx()
+                os.environ["GPU_ARCHS"] = gfx
+                logger.info(f"Pre-warmed aiter GPU_ARCHS={gfx}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm aiter chip info: {e}")
 
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
@@ -723,6 +773,8 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_num_tokens = len(static_forward_batch.input_ids)
+            raw_num_tokens = self.raw_num_tokens
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -731,6 +783,8 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
+                num_tokens=static_num_tokens,
+                raw_num_tokens=raw_num_tokens,
             ):
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
