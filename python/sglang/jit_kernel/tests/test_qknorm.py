@@ -3,7 +3,6 @@ import sys
 
 import pytest
 import torch
-import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -72,8 +71,15 @@ BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
 N_K_LIST = get_ci_test_range([2, 4], [2, 4])
 N_Q_LIST = get_ci_test_range([8, 16], [8, 16])
 HEAD_DIM_LIST = get_ci_test_range([64, 128, 256, 512, 1024], [64, 256, 1024])
-DEVICE = "cuda"
 DTYPE = torch.bfloat16
+
+# Determine device: prefer XPU if available, otherwise CUDA
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = "xpu"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = None
 
 # NOTE(dark): sgl_kernel use flashinfer template, which is bitwise identical to flashinfer impl.
 # However, sgl-jit-kernel, flashinfer, torch_impl, may have small numerical differences.
@@ -85,16 +91,22 @@ DTYPE = torch.bfloat16
     list(itertools.product(BS_LIST, N_K_LIST, N_Q_LIST, HEAD_DIM_LIST)),
 )
 def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     q = torch.randn(batch_size, n_q, head_dim, device=DEVICE, dtype=DTYPE)
     k = torch.randn(batch_size, n_k, head_dim, device=DEVICE, dtype=DTYPE)
     q_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
     k_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
-    q_k_aot = (q.clone(), k.clone())
     q_k_jit = (q.clone(), k.clone())
-    sglang_aot_qknorm(q_k_aot[0], q_k_aot[1], q_weight, k_weight)
+    q_k_ref = (q.clone(), k.clone())
     sglang_jit_qknorm(q_k_jit[0], q_k_jit[1], q_weight, k_weight)
-    triton.testing.assert_close(q_k_aot[0], q_k_jit[0], atol=1e-2, rtol=1e-2)
-    triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
+    if DEVICE == "xpu":
+        torch_impl_qknorm(q_k_ref[0], q_k_ref[1], q_weight, k_weight)
+    else:
+        sglang_aot_qknorm(q_k_ref[0], q_k_ref[1], q_weight, k_weight)
+    torch.testing.assert_close(q_k_jit[0], q_k_ref[0], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(q_k_jit[1], q_k_ref[1], atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
