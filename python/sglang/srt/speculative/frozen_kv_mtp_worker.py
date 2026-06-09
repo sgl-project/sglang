@@ -71,6 +71,7 @@ from sglang.srt.speculative.spec_utils import (
     fast_topk,
     generate_token_bitmask,
     select_top_k_tokens,
+    spec_stage_span,
 )
 from sglang.srt.utils import empty_context
 from sglang.srt.utils.async_probe import (
@@ -83,8 +84,8 @@ logger = logging.getLogger(__name__)
 
 
 class FrozenKVMTPWorker(TpModelWorker):
-    """Frozen-KV MTP worker; same constructor shape as EAGLEWorker. Entry:
-    :meth:`forward_batch_generation` (stubs for now).
+    """Frozen-KV MTP worker; same constructor shape as other TpModelWorker-based
+    spec workers. Entry: :meth:`forward_batch_generation` (stubs for now).
     """
 
     def __init__(
@@ -414,6 +415,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 self.draft_tp_context(self.draft_model_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 self.forward_draft_extend(
                     batch,
@@ -434,6 +436,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft"),
         ):
             verify_input = self.draft(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
@@ -465,7 +468,8 @@ class FrozenKVMTPWorker(TpModelWorker):
                 # step; `_run_assistant_seed_step` replaces it with a fresh
                 # `FrozenKVMTPDraftInput` for next iter.
                 batch.spec_info = draft_extend_input
-                self.forward_draft_extend_after_decode(batch)
+                with spec_stage_span("draft_extend"):
+                    self.forward_draft_extend_after_decode(batch)
             else:
                 # All reqs finished and dp_attention isn't forcing extend.
                 # Install an idle FrozenKVMTPDraftInput so next iter's scheduler
