@@ -289,10 +289,75 @@ class Ideogram4ProgressiveDenoisingStage(
     def _prepare_denoising_loop(
         self, batch: Req, server_args: ServerArgs
     ) -> DenoisingContext:
+        # ProgressiveDenoisingStage.forward() overrides batch.height/width to
+        # the initial low-res pixel dimensions before calling this method.
+        # batch.extra["ideogram4"] was built by the text-encoding stage at the
+        # full-res grid size, so we must resize position_ids / segment_ids /
+        # indicator / num_image_tokens to match the low-res grid BEFORE calling
+        # Ideogram4DenoisingStage._prepare_denoising_loop, which reads them to
+        # build the negative tensors, attn masks, and neg_llm_features.
+        cfg = server_args.pipeline_config
+        patch = cfg.patch_size * cfg.ae_scale_factor  # 16
+        grid_h = batch.height // patch
+        grid_w = batch.width // patch
+        num_image_tokens = grid_h * grid_w
+
+        data = batch.extra["ideogram4"]
+        max_text_tokens = data["max_text_tokens"]
+        device = data["position_ids"].device
+        batch_size = data["position_ids"].shape[0]
+
+        h_idx = (
+            torch.arange(grid_h, device=device)
+            .view(-1, 1)
+            .expand(grid_h, grid_w)
+            .reshape(-1)
+        )
+        w_idx = (
+            torch.arange(grid_w, device=device)
+            .view(1, -1)
+            .expand(grid_h, grid_w)
+            .reshape(-1)
+        )
+        image_pos = (
+            torch.stack([torch.zeros_like(h_idx), h_idx, w_idx], dim=1)
+            + IMAGE_POSITION_OFFSET
+        )
+        data["position_ids"] = torch.cat(
+            [
+                data["position_ids"][:, :max_text_tokens],
+                image_pos.unsqueeze(0).expand(batch_size, -1, -1),
+            ],
+            dim=1,
+        )
+        data["segment_ids"] = torch.cat(
+            [
+                data["segment_ids"][:, :max_text_tokens],
+                torch.ones(
+                    batch_size, num_image_tokens, dtype=torch.long, device=device
+                ),
+            ],
+            dim=1,
+        )
+        data["indicator"] = torch.cat(
+            [
+                data["indicator"][:, :max_text_tokens],
+                torch.full(
+                    (batch_size, num_image_tokens),
+                    OUTPUT_IMAGE_INDICATOR,
+                    dtype=torch.long,
+                    device=device,
+                ),
+            ],
+            dim=1,
+        )
+        data["num_image_tokens"] = num_image_tokens
+        data["grid_h"] = grid_h
+        data["grid_w"] = grid_w
+
         ctx = Ideogram4DenoisingStage._prepare_denoising_loop(self, batch, server_args)
-        # ProgressiveDenoisingStage.forward() reads scheduler.sigmas to locate
-        # stage-transition step indices.  Ideogram4Scheduler has no .sigmas
-        # attribute — expose the logit-normal schedule_values tensor instead.
+        # Ideogram4Scheduler has no .sigmas attribute; expose the logit-normal
+        # schedule_values tensor so stage-transition logic can find the right step.
         ctx.scheduler.sigmas = ctx.extra["ideogram4_schedule_values"]
         return ctx
 
