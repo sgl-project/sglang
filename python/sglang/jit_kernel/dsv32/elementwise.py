@@ -1,10 +1,4 @@
-"""DeepSeek-V3.2 DSA indexer K kernels (JIT).
-
-V3.2-specific: the indexer K is single-head with a LayerNorm (not RMS), ropes
-the leading dims (kRopeFirst=true), and V3.2 drops the Hadamard rotation. The
-CUDA lives in csrc/deepseek_v32/indexer_k.cuh (separate from the shared V4
-main_norm_rope.cuh so V3.2 edits don't touch V4 code).
-"""
+"""DeepSeek-V3.2 only. DSA indexer K kernels (JIT)."""
 
 import torch
 

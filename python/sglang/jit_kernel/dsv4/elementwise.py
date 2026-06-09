@@ -77,6 +77,7 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     )
 
 
+# The `*_rope_first_*` Q entry points below are DeepSeek-V3.2 only (kRopeFirst=true).
 @cache_once
 def _jit_main_q_indexer_rope_first_hadamard_quant_module(dtype: torch.dtype):
     # V3.2 lays q out as [rope | nope] (V4 is [nope | rope]) -> kRopeFirst=true.
@@ -205,7 +206,7 @@ def fused_q_indexer_rope_first_hadamard_quant(
     positions: torch.Tensor,
     hadamard: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """V3.2 indexer Q: RoPE on the leading dims + fp8 act-quant. CUDA only."""
+    """DeepSeek-V3.2 only. Indexer Q: RoPE on the leading dims + fp8 act-quant. CUDA only."""
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(

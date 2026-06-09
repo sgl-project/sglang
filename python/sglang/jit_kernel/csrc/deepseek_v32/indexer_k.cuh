@@ -1,5 +1,20 @@
-// DeepSeek-V3.2 DSA indexer K kernels: single-head LayerNorm (not RMS), ropes
-// the leading dims (kRopeFirst), and drops the Hadamard rotation by default.
+// DeepSeek-V3.2 only.
+//
+// DSA indexer K kernels: single-head LayerNorm (not RMS), ropes the leading
+// dims (kRopeFirst), and drops the Hadamard rotation by default.
+//
+// Why the Hadamard can be dropped: the normalized Hadamard H is orthonormal
+// (H^T H = I) and is applied to both q and k, so the indexer logit -- a plain
+// dot product -- is unchanged:
+//     (H q) . (H k) = (H q)^T (H k) = q^T (H^T H) k = q^T k = q . k
+// The rotation exists only as fp8-quant incoherence processing; dropping it is
+// exactly logit-preserving and only changes fp8 quant accuracy, so V3.2
+// quantizes the un-rotated activations directly (kHadamard=false).
+//
+// NOTE: this is independent of the wk + weights_proj GEMM fusion (done in
+// dsa_indexer.py): that just merges two projections into one bf16 GEMM to cut
+// launches, and `k_input` here is the non-contiguous wk slice kw[:, :head_dim]
+// read via k_input_stride_batch (no copy).
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 

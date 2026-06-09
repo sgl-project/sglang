@@ -391,7 +391,8 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        # V3.2 skips the Hadamard rotation (matches vLLM); it is logit-preserving.
+        # V3.2 skips the Hadamard rotation; it is logit-preserving (orthonormal H
+        # applied to both q and k, so (Hq)·(Hk) = q·k) and only aids fp8 quant.
         # freqs_cis is built from the fp32 cos/sin cache before any forward casts it to bf16.
         self._indexer_use_hadamard = False
         self._indexer_freqs_cis: Optional[torch.Tensor] = None
