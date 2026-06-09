@@ -399,6 +399,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # prepare_for_v2_verify requests NULL for is_suffix() too (see
         # eagle_info_v2). Capturing NULL here lets both hit the cuda graph
         # without allocating the unused FULL hidden-state buffers.
+        #
+        # HYBRID_SUFFIX_MTP, by contrast, needs FULL: its MTP step requires
+        # last-layer hidden states to keep the draft model's KV state in sync,
+        # and all three captured graphs (main K=num_draft_tokens, short_chain
+        # K=num_steps+1, baseline K=1) share this single capture_hidden_mode.
+        if model_runner.spec_algorithm.is_hybrid_suffix_mtp():
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
