@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 # Triton implementation
 @triton.jit
@@ -95,7 +95,7 @@ def act_quant(
         scale_fmt (Optional[str], optional): The format of the scale. Default is None.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The quantized tensor with dtype `torch.float8_e4m3fn`.
+            - The quantized tensor with the platform FP8 E4M3 dtype (`e4m3fn` or `e4m3fnuz`).
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
@@ -109,7 +109,7 @@ def act_quant(
     M = x_flat.size(0)
 
     # Allocate output tensors
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    y = torch.empty_like(x, dtype=fp8_dtype)
     y_flat = y.view(-1, N)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     s_flat = s.view(-1, N // block_size)
