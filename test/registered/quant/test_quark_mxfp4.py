@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd-mi35x")
+import os
 import time
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from sglang.test.test_utils import (
 
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     runner_args = []
+    environment = {}
 
     @classmethod
     def setUpClass(cls):
@@ -54,6 +56,14 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
+
+        cls.original_envs = {}
+        for env_name, env_value in cls.environment.items():
+            original_env = os.environ.get(env_name, None)
+            if original_env is not None:
+                cls.original_envs[env_name] = os.environ.get(env_name, None)
+
+            os.environ[env_name] = env_value
 
         url = cls.base_url + "/health"
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -108,6 +118,9 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        for env_name, env_value in cls.original_envs.items():
+            os.environ[env_name] = env_value
+
         kill_process_tree(cls.process.pid)
         cls.stdout.close()
         cls.stderr.close()
@@ -120,7 +133,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             self.skipTest("not is_cuda_alike")
 
         # NOTE: We can not simply rely on peak memory after `load_weights` as functions used
-        # in-between (e.g. FP8->MXFP4 requantization) during weight loading may have a higher peak memory footprint
+        # in-between (e.g. NVFP4->MXFP4 requantization) during weight loading may have a higher peak memory footprint
         # than simply the allocated weights.
         if add_peak_memory_before_load:
             reference_gib = (
@@ -182,6 +195,30 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
         self._test_gsm8k(accuracy_threshold=0.89)
+
+
+class TestNVFP4ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
+    # ModelOpt NVFP4 export (quant_method="modelopt", quant_algo="NVFP4") =>
+    # Nvfp4SourceConfig(). Exercises the NVFP4 -> MXFP4 MoE requantization path:
+    # meta-device weight registration, the per-expert dequantize_nvfp4 +
+    # dynamic_mxfp4_quant requant, and the w13 gate/up weight_scale_2 split in
+    # _requantize_nvfp4_to_mxfp4.
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"  # NVFP4 model
+    tp = 1
+
+    def test_peak_memory(self):
+        # NVFP4 weights are registered on the meta device, so peak memory before
+        # load_weights is tiny (~1.2 GiB, < 5). Equivalent BF16 model
+        # (Qwen/Qwen3-30B-A3B) loads at 56.940 GiB; requantized MXFP4
+        # reference (peak_before + load_increase) ~= 16.44 GiB (TP=1).
+        self._test_peak_memory(
+            threshold=18, test_start=True, add_peak_memory_before_load=True
+        )
+
+    def test_gsm8k(self):
+        # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.88
+        # (BF16 Qwen/Qwen3-30B-A3B reference: ~0.94).
+        self._test_gsm8k(accuracy_threshold=0.85)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 import torch
 
-from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from sglang.srt.layers.parameter import (
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
+    PackedvLLMParameter,
+    PerTensorScaleParameter,
+)
+from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.dequantization import (
+    copy_missing_attrs,
+    dequantize_nvfp4,
+)
+from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
+from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
+
+NVFP4_BLOCK_SIZE = 16
 
 _is_hip = is_hip()
 if _is_hip:
@@ -162,12 +177,14 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         weight_quant_spec: dict[str, Any],
         input_quant_spec: dict[str, Any],
         is_checkpoint_mxfp4_serialized: bool = True,
+        dequantization_config: QuantizationConfig | None = None,
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+        self.dequantization_config = dequantization_config
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
@@ -204,38 +221,227 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
         layer.logical_widths = output_partition_sizes
 
-        original_weight_loader = weight_loader
-        if not self.is_checkpoint_mxfp4_serialized:
-            weight_loader = self.get_online_mxfp4_weight_loader(layer, weight_loader)
+        # If dequantization_config is provided, we need to dequantize the source
+        # checkpoint to bf16 and re-quantize to MXFP4 at load time.
+        if self.dequantization_config is not None:
+            if isinstance(self.dequantization_config, Nvfp4SourceConfig):
+                self._create_weights_from_nvfp4(
+                    layer=layer,
+                    output_size_per_partition=output_size_per_partition,
+                    input_size_per_partition=input_size_per_partition,
+                    output_partition_sizes=output_partition_sizes,
+                    weight_loader=weight_loader,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Requantization in QuarkW4A4MXFP4 from {self.dequantization_config.__class__.__name__} is not supported."
+                )
+        else:
+            original_weight_loader = weight_loader
+            if not self.is_checkpoint_mxfp4_serialized:
+                weight_loader = self.get_online_mxfp4_weight_loader(
+                    layer, weight_loader
+                )
 
-        # WEIGHT
-        # Both serialized and online quantization use packed uint8 format
-        weight = PackedvLLMParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // 2,
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            packed_dim=1,
-            packed_factor=2,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
+            # WEIGHT
+            # Both serialized and online quantization use packed uint8 format
+            weight = PackedvLLMParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // 2,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=2,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
 
-        # WEIGHT SCALE
-        weight_scale = GroupQuantScaleParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // OCP_MX_BLOCK_SIZE,
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=original_weight_loader,
+            # WEIGHT SCALE
+            weight_scale = GroupQuantScaleParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=original_weight_loader,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+
+    def _create_weights_from_nvfp4(
+        self,
+        layer,
+        output_size_per_partition,
+        input_size_per_partition,
+        output_partition_sizes,
+        weight_loader,
+    ):
+        layer._nvfp4_loaded_numel = 0
+        # torch.get_default_device() may return `cuda` (no index), which breaks
+        # the `current_device() == idx` assert in the loader
+        layer._load_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        layer._nvfp4_loading_lock = threading.Lock()
+        layer._nvfp4_materialized = False
+
+        nvfp4_loader = self.get_online_nvfp4_to_mxfp4_weight_loader(
+            layer, weight_loader
         )
-        layer.register_parameter("weight_scale", weight_scale)
+
+        with torch.device("meta"):
+            layer.register_parameter(
+                "weight",
+                ModelWeightParameter(
+                    data=torch.empty(
+                        output_size_per_partition,
+                        input_size_per_partition // 2,
+                        dtype=torch.uint8,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=nvfp4_loader,
+                ),
+            )
+            layer.register_parameter(
+                "weight_scale",
+                ModelWeightParameter(
+                    data=torch.empty(
+                        output_size_per_partition,
+                        input_size_per_partition // NVFP4_BLOCK_SIZE,
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=nvfp4_loader,
+                ),
+            )
+            layer.register_parameter(
+                "weight_scale_2",
+                PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=nvfp4_loader,
+                ),
+            )
+
+            # NVFP4 checkpoints carry per-tensor `input_scale` (activation scale).
+            # MXFP4 uses dynamic activation quantization, so we discard it, but
+            # we still register the param so upstream model loaders that rename
+            # `gate_proj.input_scale` -> `gate_up_proj.input_scale` find a slot
+            # to write into
+            def _discard_loader(param, loaded_weight, shard_id=None):
+                pass
+
+            layer.register_parameter(
+                "input_scale",
+                PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=_discard_loader,
+                ),
+            )
+
+        layer.weight._param_name = "weight"
+        layer.weight_scale._param_name = "weight_scale"
+        layer.weight_scale_2._param_name = "weight_scale_2"
+
+    def get_online_nvfp4_to_mxfp4_weight_loader(
+        self,
+        layer,
+        original_weight_loader: Callable,
+    ) -> Callable:
+        """NVFP4 -> MXFP4 loader: materialize on first touch, then
+        dequantize+requantize once all source bytes are in place."""
+
+        def _materialize(name):
+            src = getattr(layer, name)
+            assert src.device.type == "meta"
+            kwargs = dict(
+                data=torch.empty_like(src.data, device=layer._load_device),
+                weight_loader=src._weight_loader,
+            )
+            if isinstance(src, ModelWeightParameter):
+                kwargs.update(input_dim=src.input_dim, output_dim=src.output_dim)
+            materialized = src.__class__(**kwargs)
+            copy_missing_attrs(src, materialized)
+            setattr(layer, name, materialized)
+
+        def loader(param, loaded_weight, shard_id=None):
+            param_name = getattr(param, "_param_name", None)
+            assert torch.cuda.current_device() == layer._load_device.index
+
+            with layer._nvfp4_loading_lock:
+                if not layer._nvfp4_materialized:
+                    _materialize("weight")
+                    _materialize("weight_scale")
+                    _materialize("weight_scale_2")
+                    layer._nvfp4_materialized = True
+                param = getattr(layer, param_name)
+
+            kwargs = {"loaded_shard_id": shard_id} if shard_id is not None else {}
+            counter = CopyNumelCounter()
+            with counter:
+                original_weight_loader(param, loaded_weight, **kwargs)
+
+            with layer._nvfp4_loading_lock:
+                layer._nvfp4_loaded_numel += counter.copied_numel
+                target = (
+                    layer.weight.numel()
+                    + layer.weight_scale.numel()
+                    + layer.weight_scale_2.numel()
+                )
+                if layer._nvfp4_loaded_numel == target:
+                    # weight_scale_2 is one fp32 per output partition (e.g. 2
+                    # for gate_up_proj, 3 for qkv_proj). Expand to a per-row
+                    # scalar matching layer.weight's output dim so it
+                    # broadcasts against the per-block scale.
+                    w_s2 = layer.weight_scale_2.repeat_interleave(
+                        torch.tensor(
+                            layer.logical_widths, device=layer.weight_scale_2.device
+                        )
+                    ).view(-1, 1)
+                    bf16 = dequantize_nvfp4(layer.weight, layer.weight_scale, w_s2)
+                    qw, qs = dynamic_mxfp4_quant(bf16)
+                    layer.weight = torch.nn.Parameter(qw, requires_grad=False)
+                    layer.weight_scale = torch.nn.Parameter(qs, requires_grad=False)
+                    del layer.weight_scale_2
+                    del layer._load_device
+
+        return loader
+
+    def get_online_mxfp4_weight_loader(
+        self,
+        layer,
+        original_weight_loader: Callable,
+    ) -> Callable:
+        """
+        Wrap the original weight loader to perform online MXFP4 quantization.
+        """
+
+        def online_mxfp4_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            shard_id: int | str | None = None,
+        ):
+            # Materialize on device the loaded weight.
+            loaded_weight = loaded_weight.to(param.device)
+
+            # Quantize the loaded weight shard immediately. Since MXFP4 uses per-group quantization, there is no need to load all shards (e.g. q_proj, k_proj, v_proj) before doing online quantization.
+            qweight, weight_scale = dynamic_mxfp4_quant(loaded_weight)
+
+            # Required e.g. for q_proj, k_proj, v_proj.
+            kwargs = {}
+            if shard_id is not None:
+                kwargs["loaded_shard_id"] = shard_id
+
+            # Use the original weight loader to handle the loading logic
+            # (e.g. qkv sharding, etc.)
+            original_weight_loader(param, qweight, **kwargs)
+
+            layer.weight_scale.weight_loader(layer.weight_scale, weight_scale, **kwargs)
+
+        return online_mxfp4_weight_loader
 
     def get_online_mxfp4_weight_loader(
         self,

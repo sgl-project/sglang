@@ -146,7 +146,6 @@ class AiterRunnerCore(MoeRunnerCore):
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
         from aiter.fused_moe import fused_moe
-        from aiter.ops.flydsl.moe_common import GateMode
 
         from sglang.srt.environ import envs
 
@@ -164,6 +163,11 @@ class AiterRunnerCore(MoeRunnerCore):
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
         if quant_info.swiglu_limit > 0:
+            # Imported lazily (only the swiglu_limit>0 FlyDSL path needs it) so
+            # MoE models that don't use gate_mode don't require an aiter build
+            # shipping aiter.ops.flydsl.moe_common.
+            from aiter.ops.flydsl.moe_common import GateMode
+
             # Default (INTERLEAVE) preserves the pre-fix behavior for paths
             # that prepare weights in the gate/up-interleaved layout. Set
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which

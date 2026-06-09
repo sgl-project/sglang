@@ -156,7 +156,7 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
-    "quark_mxfp4",  # Online MOE + linear quantization.
+    "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
     # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
