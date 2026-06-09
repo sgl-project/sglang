@@ -435,6 +435,8 @@ class BreakableCudaGraphRunner:
         return num_tokens <= self.max_num_tokens
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
+        if output is None:
+            return None
         if torch.is_tensor(output):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
@@ -448,12 +450,24 @@ class BreakableCudaGraphRunner:
     def _copy_output_to_buffer(
         self, output: Any, output_buffer: Any, num_tokens: int
     ) -> None:
+        if output is None or output_buffer is None:
+            if output is None and output_buffer is None:
+                return
+            raise ValueError(
+                "BCG output structure changed between capture sizes: "
+                f"{type(output)} vs {type(output_buffer)}"
+            )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors
         ):
+            if output.tensors.keys() != output_buffer.tensors.keys():
+                raise ValueError(
+                    "BCG output proxy structure changed between capture sizes: "
+                    f"{output.tensors.keys()} != {output_buffer.tensors.keys()}"
+                )
             for key, tensor in output.tensors.items():
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
