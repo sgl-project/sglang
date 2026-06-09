@@ -5,6 +5,7 @@ on:
   pull_request:
     branches:
       - main
+      - testcases
     paths:
       - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
