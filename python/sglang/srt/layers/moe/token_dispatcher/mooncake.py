@@ -8,7 +8,6 @@ from typing import NamedTuple, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -208,6 +207,7 @@ class _MooncakeEPDispatcherImpl:
         topk_ids: torch.Tensor,
         use_fp8: bool = False,
     ):
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
         buffer = self._get_buffer()
         active_ranks = ElasticEPStateManager.instance().active_ranks
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
@@ -248,6 +248,7 @@ class _MooncakeEPDispatcherImpl:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
         buffer = self._get_buffer()
         active_ranks = ElasticEPStateManager.instance().active_ranks
         combined_hidden_states, event, hook = buffer.combine(
