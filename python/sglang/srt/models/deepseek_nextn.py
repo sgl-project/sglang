@@ -36,7 +36,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
-    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -55,6 +54,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
@@ -99,8 +99,8 @@ class DeepseekModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -230,7 +230,14 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch,
                     residual,
                     zero_allocator,
+                    prev_topk_indices=(
+                        forward_batch.topk_indices
+                        if forward_batch.reuse_mtp_topk_indices
+                        else None
+                    ),
                 )
+                if forward_batch.reuse_mtp_topk_indices:
+                    forward_batch.topk_indices = topk_indices
 
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
