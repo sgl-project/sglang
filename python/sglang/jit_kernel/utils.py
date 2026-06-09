@@ -241,6 +241,30 @@ def load_jit(
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
     if cpp_files or cuda_files:
         module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
+
+    # Pin a deterministic per-module build dir and short-circuit when its .so is
+    # already built. module_name embeds a content hash of all sources (incl.
+    # transitive headers), so an existing .so is content-addressed -- loading it
+    # directly skips the ninja build entirely. Without this, ninja's mtime-based
+    # staleness check refires on every CI run: `pip install` bumps the mtime of
+    # included dependency headers (e.g. tvm_ffi) that the cached .o depends on,
+    # so ninja recompiles (~3min for marlin MoE) even on a content cache hit.
+    if build_directory is None:
+        cache_dir = os.environ.get(
+            "TVM_FFI_CACHE_DIR", str(pathlib.Path("~/.cache/tvm-ffi").expanduser())
+        )
+        build_directory = str(pathlib.Path(cache_dir).expanduser() / module_name)
+    prebuilt = pathlib.Path(build_directory) / f"{module_name}.so"
+    if prebuilt.is_file():
+        from tvm_ffi import load_module
+
+        try:
+            return load_module(str(prebuilt))
+        except Exception:
+            logger.warning(
+                "Cached JIT module %s failed to load; rebuilding.", module_name
+            )
+
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
