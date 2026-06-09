@@ -82,6 +82,9 @@ class SpeculativeAlgorithm(Enum):
             spec_class=spec_class,
         )
 
+    def is_some(self) -> bool:
+        return self != SpeculativeAlgorithm.NONE
+
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
@@ -117,23 +120,43 @@ class SpeculativeAlgorithm(Enum):
 
     def create_future_map(
         self,
-        max_running_requests: int,
-        chunked_prefill_size: int,
-        context_len: int,
         device: torch.device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(
-            max_running_requests,
-            chunked_prefill_size,
-            context_len,
-            device,
-            self,
-        )
+        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+
+    def build_disagg_draft_input(
+        self,
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+        last_tokens_tensor: torch.Tensor,
+        future_map: FutureMap,
+    ) -> Optional[SpecInput]:
+        if self.is_eagle():
+            from sglang.srt.speculative.eagle_disaggregation import (
+                build_eagle_disagg_draft_input,
+            )
+
+            return build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
+        return None
 
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # FIXME: Remove this after the forward mode refactor. Target verify is
+        # essentially a fixed sequence length prefill/extend with full cuda
+        # graph support. We can use it for target verify, or we can use it for
+        # other cases which is not target verify but fixed length prefill.
+        # Here, we expose this interface to allow the other use cases.
+        return num_draft_tokens
 
     def create_worker(
         self, server_args: ServerArgs
@@ -166,41 +189,25 @@ class SpeculativeAlgorithm(Enum):
 
             return FrozenKVMTPWorker
 
+        # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
+        # even with overlap disabled (scheduler drives it synchronously).
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
-            # FIXME: migrate to EagleWorker
-            if enable_overlap:
-                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
-                    MultiLayerEagleWorkerV2,
-                )
-
-                return MultiLayerEagleWorkerV2
-
-            from sglang.srt.speculative.multi_layer_eagle_worker import (
-                MultiLayerEagleWorker,
+            from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                MultiLayerEagleWorkerV2,
             )
 
-            return MultiLayerEagleWorker
+            return MultiLayerEagleWorkerV2
 
         elif self.is_eagle():
-            if enable_overlap:
-                from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-                return EAGLEWorkerV2
-
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-            return EAGLEWorker
+            return EAGLEWorkerV2
         elif self.is_standalone():
-            if enable_overlap:
-                from sglang.srt.speculative.standalone_worker_v2 import (
-                    StandaloneWorkerV2,
-                )
+            from sglang.srt.speculative.standalone_worker_v2 import (
+                StandaloneWorkerV2,
+            )
 
-                return StandaloneWorkerV2
-
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-            return StandaloneWorker
+            return StandaloneWorkerV2
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(

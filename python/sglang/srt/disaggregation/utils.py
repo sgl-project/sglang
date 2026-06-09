@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 #########################
 # Constants & Enums
@@ -48,21 +50,66 @@ class DisaggregationMode(Enum):
 # Synchronization
 #########################
 
-# env var for testing failure, convert to float explicitly
-FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
+
+def _get_failure_prob() -> float:
+    try:
+        return float(envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get())
+    except Exception:
+        # fallback to legacy env var
+        return float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", "0"))
 
 
-def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
-    # at a certain prob, the poll is failed to simulate failure
-    if FAILURE_PROB > 0:
-        from sglang.srt.disaggregation.base import KVPoll
-
-        polls = [
-            int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
+def _poll_with_failure_injection(pollers) -> List[int]:
+    if (failure_prob := _get_failure_prob()) > 0:
+        return [
+            int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
         ]
-    else:
-        polls = [int(poller.poll()) for poller in pollers]
+    return [int(poller.poll()) for poller in pollers]
+
+
+def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
+    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+        req.bootstrap_host is None
+        and server_args.disaggregation_transfer_backend == "fake"
+    )
+
+
+def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> None:
+    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
+
+    Mutates `polls` in-place. Called before all-reduce so that MIN across TP
+    ranks naturally prevents any rank from committing before all ranks are ready.
+    """
+    for i, poll_val in enumerate(polls):
+        if poll_val == int(KVPoll.Success):
+            decode_req = decode_reqs[i]
+            if _is_fake_transfer(decode_req.req, server_args):
+                continue
+            actual_room = metadata_buffers.bootstrap_room[
+                decode_req.metadata_buffer_index, 0
+            ].item()
+            if actual_room == 0:
+                polls[i] = int(KVPoll.Transferring)
+
+
+def poll_and_all_reduce(
+    pollers,
+    gloo_group: dist.ProcessGroup,
+    decode_reqs=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    server_args: Optional[ServerArgs] = None,
+):
+    # at a certain prob, the poll is failed to simulate failure
+    polls = _poll_with_failure_injection(pollers)
+
+    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    if (
+        decode_reqs is not None
+        and metadata_buffers is not None
+        and server_args is not None
+    ):
+        _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
@@ -89,24 +136,31 @@ def poll_and_all_reduce_attn_cp_tp_group(
 
 
 def poll_and_all_reduce_with_staging(
-    decode_reqs, staging_handler, gloo_group: dist.ProcessGroup
+    decode_reqs,
+    staging_handler,
+    gloo_group: dist.ProcessGroup,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    server_args: Optional[ServerArgs] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
-    from sglang.srt.disaggregation.base import KVPoll
-
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req
         ):
             staging_handler.advance_scatter(decode_req)
 
-    raw_polls = [int(dr.kv_receiver.poll()) for dr in decode_reqs]
+    # allow test injection of failure probability at runtime
+    receivers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
         if raw_polls[i] == int(KVPoll.Success):
             if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
                 decode_req
             ):
                 raw_polls[i] = int(KVPoll.Transferring)
+    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    if metadata_buffers is not None and server_args is not None:
+        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
     poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
     return poll_tensor.tolist()
@@ -161,7 +215,7 @@ class MetadataBuffers:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
         elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
-            device = "cpu"
+            device = "cuda"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -645,3 +699,11 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.logprob.input_top_logprobs_idx = []
         req.logprob.input_token_ids_logprobs_val = []
         req.logprob.input_token_ids_logprobs_idx = []
+
+
+def is_aborted(req: Req) -> bool:
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
+        req.finished_reason, FINISH_ABORT
+    )
