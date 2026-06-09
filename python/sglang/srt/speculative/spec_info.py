@@ -122,10 +122,11 @@ class SpeculativeAlgorithm(Enum):
         self,
         device: torch.device,
         req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(device, self, req_to_token_pool)
+        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
 
     def build_disagg_draft_input(
         self,
@@ -188,41 +189,25 @@ class SpeculativeAlgorithm(Enum):
 
             return FrozenKVMTPWorker
 
+        # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
+        # even with overlap disabled (scheduler drives it synchronously).
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
-            # FIXME: migrate to EagleWorker
-            if enable_overlap:
-                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
-                    MultiLayerEagleWorkerV2,
-                )
-
-                return MultiLayerEagleWorkerV2
-
-            from sglang.srt.speculative.multi_layer_eagle_worker import (
-                MultiLayerEagleWorker,
+            from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                MultiLayerEagleWorkerV2,
             )
 
-            return MultiLayerEagleWorker
+            return MultiLayerEagleWorkerV2
 
         elif self.is_eagle():
-            if enable_overlap:
-                from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-                return EAGLEWorkerV2
-
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-            return EAGLEWorker
+            return EAGLEWorkerV2
         elif self.is_standalone():
-            if enable_overlap:
-                from sglang.srt.speculative.standalone_worker_v2 import (
-                    StandaloneWorkerV2,
-                )
+            from sglang.srt.speculative.standalone_worker_v2 import (
+                StandaloneWorkerV2,
+            )
 
-                return StandaloneWorkerV2
-
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-            return StandaloneWorker
+            return StandaloneWorkerV2
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
