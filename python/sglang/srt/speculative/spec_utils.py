@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -464,3 +464,12 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
+
+
+def spec_stage_span(name: str):
+    """Profiler span for a coarse speculative-decoding stage (``draft`` /
+    ``draft_extend`` / ``verify``).
+    """
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return nullcontext()
