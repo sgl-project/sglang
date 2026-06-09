@@ -73,8 +73,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req.is_retracted = False
             pre_lens.append(pre_len)
 
-        extend_input_logprob_token_ids = None
-
         # Set fields
         self.input_ids = torch.tensor(
             sum(input_ids, array("q")), dtype=torch.int32, device=self.device
@@ -99,7 +97,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
         self.extend_lens = [r.extend_range.length for r in reqs]
         self.extend_logprob_start_lens = None
-        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+        self.extend_input_logprob_token_ids = None
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         # Build sampling info
