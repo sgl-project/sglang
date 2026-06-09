@@ -6,6 +6,9 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    STAGE_2_DISTILLED_SIGMA_VALUES as _SHARED_STAGE_2_DISTILLED_SIGMA_VALUES,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
     sync_ltx23_runtime_vae_markers,
@@ -16,12 +19,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
-from sglang.multimodal_gen.runtime.managers.component_manager import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
 )
-from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     SnapshotModuleResidency,
     SnapshotStrategy,
 )
@@ -553,6 +556,8 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
             if self._module_is_on_gpu(target_module):
                 self._record_component_ready("transformer")
             elif not self._snapshot_strategy.is_ready("transformer"):
+                if self._snapshot_low_vram_mode:
+                    self._release_stage2_for_low_vram()
                 self._snapshot_strategy.prefetch_component("transformer", target_module)
         else:
             self._record_component_ready("transformer")
@@ -622,6 +627,16 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         )
         if stage1_param is not None and stage1_param.device.type == "cuda":
             self._release_module_to_cpu_snapshot("transformer")
+
+    def _release_stage2_for_low_vram(self) -> None:
+        stage2_module = self.pipeline.get_module("transformer_2")
+        stage2_param = (
+            next(stage2_module.parameters(), None)
+            if stage2_module is not None
+            else None
+        )
+        if stage2_param is not None and stage2_param.device.type == "cuda":
+            self._release_module_to_cpu_snapshot("transformer_2")
 
     def _record_component_ready(self, module_name: str) -> None:
         self._snapshot_strategy.record_ready(
@@ -767,7 +782,7 @@ class LTX2TwoStageResidencyController:
 
 class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
-    STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+    STAGE_2_DISTILLED_SIGMA_VALUES = list(_SHARED_STAGE_2_DISTILLED_SIGMA_VALUES)
     STAGE_1_DISTILLED_LORA_STRENGTH = 0.0
     STAGE_2_DISTILLED_LORA_STRENGTH = 1.0
     STAGE_1_DENOISING_SAMPLER_NAME = "euler"
@@ -793,6 +808,13 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         return is_ltx23_native_variant(
             server_args.pipeline_config.vae_config.arch_config
         )
+
+    def _should_merge_lora_for_phase(self, phase: str) -> bool:
+        if phase == "stage2" and self._ltx2_residency.mode == "original":
+            # original mode reuses one DiT for both phases; dynamic LoRA avoids
+            # request-time merge/unmerge without keeping another DiT resident
+            return False
+        return self._should_merge_stage2_distilled_lora(self.server_args)
 
     def initialize_pipeline(self, server_args: ServerArgs):
         super().initialize_pipeline(server_args)
@@ -955,16 +977,15 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 strength=lora_strengths,
             )
             if phase == "stage2":
-                # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
-                # into the transformer weights. Legacy LTX-2 should keep the
-                # preexisting unmerged behavior to avoid regressing stage 2 quality.
-                set_lora_kwargs["merge_weights"] = (
-                    self._should_merge_stage2_distilled_lora(self.server_args)
+                # premerged modes keep official LTX-2.3 fused stage-2 LoRA; original
+                # avoids single-DiT request-time merge/unmerge with dynamic LoRA
+                set_lora_kwargs["merge_weights"] = self._should_merge_lora_for_phase(
+                    phase
                 )
             elif phase == "stage1" and self.pipeline_name == "LTX2TwoStageHQPipeline":
                 # Official HQ also builds stage 1 with distilled LoRA fused.
-                set_lora_kwargs["merge_weights"] = (
-                    self._should_merge_stage2_distilled_lora(self.server_args)
+                set_lora_kwargs["merge_weights"] = self._should_merge_lora_for_phase(
+                    phase
                 )
             self.set_lora(
                 **set_lora_kwargs,

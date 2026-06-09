@@ -20,18 +20,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_nsa
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
 class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
-    def __init__(self, eagle_worker: EAGLEWorker):
+    def __init__(self, eagle_worker: EagleDraftWorker):
         super().__init__(eagle_worker)
 
     def _create_graph(self):
@@ -59,7 +59,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
         )
 
     def _replay(self, forward_batch: ForwardBatch):
-        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )

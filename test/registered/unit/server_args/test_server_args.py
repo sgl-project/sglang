@@ -1,8 +1,12 @@
+import importlib
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -10,7 +14,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-b-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -497,21 +502,23 @@ class TestNgramExternalSamArgs(CustomTestCase):
         return args
 
     def test_external_sam_budget_must_fit_draft_budget(self):
+        args = self._make_dummy_ngram_args(
+            speculative_num_draft_tokens=4,
+            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+            speculative_ngram_external_sam_budget=4,
+        )
         with self.assertRaises(ValueError) as context:
-            self._make_dummy_ngram_args(
-                speculative_num_draft_tokens=4,
-                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
-                speculative_ngram_external_sam_budget=4,
-            )._handle_speculative_decoding()
+            handle_speculative_decoding(args)
         self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
 
     def test_external_corpus_max_tokens_must_be_positive(self):
+        args = self._make_dummy_ngram_args(
+            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+            speculative_ngram_external_sam_budget=2,
+            speculative_ngram_external_corpus_max_tokens=0,
+        )
         with self.assertRaises(ValueError) as context:
-            self._make_dummy_ngram_args(
-                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
-                speculative_ngram_external_sam_budget=2,
-                speculative_ngram_external_corpus_max_tokens=0,
-            )._handle_speculative_decoding()
+            handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
@@ -612,6 +619,100 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     def test_rejects_fp4_kv_cache(self):
         with self.assertRaisesRegex(ValueError, "fp4_e2m1"):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
+
+
+class TestCutedslMoeMaxNumTokens(unittest.TestCase):
+    """The shared CuteDSL MoE per-forward token bound. Fields are set directly
+    to exercise the math independently of __post_init__ resolution."""
+
+    def _args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy")
+        fields = dict(
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            max_prefill_tokens=16384,
+            disable_piecewise_cuda_graph=False,
+            piecewise_cuda_graph_max_tokens=2048,
+            cuda_graph_max_bs=512,
+        )
+        fields.update(overrides)
+        for key, value in fields.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_prefill_dominates_in_default_config(self):
+        self.assertEqual(self._args().cutedsl_moe_max_num_tokens(), 16384)
+
+    def test_speculative_decoding_scales_decode_bound(self):
+        # decode bound 512 * 8 dominates the small prefill/piecewise bounds
+        args = self._args(
+            max_prefill_tokens=512,
+            piecewise_cuda_graph_max_tokens=512,
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=8,
+        )
+        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 4096)
+
+    def test_piecewise_bound_excluded_when_disabled(self):
+        args = self._args(
+            max_prefill_tokens=512,
+            disable_piecewise_cuda_graph=True,
+            cuda_graph_max_bs=64,
+        )
+        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 512)
+
+
+class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
+    """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
+
+    The choice set is built once at server_args.py import time, so each subtest
+    reloads the module with the env var set to the desired value.
+    """
+
+    def _reload_server_args_with_env(self, *, enabled: bool):
+        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
+        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
+        try:
+            return importlib.reload(server_args_module)
+        finally:
+            if previous is None:
+                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+            else:
+                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+
+    def test_token_oracle_rejected_when_env_disabled(self):
+        reloaded = self._reload_server_args_with_env(enabled=False)
+        self.assertNotIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+
+        with self.assertRaises(SystemExit):
+            reloaded.prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--sampling-backend",
+                    "token_oracle",
+                ]
+            )
+
+    def test_token_oracle_accepted_when_env_enabled(self):
+        reloaded = self._reload_server_args_with_env(enabled=True)
+        self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+
+        parsed = reloaded.prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--sampling-backend",
+                "token_oracle",
+                # Explicit device so ServerArgs.__post_init__ does not call
+                # get_device() (fails on CPU-only CI runners) and does not run
+                # _handle_cpu_backends (which would override sampling_backend
+                # to "pytorch", masking what we want to verify).
+                "--device",
+                "cuda",
+            ]
+        )
+        self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
 if __name__ == "__main__":
