@@ -531,9 +531,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         residency_manager = self._component_residency_manager
         transformer_use = None
         if residency_manager is not None:
-            transformer_use = self._declared_component_use(
-                component_name="transformer"
-            )
+            transformer_use = self._declared_component_use(component_name="transformer")
             residency_manager.begin_use(transformer_use, self.transformer)
 
         config = server_args.pipeline_config
