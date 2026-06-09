@@ -112,6 +112,8 @@ if is_npu():
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
@@ -468,10 +470,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states.clone())
 
+        # ===== TO BE REFACTORED ====
+        # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
+        # MoE dispatch so it overlaps the down-LoRA shrink on the alt stream.
+        staged = False
+        if shared_output is not None and _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
+                shared_add_overlap_enabled,
+                stage_shared_expert_add,
+                unstage_shared_expert_add,
+            )
+
+            if shared_add_overlap_enabled():
+                stage_shared_expert_add(shared_output, current_stream)
+                staged = True
+        # ===== END TO BE REFACTORED ====
+
         with torch.cuda.stream(self.alt_stream):
             router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
+
+        if staged and unstage_shared_expert_add() is None:
+            # The dispatch consumed the staging (add already enqueued); skip the caller's add.
+            shared_output = None
 
         return router_output, shared_output
 

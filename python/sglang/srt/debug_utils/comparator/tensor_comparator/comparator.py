@@ -125,8 +125,11 @@ def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
 def _compute_percentiles(x: torch.Tensor, *, include: bool) -> dict[int, float]:
     if not include:
         return {}
-    x_float: torch.Tensor = x.float()
-    return {p: torch.quantile(x_float, p / 100.0).item() for p in DEFAULT_PERCENTILES}
+    import numpy as np
+
+    arr = x.detach().float().numpy().ravel()
+    values = np.percentile(arr, list(DEFAULT_PERCENTILES))
+    return {p: float(v) for p, v in zip(DEFAULT_PERCENTILES, values)}
 
 
 def compute_diff(
