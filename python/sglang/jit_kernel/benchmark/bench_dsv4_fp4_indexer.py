@@ -7,7 +7,7 @@ import triton
 
 from sglang.benchmark.bench_utils import run_bench
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
@@ -165,8 +165,8 @@ def benchmark(batch: int, seq_len_kv: int, provider: str):
 
 
 if __name__ == "__main__":
-    if not is_sm100_supported():
-        print("[skip] DeepSeek V4 FP4 indexer benchmark requires SM100 CUDA.")
+    if not (is_sm100_supported() or is_sm120_supported()):
+        print("[skip] DeepSeek V4 FP4 indexer benchmark requires SM100 or SM120 CUDA.")
         sys.exit(0)
     if deep_gemm is None or per_token_cast_to_fp4 is None:
         print("[skip] DeepGEMM is unavailable.")
