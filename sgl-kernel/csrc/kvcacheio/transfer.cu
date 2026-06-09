@@ -320,9 +320,24 @@ void transfer_kv_launcher(
   // other "L-shaped" side uses a per-layer base table (``lf_tbl``) or a dummy
   // 0, so its ``layout_dim`` is left untouched. Symmetric K/V short-circuits
   // to ``v_* = *`` and is bit-identical to the pre-asymmetric behavior.
+  TORCH_CHECK(
+      (k_head_dim == 0) == (v_head_dim == 0),
+      "k_head_dim and v_head_dim must be either both unset (0) or both > 0; got k_head_dim=",
+      k_head_dim,
+      ", v_head_dim=",
+      v_head_dim);
   int64_t v_src_layout_dim;
   int64_t v_dst_layout_dim;
   bool different_head_dim = k_head_dim != v_head_dim;
+  if (different_head_dim) {
+    TORCH_CHECK(
+        item_size % k_head_dim == 0,
+        "item_size (",
+        item_size,
+        ") must be divisible by k_head_dim (",
+        k_head_dim,
+        ") for asymmetric K/V rescaling");
+  }
   if (device2host) {
     TORCH_CHECK(
         !different_head_dim || dst_layout_dim % k_head_dim == 0,
@@ -337,10 +352,26 @@ void transfer_kv_launcher(
     v_dst_layout_dim = dst_layout_dim;
   }
   int64_t v_item_size = different_head_dim ? item_size / k_head_dim * v_head_dim : item_size;
+  // ``transfer_item_warp`` copies in uint64 chunks; rescaled V item size must
+  // stay 8-byte aligned or the tail bytes are silently dropped.
+  TORCH_CHECK(
+      v_item_size % 8 == 0,
+      "Rescaled V item byte size (",
+      v_item_size,
+      ") must be divisible by 8");
 
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   if constexpr (PageHeadLayout) {
-    TORCH_CHECK(!different_head_dim, "Page head layout does not support different head dimension between k and v");
+    // Page-head callers don't pass k_head_dim/v_head_dim, so different_head_dim
+    // alone can't catch the asymmetric case. Detect it from tensor shapes.
+    if constexpr (!IsMLA) {
+      TORCH_CHECK(
+          !dst_k.defined() || !dst_v.defined() || dst_k.size(-1) == dst_v.size(-1),
+          "Page head layout does not support different head dimension between k and v; got dst_k last-dim=",
+          dst_k.size(-1),
+          ", dst_v last-dim=",
+          dst_v.size(-1));
+    }
     transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
         src_k_ptr,
         dst_k_ptr,
