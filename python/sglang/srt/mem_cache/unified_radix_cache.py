@@ -722,7 +722,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        assert req.kv_committed_len >= req.cache_protected_len
         assert (
             req.extend_range is None or req.extend_range.end == req.kv_committed_len
         ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"

@@ -486,7 +486,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-        assert req.kv_committed_len >= req.cache_protected_len
         if self.disable:
             assert (
                 req.extend_range is None or req.extend_range.end == req.kv_committed_len

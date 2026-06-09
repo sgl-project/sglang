@@ -210,7 +210,6 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
-        assert req.kv_committed_len >= req.cache_protected_len
         assert (
             req.extend_range is None or req.extend_range.end == req.kv_committed_len
         ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"

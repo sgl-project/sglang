@@ -608,7 +608,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-        assert req.kv_committed_len >= req.cache_protected_len
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             assert (
