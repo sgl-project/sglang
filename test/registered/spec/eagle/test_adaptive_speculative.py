@@ -47,11 +47,13 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(
                 {
-                    "candidate_steps": [1, 3],
-                    "ema_alpha": 1.0,
-                    "warmup_batches": 1,
-                    "update_interval": 1,
-                    "up_hysteresis": 0.0,
+                    "1": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 1,
+                        "update_interval": 1,
+                        "up_hysteresis": 0.0,
+                    },
                 },
                 f,
             )

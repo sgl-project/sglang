@@ -1163,14 +1163,14 @@ class CudaGraphRunner:
     def replay(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
 
-        if not skip_attn_backend_init:
+        if forward_batch.needs_forward_metadata_init():
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
+            # Pre-planned (plan-stream replay_prepare already ran).
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
