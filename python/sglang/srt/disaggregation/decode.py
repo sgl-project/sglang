@@ -1396,7 +1396,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        # TODO: the start arg is behavior-neutral here — only .end is read before
+        # TODO: start can transiently disagree with len(prefix_indices) under HiCache
+        # decode prefetch, but it is behavior-neutral — only .end is read before
         # get_new_prebuilt_batch resets extend_range ahead of the prebuilt forward.
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
 
