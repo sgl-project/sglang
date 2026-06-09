@@ -87,6 +87,7 @@ class SelfBenchmark:
         self._grid: list[BenchmarkPoint] = []
         self._results: list[BenchmarkPointResult] = []
         self._current: Optional[BenchmarkPointResult] = None
+        self._active_reqs: list[Req] = []
         self._seq = 0
         self._warmup_remaining = max(0, self.config.warmup_iterations)
         self._grid_index = 0
@@ -115,6 +116,7 @@ class SelfBenchmark:
 
         point = self._grid[self._grid_index]
         self._current = BenchmarkPointResult(point=point)
+        self._active_reqs = []
         if point.point_type == "prefill":
             injected = self._inject_prefill(prompt_len=point.isl, max_tokens=0)
         else:
@@ -125,6 +127,7 @@ class SelfBenchmark:
         if injected == 0:
             logger.warning("Skipping benchmark point with no valid requests: %s", point)
             self._current = None
+            self._active_reqs = []
             self._grid_index += 1
 
     def observe_forward_pass(
@@ -143,6 +146,7 @@ class SelfBenchmark:
             self._warmup_remaining -= 1
             if self._warmup_remaining <= 0:
                 self.phase = BenchmarkPhase.SWEEP
+                self._active_reqs = []
             return
 
         if self._current is None:
@@ -156,8 +160,21 @@ class SelfBenchmark:
 
         if fpm is not None:
             self._current.fpms.append(msgspec.to_builtins(fpm))
+        if not self._current_point_finished():
+            return
+        self._save_current_point()
+
+    def _current_point_finished(self) -> bool:
+        if not self._active_reqs:
+            return True
+        return all(req.finished() for req in self._active_reqs)
+
+    def _save_current_point(self) -> None:
+        if self._current is None:
+            return
         self._results.append(self._current)
         self._current = None
+        self._active_reqs = []
         self._grid_index += 1
 
     def _build_grid(self) -> None:
@@ -227,16 +244,10 @@ class SelfBenchmark:
                 )
 
     def _max_prefill_isl(self) -> int:
-        chunked_prefill_size = getattr(
-            self.scheduler.server_args, "chunked_prefill_size", None
-        )
-        if chunked_prefill_size is None or chunked_prefill_size <= 0:
-            chunked_prefill_size = self._max_valid_input_len()
         return max(
             0,
             min(
                 self._max_valid_input_len(),
-                chunked_prefill_size,
                 self.scheduler.max_total_num_tokens - 2,
             ),
         )
@@ -351,6 +362,7 @@ class SelfBenchmark:
             return 0
 
         self.scheduler.running_batch = batch
+        self._active_reqs = reqs
         return len(reqs)
 
     def _inject_requests(self, prompt_len: int, max_tokens: int, n: int) -> int:
@@ -380,6 +392,7 @@ class SelfBenchmark:
                 logger.warning("Skipping invalid benchmark request: %s", error_msg)
                 continue
             self.scheduler._add_request_to_queue(req)
+            self._active_reqs.append(req)
             injected += 1
         return injected
 
@@ -523,6 +536,8 @@ class SelfBenchmark:
     def _has_inflight_work(self) -> bool:
         result_queue = getattr(self.scheduler, "result_queue", None)
         if result_queue:
+            return True
+        if getattr(self.scheduler, "chunked_req", None) is not None:
             return True
         if getattr(self.scheduler, "waiting_queue", None):
             return True
