@@ -89,7 +89,7 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             # Prefill
-            self.init_routing_prefill = NPUMoEInitRouting_Quant()
+            self.init_routing_prefill = NPUMoEInitRouting_v2()
             self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type_decode = 1
             # Decode
