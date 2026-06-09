@@ -34,8 +34,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
-    Phase,
-    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -329,10 +328,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def init_cuda_graphs(self) -> None:
-        if (
-            check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-            or self.speculative_num_steps <= 1
-        ):
+        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
         if self.target_worker.device != "cuda":
             logger.info(
