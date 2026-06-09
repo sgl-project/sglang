@@ -402,9 +402,18 @@ class Ideogram4ProgressiveDenoisingStage(
         # Persist original LLM features so _on_resolution_change can restore
         # them (with re-adapted image-token count) when the latent is upsampled.
         ctx.extra["ideogram4_full_res_llm_features"] = full_res_llm
-        # Ideogram4Scheduler has no .sigmas attribute; expose the logit-normal
-        # schedule_values tensor so stage-transition logic can find the right step.
-        ctx.scheduler.sigmas = ctx.extra["ideogram4_schedule_values"]
+        # Ideogram4Scheduler has no .sigmas attribute; expose a sigma_NOISE tensor
+        # so stage-transition logic can find the right step and DWT gets the correct
+        # noise level.
+        #
+        # schedule_values convention: sigma_clean values, index 0 = clean end (≈1),
+        # index N = noisy end (≈0). Step step_index k uses internal index i = N-1-k,
+        # so sigma_NOISE at step k = 1 - schedule_values[N-k].
+        # flip(1 - schedule_values) gives sigmas[k] = 1 - schedule_values[N-k],
+        # which decreases from ≈1 (noisy, step 0) to ≈0 (clean, step N) — the
+        # convention expected by find_transition_steps and apply_upsample (sigma_t).
+        schedule_values = ctx.extra["ideogram4_schedule_values"]
+        ctx.scheduler.sigmas = torch.flip(1.0 - schedule_values, [0])
         return ctx
 
     # ------------------------------------------------------------------
@@ -419,11 +428,15 @@ class Ideogram4ProgressiveDenoisingStage(
         server_args: ServerArgs,
     ) -> None:
         # Ideogram4DenoisingStage uses step.t_int as a step index [0..N-1] into
-        # schedule_values.  In dct_rewind mode the progressive base patches
-        # ctx.timesteps[transition_step] = t_eff * 1000 (a FLUX-convention noise
-        # level), which corrupts t_int to ~950 and causes an IndexError.
-        # step.step_index is always the raw loop counter and is safe to use.
-        step.t_int = step.step_index
+        # schedule_values.  set_timesteps(N) produces timesteps = [N-1, N-2, ..., 0],
+        # so the correct mapping is t_int = N-1-step_index.
+        #
+        # In dct_rewind mode the progressive base patches
+        # ctx.timesteps[transition_step] = t_eff * 1000 (FLUX-convention noise level),
+        # which corrupts int(timesteps[step_index]) to ~950 and causes an IndexError.
+        # We bypass ctx.timesteps entirely and reconstruct from step_index.
+        num_steps = len(ctx.timesteps)
+        step.t_int = num_steps - 1 - step.step_index
         Ideogram4DenoisingStage._run_denoising_step(self, ctx, step, batch, server_args)
 
     # ------------------------------------------------------------------
