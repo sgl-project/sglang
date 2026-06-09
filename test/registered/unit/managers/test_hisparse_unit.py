@@ -14,7 +14,19 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cuda_ci
+
+
+class _FakeReq(SimpleNamespace):
+    @property
+    def extend_fill_len(self) -> int:
+        return self.extend_range.end
+
+    @property
+    def extend_input_len(self) -> int:
+        return self.extend_range.length
+
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
@@ -40,7 +52,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         origin_input_ids = list(range(64))
     if output_ids is None:
         output_ids = []
-    req = SimpleNamespace(
+    req = _FakeReq(
         rid=rid,
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
@@ -55,8 +67,8 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         inflight_middle_chunks=0,
     )
     req.finished = lambda: req.finished_reason is not None
-    req.set_extend_input_len = lambda extend_input_len: setattr(
-        req, "extend_input_len", extend_input_len
+    req.set_extend_range = lambda start, end: setattr(
+        req, "extend_range", Range(start, end)
     )
     return req
 
@@ -210,7 +222,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
-        req.extend_fill_len = fill_len
+        req.extend_range = Range(0, fill_len)
         return kv_loc
 
     # ==================================================================
