@@ -98,10 +98,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
         self.extend_lens = [r.extend_range.length for r in reqs]
-        # Unused in PREBUILT mode: input logprobs are produced on the prefill
-        # engine and the decode server runs no extend forward here, so nothing
-        # reads this field. Left as None so any unexpected reader fails loudly
-        # instead of silently computing logprobs from a bogus start position.
         self.extend_logprob_start_lens = None
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
