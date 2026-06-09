@@ -1847,11 +1847,10 @@ class SchedulerDisaggregationDecodeMixin:
             if i < num_not_used_batch:
                 can_run_list.append(req)
                 self._activate_req(req)
-                tree_cache = (
-                    None
-                    if self.server_args.disaggregation_decode_enable_radix_cache
-                    else self.tree_cache
-                )
+                if self.server_args.disaggregation_decode_enable_radix_cache:
+                    tree_cache = None
+                else:
+                    tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
                 # Truncate extend_fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted

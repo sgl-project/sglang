@@ -1804,12 +1804,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            dllm_config=dllm_config,
-            output_process_mode=output_process_mode,
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req
             ),
+            dllm_config=dllm_config,
+            output_process_mode=output_process_mode,
         )
         return batch
 

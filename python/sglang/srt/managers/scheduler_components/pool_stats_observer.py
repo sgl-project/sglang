@@ -163,6 +163,11 @@ class SchedulerPoolStatsObserver:
         )
 
     def active_pool_idxs(self) -> set:
+        """Pool idxs currently owned by reqs in last_batch / running_batch.
+
+        Used to decide which session slots' KV is owned by batch reqs
+        (and thus counted via uncached_size, not session_held).
+        """
         idxs = set()
         for batch in [self.get_last_batch(), self.get_running_batch()]:
             if batch is None or batch.is_empty():
