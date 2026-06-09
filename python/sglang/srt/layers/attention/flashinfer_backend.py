@@ -70,6 +70,7 @@ def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
         mul_base *= get_attention_cp_size()
     return (max_bs + mul_base - 1) // mul_base * mul_base
 
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True

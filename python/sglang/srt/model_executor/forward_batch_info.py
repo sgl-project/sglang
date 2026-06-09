@@ -1161,9 +1161,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self.forward_mode.is_idle():
                     setattr(self, "_original_forward_mode", self.forward_mode)
                     self.forward_mode = ForwardMode.TARGET_VERIFY
-                bs = self.batch_size = (
-                    num_tokens // self.spec_info.num_tokens_per_req
-                )
+                bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
@@ -1189,9 +1187,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_prefix_lens = torch.zeros(
                     1, dtype=self.seq_lens.dtype, device=dev
                 )
-                self.extend_start_loc = torch.zeros(
-                    1, dtype=torch.int32, device=dev
-                )
+                self.extend_start_loc = torch.zeros(1, dtype=torch.int32, device=dev)
                 self.seq_lens = torch.tensor(
                     [num_tokens], dtype=self.seq_lens.dtype, device=dev
                 )
