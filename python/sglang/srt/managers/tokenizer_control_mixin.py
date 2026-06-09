@@ -27,6 +27,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -75,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRelayWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -101,6 +104,10 @@ _COMMUNICATOR_SPECS = [
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
+    ),
+    (
+        "destroy_weights_send_group_for_remote_instance",
+        DestroyWeightsSendGroupForRemoteInstanceReqOutput,
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
@@ -443,6 +450,32 @@ class TokenizerControlMixin:
 
         return success, message
 
+    async def update_relay_weights_from_distributed(
+        self: TokenizerManager,
+        obj: UpdateRelayWeightsFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+
+        # Relay receive only enqueues tensors; ModelRunner applies them later in a background loader.
+        # A writer lock here would be released before that load runs, so non-paused relay updates need
+        # a lock or barrier that covers the queued background apply path and is not yet supported.
+        async with self.is_pause_cond:
+            if not self.is_pause:
+                return (
+                    False,
+                    "relay distributed weight transfer requires paused generation. "
+                    "Pause generation before receiving relay weights so the asynchronous load "
+                    "cannot race with active inference.",
+                )
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
+            results = await self.update_weights_from_distributed_communicator(obj)
+        return FanOutCommunicator.merge_results(results)
+
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
         obj: InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -469,6 +502,21 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
+        return result.success, result.message
+
+    async def destroy_weights_send_group_for_remote_instance(
+        self: TokenizerManager,
+        obj: DestroyWeightsSendGroupForRemoteInstanceReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        # TODO: support DP
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for destroy_weights_send_group_for_remote_instance"
+        result = (
+            await self.destroy_weights_send_group_for_remote_instance_communicator(obj)
+        )[0]
         return result.success, result.message
 
     async def update_weights_from_tensor(

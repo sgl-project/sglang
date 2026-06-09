@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    UpdateRelayWeightsFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -92,7 +93,10 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_distributed(
         self,
-        recv_req: UpdateWeightsFromDistributedReqInput,
+        recv_req: (
+            UpdateWeightsFromDistributedReqInput
+            | UpdateRelayWeightsFromDistributedReqInput
+        ),
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         self._quiesce_for_weight_update()

@@ -115,11 +115,14 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DestroyRelayWeightsUpdateGroupReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    InitRelayWeightsUpdateGroupReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -136,6 +139,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateRelayWeightsFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1096,6 +1100,23 @@ async def send_weights_to_remote_instance(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/destroy_weights_send_group_for_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def destroy_weights_send_group_for_remote_instance(
+    obj: DestroyWeightsSendGroupForRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_send_group_for_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.get("/get_remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_remote_instance_transfer_engine_info(rank: int = None):
@@ -1176,12 +1197,42 @@ async def init_weights_update_group(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/init_relay_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def init_relay_weights_update_group(
+    obj: InitRelayWeightsUpdateGroupReqInput, request: Request
+):
+    """Initialize the relay parameter update group."""
+    success, message = await _global_state.tokenizer_manager.init_weights_update_group(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
 @app.post("/destroy_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
     """Destroy the parameter update group."""
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/destroy_relay_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def destroy_relay_weights_update_group(
+    obj: DestroyRelayWeightsUpdateGroupReqInput, request: Request
+):
+    """Destroy the relay parameter update group."""
     success, message = (
         await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     )
@@ -1230,6 +1281,24 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_relay_weights_from_distributed")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_relay_weights_from_distributed(
+    obj: UpdateRelayWeightsFromDistributedReqInput, request: Request
+):
+    """Receive relay model parameters from distributed online."""
+    success, message = (
+        await _global_state.tokenizer_manager.update_relay_weights_from_distributed(
+            obj, request
+        )
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weights_from_ipc")

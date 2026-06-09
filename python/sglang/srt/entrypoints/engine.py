@@ -62,10 +62,12 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
+    DestroyRelayWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    InitRelayWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
@@ -77,6 +79,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
+    UpdateRelayWeightsFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -999,12 +1002,46 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
+    def init_relay_weights_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str = "nccl",
+    ):
+        """Initialize relay parameter update group."""
+        obj = InitRelayWeightsUpdateGroupReqInput(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.init_weights_update_group(obj, None)
+        )
+
     def destroy_weights_update_group(
         self,
         group_name: str,
     ):
         """Destroy parameter update group."""
         obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=group_name,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
+    def destroy_relay_weights_update_group(
+        self,
+        group_name: str,
+    ):
+        """Destroy relay parameter update group."""
+        obj = DestroyRelayWeightsUpdateGroupReqInput(
             group_name=group_name,
         )
         return self.loop.run_until_complete(
@@ -1031,6 +1068,28 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def update_relay_weights_from_distributed(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+        load_format: Optional[str] = None,
+    ):
+        """Update weights from a relay distributed source."""
+        obj = UpdateRelayWeightsFromDistributedReqInput(
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            flush_cache=flush_cache,
+            load_format=load_format,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.update_relay_weights_from_distributed(obj, None)
         )
 
     def update_weights_from_tensor(
