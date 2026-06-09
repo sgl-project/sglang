@@ -381,6 +381,14 @@ class TboDPAttentionPreparer:
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
+        # Short-circuit when TBO is off: prepare_mlp_sync_batch_raw invokes
+        # this preparer unconditionally for the forward_mode all-gather, but
+        # compute_split_seq_index is TBO-only and undefined for some modes
+        # (e.g. MIXED from enable_mixed_chunk).
+        if not enable_two_batch_overlap:
+            self.local_tbo_split_seq_index = None
+            return False, self._compute_local_forward_mode(local_batch)
+
         if local_batch is not None:
             token_num_per_seq = get_token_num_per_seq(
                 forward_mode=local_batch.forward_mode, spec_info=local_batch.spec_info
@@ -692,6 +700,7 @@ class TboForwardBatchPreparer:
             "all_extend_in_batch",
             "return_logprob",
             "can_run_dp_cuda_graph",
+            "can_run_dp_breakable_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
