@@ -1,8 +1,10 @@
 # Usage (to build SGLang ROCm docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm723 -t v0.5.10.post1-rocm723-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm723 -t v0.5.10.post1-rocm723-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -11,14 +13,18 @@
 # RDMA NICs installed (rare), overwrite w. runtime env MORI_DEVICE_NIC = "bnxt"|"ionic"|"mlx5"
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm723 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm723-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm723 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm723-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_942_ROCM723="rocm/pytorch:rocm7.2.3_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_950_ROCM723="rocm/pytorch:rocm7.2.3_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -44,6 +50,16 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="7a8ff7dd4ae3063ff1a18622a46460125c84370e"
 
 # ===============================
+# Base image 942 with rocm723 and args
+FROM $BASE_IMAGE_942_ROCM723 AS gfx942-rocm723
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
+
+# ===============================
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
@@ -64,6 +80,16 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="7a8ff7dd4ae3063ff1a18622a46460125c84370e"
 
 # ===============================
+# Base image 950 with rocm723 and args
+FROM $BASE_IMAGE_950_ROCM723 AS gfx950-rocm723
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
+
+# ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
 
@@ -81,6 +107,18 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
+
+# Triton variant for ROCm 7.2.3 (selected by GPU_ARCH=*rocm723* in the Triton
+# hot patch RUN block below). Builds from the ROCm/triton fork with two
+# upstream cherry-picks from triton-lang/triton:
+#   555d04f -> https://github.com/triton-lang/triton/pull/8991
+#   dd998b6 -> https://github.com/triton-lang/triton/pull/9541
+# Pattern adapted from
+#   https://github.com/vllm-project/vllm/blob/main/docker/Dockerfile.rocm_base
+ARG TRITON_ROCM_REPO="https://github.com/ROCm/triton.git"
+ARG TRITON_ROCM_COMMIT="ba5c1517"
+ARG TRITON_ROCM_CHERRY_PICK_1="555d04f"
+ARG TRITON_ROCM_CHERRY_PICK_2="dd998b6"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -137,12 +175,12 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
 # The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
 # amdgpu.ids device-ID-to-marketing-name mapping file.
-# ROCm 7.2 base images already ship these packages, so this step is skipped.
+# ROCm 7.2.x base images already ship these packages, so this step is skipped.
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
+      *rocm72*) \
+        echo "ROCm 7.2.x (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
         ;; \
       *) \
         echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
@@ -166,16 +204,18 @@ RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
 # Install AMD SMI Python package from ROCm distribution.
-# The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
+# rocm/pytorch base images for ROCm 7.2.0 / 7.2.3 do not pre-install amd-smi,
+# so this step installs it for those variants. Other base images either ship
+# it already or do not need it.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+      *rocm720*|*rocm723*) \
+        echo "ROCm (GPU_ARCH=${GPU_ARCH}): installing amd-smi"; \
         cd /opt/rocm/share/amd_smi \
         && python3 -m pip install --no-cache-dir . \
         ;; \
       *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
+        echo "GPU_ARCH=${GPU_ARCH}: skip amd-smi installation (base image already ships it or not applicable)"; \
         ;; \
     esac
 
@@ -490,68 +530,70 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly.
-ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
-     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-     && cat > hack.py <<"PY"
-import zipfile, csv, os, re
+# Both rocm7.2.0 and rocm7.2.3 base images install a torch wheel that hardcodes
+# a specific triton version (e.g. triton==3.5.1+rocm7.2.x.git...). Since this
+# Dockerfile builds a custom triton later (BUILD_TRITON=1), that pin would
+# cause `pip check` / future `pip install` to fail with a version conflict.
+# We relax the constraint to `triton>=3.5.1` by editing the installed torch
+# dist-info METADATA in place.
+#
+# (Both rocm720 and rocm723 base images ship a pre-installed torch. rocm720
+# additionally keeps the source wheel at /, which we drop to shrink the image.)
+RUN cat > /tmp/hack_inplace.py <<"PY"
+"""Relax torch's pinned triton requirement in-place.
+
+The rocm/pytorch ROCm 7.2.x base images install torch with a hardcoded
+`Requires-Dist: triton==3.5.1+rocm7.2.x.git...` pin. Since this Dockerfile
+replaces triton with a custom build later, the pin would cause `pip install`
+/ `pip check` to fail with a version conflict. This script edits the
+installed torch dist-info METADATA to relax the pin to `triton>=3.5.1` and
+blanks the corresponding RECORD hash so pip stays happy.
+"""
+import csv, re, sys
 from pathlib import Path
 
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
+site = Path("/opt/venv/lib/python3.10/site-packages")
+dist_info = next(site.glob("torch-*.dist-info"), None)
+if dist_info is None:
+    sys.exit("torch dist-info not found under /opt/venv")
 
-# 1) Extract
-with zipfile.ZipFile(in_whl, "r") as z:
-    z.extractall(work)
-
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
-dist_info = next(work.glob("*.dist-info"))
 meta = dist_info / "METADATA"
 txt = meta.read_text(encoding="utf-8")
-
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
+# Match the version string up to (but not including) the env marker ";" so that
+# substituting in "triton>=3.5.1" keeps the trailing "; platform_system ..." part.
+pat = r"^Requires-Dist:\s*triton==3\.5\.1[^;\s]*"
+txt2, n = re.subn(pat, "Requires-Dist: triton>=3.5.1", txt, flags=re.MULTILINE)
+if n == 0:
+    sys.exit("Did not find expected Requires-Dist line to replace in METADATA")
 meta.write_text(txt2, encoding="utf-8")
+print(f"Patched {meta}: triton pin -> triton>=3.5.1 ({n} line)")
 
-# 3) Hacky step: blank hash/size columns in RECORD
+# Blank METADATA hash/size in RECORD so pip is happy on subsequent operations.
 record = dist_info / "RECORD"
-rows = []
-with record.open(newline="", encoding="utf-8") as f:
-    for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
-with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in work.rglob("*"):
-        if p.is_file():
-            z.write(p, p.relative_to(work).as_posix())
-
-print("Wrote", out_whl)
+if record.exists():
+    rows = []
+    rel_meta = f"{dist_info.name}/METADATA"
+    with record.open(newline="", encoding="utf-8") as f:
+        for r in csv.reader(f):
+            if not r:
+                continue
+            if r[0] == rel_meta:
+                rows.append([r[0], "", ""])
+            else:
+                rows.append(r)
+    with record.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+    print(f"Blanked METADATA hash/size in {record}")
 PY
 
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
+RUN case "${GPU_ARCH}" in \
+      *rocm720*|*rocm723*) \
+        echo "ROCm 7.2.x (GPU_ARCH=${GPU_ARCH}): relaxing torch METADATA in-place"; \
+        python3 /tmp/hack_inplace.py \
+        && rm -f /tmp/hack_inplace.py /torch-*.whl \
         ;; \
       *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
+        echo "GPU_ARCH=${GPU_ARCH}: skip torch hot patch (only rocm720/rocm723 need it)"; \
         ;; \
     esac
 
@@ -562,14 +604,41 @@ RUN cd /tmp/whl \
 # so future `pip install` will break the ROCm stack.
 # A workaround for this is to reinstall the default triton
 # wheel with the `rocm/pytorch` image in the root directory.
+#
+# Two build variants are selected by GPU_ARCH (same pattern as the libdrm and
+# amd-smi cases above):
+#   - *rocm723*: ROCm/triton fork + upstream cherry-picks (PR#8991, PR#9541),
+#     build pattern adapted from vLLM Dockerfile.rocm_base.
+#   - default (e.g. rocm720): unchanged legacy build from triton-lang/triton.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip uninstall -y triton \
-     && apt install -y cmake \
-     && git clone ${TRITON_REPO} triton-custom \
-     && cd triton-custom \
-     && git checkout ${TRITON_COMMIT} \
-     && pip install -r python/requirements.txt \
-     && pip install -e .; \
+        case "${GPU_ARCH}" in \
+          *rocm723*) \
+            set -eux \
+         && pip uninstall -y triton \
+         && apt-get update && apt-get install -y --no-install-recommends cmake \
+         && rm -rf /var/lib/apt/lists/* \
+         && git clone ${TRITON_ROCM_REPO} triton-custom \
+         && cd triton-custom \
+         && git checkout ${TRITON_ROCM_COMMIT} \
+         && git config user.email "build@sglang.local" \
+         && git config user.name "SGLang Build" \
+         && echo "[Triton] Cherry-picking ${TRITON_ROCM_CHERRY_PICK_1} (PR#8991)" \
+         && git cherry-pick ${TRITON_ROCM_CHERRY_PICK_1} \
+         && echo "[Triton] Cherry-picking ${TRITON_ROCM_CHERRY_PICK_2} (PR#9541)" \
+         && git cherry-pick ${TRITON_ROCM_CHERRY_PICK_2} \
+         && if [ ! -f setup.py ]; then cd python; fi \
+         && pip install . \
+            ;; \
+          *) \
+            pip uninstall -y triton \
+         && apt install -y cmake \
+         && git clone ${TRITON_REPO} triton-custom \
+         && cd triton-custom \
+         && git checkout ${TRITON_COMMIT} \
+         && pip install -r python/requirements.txt \
+         && pip install -e . \
+            ;; \
+        esac; \
     fi
 
 # -----------------------

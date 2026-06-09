@@ -100,6 +100,8 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  AMD_CI_MI30X_IMAGE: rocm/sgl-dev:v0.5.12.post1-rocm723-mi30x-20260525-test
+  AMD_CI_MI35X_IMAGE: rocm/sgl-dev:v0.5.12.post1-rocm723-mi35x-20260525-test
 
 concurrency:
   # When called via workflow_call with run_all_tests=true, use a unique group per run to
