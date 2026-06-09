@@ -1,0 +1,100 @@
+Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`
+[06-09 08:14:04] Auto memory policy for Ideogram4PipelineConfig selected layerwise offload components: text_encoder, image_encoder, vae
+[06-09 08:14:04] server_args: {"model_path": "/miele/brian/modelscope/ideogram-4-fp8", "model_id": null, "backend": "auto", "attention_backend": "torch_sdpa", "attention_backend_config": {}, "component_attention_backends": {}, "cache_dit_config": null, "nccl_port": null, "trust_remote_code": false, "revision": null, "num_gpus": 1, "performance_mode": "auto", "base_gpu_id": 0, "gpu_ids": null, "tp_size": 1, "sp_degree": 1, "ulysses_degree": 1, "ring_degree": 1, "dp_size": 1, "dp_degree": 1, "enable_cfg_parallel": false, "cfg_parallel_degree": 1, "hsdp_replicate_dim": 1, "hsdp_shard_dim": 1, "dist_timeout": 3600, "pipeline_class_name": null, "lora_path": null, "lora_nickname": "default", "lora_scale": 1.0, "lora_merge_mode": "auto", "lora_weight_name": null, "component_paths": {}, "transformer_weights_path": null, "component_transformer_weights_paths": {}, "quantization": null, "quantization_ignored_layers": null, "lora_target_modules": null, "dit_cpu_offload": false, "dit_layerwise_offload": false, "layerwise_offload_components": ["text_encoder", "image_encoder", "vae"], "dit_offload_prefetch_size": 0.0, "text_encoder_cpu_offload": false, "image_encoder_cpu_offload": false, "vae_cpu_offload": false, "use_fsdp_inference": false, "pin_cpu_memory": true, "ltx2_two_stage_device_mode": null, "comfyui_mode": false, "enable_torch_compile": false, "enable_layerwise_nvtx_marker": false, "warmup": false, "server_warmup": false, "warmup_resolutions": null, "warmup_steps": 1, "disable_autocast": false, "master_port": 30005, "host": "127.0.0.1", "port": 30000, "webui": false, "webui_port": 12312, "scheduler_port": 5594, "batching_mode": "dynamic", "batching_max_size": 1, "batching_delay_ms": 0.0, "batching_config": null, "enable_batching_metrics": false, "strict_ports": false, "output_path": "outputs/", "input_save_path": "inputs/uploads", "prompt_file_path": null, "model_paths": {}, "model_loaded": {"transformer": true, "vae": true, "video_vae": true, "audio_vae": true, "video_dit": true, "audio_dit": true, "dual_tower_bridge": true}, "boundary_ratio": null, "disagg_role": "monolithic", "disagg_timeout": 3600, "disagg_downstream_wait_timeout": 1800, "disagg_dispatch_policy": "round_robin", "disagg_mode": false, "disagg_instance_id": 0, "disagg_max_slots_per_instance": 8, "disagg_transfer_redundancy": 1.25, "disagg_role_device": "auto", "disagg_transfer_backend": "auto", "disagg_transfer_pool_size": 268435456, "disagg_transfer_pin_memory": "auto", "disagg_p2p_hostname": "127.0.0.1", "disagg_ib_device": null, "disagg_server_addr": null, "encoder_urls": null, "denoiser_urls": null, "decoder_urls": null, "encoder_tp": null, "denoiser_tp": null, "denoiser_sp": null, "denoiser_ulysses": null, "denoiser_ring": null, "decoder_sp": null, "decoder_tp": null, "pool_work_endpoint": null, "pool_result_endpoint": null, "pool_control_endpoint": null, "pool_control_advertised_endpoint": null, "log_level": "info", "uvicorn_access_log_exclude_prefixes": [], "enable_trace": false, "otlp_traces_endpoint": "localhost:4317"}
+[06-09 08:14:04] Diffusers version: 0.39.0.dev0
+[06-09 08:14:04] Local mode: True
+[06-09 08:14:04] Starting server...
+Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`
+[06-09 08:14:14] Scheduler bind at endpoint: tcp://127.0.0.1:5594
+[06-09 08:14:14] Initializing distributed environment with world_size=1, device=cuda:0, timeout=3600
+[06-09 08:14:14] Setting distributed timeout to 3600 seconds
+[06-09 08:14:15] No pipeline_class_name specified, using model_index.json
+[06-09 08:14:15] Diffusers version: 0.39.0.dev0
+[06-09 08:14:15] Using pipeline from model_index.json: Ideogram4Pipeline
+[06-09 08:14:15] Loading pipeline modules...
+[06-09 08:14:15] Model already exists locally and is complete
+[06-09 08:14:15] Model path: /miele/brian/modelscope/ideogram-4-fp8
+[06-09 08:14:15] Diffusers version: 0.39.0.dev0
+[06-09 08:14:15] Loading pipeline modules from config: {'_class_name': 'Ideogram4Pipeline', '_diffusers_version': '0.39.0.dev0', '_name_or_path': 'ideogram-ai/debug-ideogram-v4', 'scheduler': ['diffusers', 'FlowMatchEulerDiscreteScheduler'], 'text_encoder': ['transformers', 'Qwen3VLModel'], 'tokenizer': ['transformers', 'Qwen2Tokenizer'], 'transformer': ['diffusers', 'Ideogram4Transformer2DModel'], 'unconditional_transformer': ['diffusers', 'Ideogram4Transformer2DModel'], 'vae': ['diffusers', 'AutoencoderKLFlux2']}
+[06-09 08:14:15] Loading required components: ['text_encoder', 'tokenizer', 'vae', 'transformer', 'unconditional_transformer', 'scheduler']
+[06-09 08:14:15] Memory-aware component load order: ['transformer', 'unconditional_transformer', 'text_encoder', 'vae', 'tokenizer', 'scheduler']
+Loading required modules:   0%|          | 0/6 [00:00<?, ?it/s][06-09 08:14:15] Loading transformer from /miele/brian/modelscope/ideogram-4-fp8/transformer. avail mem: 42.51 GB
+[06-09 08:14:15] Loading Ideogram4Transformer2DModel from 1 safetensors file(s) , param_dtype: torch.bfloat16
+[06-09 08:14:15] Using Torch SDPA backend
+[06-09 08:14:15] Using torch_sdpa backend for transformer
+[06-09 08:14:16] [RunAI Streamer] Overall time to stream 8.7 GiB of all files to cpu: 0.87s, 9.9 GiB/s
+[93m[06-09 08:14:18] Model dtype does not match expected param dtype, torch.float8_e4m3fn vs torch.bfloat16[0;0m
+[06-09 08:14:18] Loaded transformer: Ideogram4Transformer2DModel (sgl-diffusion version). model size: 8.65 GB, consumed GPU mem: 8.80 GB, avail GPU mem: 33.71 GB
+Loading required modules:  17%|█▋        | 1/6 [00:03<00:15,  3.20s/it][06-09 08:14:18] Loading unconditional_transformer from /miele/brian/modelscope/ideogram-4-fp8/unconditional_transformer. avail mem: 33.71 GB
+[06-09 08:14:18] Loading Ideogram4Transformer2DModel from 1 safetensors file(s) , param_dtype: torch.bfloat16
+[06-09 08:14:18] Using torch_sdpa backend for unconditional_transformer
+[06-09 08:14:19] [RunAI Streamer] Overall time to stream 8.7 GiB of all files to cpu: 0.77s, 11.3 GiB/s
+[93m[06-09 08:14:22] Model dtype does not match expected param dtype, torch.float8_e4m3fn vs torch.bfloat16[0;0m
+[06-09 08:14:22] Loaded unconditional_transformer: Ideogram4Transformer2DModel (sgl-diffusion version). model size: 8.65 GB, consumed GPU mem: 8.78 GB, avail GPU mem: 24.92 GB
+Loading required modules:  33%|███▎      | 2/6 [00:06<00:13,  3.37s/it][06-09 08:14:22] Loading text_encoder from /miele/brian/modelscope/ideogram-4-fp8/text_encoder. avail mem: 24.92 GB
+[06-09 08:14:22] Loading text_encoder on CPU first because it is selected for layerwise offload
+[06-09 08:14:37] Using Torch SDPA backend
+[06-09 08:14:37] Using torch_sdpa backend for text_encoder
+[06-09 08:14:38] [RunAI Streamer] Overall time to stream 8.2 GiB of all files to cpu: 1.26s, 6.5 GiB/s
+[06-09 08:14:39] No layerwise-offloadable ModuleList found for IdeogramQwen3VLTextEncoder. Candidates: ['layers', 'encoder.block', 'text_model.encoder.layers', 'model.language_model.layers']
+[06-09 08:14:39] No pipeline component supports layerwise offload.
+[93m[06-09 08:14:39] Layerwise startup CPU staging was requested for text_encoder, but the loaded module did not enable layerwise offload. Moving it to GPU.[0;0m
+[06-09 08:14:41] Loaded text_encoder: IdeogramQwen3VLTextEncoder (sgl-diffusion version). model size: 7.63 GB, consumed GPU mem: 7.63 GB, avail GPU mem: 17.29 GB
+Loading required modules:  50%|█████     | 3/6 [00:25<00:30, 10.32s/it][06-09 08:14:41] Loading vae from /miele/brian/modelscope/ideogram-4-fp8/vae. avail mem: 17.29 GB
+[06-09 08:14:41] Loaded vae: AutoencoderKLFlux2 (sgl-diffusion version). model size: 0.16 GB, consumed GPU mem: 0.17 GB, avail GPU mem: 17.13 GB
+Loading required modules:  67%|██████▋   | 4/6 [00:25<00:12,  6.30s/it][06-09 08:14:41] Loading tokenizer from /miele/brian/modelscope/ideogram-4-fp8/tokenizer. avail mem: 17.13 GB
+[06-09 08:14:42] Loaded tokenizer: Qwen2Tokenizer (sgl-diffusion version). model size: NA GB, consumed GPU mem: 0.00 GB, avail GPU mem: 17.13 GB
+Loading required modules:  83%|████████▎ | 5/6 [00:26<00:04,  4.34s/it][06-09 08:14:42] Loading scheduler from /miele/brian/modelscope/ideogram-4-fp8/scheduler. avail mem: 17.13 GB
+[06-09 08:14:42] Loaded scheduler: FlowMatchEulerDiscreteScheduler (sgl-diffusion version). model size: NA GB, consumed GPU mem: 0.00 GB, avail GPU mem: 17.13 GB
+Loading required modules: 100%|██████████| 6/6 [00:26<00:00,  4.38s/it]
+[06-09 08:14:42] Creating pipeline stages...
+[06-09 08:14:42] Using Torch SDPA backend
+[06-09 08:14:42] Pipeline instantiated
+[06-09 08:14:42] No layerwise-offloadable ModuleList found for IdeogramQwen3VLTextEncoder. Candidates: ['layers', 'encoder.block', 'text_model.encoder.layers', 'model.language_model.layers']
+[06-09 08:14:42] LayerwiseOffloadManager initialized with num prefetched layer: 1, total num layers: 4
+[06-09 08:14:42] LayerwiseOffloadManager initialized with num prefetched layer: 1, total num layers: 4
+[06-09 08:14:42] Enabled layerwise offload for AutoencoderKLFlux2 on modules: ['encoder.down_blocks', 'decoder.up_blocks']
+[06-09 08:14:42] Enabled layerwise offload for pipeline components: ['vae']
+[06-09 08:14:42] Worker 0: Initialized device, model, and distributed environment.
+[06-09 08:14:42] Worker 0: Scheduler loop started.
+[06-09 08:14:42] Processing 1 grouped request(s)
+[06-09 08:14:42] Sampling params:
+                       width: 1024
+                      height: 1024
+                  num_frames: 1
+                         fps: 24
+                      prompt: <redacted, len=5975>
+                  neg_prompt: <redacted, len=1>
+                        seed: 42
+                 infer_steps: 20
+      num_outputs_per_prompt: 1
+              guidance_scale: 7.0
+     embedded_guidance_scale: 6.0
+                    n_tokens: None
+                  flow_shift: None
+                  image_path: None
+                 save_output: True
+            output_file_path: /home/brianchc/sglang/scratch/spectral-progressive-ideogram/results/delta_sweep_20260609_081010/Ideogram4_dct_rewind_d0_02.png
+
+[06-09 08:14:42] Running pipeline stages: ['InputValidationStage', 'ideogram4_text_encoding_stage', 'LatentPreparationStage', 'ideogram4_denoising_stage', 'ideogram4_decoding_stage']
+[06-09 08:14:42] [InputValidationStage] started...
+[06-09 08:14:42] [InputValidationStage] finished in 0.0000 seconds
+[06-09 08:14:42] [Ideogram4TextEncodingStage] started...
+[06-09 08:14:42] [Ideogram4TextEncodingStage] finished in 0.5057 seconds
+[06-09 08:14:42] [LatentPreparationStage] started...
+[06-09 08:14:42] [LatentPreparationStage] finished in 0.0010 seconds
+[06-09 08:14:42] [DenoisingStage] started...
+[06-09 08:14:42] Progressive denoising: mode=dct_rewind levels=1 delta=0.020 initial=32x32
+[06-09 08:14:42] Stage 1/2: 32x32 latent, steps [0, 4)
+[06-09 08:14:46]   rewind: sigma=0.8972 → t_eff=0.9458 at step 4
+[06-09 08:14:46] Updated position_ids / attn_masks / llm_features for 64x64 latent grid (4096 image tokens) across 1 batch item(s)
+[06-09 08:14:46] Stage 2/2: 64x64 latent, steps [4, 20)
+[06-09 08:15:29] Progressive denoising done in 46.92s (avg 2.3462s/step)
+[06-09 08:15:29] [DenoisingStage] finished in 46.9515 seconds
+[06-09 08:15:29] [Ideogram4DecodingStage] started...
+[06-09 08:15:30] [Ideogram4DecodingStage] finished in 0.8271 seconds
+[06-09 08:15:30] Output saved to [1;36m/home/brianchc/sglang/scratch/spectral-progressive-ideogram/results/delta_sweep_20260609_081010/Ideogram4_dct_rewind_d0_02.png[0;0m
+[06-09 08:15:30] Pixel data generated successfully in [92m48.45[0;0m seconds
+[06-09 08:15:30] Memory usage - Max peak: 33326.00 MB, Avg peak: 33326.00 MB
+[93m[06-09 08:15:30] Generator was garbage collected without being shut down. Attempting to shut down the local server and client.[0;0m
+[06-09 08:15:36] Worker 0: Shutdown complete.
