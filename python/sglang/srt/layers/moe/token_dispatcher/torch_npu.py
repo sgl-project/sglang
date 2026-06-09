@@ -80,21 +80,22 @@ class TorchNpuDispatcher(BaseDispatcher):
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
             # Prefill
             self.init_routing_prefill = NPUMoEInitRouting_v2()
-            self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=3)
+            self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type_prefill = 1
             # Decode
             self.init_routing_decode = NPUMoEInitRouting_v2()
-            self.finalize_routing_decode = NPUFinalizeRouting(drop_pad_mode=3)
+            self.finalize_routing_decode = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type_decode = 1
 
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             # Prefill
             self.init_routing_prefill = NPUMoEInitRouting_Quant()
             self.finalize_routing_prefill = NPUMoETokenUnpermute()
+            self.group_list_type_decode = 0
             # Decode
-            self.init_routing_decode = NPUMoEInitRouting_v2()  # example
-            self.finalize_routing_decode = NPUFinalizeRouting()  # example
-            self.group_list_type = 0
+            self.init_routing_decode = NPUMoEInitRouting_v2()
+            self.finalize_routing_decode = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type_decode = 1
 
         else:
             raise ValueError(
