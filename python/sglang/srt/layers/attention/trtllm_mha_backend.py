@@ -60,6 +60,8 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
+    # Pre-translated out_cache_loc for SWA KV write (avoids per-layer translation)
+    swa_out_cache_loc: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -206,9 +208,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._swa_kv_pool is not None:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
+                return self.forward_metadata.swa_out_cache_loc
         return forward_batch.out_cache_loc
 
     def _bind_swa_page_table(
@@ -218,6 +218,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         buf = source.get(key)
         if buf is not None:
             metadata.swa_page_table = buf[:bs, :]
+
+    def _bind_swa_out_cache_loc(
+        self, metadata: TRTLLMMHAMetadata, source: dict, bs: int
+    ):
+        """Bind pre-allocated swa_out_cache_loc slice to metadata for CUDA graph."""
+        buf = source.get("swa_out_cache_loc")
+        if buf is not None:
+            metadata.swa_out_cache_loc = buf[:bs]
 
     def _get_layer_page_table(
         self, layer: RadixAttention, forward_batch: ForwardBatch
@@ -247,6 +255,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=self.device,
             ),
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+            "swa_out_cache_loc": (
+                torch.zeros(max_bs, dtype=torch.int64, device=self.device)
+                if self._swa_kv_pool is not None
+                else None
+            ),
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
             ),
@@ -293,6 +306,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     device=self.device,
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+                "swa_out_cache_loc": (
+                    torch.zeros(max_bs, dtype=torch.int64, device=self.device)
+                    if self._swa_kv_pool is not None
+                    else None
+                ),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
@@ -317,6 +335,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     device=self.device,
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+                "swa_out_cache_loc": (
+                    torch.zeros(max_bs, dtype=torch.int64, device=self.device)
+                    if self._swa_kv_pool is not None
+                    else None
+                ),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
@@ -354,6 +377,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     "swa_page_table_draft_decode",
                     bs,
                 )
+                self._bind_swa_out_cache_loc(
+                    metadata, self.decode_cuda_graph_metadata, bs
+                )
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
                 # Normal Decode
@@ -374,6 +400,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.decode_cuda_graph_metadata,
                     "swa_page_table",
                     bs,
+                )
+                self._bind_swa_out_cache_loc(
+                    metadata, self.decode_cuda_graph_metadata, bs
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
@@ -396,6 +425,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table",
                 bs,
             )
+            self._bind_swa_out_cache_loc(
+                metadata, self.target_verify_metadata, bs
+            )
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = num_tokens // bs
@@ -412,6 +444,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table",
                 bs,
             )
+            self._bind_swa_out_cache_loc(
+                metadata, self.draft_extend_metadata, bs
+            )
             self.draft_extend_metadata[bs] = metadata
 
         return metadata
@@ -424,6 +459,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -537,6 +573,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+
+        if (
+            metadata is not None
+            and metadata.swa_out_cache_loc is not None
+            and out_cache_loc is not None
+        ):
+            translated = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            )
+            metadata.swa_out_cache_loc.copy_(translated[:bs])
+
         self.forward_metadata = metadata
 
     def update_verify_buffers_to_fill_after_draft(
@@ -547,6 +594,31 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
+
+    def _set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_scale: float,
+        v_scale: float,
+    ):
+        """Write KV to cache, passing pre-translated SWA loc when available."""
+        if self._swa_kv_pool is not None:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                cache_loc,
+                k,
+                v,
+                k_scale,
+                v_scale,
+                swa_loc=self.forward_metadata.swa_out_cache_loc,
+            )
+        else:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, k_scale, v_scale
+            )
 
     def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
@@ -603,6 +675,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=forward_batch.out_cache_loc,
             )
             if forward_mode.is_draft_extend():
                 # CUDA graph bakes max_seq_len_q as a constant. replay() sets it
@@ -618,6 +691,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                out_cache_loc=forward_batch.out_cache_loc,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -718,6 +792,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Compute SWA page table (None for non-SWA models)
         metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
 
+        # Pre-translate out_cache_loc for SWA KV writes (once per forward,
+        # instead of per SWA layer in _get_layer_cache_loc / set_kv_buffer)
+        if self._swa_kv_pool is not None and forward_batch.out_cache_loc is not None:
+            metadata.swa_out_cache_loc = (
+                self._swa_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+
         # Convert the page tables to a strided format
         if self.page_size > 1:
             self.strided_indices = torch.arange(
@@ -760,9 +843,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
+                self._set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -846,9 +928,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
+                self._set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
