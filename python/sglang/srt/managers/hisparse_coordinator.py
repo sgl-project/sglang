@@ -207,7 +207,7 @@ class HiSparseCoordinator:
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, : req.fill_len
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -298,7 +298,7 @@ class HiSparseCoordinator:
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
-            allocated_len = len(req.fill_ids)
+            allocated_len = req.fill_len
             alloc_size = self.padded_buffer_size
         else:
             allocated_len = req.kv_allocated_len
@@ -707,7 +707,7 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        prefill_len = len(req.fill_ids)
+        prefill_len = req.fill_len
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ]
