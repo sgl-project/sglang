@@ -96,6 +96,82 @@ def _jit_main_q_indexer_rope_first_hadamard_quant_module(dtype: torch.dtype):
 
 
 @cache_once
+def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
+    """V3.2 indexer Q kernel without Hadamard: RoPE on leading dims + fp8 act-quant.
+
+    kRopeFirst=true, kHadamard=false. V3.2 quantizes the un-rotated activations
+    (matches vLLM); the rotation is logit-preserving so dropping it only trades
+    fp8 quant accuracy.
+    """
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False)
+    return load_jit(
+        make_name("main_q_indexer_rope_first_quant"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_main_k_indexer_norm_rope_first_module(dtype: torch.dtype):
+    """V3.2 indexer K kernel without Hadamard: LayerNorm + RoPE on leading dims.
+
+    kRopeFirst=true, kHadamard=false. Counterpart of the no-Hadamard Q kernel.
+    """
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False)
+    return load_jit(
+        make_name("main_k_indexer_norm_rope_first"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedKIndexerNormRopeHadamardKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_main_k_indexer_norm_rope_store_module(
+    dtype: torch.dtype, page_size: int, hadamard: bool
+):
+    """V3.2 indexer K kernel + fused store: LayerNorm + RoPE on leading dims
+    (+ optional Hadamard) + fp8 act-quant + paged index-k cache write.
+
+    Collapses k_norm + rope + rotate_activation + fused_store_index_k_cache into
+    one launch so the whole K side overlaps the Q kernel.
+    """
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True, hadamard, page_size)
+    return load_jit(
+        make_name(f"main_k_indexer_norm_rope_store_p{page_size}_h{int(hadamard)}"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedKIndexerNormRopeStoreKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_main_k_indexer_norm_rope_first_hadamard_module(dtype: torch.dtype):
+    """V3.2 indexer K kernel: LayerNorm + RoPE on leading dims + 128-pt Hadamard.
+
+    Fuses k_norm + rope + rotate_activation; output is bf16 and fed to the
+    fused index-k cache store (which still does the fp8 quant). kRopeFirst=true
+    matches the V3.2 [rope | nope] layout.
+    """
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True)
+    return load_jit(
+        make_name("main_k_indexer_norm_rope_first_hadamard"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedKIndexerNormRopeHadamardKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
@@ -193,14 +269,22 @@ def fused_q_indexer_rope_first_hadamard_quant(
     weight_scale: float,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    hadamard: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """V3.2 variant: RoPE on the leading dims (q laid out as [rope | nope]). CUDA only."""
+    """V3.2 variant: RoPE on the leading dims (q laid out as [rope | nope]). CUDA only.
+
+    hadamard=False skips the rotation (V3.2 default), quantizing the un-rotated q.
+    """
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    module = _jit_main_q_indexer_rope_first_hadamard_quant_module(q_input.dtype)
+    module = (
+        _jit_main_q_indexer_rope_first_hadamard_quant_module(q_input.dtype)
+        if hadamard
+        else _jit_main_q_indexer_rope_first_quant_module(q_input.dtype)
+    )
     module.forward(
         q_input,
         q_fp8,
@@ -211,6 +295,73 @@ def fused_q_indexer_rope_first_hadamard_quant(
         positions,
     )
     return q_fp8, weights_out
+
+
+def fused_k_indexer_norm_rope_first_hadamard(
+    k_input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    hadamard: bool = True,
+) -> torch.Tensor:
+    """V3.2 indexer K: LayerNorm + RoPE on leading dims (+ optional Hadamard). CUDA only.
+
+    Returns the bf16 key; the caller stores it into the index-k cache (which
+    applies the fp8 quant). hadamard=False skips the rotation (V3.2 default).
+    """
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    k_out = torch.empty_like(k_input)
+    module = (
+        _jit_main_k_indexer_norm_rope_first_hadamard_module(k_input.dtype)
+        if hadamard
+        else _jit_main_k_indexer_norm_rope_first_module(k_input.dtype)
+    )
+    module.forward(
+        k_input,
+        k_out,
+        weight,
+        bias,
+        freqs_real,
+        positions,
+        float(eps),
+    )
+    return k_out
+
+
+def fused_k_indexer_norm_rope_store(
+    k_input: torch.Tensor,
+    cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    page_size: int,
+    hadamard: bool = True,
+) -> None:
+    """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims (+ optional
+    Hadamard) + fp8 act-quant + paged index-k cache write, in one launch. CUDA only.
+
+    `cache` is the index_k_with_scale buffer (num_pages, 132*page_size) uint8;
+    `out_cache_loc` is int64. hadamard=False skips the rotation (V3.2 default).
+    """
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    module = _jit_main_k_indexer_norm_rope_store_module(
+        k_input.dtype, page_size, hadamard
+    )
+    module.forward(
+        k_input,
+        cache,
+        out_cache_loc,
+        weight,
+        bias,
+        freqs_real,
+        positions,
+        float(eps),
+    )
 
 
 def fused_q_indexer_rope_hadamard_fp4_quant(

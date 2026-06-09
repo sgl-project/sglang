@@ -101,7 +101,11 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_hadamard_quant
+    from sglang.jit_kernel.dsv4 import (
+        fused_k_indexer_norm_rope_first_hadamard,
+        fused_k_indexer_norm_rope_store,
+        fused_q_indexer_rope_first_hadamard_quant,
+    )
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
 
@@ -387,9 +391,12 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        # Fused q path (CUDA): one kernel for rope + Hadamard + fp8 quant + head-gate
-        # fold. freqs_cis is the complex form of the (interleaved) rope cos/sin cache,
-        # built from the fp32 cache before any forward casts it to bf16.
+        # Fused q path (CUDA): one kernel for rope (+ optional Hadamard) + fp8 quant
+        # + head-gate fold. freqs_cis is the complex form of the (interleaved) rope
+        # cos/sin cache, built from the fp32 cache before any forward casts it to bf16.
+        # V3.2 skips the Hadamard rotation (matches vLLM): it is logit-preserving
+        # (orthonormal, applied to both q and k) and only aids fp8 quant accuracy.
+        self._indexer_use_hadamard = False
         self._indexer_freqs_cis: Optional[torch.Tensor] = None
         if _is_cuda:
             c = self.rotary_emb.cos_sin_cache.to(torch.float32)
@@ -586,6 +593,58 @@ class Indexer(MultiPlatformOp):
 
         return key
 
+    def _fused_k_prepare_and_store(
+        self,
+        key_raw: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+    ) -> None:
+        # Prefer the all-in-one kernel: LayerNorm + rope (+ Hadamard) + fp8 quant +
+        # paged cache write in one launch, so the whole K side is a single kernel
+        # that overlaps the Q kernel with no trailing store on the critical path.
+        out_cache_loc = forward_batch.out_cache_loc
+        pool = get_token_to_kv_pool()
+        page_size = pool.page_size
+        if (
+            not _is_fp8_fnuz
+            and out_cache_loc is not None
+            and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
+        ):
+            if not out_cache_loc.is_contiguous():
+                out_cache_loc = out_cache_loc.contiguous()
+            fused_k_indexer_norm_rope_store(
+                key_raw.contiguous(),
+                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                out_cache_loc,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                self._indexer_freqs_cis,
+                positions,
+                page_size,
+                hadamard=self._indexer_use_hadamard,
+            )
+            return
+
+        # Fallback: separate K kernel (-> bf16) + store kernel.
+        key = fused_k_indexer_norm_rope_first_hadamard(
+            key_raw.contiguous(),
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+            self._indexer_freqs_cis,
+            positions,
+            hadamard=self._indexer_use_hadamard,
+        )
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+        )
+
     def _fused_q_prepare_and_store(
         self,
         x: torch.Tensor,
@@ -595,43 +654,60 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         act_quant,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Overlap the q projection (wq_b) with the k norm/rope/store so the GEMM
-        # stays hidden, as the old dual-stream path did.
-        overlap = self.alt_stream is not None
-        if overlap:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self.alt_stream):
-                q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+        q_scale_gate = self.softmax_scale * self.n_heads**-0.5
+
+        if self.alt_stream is None:
+            kw, _ = self.wk_weights_proj(x)
+            key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+            self._fused_k_prepare_and_store(
+                key, positions, forward_batch, layer_id, act_quant
+            )
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+            return fused_q_indexer_rope_first_hadamard_quant(
+                q.contiguous(),
+                weights_raw.contiguous(),
+                q_scale_gate,
+                self._indexer_freqs_cis,
+                positions,
+                hadamard=self._indexer_use_hadamard,
+            )
+
+        # Two layers of overlap, with the returned q tensors kept on the current
+        # stream (the K kernel + cache store are the offloaded-to-alt work, as in
+        # the dual-stream path):
+        #   1. wq_b GEMM (alt) runs concurrently with the wk_weights_proj GEMM (current).
+        #   2. the fused Q kernel (current) runs concurrently with the fused K
+        #      kernel + cache store (alt).
+        # wait_stream calls are ordered by issue position so each side waits only
+        # on the GEMMs it consumes, not on the other side's fused kernel.
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
 
         kw, _ = self.wk_weights_proj(x)
         key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
-        key = self.k_norm(key)
-        k_rope, _ = torch.split(
-            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
-        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = rotate_activation(key)
-        self._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key,
-            act_quant=act_quant,
-        )
 
-        if overlap:
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+        # Pull q (from the alt wq_b GEMM) onto the current stream; issued before
+        # the K work below so the current stream does not wait on it.
+        current_stream.wait_stream(self.alt_stream)
+        # Hand key (from the current wk GEMM) to the alt stream for the K kernel.
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            self._fused_k_prepare_and_store(
+                key, positions, forward_batch, layer_id, act_quant
+            )
 
         q_fp8, weights = fused_q_indexer_rope_first_hadamard_quant(
             q.contiguous(),
             weights_raw.contiguous(),
-            self.softmax_scale * self.n_heads**-0.5,
+            q_scale_gate,
             self._indexer_freqs_cis,
             positions,
+            hadamard=self._indexer_use_hadamard,
         )
+
+        current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
 
     @staticmethod

@@ -11,6 +11,8 @@ from .compress import (
 )
 from .compress_old import fused_norm_rope_inplace
 from .elementwise import (
+    fused_k_indexer_norm_rope_first_hadamard,
+    fused_k_indexer_norm_rope_store,
     fused_k_norm_rope_flashmla,
     fused_q_indexer_rope_first_hadamard_quant,
     fused_q_indexer_rope_hadamard_fp4_quant,
@@ -42,6 +44,8 @@ __all__ = [
     "fused_q_indexer_rope_first_hadamard_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
+    "fused_k_indexer_norm_rope_first_hadamard",
+    "fused_k_indexer_norm_rope_store",
     "fused_k_norm_rope_flashmla",
     "make_name",
     "linear_bf16_fp32",
