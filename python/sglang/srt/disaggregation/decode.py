@@ -380,15 +380,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_len + self.num_reserved_decode_tokens,
         )
 
-    def _init_kv_manager(self) -> CommonKVManager:
-        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
-        kv_args = kv_args_class()
-
-        attn_tp_size = get_attention_tp_size()
-        kv_args.engine_rank = self.tp_rank % (attn_tp_size)
-
-        kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+    def _get_kv_buffer_infos(self) -> Tuple[List[int], List[int], List[int]]:
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
             if self.scheduler.enable_hisparse
@@ -417,9 +409,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
 
-        kv_args.kv_data_ptrs = kv_data_ptrs
-        kv_args.kv_data_lens = kv_data_lens
-        kv_args.kv_item_lens = kv_item_lens
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def _refresh_kv_args_buffer_infos(self) -> None:
+        kv_args = self.kv_manager.kv_args
+        kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
+            self._get_kv_buffer_infos()
+        )
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+            self.metadata_buffers.get_buf_infos()
+        )
+        setup_state_kv_args(
+            kv_args,
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            total_kv_layers=self.scheduler.model_config.num_hidden_layers,
+            req_to_token_pool=getattr(self, "req_to_token_pool", None),
+        )
+
+    def _init_kv_manager(self) -> CommonKVManager:
+        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
+        kv_args = kv_args_class()
+
+        attn_tp_size = get_attention_tp_size()
+        kv_args.engine_rank = self.tp_rank % (attn_tp_size)
+
+        kv_args.pp_rank = self.pp_rank
+        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
+            self._get_kv_buffer_infos()
+        )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -564,6 +583,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Add a request to the pending queue."""
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
+
+    def release_memory_occupation(self):
+        self.queue.clear()
+        self.retracted_queue.clear()
+        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self._refresh_kv_args_buffer_infos()
+            self.kv_manager.register_buffer_to_engine()
+            with self.kv_manager.connection_lock:
+                self.kv_manager.connection_pool.clear()
 
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
@@ -1697,6 +1729,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ]
 
         return transferred_reqs
+
+    def release_memory_occupation(self):
+        """Clean up in-flight transfers before releasing GPU memory."""
+        self.queue.clear()
+
+    def resume_memory_occupation(self):
+        """Queues are already cleared on release; new transfers can be accepted."""
+        pass
 
 
 class SchedulerDisaggregationDecodeMixin:

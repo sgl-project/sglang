@@ -16,6 +16,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -77,6 +78,7 @@ class SchedulerWeightUpdaterManager:
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
+    scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
@@ -102,6 +104,42 @@ class SchedulerWeightUpdaterManager:
                 empty_cache=recv_req.torch_empty_cache
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
+
+    def _release_disaggregation_kv_queues(self) -> None:
+        scheduler = self.scheduler
+        if scheduler is None:
+            return
+
+        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            for queue_name in (
+                "disagg_decode_transfer_queue",
+                "disagg_decode_prealloc_queue",
+            ):
+                queue = getattr(scheduler, queue_name, None)
+                if queue is not None:
+                    queue.release_memory_occupation()
+        elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+            if queue is not None:
+                queue.release_memory_occupation()
+
+    def _resume_disaggregation_kv_queues(self) -> None:
+        scheduler = self.scheduler
+        if scheduler is None:
+            return
+
+        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            for queue_name in (
+                "disagg_decode_transfer_queue",
+                "disagg_decode_prealloc_queue",
+            ):
+                queue = getattr(scheduler, queue_name, None)
+                if queue is not None:
+                    queue.resume_memory_occupation()
+        elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+            if queue is not None:
+                queue.resume_memory_occupation()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
@@ -189,6 +227,7 @@ class SchedulerWeightUpdaterManager:
             self.offload_tags.add(tag)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self._release_disaggregation_kv_queues()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
 
@@ -229,6 +268,7 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            self._resume_disaggregation_kv_queues()
 
         return ResumeMemoryOccupationReqOutput()
 

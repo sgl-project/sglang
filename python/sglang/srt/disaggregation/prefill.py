@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -144,15 +144,7 @@ class PrefillBootstrapQueue:
             )
         self.kv_manager = self._init_kv_manager()
 
-    def _init_kv_manager(self) -> CommonKVManager:
-        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
-        kv_args = kv_args_class()
-        kv_args.engine_rank = self.tp_rank
-        kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
-        kv_args.mla_compression_ratios = None
+    def _get_kv_buffer_infos(self) -> Tuple[List[int], List[int], List[int]]:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -167,9 +159,36 @@ class PrefillBootstrapQueue:
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
 
-        kv_args.kv_data_ptrs = kv_data_ptrs
-        kv_args.kv_data_lens = kv_data_lens
-        kv_args.kv_item_lens = kv_item_lens
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def _refresh_kv_args_buffer_infos(self) -> None:
+        kv_args = self.kv_manager.kv_args
+        kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
+            self._get_kv_buffer_infos()
+        )
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+            self.metadata_buffers.get_buf_infos()
+        )
+        setup_state_kv_args(
+            kv_args,
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            total_kv_layers=self.scheduler.model_config.num_hidden_layers,
+            req_to_token_pool=getattr(self.scheduler, "req_to_token_pool", None),
+        )
+
+    def _init_kv_manager(self) -> CommonKVManager:
+        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
+        kv_args = kv_args_class()
+        kv_args.engine_rank = self.tp_rank
+        kv_args.pp_rank = self.pp_rank
+        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        kv_args.mla_compression_ratios = None
+        kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
+            self._get_kv_buffer_infos()
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -377,6 +396,16 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs
         else:
             return bootstrapped_reqs, failed_reqs
+
+    def release_memory_occupation(self):
+        self.queue.clear()
+        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self._refresh_kv_args_buffer_infos()
+            self.kv_manager.register_buffer_to_engine()
 
 
 class SchedulerDisaggregationPrefillMixin:

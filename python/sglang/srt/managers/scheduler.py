@@ -1576,6 +1576,7 @@ class Scheduler(
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
+            scheduler=self,
             metrics_collector=self.metrics_collector,
         )
 
