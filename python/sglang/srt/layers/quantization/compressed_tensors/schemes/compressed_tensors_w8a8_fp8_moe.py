@@ -349,7 +349,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().is_none()
+                and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
@@ -400,7 +400,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     get_activation_type,
                 )
 
-                activation_type = get_activation_type(moe_runner_config.activation)
+                activation_type = get_activation_type(
+                    moe_runner_config.activation,
+                    is_gated=moe_runner_config.is_gated,
+                )
                 quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,

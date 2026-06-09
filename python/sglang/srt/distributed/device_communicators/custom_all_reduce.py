@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce.py
 
 import ctypes
@@ -326,7 +328,8 @@ class CustomAllreduce:
 
     def close(self):
         if not self.disabled and self._ptr:
-            ops.dispose(self._ptr)
+            if ops is not None:
+                ops.dispose(self._ptr)
             if _is_cuda:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
@@ -336,7 +339,10 @@ class CustomAllreduce:
         self.close()
 
 
-def dispatch_custom_allreduce():
+def dispatch_custom_allreduce(
+    group: ProcessGroup,
+    device: torch.device,
+):
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
@@ -348,10 +354,14 @@ def dispatch_custom_allreduce():
     ``nnodes > 1`` since custom AR is intra-node only.
     """
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-        from .custom_all_reduce_v2 import CustomAllReduceV2
+        from .custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+            can_use_custom_all_reduce_v2,
+        )
 
-        logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
-        return CustomAllReduceV2
+        if can_use_custom_all_reduce_v2(group=group, device=device):
+            logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+            return CustomAllReduceV2
 
     if _is_cuda or _is_musa:
         return CustomAllreduce
