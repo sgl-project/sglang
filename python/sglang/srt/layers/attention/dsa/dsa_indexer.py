@@ -601,8 +601,6 @@ class Indexer(MultiPlatformOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
-            if not out_cache_loc.is_contiguous():
-                out_cache_loc = out_cache_loc.contiguous()
             fused_k_indexer_norm_rope_store(
                 key_raw,
                 pool.get_index_k_with_scale_buffer(layer_id=layer_id),
