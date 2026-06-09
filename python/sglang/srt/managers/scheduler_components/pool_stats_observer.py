@@ -163,12 +163,6 @@ class SchedulerPoolStatsObserver:
         )
 
     def active_pool_idxs(self) -> set:
-        """Pool idxs currently owned by reqs in last_batch / running_batch or
-        held by chunked-resume reqs in active_reqs.
-
-        Used to decide which session slots' KV is owned by batch reqs
-        (and thus counted via uncached_size, not session_held).
-        """
         idxs = set()
         for batch in [self.get_last_batch(), self.get_running_batch()]:
             if batch is None or batch.is_empty():
@@ -176,9 +170,6 @@ class SchedulerPoolStatsObserver:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
-        # Chunked-resume reqs in active_reqs still own their row across iters
-        # (filter_batch may have just moved them out of last_batch but they
-        # haven't yet been re-admitted to running_batch).
         for req in self.get_active_reqs().values():
             if req.has_pending_chunk and req.req_pool_idx is not None:
                 idxs.add(req.req_pool_idx)

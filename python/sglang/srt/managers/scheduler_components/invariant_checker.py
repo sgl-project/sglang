@@ -174,10 +174,6 @@ class SchedulerInvariantChecker:
             and not running_batch.is_empty()
         ):
             req_groups.append(list(running_batch.reqs))
-        # Chunked-resume reqs in active_reqs carry uncached tail
-        # (kv_committed_len - cache_protected_len, < page_size) that
-        # filter_batch just removed from last_batch but haven't been
-        # re-admitted to running_batch yet. The leak invariant must count it.
         seen_ids = {id(req) for group in req_groups for req in group}
         chunked_in_active = [
             req

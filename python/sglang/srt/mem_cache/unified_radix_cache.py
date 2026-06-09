@@ -722,7 +722,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        # Bound row read by kv_committed_len; see radix_cache.py for rationale.
         assert req.kv_committed_len >= req.cache_protected_len
         assert (
             req.extend_range.end == req.kv_committed_len

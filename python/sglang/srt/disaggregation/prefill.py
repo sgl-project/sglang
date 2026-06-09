@@ -879,22 +879,13 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     def process_prefill_chunk(self: Scheduler) -> None:
-        # Disagg PREFILL chunked-resume lives in active_reqs (same as sync
-        # mode); pull the single-flight chunked-resume req via chunked_reqs().
-        # DLLM is excluded by has_pending_chunk's own short-circuit.
         chunked_req = next(iter(self.chunked_reqs()), None)
         if chunked_req is not None:
             maybe_cache_unfinished_req(chunked_req, self.tree_cache, chunked=True)
             if not self.check_bootstrap(chunked_req):
-                # Optimistic bootstrap failed: check_bootstrap already released
-                # and requeued the req via optimistic_release_and_requeue;
-                # skip the KV send for this iter. (Only reachable when the
-                # opt-in optimistic_prefill_retries feature is enabled;
-                # check_bootstrap returns True otherwise.)
                 pass
             else:
                 if self.enable_overlap:
-                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     chunked_req.tmp_end_idx = min(
                         chunked_req.extend_range.end,
                         len(chunked_req.origin_input_ids),
@@ -905,11 +896,6 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             last_bs = self.last_batch.batch_size()
-            # Drop mid-prefill / DLLM-intermediate reqs from last_batch —
-            # running_batch runs decode forward and admitting a mid-prefill
-            # req there breaks shape + KV accounting. The dropped reqs stay
-            # in self.active_reqs and re-enter via the next iter's Stage A
-            # stash + admission cycle.
             self.last_batch.filter_batch(only_decode_ready=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False

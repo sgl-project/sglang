@@ -428,14 +428,6 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        """Validate PP skip output comm correctness.
-
-        Uses the per-req `batch.output_process_mode` list (1:1 with `batch.reqs`):
-        - When skip=True: all reqs must be intermediate (mode.is_intermediate() is
-          True) so placeholder zeros are never consumed via req.output_ids.append().
-        - When skip=False: at least one req should consume next_token_ids
-          (mode.is_intermediate() is False), otherwise warn.
-        """
         if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
             return
 
@@ -857,10 +849,6 @@ class SchedulerBatchResultProcessor:
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
-            # The scheduler no longer owns this req's lifecycle. Fires for both
-            # offload and non-offload paths: _deactivate only pops active_reqs
-            # (no KV release), so it is independent of the async offload's
-            # deferred release_kv_cache timing.
             self.deactivate_req(req)
 
             req.time_stats.set_completion_time()

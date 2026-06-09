@@ -91,13 +91,6 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.finished.return_value = False
-        # add_first_chunk_req reads these on its admission gates;
-        # MagicMock(spec=Req) doesn't surface attributes set only in
-        # Req.__init__, so seed them. has_pending_chunk is a derived
-        # @property on Req now but MagicMock turns property accesses into a
-        # fresh Mock by default; override to a concrete bool so the
-        # scheduler-side dispatch (and add_first_chunk_req's defensive
-        # assert) see False for the mock reqs in this unit test.
         req.has_pending_chunk = False
         req.scheduled_extend_len = 0
         req.is_dllm.return_value = False
@@ -136,7 +129,6 @@ class TestPrefillAdder(CustomTestCase):
         return req
 
     def test_retracted_decode_req_pending_bound_uses_full_fill_sequence(self):
-        """Retracted decode reqs stay pending while output history is refilled."""
         req = self.create_retracted_decode_req(
             origin_len=367,
             output_len=438,
@@ -162,7 +154,6 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(_compute_chunked_req_next_prompt_token(req))
 
     def test_decoded_req_output_ids_do_not_extend_chunked_prefill_bound(self):
-        """Decoded output tokens do not make a completed prompt pending again."""
         req = Req.__new__(Req)
         req.rid = "decoded-req"
         req.dllm_config = None

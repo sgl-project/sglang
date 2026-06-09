@@ -181,9 +181,6 @@ class ReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        # The row pool only cares whether the row has committed KV — it does
-        # not need to know whether the req is chunked. kv_committed_len > 0
-        # naturally covers chunked-resume + DLLM staging + any reuse case.
         assert all(
             reqs[i].kv_committed_len > 0 for i in reusing
         ), "reusing request must have committed KV"

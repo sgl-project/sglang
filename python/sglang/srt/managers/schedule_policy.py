@@ -683,11 +683,6 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
-        # DLLM uses scheduled_extend_len bookkeeping for symmetry with
-        # chunked-prefill; DLLM's has_pending_chunk is always False (the
-        # property short-circuits is_dllm()), so this only affects audit
-        # views. Snapshot the post-admit position the same way as
-        # add_first_chunk_req.
         req.set_scheduled_extend_len(req.extend_range.end)
         self.can_run_list.append(req)
 
@@ -709,7 +704,6 @@ class PrefillAdder:
         )
 
     def add_non_first_chunk_req(self, req: Req) -> AddReqResult:
-        # Scheduler-side dispatch invariant: only chunked-resume non-DLLM reqs reach here.
         assert req.has_pending_chunk and not req.is_dllm(), f"non-resume req {req.rid}"
 
         if self.dllm_config is not None:
@@ -868,9 +862,6 @@ class PrefillAdder:
             self.can_run_list.append(req)
             self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
 
-        # Plan-time advance: snapshot how far fill_ids has been scheduled.
-        # See add_first_chunk_req for the rationale (prefix_indices + admitted
-        # tokens yields the right last-vs-middle comparison).
         req.set_scheduled_extend_len(req.extend_range.end)
 
         return self.budget_state()
@@ -878,9 +869,6 @@ class PrefillAdder:
     def add_first_chunk_req(
         self, req: Req, truncation_align_size: Optional[int]
     ) -> AddReqResult:
-        # Scheduler-side dispatch invariant: chunked-resume reqs are routed
-        # to `add_non_first_chunk_req`. This function only admits fresh
-        # reqs (and DLLM, whose `has_pending_chunk` is always False).
         assert not req.has_pending_chunk or req.is_dllm(), (
             f"add_first_chunk_req called on chunked-resume req {req.rid}; "
             f"scheduler-side dispatch broken"
@@ -1013,7 +1001,6 @@ class PrefillAdder:
                     req.retracted_stain,
                 )
             else:
-                # Chunked prefill: this admission doesn't complete the prefill.
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
@@ -1050,13 +1037,6 @@ class PrefillAdder:
                     prefix_len, trunc_len, 0, req.retracted_stain
                 )
 
-        # Plan-time advance: snapshot how far this req's fill_ids has been
-        # scheduled. After this admit, fill_ids covers `prefix_indices`
-        # plus the `extend_input_len` tokens newly admitted; setting
-        # `scheduled_extend_len` to that sum keeps it monotone with the
-        # original "truncated" flag semantics (last chunk admit yields
-        # scheduled_extend_len == len(origin_input_ids), middle chunk
-        # yields strictly less).
         req.set_scheduled_extend_len(req.extend_range.end)
 
         return self.budget_state()

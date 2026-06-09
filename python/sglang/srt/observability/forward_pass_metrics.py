@@ -1,22 +1,3 @@
-"""
-Forward pass metrics for per-iteration scheduler telemetry.
-
-Emits per-iteration scheduling metrics over ZMQ PUB so that external
-consumers can observe scheduler behavior in real time without polling
-Prometheus.
-
-Uses msgspec.Struct for zero-copy serialization.
-
-Data flow::
-
-    Scheduler process:
-        SchedulerMetricsReporter._emit_forward_pass_metrics()
-          -> _FpmPublisherThread -> ZMQ PUB (localhost)
-
-    External consumer:
-        ZMQ SUB -> deserialize ForwardPassMetrics
-
-"""
 
 from __future__ import annotations
 

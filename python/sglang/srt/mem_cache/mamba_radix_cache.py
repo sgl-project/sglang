@@ -608,7 +608,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-        # Bound row read by kv_committed_len; see radix_cache.py for rationale.
         assert req.kv_committed_len >= req.cache_protected_len
         read_len = req.kv_committed_len
 
@@ -620,7 +619,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, :read_len
             ]
 
-            # `req.prefix_indices` will be used by add_non_first_chunk_req next iter
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
@@ -709,7 +707,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used by add_non_first_chunk_req next iter
         # NOTE: this is needed for both page_size == 1 and page_size > 1
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]

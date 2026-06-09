@@ -486,9 +486,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-        # Bound the row read by kv_committed_len, not len(fill_ids); see
-        # radix_cache.py:cache_unfinished_req for the rationale. In the
-        # extend_range model kv_committed_len equals extend_range.end.
         assert req.kv_committed_len >= req.cache_protected_len
         read_len = req.kv_committed_len
         if self.disable:
@@ -499,7 +496,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, :read_len
             ]
 
-            # `req.prefix_indices` will be used by add_non_first_chunk_req next iter
             req.prefix_indices = kv_indices
             return
 
@@ -551,7 +547,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
-        # `req.prefix_indices` will be used by add_non_first_chunk_req next iter
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]

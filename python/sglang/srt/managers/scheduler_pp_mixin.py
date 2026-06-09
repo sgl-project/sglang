@@ -610,9 +610,6 @@ class SchedulerPPMixin:
                 req.set_extend_range(
                     len(req.prefix_indices), req.get_full_untruncated_fill_len()
                 )
-                # Profiling forward simulates one full prefill — mark the whole
-                # prompt as scheduled so output_process_mode resolves to
-                # EXTEND_LAST_CHUNK in init_new.
                 req.scheduled_extend_len = len(req.origin_input_ids)
 
                 # Prepare batch

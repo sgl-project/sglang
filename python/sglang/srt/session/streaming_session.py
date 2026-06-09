@@ -352,11 +352,6 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return False
         if chunked:
-            # Bound row read by kv_committed_len, NOT len(fill_ids): the row
-            # only holds KV up to kv_committed_len — reading beyond that
-            # yields garbage slot indices. In the extend_range model
-            # kv_committed_len equals extend_range.end. See radix_cache.py
-            # for the same fix applied to the non-session caches.
             assert req.kv_committed_len >= req.cache_protected_len
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.kv_committed_len

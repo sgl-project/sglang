@@ -8,11 +8,6 @@ if TYPE_CHECKING:
 
 
 def _chunked_req(s) -> Optional["Req"]:
-    """The single in-flight chunked-prefill req (stateless single-flight model), or None.
-
-    The stateless scheduler exposes pending chunked reqs via ``chunked_reqs()``
-    (an iterator yielding 0 or 1 req) rather than the removed ``self.chunked_req``.
-    """
     return next(iter(s.chunked_reqs()), None)
 
 

@@ -85,14 +85,12 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
-        # Bound row read by kv_committed_len; see radix_cache.py for rationale.
         assert (
             req.extend_range.end == req.kv_committed_len
         ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_committed_len
         ]
-        # `req.prefix_indices` will be used by add_non_first_chunk_req next iter
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
     def evict(self, params: EvictParams) -> EvictResult:

@@ -239,32 +239,6 @@ class MultimodalInputFormat(Enum):
 
 
 class OutputProcessMode(Enum):
-    """How a forward result should be processed for a single req.
-
-    Decided at admission time and frozen on the ScheduleBatch alongside
-    `reqs`. Replaces the scattered per-Req field-trio (has_pending_chunk,
-    a pending-middle-outputs counter, and the DLLM flag) that previously
-    encoded the same plan-time decision.
-
-    Semantics:
-    - EXTEND_MIDDLE_CHUNK: A non-final chunked-prefill extend. The sampled
-      next-token is garbage (the chunk did not cover the full prompt).
-      Output processor discards the sample.
-    - EXTEND_LAST_CHUNK: The final extend chunk completes the prompt.
-      Output processor appends the sample to `req.output_ids` as the first
-      decode token.
-    - DECODE: Pure decode iteration. Output processor appends the sample
-      to `req.output_ids`.
-    - DLLM_INTERMEDIATE: A DLLM (diffusion LLM) denoising step that is not
-      the final one for this req. DLLM has its own output-processor path
-      (`process_batch_result_dllm`) and does not consult this enum for
-      sample handling, but filter/merge logic uses it to keep DLLM reqs
-      out of the regular decode running_batch.
-    - DLLM_FINAL: The final DLLM denoising step. Currently unused as a
-      distinct mode (DLLM batches all mark DLLM_INTERMEDIATE) but kept in
-      the enum for symmetry and forward compatibility with explicit
-      DLLM-final modeling.
-    """
 
     EXTEND_MIDDLE_CHUNK = "extend_middle_chunk"
     EXTEND_LAST_CHUNK = "extend_last_chunk"
@@ -273,15 +247,6 @@ class OutputProcessMode(Enum):
     DLLM_FINAL = "dllm_final"
 
     def is_intermediate(self) -> bool:
-        """True if this mode's forward result is NOT decode-ready —
-        a middle prefill chunk or an intermediate DLLM denoising step.
-
-        Filter / merge predicates use this to drop in-flight reqs before
-        folding them into the decode running_batch. The complement
-        (EXTEND_LAST_CHUNK / DECODE / DLLM_FINAL) is "decode-ready":
-        the req's sample (if any) is committed and the next forward, if
-        any, can safely be a decode.
-        """
         return self in (
             OutputProcessMode.EXTEND_MIDDLE_CHUNK,
             OutputProcessMode.DLLM_INTERMEDIATE,
@@ -884,21 +849,7 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
-        # Cumulative count of prompt tokens this req has had scheduled for
-        # prefill so far (plan-time advance). Increments at admission for
-        # both middle and last chunks. Equivalent to tokenspeed's
-        # `window.begin + window.size`.
-        #
-        # - `has_pending_chunk` is derived (see property below).
-        # - "this admit is last chunk" <=>
-        #   scheduled_extend_len_after_this_admit == num_prompt_tokens.
-        #
-        # Reset to 0 in `reset_for_retract`: non-disagg retract drops the
-        # KV pool entry, so the next admission re-prefills from scratch.
-        # On abort, the req is finalized without touching the counter.
         self.scheduled_extend_len: int = 0
-        # Frozen target length for the current chunked prefill plan. This
-        # stays stable while output_ids grow during later decode steps.
         self.scheduled_extend_target_len: int = 0
 
         # For retraction
@@ -1021,8 +972,6 @@ class Req(ReqDllmMixin):
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
-        # kv_send(req.input_ids[req.start_send_idx:req.extend_range.end])
-        # start_send_idx = req.extend_range.end
         self.start_send_idx: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
@@ -1054,25 +1003,12 @@ class Req(ReqDllmMixin):
 
     @property
     def has_pending_chunk(self) -> bool:
-        """Whether this req is in the middle of a chunked prefill.
-
-        Derived from `scheduled_extend_len`: True iff admission has
-        scheduled a non-empty proper prefix of the current fill sequence.
-        A brand-new req that has never been admitted has
-        `scheduled_extend_len == 0` and is not "mid-chunk"; a req whose final
-        chunk was just admitted has `scheduled_extend_len == fill length` and
-        likewise reports False.
-
-        DLLM uses its own staging concept (DllmManager queues) and never
-        reports as having a pending chunk through this property.
-        """
         if self.is_dllm():
             return False
         n = self.scheduled_extend_len_bound()
         return 0 < self.scheduled_extend_len < n
 
     def scheduled_extend_len_bound(self) -> int:
-        """Return the current sequence length that prefill scheduling targets."""
         scheduled_extend_target_len = getattr(self, "scheduled_extend_target_len", 0)
         if scheduled_extend_target_len:
             return scheduled_extend_target_len
@@ -1088,21 +1024,6 @@ class Req(ReqDllmMixin):
         return origin_len
 
     def set_scheduled_extend_len(self, value: int) -> None:
-        """Update `scheduled_extend_len` with a bounds check.
-
-        For normal chunked prefill, plan-time prefill progress must stay
-        within the current fill sequence length. A retracted decode req may
-        need to re-prefill `origin_input_ids + output_ids`, so the bound is
-        not always just `len(origin_input_ids)`.
-
-        DLLM is exempt from the bounds check: `scheduled_extend_len` is
-        audit-only for DLLM (`has_pending_chunk` short-circuits on
-        `is_dllm()` and last-vs-middle chunk is decided unconditionally),
-        and DLLM fill_ids include a trailing mask block
-        (`origin_input_ids + output_ids + [mask] * block_size`), so `value`
-        legitimately grows past `len(origin_input_ids)` as denoising
-        proceeds. The prompt-length bound therefore does not hold for DLLM.
-        """
         if not self.is_dllm():
             n = self._scheduled_extend_len_bound_for_value(value)
             assert 0 <= value <= n, (
@@ -1489,11 +1410,6 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
-        # Reset scheduled_extend_len: non-disagg retract releases the KV
-        # via release_kv_cache (release_req above), so the next admission
-        # re-prefills the prompt from scratch. The derived
-        # has_pending_chunk view will then read False until the first new
-        # chunk admit bumps the counter again.
         self.scheduled_extend_len = 0
         self.scheduled_extend_target_len = 0
         self.mamba_pool_idx = None
@@ -1511,12 +1427,6 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-        # Disagg-prefill send-side bookkeeping. The pre-v2 retract path never
-        # ran against a req that had started sending (retract only touched
-        # running_batch), so these stayed at init values. After v2 added
-        # pause(retract) coverage for active chunked-resume reqs, a retracted
-        # disagg-prefill req's stale start_send_idx would index garbage in the
-        # new row on re-prefill.
         self.start_send_idx = 0
         self.tmp_end_idx = -1
 
@@ -1653,33 +1563,14 @@ def _decide_output_process_mode(
     dllm_config: Optional[DllmConfig],
     forward_mode: Optional[ForwardMode],
 ) -> OutputProcessMode:
-    """Decide how this req's forward sample should be processed.
-
-    Called at batch construction (`ScheduleBatch.init_new`) after admission
-    has already advanced `req.scheduled_extend_len` for this iter. The
-    decision is purely plan-time:
-
-    - DLLM batches => DLLM_INTERMEDIATE (DLLM has its own output processor;
-      this enum is only consulted by filter/merge, where DLLM must never
-      be merged into the decode running_batch).
-    - Decode / prebuilt forward => DECODE.
-    - Extend whose admission already covers the full fill sequence
-      (`scheduled_extend_len >= fill length`) => EXTEND_LAST_CHUNK.
-    - Otherwise the admission left more prompt tokens behind for the next
-      iter => EXTEND_MIDDLE_CHUNK.
-    """
     if dllm_config is not None:
         return OutputProcessMode.DLLM_INTERMEDIATE
 
-    # Decode-only batches (forward_mode set explicitly by callers like the
-    # update_running_batch path) skip the chunked-prefill check.
     if forward_mode is not None and (
         forward_mode.is_decode() or forward_mode.is_prebuilt()
     ):
         return OutputProcessMode.DECODE
 
-    # `scheduled_extend_len` has already been bumped by admission for the
-    # current chunk; comparing to fill length decides last vs middle.
     if req.scheduled_extend_len >= req.scheduled_extend_len_bound():
         return OutputProcessMode.EXTEND_LAST_CHUNK
     return OutputProcessMode.EXTEND_MIDDLE_CHUNK
@@ -1822,7 +1713,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
 
-    token_type_ids: torch.Tensor = None  # shape: [b], int64
+    token_type_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
 
@@ -1870,18 +1761,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
-    # Whether to return captured experts
     return_routed_experts: bool = False
 
     return_indexer_topk: bool = False
 
-    # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
 
     # Has grammar
     has_grammar: bool = False
 
-    # Stream
     has_stream: bool = False
 
     # The sum of all sequence lengths
@@ -1891,7 +1779,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
-    # Multi-item scoring delimiter indices (set during prepare_for_extend)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
@@ -1904,7 +1791,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
-    # For logits and logprob post processing
     temp_scaled_logprobs: bool = False
     top_p_normalized_logprobs: bool = False
 
@@ -1912,7 +1798,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     encoder_cached: Optional[List[bool]] = None
     encoder_lens_cpu: Optional[List[int]] = None
 
-    # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
     # For extend and mixed chunekd prefill
@@ -1920,11 +1805,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_lens: List[int] = None
     extend_logprob_start_lens: List[int] = None
 
-    # Per-req decision (parallel to `reqs`) of how this forward's sample
-    # should be processed. Frozen at batch construction time
-    # (`ScheduleBatch.init_new`) based on the req's plan-time state
-    # (decode vs DLLM vs chunked-prefill last/middle). Output processors
-    # and filter/merge predicates branch on this enum.
     output_process_mode: List[OutputProcessMode] = dataclasses.field(
         default_factory=list
     )
@@ -2286,7 +2166,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                # We will need req.extend_range.length - req.extend_logprob_start_len number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
@@ -2721,11 +2600,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
-        # All reqs now run decode this forward; refresh the per-req mode
-        # snapshot so subsequent filter / merge predicates see DECODE
-        # rather than the stale EXTEND_LAST_CHUNK from the prefill->decode
-        # transition. (process_batch_result_decode itself does not read
-        # output_process_mode; this is purely for downstream filtering.)
         self.output_process_mode = [OutputProcessMode.DECODE] * bs
 
         # Clear context parallel metadata - CP is only for prefill, not decode
@@ -2826,20 +2700,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         v1_spec_info_filtered: Optional[bool] = False,
         only_decode_ready: bool = False,
     ):
-        """Filter reqs out of this batch.
-
-        Args:
-            keep_indices: explicit indices to keep. When provided, the
-                only_decode_ready predicate is ignored.
-            only_decode_ready: when True (and keep_indices is None), keep
-                only reqs whose `output_process_mode` is decode-ready
-                (EXTEND_LAST_CHUNK, DECODE, DLLM_FINAL). Used before
-                merging into the decode running_batch to drop reqs that
-                are still mid-prefill or in a DLLM intermediate step.
-                The PP cross-mb in-flight case is handled by the per-mb
-                `last_mbs[mb_id]` commit-before-update invariant in
-                `scheduler_pp_mixin`; no cross-mb scan is needed here.
-        """
         if keep_indices is None:
             modes = self.output_process_mode
             keep_indices = [
@@ -2920,11 +2780,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # Caller must filter_batch(only_decode_ready=True) on the other batch
-        # before merging — running_batch runs decode forward and admitting a
-        # prefill-in-progress req there breaks shape + KV accounting. The
-        # assert mirrors the decode-ready predicate so PP middle-chunk and
-        # DLLM intermediate reqs are also caught here.
         if other.output_process_mode:
             assert all(
                 not mode.is_intermediate() for mode in other.output_process_mode
@@ -2932,7 +2787,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "merge_batch requires the other batch to be decode-ready; "
                 f"got modes={other.output_process_mode}"
             )
-            # Merge parallel output_process_mode lists.
             if not self.output_process_mode:
                 self.output_process_mode = list(other.output_process_mode)
             else:
@@ -2999,9 +2853,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,
         # merge_batch) on the original don't corrupt this snapshot.
-        # output_process_mode MUST be copied: process_batch_result_prefill
-        # reads it via strict zip with reqs, so an empty list here would
-        # crash overlap-mode delayed result processing.
         return ScheduleBatch(
             reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,

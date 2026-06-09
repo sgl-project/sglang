@@ -1790,8 +1790,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
-            # Defensive: chunked prefill is a prefill-side concept; decode-side
-            # prebuilt batches shouldn't carry intermediate-mode reqs.
             modes = new_prebuilt_batch.output_process_mode or []
             assert not any(
                 m.is_intermediate() for m in modes
@@ -1846,19 +1844,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                # Decode-side admission point: the scheduler now owns this
-                # req's lifecycle (it leaves waiting_queue below and runs in
-                # running_batch until finish/retract/abort). Mirror the
-                # prefill-side `_activate` in `_get_new_batch_prefill_raw`.
                 self._activate(req)
-                # Decode-radix path: do NOT re-match prefix here.
-                # `pop_preallocated` already took a tree snapshot and used it
-                # to (1) pre-allocate KV, (2) choose delta pages for transfer,
-                # and (3) set cache_protected_len/last_node for correct frees.
-                # Re-matching now can observe a newer tree (other reqs may have
-                # inserted the same prefix) and overwrite cache_protected_len,
-                # making `cache_unfinished_req` free the wrong range (leak).
-                # Non-radix decode keeps the original behavior.
                 tree_cache = (
                     None
                     if self.server_args.disaggregation_decode_enable_radix_cache
@@ -1879,9 +1865,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
-        # construct a schedule batch with those requests and mark as decode.
-        # Pass forward_mode=PREBUILT so output_process_mode is set to DECODE
-        # (the prefill was performed remotely; locally we only schedule decode).
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,

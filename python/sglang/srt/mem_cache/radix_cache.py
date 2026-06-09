@@ -466,9 +466,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        # Bound the row read by kv_committed_len (the actually-written prefix
-        # length on the row). In the extend_range model it equals
-        # extend_range.end; the sanity assert guards that invariant.
         assert req.kv_committed_len >= req.cache_protected_len
         assert (
             req.extend_range.end == req.kv_committed_len
@@ -521,7 +518,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used by add_non_first_chunk_req next iter
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices
         # - eagle case: bigram keys will only cache len - 1 kv indices
         if len(new_indices) < len(kv_indices):
