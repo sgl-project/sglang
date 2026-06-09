@@ -16,7 +16,8 @@ limitations under the License.
 import logging
 import threading
 import time
-from queue import Empty, Full, Queue
+from functools import cache
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
@@ -46,25 +47,24 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
-_timing_event_supported: Optional[bool] = None
+@cache
+def _timing_events_supported() -> bool:
+    try:
+        device_module.Event(enable_timing=True)
+        return True
+    except (TypeError, NotImplementedError):
+        logger.warning(
+            "%s.Event does not support enable_timing=True; load-back "
+            "duration metric will be skipped on this backend.",
+            device_module.__name__,
+        )
+        return False
 
 
-def make_timing_event():
-    global _timing_event_supported
-    if _timing_event_supported is None:
-        try:
-            event = device_module.Event(enable_timing=True)
-            _timing_event_supported = True
-            return event
-        except (TypeError, NotImplementedError):
-            _timing_event_supported = False
-            logger.warning(
-                "%s.Event does not support enable_timing=True; load-back "
-                "duration metric will be skipped on this backend.",
-                device_module.__name__,
-            )
-            return None
-    return device_module.Event(enable_timing=True) if _timing_event_supported else None
+def make_timing_event_pair():
+    timing_enabled = _timing_events_supported()
+    kwargs = {"enable_timing": True} if timing_enabled else {}
+    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
 
 
 class LayerLoadingEvent:
@@ -157,27 +157,12 @@ class CacheOperation:
         return self.priority < other.priority
 
 
-class HiCacheAck:
-    # start_event is None on backends lacking Event(enable_timing=True); in
-    # that case finish_event reuses producer_event.finish_event for readiness.
-    __slots__ = ("start_event", "finish_event", "node_ids", "num_tokens")
-
-    def __init__(
-        self,
-        start_event: Optional[device_module.Event],
-        finish_event: device_module.Event,
-        node_ids: List[int],
-        num_tokens: int = 0,
-    ):
-        self.start_event = start_event
-        self.finish_event = finish_event
-        self.node_ids = node_ids
-        self.num_tokens = num_tokens
-
-    def __iter__(self):
-        yield self.start_event
-        yield self.finish_event
-        yield self.node_ids
+class HiCacheAck(NamedTuple):
+    start_event: device_module.Event
+    finish_event: device_module.Event
+    node_ids: List[int]
+    num_tokens: int = 0
+    timing_enabled: bool = False
 
 
 class StorageOperation:
@@ -805,13 +790,11 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        ack_start_event = make_timing_event()
-        ack_finish_event = make_timing_event()
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            if ack_start_event is not None:
-                ack_start_event.record()
+            ack_start_event.record()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -829,8 +812,7 @@ class HiCacheController:
                         self.io_backend,
                     )
                 producer_event.complete(i)
-            if ack_finish_event is not None:
-                ack_finish_event.record()
+            ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -842,13 +824,10 @@ class HiCacheController:
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=ack_start_event,
-                finish_event=(
-                    ack_finish_event
-                    if ack_finish_event is not None
-                    else producer_event.finish_event
-                ),
+                finish_event=ack_finish_event,
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
             )
         )
         return producer_id

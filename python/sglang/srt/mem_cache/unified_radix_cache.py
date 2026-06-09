@@ -15,7 +15,6 @@ import torch
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import timing_event_supported
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -2399,7 +2398,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if self.metrics_collector is not None:
                 self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
-                if ack.start_event is not None:
+                if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(
                         duration_ms / 1000.0
