@@ -22,7 +22,7 @@ v0.5.10 or a later version.
 
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
-| Tensor Parallelism            | `--tp-size 16`                                                                                  |
+| Tensor Parallelism            | `--tp-size 16`                                                                                |
 | Data Parallelism              | `--enable-dp-attention --dp-size 16`                                                          |
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto` (`--ep-size` is automatically set to `--tp`)    |
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
@@ -36,17 +36,15 @@ v0.5.10 or a later version.
 | EPLB                          | `--load-balance-method round_robin`                                                           |
 | NZ Weight Format              | `export SGLANG_USE_FIA_NZ=1`                                                                  |
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 ## Prerequisites
 
 ### Model weights
 
 <Warning>
-If you need to download model weights, check the model size before downloading to reserve enough space.
+Before downloading model weights, check the model size to reserve enough disk space.
 </Warning>
 
 - [DeepSeek-R1-0528-W4A8](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8) (Quantized version)
@@ -60,7 +58,7 @@ It is recommended to download the model weights to a shared directory across mul
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+The Docker image requires at least 30 GB of free space. Ensure sufficient disk space before pulling images.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -69,16 +67,13 @@ online platform. You can directly pull it.
 We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -113,7 +108,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -137,6 +132,12 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
   </Tab>
 </Tabs>
 
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
 ## Online service deployment
 
 ### Single-node online deployment
@@ -145,6 +146,11 @@ Single-node deployment completes both prefill and decode within the same node (P
 with limited hardware resources. The following command is based on the W4A8 quantized model.
 
 ```bash Launch server
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -173,7 +179,7 @@ export HCCL_BUFFSIZE=1600
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/DeepSeek-R1-0528-w4a8
 
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
@@ -198,9 +204,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 --dtype bfloat16
 ```
 
-<Tip>
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
-</Tip>
 
 ### Multi-node PD disaggregation deployment
 
@@ -214,6 +218,16 @@ The prefill node and decode node will each run on one Atlas 800I A3.
 1. Run the following command on both prefill and decode nodes.
 
 ```bash Prefill node
+#============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port (e.g., tcp://192.168.1.1:24667)
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME (decode section): network interface name for HCCL
+#   GLOO_SOCKET_IFNAME (decode section): network interface name for Gloo
+#============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -232,13 +246,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24667"
+P_IP=(<your prefill ip>)
+D_IP=(<your decode ip>)
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24667"
 
-P_IP=('your prefill ip1')
-
-D_IP=('your decode ip1')
-
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/DeepSeek-R1-0528-w4a8
 
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
@@ -303,11 +315,17 @@ done
 2. Launch the SGLang Router (on any reachable node):
 
 ```bash Router
+#============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+#============================================================
+
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6699 \
     --mini-lb
@@ -374,9 +392,7 @@ on the Best Practice page.
 | High throughput (2K+2K)       | PD disaggregation   | 16 (A3)     | W4A8 INT8       |
 | High throughput (3.5K+1.5K)   | PD disaggregation   | 16 (A3)     | W4A8 INT8       |
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 ## Performance tuning
 
