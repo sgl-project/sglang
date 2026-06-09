@@ -3,11 +3,10 @@ from dataclasses import dataclass
 import torch
 
 # Budget for cumsum block size selection on Ascend NPU, tuned against
-# shared-memory / kernel constraints. See vllm-ascend #7487.
+# shared-memory / kernel constraints.
 _GDN_CUMSUM_BLOCK_BUDGET = 2**18
 
-# Large block size used by solve_tril Triton kernel (LARGE_BLOCK_T in
-# sgl-kernel-npu solve_tril.py). See vllm-ascend #7487.
+# Large block size used by solve_tril Triton kernel
 _GDN_LARGE_BLOCK_SIZE = 608 * 2
 
 
