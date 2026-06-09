@@ -247,6 +247,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                torch torchvision torchaudio --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
+    && if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+           CUTLASS_DSL_VERSION=$(pip show nvidia-cutlass-dsl 2>/dev/null | awk '/^Version:/{print $2}') && \
+           if [ -n "$CUTLASS_DSL_VERSION" ]; then \
+               python3 -m pip install --force-reinstall --no-deps \
+                   "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}"; \
+           fi; \
+       fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
