@@ -103,6 +103,15 @@ def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _halo_memory_format(reference: torch.Tensor) -> torch.memory_format:
+    if reference.dim() > 1 and reference.stride(1) == 1:
+        if reference.dim() == 5 and hasattr(torch, "channels_last_3d"):
+            return torch.channels_last_3d
+        if reference.dim() == 4:
+            return torch.channels_last
+    return torch.contiguous_format
+
+
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
     if expected_height is None:
         return x
@@ -115,13 +124,20 @@ def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
 def _ensure_recv_buf(
     recv_buf: torch.Tensor | None, reference: torch.Tensor
 ) -> torch.Tensor:
+    memory_format = _halo_memory_format(reference)
     if (
         recv_buf is None
         or recv_buf.shape != reference.shape
         or recv_buf.dtype != reference.dtype
         or recv_buf.device != reference.device
+        or not recv_buf.is_contiguous(memory_format=memory_format)
     ):
-        return torch.empty_like(reference)
+        return torch.empty(
+            reference.shape,
+            dtype=reference.dtype,
+            device=reference.device,
+            memory_format=memory_format,
+        )
     return recv_buf
 
 
@@ -140,11 +156,11 @@ def halo_exchange(
     group = sp_group.device_group
     group_ranks = sp_group.ranks
 
-    top_row = x[..., :height_halo_size, :].contiguous()
-    bottom_row = x[..., -height_halo_size:, :].contiguous()
+    top_row_ref = x[..., :height_halo_size, :]
+    bottom_row_ref = x[..., -height_halo_size:, :]
 
-    recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
-    recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
+    recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row_ref)
+    recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row_ref)
 
     # use batched P2P operations
     p2p_ops = []
@@ -152,11 +168,15 @@ def halo_exchange(
     if rank > 0:
         # has previous neighbor, recv previous rank's data to recv_top_buf and send top_row to it.
         prev_rank = group_ranks[rank - 1]
+        top_row = top_row_ref.contiguous(memory_format=_halo_memory_format(top_row_ref))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
         p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
     if rank < world_size - 1:
         # has next neighbor, send bottom_row to next rank and recv next rank's data to recv_bottom_buf.
         next_rank = group_ranks[rank + 1]
+        bottom_row = bottom_row_ref.contiguous(
+            memory_format=_halo_memory_format(bottom_row_ref)
+        )
         p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
 

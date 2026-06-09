@@ -20,8 +20,7 @@ import gc
 import logging
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
@@ -60,15 +59,18 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
+    is_hip,
     is_musa,
     is_npu,
     log_info_on_rank0,
     require_gathered_buffer,
 )
 
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
@@ -77,18 +79,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_musa = is_musa()
-
-
-@dataclass
-class PrefillInputBuffers(ForwardInputBuffers):
-    input_ids: torch.Tensor
-    out_cache_loc: torch.Tensor
-    mamba_track_indices: Optional[torch.Tensor]
-    mamba_track_mask: Optional[torch.Tensor]
-    mamba_track_seqlens: Optional[torch.Tensor]
-    positions: torch.Tensor
-    input_embeds: Optional[torch.Tensor]
-    mrope_positions: Optional[torch.Tensor]
 
 
 @contextmanager
@@ -242,62 +232,10 @@ class PiecewiseCudaGraphRunner:
         # CUDA graph capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
-        # Graph inputs
         with torch.device(self.device):
-            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
-            )
-            mamba_track_indices = (
-                torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_mask = (
-                torch.zeros((self.max_bs,), dtype=torch.bool)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_seqlens = (
-                torch.zeros((self.max_bs,), dtype=torch.int32)
-                if self.mamba_track_enabled
-                else None
-            )
-            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-            if (
-                self.is_multimodal
-            ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
-                # 1. In multimodal, we only compile and capture the language model part.
-                # 2. The embedder is outside of the graph, but cuda graph requires the input embeds to have a fixed memory address.
-                # 3. Input embeds is a pre-allocated buffer. In model.forward, we copy the embed output to this buffer.
-                input_embeds = torch.zeros(
-                    (self.max_num_tokens, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                )
-                mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
-            else:
-                input_embeds = None
-                mrope_positions = None
-
-        self.buffers = PrefillInputBuffers(
-            input_ids=input_ids,
-            out_cache_loc=out_cache_loc,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
-            positions=positions,
-            input_embeds=input_embeds,
-            mrope_positions=mrope_positions,
-        )
-        self.buffers.share_buffers()
-
-        # Token-axis FB-shared slot registry, adopting the PrefillInputBuffers
-        # storage (one data_ptr shared with capture + replay).
+        # Registry owns (allocates + pools) the token-axis input buffers.
         self.buffer_registry = build_prefill_registry(
             device=self.device,
             max_bs=self.max_bs,
@@ -307,7 +245,8 @@ class PiecewiseCudaGraphRunner:
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
-            source=self.buffers,
+            share_pool=not is_npu(),
+            source=None,
         )
 
         self.attention_layers = self.model_runner.attention_layers
@@ -345,21 +284,32 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with enable_piecewise_cuda_graph_compile():
-                    compile_range = (
-                        tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                        if get_tensor_model_parallel_rank() == 0
-                        else reversed(self.capture_num_tokens)
-                    )
-                    for _, num_tokens in enumerate(compile_range):
-                        if get_tensor_model_parallel_rank() == 0:
-                            compile_range.set_description(
-                                f"Compiling num tokens ({num_tokens=})"
-                            )
-                        self.warmup_compile(num_tokens=num_tokens)
+                if _is_hip:
+                    # AMD: single Dynamo trace is sufficient; the capture
+                    # phase does per-shape JIT kernel warmup before each
+                    # CUDA graph recording.  The N-iteration loop is
+                    # redundant and extremely slow on ROCm (~30 min).
+                    with enable_piecewise_cuda_graph_compile():
+                        self.warmup_compile(num_tokens=self.capture_num_tokens[-1])
+                else:
+                    with enable_piecewise_cuda_graph_compile():
+                        compile_range = (
+                            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                            if get_tensor_model_parallel_rank() == 0
+                            else reversed(self.capture_num_tokens)
+                        )
+                        for _, num_tokens in enumerate(compile_range):
+                            if get_tensor_model_parallel_rank() == 0:
+                                compile_range.set_description(
+                                    f"Compiling num tokens ({num_tokens=})"
+                                )
+                            self.warmup_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
+
+                if _use_aiter:
+                    self._pre_warm_aiter_chip_info()
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
@@ -367,6 +317,41 @@ class PiecewiseCudaGraphRunner:
                 self.capture()
 
         self.raw_num_tokens = 0
+
+    _aiter_chip_info_cached = False
+
+    @classmethod
+    def _pre_warm_aiter_chip_info(cls):
+        """Pre-populate aiter chip info env vars before CUDA graph capture.
+
+        aiter's get_cu_num_custom_op and get_gfx_custom_op call
+        subprocess.run(rocminfo) to query GPU info. During CUDA graph capture
+        the GPU context is locked, so rocminfo hangs indefinitely. Pre-calling
+        them here caches the results as environment variables so the subprocess
+        is never invoked during capture. Only runs once per process.
+        """
+        if cls._aiter_chip_info_cached:
+            return
+        cls._aiter_chip_info_cached = True
+
+        import os
+
+        try:
+            from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+            if not os.environ.get("CU_NUM"):
+                cu_num = get_cu_num()
+                os.environ["CU_NUM"] = str(cu_num)
+                logger.info(f"Pre-warmed aiter CU_NUM={cu_num}")
+
+            if not os.environ.get("GPU_ARCHS"):
+                gfx = get_gfx()
+                os.environ["GPU_ARCHS"] = gfx
+                logger.info(f"Pre-warmed aiter GPU_ARCHS={gfx}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm aiter chip info: {e}")
 
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
@@ -788,6 +773,8 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_num_tokens = len(static_forward_batch.input_ids)
+            raw_num_tokens = self.raw_num_tokens
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -796,6 +783,8 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
+                num_tokens=static_num_tokens,
+                raw_num_tokens=raw_num_tokens,
             ):
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(

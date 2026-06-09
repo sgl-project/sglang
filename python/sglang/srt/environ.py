@@ -221,7 +221,9 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
-    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
+    # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
+    # else /tmp); see debug_utils/cuda_coredump.py.
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -337,6 +339,11 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
 
+    SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
+    SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
+    SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
+
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
@@ -391,6 +398,32 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
 
+    # MoRI KV Transfer
+    # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
+    SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
+    # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
+    # values can increase parallelism and bandwidth utilization.
+    SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)
+    # Number of RDMA work requests posted in a single batch to each QP. Larger
+    # batch sizes reduce per-operation overhead and improve throughput at the
+    # cost of higher latency. -1 selects automatic sizing based on the number
+    # of merged work requests and available endpoints.
+    SGLANG_MORI_POST_BATCH_SIZE = EnvInt(-1)
+    # Number of worker threads in the RDMA executor thread pool. More workers
+    # can improve parallelism for large batch transfers across multiple QPs,
+    # but excessive threads may cause contention.
+    SGLANG_MORI_NUM_WORKERS = EnvInt(4)
+    # Number of sharded synchronous worker threads that drain KV transfers.
+    # Also the bound on outstanding (posted-but-not-completed) transfers, so it
+    # is the primary throttle keeping the RDMA send queue from overflowing.
+    SGLANG_MORI_TRANSFER_SHARDS = EnvInt(8)
+    # Poll cadence (ms) at which a transfer worker wakes to check the SLA while
+    # waiting for completion; real completion still wakes it immediately.
+    SGLANG_MORI_WAIT_POLL_MS = EnvInt(1000)
+    # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
+    # and relies on the RDMA retry-exceeded timeout only.
+    SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
@@ -400,6 +433,26 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
+    # before the MoE block for models whose MoE input hidden_size must be
+    # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
+    # 256). When False (default) the pad runs as a separate
+    # torch.nn.functional.pad call inside the MoE method. When True, the
+    # aiter Triton kernel `fused_add_rmsnorm_pad` produces a padded
+    # post-attention layernorm output in one launch and the MoE method
+    # skips the explicit pad. Currently only takes effect on the
+    # post_attention_layernorm path with aiter backend and TP=1.
+    SGLANG_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
+    # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
+    # (size, head_num, head_dim) per-token storage that
+    # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.
+    # "vectorized_5d" allocates K as (num_blocks, H_kv, head_dim/x, page_size, x)
+    # and V as (num_blocks, H_kv, page_size/x, head_dim, x) (x = 16 / dtype_size),
+    # matching the SHUFFLE layout that aiter's CK FmhaBatchPrefill kernel and
+    # `aiter.ops.triton.gluon.pa_decode_gluon` both consume natively. This is
+    # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
+    # decode without runtime permutes.
+    SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -421,6 +474,9 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
+    # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
+    SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -446,6 +502,9 @@ class Envs:
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Enable per-token NVFP4 activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
+    FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
+    FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
@@ -483,6 +542,7 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # DeepSeek MHA Optimization
@@ -749,6 +809,10 @@ class Envs:
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
 
+    # Eager forward wraps the ForwardBatch's own tensors instead of copying them
+    # into the CUDA graph buffer registry (no per-iter device-to-device copy).
+    SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
@@ -776,9 +840,13 @@ class Envs:
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
