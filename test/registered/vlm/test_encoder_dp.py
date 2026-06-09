@@ -31,7 +31,10 @@ class TestVLMEncoderDP(MMMUMultiModelTestBase):
         models_to_test = MODELS
 
         if is_in_ci():
-            models_to_test = [random.choice(MODELS)]
+            # VERIFY: pin to a model that previously faulted in the DP encoder.
+            models_to_test = [
+                next(m for m in MODELS if m.model == "Qwen/Qwen3-VL-32B-Instruct")
+            ]
 
         for model in models_to_test:
             # Per-model temp dir avoids cross-test cached results.

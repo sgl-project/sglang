@@ -532,6 +532,15 @@ def run_dp_sharded_mrope_vision_model(
         get_dp_encoder_lb_assignment(patches_per_image, tp_size)
     )
 
+    # When there are fewer images than TP ranks (e.g. server warmup or
+    # single-image requests), some ranks are assigned no images. The padded
+    # all_gather over those empty shards triggers an illegal memory access
+    # ("write access to a read-only page") on ROCm. Fall back to replicated
+    # execution: every rank computes the full vision output (cheap in this
+    # regime) and the fragile collective is avoided.
+    if 0 in gpu_sample_counts:
+        return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
+
     # cu_gpu_sample_counts = [0, 1, 4]
     cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
 
