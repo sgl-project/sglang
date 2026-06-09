@@ -3057,9 +3057,7 @@ async def _dp_worker_handle_request(
         "send",
     )
     if is_encode and encoder_metrics_collector is not None:
-        encoder_metrics_collector.inc_requests_received(
-            dp_rank=dp_rank, modality=modality_str
-        )
+        encoder_metrics_collector.inc_requests_received(modality=modality_str)
     try:
         if dp_type in ("start_profile", "stop_profile"):
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
@@ -3150,7 +3148,10 @@ async def run_dp_worker(
     global encoder_metrics_collector
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
-        labels = {"model_name": server_args.served_model_name}
+        labels = {
+            "model_name": server_args.served_model_name,
+            "dp_rank": str(dp_rank),
+        }
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
         encoder_metrics_collector = EncoderMetricsCollector(labels)
@@ -3408,10 +3409,13 @@ def launch_server(server_args: ServerArgs):
 
     global encoder, encoder_metrics_collector
 
-    # Set up prometheus metrics (single-instance path).
+    # Set up prometheus metrics.
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
-        labels = {"model_name": server_args.served_model_name}
+        labels = {
+            "model_name": server_args.served_model_name,
+            "dp_rank": "0",
+        }
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
         encoder_metrics_collector = EncoderMetricsCollector(labels)
@@ -3661,9 +3665,7 @@ async def handle_encode_request(request: dict):
             modality = Modality.from_str(request["modality"])
             modality_str = modality.name.lower()
             if encoder_metrics_collector is not None:
-                encoder_metrics_collector.inc_requests_received(
-                    dp_rank=0, modality=modality_str
-                )
+                encoder_metrics_collector.inc_requests_received(modality=modality_str)
             if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
                 try:
                     nbytes, embedding_len, embedding_dim, error_msg, error_code = (
