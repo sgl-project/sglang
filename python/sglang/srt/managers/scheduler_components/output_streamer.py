@@ -24,6 +24,9 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
 )
+from sglang.srt.managers.scheduler_components.beam_search_processor import (
+    SchedulerBeamSearchProcessor,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -278,6 +281,7 @@ class _GenerationStreamAccumulator:
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
+    beam_search_output: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
@@ -322,7 +326,11 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            if req.stream:
+            if req.is_beam_search:
+                # Beam search only emits a final result once the request is
+                # finished; intermediate decode steps produce no user output.
+                should_output = False
+            elif req.stream:
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
@@ -372,6 +380,15 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.completion_tokens.append(len(output_ids_))
+        if req.is_beam_search:
+            # Replace the single-sequence token count with the beam total and
+            # attach the completed beam sequences for this finished request.
+            self.completion_tokens[-1] = (
+                SchedulerBeamSearchProcessor.sum_beam_completion_tokens(req)
+            )
+            self.beam_search_output.append(
+                SchedulerBeamSearchProcessor.convert_beam_sequences_to_output(req)
+            )
         self.cached_tokens.append(req.cached_tokens)
 
         # Collect detailed cache breakdown if available
@@ -524,6 +541,7 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            beam_search_output=self.beam_search_output,
             load=load,
             dp_ranks=dp_ranks,
         )

@@ -3650,6 +3650,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+            forward_batch.is_beam_search,
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids

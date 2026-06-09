@@ -167,8 +167,14 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.schedule_batch_beam_search_mixin import (
+    BeamSearchAdmissionError,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.beam_search_processor import (
+    SchedulerBeamSearchProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
@@ -1427,7 +1433,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -1759,6 +1764,12 @@ class Scheduler(
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
         )
+        # Beam-search sibling of batch_result_processor; only built when enabled.
+        self.beam_search_processor = (
+            SchedulerBeamSearchProcessor(scheduler=self)
+            if self.server_args.enable_beam_search
+            else None
+        )
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
@@ -1926,13 +1937,15 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # beam search not support return logprob
+            is_beam_search = self.server_args.enable_beam_search
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
+                return_logprob=recv_req.return_logprob if not is_beam_search else False,
+                top_logprobs_num=recv_req.top_logprobs_num if not is_beam_search else 0,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
@@ -1945,6 +1958,7 @@ class Scheduler(
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
+                is_beam_search=is_beam_search,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2519,8 +2533,25 @@ class Scheduler(
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
             ):
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+                try:
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    ret = (
+                        self.running_batch
+                        if not self.running_batch.is_empty()
+                        else None
+                    )
+                except BeamSearchAdmissionError as e:
+                    # Pool can't fit this tick's beam branches (should be
+                    # unreachable given get_num_allocatable_reqs). Skip the tick
+                    # and retry next loop instead of crashing.
+                    logger.warning(
+                        "Skipping beam search decode tick: needs %d slots, %d free "
+                        "(#reqs=%d).",
+                        e.total_slots,
+                        e.available,
+                        len(e.failing_reqs),
+                    )
+                    ret = None
             else:
                 ret = None
 
@@ -2539,9 +2570,28 @@ class Scheduler(
 
         return ret
 
-    def get_num_allocatable_reqs(self, running_bs):
-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        res = min(res, self.req_to_token_pool.available_size())
+    def get_num_allocatable_reqs(self, running_bs, beam_width=None):
+        pp_budget = get_global_server_args().pp_max_micro_batch_size - running_bs
+        res = min(pp_budget, self.req_to_token_pool.available_size())
+
+        if self.server_args.enable_beam_search:
+            # A beam request owns `beam_width + 1` slots once decoding, vs 1 for a
+            # normal request. Reserve the branch slots that running prefill-stage
+            # beam reqs (batch_slot_start_idx == -1) will claim next tick so we
+            # don't over-admit and OOM at the decode boundary.
+            pending_expansion = sum(
+                r.beam_width
+                for r in self.running_batch.reqs
+                if r.is_beam_search and r.beam_list.batch_slot_start_idx == -1
+            )
+            slot_capacity = max(
+                self.req_to_token_pool.available_size() - pending_expansion, 0
+            )
+            if beam_width is not None:
+                # Each new beam candidate needs `beam_width + 1` slots.
+                slot_capacity = slot_capacity // (beam_width + 1)
+            res = min(pp_budget, slot_capacity)
+
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -2660,7 +2710,10 @@ class Scheduler(
                 continue
 
             running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            candidate_beam_width = req.beam_width if req.is_beam_search else None
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, candidate_beam_width
+            ):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -3217,12 +3270,21 @@ class Scheduler(
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            if batch.reqs and batch.reqs[0].is_beam_search:
+                self.beam_search_processor.process_beam_search_decode_result(
+                    batch, result
+                )
+            else:
+                self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.process_batch_result_disagg_prefill(batch, result)
+            elif batch.reqs and batch.reqs[0].is_beam_search:
+                self.beam_search_processor.process_beam_search_prefill_result(
+                    batch, result.logits_output
+                )
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
