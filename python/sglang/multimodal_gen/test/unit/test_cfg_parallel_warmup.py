@@ -38,11 +38,6 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     should_include_warmup_image,
 )
 
-# Patch path for get_global_server_args used by Stage.__init__
-_GLOBAL_ARGS_PATCH = (
-    "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
-)
-
 
 def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     """
@@ -75,11 +70,7 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
 
 
 def _make_input_validation_stage() -> InputValidationStage:
-    """Construct InputValidationStage with the global server-args patch
-    that existing tests in this suite use (see test_input_validation.py)."""
-    with patch(_GLOBAL_ARGS_PATCH) as m:
-        m.return_value = MagicMock()
-        return InputValidationStage()
+    return InputValidationStage()
 
 
 def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
