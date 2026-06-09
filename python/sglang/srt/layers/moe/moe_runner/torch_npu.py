@@ -247,7 +247,6 @@ def pre_permute_deepep_ll_to_torch_npu(
     group_list = group_list.to(torch.int64)
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
-
     return TorchNpuRunnerInput(
         hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
@@ -263,6 +262,9 @@ def post_permute_torch_npu_to_torch_npu(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> TorchNpuCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.torch_npu import (
+        TorchNpuCombineInput
+    )
     return TorchNpuCombineInput(hidden_states=runner_output.hidden_states)
 
 
@@ -273,6 +275,9 @@ def post_permute_torch_npu_to_deepep_normal(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPNormalCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPNormalCombineInput
+    )
     return DeepEPNormalCombineInput(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],
@@ -287,6 +292,9 @@ def post_permute_torch_npu_to_deepep_ll(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPLLCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput
+    )
     return DeepEPLLCombineInput(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],
