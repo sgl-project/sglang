@@ -65,7 +65,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import destroy_distributed_environment
+from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+)
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
@@ -371,9 +374,10 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             origin_input_ids=array("q", tmp_input_ids),
             sampling_params=sampling_params,
         )
-        req.fill_ids = req.origin_input_ids
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.fill_len = len(req.full_untruncated_fill_ids)
         req.logprob_start_len = -1
-        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
         reqs.append(req)
 
     return input_ids, reqs
@@ -384,14 +388,15 @@ def prepare_extend_inputs_for_correctness_test(
 ):
     for i in range(len(reqs)):
         req: Req = reqs[i]
-        req.fill_ids.extend(input_ids[i][bench_args.cut_len :])
+        req.full_untruncated_fill_ids += input_ids[i][bench_args.cut_len :]
+        req.fill_len = len(req.full_untruncated_fill_ids)
         if model_runner is not None:
             # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
-            req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+            req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
     return reqs
 
 
@@ -416,9 +421,10 @@ def prepare_synthetic_inputs_for_latency_test(
             origin_input_ids=array("q", input_ids[i]),
             sampling_params=sampling_params,
         )
-        req.fill_ids = req.origin_input_ids
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.fill_len = len(req.full_untruncated_fill_ids)
         req.logprob_start_len = -1
-        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
         reqs.append(req)
 
     return reqs
@@ -557,7 +563,7 @@ class _MlxBenchRunner:
         req_ids = [str(req.rid) for req in reqs]
         results = []
         for rid, req in zip(req_ids, reqs):
-            token_ids = [int(t) for t in req.fill_ids]
+            token_ids = [int(t) for t in req.get_fill_ids()]
             next_token = self.mlx_runner.prefill(
                 req_id=rid,
                 new_token_ids=token_ids,
@@ -933,6 +939,7 @@ def latency_test(
                 fout.write(json.dumps(result) + "\n")
 
     if server_args.tp_size > 1:
+        destroy_model_parallel()
         destroy_distributed_environment()
 
 
@@ -954,12 +961,17 @@ def main(server_args, bench_args):
 
     port_args = PortArgs.init_new(server_args)
 
+    # Calculate local ranks for multi-node setup
+    nranks_per_node = server_args.tp_size // server_args.nnodes
+    local_rank_start = server_args.node_rank * nranks_per_node
+    local_rank_end = local_rank_start + nranks_per_node
+
     if server_args.tp_size == 1:
         work_func(server_args, port_args, bench_args, 0, 0)
     else:
         workers = []
-        for tp_rank in range(server_args.tp_size):
-            with maybe_reindex_device_id(tp_rank) as gpu_id:
+        for tp_rank in range(local_rank_start, local_rank_end):
+            with maybe_reindex_device_id(tp_rank - local_rank_start) as gpu_id:
                 proc = multiprocessing.Process(
                     target=work_func,
                     args=(

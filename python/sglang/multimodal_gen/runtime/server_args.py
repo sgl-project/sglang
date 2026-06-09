@@ -778,9 +778,11 @@ class ServerArgs(DisaggServerArgsMixin):
         # SamplingParams use classifier-free guidance (negative_prompt is not None),
         # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
+            deployment_config = self.pipeline_config.get_model_deployment_config()
             cfg_group_size = self.dp_size * self.tp_size * 2
             if (
                 self.performance_mode != "manual"
+                and deployment_config.auto_enable_cfg_parallel
                 and self.num_gpus >= 2
                 and self.num_gpus % cfg_group_size == 0
                 and sp_unspecified
