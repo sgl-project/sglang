@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
 import pathlib
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -63,6 +65,42 @@ def cache_once(fn: F) -> F:
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+
+
+_LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+
+
+def _local_jit_source_hash(source_files: List[str]) -> str:
+    """Hash JIT source contents so TVM-FFI cache keys track included headers."""
+    digest = hashlib.sha256()
+    seen: set[pathlib.Path] = set()
+    stack = [pathlib.Path(path).resolve() for path in source_files]
+
+    while stack:
+        path = stack.pop()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+
+        data = path.read_bytes()
+        # Relative to kernel root, not absolute: the key must track source
+        # content, not install location (differs across runners / job dirs).
+        try:
+            ident = str(path.relative_to(KERNEL_PATH))
+        except ValueError:
+            ident = path.name
+        digest.update(ident.encode())
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+
+        text = data.decode("utf-8", errors="ignore")
+        for include in _LOCAL_INCLUDE_RE.findall(text):
+            include_path = (path.parent / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+
+    return digest.hexdigest()[:16]
 
 
 @cache_once
@@ -134,6 +172,31 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     return CPPArgList(_convert(arg) for arg in args)
 
 
+@cache_once
+def _tvm_ffi_version() -> str:
+    try:
+        import tvm_ffi
+
+        version = getattr(tvm_ffi, "__version__", None)
+        if version:
+            return str(version)
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version as dist_version
+
+        return dist_version("apache-tvm-ffi")
+    except Exception:
+        return "unknown"
+
+
+def _jit_build_dir_name(module_name: str) -> str:
+    # Key on arch + tvm-ffi ABI too (module_name only hashes sources), so a
+    # shared cache volume never reuses a cross-arch/ABI .so.
+    arch = get_jit_cuda_arch().target_name
+    return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
+
+
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
@@ -201,6 +264,30 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    if cpp_files or cuda_files:
+        module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
+
+    # A built .so under a deterministic dir is content-addressed: load it
+    # directly to skip ninja, whose mtime check rebuilds every CI run (pip
+    # install bumps dep header mtimes).
+    if build_directory is None:
+        cache_dir = os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+        build_directory = str(
+            pathlib.Path(cache_dir).expanduser() / _jit_build_dir_name(module_name)
+        )
+    prebuilt = pathlib.Path(build_directory) / f"{module_name}.so"
+    if prebuilt.is_file():
+        from tvm_ffi import load_module
+
+        try:
+            module = load_module(str(prebuilt))
+            logger.debug("Reused cached JIT module %s", module_name)
+            return module
+        except Exception:
+            logger.warning(
+                "Cached JIT module %s failed to load; rebuilding.", module_name
+            )
+
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
