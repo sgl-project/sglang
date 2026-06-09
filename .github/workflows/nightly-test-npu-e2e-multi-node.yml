@@ -1,4 +1,4 @@
-name: 'e2e nightly test pd-separation (Ascend NPU)'
+name: 'Nightly Test (NPU) Multi Node Template'
 
 on:
   workflow_call:
