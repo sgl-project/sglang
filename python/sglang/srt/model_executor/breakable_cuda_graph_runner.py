@@ -509,12 +509,19 @@ class BreakableCudaGraphRunner:
                 self._prepare_forward_metadata_for_replay(
                     forward_batch, static_forward_batch, static_num_tokens
                 )
+                # Pass token counts so eager attention (radix_attention) can zero
+                # the padded [raw_num_tokens:static_num_tokens] region on HIP.
+                # Without this, padded positions keep uninitialized garbage
+                # (NaN/Inf) that propagates through residual/MoE/allreduce and
+                # corrupts outputs once batches are padded (high concurrency).
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,
                     self.quant_config,
                     self.moe_layers,
                     self.moe_fusions,
+                    num_tokens=static_num_tokens,
+                    raw_num_tokens=self.raw_num_tokens,
                 ):
                     output = self.model_runner.model.forward(
                         static_forward_batch.input_ids,
