@@ -1275,6 +1275,7 @@ class Req(ReqDllmMixin):
         stop_regex: Optional[str] = None,
     ) -> int:
         """Map a matched stop string/regex to output_ids length (stop included)."""
+
         def matched(text: str) -> bool:
             if stop_str is not None:
                 return stop_str in text
