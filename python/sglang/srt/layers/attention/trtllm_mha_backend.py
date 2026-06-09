@@ -125,9 +125,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
-        # separate index spaces; SWA layers need a translated page_table. Resolve
-        # the pool from the allocator (stable at construction), not from
-        # token_to_kv_pool, which FROZEN_KV MTP swaps per forward call.
+        # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
 
         # Forward metadata
@@ -147,14 +145,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
 
-        Read it from the allocator: in FROZEN_KV MTP the draft shares the
-        target's SWA allocator while its own token_to_kv_pool stays non-SWA
-        until swapped per call. The getattr only tolerates the minimal
-        allocator stub used by attention test fixtures.
+        EAGLE draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's
+        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
+        draft path reads target KV directly, so it still needs the allocator
+        pool when the active pool is not SWA.
         """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+
         allocator = model_runner.token_to_kv_pool_allocator
-        get_kvcache = getattr(allocator, "get_kvcache", None)
-        kvcache = get_kvcache() if get_kvcache is not None else None
+        kvcache = allocator.get_kvcache()
         return kvcache if isinstance(kvcache, SWAKVPool) else None
 
     def _maybe_translate_swa(
@@ -164,9 +170,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._swa_kv_pool is None:
             return None
         shape = token_indices.shape
-        return self._swa_kv_pool.translate_loc_from_full_to_swa(
-            token_indices.reshape(-1)
-        ).reshape(shape)
+        # trtllm-gen SWA attention kernels require int32 page indices.
+        return (
+            self._swa_kv_pool.translate_loc_from_full_to_swa(token_indices.reshape(-1))
+            .reshape(shape)
+            .to(torch.int32)
+        )
 
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
@@ -388,7 +397,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bs,
             )
             self.target_verify_metadata[bs] = metadata
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
@@ -481,7 +490,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
@@ -490,15 +499,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            extend_lens = spec_info.num_accept_tokens[:bs]
-            if spec_info.num_accept_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
+            if forward_mode.is_draft_extend_v2():
+                num_tokens_per_bs = spec_info.num_tokens_per_req
+                if num_tokens_per_bs <= 0:
+                    # Capture uses a synthetic EagleDraftExtendInput; infer the
+                    # fixed V2 stride from the capture buffer when it is unset.
+                    num_tokens_per_bs = int(
+                        spec_info.num_accept_tokens[:bs].max().item()
+                    )
+                metadata.max_seq_len_q = num_tokens_per_bs
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.arange(
+                        num_tokens_per_bs,
+                        bs * num_tokens_per_bs + 1,
+                        num_tokens_per_bs,
+                        dtype=torch.int32,
+                        device=metadata.cu_seqlens_q.device,
+                    )
+                )
             else:
-                metadata.max_seq_len_q = 1
+                extend_lens = spec_info.num_accept_tokens[:bs]
+                if spec_info.num_accept_tokens_cpu:
+                    metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
+                else:
+                    metadata.max_seq_len_q = 1
 
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
-            )
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+                )
 
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1

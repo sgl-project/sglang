@@ -34,7 +34,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.frozen_kv_mtp_worker import FrozenKVMTPWorker
+    from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 
 
 @dataclass
@@ -47,7 +47,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
-    # Consumed by the captured seed iter; see `FrozenKVMTPWorker.draft_forward`.
+    # Consumed by the captured seed iter; see `FrozenKVMTPDraftWorker.draft_forward`.
     bonus_tokens: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -56,7 +56,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
 class FrozenKVMTPCudaGraphRunner:
     """CUDA graph runner for the Frozen-KV MTP recurrent draft-loop step."""
 
-    def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPWorker):
+    def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPDraftWorker):
         self.frozen_kv_mtp_worker = frozen_kv_mtp_worker
         self.model_runner = model_runner = frozen_kv_mtp_worker.draft_model_runner
         self.graphs = {}
@@ -270,9 +270,6 @@ class FrozenKVMTPCudaGraphRunner:
         )
 
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
@@ -283,9 +280,9 @@ class FrozenKVMTPCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             hidden_states_backup = forward_batch.spec_info.hidden_states
-            ret = self.frozen_kv_mtp_worker.draft_forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            # The capture batch is marked by the capture metadata helper
+            # below, so draft_forward skips its eager plan.
+            ret = self.frozen_kv_mtp_worker.draft_forward(forward_batch)
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
