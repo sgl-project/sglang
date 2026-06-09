@@ -1205,12 +1205,11 @@ class Req(ReqDllmMixin):
             self.sampling_params.stop_regex_max_len + 1,
         )
 
-        # Ensure the window covers all newly accepted tokens plus the
-        # stop-string length so that multi-token speculative acceptance
-        # never pushes an early stop string out of view.
+        # Spec decode accepts multiple tokens per step; widen the window to cover
+        # the whole accepted chunk so a stop string landing mid-chunk (with more
+        # tokens accepted after it) is not pushed out of view.
         tail_len = min(
-            max(max_len_tail_str, new_accepted_len + max_len_tail_str),
-            len(self.output_ids),
+            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
         )
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
