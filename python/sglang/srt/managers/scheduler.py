@@ -2607,7 +2607,9 @@ class Scheduler(
             f"single-flight violated: {len(partially_extended_in_active)} partially-extended reqs "
             f"in active ({[r.rid for r in partially_extended_in_active]})"
         )
-        partially_extended_req = partially_extended_in_active[0] if partially_extended_in_active else None
+        partially_extended_req = (
+            partially_extended_in_active[0] if partially_extended_in_active else None
+        )
 
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -2765,12 +2767,16 @@ class Scheduler(
                 self._deactivate_req(req)
                 self._add_request_to_queue(req)
 
-        partially_extended_in_batch = [r for r in can_run_list if r.is_partially_extended]
+        partially_extended_in_batch = [
+            r for r in can_run_list if r.is_partially_extended
+        ]
         assert (
             len(partially_extended_in_batch) <= 1
         ), "single-flight invariant: at most one partially-extended req per batch"
         chunk_deduct = (
-            partially_extended_in_batch[0].extend_range.length if partially_extended_in_batch else 0
+            partially_extended_in_batch[0].extend_range.length
+            if partially_extended_in_batch
+            else 0
         )
 
         set_time_batch(can_run_list, "set_forward_entry_time")

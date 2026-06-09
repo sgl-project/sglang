@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 
 from sglang.srt.managers.schedule_batch import (
     Req,
-    _compute_next_extend_prompt_token,
     _compute_is_extend_intermediate,
+    _compute_next_extend_prompt_token,
 )
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (

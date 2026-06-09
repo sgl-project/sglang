@@ -70,7 +70,9 @@ class SchedulerLoadInquirer:
         partially_extended_req = next(iter(self.get_partially_extended_reqs()), None)
         if partially_extended_req is not None:
             num_pending_tokens += (
-                partially_extended_req.seqlen - len(partially_extended_req.prefix_indices) - chunk_deduct
+                partially_extended_req.seqlen
+                - len(partially_extended_req.prefix_indices)
+                - chunk_deduct
             )
         return num_pending_tokens
 

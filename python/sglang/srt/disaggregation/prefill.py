@@ -889,7 +889,9 @@ class SchedulerDisaggregationPrefillMixin:
     def process_prefill_chunk(self: Scheduler) -> None:
         partially_extended_req = next(iter(self.partially_extended_reqs()), None)
         if partially_extended_req is not None:
-            maybe_cache_unfinished_req(partially_extended_req, self.tree_cache, chunked=True)
+            maybe_cache_unfinished_req(
+                partially_extended_req, self.tree_cache, chunked=True
+            )
             if self.check_bootstrap(partially_extended_req):
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved

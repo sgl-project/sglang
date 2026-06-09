@@ -703,7 +703,9 @@ class PrefillAdder:
         )
 
     def add_resumed_extend_req(self, req: Req) -> AddReqResult:
-        assert req.is_partially_extended and not req.is_dllm(), f"non-resume req {req.rid}"
+        assert (
+            req.is_partially_extended and not req.is_dllm()
+        ), f"non-resume req {req.rid}"
 
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
