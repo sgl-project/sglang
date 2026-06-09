@@ -2360,13 +2360,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
         # DSA attention reads garbage at those token positions.
-        kv_cache_cpu = super().get_cpu_copy(indices)
+        kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
 
         page_indices = indices[:: self.page_size] // self.page_size
         torch.cuda.synchronize()
@@ -2385,8 +2385,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
-        super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+        super().load_cpu_copy(
+            kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
+        )
 
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]

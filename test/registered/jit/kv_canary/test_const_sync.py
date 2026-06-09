@@ -3,14 +3,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import sglang.jit_kernel
 from sglang.jit_kernel.kv_canary import consts
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="base-b-kernel-unit-1-gpu-large")
 
 
+# Resolve the kernel source against the installed jit_kernel package rather
+# than this file's location, so the test stays correct wherever it lives.
 _CONSTS_CUH: Path = (
-    Path(__file__).resolve().parents[2] / "csrc" / "kv_canary" / "consts.cuh"
+    Path(sglang.jit_kernel.__file__).resolve().parent
+    / "csrc"
+    / "kv_canary"
+    / "consts.cuh"
 )
 
 

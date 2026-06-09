@@ -134,7 +134,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        if model_runner.server_args.enable_return_hidden_states:
+        # If returning hidden states is enabled, or if speculative prefill
+        # needs aux hidden states (DFLASH), capture the FULL variant up front.
+        # Ported from main #27468.
+        if (
+            model_runner.server_args.enable_return_hidden_states
+            or model_runner.spec_algorithm.is_dflash()
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
@@ -527,7 +533,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                # Use self.capture_hidden_mode so dflash spec (which needs
+                # FULL aux hidden states) captures with the right mode.
+                # Ported from main #27468.
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,

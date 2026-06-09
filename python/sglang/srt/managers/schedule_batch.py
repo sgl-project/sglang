@@ -1330,7 +1330,7 @@ class Req(ReqDllmMixin):
 
     def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
         for i, token_id in enumerate(new_accepted_tokens):
-            if token_id > self.vocab_size or token_id < 0:
+            if token_id >= self.vocab_size or token_id < 0:
                 offset = len(self.output_ids) - len(new_accepted_tokens) + i
                 if self.sampling_params.stop_token_ids:
                     self.output_ids[offset] = next(

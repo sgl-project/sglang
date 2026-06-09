@@ -1163,7 +1163,7 @@ class Scheduler(
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
-        # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
+        # Workers not on BaseSpecWorker (e.g. NGRAM / DFLASH) lack the
         # override; fall back to target-only so the helper still produces a
         # safe decision (no accidental opt-out for unaudited shapes).
         if self.draft_worker is not None:
@@ -3120,9 +3120,9 @@ class Scheduler(
                         )
                         batch.input_ids = None
                     else:
-                        # Spec_v1 (NGRAM / DFLASH / FROZEN_KV_MTP, non-overlap):
-                        # worker shape doesn't match req_pool_indices; relay is
-                        # unused (worker rebuilds input_ids inside verify).
+                        # Spec_v1 (NGRAM / DFLASH, non-overlap): worker shape
+                        # doesn't match req_pool_indices; relay is unused (worker
+                        # rebuilds input_ids inside verify).
                         batch.input_ids = batch_result.next_token_ids.to(torch.int64)
                 self.update_cache_from_scheduler(batch, batch_result)
 
