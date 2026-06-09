@@ -12,10 +12,15 @@ def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
     if s.chunked_req is not None:
         yield s.chunked_req
     yield from s.waiting_queue
-    if s.running_batch is not None:
-        yield from s.running_batch.reqs
-    if s.last_batch is not None:
-        yield from s.last_batch.reqs
+    if s.ps.pp_size > 1:
+        for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
+            if mb is not None:
+                yield from mb.reqs
+    else:
+        if s.running_batch is not None:
+            yield from s.running_batch.reqs
+        if s.last_batch is not None:
+            yield from s.last_batch.reqs
 
 
 def list_active_reqs(ctx: "ScriptedContext") -> List["Req"]:
@@ -75,9 +80,20 @@ def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
 
 def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
     req = find_req_by_rid(ctx, rid)
-    if req is None:
-        return rid in ctx._seen_rids
-    return req.finished()
+    if req is not None:
+        return req.finished()
+    if rid in ctx._seen_rids:
+        return True
+    # Fallback: if the req ran in a forward batch (recorded in _batch_log) but
+    # is now absent from all active scheduler sets, it must have finished.
+    # This catches requests that completed without ever being observed via
+    # find_req_by_rid (e.g. when Python short-circuit evaluation prevents the
+    # query while another request is still running).
+    log = ctx._scheduler_hook._batch_log
+    if any(rid in record.rids for record in log):
+        ctx._seen_rids.add(rid)
+        return True
+    return False
 
 
 def is_chunking(ctx: "ScriptedContext", rid: str) -> bool:
