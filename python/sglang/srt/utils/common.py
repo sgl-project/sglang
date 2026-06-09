@@ -344,6 +344,16 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+def is_deepseek_v4_kernel_available() -> bool:
+    """Check whether the out-of-tree deepseek_v4_kernel is installed.
+
+    Provides the SM120 HMMA tensor-core sparse-decode kernel
+    (``deepseek_v4_kernel.ops.sparse_decode_fwd``), a drop-in for FlashMLA's
+    sparse decode. Optional; when absent the in-tree Triton kernel is used.
+    """
+    return importlib.util.find_spec("deepseek_v4_kernel") is not None
+
+
 @lru_cache(maxsize=1)
 def is_tokenspeed_mla_available():
     """
