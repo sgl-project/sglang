@@ -51,9 +51,9 @@ _EAGLE3_SPEC_ARGS = [
 
 
 class TestStreamingSessionEagle(StreamingSessionServerBase, StreamingSessionKitMixin):
-    """EAGLE3 spec v1 (overlap disabled); offset=-1 — see kit's note."""
+    """EAGLE3 spec v2, overlap disabled; inherited count jitters {0, -1} — see kit's note."""
 
-    kv_inherit_offset = -1
+    kv_inherit_offsets = (0, -1)
     model = DEFAULT_TARGET_MODEL_EAGLE3
     extra_args = [
         "--disable-overlap-schedule",
@@ -82,10 +82,11 @@ class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKi
 class TestStreamingSessionEagleRetractLargePage(
     StreamingSessionServerBase, StreamingSessionKitMixin
 ):
-    """EAGLE3 spec v1 + retract + page=256: max-pressure on `_free_tail`
-    (spec tail + retract alloc-commit gap + page alignment)."""
+    """EAGLE3 spec v2 (overlap disabled) + retract + page=256: max-pressure on
+    `_free_tail` (spec tail + retract alloc-commit gap + page alignment).
+    Inherited count jitters {0, -1} — see kit's note."""
 
-    kv_inherit_offset = -1
+    kv_inherit_offsets = (0, -1)
     model = DEFAULT_TARGET_MODEL_EAGLE3
     extra_args = [
         "--disable-overlap-schedule",
