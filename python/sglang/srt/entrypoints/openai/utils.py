@@ -189,6 +189,7 @@ def parse_tool_calls_from_content(
     tools: List[Tool],
     tool_call_parser: str,
     generate_tool_call_id: Callable[[Any, int], str],
+    history_tool_calls_cnt: int = 0,
 ) -> Tuple[str, List[ResponseFunctionToolCall]]:
     """Parse tool calls from model output content.
 
@@ -204,7 +205,6 @@ def parse_tool_calls_from_content(
     """
     tool_calls: List[ResponseFunctionToolCall] = []
     remaining_text = content
-    history_tool_calls_cnt = 0
 
     parser = FunctionCallParser(tools, tool_call_parser)
     if parser.has_tool_call(content):
@@ -221,7 +221,7 @@ def parse_tool_calls_from_content(
                     status="completed",
                 )
                 tool_calls.append(function_tool_call)
-                history_tool_calls_cnt += 1
+
             remaining_text = text
         except Exception as e:
             logger.error(f"Tool call parsing error: {e}")

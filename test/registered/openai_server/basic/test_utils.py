@@ -50,6 +50,7 @@ class TestParseToolCallsFromContent(unittest.TestCase):
                 tools=tools,
                 tool_call_parser="llama3",
                 generate_tool_call_id=lambda call_info, cnt: f"call_{cnt}",
+                history_tool_calls_cnt=0,
             )
 
         self.assertEqual(remaining_text, "Hello, how are you?")
@@ -92,6 +93,7 @@ class TestParseToolCallsFromContent(unittest.TestCase):
                 tools=tools,
                 tool_call_parser="llama3",
                 generate_tool_call_id=lambda call_info, cnt: f"call_{cnt}",
+                history_tool_calls_cnt=0,
             )
 
         self.assertEqual(remaining_text, "")
@@ -138,6 +140,7 @@ class TestParseToolCallsFromContent(unittest.TestCase):
                 tools=tools,
                 tool_call_parser="llama3",
                 generate_tool_call_id=lambda call_info, cnt: f"call_{cnt}",
+                history_tool_calls_cnt=0,
             )
 
         self.assertEqual(remaining_text, "Some remaining text")
@@ -171,6 +174,7 @@ class TestParseToolCallsFromContent(unittest.TestCase):
                 tools=tools,
                 tool_call_parser="llama3",
                 generate_tool_call_id=lambda call_info, cnt: f"call_{cnt}",
+                history_tool_calls_cnt=0,
             )
 
         self.assertEqual(remaining_text, "Invalid tool call content")
@@ -206,6 +210,7 @@ class TestParseToolCallsFromContent(unittest.TestCase):
                 tools=tools,
                 tool_call_parser="llama3",
                 generate_tool_call_id=custom_id_generator,
+                history_tool_calls_cnt=0,
             )
 
         self.assertEqual(len(tool_calls), 1)

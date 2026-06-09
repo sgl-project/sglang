@@ -62,6 +62,7 @@ from sglang.srt.entrypoints.openai.utils import (
     parse_tool_calls_from_content,
     to_openai_style_logprobs,
 )
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import _is_complete_json
@@ -854,6 +855,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     content,
                     function_tools,
                     request.tool_choice,
+                    request,
                 )
                 output_items.extend(tool_calls)
                 content = remaining_text
@@ -1193,6 +1195,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     function_tools, self.tool_call_parser
                 )
 
+        history_tool_calls_cnt = (
+            self._get_history_tool_calls_cnt(request) if function_tools else 0
+        )
+
         reasoning_parser: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             is_force_reasoning = (
@@ -1457,11 +1463,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     args_str = call_info.parameters or ""
                                     if isinstance(args_str, dict):
                                         args_str = json.dumps(args_str)
-                                    function_name = call_info.name or ""
+
+                                    if call_info.name:
+                                        fc_call_id = self._process_tool_call_id(
+                                            call_info, history_tool_calls_cnt
+                                        )
+                                        function_name = call_info.name
+                                    else:
+                                        fc_call_id = ""
+                                        function_name = ""
 
                                     if tool_index not in tool_call_states:
                                         fc_item_id = f"fc_{random_uuid()}"
-                                        fc_call_id = f"call_{random_uuid()[:24]}"
                                         tool_call_states[tool_index] = {
                                             "item_id": fc_item_id,
                                             "call_id": fc_call_id,
@@ -2130,15 +2143,46 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         return True  # default
 
+    def _get_history_tool_calls_cnt(self, request: ResponsesRequest) -> int:
+        """Counts the number of tool calls in the request's input history.
+
+        NOTE: This method is only useful for models that include self-increasing
+        history tool call idx in tool calls id, such as kimi-k2.
+
+        For the Responses API, tool calls can appear in:
+        1. input items with type "function_call"
+        2. assistant-role messages with tool_calls in input
+        """
+        if isinstance(request.input, str):
+            return 0
+
+        idx = 0
+        for raw_item in request.input:
+            # Convert Pydantic models to dicts for uniform handling
+            item = raw_item
+            if hasattr(raw_item, "model_dump"):
+                item = raw_item.model_dump()
+
+            item_type = item.get("type", "message")
+            if item_type == "function_call":
+                idx += 1
+
+        return idx
+
     def _parse_tool_calls(
         self,
         content: str,
         tools: list[Any],
         tool_choice: Optional[Union[str, ToolChoice]] = None,
+        request: Optional[ResponsesRequest] = None,
     ) -> tuple[str, Optional[list[ResponseFunctionToolCall]]]:
         """Process tool calls in the response"""
 
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+        history_tool_calls_cnt = (
+            self._get_history_tool_calls_cnt(request) if request else 0
+        )
+
         if self.tool_call_parser:
             parser = FunctionCallParser(tools, self.tool_call_parser)
             should_try_parser = (
@@ -2150,6 +2194,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tools=tools,
                     tool_call_parser=self.tool_call_parser,
                     generate_tool_call_id=self._process_tool_call_id,
+                    history_tool_calls_cnt=history_tool_calls_cnt,
                 )
                 return remaining_text, tool_calls
 
@@ -2158,11 +2203,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tool_call_data = orjson.loads(content)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
+                    call_info = ToolCallItem(
+                        tool_index=i,
+                        name=tool["name"],
+                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                    )
+                    call_id = self._process_tool_call_id(
+                        call_info, history_tool_calls_cnt
+                    )
                     # Create a ToolCallItem from the JSON data
                     function_tool_call = ResponseFunctionToolCall(
                         id=f"fc_{random_uuid()[:32]}",
                         type="function_call",
-                        call_id=f"call_{random_uuid()[:24]}",
+                        call_id=call_id,
                         name=tool["name"],
                         arguments=json.dumps(tool["parameters"], ensure_ascii=False),
                         status="completed",
