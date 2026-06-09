@@ -24,10 +24,9 @@ impl std::fmt::Debug for TokenizerRegistry {
 impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
-        for m in &cfg.models {
-            let t = adapter::load(&m.tokenizer_path)?;
-            me.inner.insert(m.id.clone(), t);
-        }
+        let m = &cfg.model;
+        let t = adapter::load(&m.tokenizer_path)?;
+        me.inner.insert(m.id.clone(), t);
         Ok(me)
     }
 
@@ -54,20 +53,19 @@ mod tests {
                 port: 0,
             },
             observability: Default::default(),
-            models: vec![crate::config::ModelConfig {
+            model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
-            }],
-            discovery: crate::config::DiscoveryConfig {
-                backend: crate::config::DiscoveryBackend::StaticUrls(
-                    crate::config::StaticUrlsDiscoveryConfig {
-                        urls: vec!["http://placeholder:0".into()],
-                    },
-                ),
+                sticky: None,
             },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
             proxy: crate::config::ProxyConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
         }
@@ -104,15 +102,17 @@ mod tests {
 
     /// Forces `decode_complete` through its `DecodeResult::Partial` branch.
     ///
-    /// Strategy A: the fixture is a GPT-2 byte-level BPE. The 4-byte UTF-8
-    /// emoji `😀` (`\xF0\x9F\x98\x80`) encodes into 2 byte-level BPE tokens
-    /// with this fixture: `[47249, 222]`. Decoding just the first token
-    /// yields a leading-bytes-only prefix that the HF adapter passes through
-    /// `String::from_utf8_lossy`, producing a trailing U+FFFD. dynamo's
-    /// `DecodeResult::from_decoded` then classifies that as `Partial`.
-    /// Pinning the literal token id keeps the test deterministic — if the
-    /// fixture or upstream BPE merges ever shift, this fails loudly rather
-    /// than silently dropping back into `Complete` and losing coverage.
+    /// The fixture is a no-merge byte-level BPE. The 4-byte UTF-8 emoji
+    /// `😀` (`\xF0\x9F\x98\x80`) encodes to its raw byte token ids:
+    /// `[240, 159, 152, 128]`. Decoding only a prefix yields leading bytes
+    /// that the HF adapter passes through `String::from_utf8_lossy`,
+    /// producing a trailing U+FFFD. dynamo's `DecodeResult::from_decoded`
+    /// then classifies that as `Partial`.
+    ///
+    /// Pinning the literal token ids keeps the test deterministic: if the
+    /// fixture shape or upstream byte-level handling ever shifts, this fails
+    /// loudly rather than silently dropping back into `Complete` and losing
+    /// coverage.
     #[test]
     fn decode_complete_returns_string_on_partial_utf8() {
         let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
@@ -123,13 +123,13 @@ mod tests {
         let full = adapter::encode(&t, "😀").unwrap();
         assert_eq!(
             full,
-            vec![47249, 222],
-            "fixture tokenisation drift: '😀' no longer encodes to [47249, 222]"
+            vec![240, 159, 152, 128],
+            "fixture tokenisation drift: '😀' no longer encodes to [240, 159, 152, 128]"
         );
 
-        // Feed only the first token — its bytes are the leading 3 of a
-        // 4-byte UTF-8 codepoint, which is incomplete.
-        let s = adapter::decode_complete(&t, &full[..1], false).unwrap();
+        // Feed only the first three bytes of a 4-byte UTF-8 codepoint,
+        // which is incomplete.
+        let s = adapter::decode_complete(&t, &full[..3], false).unwrap();
 
         // We pin the exact output: the lossy decoder folds the 3 leading
         // bytes into a single U+FFFD. Anything else (empty string, Err, or
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
-        c.models[0].tokenizer_path = "/nonexistent.json".into();
+        c.model.tokenizer_path = "/nonexistent.json".into();
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
     }

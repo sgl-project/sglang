@@ -9,20 +9,14 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.common import get_last_loc
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_draft_cache_locs as assign_draft_cache_locs,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -53,6 +47,9 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
@@ -75,6 +72,31 @@ TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
     _is_cuda or _is_musa
 )  # This kernel is only available for CUDA and MUSA now
+
+
+def draft_kv_indices_buffer_width(
+    num_seqs: int, topk: int, max_context_len: int
+) -> int:
+    """Per-step row width of the EAGLE draft-decode kv_indices buffer.
+
+    num_seqs * topk branches each attend up to max_context_len KV slots; the topk
+    factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
+    """
+    assert (
+        num_seqs * topk * max_context_len < 2**31
+    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    return num_seqs * topk * max_context_len
+
+
+def draft_kv_indices_used_len(
+    seq_lens_sum: int, topk: int, bs: int, num_steps: int
+) -> int:
+    """kv_indices length used through num_steps draft-decode steps.
+
+    bs = topk * num_seqs branches, one index appended per branch per step. Called with
+    num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
+    """
+    return seq_lens_sum * topk + bs * num_steps
 
 
 def record_stream_each(tensors, stream):
@@ -313,13 +335,13 @@ def traverse_tree(
             is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
-            curr_token_id = draft_tokens[curr]
-            if vocab_size and curr_token_id >= vocab_size:
+            current_token = draft_tokens[curr]
+            if vocab_size and current_token >= vocab_size:
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
                 is_accepted = (
-                    parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+                    parent_bitmask[current_token // 32] & (1 << (current_token % 32))
                 ) != 0
 
         if is_accepted:
@@ -442,39 +464,3 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
-
-
-# Disable torch.compile for this function because it will be
-# even slower.
-# @torch.compile(dynamic=True)
-def get_last_loc_large_page_size_large_top_k(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    speculative_num_steps: int,
-    topk: int,
-    page_size: int,
-):
-    prefix_lens = seq_lens
-    last_page_lens = prefix_lens % page_size
-    num_new_pages_per_topk = (
-        last_page_lens + speculative_num_steps + page_size - 1
-    ) // page_size
-    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
-        page_size * topk
-    )
-    extend_lens = seq_lens - prefix_lens
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
-    )
-
-    return (
-        prefix_lens,
-        seq_lens,
-        last_loc,
-        num_new_pages_per_topk,
-        extend_lens,
-        last_page_lens,
-    )
