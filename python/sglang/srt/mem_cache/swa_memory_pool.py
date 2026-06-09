@@ -161,14 +161,9 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        swa_loc: Optional[torch.Tensor] = None,
     ):
-        # loc_info bundles the full loc and the pre-translated SWA loc. The
-        # explicit swa_loc kwarg is a transitional path (e.g. DSV4-style callers
-        # that have not moved to KVWriteLoc) and takes precedence when given.
-        loc, info_swa_loc = unwrap_write_loc(loc_info)
-        if swa_loc is None:
-            swa_loc = info_swa_loc
+        # loc_info bundles the full loc and the pre-translated SWA loc.
+        loc, swa_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
