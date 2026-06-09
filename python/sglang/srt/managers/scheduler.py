@@ -2487,7 +2487,7 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
         ):
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(only_decode_ready=True)
+            self.last_batch.filter_batch(skip_extend_intermediate=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -3785,7 +3785,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            self.last_batch.filter_batch(only_decode_ready=True)
+            self.last_batch.filter_batch(skip_extend_intermediate=True)
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never

@@ -2654,7 +2654,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         keep_indices: Optional[List[int]] = None,
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
-        only_decode_ready: bool = False,
+        skip_extend_intermediate: bool = False,
     ):
         if keep_indices is None:
             is_extend_intermediate = self.is_extend_intermediate
@@ -2663,7 +2663,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
                 and not (
-                    only_decode_ready
+                    skip_extend_intermediate
                     and is_extend_intermediate
                     and is_extend_intermediate[i]
                 )
