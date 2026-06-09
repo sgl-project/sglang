@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -9,14 +10,20 @@ from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask
+from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +44,29 @@ class NGRAMWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
+        self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+
+        # Adaptive speculative decoding
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self, config_path=server_args.speculative_adaptive_config
+            )
+            self._max_draft_token_num = max(
+                s + 1 for s in self.adaptive_controller.candidate_steps
+            )
+        else:
+            self._max_draft_token_num = self.draft_token_num
 
         self._init_preallocated_tensors()
 
@@ -55,7 +76,7 @@ class NGRAMWorker:
             match_type=server_args.speculative_ngram_match_type,
             capacity=server_args.speculative_ngram_capacity,
             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
-            draft_token_num=server_args.speculative_num_draft_tokens,
+            draft_token_num=self._max_draft_token_num,
             external_sam_budget=server_args.speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
         )
@@ -79,6 +100,25 @@ class NGRAMWorker:
                 corpus_path,
                 loaded,
             )
+
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.draft_token_num - 1,
+                    speculative_num_draft_tokens=self.draft_token_num,
+                    draft_attn_backend=None,
+                    cuda_graph_runner=None,
+                    target_attn_backend=self.target_worker.model_runner.attn_backend,
+                    target_graph_runner=self.target_worker.model_runner.graph_runner,
+                    draft_extend_attn_backend=None,
+                    cuda_graph_runner_for_draft_extend=None,
+                )
+            )
+            self.adaptive_controller.init_states()
+
+    @property
+    def speculative_num_steps(self) -> int:
+        return self.draft_token_num - 1
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
@@ -162,6 +202,80 @@ class NGRAMWorker:
                 self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
             )
 
+    # -- Adaptive speculative decoding --
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ) -> SpecRuntimeState:
+        """Build a NGRAM runtime state for the given draft-token count."""
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.server_args.device, self.gpu_id)
+
+        target_model_runner = self.target_worker.model_runner
+        sa = self.server_args
+        backup = (sa.speculative_num_steps, sa.speculative_num_draft_tokens)
+        try:
+            sa.speculative_num_steps = speculative_num_steps
+            sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+
+            backup_init = target_model_runner.init_new_workspace
+            try:
+                target_attn_backend = target_model_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_model_runner.init_new_workspace = backup_init
+
+            target_graph_runner = None
+            if not sa.disable_cuda_graph:
+                target_graph_runner = CudaGraphRunner(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=speculative_num_steps,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+        finally:
+            sa.speculative_num_steps, sa.speculative_num_draft_tokens = backup
+
+        after_mem = get_available_gpu_memory(self.server_args.device, self.gpu_id)
+        logger.info(
+            "Built NGRAM adaptive state draft_tokens=%s: elapsed=%.2fs, mem=%.2fGB",
+            speculative_num_draft_tokens,
+            time.perf_counter() - tic,
+            before_mem - after_mem,
+        )
+        return SpecRuntimeState(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            draft_attn_backend=None,
+            cuda_graph_runner=None,
+            target_attn_backend=target_attn_backend,
+            target_graph_runner=target_graph_runner,
+            draft_extend_attn_backend=None,
+            cuda_graph_runner_for_draft_extend=None,
+        )
+
+    def apply_runtime_state(self, state: SpecRuntimeState):
+        """Apply a pre-built runtime state to this worker."""
+        if self.draft_token_num == state.speculative_num_draft_tokens:
+            return
+
+        logger.info(
+            "Switch NGRAM adaptive state: draft_tokens %d -> %d",
+            self.draft_token_num,
+            state.speculative_num_draft_tokens,
+        )
+        self.draft_token_num = state.speculative_num_draft_tokens
+        self._init_preallocated_tensors()
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.graph_runner = state.target_graph_runner
+        self.server_args.speculative_num_steps = state.speculative_num_steps
+        self.server_args.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+
+    # -- Draft / verify pipeline --
+
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -181,6 +295,13 @@ class NGRAMWorker:
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
+
+        # Truncate if corpus produces more tokens than current config
+        if self._max_draft_token_num > self.draft_token_num:
+            n, k = self._max_draft_token_num, self.draft_token_num
+            req_drafts = req_drafts.reshape(bs, n)[:, :k].flatten()
+            mask = mask.reshape(bs, n, n)[:, :k, :k].flatten()
+
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -345,6 +466,10 @@ class NGRAMWorker:
                     finished_req_ids.append(req.rid)
             if finished_req_ids:
                 self.ngram_corpus.erase_match_state(finished_req_ids)
+
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.on_verify_complete(accept_length_per_req_cpu)
+
             batch.forward_mode = ForwardMode.DECODE
 
         else:
