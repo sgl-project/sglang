@@ -308,6 +308,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     self._cache_permute_indices,
                     layer.w13_weight.data[i].view(torch.uint8),
                     epilogue_tile_m,
+                    is_gated_act_gemm=layer.moe_runner_config.is_gated,
                 )
                 tmp_weights1 = (
                     layer.w13_weight.data[i]
@@ -509,6 +510,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     else ActivationType.Swiglu
                 ),
             )[0]
+
+            if (
+                not layer.should_fuse_routed_scaling_factor_in_topk
+                and moe_runner_config.routed_scaling_factor is not None
+            ):
+                output.mul_(moe_runner_config.routed_scaling_factor)
+
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -627,6 +635,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         assert moe_runner_config.activation in [
             "silu",
             "gelu",
+            "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
         ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
