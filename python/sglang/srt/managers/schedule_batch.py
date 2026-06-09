@@ -1832,6 +1832,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         output_process_mode = [
             _decide_output_process_mode(req, dllm_config, forward_mode) for req in reqs
         ]
+        chunked_req = next(
+            (
+                req
+                for req, mode in zip(reqs, output_process_mode)
+                if mode is OutputProcessMode.EXTEND_MIDDLE_CHUNK
+            ),
+            None,
+        )
 
         batch = cls(
             reqs=reqs,
@@ -1849,6 +1857,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             dllm_config=dllm_config,
             output_process_mode=output_process_mode,
+            chunked_req=chunked_req,
+            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
+                chunked_req
+            ),
         )
         return batch
 
