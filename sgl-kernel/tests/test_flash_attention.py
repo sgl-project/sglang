@@ -1365,5 +1365,151 @@ def test_flash_attn_varlen_output(
         ).abs().max().item() + dv_atol
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("num_splits", [2, 4])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 128),
+        (1, 339),
+        (3, 1024),
+        (64, 800),
+        (64, 2048),
+        (128, 128),
+        (256, 512),
+        (2048, 3577),
+    ],
+)
+def test_flash_attn_deterministic_num_splits(
+    seqlen_q,
+    seqlen_k,
+    d,
+    varlen_q,
+    causal,
+    num_splits,
+    mha_type,
+    dtype,
+):
+    """Test that flash attention output with static num_splits > 1 is batch-invariant."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size_1 = 5
+    batch_size_2 = 7
+    nheads = 6
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    dv = d
+
+    q1 = torch.randn(batch_size_1, seqlen_q, nheads, d, device=device, dtype=dtype)
+    q2 = torch.cat(
+        [
+            q1.clone(),
+            torch.randn(
+                batch_size_2 - batch_size_1,
+                seqlen_q,
+                nheads,
+                d,
+                device=device,
+                dtype=dtype,
+            ),
+        ],
+        dim=0,
+    )
+
+    if varlen_q:
+        query_padding_mask_1 = generate_random_padding_mask(
+            seqlen_q, batch_size_1, device, mode="random"
+        )
+        q_unpad_1, indices_q_1, cu_seqlens_q_1, max_seqlen_q_1, *_ = unpad_input(
+            q1, query_padding_mask_1
+        )
+        output_pad_fn_1 = lambda output_unpad: pad_input(
+            output_unpad, indices_q_1, batch_size_1, seqlen_q
+        )
+
+        query_padding_mask_2_extra = generate_random_padding_mask(
+            seqlen_q, batch_size_2 - batch_size_1, device, mode="random"
+        )
+        query_padding_mask_2 = torch.cat(
+            [query_padding_mask_1.clone(), query_padding_mask_2_extra], dim=0
+        )
+        q_unpad_2, indices_q_2, cu_seqlens_q_2, max_seqlen_q_2, *_ = unpad_input(
+            q2, query_padding_mask_2
+        )
+        output_pad_fn_2 = lambda output_unpad: pad_input(
+            output_unpad, indices_q_2, batch_size_2, seqlen_q
+        )
+    else:
+        q_unpad_1, cu_seqlens_q_1, max_seqlen_q_1 = q1, None, None
+        q_unpad_2, cu_seqlens_q_2, max_seqlen_q_2 = q2, None, None
+        output_pad_fn_1 = output_pad_fn_2 = lambda x: x
+
+    k_cache_2 = torch.randn(
+        batch_size_2, seqlen_k, nheads_k, d, device=device, dtype=dtype
+    )
+    v_cache_2 = torch.randn(
+        batch_size_2, seqlen_k, nheads_k, dv, device=device, dtype=dtype
+    )
+    k_cache_1 = k_cache_2[:batch_size_1]
+    v_cache_1 = v_cache_2[:batch_size_1]
+
+    cache_seqlens_1 = torch.randint(
+        1, seqlen_k + 1, (batch_size_1,), dtype=torch.int32, device=device
+    )
+    cache_seqlens_2 = torch.cat(
+        [
+            cache_seqlens_1,
+            torch.randint(
+                1,
+                seqlen_k + 1,
+                (batch_size_2 - batch_size_1,),
+                dtype=torch.int32,
+                device=device,
+            ),
+        ],
+        dim=0,
+    )
+
+    out1, lse1, *_ = flash_attn_with_kvcache(
+        q_unpad_1,
+        k_cache_1,
+        v_cache_1,
+        cache_seqlens=cache_seqlens_1,
+        cu_seqlens_q=cu_seqlens_q_1,
+        max_seqlen_q=max_seqlen_q_1,
+        causal=causal,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+        batch_invariant=True,
+    )
+    if varlen_q:
+        out1 = output_pad_fn_1(out1)
+
+    out2, lse2, *_ = flash_attn_with_kvcache(
+        q_unpad_2,
+        k_cache_2,
+        v_cache_2,
+        cache_seqlens=cache_seqlens_2,
+        cu_seqlens_q=cu_seqlens_q_2,
+        max_seqlen_q=max_seqlen_q_2,
+        causal=causal,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+        batch_invariant=True,
+    )
+    if varlen_q:
+        out2 = output_pad_fn_2(out2)
+
+    assert torch.equal(out1, out2[:batch_size_1]), (
+        f"Outputs differ with num_splits={num_splits}: "
+        f"max diff = {(out1 - out2[:batch_size_1]).abs().max().item()}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

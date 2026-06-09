@@ -82,7 +82,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int64_t num_splits,
     std::optional<bool> pack_gqa_,
     int64_t sm_margin,
-    std::optional<const at::Tensor>& sinks_);  // (h)
+    std::optional<const at::Tensor>& sinks_,  // (h)
+    bool batch_invariant = false,
+    std::optional<at::Tensor> sparse_mask_fine_ = std::nullopt);
 
 /*
  * From flash-attention: get_scheduler_metadata
