@@ -243,14 +243,9 @@ class OutputProcessMode(Enum):
     EXTEND_MIDDLE_CHUNK = "extend_middle_chunk"
     EXTEND_LAST_CHUNK = "extend_last_chunk"
     DECODE = "decode"
-    DLLM_INTERMEDIATE = "dllm_intermediate"
-    DLLM_FINAL = "dllm_final"
 
     def is_intermediate(self) -> bool:
-        return self in (
-            OutputProcessMode.EXTEND_MIDDLE_CHUNK,
-            OutputProcessMode.DLLM_INTERMEDIATE,
-        )
+        return self is OutputProcessMode.EXTEND_MIDDLE_CHUNK
 
 
 @dataclasses.dataclass
@@ -1517,7 +1512,10 @@ def _decide_output_process_mode(
     forward_mode: Optional[ForwardMode],
 ) -> OutputProcessMode:
     if dllm_config is not None:
-        return OutputProcessMode.DLLM_INTERMEDIATE
+        # dLLM steps are always intermediate: their output is committed via
+        # dllm_manager, not the normal output path. Reuse the generic
+        # intermediate mode instead of a dedicated dLLM enum value.
+        return OutputProcessMode.EXTEND_MIDDLE_CHUNK
 
     if forward_mode is not None and (
         forward_mode.is_decode() or forward_mode.is_prebuilt()
@@ -1785,7 +1783,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             (
                 req
                 for req, mode in zip(reqs, output_process_mode)
-                if mode is OutputProcessMode.EXTEND_MIDDLE_CHUNK
+                if mode.is_intermediate() and not req.is_dllm()
             ),
             None,
         )
