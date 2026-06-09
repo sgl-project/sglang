@@ -614,8 +614,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 for content in output_item.content:
                     messages.append(
                         {
-                            "role": "system",
-                            "content": request.instructions,
+                            "role": "assistant",
+                            "content": content.text,
                         }
                     )
 
