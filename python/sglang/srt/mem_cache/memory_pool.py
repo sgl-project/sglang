@@ -782,8 +782,10 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, fp8_dtype):
+            # NOTE: Store as torch.uint8 because Tensor.index_put is not supported for
+            # FP8 storage dtypes, including e5m2, e4m3fn, and the
+            # platform-native E4M3 type in fp8_dtype.
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
