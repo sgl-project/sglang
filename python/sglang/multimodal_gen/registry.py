@@ -58,6 +58,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
@@ -77,6 +80,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -108,6 +112,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
 )
@@ -133,6 +138,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -834,9 +840,9 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: (
-                "flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower()
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" not in hf_id.lower()
             )
-            and "base" not in hf_id.lower()
         ],
     )
     register_configs(
@@ -848,9 +854,9 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: (
-                "flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower()
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" in hf_id.lower()
             )
-            and "base" in hf_id.lower()
         ],
     )
     register_configs(
@@ -888,10 +894,12 @@ def _register_configs():
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
         model_detectors=[
-            lambda hf_id: "qwen-image" in hf_id.lower()
-            and "edit" not in hf_id.lower()
-            and "layered" not in hf_id.lower()
-            and "2512" not in hf_id.lower()
+            lambda hf_id: (
+                "qwen-image" in hf_id.lower()
+                and "edit" not in hf_id.lower()
+                and "layered" not in hf_id.lower()
+                and "2512" not in hf_id.lower()
+            )
         ],
     )
     register_configs(
@@ -905,9 +913,11 @@ def _register_configs():
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
         model_detectors=[
-            lambda hf_id: "qwen-image-edit" in hf_id.lower()
-            and "2509" not in hf_id.lower()
-            and "2511" not in hf_id.lower()
+            lambda hf_id: (
+                "qwen-image-edit" in hf_id.lower()
+                and "2509" not in hf_id.lower()
+                and "2511" not in hf_id.lower()
+            )
         ],
     )
 
@@ -943,12 +953,14 @@ def _register_configs():
             "stabilityai/stable-diffusion-3.5-large-diffusers",
         ],
         model_detectors=[
-            lambda hf_id: "stable-diffusion-3-medium" in hf_id.lower()
-            or "stable-diffusion-3.5-medium" in hf_id.lower()
-            or "stable-diffusion-3.5-large" in hf_id.lower()
-            or "sd3-medium" in hf_id.lower()
-            or "sd3.5-medium" in hf_id.lower()
-            or "sd3.5-large" in hf_id.lower()
+            lambda hf_id: (
+                "stable-diffusion-3-medium" in hf_id.lower()
+                or "stable-diffusion-3.5-medium" in hf_id.lower()
+                or "stable-diffusion-3.5-large" in hf_id.lower()
+                or "sd3-medium" in hf_id.lower()
+                or "sd3.5-medium" in hf_id.lower()
+                or "sd3.5-large" in hf_id.lower()
+            )
         ],
     )
 
@@ -974,9 +986,11 @@ def _register_configs():
             "BestWishYsh/Helios-Base",
         ],
         model_detectors=[
-            lambda hf_id: "helios" in hf_id.lower()
-            and "mid" not in hf_id.lower()
-            and "distill" not in hf_id.lower()
+            lambda hf_id: (
+                "helios" in hf_id.lower()
+                and "mid" not in hf_id.lower()
+                and "distill" not in hf_id.lower()
+            )
         ],
     )
     register_configs(
@@ -991,6 +1005,20 @@ def _register_configs():
         pipeline_config_cls=HeliosDistilledConfig,
         hf_model_paths=[
             "BestWishYsh/Helios-Distilled",
+        ],
+    )
+
+    # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
+    register_configs(
+        sampling_param_cls=SanaWMSamplingParams,
+        pipeline_config_cls=SanaWMPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-WM_bidirectional",
+            "Efficient-Large-Model/SANA-WM_streaming",
+        ],
+        model_detectors=[
+            # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
+            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
         ],
     )
 
@@ -1022,7 +1050,13 @@ def _register_configs():
             "Efficient-Large-Model/Sana_1600M_512px_diffusers",
             "Efficient-Large-Model/Sana_600M_512px_diffusers",
         ],
-        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: (
+                "sana" in hf_id.lower()
+                and "sana-wm" not in hf_id.lower()
+                and "sana_wm" not in hf_id.lower()
+            )
+        ],
     )
 
     # FireRed-Image-Edit
@@ -1057,6 +1091,24 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "joyai-image-edit" in hf_id.lower(),
+        ],
+    )
+
+    # Ideogram 4
+    register_configs(
+        sampling_param_cls=Ideogram4SamplingParams,
+        pipeline_config_cls=Ideogram4PipelineConfig,
+        hf_model_paths=[
+            "ideogram-ai/ideogram-4-fp8",
+            "ideogram-ai/ideogram-4-nf4",
+            "Comfy-Org/Ideogram-4",
+        ],
+        model_detectors=[
+            lambda hf_id: "ideogram4pipeline" in hf_id.lower(),
+            lambda hf_id: "ideogram-4-fp8" in hf_id.lower(),
+            lambda hf_id: "ideogram-4-nf4" in hf_id.lower(),
+            lambda hf_id: "comfy-org/ideogram-4" in hf_id.lower(),
+            lambda hf_id: "comfy-org--ideogram-4" in hf_id.lower(),
         ],
     )
 

@@ -437,6 +437,65 @@ class TestMissingAndOptionalSlots(unittest.TestCase):
             )
         )
 
+    def test_extract_carries_none_for_absent_plain_slot(self):
+        # A plain copy slot absent this iter (mrope on a non-multimodal batch)
+        # must be carried as None, not exposed as the stale/zero buffer.
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot("input_ids", lambda bs, mt: (mt,), torch.int64, axis="tokens")
+        )
+        r.register_slot(
+            GraphSlot(
+                "mrope_positions",
+                lambda bs, mt: (3, mt),
+                torch.int64,
+                axis="tokens",
+                slice_fn=lambda buf, n: buf[:, :n],
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(2, dtype=torch.int64),
+            mrope_positions=None,  # non-multimodal: FB doesn't carry it
+        )
+        r.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
+        fb_view = r.extract_buffer(
+            padded_bs=2, padded_num_tokens=2, forward_batch_template=fb
+        )
+        # input_ids was present -> buffer-backed; mrope absent -> carried None.
+        self.assertEqual(
+            fb_view.input_ids.data_ptr(), r.get_slot("input_ids").buffer.data_ptr()
+        )
+        self.assertIsNone(fb_view.mrope_positions)
+
+    def test_extract_exposes_computed_slot_even_when_fb_field_none(self):
+        # A computed slot (copy_from_fb=False) is always exposed, even when its
+        # FB field is None — the None-skip carry applies only to plain copies.
+        def _fill_two(buf, fb, ctx):
+            buf.fill_(2)
+
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot(
+                "global_num_tokens_gpu",
+                lambda bs, mt: (1,),
+                torch.int32,
+                axis="none",
+                copy_from_fb=False,
+                post_fill=_fill_two,
+            )
+        )
+        fb = _MiniForwardBatch(batch_size=2, global_num_tokens_gpu=None)
+        r.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
+        fb_view = r.extract_buffer(
+            padded_bs=2, padded_num_tokens=2, forward_batch_template=fb
+        )
+        self.assertIsNotNone(fb_view.global_num_tokens_gpu)
+        self.assertEqual(
+            fb_view.global_num_tokens_gpu.data_ptr(),
+            r.get_slot("global_num_tokens_gpu").buffer.data_ptr(),
+        )
+
 
 class TestPostFillHook(unittest.TestCase):
     def test_post_fill_runs_after_copy(self):
@@ -888,6 +947,61 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         # local = clamp(100 - rank*4, 0, 4) = 4  (NOT the raw FB copy of 100).
         self.assertEqual(int(src.num_token_non_padded.item()), 4)
 
+    def test_register_global_num_tokens_false_carries_fb_values(self):
+        # register_global_num_tokens=False (eager) excludes the computed
+        # global_num_tokens_* slots so the batch's DP values are carried, not
+        # clobbered by the zero buffer extract_buffer would otherwise expose.
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            register_global_num_tokens=False,
+            share_pool=False,
+            source=None,
+        )
+        self.assertFalse(reg.has_slot("global_num_tokens_gpu"))
+        self.assertFalse(reg.has_slot("global_num_tokens_for_logprob_gpu"))
+
+        gnt = torch.tensor([37], dtype=torch.int32)
+        gntlp = torch.tensor([41], dtype=torch.int32)
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(2, dtype=torch.int64),
+            positions=torch.arange(2, dtype=torch.int64),
+            out_cache_loc=torch.arange(2, dtype=torch.int64),
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.full((2,), 5, dtype=torch.int32),
+            seq_lens_cpu=torch.full((2,), 5, dtype=torch.int32),
+            global_num_tokens_gpu=gnt,
+            global_num_tokens_for_logprob_gpu=gntlp,
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
+        fb_view = reg.extract_buffer(
+            padded_bs=2, padded_num_tokens=2, forward_batch_template=fb
+        )
+        # Carried from the batch (same tensors), not a zero registry buffer.
+        self.assertIs(fb_view.global_num_tokens_gpu, gnt)
+        self.assertIs(fb_view.global_num_tokens_for_logprob_gpu, gntlp)
+
+        # Default (graph path) still registers the computed slots.
+        reg2 = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            share_pool=False,
+            source=None,
+        )
+        self.assertTrue(reg2.has_slot("global_num_tokens_gpu"))
+        self.assertTrue(reg2.has_slot("global_num_tokens_for_logprob_gpu"))
+
     def test_source_with_ngram_registers_structured_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
@@ -1187,6 +1301,42 @@ class TestBuildPrefillRegistry(unittest.TestCase):
             torch.equal(ids[:3], torch.tensor([1, 2, 3], dtype=torch.int64))
         )
         self.assertTrue(torch.all(ids[3:8] == 0))
+
+    def test_register_input_embeds_false_keeps_mrope_carries_embeds(self):
+        # register_input_embeds=False (eager): mrope stays registered but
+        # input_embeds is carried from the FB (a read input), not a zero buffer.
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=True,
+            hidden_size=4,
+            embed_dtype=torch.float32,
+            register_input_embeds=False,
+            share_pool=False,
+            source=None,
+        )
+        self.assertTrue(reg.has_slot("mrope_positions"))
+        self.assertFalse(reg.has_slot("input_embeds"))
+        # extract_buffer carries the FB's real input_embeds (not a zero buffer).
+        embeds = torch.randn(3, 4)
+        fb = _MiniForwardBatch(
+            batch_size=1,
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
+            positions=torch.tensor([0, 1, 2], dtype=torch.int64),
+            out_cache_loc=torch.tensor([7, 8, 9], dtype=torch.int64),
+            input_embeds=embeds,
+        )
+        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=3)
+        fb_view = reg.extract_buffer(
+            padded_bs=1, padded_num_tokens=3, forward_batch_template=fb
+        )
+        self.assertIs(fb_view.input_embeds, embeds)
 
 
 class TestFillOncePolicy(unittest.TestCase):
