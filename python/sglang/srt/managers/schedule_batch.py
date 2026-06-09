@@ -1192,6 +1192,17 @@ class Req(ReqDllmMixin):
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
+    def _stop_match_tail_len(self, new_accepted_len: int) -> int:
+        max_len_tail_str = max(
+            self.sampling_params.stop_str_max_len + 1,
+            self.sampling_params.stop_regex_max_len + 1,
+        )
+        # Cover all newly accepted tokens so an early stop string is not missed
+        # when speculative decoding accepts multiple tokens per step.
+        return min(
+            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
+        )
+
     def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
         if (
@@ -1200,17 +1211,7 @@ class Req(ReqDllmMixin):
         ):
             return ""
 
-        max_len_tail_str = max(
-            self.sampling_params.stop_str_max_len + 1,
-            self.sampling_params.stop_regex_max_len + 1,
-        )
-
-        # Spec decode accepts multiple tokens per step; widen the window to cover
-        # the whole accepted chunk so a stop string landing mid-chunk (with more
-        # tokens accepted after it) is not pushed out of view.
-        tail_len = min(
-            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
-        )
+        tail_len = self._stop_match_tail_len(new_accepted_len)
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -1266,6 +1267,34 @@ class Req(ReqDllmMixin):
 
         return False
 
+    def _locate_str_stop_finished_len(
+        self,
+        new_accepted_len: int,
+        *,
+        stop_str: Optional[str] = None,
+        stop_regex: Optional[str] = None,
+    ) -> int:
+        """Map a matched stop string/regex to output_ids length (stop included)."""
+
+        def matched(text: str) -> bool:
+            if stop_str is not None:
+                return stop_str in text
+            return re.search(stop_regex, text) is not None
+
+        tail_len = self._stop_match_tail_len(new_accepted_len)
+        start = len(self.output_ids) - tail_len
+        token_window = self.output_ids[start:]
+
+        # Old prefixes were checked in the previous step.
+        for token_count in range(
+            max(1, len(token_window) - new_accepted_len + 1), len(token_window)
+        ):
+            if matched(self.tokenizer.decode(token_window[:token_count])):
+                return start + token_count
+
+        # The full tail window is already known to match by the caller.
+        return len(self.output_ids)
+
     def _check_str_based_finish(self, new_accepted_len: int = 1):
         if (
             len(self.sampling_params.stop_strs) > 0
@@ -1276,8 +1305,13 @@ class Req(ReqDllmMixin):
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in self.decoded_text:
+                    stop_str_in_tail = stop_str in tail_str
+                    if stop_str_in_tail or stop_str in self.decoded_text:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        if stop_str_in_tail:
+                            self.finished_len = self._locate_str_stop_finished_len(
+                                new_accepted_len, stop_str=stop_str
+                            )
                         return True
 
             # Check stop regex
@@ -1286,6 +1320,9 @@ class Req(ReqDllmMixin):
                     if re.search(stop_regex_str, tail_str):
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
+                        )
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_regex=stop_regex_str
                         )
                         return True
 
