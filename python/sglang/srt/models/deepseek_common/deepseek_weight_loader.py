@@ -238,18 +238,16 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    skip_unmaterialized_expert_param = False
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
-                        resolved_name = name.replace(weight_name, param_name)
-                        if resolved_name not in params_dict:
-                            skip_unmaterialized_expert_param = True
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
                             continue
-                        param = params_dict[resolved_name]
+                        param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
                             executor=executor,
@@ -259,7 +257,7 @@ class DeepseekV2WeightLoaderMixin:
                             func_args=(
                                 param,
                                 loaded_weight,
-                                resolved_name,
+                                name,
                             ),
                             func_kwargs={
                                 "shard_id": shard_id,
@@ -268,8 +266,6 @@ class DeepseekV2WeightLoaderMixin:
                         )
                         break
                     else:
-                        if skip_unmaterialized_expert_param:
-                            continue
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
