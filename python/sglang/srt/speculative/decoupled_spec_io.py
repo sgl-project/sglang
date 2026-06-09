@@ -181,12 +181,12 @@ class VerifierCommitSegment:
         catches zmq.error.ContextTerminated, so a raise here escapes _run and
         silently kills the drafter control thread. It then stops applying
         ALL requests' controls while the verifier keeps pushing.
-        
+
         TODO: 1. peer-data violations (non-contiguous / invalid len)
         should quarantine just that request (drop + add to close_keys), not
-        crash the thread. 2. phase 5.c will handle the drafter failure by 
+        crash the thread. 2. phase 5.c will handle the drafter failure by
         degrading the verifier into normal autoregressive decoding.
-        """ 
+        """
         if message.draft_key != self.draft_key:
             raise RuntimeError(
                 "Verifier commit segment received a commit for a different "
@@ -241,9 +241,7 @@ class VerifierCommitSegment:
             pre_verify_committed_len=int(self.pre_verify_committed_len),
             committed_token_ids=prefix_tokens,
         )
-        self.pre_verify_committed_len = (
-            int(self.pre_verify_committed_len) + num_tokens
-        )
+        self.pre_verify_committed_len = int(self.pre_verify_committed_len) + num_tokens
         self.committed_token_ids = remaining_tokens
         return prefix_segment
 
@@ -289,9 +287,7 @@ class DraftControlInbox:
         self.close_keys.add(draft_key)
         self.verifier_commit_segments.pop(draft_key, None)
         self.sync_messages = [
-            message
-            for message in self.sync_messages
-            if message.draft_key != draft_key
+            message for message in self.sync_messages if message.draft_key != draft_key
         ]
 
     def add_verify_commit_locked(self, message: VerifyCommit) -> None:
@@ -356,6 +352,7 @@ class ReadyDraftControls:
             + len(self.close_keys)
             + len(self.ready_commit_segments)
         )
+
 
 @dataclass
 class DraftMeshMessage:
