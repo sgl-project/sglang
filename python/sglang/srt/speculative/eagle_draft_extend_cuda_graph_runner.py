@@ -31,7 +31,6 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     is_hip,
-    is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -39,7 +38,6 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
-_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
