@@ -345,7 +345,10 @@ class Compressor(nn.Module):
     def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        ret = token_to_kv_pool.get_state_pool(self.layer_id, self.is_in_indexer)
+        if self.is_in_indexer:
+            ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
+        else:
+            ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
         assert isinstance(ret, CompressStatePool)
         return ret
 

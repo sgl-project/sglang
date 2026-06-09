@@ -1203,13 +1203,13 @@ class DeepseekV4AscendAttnBackend(
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
         # The c{4,128} kv pools are allocated with the global page_size (via
-        # DeepSeekV4SingleKVPool.kernel_page_size), so cmp_kv already shares
+        # NPUDeepSeekV4SingleKVPool.kernel_page_size), so cmp_kv already shares
         # ori_kv's page_size and the kernel consumes it directly — no reshape.
         # Assert the invariant rather than papering over a page-size mismatch.
         assert cmp_native_page_size == ori_page_size, (
             f"cmp page_size={cmp_native_page_size} != ori page_size={ori_page_size}; "
             "c{N}_kv_pool must be allocated with the global page_size on NPU "
-            "(see DeepSeekV4SingleKVPool.kernel_page_size)"
+            "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
         attn_kwargs = dict(
