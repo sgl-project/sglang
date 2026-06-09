@@ -2641,7 +2641,9 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            running_loras = {req.lora_id for req in self.running_batch.reqs}
+            running_loras = {
+                req.lora_id for req in self.running_batch.reqs if not req.finished()
+            }
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
 

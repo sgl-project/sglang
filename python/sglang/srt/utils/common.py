@@ -759,6 +759,8 @@ def get_dispatch_device_backend():
         dispatch_key = "CUDA"
     elif is_xpu():
         dispatch_key = "XPU"
+    elif is_npu():
+        dispatch_key = "NPU"
     else:
         raise RuntimeError("No supported accelerator (CUDA/XPU) available")
     return dispatch_key
