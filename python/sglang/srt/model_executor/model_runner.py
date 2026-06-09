@@ -566,6 +566,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.hisparse_coordinator = None
 
         self._linear_attn_registry_cache: Any = _UNSET
+        if not self.is_draft_worker:
+            self.use_linear_compact_spec_cache()
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)

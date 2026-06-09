@@ -620,8 +620,8 @@ class MambaMixer2(torch.nn.Module):
                     use_triton_causal_conv
                 ), "Speculative decoding requires use_triton_causal_conv=True for intermediate state support"
                 assert isinstance(
-                    layer_cache, MambaPool.SpeculativeState
-                ), "layer_cache must be SpeculativeState for speculative decoding"
+                    layer_cache, MambaPool.SpeculativeStateTypes
+                ), "layer_cache must be a speculative mamba state for speculative decoding"
                 draft_token_num = metadata.draft_token_num
                 self.intermediate_state_indices = torch.arange(
                     num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device

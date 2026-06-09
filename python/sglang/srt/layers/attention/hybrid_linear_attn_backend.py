@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
@@ -168,6 +168,18 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
+
+    def update_linear_compact_spec_cache_after_verify(
+        self,
+        mamba_caches: MambaPool.LinearCompactSpeculativeState,
+        state_indices_tensor: torch.Tensor,
+        accepted_steps: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ) -> None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support compact linear spec cache replay."
+        )
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -994,17 +1006,27 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Use fully fused kernel that handles masking internally
-        # This avoids separate nonzero() and index_select() calls
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        if isinstance(mamba_caches, MambaPool.LinearCompactSpeculativeState):
+            self.linear_attn_backend.update_linear_compact_spec_cache_after_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+        else:
+            intermediate_state_cache = mamba_caches.intermediate_ssm
+
+            # Use fully fused kernel that handles masking internally
+            # This avoids separate nonzero() and index_select() calls
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
@@ -1012,16 +1034,21 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
         )
 
-        # Track indices used for tracking mamba states for prefix cache
+        # Save tracked Mamba states for prefix cache.
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            # Use fully fused kernel for track scatter operations
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+            # Full-state caches already materialized per-step SSM states, so the
+            # tracked SSM snapshot is a direct scatter from intermediate_ssm.
+            # Compact caches save the same prefix-cache SSM snapshot by replaying
+            # K/V/decay into mamba_track_indices inside the linear backend hook,
+            # before accepted states overwrite the working request slots.
+            if not isinstance(mamba_caches, MambaPool.LinearCompactSpeculativeState):
+                fused_mamba_state_scatter_with_mask(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
             fused_mamba_state_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,

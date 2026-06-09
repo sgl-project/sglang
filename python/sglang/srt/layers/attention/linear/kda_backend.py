@@ -13,7 +13,11 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_linear_compact_state_replay_with_optional_track,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -172,6 +176,39 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+
+    def update_linear_compact_spec_cache_after_verify(
+        self,
+        mamba_caches: MambaPool.LinearCompactSpeculativeState,
+        state_indices_tensor: torch.Tensor,
+        accepted_steps: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ) -> None:
+        ssm_states = mamba_caches.temporal
+        # KDA writes normalized K and post-beta delta V into the generic compact
+        # K/V replay buffers.
+        k_norm = mamba_caches.intermediate_k
+        delta_v = mamba_caches.intermediate_v
+        decay = mamba_caches.intermediate_decay
+
+        # Replay once from the request's pre-verify recurrent state. When a
+        # prefix-cache track point is present, the replay kernel stores that
+        # snapshot before it stores the final accepted snapshot.
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+
+        fused_linear_compact_state_replay_with_optional_track(
+            ssm_states,
+            k_norm,
+            delta_v,
+            decay,
+            state_indices_tensor,
+            state_indices_tensor,
+            accepted_steps,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
 
     def forward_decode(
         self,

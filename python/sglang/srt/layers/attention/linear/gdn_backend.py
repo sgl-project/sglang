@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_linear_compact_state_replay_with_optional_track,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -282,6 +285,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        if model_runner.server_args.enable_linear_compact_spec_cache:
+            assert isinstance(
+                self.kernel_dispatcher.verify_kernel, TritonGDNKernel
+            ), "Compact linear spec cache requires Triton GDN target verify."
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -297,6 +304,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+
+    def update_linear_compact_spec_cache_after_verify(
+        self,
+        mamba_caches: MambaPool.LinearCompactSpeculativeState,
+        state_indices_tensor: torch.Tensor,
+        accepted_steps: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ) -> None:
+        ssm_states = mamba_caches.temporal
+        # GDN writes normalized K and post-beta delta V into the generic compact
+        # K/V replay buffers. Its scalar per-head decay is broadcast over K when
+        # cached, so it matches the compact replay kernel layout.
+        k_norm = mamba_caches.intermediate_k
+        delta_v = mamba_caches.intermediate_v
+        decay = mamba_caches.intermediate_decay
+
+        # Replay once from the request's pre-verify recurrent state. When a
+        # prefix-cache track point is present, the replay kernel stores that
+        # snapshot before it stores the final accepted snapshot.
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+
+        fused_linear_compact_state_replay_with_optional_track(
+            ssm_states,
+            k_norm,
+            delta_v,
+            decay,
+            state_indices_tensor,
+            state_indices_tensor,
+            accepted_steps,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
 
     def forward_decode(
         self,
@@ -398,8 +439,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeStateTypes)
+            use_compact_spec_cache = isinstance(
+                mamba_cache_params, MambaPool.LinearCompactSpeculativeState
+            )
+            intermediate_state_cache = (
+                None if use_compact_spec_cache else mamba_cache_params.intermediate_ssm
+            )
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
@@ -487,6 +533,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
+                compact_k_buffer=(
+                    mamba_cache_params.intermediate_k
+                    if use_compact_spec_cache
+                    else None
+                ),
+                compact_v_buffer=(
+                    mamba_cache_params.intermediate_v
+                    if use_compact_spec_cache
+                    else None
+                ),
+                compact_decay_buffer=(
+                    mamba_cache_params.intermediate_decay
+                    if use_compact_spec_cache
+                    else None
+                ),
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)

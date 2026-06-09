@@ -684,6 +684,7 @@ class ServerArgs:
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
+    enable_linear_compact_spec_cache: bool = False
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -3222,6 +3223,16 @@ class ServerArgs:
                 "SM100+ detected with mamba-ssm-dtype=bfloat16, "
                 "defaulting --linear-attn-decode-backend to flashinfer."
             )
+
+        if self.enable_linear_compact_spec_cache:
+            decode = self.linear_attn_decode_backend or self.linear_attn_backend
+            if decode != "triton":
+                logger.info(
+                    "--enable-linear-compact-spec-cache requires Triton GDN target "
+                    "verify; setting --linear-attn-decode-backend from %s to triton.",
+                    decode,
+                )
+            self.linear_attn_decode_backend = "triton"
 
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
@@ -6256,6 +6267,13 @@ class ServerArgs:
             default=ServerArgs.linear_attn_prefill_backend,
             help="Override the kernel backend for linear attention prefill/extend. "
             "If not set, uses --linear-attn-backend.",
+        )
+        parser.add_argument(
+            "--enable-linear-compact-spec-cache",
+            action="store_true",
+            default=ServerArgs.enable_linear_compact_spec_cache,
+            help="Enable compact K/V/decay replay cache for supported linear attention "
+            "backends during speculative target verification.",
         )
 
         # Hierarchical cache
