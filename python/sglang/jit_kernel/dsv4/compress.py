@@ -10,8 +10,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_cuda
 
 from .utils import make_name
+
+_is_cuda = is_cuda()
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -130,8 +133,14 @@ class CompressorDecodePlan(NamedTuple):
         swa_page_size: int,
         ring_size: int,
     ) -> CompressorDecodePlan:
-        module = _jit_compress_plan_module()
-        plan_d = module.plan_decode(
+        if _is_cuda:
+            module = _jit_compress_plan_module()
+            fn = module.plan_decode
+        else:
+            from .compress_plan_torch import plan_compress_decode
+
+            fn = plan_compress_decode
+        plan_d = fn(
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -148,8 +157,14 @@ class CompressorDecodePlan(NamedTuple):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> CompressorDecodePlan:
-        module = _jit_compress_plan_module()
-        plan_d = module.plan_decode_legacy(req_pool_indices, seq_lens, compress_ratio)
+        if _is_cuda:
+            module = _jit_compress_plan_module()
+            fn = module.plan_decode_legacy
+        else:
+            from .compress_plan_torch import plan_compress_decode_legacy
+
+            fn = plan_compress_decode_legacy
+        plan_d = fn(req_pool_indices, seq_lens, compress_ratio)
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
     @staticmethod
@@ -205,14 +220,20 @@ class CompressorPrefillPlan(NamedTuple):
         num_q_tokens: int,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
-        is_gpu_input = seq_lens.device.type == "cuda"
+        is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
             0 if is_gpu_input else num_q_tokens * _PREFILL_PLAN_BYTES,
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
-        module = _jit_compress_plan_module()
-        plan_c, plan_w = module.plan_prefill(
+        if is_gpu_input and _is_cuda:
+            module = _jit_compress_plan_module()
+            fn = module.plan_prefill
+        else:
+            from .compress_plan_torch import plan_compress_prefill
+
+            fn = plan_compress_prefill
+        plan_c, plan_w = fn(
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -227,8 +248,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c),
-            torch.from_dlpack(plan_w),
+            torch.from_dlpack(plan_c) if _is_cuda else plan_c,
+            torch.from_dlpack(plan_w) if _is_cuda else plan_w,
             pin_buffer,
         )
 
@@ -247,8 +268,14 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=True,
         )
-        module = _jit_compress_plan_module()
-        plan_c, plan_w = module.plan_prefill_legacy(
+        if _is_cuda:
+            module = _jit_compress_plan_module()
+            fn = module.plan_prefill_legacy
+        else:
+            from .compress_plan_torch import plan_compress_prefill_legacy
+
+            fn = plan_compress_prefill_legacy
+        plan_c, plan_w = fn(
             req_pool_indices,
             seq_lens,
             extend_lens,
@@ -259,8 +286,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c),
-            torch.from_dlpack(plan_w),
+            torch.from_dlpack(plan_c) if _is_cuda else plan_c,
+            torch.from_dlpack(plan_w) if _is_cuda else plan_w,
             pin_buffer,
         )
 
@@ -329,11 +356,30 @@ def compress_forward(
         assert compress_ratio == 128 and head_dim == 512
         module = _jit_compress_128_online_module(512)
     else:
-        dtype_in, dtype_out = kv_score_input.dtype, out.dtype
-        module = _jit_compress_module(
-            head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
-        )
-    fn = module.decode if plan.is_decode else module.prefill
+        if _is_cuda:
+            dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+            module = _jit_compress_module(head_dim, dtype_in, dtype_out, compress_ratio)
+        else:
+            if compress_ratio == 128:
+                from .flash_compress_128_torch import (
+                    flash_compress128_decode,
+                    flash_compress128_prefill,
+                )
+
+                flash_compress_decode = flash_compress128_decode
+                flash_compress_prefill = flash_compress128_prefill
+            else:
+                from .flash_compress_4_torch import (
+                    flash_compress4_decode,
+                    flash_compress4_prefill,
+                )
+
+                flash_compress_decode = flash_compress4_decode
+                flash_compress_prefill = flash_compress4_prefill
+    if _is_cuda:
+        fn = module.decode if plan.is_decode else module.prefill
+    else:
+        fn = flash_compress_decode if plan.is_decode else flash_compress_prefill
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
 
@@ -354,18 +400,35 @@ def compress_norm_rope_store(
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
-    )
-    fn = module.forward_fp4 if use_fp4 else module.forward
-    fn(
-        kv,
-        plan[1],
-        norm_weight,
-        norm_eps,
-        freq_cis,
-        out_loc,
-        kvcache,
-        plan.is_decode,
-        plan.compress_ratio,
-    )
+    if _is_cuda:
+        module = _jit_compress_norm_rope_module(
+            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+        )
+        fn = module.forward_fp4 if use_fp4 else module.forward
+        fn(
+            kv,
+            plan[1],
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+            plan.is_decode,
+            plan.compress_ratio,
+        )
+    else:
+        from .fused_norm_rope_v2_torch import compress_norm_rope_store_torch
+
+        compress_norm_rope_store_torch(
+            kv,
+            plan[1],
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+            plan.is_decode,
+            plan.compress_ratio,
+            page_size,
+            use_fp4,
+        )
