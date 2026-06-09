@@ -27,6 +27,8 @@ from sglang.jit_kernel.dsv4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
@@ -59,6 +61,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_dp_attention_enabled,
@@ -67,7 +70,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.mhc import mhc_fused_post_pre
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -81,6 +84,12 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -96,7 +105,8 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
-from sglang.srt.models.deepseek_common.utils import is_wint4afp8_or_wint4a16_config
+
+from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95, is_wint4afp8_or_wint4a16_config
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 
 if not _is_hip:
@@ -113,6 +123,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -151,6 +162,7 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         dtype_quant=torch.float8_e4m3fn,
         res1=None,
         output_unquantized_inp1=True,
+        transpose_scale=_use_aiter_bpreshuffle_gfx95,
     )
     return x_quant, x_bf16
 
@@ -187,6 +199,57 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def deepseek_v4_attention_with_output(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    query = query[:real_num_tokens]
+    key_value = key_value[:real_num_tokens]
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+
+    attn_backend = get_attn_backend()
+    try:
+        ret = attn_backend.forward(
+            q=query,
+            k=key_value,
+            v=key_value,
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            compress_ratio=compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=save_kv_cache,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+    assert (
+        output[:real_num_tokens].numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+
+    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    return
+
+
+bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
+    deepseek_v4_attention_with_output
+)
 
 
 @triton.jit
@@ -472,6 +535,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        attn_backend,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
@@ -488,7 +552,7 @@ class MQALayer(nn.Module):
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
-            raw_loc=forward_batch.out_cache_loc,
+            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
             kv=kv,
             kv_weight=self.kv_norm.weight.data,
             eps=self.eps,
@@ -563,7 +627,9 @@ class MQALayer(nn.Module):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
             # Fused norm + rope + cache write -- no bf16 KV intermediate.
-            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            self._compute_kv_to_cache(
+                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+            )
 
         del qkv_a
 
@@ -647,9 +713,7 @@ class MQALayer(nn.Module):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = token_to_kv_pool.get_cached_swa_loc(
-                forward_batch.out_cache_loc, self.layer_id
-            )
+            swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
             swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
@@ -673,7 +737,9 @@ class MQALayer(nn.Module):
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
-            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            self._compute_kv_to_cache(
+                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+            )
 
         del qkv_a
 
@@ -737,9 +803,7 @@ class MQALayer(nn.Module):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = token_to_kv_pool.get_cached_swa_loc(
-                forward_batch.out_cache_loc, self.layer_id
-            )
+            swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
             swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
@@ -791,7 +855,7 @@ class MQALayer(nn.Module):
                 )
             else:
                 self._compute_kv_to_cache(
-                    x_linear, positions, forward_batch, qkv_a=qkv_a
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
                 )
                 kv = None
 
@@ -886,17 +950,33 @@ class MQALayer(nn.Module):
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
+        attn_q = q_padded if q_padded is not None else q
         attn_k = kv if kv is not None else q
-        o = attn_backend.forward(
-            q=q_padded if q_padded is not None else q,
-            k=attn_k,
-            v=attn_k,
-            layer=self.attn_mqa,
-            forward_batch=forward_batch,
-            compress_ratio=self.compress_ratio,
-            attn_sink=self.attn_sink,
-            save_kv_cache=False,
-        )
+        save_kv_cache = False
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            o = attn_q.new_empty(
+                (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+            )
+            bcg_deepseek_v4_attention_with_output(
+                attn_q,
+                attn_k,
+                o,
+                self.attn_mqa.layer_id,
+                self.compress_ratio,
+                self.attn_sink,
+                save_kv_cache,
+            )
+        else:
+            o = attn_backend.forward(
+                q=attn_q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=self.attn_sink,
+                save_kv_cache=save_kv_cache,
+            )
         o = o[:, tp_slice, :]
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
@@ -1431,7 +1511,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            if should_use_dp_reduce_scatterv():
+                get_tp_group().reduce_scatterv(
+                    global_hidden_states,
+                    output=hidden_states,
+                    sizes=get_dp_global_num_tokens(),
+                )
+            else:
+                dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
@@ -1741,7 +1828,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
+                    core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)

@@ -249,12 +249,21 @@ class TextEncodingStage(ConditionEncodingStage):
     ) -> None:
         assert batch.negative_prompt_embeds is not None
 
-        # a single negative prompt can be shared across positive prompts
-        target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
+        # a single negative prompt can be shared across positive prompts.
+        # 2-D embeddings (seq × dim, e.g. Z-Image single-prompt) carry no explicit
+        # batch dimension; treat them as batch=1.
+        target_batch_sizes = [
+            1 if pe.ndim == 2 else pe.shape[0] for pe in prompt_embeds_list
+        ]
 
         def align_negative_batch_dim(
             tensor: torch.Tensor, target_batch: int, name: str
         ) -> torch.Tensor:
+            # 2-D: seq × dim with no batch dim — implicitly batch=1.
+            if tensor.ndim == 2:
+                if target_batch > 1:
+                    return tensor.unsqueeze(0).repeat(target_batch, 1, 1)
+                return tensor
             if tensor.shape[0] == target_batch:
                 return tensor
             if tensor.shape[0] == 1 and target_batch > 1:
