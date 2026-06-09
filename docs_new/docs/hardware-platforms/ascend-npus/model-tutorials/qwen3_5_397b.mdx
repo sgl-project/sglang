@@ -35,10 +35,8 @@ use v0.5.10 or a later version.
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 | Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                                        |
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 ## Prerequisites
 
@@ -67,16 +65,13 @@ online platform. You can directly pull it.
 We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -108,6 +103,12 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
   </Tab>
 </Tabs>
 
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
 ## Online service deployment
 
 ### Single-node online deployment
@@ -116,6 +117,11 @@ Single-node deployment completes both prefill and decode within the same node (P
 with limited hardware resources. The following command is based on the W8A8 quantized model.
 
 ```bash Launch server
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#============================================================
+
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -154,7 +160,7 @@ export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 export ZBAL_ENABLE_GRAPH=1
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 python3 -m sglang.launch_server \
 --model-path $MODEL_PATH \
@@ -178,9 +184,7 @@ python3 -m sglang.launch_server \
 --enable-prefill-delayer --prefill-delayer-max-delay-passes 100
 ```
 
-<Tip>
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
-</Tip>
 
 ## Functional verification
 
@@ -227,9 +231,7 @@ on the Best Practice page.
 | Low latency (3.5K+1.5K)       | PD mixed        | 8 (A3)     | W4A8           |
 | High throughput (3.5K+1.5K)   | PD mixed        | 8 (A3)     | W4A8           |
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 ## Performance tuning
 

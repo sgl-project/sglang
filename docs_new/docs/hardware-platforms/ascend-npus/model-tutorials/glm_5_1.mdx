@@ -31,10 +31,8 @@ v0.5.10 or a later version.
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                      |
 | Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                            |
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 ## Prerequisites
 
@@ -63,16 +61,13 @@ online platform. You can directly pull it.
 We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -107,7 +102,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -131,13 +126,17 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
   </Tab>
 </Tabs>
 
-<Note>
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
 Before running best practices, update transformers to version 5.3.0:
 
 ```bash
 pip install transformers==5.3.0
 ```
-</Note>
 
 ## Online service deployment
 
@@ -145,6 +144,11 @@ pip install transformers==5.3.0
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. The following command is based on the W4A8 quantized model.
+
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#============================================================
 
 ```bash Launch server
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -171,7 +175,7 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -188,9 +192,7 @@ python3 -m sglang.launch_server \
         --moe-a2a-backend deepep --deepep-mode auto
 ```
 
-<Tip>
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
-</Tip>
 
 ### Multi-node deployment
 
@@ -233,7 +235,7 @@ export GLOO_SOCKET_IFNAME=xxx
 P_IP=('your ip1' 'your ip2')
 P_MASTER="${P_IP[0]}:your port"
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -305,9 +307,7 @@ For complete deployment examples and benchmark commands, see the
 | Single-node deployment        | PD mixed            | 16 (A3)     | W4A8 INT8       |
 | Multi-node deployment         | TP across nodes     | 32 (A3)     | BF16            |
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 ## Performance tuning
 

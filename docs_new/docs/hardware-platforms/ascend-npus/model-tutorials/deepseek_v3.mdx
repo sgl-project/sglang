@@ -34,10 +34,8 @@ v0.5.10 or a later version.
 | MLAPO                         | `export SGLANG_NPU_USE_MLAPO=1`                                                               |
 | NZ Weight Format              | `export SGLANG_USE_FIA_NZ=1`                                                                  |
 
-<Note>
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
-</Note>
 
 ## Prerequisites
 
@@ -67,16 +65,13 @@ online platform. You can directly pull it.
 We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
-container, for example: `-v /path/to/models:/models`.
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -111,7 +106,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -135,6 +130,12 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
   </Tab>
 </Tabs>
 
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
 ## Online service deployment
 
 ### Single-node online deployment
@@ -143,6 +144,11 @@ Single-node deployment completes both prefill and decode within the same node (P
 with limited hardware resources. The following command is based on the BF16 model.
 
 ```bash Launch server
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#============================================================
+
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
@@ -155,7 +161,7 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
@@ -184,9 +190,7 @@ python3 -m sglang.launch_server \
     --dtype bfloat16
 ```
 
-<Tip>
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
-</Tip>
 
 ### Multi-node PD disaggregation deployment
 
@@ -200,16 +204,26 @@ The prefill node and decode node will each run on one Atlas 800I A3.
 1. Run the following command on both prefill and decode nodes.
 
 ```bash Prefill node
+#============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port (e.g., tcp://192.168.1.1:24667)
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME (decode section): network interface name for HCCL
+#   GLOO_SOCKET_IFNAME (decode section): network interface name for Gloo
+#============================================================
+
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24667"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24667"
 
-P_IP=('your prefill ip1')
+P_IP=(<your prefill ip>)
 
-D_IP=('your decode ip1')
+D_IP=(<your decode ip>)
 
-MODEL_PATH=xxx
+MODEL_PATH=/path/to/model-weights
 
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
@@ -275,11 +289,17 @@ done
 2. Launch the SGLang Router (on any reachable node):
 
 ```bash Router
+#============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+#============================================================
+
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8996 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8996 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688
 ```
@@ -340,9 +360,7 @@ examples.
 | Standard disaggregation | PD disaggregation | 32 (A3)    | W4A8           |
 | Large-scale deployment  | PD disaggregation | 64 (A3)    | W8A8           |
 
-<Note>
 `Total NPUs` indicates the total number of NPUs used across all nodes.
-</Note>
 
 ## Performance tuning
 
