@@ -58,7 +58,7 @@ ${PIP_INSTALL} ${PTA_URL}
 ${UV_PIP_INSTALL} memfabric-zbal==1.1.1
 
 ### Install Triton-Ascend
-${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn
+${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host mirrors.huaweicloud.com
 
 
 ### Install sgl-kernel-npu
