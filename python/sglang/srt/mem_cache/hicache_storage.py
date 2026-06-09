@@ -14,6 +14,9 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+if TYPE_CHECKING:
+    from sglang.srt.observability.metrics_collector import StorageMetrics
+
 logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
@@ -142,10 +145,14 @@ class HiCacheStorage(ABC):
     """
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
-    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
         self.mem_pool_host = mem_pool_host
 
-    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+    def register_mem_host_pool_v2(
+        self,
+        host_pool: HostKVCache,
+        host_pool_name: PoolName,
+    ) -> None:
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
@@ -215,7 +222,7 @@ class HiCacheStorage(ABC):
         Retrieve values for multiple keys.
         Returns a list of booleans indicating success for each key.
         """
-        pass
+        raise NotImplementedError()
 
     def batch_set_v1(
         self,
@@ -227,14 +234,14 @@ class HiCacheStorage(ABC):
         Store multiple key-value pairs.
         Returns a list of booleans indicating success for each key.
         """
-        pass
+        raise NotImplementedError()
 
     @abstractmethod
     def get(
         self,
         key: str,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
+        target_location: Optional[torch.Tensor | int] = None,
+        target_sizes: Optional[int] = None,
     ) -> torch.Tensor | None:
         """
         Retrieve the value associated with the given key.
@@ -247,8 +254,8 @@ class HiCacheStorage(ABC):
     def batch_get(
         self,
         keys: List[str],
-        target_locations: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
+        target_locations: Optional[List[torch.Tensor] | List[int]] = None,
+        target_sizes: Optional[List[int]] = None,
     ) -> List[torch.Tensor | None] | int:
         """
         Retrieve values for multiple keys.
@@ -260,7 +267,7 @@ class HiCacheStorage(ABC):
     def set(
         self,
         key: str,
-        value: Optional[Any] = None,
+        value: torch.Tensor,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
@@ -275,7 +282,7 @@ class HiCacheStorage(ABC):
     def batch_set(
         self,
         keys: List[str],
-        values: Optional[Any] = None,
+        values: List[torch.Tensor],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
@@ -310,7 +317,7 @@ class HiCacheStorage(ABC):
     def clear(self) -> None:
         pass
 
-    def get_stats(self):
+    def get_stats(self) -> Optional[StorageMetrics]:
         return None
 
 
@@ -358,9 +365,10 @@ class HiCacheFile(HiCacheStorage):
     def get(
         self,
         key: str,
-        target_location: torch.Tensor,
-        target_sizes: Optional[Any] = None,
+        target_location: Optional[torch.Tensor | int] = None,
+        target_sizes: Optional[int] = None,
     ) -> torch.Tensor | None:
+        assert isinstance(target_location, torch.Tensor)
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
@@ -377,8 +385,8 @@ class HiCacheFile(HiCacheStorage):
     def batch_get(
         self,
         keys: List[str],
-        target_locations: List[torch.Tensor],
-        target_sizes: Optional[Any] = None,
+        target_locations: Optional[List[torch.Tensor] | List[int]] = None,
+        target_sizes: Optional[List[int]] = None,
     ) -> List[torch.Tensor | None]:
         return [
             self.get(key, target_location)
@@ -390,7 +398,7 @@ class HiCacheFile(HiCacheStorage):
     def set(
         self,
         key: str,
-        value: Optional[Any] = None,
+        value: torch.Tensor,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
@@ -410,7 +418,7 @@ class HiCacheFile(HiCacheStorage):
     def batch_set(
         self,
         keys: List[str],
-        values: Optional[Any] = None,
+        values: List[torch.Tensor],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
@@ -551,14 +559,13 @@ class HiCacheFile(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, self._write_page)
 
-    def clear(self) -> bool:
+    def clear(self) -> None:
         try:
             for filename in os.listdir(self.file_path):
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
             logger.info("Cleared all entries in HiCacheFile storage.")
-            return True
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
-            return False
+        return
