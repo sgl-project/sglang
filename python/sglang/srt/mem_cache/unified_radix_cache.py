@@ -726,18 +726,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         assert (
             req.extend_range is None or req.extend_range.end == req.kv_committed_len
         ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
-        read_len = req.kv_committed_len
-        token_ids = req.get_full_untruncated_fill_ids()[:read_len]
+        token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :read_len
+                req.req_pool_idx, : len(token_ids)
             ]
             req.prefix_indices = kv_indices
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :read_len
+            req.req_pool_idx, : len(token_ids)
         ]
 
         # components prepare insert data + return effective cache_len

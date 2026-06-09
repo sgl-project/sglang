@@ -470,9 +470,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         assert (
             req.extend_range is None or req.extend_range.end == req.kv_committed_len
         ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
-        read_len = req.kv_committed_len
-        token_ids = req.get_full_untruncated_fill_ids()[:read_len]
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :read_len]
+        token_ids = req.get_full_untruncated_fill_ids()[: req.kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
