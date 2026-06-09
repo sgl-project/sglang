@@ -7,16 +7,13 @@ from typing import Any, Optional
 
 import torch
 
-# NPU activation implementations (added NPUSwigluDeepEPKernel)
-from sglang.srt.hardware_backend.npu.moe.activation import (
-    NPUSwigluDeepEPKernel,  # <-- added
-)
 from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUGeluAndMul,
     NPUSwiglu,
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
+    NPUSwigluDeepEPKernel,
 )
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8MoEMethod,
@@ -31,16 +28,14 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.token_dispatcher import DeepEPLLDispatchOutput  # <-- added
-from sglang.srt.layers.moe.token_dispatcher import (
-    DeepEPNormalDispatchOutput,  # <-- added
-)
-from sglang.srt.layers.moe.token_dispatcher import (
-    DeepEPLLCombineInput,
-    DeepEPNormalCombineInput,
-    TorchNpuCombineInput,
-    TorchNpuDispatchOutput,
-)
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
+    )
+
 from sglang.srt.layers.moe.utils import (  # fixed import
     MoeRunnerBackend,
     get_moe_a2a_backend,
