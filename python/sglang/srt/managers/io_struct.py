@@ -1522,7 +1522,7 @@ class UpdateWeightFromDiskReqOutput(BaseReqIpc, kw_only=True):
 
 class UpdateWeightsFromDistributedReqInput(BaseReqIpc, kw_only=True):
     names: List[str]
-    dtypes: List[bytes]
+    dtypes: List[str]
     shapes: List[List[int]]
     # The group name
     group_name: str = "weight_update_group"
