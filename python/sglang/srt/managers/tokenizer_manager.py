@@ -1003,6 +1003,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+            if (
+                obj.return_logprob
+                and (self.server_args.speculative_algorithm or "").upper() == "NGRAM"
+            ):
+                raise ValueError(
+                    "Ngram speculative decoding does not support logprob yet. "
+                    "Please remove return_logprob or launch the server without "
+                    "ngram speculative decoding."
+                )
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
