@@ -5,9 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
-    AWQMarlinLinearKernel,
-)
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.marlin_utils import verify_marlin_supports_shape
 
@@ -22,7 +19,14 @@ __all__ = ["AWQMarlinLinearScheme"]
 class AWQMarlinLinearScheme(AWQLinearSchemeBase):
     def __init__(self, quant_config: "AWQMarlinConfig"):
         self.quant_config = quant_config
-        self.kernel = AWQMarlinLinearKernel(quant_config)
+        self.kernel = self._init_kernel(quant_config)
+
+    def _init_kernel(self, quant_config: "AWQMarlinConfig"):
+        from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
+            AWQMarlinLinearKernel,
+        )
+
+        return AWQMarlinLinearKernel(quant_config)
 
     def create_weights(
         self,
