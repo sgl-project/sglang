@@ -469,6 +469,48 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.decode_attention_backend, "triton")
 
 
+class TestCpuOffloadDisablesCudaGraph(unittest.TestCase):
+    def _make_args(self, **overrides) -> ServerArgs:
+        # "dummy" model_path short-circuits __post_init__, so we construct
+        # with dummy and then manually set fields + invoke the handler.
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_cuda_graph_disabled_when_cpu_offload_set(self, mock_model_config):
+        mock_model_config.return_value = MagicMock(
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+        )
+        args = self._make_args(cpu_offload_gb=1)
+        args._handle_piecewise_cuda_graph()
+        self.assertTrue(args.disable_cuda_graph)
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_cuda_graph_not_disabled_when_cpu_offload_zero(self, mock_model_config):
+        mock_model_config.return_value = MagicMock(
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+        )
+        args = self._make_args(cpu_offload_gb=0)
+        args._handle_piecewise_cuda_graph()
+        self.assertFalse(args.disable_cuda_graph)
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_piecewise_cuda_graph_also_disabled_when_cpu_offload_set(
+        self, mock_model_config
+    ):
+        mock_model_config.return_value = MagicMock(
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+        )
+        args = self._make_args(cpu_offload_gb=1)
+        args._handle_piecewise_cuda_graph()
+        self.assertTrue(args.disable_piecewise_cuda_graph)
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def test_prepare_server_args_parses_external_sam_args(self):
         server_args = prepare_server_args(

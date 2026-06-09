@@ -1387,6 +1387,14 @@ class ServerArgs:
         # 11. CPU offload (breaks dynamo)
         if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
             self.disable_piecewise_cuda_graph = True
+        # CPU offload forward hook swaps param.data, which is incompatible with
+        # regular CUDA graph capture (graph bakes in stale memory addresses).
+        if self.cpu_offload_gb > 0:
+            if not self.disable_cuda_graph:
+                logger.warning(
+                    "CUDA graph is disabled because --cpu-offload-gb is set."
+                )
+                self.disable_cuda_graph = True
         # 12. Deterministic inference
         if self.enable_deterministic_inference:
             self.disable_piecewise_cuda_graph = True
