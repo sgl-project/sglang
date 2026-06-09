@@ -469,12 +469,6 @@ def draft_tp_context(tp_group: GroupCoordinator):
 def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
-
-    Mirrors ``ModelRunner.forward``'s step-span gating: a ``record_function``
-    range is only emitted while a profiler is active, so the stage shows up in
-    torch-profiler chrome traces and -- when the run is wrapped in
-    ``torch.autograd.profiler.emit_nvtx`` -- as an nsys NVTX range, while
-    staying a near-zero-overhead no-op when profiling is off.
     """
     if torch.autograd._profiler_enabled():
         return torch.profiler.record_function(name)
