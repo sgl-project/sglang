@@ -1545,8 +1545,6 @@ def compute_extend_logprob_start_len(
     extend_len: int,
     full_untruncated_fill_len: int,
 ) -> int:
-    # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
-    #
     # Key variables:
     # - logprob_start_len: Absolute position in full sequence where logprob computation begins
     # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
