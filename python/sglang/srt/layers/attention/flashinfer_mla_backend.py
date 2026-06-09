@@ -454,6 +454,24 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             "kv_indices": self.cuda_graph_kv_indices,
         }
 
+        # Pinned host buffers for the fast verify plan: target-verify cuda-graph
+        # replay passes these into flashinfer's MLA plan() so it skips the 3
+        # blocking DtoH copies at mla/_core.py:839-841 (which serialize the host
+        # and break overlap scheduling). Pinned so the in-plan HtoD buffer copies
+        # stay async and never stall the host on GPU compute. Only the
+        # prefill-capable (target) backend runs verify; draft multistep backends
+        # are skip_prefill and never use these.
+        if not self.skip_prefill:
+            self.cuda_graph_verify_qo_indptr_cpu = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            self.cuda_graph_verify_kv_indptr_cpu = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            self.cuda_graph_verify_kv_len_arr_cpu = torch.zeros(
+                (max_bs,), dtype=torch.int32, device="cpu", pin_memory=True
+            )
+
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -492,6 +510,34 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 **self.fast_decode_kwargs,
             )
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            fast_verify_kwargs = {}
+            # Fast verify plan (target-verify only): derive the host-side
+            # indptr/len arrays from seq_lens_cpu (already resident) + the
+            # constant draft_token_num, so flashinfer's MLA plan() skips the 3
+            # blocking DtoH copies at mla/_core.py:839-841. qo_indptr is the
+            # fixed tree shape; kv_indptr/kv_len_arr come from seq_lens; both
+            # match what the GPU path produces. kv_indices stays on GPU (plan()
+            # never copies it to host). Draft-extend keeps the stock GPU path
+            # (its qo_indptr depends on per-request accept lengths).
+            if (
+                forward_mode.is_target_verify()
+                and seq_lens_cpu is not None
+                and spec_info is not None
+                and getattr(spec_info, "draft_token_num", None) is not None
+            ):
+                ndt = spec_info.draft_token_num
+                self.cuda_graph_verify_qo_indptr_cpu[: bs + 1] = torch.arange(
+                    0, (bs + 1) * ndt, ndt, dtype=torch.int32
+                )
+                self.cuda_graph_verify_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
+                self.cuda_graph_verify_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    self.cuda_graph_verify_kv_len_arr_cpu[:bs], dim=0
+                )
+                fast_verify_kwargs = {
+                    "qo_indptr_cpu": self.cuda_graph_verify_qo_indptr_cpu[: bs + 1],
+                    "kv_indptr_cpu": self.cuda_graph_verify_kv_indptr_cpu[: bs + 1],
+                    "kv_len_arr_cpu": self.cuda_graph_verify_kv_len_arr_cpu[:bs],
+                }
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -500,6 +546,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 spec_info=spec_info,
+                **fast_verify_kwargs,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -776,13 +823,16 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
     def update(
         self,
-        req_pool_indices: torch.Tnesor,
+        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        qo_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_len_arr_cpu: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -803,6 +853,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
             self.qo_indptr,
             use_ragged,
             spec_info,
+            qo_indptr_cpu=qo_indptr_cpu,
+            kv_indptr_cpu=kv_indptr_cpu,
+            kv_len_arr_cpu=kv_len_arr_cpu,
         )
 
     def call_begin_forward(
@@ -818,6 +871,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        qo_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_len_arr_cpu: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -868,13 +924,23 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 causal=True,
             )
         else:
-            # mla paged prefill
-            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+            # mla paged prefill. When host-side arrays are supplied (fast verify
+            # plan for target-verify cuda-graph replay), pass them so flashinfer's
+            # plan() skips the 3 blocking DtoH copies at mla/_core.py:839-841.
+            # kv_indices stays on GPU (plan() keeps it on device); only
+            # qo_indptr/kv_indptr/kv_len_arr move to host.
+            plan_qo_indptr = qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu
+            plan_kv_indptr = kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu
+            plan_kv_len_arr = (
+                kv_indptr[1:] - kv_indptr[:-1]
+                if kv_len_arr_cpu is None
+                else kv_len_arr_cpu
+            )
             wrapper_paged.plan(
-                qo_indptr,
-                kv_indptr,
+                plan_qo_indptr,
+                plan_kv_indptr,
                 kv_indices,
-                kv_len_arr,
+                plan_kv_len_arr,
                 self.num_local_heads,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
