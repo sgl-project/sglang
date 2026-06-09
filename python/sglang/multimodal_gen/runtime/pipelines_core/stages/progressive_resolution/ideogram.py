@@ -283,6 +283,20 @@ class Ideogram4ProgressiveDenoisingStage(
         )
 
     # ------------------------------------------------------------------
+    # Denoising-loop preparation
+    # ------------------------------------------------------------------
+
+    def _prepare_denoising_loop(
+        self, batch: Req, server_args: ServerArgs
+    ) -> DenoisingContext:
+        ctx = Ideogram4DenoisingStage._prepare_denoising_loop(self, batch, server_args)
+        # ProgressiveDenoisingStage.forward() reads scheduler.sigmas to locate
+        # stage-transition step indices.  Ideogram4Scheduler has no .sigmas
+        # attribute — expose the logit-normal schedule_values tensor instead.
+        ctx.scheduler.sigmas = ctx.extra["ideogram4_schedule_values"]
+        return ctx
+
+    # ------------------------------------------------------------------
     # Cache-DiT refresh override
     # ------------------------------------------------------------------
 
