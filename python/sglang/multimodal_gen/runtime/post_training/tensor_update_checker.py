@@ -8,7 +8,7 @@ from collections.abc import Iterable
 import torch
 from torch.distributed.tensor import DTensor
 
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     iter_materialized_weights,
 )
 

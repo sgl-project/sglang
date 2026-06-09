@@ -4,15 +4,15 @@ from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    iter_materialized_weights,
+)
 from sglang.multimodal_gen.runtime.post_training.tensor_update_checker import (
     TensorUpdateChecker,
 )
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
-)
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
-    iter_materialized_weights,
 )
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
