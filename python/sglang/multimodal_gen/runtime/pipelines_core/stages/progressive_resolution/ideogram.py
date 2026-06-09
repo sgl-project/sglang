@@ -408,6 +408,25 @@ class Ideogram4ProgressiveDenoisingStage(
         return ctx
 
     # ------------------------------------------------------------------
+    # Denoising step override
+    # ------------------------------------------------------------------
+
+    def _run_denoising_step(
+        self,
+        ctx: DenoisingContext,
+        step,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        # Ideogram4DenoisingStage uses step.t_int as a step index [0..N-1] into
+        # schedule_values.  In dct_rewind mode the progressive base patches
+        # ctx.timesteps[transition_step] = t_eff * 1000 (a FLUX-convention noise
+        # level), which corrupts t_int to ~950 and causes an IndexError.
+        # step.step_index is always the raw loop counter and is safe to use.
+        step.t_int = step.step_index
+        Ideogram4DenoisingStage._run_denoising_step(self, ctx, step, batch, server_args)
+
+    # ------------------------------------------------------------------
     # Cache-DiT refresh override
     # ------------------------------------------------------------------
 
