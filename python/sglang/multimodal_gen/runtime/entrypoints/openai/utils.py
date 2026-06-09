@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -165,7 +166,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
 
 async def save_image_to_path(
-    image: Union[UploadFile, str],
+    image: Union[UploadFile, bytes, str],
     target_path: str,
     *,
     prefer_remote_source: bool = False,
@@ -179,9 +180,27 @@ async def save_image_to_path(
 
 
 # Helpers
-async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
+async def _save_upload_to_path(
+    upload: Union[UploadFile, bytes], target_path: str
+) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    content = await upload.read()
+    if isinstance(upload, bytes):
+        content = upload
+    elif isinstance(upload, (bytearray, memoryview)):
+        content = bytes(upload)
+    else:
+        read = getattr(upload, "read", None)
+        if not callable(read):
+            raise TypeError(f"Unsupported image upload type: {type(upload).__name__}")
+        content = read()
+        if inspect.isawaitable(content):
+            content = await content
+        if isinstance(content, (bytearray, memoryview)):
+            content = bytes(content)
+        if not isinstance(content, bytes):
+            raise TypeError(
+                f"Image upload read() returned {type(content).__name__}, expected bytes"
+            )
     with open(target_path, "wb") as f:
         f.write(content)
     return target_path
@@ -353,15 +372,20 @@ async def process_generation_batch(
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
-        if result.output is None and result.output_file_paths is None:
+        if (
+            result.output is None
+            and result.output_file_paths is None
+            and result.raw_frame_batches is None
+        ):
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
 
+        save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
-        else:
+        elif result.output is not None:
             num_outputs = len(result.output)
             save_file_path_list = save_outputs(
                 result.output,

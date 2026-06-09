@@ -36,10 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.layers.dp_attention import (
-    set_dp_buffer_len,
-    set_is_extend_in_batch,
-)
+from sglang.srt.layers.dp_attention import set_dp_buffer_len, set_is_extend_in_batch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
@@ -123,6 +120,10 @@ class BreakableCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
+        self.use_captured_attn_metadata = (
+            model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.attn_metadata_buffers = {} if self.use_captured_attn_metadata else None
 
         # Resolve the inner transformer-stack module (the same boundary PCG draws
         # via patch_model). At replay we monkey-patch this module's forward with
@@ -167,32 +168,26 @@ class BreakableCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
+    def _has_inactive_dp_rank(self, forward_batch: "ForwardBatch") -> bool:
+        global_num_tokens = forward_batch.global_num_tokens_cpu
+        if global_num_tokens is None:
+            return False
+
+        # DSV4 DP attention / DeepEP collectives need every DP rank to enter
+        # the same replay path. Sparse-DP batches fall back to eager to avoid
+        # hanging ranks that have zero local tokens.
+        return len(global_num_tokens) > 1 and any(
+            int(num_tokens) == 0 for num_tokens in global_num_tokens
+        )
+
     def _init_buffers(self, model_runner):
         """Initialize input buffers."""
-        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
-            PrefillInputBuffers,
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
         )
         from sglang.srt.utils import is_npu
 
-        with torch.device(self.device):
-            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,),
-                dtype=torch.int64 if not is_npu() else torch.int32,
-            )
-            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            if self.is_multimodal:
-                input_embeds = torch.zeros(
-                    (self.max_num_tokens, model_runner.model_config.hidden_size),
-                    dtype=model_runner.dtype,
-                )
-                mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
-            else:
-                input_embeds = None
-                mrope_positions = None
-
+        cache_loc_dtype = torch.int64 if not is_npu() else torch.int32
         if model_runner.is_draft_worker:
             from sglang.srt.speculative.eagle_utils import get_draft_hidden_dim
 
@@ -203,17 +198,19 @@ class BreakableCudaGraphRunner:
                 device=self.device,
             )
 
-        self.buffers = PrefillInputBuffers(
-            input_ids=input_ids,
-            out_cache_loc=out_cache_loc,
-            mamba_track_indices=None,
-            mamba_track_mask=None,
-            mamba_track_seqlens=None,
-            positions=positions,
-            input_embeds=input_embeds,
-            mrope_positions=mrope_positions,
+        # Registry owns (allocates + pools) the token-axis input buffers.
+        self.buffer_registry = build_prefill_registry(
+            device=self.device,
+            max_bs=1,
+            max_num_token=self.max_num_tokens,
+            cache_loc_dtype=cache_loc_dtype,
+            is_multimodal=self.is_multimodal,
+            hidden_size=model_runner.model_config.hidden_size,
+            embed_dtype=model_runner.dtype,
+            enable_mamba_track=False,
+            share_pool=not is_npu(),
+            source=None,
         )
-        self.buffers.share_buffers()
 
     @torch.no_grad()
     def _run_forward(self, forward_batch, num_tokens):
@@ -271,8 +268,12 @@ class BreakableCudaGraphRunner:
                 hidden_states=self.static_draft_hidden_states[:num_tokens],
             )
 
-        buffers = self.buffers
+        registry = self.buffer_registry
         bs = 1
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
         with torch.device(self.device):
             seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
             extend_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
@@ -284,16 +285,16 @@ class BreakableCudaGraphRunner:
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=bs,
-            input_ids=buffers.input_ids[:num_tokens],
+            input_ids=_slot("input_ids"),
             input_embeds=(
-                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+                _slot("input_embeds") if registry.has_slot("input_embeds") else None
             ),
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             next_token_logits_buffer=None,
             orig_seq_lens=orig_seq_lens,
             seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc=_slot("out_cache_loc"),
             seq_lens_sum=num_tokens,
             mamba_track_indices=None,
             mamba_track_mask=None,
@@ -307,13 +308,15 @@ class BreakableCudaGraphRunner:
             extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
             extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
             extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            positions=buffers.positions[:num_tokens],
+            positions=_slot("positions"),
             global_num_tokens_gpu=None,
             global_num_tokens_for_logprob_gpu=None,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=None,
             mrope_positions=(
-                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+                _slot("mrope_positions")
+                if registry.has_slot("mrope_positions")
+                else None
             ),
             spec_algorithm=None,
             spec_info=spec_info,
@@ -327,11 +330,46 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_forward_context(
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+            ),
         ):
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
             self._run_forward(forward_batch, num_tokens)
+
+    def _init_forward_metadata_for_capture(self, forward_batch, num_tokens):
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_captured_attn_metadata:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+            forward_batch
+        )
+        assert self.attn_metadata_buffers is not None
+        self.attn_metadata_buffers[num_tokens] = metadata
+
+    def _prepare_forward_metadata_for_replay(
+        self, forward_batch, static_forward_batch, num_tokens
+    ):
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_captured_attn_metadata:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        assert self.attn_metadata_buffers is not None
+        metadata = self.attn_metadata_buffers[num_tokens]
+        attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
@@ -374,6 +412,13 @@ class BreakableCudaGraphRunner:
             return False
         if forward_batch.replace_embeds is not None:
             return False
+        if self._has_inactive_dp_rank(forward_batch):
+            return False
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and not forward_batch.can_run_dp_breakable_cuda_graph
+        ):
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -387,12 +432,9 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
-            # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
         with forward_context(
@@ -446,9 +488,9 @@ class BreakableCudaGraphRunner:
             if self.use_input_embeds:
                 if ie is None:
                     raise ValueError("BCG replay expects input_embeds but got None")
-                self.buffers.input_embeds[:static_num_tokens].copy_(
-                    ie[:static_num_tokens]
-                )
+                self.buffer_registry.get_slot("input_embeds").slice_for(
+                    1, static_num_tokens
+                ).copy_(ie[:static_num_tokens])
             else:
                 if ie is not None:
                     raise ValueError(
@@ -463,7 +505,9 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                self._prepare_forward_metadata_for_replay(
+                    forward_batch, static_forward_batch, static_num_tokens
+                )
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,
