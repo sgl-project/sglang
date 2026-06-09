@@ -59,9 +59,7 @@ class TestTrimMatchedStop(unittest.TestCase):
     def test_token_gpt_oss_call_kept(self):
         # gpt-oss tool-call token is also an eos; keep it even when trimming.
         self.assertEqual(
-            _trim(
-                [1, 2, GPT_OSS_CALL_TOKEN], GPT_OSS_CALL_TOKEN, False, gpt_oss=True
-            ),
+            _trim([1, 2, GPT_OSS_CALL_TOKEN], GPT_OSS_CALL_TOKEN, False, gpt_oss=True),
             [1, 2, GPT_OSS_CALL_TOKEN],
         )
 
