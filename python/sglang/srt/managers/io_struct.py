@@ -1522,7 +1522,7 @@ class UpdateWeightFromDiskReqOutput(BaseReqIpc, kw_only=True):
 
 class UpdateWeightsFromDistributedReqInput(BaseReqIpc, kw_only=True):
     names: List[str]
-    dtypes: List[str]
+    dtypes: List[bytes]
     shapes: List[List[int]]
     # The group name
     group_name: str = "weight_update_group"
@@ -1638,7 +1638,7 @@ class InitWeightsUpdateGroupReqInput(BaseReqIpc, kw_only=True):
     # The master address
     master_address: str
     # The master port
-    master_port: int
+    master_port: Union[int, str]
     # The rank offset
     rank_offset: int
     # The world size
