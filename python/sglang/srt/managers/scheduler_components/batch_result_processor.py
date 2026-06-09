@@ -222,7 +222,7 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             logprob_pt = 0
 
-            for i, (req, next_token_id, is_intermediate) in enumerate(
+            for i, (req, next_token_id, is_extend_intermediate) in enumerate(
                 zip(
                     batch.reqs,
                     next_token_ids,
@@ -234,7 +234,7 @@ class SchedulerBatchResultProcessor:
                     # decode req in mixed batch or retracted req
                     continue
 
-                if not is_intermediate:
+                if not is_extend_intermediate:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
@@ -316,7 +316,7 @@ class SchedulerBatchResultProcessor:
                     phs = phs.cpu().detach()
 
             # Check finish conditions
-            for i, (req, is_intermediate) in enumerate(
+            for i, (req, is_extend_intermediate) in enumerate(
                 zip(batch.reqs, batch.is_extend_intermediate, strict=True)
             ):
                 if req.is_retracted:
@@ -326,7 +326,7 @@ class SchedulerBatchResultProcessor:
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
 
-                if not is_intermediate:
+                if not is_extend_intermediate:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
@@ -445,8 +445,8 @@ class SchedulerBatchResultProcessor:
         if not getattr(result, "skipped_output_comm", False):
             if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
                 has_consumed_output = any(
-                    not is_intermediate
-                    for req, is_intermediate in zip(
+                    not is_extend_intermediate
+                    for req, is_extend_intermediate in zip(
                         batch.reqs, batch.is_extend_intermediate, strict=True
                     )
                     if not req.finished() and not req.is_retracted
@@ -460,13 +460,13 @@ class SchedulerBatchResultProcessor:
                     )
             return
 
-        for req, is_intermediate in zip(
+        for req, is_extend_intermediate in zip(
             batch.reqs, batch.is_extend_intermediate, strict=True
         ):
             if not req.finished() and not req.is_retracted:
-                assert is_intermediate, (
+                assert is_extend_intermediate, (
                     f"PP skip output comm invariant violated: req {req.rid} "
-                    f"has is_extend_intermediate={is_intermediate} "
+                    f"has is_extend_intermediate={is_extend_intermediate} "
                     f"(not intermediate) but output was skipped "
                     f"(contains_last_prefill_chunk="
                     f"{batch.contains_last_prefill_chunk}). "
