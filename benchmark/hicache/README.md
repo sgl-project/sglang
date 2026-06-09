@@ -120,8 +120,9 @@ so the server must tokenize every request; this adds per-request overhead that
 grows with `--total-tokens` and is unrelated to cache performance.
 
 ## Supported Backends
-`bench_serving.py` and `bench_warm_cache.py` support OpenAI-compatible completion and chat-completion
-servers. Use `--base-url` when the server is not on the backend's default port.
+`bench_serving.py` supports `sglang`, `vllm`, and `lmdeploy`. `bench_warm_cache.py`
+additionally supports the `-oai` and `-chat` variants.
+Use `--base-url` when the server is not on the backend's default port.
 
 | Backend | Endpoint | Default port |
 | --- | --- | --- |
@@ -132,15 +133,3 @@ servers. Use `--base-url` when the server is not on the backend's default port.
 | `vllm-chat` | `/v1/chat/completions` | 8000 |
 | `lmdeploy` | `/v1/completions` | 23333 |
 | `lmdeploy-chat` | `/v1/chat/completions` | 23333 |
-
-Example OpenAI-compatible SGLang chat benchmark:
-```bash
-python3 bench_serving.py --model Qwen/Qwen2.5-14B-Instruct --backend sglang-oai-chat \
---base-url http://localhost:30000 --dataset-name random --num-prompts 10
-```
-
-Example vLLM chat benchmark:
-```bash
-python3 bench_serving.py --model Qwen/Qwen2.5-14B-Instruct --backend vllm-chat \
---base-url http://localhost:8000 --dataset-name random --num-prompts 10
-```
