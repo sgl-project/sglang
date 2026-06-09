@@ -155,11 +155,13 @@ class NPUGeluAndMul(BaseActivation):
           (e.g. certain non‑silu MoE variants).
         - The downstream code expects the same ``(hidden_states, scale)`` interface.
     """
+    def __init__(self):
+        self._gelu = GeluAndMul()
 
     def _apply_activation(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return GeluAndMul()(hidden_states), None
+        return self._gelu(hidden_states), None
 
 
 # =============================================================================
