@@ -209,6 +209,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             {} if self.use_captured_attn_metadata else None
         )
 
+        # --- BCG: resolve inner layer_model for capture/replay --------
+        # BCG captures only the inner transformer stack (layer_model.forward)
+        # — not the outer model.forward. The outer's tail (logits_processor /
+        # pooler) has bs-shaped kernels that would bake bs=1 into the captured
+        # graph and break multi-req replay. At replay, we monkey-patch
+        # layer_model.forward to replay the captured graph and return the
+        # captured hidden states; the outer model.forward then runs
+        # logits_processor eagerly on top with the live multi-req metadata.
+        # Mirrors main's BreakableCudaGraphRunner.
+        self.layer_model = None
+        if isinstance(self.backend, BreakableCudaGraphBackend):
+            language_model = getattr(
+                self.model_runner.model, "language_model", self.model_runner.model
+            )
+            if hasattr(language_model, "model") and hasattr(
+                language_model.model, "layers"
+            ):
+                self.layer_model = language_model.model
+            else:
+                raise RuntimeError(
+                    f"BCG could not resolve inner layer_model on "
+                    f"{type(language_model).__name__}; BCG is unsupported for "
+                    f"this model architecture."
+                )
+
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
@@ -229,8 +254,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    @torch.no_grad()
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
-        """Run model.forward inside the prefill set_tc_piecewise_forward_context."""
+        """Run forward inside the prefill set_tc_piecewise_forward_context.
+
+        BCG path: captures only the inner layer_model.forward (transformer
+        stack), excluding the outer model.forward tail (logits_processor /
+        pooler). The captured output is bs=1 hidden states; replay then runs
+        the outer tail eagerly with live multi-req metadata.
+
+        TC_PIECEWISE path: captures the outer model.forward; torch.compile
+        FX-traces produce bs-invariant kernels.
+
+        ``@torch.no_grad`` mirrors the decorator on the outer
+        ``*ForCausalLM.forward``. For BCG, calling ``layer_model.forward``
+        directly skips that decorator, so we apply it here — without it
+        some MoE ``@torch.compile`` kernels (``torch.sum(out=...)``) fail
+        dynamo with "out= doesn't support autograd", and mamba state ops
+        can spuriously track gradients.
+        """
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(
             forward_batch.global_dp_buffer_len,
@@ -250,6 +292,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.moe_fusions,
             dsa_indexers=self.dsa_indexers,
         ):
+            if self.layer_model is not None:
+                return self.layer_model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    forward_batch.input_embeds,
+                )
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -351,14 +400,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # Breakable-prefill captures bs=1 only; multi-req would silently
-        # return wrong-shaped logits, corrupting downstream output_ids.
-        if self._prefill_static_buffers is not None and forward_batch.batch_size > 1:
-            return False
         # No backend-level shape check here: replay_prepare bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
         # bounded by num_tokens <= self.max_num_tokens (already
         # checked above), not by exact shape membership.
+        #
+        # Multi-req replay is supported by BCG via the layer_model.forward
+        # monkey-patch in replay(): the captured bs=1 graph runs the
+        # transformer stack, then the outer model.forward runs
+        # logits_processor eagerly on top with live multi-req metadata.
         return True
 
     # -----------------------------------------------------------------
@@ -701,19 +751,59 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with self.backend.replay_session():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
-            with forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
-            ), set_tc_piecewise_forward_context(
-                static_forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-                dsa_indexers=self.dsa_indexers,
-            ):
-                output = self.backend.replay(
-                    self._static_num_tokens, static_forward_batch, **kwargs
-                )
+            if self.layer_model is not None:
+                # BCG path. The captured graph is a bs=1 replay of
+                # layer_model.forward. Monkey-patch layer_model.forward to
+                # call backend.replay (which fires the captured graph and
+                # returns the captured hidden_states), then drive the outer
+                # model.forward eagerly with the live multi-req
+                # static_forward_batch. The outer's logits_processor /
+                # pooler then runs on top with live multi-req metadata.
+                shape_key = self._static_num_tokens
+
+                def replay_layer_forward(*args, **layer_kwargs):
+                    return self.backend.replay(
+                        shape_key, static_forward_batch, **kwargs
+                    )
+
+                original_layer_forward = self.layer_model.forward
+                self.layer_model.forward = replay_layer_forward
+                try:
+                    with forward_context(
+                        ForwardContext(attn_backend=self.model_runner.attn_backend)
+                    ), set_tc_piecewise_forward_context(
+                        static_forward_batch,
+                        self.attention_layers,
+                        self.quant_config,
+                        self.moe_layers,
+                        self.moe_fusions,
+                        dsa_indexers=self.dsa_indexers,
+                    ):
+                        output = self.model_runner.model.forward(
+                            static_forward_batch.input_ids,
+                            static_forward_batch.positions,
+                            static_forward_batch,
+                            **kwargs,
+                        )
+                finally:
+                    self.layer_model.forward = original_layer_forward
+            else:
+                # TC_PIECEWISE path. backend.replay calls the compiled
+                # outer model.forward directly (torch.compile handles
+                # multi-req via bs-invariant FX-traced kernels).
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ), set_tc_piecewise_forward_context(
+                    static_forward_batch,
+                    self.attention_layers,
+                    self.quant_config,
+                    self.moe_layers,
+                    self.moe_fusions,
+                    dsa_indexers=self.dsa_indexers,
+                ):
+                    output = self.backend.replay(
+                        self._static_num_tokens, static_forward_batch, **kwargs
+                    )
 
             if isinstance(output, LogitsProcessorOutput):
                 # Preserve mm_input_embeds for speculative decoding.
