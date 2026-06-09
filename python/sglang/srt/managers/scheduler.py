@@ -2454,16 +2454,16 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
+        if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
+            for req in self.dllm_manager.staging_queue:
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+
         for req in self.chunked_reqs():
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A chunk that committed no new KV
             # leaves extend_range.end == len(prefix_indices), so caching would
             # be a no-op; skip it to avoid a wasted insert pass.
             if req.extend_range.end > len(req.prefix_indices):
-                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
-
-        if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            for req in self.dllm_manager.staging_queue:
                 maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
