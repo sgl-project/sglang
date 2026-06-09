@@ -36,6 +36,9 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_npu,
 )
+from sglang.srt.multiplex.pdmux_context import (
+    get_current_stream_idx,
+)
 
 is_npu = is_npu()
 
@@ -142,7 +145,10 @@ class NPUGraphRunner(CudaGraphRunner):
         if isinstance(self.update_attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
 
-        self.graphs[self.bs].update(
+        bs_key = self.bs
+        if self.enable_pdmux:
+            bs_key = f"{get_current_stream_idx()}_{self.bs}"
+        self.graphs[bs_key].update(
             cpu_update_input=[{self.update_attr_name: seq_lens}]
         )
 
@@ -206,6 +212,11 @@ class NPUGraphRunner(CudaGraphRunner):
 
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
+
+        bs_key = self.bs
+        if self.enable_pdmux:
+            bs_key = f"{get_current_stream_idx()}_{self.bs}"
+
         # Replay
         if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
@@ -217,12 +228,12 @@ class NPUGraphRunner(CudaGraphRunner):
                 )
             thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
             thread.start()
-            self.graphs[self.bs].replay()
+            self.graphs[bs_key].replay()
             thread.join()
         else:
-            self.graphs[self.bs].replay()
+            self.graphs[bs_key].replay()
 
-        output = self.output_buffers[self.bs]
+        output = self.output_buffers[bs_key]
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
