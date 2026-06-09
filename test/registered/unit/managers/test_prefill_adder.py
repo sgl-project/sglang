@@ -92,7 +92,6 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.finished.return_value = False
         req.has_pending_chunk = False
-        req.scheduled_extend_len = 0
         req.is_dllm.return_value = False
         req.host_hit_length = 0
         req.needs_host_load_back.return_value = False
@@ -114,36 +113,32 @@ class TestPrefillAdder(CustomTestCase):
         return PrefillAdder(**defaults)
 
     def create_retracted_decode_req(
-        self, *, origin_len: int, output_len: int, scheduled_extend_len: int
+        self, *, origin_len: int, output_len: int, extend_end: int
     ) -> Req:
         req = Req.__new__(Req)
         req.rid = "retracted-decode"
         req.dllm_config = None
         req.origin_input_ids = array("q", range(origin_len))
         req.output_ids = array("q", range(origin_len, origin_len + output_len))
-        req.extend_range = Range(0, scheduled_extend_len)
-        req.scheduled_extend_len = 0
-        req.scheduled_extend_target_len = 0
+        req.extend_range = Range(0, extend_end)
         req.retracted_stain = True
-        req.set_scheduled_extend_len(scheduled_extend_len)
         return req
 
     def test_retracted_decode_req_pending_bound_uses_full_fill_sequence(self):
         req = self.create_retracted_decode_req(
             origin_len=367,
             output_len=438,
-            scheduled_extend_len=600,
+            extend_end=600,
         )
 
         self.assertTrue(req.has_pending_chunk)
-        self.assertEqual(req.scheduled_extend_len_bound(), 805)
+        self.assertEqual(req.get_full_untruncated_fill_len(), 805)
         self.assertEqual(
             _decide_output_process_mode(req, dllm_config=None, forward_mode=None),
             OutputProcessMode.EXTEND_MIDDLE_CHUNK,
         )
         self.assertEqual(_compute_chunked_req_next_prompt_token(req), 600)
 
-        req.set_scheduled_extend_len(805)
         req.extend_range = Range(0, 805)
 
         self.assertFalse(req.has_pending_chunk)
@@ -159,19 +154,35 @@ class TestPrefillAdder(CustomTestCase):
         req.dllm_config = None
         req.origin_input_ids = array("q", range(128))
         req.output_ids = array("q", range(128, 132))
-        req.extend_range = Range(0, len(req.origin_input_ids))
-        req.scheduled_extend_len = 0
-        req.scheduled_extend_target_len = 0
         req.retracted_stain = False
-        req.set_scheduled_extend_len(len(req.origin_input_ids))
 
+        # A completed-prompt decoding req has entered decode, so extend_range is
+        # None and it never counts as having a pending chunk, regardless of how
+        # many output_ids have accumulated past the prompt length.
+        req.extend_range = None
         self.assertFalse(req.has_pending_chunk)
-        self.assertEqual(req.scheduled_extend_len_bound(), len(req.origin_input_ids))
+
+        # A fresh single-chunk prefill whose extend_range already covers the full
+        # prompt (no output yet) is the last chunk: not pending, no next token.
+        last_chunk_req = Req.__new__(Req)
+        last_chunk_req.rid = "last-chunk-req"
+        last_chunk_req.dllm_config = None
+        last_chunk_req.origin_input_ids = array("q", range(128))
+        last_chunk_req.output_ids = array("q", [])
+        last_chunk_req.extend_range = Range(
+            0, len(last_chunk_req.origin_input_ids)
+        )
+        last_chunk_req.retracted_stain = False
+
+        self.assertEqual(last_chunk_req.get_full_untruncated_fill_len(), 128)
+        self.assertFalse(last_chunk_req.has_pending_chunk)
         self.assertEqual(
-            _decide_output_process_mode(req, dllm_config=None, forward_mode=None),
+            _decide_output_process_mode(
+                last_chunk_req, dllm_config=None, forward_mode=None
+            ),
             OutputProcessMode.EXTEND_LAST_CHUNK,
         )
-        self.assertIsNone(_compute_chunked_req_next_prompt_token(req))
+        self.assertIsNone(_compute_chunked_req_next_prompt_token(last_chunk_req))
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
