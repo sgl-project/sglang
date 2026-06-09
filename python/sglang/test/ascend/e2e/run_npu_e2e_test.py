@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import random
@@ -488,6 +489,57 @@ def monitor_pod_logs(
                 process.kill()
 
 
+def generate_metrics_json(metrics_data_file, test_case, status):
+    log_file = os.path.join(metrics_data_file, "test_output.log")
+    if not os.path.exists(log_file):
+        logger.warning(f"Metrics log file not found: {log_file}")
+        return
+
+    metrics = {}
+    baselines = {}
+
+    with open(log_file, "r") as f:
+        for line in f:
+            m = re.match(r"\[METRIC\] (\S+)=(\S+)", line.strip())
+            if m:
+                key = m.group(1)
+                value = m.group(2)
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
+                if key.endswith("_baseline"):
+                    baselines[key[:-9]] = value
+                else:
+                    metrics[key] = value
+
+    tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+
+    test_type = "unknown"
+    parts = metrics_data_file.split("/")
+    for i, part in enumerate(parts):
+        if part == "output" and i + 1 < len(parts):
+            test_type = parts[i + 1]
+            break
+
+    output = {
+        "test_case": tc_name,
+        "test_type": test_type,
+        "status": status,
+        "metrics": metrics,
+        "baselines": baselines,
+    }
+
+    output_path = os.path.join(metrics_data_file, "metrics.json")
+    with open(output_path, "w") as f:
+        json.dump(output, f, indent=2)
+    logger.info(f"Metrics JSON written to {output_path}")
+
+    with open("/tmp/metrics.json", "w") as f:
+        json.dump(output, f, indent=2)
+    logger.info("Metrics JSON written to /tmp/metrics.json")
+
+
 def run_npu_e2e_test_case(
     docker_image_url: str,
     kube_name_space: str,
@@ -632,9 +684,24 @@ def run_npu_e2e_test_case(
         else:
             logger.info("Pod not ready, maybe not enough resource")
 
-        monitor_pod_logs(
-            kube_job_type, final_kube_job_name, kube_name_space, LOCAL_TIMEOUT
-        )
+        monitor_success = False
+        try:
+            monitor_pod_logs(
+                kube_job_type, final_kube_job_name, kube_name_space, LOCAL_TIMEOUT
+            )
+            monitor_success = True
+        except Exception:
+            logger.error(f"Test case failed: {test_case}", exc_info=True)
+            raise
+        finally:
+            if metrics_data_file:
+                status = "pass" if monitor_success else "fail"
+                try:
+                    generate_metrics_json(metrics_data_file, test_case, status)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to generate metrics JSON: {e}", exc_info=True
+                    )
     finally:
         if os.path.exists(kube_yaml_file):
             # Don't delete pod when trouble_shotting is enabled

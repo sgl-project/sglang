@@ -203,6 +203,14 @@ jobs:
           echo "Run command: ${CMD}"
           eval "${CMD}"
 
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ inputs.test_config_name }}
+          path: /tmp/metrics.json
+          retention-days: 7
+
       - name: Post process
         if: always()
         run: |

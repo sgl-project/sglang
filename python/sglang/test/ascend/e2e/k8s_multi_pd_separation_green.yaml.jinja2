@@ -51,6 +51,8 @@ spec:
           value: "{{ kube_config_map }}"
         - name: HF_ENDPOINT
           value: "https://hf-mirror.com"
+        - name: METRICS_DATA_FILE
+          value: "{{ metrics_data_file }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
         command: ["/bin/bash", "-c"]
@@ -150,6 +152,8 @@ spec:
           value: "{{ kube_config_map }}"
         - name: HF_ENDPOINT
           value: "https://hf-mirror.com"
+        - name: METRICS_DATA_FILE
+          value: "{{ metrics_data_file }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
         command: ["/bin/bash", "-c"]
@@ -248,6 +252,8 @@ spec:
           value: "{{ kube_config_map }}"
         - name: HF_ENDPOINT
           value: "https://hf-mirror.com"
+        - name: METRICS_DATA_FILE
+          value: "{{ metrics_data_file }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
         command: ["/bin/bash", "-c"]

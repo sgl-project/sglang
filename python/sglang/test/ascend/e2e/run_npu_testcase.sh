@@ -132,6 +132,12 @@ else
 fi
 echo "Finished test case ${test_case}"
 
+if [ -n "${METRICS_DATA_FILE}" ]; then
+    mkdir -p "${METRICS_DATA_FILE}"
+    cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
+    echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
+fi
+
 source_plog_path="/root/ascend/log/debug/plog"
 if [ -d "$source_plog_path" ];then
     echo "Plog files found. Begin to backup them."
