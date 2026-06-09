@@ -139,6 +139,14 @@ class Ideogram4ProgressiveDenoisingStage(
         cfg = server_args.pipeline_config
         return cfg.patch_size * cfg.ae_scale_factor
 
+    def _spectrum_latent_dims(self, batch, server_args, H_lat: int, W_lat: int):
+        # Ideogram 4 packs 2×2 latent patches per grid token.  H_lat here is
+        # the grid dimension (= image_h // 16 = 64 for 1024-px input); the
+        # physical spatial-latent dimension is grid × patch_size (= 128).
+        # The Nyquist calculation must use physical dims to match the reference.
+        patch = server_args.pipeline_config.patch_size  # 2
+        return H_lat * patch, W_lat * patch
+
     # ------------------------------------------------------------------
     # Pack / Unpack
     # ------------------------------------------------------------------

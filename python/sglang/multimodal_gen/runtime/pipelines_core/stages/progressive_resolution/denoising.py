@@ -258,6 +258,18 @@ class ProgressiveDenoisingStage(DenoisingStage):
         """
         return server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
 
+    def _spectrum_latent_dims(
+        self, batch: Req, server_args: ServerArgs, H_lat: int, W_lat: int
+    ) -> tuple[int, int]:
+        """Physical spatial-latent dims for the Nyquist-frequency calculation.
+
+        By default these equal the grid dims returned by _latent_scale_factor.
+        Override for models (e.g. Ideogram 4) where patch packing causes the
+        grid dimension to be smaller than the true spatial-latent dimension,
+        so that the spectrum threshold is computed at the correct scale.
+        """
+        return H_lat, W_lat
+
     def _unpack_latent(
         self, latent: torch.Tensor, h_lat: int, w_lat: int
     ) -> torch.Tensor:
@@ -464,9 +476,12 @@ class ProgressiveDenoisingStage(DenoisingStage):
         init_h_lat = H_lat // downsample
         init_w_lat = W_lat // downsample
 
-        # Compute stage transitions from the power-law spectrum
+        # Compute stage transitions from the power-law spectrum.
+        # Use physical spatial-latent dims (may differ from grid dims for
+        # patch-packed models like Ideogram 4).
+        H_spec, W_spec = self._spectrum_latent_dims(batch, server_args, H_lat, W_lat)
         stage_sigmas = compute_stage_transitions(
-            delta, levels, self._spectrum_A, self._spectrum_beta, H_lat, W_lat
+            delta, levels, self._spectrum_A, self._spectrum_beta, H_spec, W_spec
         )
         num_stages = len(stage_sigmas)
 
