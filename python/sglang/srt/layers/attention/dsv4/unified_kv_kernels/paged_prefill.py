@@ -324,6 +324,8 @@ def sparse_attn_v4_paged_prefill(
         H = q.shape[1]
         if attn_sink.shape[0] != H:
             attn_sink = attn_sink[:H].contiguous()
+        if kv.stride(0) != unified_kv.stride(0) and kv.shape[0] == 1 and kv.stride(1) == 1:
+            kv = kv.as_strided(kv.shape, (kv.shape[1], 1))
         return pa_sparse_prefill_opus(
             q,
             unified_kv,
