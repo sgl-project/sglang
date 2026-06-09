@@ -352,9 +352,8 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return False
         if chunked:
-            assert req.kv_committed_len >= req.cache_protected_len
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_committed_len
+                req.req_pool_idx, : req.extend_range.end
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
