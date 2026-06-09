@@ -699,9 +699,7 @@ def run_npu_e2e_test_case(
                 try:
                     generate_metrics_json(metrics_data_file, test_case, status)
                 except Exception as e:
-                    logger.error(
-                        f"Failed to generate metrics JSON: {e}", exc_info=True
-                    )
+                    logger.error(f"Failed to generate metrics JSON: {e}", exc_info=True)
     finally:
         if os.path.exists(kube_yaml_file):
             # Don't delete pod when trouble_shotting is enabled
