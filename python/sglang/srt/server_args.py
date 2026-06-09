@@ -832,7 +832,9 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
-    num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+    num_reserved_decode_tokens: Optional[int] = (
+        None  # used for decode kv cache offload in PD
+    )
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
@@ -3960,6 +3962,12 @@ class ServerArgs:
             return False
 
     def _handle_encoder_disaggregation(self):
+        if self.num_reserved_decode_tokens is None:
+            self.num_reserved_decode_tokens = (
+                4096
+                if self.enable_hisparse and self.disaggregation_mode == "decode"
+                else 512
+            )
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"

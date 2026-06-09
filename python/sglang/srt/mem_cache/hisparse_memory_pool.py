@@ -51,7 +51,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        use_hisparse_memory_config: bool = True,
     ):
+        logical_size = (
+            size * host_to_device_ratio if use_hisparse_memory_config else size
+        )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -65,7 +69,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
-            index_buf_size=size * host_to_device_ratio,
+            index_buf_size=logical_size,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 
@@ -142,9 +146,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
+        use_hisparse_memory_config: bool = True,
     ):
         self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
+        self._size_full = (
+            size * host_to_device_ratio if use_hisparse_memory_config else size
+        )
         self._size_hisparse = size
         self.compress_ratio = 1
         self.dtype = dtype

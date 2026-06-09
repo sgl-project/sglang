@@ -6,11 +6,48 @@ invariants hold (tokens * per_token_cost <= available_bytes).
 """
 
 import contextlib
+import importlib.abc
+import importlib.machinery
+import json
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
+
+
+def maybe_stub_sgl_kernel():
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return
+    except (ImportError, OSError):
+        pass
+
+    class _SglKernelLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            module.__getattr__ = lambda name: MagicMock()
+
+    class _SglKernelFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    _SglKernelLoader(),
+                    is_package=True,
+                )
+            return None
+
+    sys.meta_path.insert(0, _SglKernelFinder())
+
+
+maybe_stub_sgl_kernel()
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -18,8 +55,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 @contextlib.contextmanager
 def mock_cpu_env(kv_size=2, tp_size=1):
     """Mock GPU-dependent functions for CPU-only testing."""
+    import sglang.srt.model_executor.pool_configurator  # noqa: F401
+
+    def element_size(dtype):
+        if dtype is torch.uint8:
+            return 1
+        return kv_size
+
     with (
-        patch("torch._utils._element_size", return_value=kv_size),
+        patch("torch._utils._element_size", side_effect=element_size),
         patch(
             "sglang.srt.model_executor.pool_configurator.get_attention_tp_size",
             return_value=tp_size,
@@ -44,6 +88,15 @@ def _make_model_runner(
     swa_full_tokens_ratio=0.5,
     page_size=1,
     mambaish_config=None,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
+    index_head_dim=128,
+    hf_config=None,
+    enable_hisparse=False,
+    max_running_requests=None,
+    hisparse_config=None,
+    kv_cache_dtype="fake_bf16",
+    disaggregation_mode="null",
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -55,10 +108,14 @@ def _make_model_runner(
     mr.end_layer = num_layers
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
+    mr.enable_hisparse = enable_hisparse
 
     mc = SimpleNamespace()
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
+    mc.kv_lora_rank = kv_lora_rank
+    mc.qk_rope_head_dim = qk_rope_head_dim
+    mc.index_head_dim = index_head_dim
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
         full_attention_layer_ids
@@ -72,14 +129,17 @@ def _make_model_runner(
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
-    mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    mc.hf_config = hf_config or SimpleNamespace(architectures=["LlamaForCausalLM"])
     mr.model_config = mc
 
-    mr.kv_cache_dtype = "fake_bf16"
+    mr.kv_cache_dtype = kv_cache_dtype
 
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
+    sa.max_running_requests = max_running_requests
+    sa.hisparse_config = hisparse_config
+    sa.disaggregation_mode = disaggregation_mode
     mr.server_args = sa
 
     spec = MagicMock()
@@ -106,6 +166,19 @@ def _swa_per_token(mr):
 def _actual_memory_used(mr, config):
     """Compute actual memory consumed by the pool sizes in config."""
     mc = mr.model_config
+
+    if mr.use_mla_backend:
+        mla_pt = (mc.kv_lora_rank + mc.qk_rope_head_dim) * KV_SIZE
+        nsa_index_pt = 0
+        if getattr(mc.hf_config, "index_topk", None) is not None:
+            index_head_dim = getattr(mc.hf_config, "index_head_dim", mc.index_head_dim)
+            nsa_index_pt = index_head_dim + index_head_dim // 128 * 4
+        return (
+            config.max_total_num_tokens
+            * (mla_pt + nsa_index_pt)
+            * mr.num_effective_layers
+        )
+
     full_pt = _full_per_token(mr)
     swa_pt = _swa_per_token(mr)
     nf = len(mc.full_attention_layer_ids)
@@ -163,6 +236,275 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+
+class TestMLAConfigurator(unittest.TestCase):
+    """MLA: available_bytes -> tokens, memory invariant holds."""
+
+    NUM_LAYERS = 32
+    KV_LORA_RANK = 512
+    QK_ROPE_HEAD_DIM = 64
+
+    def _run(self, available_bytes, page_size=1):
+        mr = _make_model_runner(
+            num_layers=self.NUM_LAYERS,
+            use_mla_backend=True,
+            page_size=page_size,
+            kv_lora_rank=self.KV_LORA_RANK,
+            qk_rope_head_dim=self.QK_ROPE_HEAD_DIM,
+            hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
+            kv_cache_dtype=torch.bfloat16,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available_bytes, page_size)
+        return mr, cfg, config
+
+    def _main_kv_cell_size(self):
+        return (self.KV_LORA_RANK + self.QK_ROPE_HEAD_DIM) * self.NUM_LAYERS * KV_SIZE
+
+    def test_memory_utilization(self):
+        available = 10_000_000
+        mr, _, config = self._run(available)
+        used = _actual_memory_used(mr, config)
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
+    def test_page_alignment(self):
+        available = 10_000_000
+        _, _, config = self._run(available, page_size=128)
+        self.assertEqual(config.max_total_num_tokens % 128, 0)
+
+    def test_without_nsa_index_memory(self):
+        available = 10_000_000
+        _, _, config = self._run(available)
+        self.assertEqual(
+            config.max_total_num_tokens, available // self._main_kv_cell_size()
+        )
+
+
+class TestDSAModelConfigurator(unittest.TestCase):
+    """GLM-5 DSA/NSA MLA memory sizing invariants."""
+
+    PAGE_SIZE = 64
+    NUM_LAYERS = 78
+    KV_LORA_RANK = 512
+    QK_ROPE_HEAD_DIM = 64
+    INDEX_HEAD_DIM = 128
+    AVAILABLE_GPU_GB = (32, 64, 96)
+    DEVICE_BUFFER_SIZES = (4096, 6144, 8192)
+    BATCH_SIZES = (32, 64, 96)
+    HOST_TO_DEVICE_RATIOS = (2, 5, 8)
+
+    @staticmethod
+    def _make_dsa_hf_config(index_head_dim=INDEX_HEAD_DIM):
+        return SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=index_head_dim,
+        )
+
+    def _make_dsa_runner(
+        self,
+        *,
+        enable_hisparse=False,
+        max_running_requests=None,
+        device_buffer_size=None,
+        host_to_device_ratio=None,
+    ):
+        hisparse_config = None
+        if enable_hisparse:
+            hisparse_config = json.dumps(
+                {
+                    "top_k": 2048,
+                    "device_buffer_size": device_buffer_size,
+                    "host_to_device_ratio": host_to_device_ratio,
+                }
+            )
+
+        return _make_model_runner(
+            num_layers=self.NUM_LAYERS,
+            use_mla_backend=True,
+            page_size=self.PAGE_SIZE,
+            kv_lora_rank=self.KV_LORA_RANK,
+            qk_rope_head_dim=self.QK_ROPE_HEAD_DIM,
+            index_head_dim=self.INDEX_HEAD_DIM,
+            hf_config=self._make_dsa_hf_config(),
+            enable_hisparse=enable_hisparse,
+            max_running_requests=max_running_requests,
+            hisparse_config=hisparse_config,
+            kv_cache_dtype=torch.bfloat16,
+            disaggregation_mode="decode" if enable_hisparse else "null",
+        )
+
+    def _calculate_config(self, mr, available_bytes):
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available_bytes, mr.server_args.page_size)
+        return cfg, config
+
+    def _main_kv_cell_size(self):
+        return (self.KV_LORA_RANK + self.QK_ROPE_HEAD_DIM) * self.NUM_LAYERS * KV_SIZE
+
+    def _index_k_cell_size(self):
+        return (self.INDEX_HEAD_DIM + self.INDEX_HEAD_DIM // 128 * 4) * self.NUM_LAYERS
+
+    @staticmethod
+    def _align_up(value, page_size):
+        return ((value + page_size - 1) // page_size) * page_size
+
+    @staticmethod
+    def _describe_bytes(num_bytes):
+        return f"{num_bytes / 1024**3:.2f} GiB ({num_bytes} bytes)"
+
+    def _expected_hisparse_pool_size(self, buffer_size, batch_size):
+        return self._align_up(buffer_size * batch_size, self.PAGE_SIZE)
+
+    def _actual_hisparse_gpu_memory(
+        self, config, buffer_size, batch_size, host_to_device_ratio
+    ):
+        hot_tokens = self._expected_hisparse_pool_size(buffer_size, batch_size)
+        return (
+            hot_tokens * self._main_kv_cell_size()
+            + config.max_total_num_tokens
+            * host_to_device_ratio
+            * self._index_k_cell_size()
+        )
+
+    def _actual_hisparse_cpu_memory(self, config, host_to_device_ratio):
+        return (
+            config.max_total_num_tokens
+            * host_to_device_ratio
+            * self._main_kv_cell_size()
+        )
+
+    def test_non_hisparse_full_gpu_pool_fits_available_memory(self):
+        mr = self._make_dsa_runner()
+        for available_gpu_gb in self.AVAILABLE_GPU_GB:
+            available_gpu = available_gpu_gb * 1024**3
+            with self.subTest(available_gpu_gb=available_gpu_gb):
+                _, config = self._calculate_config(mr, available_gpu)
+
+                actual_gpu_bytes = _actual_memory_used(mr, config)
+
+                self.assertLessEqual(
+                    actual_gpu_bytes,
+                    available_gpu,
+                    msg=(
+                        "GPU memory overflow for non-HiSparse DSA config: "
+                        f"actual_gpu={self._describe_bytes(actual_gpu_bytes)}, "
+                        f"available_gpu={self._describe_bytes(available_gpu)}, "
+                        f"available_gpu_gb={available_gpu_gb}, "
+                        f"max_total_num_tokens={config.max_total_num_tokens}"
+                    ),
+                )
+                self.assertEqual(config.max_total_num_tokens % self.PAGE_SIZE, 0)
+
+    def test_hisparse_gpu_and_cpu_pool_fit_memory_budget(self):
+        for available_gpu_gb in self.AVAILABLE_GPU_GB:
+            available_gpu = available_gpu_gb * 1024**3
+            for buffer_size in self.DEVICE_BUFFER_SIZES:
+                for batch_size in self.BATCH_SIZES:
+                    hot_tokens = self._expected_hisparse_pool_size(
+                        buffer_size, batch_size
+                    )
+                    hot_main_bytes = hot_tokens * self._main_kv_cell_size()
+                    if hot_main_bytes > available_gpu:
+                        continue
+                    for host_to_device_ratio in self.HOST_TO_DEVICE_RATIOS:
+                        available_cpu = available_gpu * host_to_device_ratio
+                        minimal_config = SimpleNamespace(
+                            max_total_num_tokens=hot_tokens
+                        )
+                        if (
+                            self._actual_hisparse_gpu_memory(
+                                minimal_config,
+                                buffer_size,
+                                batch_size,
+                                host_to_device_ratio,
+                            )
+                            > available_gpu
+                        ):
+                            continue
+                        if (
+                            self._actual_hisparse_cpu_memory(
+                                minimal_config, host_to_device_ratio
+                            )
+                            > available_cpu
+                        ):
+                            continue
+
+                        with self.subTest(
+                            available_gpu_gb=available_gpu_gb,
+                            buffer_size=buffer_size,
+                            batch_size=batch_size,
+                            host_to_device_ratio=host_to_device_ratio,
+                        ):
+                            mr = self._make_dsa_runner(
+                                enable_hisparse=True,
+                                max_running_requests=batch_size,
+                                device_buffer_size=buffer_size,
+                                host_to_device_ratio=host_to_device_ratio,
+                            )
+                            _, config = self._calculate_config(mr, available_gpu)
+                            actual_gpu_bytes = self._actual_hisparse_gpu_memory(
+                                config,
+                                buffer_size,
+                                batch_size,
+                                host_to_device_ratio,
+                            )
+                            actual_cpu_bytes = self._actual_hisparse_cpu_memory(
+                                config,
+                                host_to_device_ratio,
+                            )
+                            indexer_bytes = actual_gpu_bytes - hot_main_bytes
+
+                            self.assertGreaterEqual(
+                                config.max_total_num_tokens, hot_tokens
+                            )
+                            self.assertLessEqual(
+                                actual_gpu_bytes,
+                                available_gpu,
+                                msg=(
+                                    "GPU memory overflow for HiSparse DSA config: "
+                                    f"actual_gpu={self._describe_bytes(actual_gpu_bytes)}, "
+                                    f"available_gpu={self._describe_bytes(available_gpu)}, "
+                                    f"hot_main_kv={self._describe_bytes(hot_main_bytes)}, "
+                                    f"indexer={self._describe_bytes(indexer_bytes)}, "
+                                    f"available_gpu_gb={available_gpu_gb}, "
+                                    f"buffer_size={buffer_size}, "
+                                    f"batch_size={batch_size}, "
+                                    f"host_to_device_ratio={host_to_device_ratio}, "
+                                    f"hot_tokens={hot_tokens}, "
+                                    f"max_total_num_tokens={config.max_total_num_tokens}"
+                                ),
+                            )
+                            self.assertLessEqual(
+                                actual_cpu_bytes,
+                                available_cpu,
+                                msg=(
+                                    "CPU memory overflow for HiSparse DSA config: "
+                                    f"actual_cpu={self._describe_bytes(actual_cpu_bytes)}, "
+                                    f"available_cpu={self._describe_bytes(available_cpu)}, "
+                                    f"available_gpu_gb={available_gpu_gb}, "
+                                    f"buffer_size={buffer_size}, "
+                                    f"batch_size={batch_size}, "
+                                    f"host_to_device_ratio={host_to_device_ratio}, "
+                                    f"hot_tokens={hot_tokens}, "
+                                    f"max_total_num_tokens={config.max_total_num_tokens}"
+                                ),
+                            )
+                            self.assertEqual(
+                                config.max_total_num_tokens % self.PAGE_SIZE, 0
+                            )
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):
