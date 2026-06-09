@@ -77,6 +77,8 @@ class TestPrefillAdder(CustomTestCase):
         req.rid = str(rid)
         req.priority = priority
         req.extend_input_len = 0
+        req.prefix_indices = []
+        req.get_full_untruncated_fill_len.return_value = 0
         req.extend_logprob_start_len = 0
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
