@@ -21,7 +21,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
     FrozenKVMTPCudaGraphRunner,
 )
@@ -29,7 +29,7 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftInput,
 )
-from sglang.srt.speculative.frozen_kv_mtp_worker import FrozenKVMTPWorker
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from ..attention_methods.dense_attention import (
@@ -175,10 +175,26 @@ class _EagleDraftWorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
         self.model_runner.forward = model_forward
-        self.draft_forward = MethodType(EAGLEWorker.draft_forward, self)
+        self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
+        # draft_forward's topk=1 fast path reads these prealloc buffers (built
+        # in EagleDraftWorker.__init__, which the harness skips), so build them
+        # here. _rebuild_topk1_chain_buffers asserts num_draft_tokens ==
+        # num_steps + 1; the fast path never reads num_draft_tokens, so pin it.
+        self.device = self.model_runner.device
+        if self.topk == 1:
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+        self._topk1_parents_prealloc = None
+        self._topk1_score_indices_prealloc = None
+        EagleDraftWorker._rebuild_topk1_chain_buffers(self)
 
     @property
     def draft_model_runner(self):
+        return self.model_runner
+
+    @property
+    def draft_runner(self):
+        # V2 draft_forward reads self.draft_runner (forward / model_config /
+        # canary_manager); for the harness that's the fixture runner.
         return self.model_runner
 
 
@@ -210,26 +226,26 @@ class _FrozenKVMTPWorkerHarness:
         )
         self.model_runner.forward = model_forward
         self._hidden_size = settings.hidden_size
-        self.draft_forward = MethodType(FrozenKVMTPWorker.draft_forward, self)
+        self.draft_forward = MethodType(FrozenKVMTPDraftWorker.draft_forward, self)
         self._frozen_kv_target_view = MethodType(
-            FrozenKVMTPWorker._frozen_kv_target_view,
+            FrozenKVMTPDraftWorker._frozen_kv_target_view,
             self,
         )
         self._target_kv_pool_view = MethodType(
-            FrozenKVMTPWorker._target_kv_pool_view,
+            FrozenKVMTPDraftWorker._target_kv_pool_view,
             self,
         )
-        self._set_positions = MethodType(FrozenKVMTPWorker._set_positions, self)
+        self._set_positions = MethodType(FrozenKVMTPDraftWorker._set_positions, self)
         self._init_frozen_kv_metadata = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata,
             self,
         )
         self._init_frozen_kv_metadata_capture_cuda_graph = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata_capture_cuda_graph,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata_capture_cuda_graph,
             self,
         )
         self._init_frozen_kv_metadata_replay_cuda_graph = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata_replay_cuda_graph,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata_replay_cuda_graph,
             self,
         )
 
@@ -390,6 +406,7 @@ def _run_eagle_draft_eager(
         init_eager_metadata(worker, batch, settings)
     else:
         worker.draft_attn_backend.init_forward_metadata(batch)
+    batch.mark_forward_metadata_ready()  # mirror production: pre-plan marks
     return worker.draft_forward(batch)
 
 
@@ -397,7 +414,7 @@ def _run_frozen_kv_mtp_eager(
     worker: _FrozenKVMTPWorkerHarness,
     batch: ForwardBatch,
 ):
-    return worker.draft_forward(batch, skip_attn_backend_init=False)
+    return worker.draft_forward(batch)
 
 
 def _capture_eagle_draft_graph_runner(
@@ -588,8 +605,10 @@ class _DenseEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -625,8 +644,10 @@ class _FrozenKVMTPDenseDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1012,8 +1033,10 @@ class _MLAEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1268,8 +1291,10 @@ class _DSV4EagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1568,8 +1593,10 @@ class _DSAEagleDraftForward:
             torch.full_like(indices, -1),
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
