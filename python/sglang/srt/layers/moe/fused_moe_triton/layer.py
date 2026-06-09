@@ -1115,6 +1115,29 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
+    @property
+    def supports_deferred_finalize(self) -> bool:
+        return get_moe_runner_backend().is_flashinfer_trtllm() and isinstance(
+            self.quant_method, ModelOptNvFp4FusedMoEMethod
+        )
+
+    def forward_deferred_finalize(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ):
+        assert self.quant_method is not None
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            flashinfer_trtllm_deferred_finalize_context,
+        )
+
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+
+        with flashinfer_trtllm_deferred_finalize_context():
+            combine_input = self.run_moe_core(dispatch_output=dispatch_output)
+
+        return self.dispatcher.combine(combine_input=combine_input)
+
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
