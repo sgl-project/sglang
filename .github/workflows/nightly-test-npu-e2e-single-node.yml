@@ -1,4 +1,4 @@
-name: 'e2e nightly test single-node (Ascend NPU)'
+name: 'Nightly Test (NPU) Single Node Template'
 
 on:
   workflow_call:
