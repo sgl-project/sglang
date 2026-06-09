@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
-    SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
+    SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "spawn"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     MAX_JOBS: str | None = None
@@ -238,7 +238,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
-        "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
+        "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "spawn"
     ),
     # Internal per-worker platform override used by disaggregated role launch.
     # Empty means normal platform auto-detection.

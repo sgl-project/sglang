@@ -208,7 +208,7 @@ class BaseMultimodalProcessor(ABC):
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
         )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("fork"),
+            mp_context=mp.get_context("spawn"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
 

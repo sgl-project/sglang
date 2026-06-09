@@ -291,7 +291,9 @@ def should_async_load(weight: torch.Tensor) -> bool:
 
     For host (CPU) tensors, using a threadpool can overlap H2D copies
     and improve throughput. For device tensors, threading often adds overhead
-    (e.g., GIL contention) without benefit, so we do it synchronously.
+    without benefit, so we do it synchronously.
+    TODO(free-threading): Re-benchmark with no-GIL Python; device tensors
+    may also benefit from async loading when GIL contention is eliminated.
     """
     device = getattr(weight, "device", None)
     if device is None:

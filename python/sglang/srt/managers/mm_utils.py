@@ -45,6 +45,7 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
+_force_skip_shm_transport = False
 
 
 def init_feature_buffer(device):
@@ -1562,6 +1563,7 @@ class ShmPointerMMData:
             tensor = tensor.contiguous()
         self.shape = tensor.shape
         self.dtype = tensor.dtype
+        self._local_tensor = tensor
         nbytes = tensor.numel() * tensor.element_size()
         shm = shared_memory.SharedMemory(create=True, size=nbytes)
         try:
@@ -1594,7 +1596,27 @@ class ShmPointerMMData:
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
-        tensor = self.tensor.clone()
+        if hasattr(self, "_local_tensor") and self._local_tensor is not None:
+            # In-process path (ThreadedEngine): skip SHM, return directly.
+            t = self._local_tensor
+            self._local_tensor = None
+            self._cleanup_shm()
+            return t
+        if hasattr(self, "tensor"):
+            tensor = self.tensor.clone()
+        else:
+            shm = shared_memory.SharedMemory(name=self.shm_name)
+            tensor = (
+                torch.frombuffer(shm.buf, dtype=self.dtype)
+                .reshape(self.shape)
+                .clone()
+            )
+            shm.close()
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            return tensor
         if self._shm_handle is not None:
             self._shm_handle.close()
             try:
@@ -1604,6 +1626,15 @@ class ShmPointerMMData:
             self._shm_handle = None
         return tensor
 
+    def _cleanup_shm(self):
+        """Unlink the SHM segment that was created but never used cross-process."""
+        try:
+            shm = shared_memory.SharedMemory(name=self.shm_name)
+            shm.close()
+            shm.unlink()
+        except (FileNotFoundError, Exception):
+            pass
+
     def __del__(self):
         # Only close; never unlink. Unlinking is materialize()'s job.
         if getattr(self, "_shm_handle", None) is not None:
@@ -1611,8 +1642,16 @@ class ShmPointerMMData:
             self._shm_handle = None
 
 
+def set_skip_shm_transport(skip: bool = True):
+    """Called by ThreadedEngine to disable SHM wrapping (in-process queues)."""
+    global _force_skip_shm_transport
+    _force_skip_shm_transport = skip
+
+
 def _get_is_default_transport():
     global _is_default_tensor_transport
+    if _force_skip_shm_transport:
+        return True
     if _is_default_tensor_transport is None:
         from sglang.srt.managers.tokenizer_manager import (
             _determine_tensor_transport_mode,
