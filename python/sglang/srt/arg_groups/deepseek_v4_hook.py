@@ -12,42 +12,25 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
     from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
-    # NPU has no dsv4 backend (it's CUDA JIT + Triton + TileLang) and no
-    # fp8_e4m3 dtype support; keep the user's --attention-backend ascend
-    # selection intact and let our DeepseekV4AscendAttnBackend bridge handle
-    # V4's compress / indexer surface. NPU also lacks fp8 KV cache, so fall
-    # back to bfloat16.
-    if server_args.device == "npu":
-        if server_args.attention_backend not in ("ascend",):
-            server_args.attention_backend = "ascend"
-        server_args.page_size = 128
-        logger.info(
-            f"NPU: keeping ascend attention backend for {model_arch}, page_size=128."
-        )
-        if server_args.kv_cache_dtype == "auto":
-            server_args.kv_cache_dtype = "bfloat16"
-            logger.warning(
-                f"NPU: setting KV cache dtype to bfloat16 for {model_arch} "
-                f"(fp8_e4m3 unsupported on Ascend)."
-            )
-        assert (
-            server_args.kv_cache_dtype == "bfloat16"
-        ), f"NPU only supports bfloat16 KV cache for {model_arch}, got {server_args.kv_cache_dtype}"
-    else:
-        server_args.attention_backend = "dsv4"
-        server_args.page_size = 256
-        logger.info(
-            f"Use dsv4 attention backend for {model_arch}, setting page_size to 256."
+    server_args.attention_backend = "dsv4"
+    server_args.page_size = 256
+    if server_args.kv_cache_dtype == "auto":
+        server_args.kv_cache_dtype = "fp8_e4m3"
+        logger.warning(
+            f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
         )
 
-        if server_args.kv_cache_dtype == "auto":
-            server_args.kv_cache_dtype = "fp8_e4m3"
-            logger.warning(
-                f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
-            )
-        assert server_args.kv_cache_dtype in [
-            "fp8_e4m3"
-        ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
+    if server_args.device == "npu":
+        server_args.attention_backend = "ascend"
+        server_args.page_size = 128
+        server_args.kv_cache_dtype = "bfloat16"
+
+    logger.info(
+        f"Use dsv4 attention backend for {model_arch}, setting page_size to {server_args.page_size}."
+    )
+    assert server_args.kv_cache_dtype in [
+        "fp8_e4m3", "bfloat16"
+    ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
