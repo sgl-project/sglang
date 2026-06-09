@@ -122,11 +122,11 @@ jobs:
       matrix:
         test_config:
           # glm5_1 performance tests
-          - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
-            prefill_size: 2
-            decode_size: 2
+          - name: kimi_k2_6_w4a8_1p1d_16p_in64k_out1k5_100ms
+            prefill_size: 1
+            decode_size: 1
             router_size: 1
-            test_case: test/registered/ascend/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
+            test_case: test/registered/ascend/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_1p1d_16p_in64k_out1k5_100ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
