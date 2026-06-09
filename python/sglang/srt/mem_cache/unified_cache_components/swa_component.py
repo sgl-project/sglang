@@ -376,30 +376,106 @@ class SWAComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
+    def _window_retention_len(self) -> int:
+        page_size = self.cache.page_size
+        return ((self.sliding_window_size + page_size - 1) // page_size) * page_size
+
+    def _has_retained_window_child(
+        self, node: UnifiedTreeNode, retain_len: int
+    ) -> bool:
+        if len(node.children) != 1:
+            return False
+
+        # A retained suffix can later become internal after extension inserts.
+        child = next(iter(node.children.values()))
+        child_cd = child.component_data[self.component_type]
+        return child_cd.value is not None and len(child_cd.value) == retain_len
+
+    def _swa_evict_target(
+        self,
+        node: UnifiedTreeNode,
+        retain_len: int,
+        protect_window: bool,
+    ) -> Optional[UnifiedTreeNode]:
+        cd = node.component_data[self.component_type]
+        value_len = len(cd.value)
+
+        if not protect_window:
+            return node
+
+        if value_len <= retain_len:
+            return None
+
+        if self._has_retained_window_child(node, retain_len):
+            return node
+
+        split_len = value_len - retain_len
+        assert split_len % self.cache.page_size == 0
+        # Preserve device LRU order so splitting under memory pressure does not
+        # promote either side as a new cache hit.
+        return self.cache._split_node(
+            node.key, node, split_len, preserve_lru_position=True
+        )
+
+    def _drive_eviction_pass(
+        self,
+        request: int,
+        tracker: dict[ComponentType, int],
+        protect_window: bool,
+    ) -> None:
+        ct = self.component_type
+        lru = self.cache.lru_lists[ct]
+        retain_len = self._window_retention_len()
+        x = lru.get_lru_no_lock()
+        while tracker[ct] < request and x is not None:
+            if not lru.in_list(x):
+                x = lru.get_lru_no_lock()
+                continue
+            x_next = lru.get_prev_no_lock(x)
+            cd = x.component_data[ct]
+            if cd.lock_ref > 0:
+                x = x_next
+                continue
+            assert cd.value is not None
+
+            evict_node = self._swa_evict_target(
+                x,
+                retain_len=retain_len,
+                protect_window=protect_window,
+            )
+            if evict_node is None:
+                x = x_next
+                continue
+
+            if evict_node in self.cache.evictable_device_leaves:
+                # D-leaf: atomic eviction of all components.
+                self.cache._evict_device_leaf(evict_node, tracker)
+            else:
+                # Internal SWA is path data. First pass keeps a trailing
+                # sliding-window suffix so descendants can still reuse SWA.
+                self.cache._evict_component_and_detach_lru(
+                    evict_node,
+                    self,
+                    target=EvictLayer.DEVICE,
+                    tracker=tracker,
+                )
+                self.cache._cascade_evict(evict_node, self, tracker)
+            if x_next is not None and not lru.in_list(x_next):
+                x_next = lru.get_lru_no_lock()
+            x = x_next
+
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
         ct = self.component_type
-        lru = self.cache.lru_lists[ct]
-        x = lru.get_lru_no_lock()
-        while tracker[ct] < request and x is not None and lru.in_list(x):
-            assert x.component_data[ct].value is not None
-            if x in self.cache.evictable_device_leaves:
-                # D-leaf: atomic eviction of all components
-                x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_device_leaf(x, tracker)
-                if not lru.in_list(x_next):
-                    x_next = lru.get_lru_no_lock()
-                x = x_next
-            else:
-                # Internal: tombstone SWA + cascade
-                x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_component_and_detach_lru(
-                    x, self, target=EvictLayer.DEVICE, tracker=tracker
-                )
-                self.cache._cascade_evict(x, self, tracker)
-                x = x_next
+        self._drive_eviction_pass(
+            request=request, tracker=tracker, protect_window=True
+        )
+        if tracker[ct] < request:
+            self._drive_eviction_pass(
+                request=request, tracker=tracker, protect_window=False
+            )
 
     def acquire_component_lock(
         self,
