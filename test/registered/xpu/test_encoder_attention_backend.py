@@ -1,5 +1,5 @@
 """
-python3 -m unittest test_deepseek_ocr.py
+python3 -m unittest test_encoder_attention_backend.py
 """
 
 import json
@@ -22,10 +22,11 @@ from sglang.test.test_utils import (
 register_xpu_ci(est_time=360, suite="stage-b-test-1-gpu-xpu")
 
 
-class TestDeepSeekOCR(CustomTestCase):
+class TestEncoderAttention(CustomTestCase):
+    # Test "xpu_attn" attention backend
     @classmethod
     def setUpClass(cls):
-        cls.model = "deepseek-ai/DeepSeek-OCR"
+        cls.model = "Qwen/Qwen3-VL-2B-Thinking"
         cls.tokenizer = get_tokenizer(cls.model)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.image_path = str(
@@ -36,8 +37,8 @@ class TestDeepSeekOCR(CustomTestCase):
         cls.common_args = [
             "--device",
             "xpu",
-            "--attention-backend",
-            "intel_xpu",
+            "--mm-attention-backend",
+            "xpu_attn",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
@@ -64,10 +65,10 @@ class TestDeepSeekOCR(CustomTestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "<image>\n<|grounding|>Convert the document to pure text.",
+                "text": "<image>\n Tell me what you can see from the image.",
                 "image_data": self.image_path,
                 "sampling_params": {
-                    "temperature": 0 if n == 1 else 0.5,
+                    "temperature": 0 if n == 1 else 1.0,
                     "max_new_tokens": max_new_tokens,
                 },
             },
@@ -105,8 +106,37 @@ class TestDeepSeekOCR(CustomTestCase):
 
         print("=" * 100)
 
-    def test_moe(self):
+    def test_run(self):
         self.run_decode()
+
+
+class TestEncoderAttention_Triton(TestEncoderAttention):
+    # Test "triton_attn" attention backend
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-VL-2B-Thinking"
+        cls.tokenizer = get_tokenizer(cls.model)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.image_path = str(
+            (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
+        )
+        if not os.path.exists(cls.image_path):
+            raise FileNotFoundError(f"Image not found: {cls.image_path}")
+        cls.common_args = [
+            "--device",
+            "xpu",
+            "--mm-attention-backend",
+            "triton_attn",
+        ]
+        os.environ["SGLANG_USE_SGL_XPU"] = "0"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                *cls.common_args,
+            ],
+        )
 
 
 if __name__ == "__main__":
