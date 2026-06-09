@@ -336,7 +336,10 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
         vae_arch = self.vae_config.arch_config
         temporal_ratio = vae_arch.temporal_compression_ratio
         spatial_ratio = vae_arch.spatial_compression_ratio
-        chunk_size = self.dit_config.arch_config.num_frames_per_block
+        chunk_size = int(
+            getattr(batch, "realtime_chunk_size", None)
+            or self.dit_config.arch_config.num_frames_per_block
+        )
 
         latent_height = batch.height // spatial_ratio
         latent_width = batch.width // spatial_ratio

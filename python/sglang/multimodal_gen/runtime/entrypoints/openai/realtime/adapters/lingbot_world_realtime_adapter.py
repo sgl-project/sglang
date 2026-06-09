@@ -254,7 +254,7 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
             output_compression=request.output_compression,
             output_quality=request.output_quality,
             condition_inputs=chunk_inputs.condition_inputs,
-            realtime_chunk_size=chunk_size,
+            chunk_size=chunk_size,
         )
 
     @staticmethod
@@ -276,6 +276,31 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         required_num_frames = (required_latent_frames - 1) * temporal_ratio + 1
         return max(int(request.num_frames or 0), required_num_frames)
 
+    @staticmethod
+    def _resolve_chunk_size(
+        request: RealtimeVideoGenerationsRequest,
+        server_args: ServerArgs,
+    ) -> int:
+        default_chunk_size = max(
+            1,
+            int(
+                server_args.pipeline_config.dit_config.arch_config.num_frames_per_block
+            ),
+        )
+        requested_chunk_size = request.realtime_chunk_size
+        if requested_chunk_size is None:
+            return default_chunk_size
+
+        chunk_size = int(requested_chunk_size)
+        if chunk_size <= 0:
+            raise ValueError("realtime_chunk_size must be positive")
+        if chunk_size > default_chunk_size:
+            raise ValueError(
+                "realtime_chunk_size must be less than or equal to "
+                f"num_frames_per_block ({default_chunk_size})"
+            )
+        return chunk_size
+
     def prepare_next_request(
         self,
         session: GenerateSession,
@@ -283,8 +308,10 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         chunk: RealtimeChunkContext,
     ) -> Req:
         """build a new request for the next chunk"""
-        pipeline_config = server_args.pipeline_config
-        chunk_size = int(pipeline_config.dit_config.arch_config.num_frames_per_block)
+        request = session.request
+        if request is None:
+            raise ValueError("realtime request is not initialized")
+        chunk_size = self._resolve_chunk_size(request, server_args)
         chunk_inputs = self._sample_chunk_inputs(session, chunk, chunk_size)
         sampling_params = self._build_sampling_params(
             session,

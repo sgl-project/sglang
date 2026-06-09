@@ -139,6 +139,7 @@ textarea { resize: vertical; line-height: 1.45; }
 input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.12); }
 
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.split.trio { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .output-options {
   align-items: end;
 }

@@ -1424,6 +1424,7 @@ async function connect() {
       seed: Number($("seed").value),
       num_inference_steps: Number($("steps").value),
       guidance_scale: Number($("guidance").value),
+      realtime_chunk_size: readOptionalInteger("chunkSize"),
       realtime_causal_sink_size: readOptionalInteger("sinkSize"),
       realtime_causal_kv_cache_num_frames: readOptionalInteger("windowFrames"),
       max_chunks: $("continuous").checked ? undefined : 1,
