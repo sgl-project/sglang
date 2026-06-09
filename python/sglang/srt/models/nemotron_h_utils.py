@@ -11,7 +11,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
+from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -21,10 +21,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 ATTN_LAYERS = (MAMBA, ATTENTION)
-
-
-def _is_sparse_layer(layer_type: str) -> bool:
-    return layer_type == MOE
 
 
 def _is_attn_layer(layer_type: str) -> bool:
