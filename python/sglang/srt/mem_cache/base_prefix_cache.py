@@ -48,6 +48,10 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Return the full matched prefix (all full-attention cards) instead of the
+    # SWA-window-safe truncation. For the decode-side dedup/repoint, where cards
+    # are present even when SWA is tombstoned. No effect on non-SWA caches.
+    return_full_match: bool = False
 
 
 @dataclasses.dataclass
@@ -103,6 +107,9 @@ class IncLockRefResult:
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
+    # False iff no SWA node was locked (whole locked prefix is SWA-tombstoned),
+    # so the caller skips the SWA side on the matching dec_lock_ref.
+    swa_lock_taken: bool = True
     swa_uuid_for_host_lock: Optional[int] = None
     # Component nodes that were tombstones at acquire time. Replaying this set
     # at release prevents a short-lived lock from consuming a later load-back or

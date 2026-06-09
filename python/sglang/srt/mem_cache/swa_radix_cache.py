@@ -411,8 +411,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_node=self.root_node,
             )
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        value, last_node, best_value_len, full_last_node = self._match_prefix_helper(key)
+        return self._match_post_processor(
+            params, value, last_node, best_value_len, full_last_node
+        )
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -522,7 +524,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, return_full_match=True)
+        )
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -545,6 +549,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         req.swa_prefix_lock_released = False
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
+        # If no SWA node was locked (whole reused prefix tombstoned), dec_lock_ref
+        # must skip the SWA side.
+        req.swa_prefix_lock_released = not result.swa_lock_taken
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
@@ -683,6 +690,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         swa_lock_size = 0
         swa_uuid_for_lock = None
+        last_swa_locked_node = None
         while node != self.root_node:
             # lock full from node to root
             assert (
@@ -693,24 +701,34 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.full_protected_size_ += len(node.value)
             node.full_lock_ref += 1
 
-            # lock swa if we have not reached the sliding window size.
-            # When we reach the sliding window size, we will set the swa_uuid_for_lock.
-            # caller needs to pass the swa_uuid_for_lock to dec_lock_ref
+            # Lock swa up to the sliding window size, OR stop at a tombstone (the
+            # live window is shorter than W, e.g. a reused tombstoned prefix).
+            # Anchor swa_uuid_for_lock at the last swa-locked node so dec_lock_ref
+            # releases exactly the swa-locked span; full_lock_ref still covers the
+            # whole chain.
             if swa_lock_size < self.sliding_window_size:
-                assert (
-                    not node.swa_tombstone
-                ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
-                if node.swa_lock_ref == 0:
-                    self.swa_evictable_size_ -= len(node.value)
-                    self.swa_protected_size_ += len(node.value)
-                node.swa_lock_ref += 1
-                swa_lock_size += len(node.value)
-                if swa_lock_size >= self.sliding_window_size:
-                    if node.swa_uuid is None:
-                        node.swa_uuid = gen_swa_uuid()
-                    swa_uuid_for_lock = node.swa_uuid
+                if node.swa_tombstone:
+                    if last_swa_locked_node is not None:
+                        if last_swa_locked_node.swa_uuid is None:
+                            last_swa_locked_node.swa_uuid = gen_swa_uuid()
+                        swa_uuid_for_lock = last_swa_locked_node.swa_uuid
+                    swa_lock_size = self.sliding_window_size  # stop swa locking
+                else:
+                    if node.swa_lock_ref == 0:
+                        self.swa_evictable_size_ -= len(node.value)
+                        self.swa_protected_size_ += len(node.value)
+                    node.swa_lock_ref += 1
+                    swa_lock_size += len(node.value)
+                    last_swa_locked_node = node
+                    if swa_lock_size >= self.sliding_window_size:
+                        if node.swa_uuid is None:
+                            node.swa_uuid = gen_swa_uuid()
+                        swa_uuid_for_lock = node.swa_uuid
             node = node.parent
-        return IncLockRefResult(swa_uuid_for_lock=swa_uuid_for_lock)
+        return IncLockRefResult(
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            swa_lock_taken=last_swa_locked_node is not None,
+        )
 
     def dec_lock_ref(
         self,
@@ -922,7 +940,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             best_value_len = len(value)
             best_last_node = node
 
-        return value, best_last_node, best_value_len
+        # `node` is the full last matched node (may extend past the SWA-safe
+        # boundary into tombstones); for return_full_match callers.
+        return value, best_last_node, best_value_len, node
 
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
@@ -941,6 +961,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         value: List[torch.Tensor],
         last_node: TreeNode,
         best_value_len: int,
+        full_last_node: TreeNode,
     ) -> MatchResult:
         """Post-process the matched result."""
         node_update = last_node
@@ -958,17 +979,23 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             node_update = node_update.parent
 
-        value = value[:best_value_len]
-        if value:
-            value = torch.cat(value)
+        # return_full_match: dedup/repoint needs all matched full-attention cards
+        # (present even where SWA is tombstoned), not the window-safe truncation.
+        # Safe because inc_lock_ref stops SWA-locking at the first tombstone.
+        if getattr(params, "return_full_match", False):
+            chosen_value, chosen_node = value, full_last_node
         else:
-            value = torch.empty((0,), dtype=torch.int64, device=self.device)
+            chosen_value, chosen_node = value[:best_value_len], last_node
+        if chosen_value:
+            chosen_value = torch.cat(chosen_value)
+        else:
+            chosen_value = torch.empty((0,), dtype=torch.int64, device=self.device)
 
         return MatchResult(
-            device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_node,
-            best_match_node=last_node,
+            device_indices=chosen_value,
+            last_device_node=chosen_node,
+            last_host_node=chosen_node,
+            best_match_node=chosen_node,
         )
 
     def _compact_single_child_chain(self, node: TreeNode) -> None:
