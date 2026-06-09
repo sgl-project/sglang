@@ -106,48 +106,6 @@ def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
 
 
 @cache_once
-def _jit_main_k_indexer_norm_rope_first_module(dtype: torch.dtype):
-    # kRopeFirst=true, kHadamard=false.
-    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False)
-    return load_jit(
-        make_name("main_k_indexer_norm_rope_first"),
-        *args,
-        cuda_files=["deepseek_v32/indexer_k.cuh"],
-        cuda_wrappers=[
-            ("forward", f"FusedKIndexerNormRopeHadamardKernel<{args}>::forward"),
-        ],
-    )
-
-
-@cache_once
-def _jit_main_k_indexer_norm_rope_store_module(
-    dtype: torch.dtype, page_size: int, hadamard: bool
-):
-    args = make_cpp_args(dtype, is_arch_support_pdl(), True, hadamard, page_size)
-    return load_jit(
-        make_name(f"main_k_indexer_norm_rope_store_p{page_size}_h{int(hadamard)}"),
-        *args,
-        cuda_files=["deepseek_v32/indexer_k.cuh"],
-        cuda_wrappers=[
-            ("forward", f"FusedKIndexerNormRopeStoreKernel<{args}>::forward"),
-        ],
-    )
-
-
-@cache_once
-def _jit_main_k_indexer_norm_rope_first_hadamard_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype, is_arch_support_pdl(), True)
-    return load_jit(
-        make_name("main_k_indexer_norm_rope_first_hadamard"),
-        *args,
-        cuda_files=["deepseek_v32/indexer_k.cuh"],
-        cuda_wrappers=[
-            ("forward", f"FusedKIndexerNormRopeHadamardKernel<{args}>::forward"),
-        ],
-    )
-
-
-@cache_once
 def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
@@ -268,66 +226,6 @@ def fused_q_indexer_rope_first_hadamard_quant(
         positions,
     )
     return q_fp8, weights_out
-
-
-def fused_k_indexer_norm_rope_first_hadamard(
-    k_input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-    hadamard: bool = True,
-) -> torch.Tensor:
-    """V3.2 indexer K: LayerNorm + RoPE on leading dims (+ optional Hadamard) -> bf16. CUDA only."""
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    # k_input may be a non-contiguous wk slice; output is always contiguous.
-    k_out = torch.empty(k_input.shape, dtype=k_input.dtype, device=k_input.device)
-    module = (
-        _jit_main_k_indexer_norm_rope_first_hadamard_module(k_input.dtype)
-        if hadamard
-        else _jit_main_k_indexer_norm_rope_first_module(k_input.dtype)
-    )
-    module.forward(
-        k_input,
-        k_out,
-        weight,
-        bias,
-        freqs_real,
-        positions,
-        float(eps),
-    )
-    return k_out
-
-
-def fused_k_indexer_norm_rope_store(
-    k_input: torch.Tensor,
-    cache: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-    page_size: int,
-    hadamard: bool = True,
-) -> None:
-    """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims (+ optional
-    Hadamard) + fp8 act-quant + paged index-k cache write, in one launch. CUDA only."""
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    module = _jit_main_k_indexer_norm_rope_store_module(
-        k_input.dtype, page_size, hadamard
-    )
-    module.forward(
-        k_input,
-        cache,
-        out_cache_loc,
-        weight,
-        bias,
-        freqs_real,
-        positions,
-        float(eps),
-    )
 
 
 def fused_q_indexer_rope_hadamard_fp4_quant(

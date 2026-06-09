@@ -101,10 +101,10 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv4 import (
+    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_hadamard_quant
+    from sglang.jit_kernel.dsv32 import (
         fused_k_indexer_norm_rope_first_hadamard,
         fused_k_indexer_norm_rope_store,
-        fused_q_indexer_rope_first_hadamard_quant,
     )
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
