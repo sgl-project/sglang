@@ -17,7 +17,11 @@ Caller contract:
   kv_indices: [total_indices] int32 — per-token slot lists, flat.
     Per-token entries live in
     `kv_indices[kv_indptr[t] : kv_indptr[t+1]]`.
-    `-1` entries are skipped (sentinel for unused tail).
+    **All entries MUST be valid slot ids in [0, unified_kv.shape[0]).**
+    The production decode index builder (``write_v4_paged_decode_indices``)
+    emits ragged-packed indices with no sentinels; CG-padded tokens get
+    a zero-length slice via ``indptr[t+1] == indptr[t]``. The kernel no
+    longer carries a per-iter ``slot >= 0`` sentinel check.
   kv_indptr:  [N+1] int32 — true prefix sum (variable per-token len).
   attn_sink:        [H] per-head learnable softmax-denom bias (V4 specific).
   softmax_scale:    float.
@@ -97,14 +101,22 @@ def _kernel_config(block_h: int) -> tuple[int, int, int]:
     Derived from autotune statistics over ~150 shapes on MI355:
       - BLOCK_K=16 dominated (~78% of best configs for D=512); D=512 has
         enough load width that wider K tiles spill regs more than they buy.
-      - num_warps tracks BLOCK_H: a 64-head tile needs 8 warps to keep all
-        MFMA lanes fed; a 16-head tile peaks at 4 warps before going idle.
+      - num_warps:
+          block_h ≤ 32 → 4 warps; block_h ≥ 64 → 8 warps.
+        Pre-v11 the threshold was 16, which gave H=32 nw=8 — that was a
+        regression worth +30% geomean (max +57%) on H=32 across all T,
+        from a Phase-1 fine-tune sweep on top of v05+v09. With block_h=32
+        the MFMA tile is 32×16×D; 4 waves (256 threads) is the sweet
+        spot for AMD wave64 register budget. 8 warps over-distribute and
+        leave each warp with too little MFMA to amortize pipeline fill.
+        block_h=64 still wants 8 warps (one wave per row tile is too
+        little ILP).
       - num_stages=2 is the safe default — deeper pipelining (3) helps only
         when the K loop has many iterations; we cannot know per-token K at
         capture time, so the conservative pick avoids regressing short-K.
     """
     block_k = 16
-    num_warps = 4 if block_h <= 16 else 8
+    num_warps = 4 if block_h <= 32 else 8
     num_stages = 2
     return block_k, num_warps, num_stages
 
@@ -234,21 +246,24 @@ def _paged_decode_fused_kernel(
         # NUM_GROUPS distinct values; redundant scale loads at the same
         # address are coalesced through L1, no per-element scalar issue.
         g_idx_per_d = d_offs // GROUP_SIZE
-    for j in tl.range(0, num_tiles):
+    # num_stages=3 on the inner K loop overrides the launch-time default
+    # (2) for this loop only. Deeper SW pipeline keeps 2 in-flight KV
+    # gathers (vs 1 with stages=2) while the current MFMA runs — better
+    # hides AMD HBM gather latency on D=512. Cost: ~1 extra KV tile
+    # (BLOCK_K*BLOCK_D*2 = 16KB at bf16) staged in regs/LDS per CTA.
+    for j in tl.range(0, num_tiles, num_stages=3):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
-        in_range = k_pos < kv_len
+        valid = k_pos < kv_len  # in_range; no sentinel check (see contract)
         slot = tl.load(
             kv_indices_ptr + kv_start + k_pos,
-            mask=in_range,
-            other=-1,
+            mask=valid,
+            other=0,  # any in-bounds slot; the read is masked out below
         )
-        valid = in_range & (slot >= 0)
-        slot_clamped = tl.maximum(slot, 0)
 
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot_clamped[:, None] * kv_stride_n
+            + slot[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
@@ -261,9 +276,7 @@ def _paged_decode_fused_kernel(
             # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
             # NUM_GROUPS-wide load per row.
             scales_full = tl.load(
-                kv_scales_ptr
-                + slot_clamped[:, None] * ks_stride_n
-                + g_idx_per_d[None, :],
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -272,13 +285,19 @@ def _paged_decode_fused_kernel(
             kv = kv_raw
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
-        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        # K: drop h_mask from the per-iter where. In V4-Pro every realistic
+        # (H, BLOCK_H) pair has H % BLOCK_H == 0 → h_mask is statically
+        # all-True, but the runtime ``h_offs < H`` compare prevents Triton
+        # from constant-folding. Masking only on ``valid`` is sufficient:
+        # ``neg_large`` on invalid k positions makes exp2(scores - m) ≈ 0
+        # in the subsequent dot, and the masked store at the end gates
+        # invalid h rows from polluting the output.
+        scores = tl.where(valid[None, :], scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(scores - m_new[:, None])
-        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
@@ -397,30 +416,27 @@ def _paged_decode_split_kernel(
     k_offs = tl.arange(0, BLOCK_K)
     if QUANT_KV:
         g_idx_per_d = d_offs // GROUP_SIZE
-    for j in tl.range(tile_start, tile_end):
+    # num_stages=3 (see fused kernel comment for rationale).
+    for j in tl.range(tile_start, tile_end, num_stages=3):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
-        in_range = k_pos < kv_len
+        valid = k_pos < kv_len  # in_range; no sentinel check (see contract)
         slot = tl.load(
             kv_indices_ptr + kv_start + k_pos,
-            mask=in_range,
-            other=-1,
+            mask=valid,
+            other=0,  # any in-bounds slot; masked out below
         )
-        valid = in_range & (slot >= 0)
-        slot_clamped = tl.maximum(slot, 0)
 
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot_clamped[:, None] * kv_stride_n
+            + slot[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr
-                + slot_clamped[:, None] * ks_stride_n
-                + g_idx_per_d[None, :],
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -429,13 +445,13 @@ def _paged_decode_split_kernel(
             kv = kv_raw
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
-        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        # K (same as fused kernel): drop h_mask from per-iter where.
+        scores = tl.where(valid[None, :], scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(scores - m_new[:, None])
-        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
@@ -482,25 +498,43 @@ def _paged_decode_reduce_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
-    BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Combine KV_SPLITS partials, fold attn_sink, write final output.
+    """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
+    final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
+    (token, single-head, D-chunk) tuple.
 
-    Splits that early-returned never wrote their slot. We re-derive the same
-    ``tiles_per_segment`` the split kernel used (BLOCK_K is constexpr and
-    matches across kernels), compute ``act_num_segments`` from kv_len, and
-    mask out unwritten slots with ``other=-inf`` (for m) / 0 (for l, acc).
-    Sink is a natural-log bias; we multiply by ``log2e`` before folding.
+    Rewrite of the prior 3D-load reduce inspired by:
+      - aiter ``_fwd_kernel_stage2`` (mla_decode_rope.py): scalar control
+        flow + one D-tile per CTA, online accumulation across splits.
+      - AKO4X ``hybrid_2d_reduce`` (B200 reference, +3.37x): merged 2D
+        tile load ``[KV_SPLITS, D_CHUNK]`` replaces strided 3D access.
+
+    Why this wins on MI355 split path (T ≤ ~256, kv_splits > 1):
+
+    1. **2D tile fits registers**. The old 3D load tile
+       ``[KV_SPLITS=64, BLOCK_H=1, BLOCK_D=512]`` = 32K fp32 = 128 KB —
+       didn't fit in registers, spilled to LDS, and used a strided 3D
+       address compute. New ``[KV_SPLITS, D_CHUNK]`` = 64×64×4 = 16 KB
+       fits one wave's VGPR with headroom.
+    2. **D-chunked grid widens occupancy**. Old grid was ``(T, H)`` —
+       e.g. T=1 H=16 → 16 CTAs into 256 CUs (6% occupancy). New grid
+       ``(T, H, D/D_CHUNK)`` → 16 × (512/64) = 128 CTAs at T=1 H=16
+       (50% occupancy). Reduce was the latency bottleneck at small T.
+    3. **Scalar control flow for sink fold**. Sink computation needs
+       (m_max, l_combined) which only depend on (t, h) — same value
+       across all dc programs for the same (t, h). They recompute it
+       redundantly but it's a tiny scalar reduce; cheaper than passing
+       through LDS.
     """
     t = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    h = tl.program_id(1)
+    dc = tl.program_id(2)
 
-    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    d_offs = tl.arange(0, BLOCK_D)
+    d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
     k_offs = tl.arange(0, KV_SPLITS)
-    h_mask = h_offs < H
     d_mask = d_offs < D
 
     neg_large = -3.4028234663852886e38
@@ -508,64 +542,75 @@ def _paged_decode_reduce_kernel(
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
     kv_len = kv_end - kv_start
+    # CTA-level early return for empty tokens (CUDAGraph padding, or any
+    # caller-supplied zero-length slice). Split kernel skipped these without
+    # writing partials → partial buffers hold garbage; the segm_mask path
+    # below would still mask it correctly but consumes the masked-load BW
+    # and the sink-fold arithmetic. Skipping the whole CTA also halves the
+    # reduce-kernel cost on mixed-kv batches with many padded tokens.
+    if kv_len == 0:
+        out_off = t * out_stride_t + h * out_stride_h + d_offs * out_stride_d
+        tl.store(
+            out_ptr + out_off,
+            tl.zeros([D_CHUNK], dtype=out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
+        return
     tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-    # Only segments [0, act_num_segments) were written by the split kernel.
     act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
     segm_mask = k_offs < act_num_segments
 
+    # 1D loads for (m, l) along splits — single head h.
     m_p = tl.load(
-        m_partial_ptr
-        + t * mp_stride_t
-        + k_offs[:, None] * mp_stride_k
-        + h_offs[None, :] * mp_stride_h,
-        mask=segm_mask[:, None] & h_mask[None, :],
+        m_partial_ptr + t * mp_stride_t + k_offs * mp_stride_k + h * mp_stride_h,
+        mask=segm_mask,
         other=neg_large,
-    )  # [KV_SPLITS, BLOCK_H]
+    )  # [KV_SPLITS]
     l_p = tl.load(
-        l_partial_ptr
-        + t * lp_stride_t
-        + k_offs[:, None] * lp_stride_k
-        + h_offs[None, :] * lp_stride_h,
-        mask=segm_mask[:, None] & h_mask[None, :],
+        l_partial_ptr + t * lp_stride_t + k_offs * lp_stride_k + h * lp_stride_h,
+        mask=segm_mask,
         other=0.0,
-    )  # [KV_SPLITS, BLOCK_H]
+    )  # [KV_SPLITS]
+
+    # 2D-tile load for acc partials — the key change vs old 3D-strided load.
     a_p = tl.load(
         acc_partial_ptr
         + t * ap_stride_t
-        + k_offs[:, None, None] * ap_stride_k
-        + h_offs[None, :, None] * ap_stride_h
-        + d_offs[None, None, :] * ap_stride_d,
-        mask=segm_mask[:, None, None] & h_mask[None, :, None] & d_mask[None, None, :],
+        + k_offs[:, None] * ap_stride_k
+        + h * ap_stride_h
+        + d_offs[None, :] * ap_stride_d,
+        mask=segm_mask[:, None] & d_mask[None, :],
         other=0.0,
-    )  # [KV_SPLITS, BLOCK_H, BLOCK_D]
+    )  # [KV_SPLITS, D_CHUNK]
 
-    # Combine splits in log2 domain.
-    m_max = tl.max(m_p, axis=0)  # [BLOCK_H]
-    alpha_split = tl.exp2(m_p - m_max[None, :])  # [KV_SPLITS, BLOCK_H]
-    l_combined = tl.sum(l_p * alpha_split, axis=0)
-    acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)
+    # Combine across splits.
+    m_max = tl.max(m_p, axis=0)  # scalar
+    alpha_split = tl.exp2(m_p - m_max)  # [KV_SPLITS]
+    l_combined = tl.sum(l_p * alpha_split, axis=0)  # scalar
+    acc_combined = tl.sum(a_p * alpha_split[:, None], axis=0)  # [D_CHUNK]
 
-    # Sink is a natural-log bias on the softmax denom. Multiply by LOG2E so
-    # comparisons live in the same log2 domain as the split outputs.
-    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
-        tl.float32
-    )
+    # Fold attn_sink (recomputed across dc — scalar work, negligible).
+    sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32)
     sink = sink_raw * log2e
     m_final = tl.maximum(m_max, sink)
     alpha_kv = tl.exp2(m_max - m_final)
     alpha_sink = tl.exp2(sink - m_final)
     l_final = l_combined * alpha_kv + alpha_sink
-    acc_final = acc_combined * alpha_kv[:, None]
 
     denom = tl.maximum(l_final, 1.0e-30)
-    out = tl.where(l_final[:, None] > 0.0, acc_final / denom[:, None], 0.0)
+    # Direct divide (acc*alpha_kv)/denom, matching the single-CTA reference.
+    # The prior `acc * (alpha_kv/denom)` precomputed a reciprocal-scaled scalar
+    # (~1 extra ulp per element). Under split-K that per-kv_splits rounding
+    # diverges across batch shapes (T) and, via MTP greedy spec-acceptance,
+    # flips tokens — breaking MTP losslessness. The D-chunked multi-CTA layout
+    # (perf) is untouched; only the final normalize arithmetic changes.
+    acc_final = acc_combined * alpha_kv
+    out = tl.where(l_final > 0.0, acc_final / denom, 0.0)
+
     tl.store(
-        out_ptr
-        + t * out_stride_t
-        + h_offs[:, None] * out_stride_h
-        + d_offs[None, :] * out_stride_d,
+        out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
         out.to(out_ptr.dtype.element_ty),
-        mask=h_mask[:, None] & d_mask[None, :],
+        mask=d_mask,
     )
 
 
@@ -634,8 +679,6 @@ def _sparse_attn_v4_paged_decode_triton(
 
     T, H, D = q.shape
     out = torch.empty_like(q)
-    kv_indices = kv_indices.to(torch.int32).contiguous()
-    kv_indptr = kv_indptr.to(torch.int32).contiguous()
 
     if block_h is None:
         block_h = triton.next_power_of_2(min(H, 64))
@@ -762,11 +805,25 @@ def _sparse_attn_v4_paged_decode_triton(
         num_stages=num_stages,
     )
 
-    # Reduce: one CTA per (token, head). Per-head fan-out hides launch latency
-    # on small per-rank H (TP=8 → H ∈ {8, 16}); for large H we accept the extra
-    # CTAs since the reduce work is tiny.
-    block_h_reduce = 1
-    grid_reduce = (T, (H + block_h_reduce - 1) // block_h_reduce)
+    # 2D-tile reduce: grid = (T, H, ceil(D/D_CHUNK)). One CTA per
+    # (token, single-head, D-chunk). Adaptive D_CHUNK based on whether the
+    # base reduce grid (T*H) already saturates the GPU:
+    #   - large T*H (≥ 2*num_CU=512 on MI355): the grid is already at or
+    #     above the launch target; further D-splitting just over-fragments
+    #     (T=128 H=128 with D_CHUNK=64 → 131K CTAs → 2× slowdown). Use
+    #     D_CHUNK = block_d (1 d-block per CTA, grid = T*H).
+    #   - small T*H: D-split widens the grid to fill CUs at small-T
+    #     latency-critical decode. The 2D tile [KV_SPLITS, D_CHUNK] should
+    #     stay ≤ 16 KB fp32 to fit registers.
+    base_grid_t_h = T * H
+    target_reduce_wg = 2 * _cu_count()
+    if base_grid_t_h >= target_reduce_wg:
+        d_chunk = block_d
+    else:
+        d_chunks_needed = max(1, target_reduce_wg // base_grid_t_h)
+        d_chunks_needed = min(d_chunks_needed, block_d // 32)
+        d_chunk = max(32, triton.next_power_of_2(block_d // d_chunks_needed))
+    grid_reduce = (T, H, (D + d_chunk - 1) // d_chunk)
     _paged_decode_reduce_kernel[grid_reduce](
         m_partial,
         l_partial,
@@ -791,8 +848,8 @@ def _sparse_attn_v4_paged_decode_triton(
         H,
         D,
         kv_splits,
-        BLOCK_H=block_h_reduce,
         BLOCK_D=block_d,
+        D_CHUNK=d_chunk,
         BLOCK_K=block_k,
         num_warps=4,
     )

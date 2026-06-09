@@ -113,12 +113,14 @@ class DSV4AttnMetadata:
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c4_sparse_topk_lengths: torch.Tensor = field(init=False)
+    c4_sparse_topk_lengths_raw: torch.Tensor = field(init=False)
     c4_sparse_page_indices: torch.Tensor = field(init=False)
     c4_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
+    c128_topk_lengths_raw: Optional[torch.Tensor] = None
 
     # unified_kv: per-forward prebuilt ragged decode index
     unified_swa_indices: Optional[torch.Tensor] = None
@@ -172,9 +174,11 @@ class DSV4AttnMetadata:
                 "swa_topk_lengths",
                 "c128_page_indices",
                 "c128_topk_lengths_clamp1",
+                "c128_topk_lengths_raw",
                 "c4_topk_lengths_raw",
                 "c4_topk_lengths_clamp1",
                 "c4_sparse_topk_lengths",
+                "c4_sparse_topk_lengths_raw",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
                 "unified_swa_indices",
@@ -211,6 +215,7 @@ class DSV4AttnMetadata:
             self.c4_topk_lengths_clamp1,
             self.c128_out_loc,
             _,
+            self.c128_topk_lengths_raw,
             self.c128_topk_lengths_clamp1,
             self.c128_page_indices,
         ) = _init_compression_metadata_triton(
@@ -235,6 +240,7 @@ class DSV4AttnMetadata:
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
+        "c128_topk_lengths_raw",
     ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
@@ -285,6 +291,10 @@ class DSV4AttnMetadata:
         assert self.c4_topk_lengths_clamp1 is not None
         self.c4_sparse_topk_lengths = torch.clamp(
             self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
+        )
+        assert self.c4_topk_lengths_raw is not None
+        self.c4_sparse_topk_lengths_raw = torch.clamp(
+            self.c4_topk_lengths_raw, max=self.c4_sparse_topk
         )
         self.c4_sparse_page_indices = torch.full(
             (self.c4_topk_lengths_clamp1.size(0), self.c4_sparse_topk),
@@ -1010,8 +1020,8 @@ class DeepseekV4HipRadixBackend(
             state_slot=req_pool_indices[:N],
             positions=core.positions_casual,
             swa_len=core.swa_topk_lengths,
-            hca_len=core.c128_topk_lengths_clamp1,
-            csa_len=core.c4_sparse_topk_lengths,
+            hca_len=core.c128_topk_lengths_raw,
+            csa_len=core.c4_sparse_topk_lengths_raw,
             hca_page_indices=core.c128_page_indices,
             csa_width=core.c4_sparse_page_indices.shape[1],
             win=pool.unified_swa_window,
@@ -1106,7 +1116,7 @@ class DeepseekV4HipRadixBackend(
                     indptr=kv_indptr,
                     prefix_len=core_attn_metadata.swa_topk_lengths[:T],
                     page_indices=c4_pi[:T],
-                    valid_len=core_attn_metadata.c4_sparse_topk_lengths[:T],
+                    valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
                     swa_pages=swa_pages,
                 )
             else:
@@ -1450,6 +1460,7 @@ class DeepseekV4HipRadixBackend(
             core_attn_metadata.init_flashmla_related()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
+            core_attn_metadata.c4_sparse_topk_lengths_raw = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c4_sparse_raw_indices = None
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
