@@ -673,14 +673,6 @@ class TboForwardBatchPreparer:
                 output_dict[key] = None
                 continue
             elif key == "rids" and len(old_value) != num_seqs:
-                # Under DP attention MAX_LEN padding, `prepare_mlp_sync_batch`
-                # pads `batch_size` (= num_seqs) and the device tensors of a
-                # sub-max rank up to the global max token count, but `rids` is
-                # a per-request host list (one entry per real request) that is
-                # not padded -- so it can be shorter than num_seqs here (e.g. a
-                # rank with 4 real reqs padded to batch_size=5 has len(rids)=4).
-                # Padding rows have no request to attribute, so slice with a
-                # clamped end instead of asserting equality.
                 output_dict[key] = old_value[
                     start_seq_index : min(end_seq_index, len(old_value))
                 ]
