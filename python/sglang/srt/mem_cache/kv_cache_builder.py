@@ -96,7 +96,6 @@ def maybe_register_hicache_draft(
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import (
-        HostPoolGroup,
         MHATokenToKVPoolHost,
         MLATokenToKVPoolHost,
     )
@@ -106,8 +105,7 @@ def maybe_register_hicache_draft(
         pool = pool.full_kv_pool
 
     # UnifiedRadixCache path: use draft strategy dispatch
-    primary = tree_cache.cache_controller.mem_pool_host
-    if isinstance(primary, HostPoolGroup):
+    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             attach_draft_pool_to_unified_cache,
         )
@@ -121,6 +119,7 @@ def maybe_register_hicache_draft(
         return
 
     # Legacy path (SWARadixCache / HiRadixCache): single host pool, use MHA/MLA directly
+    primary = tree_cache.cache_controller.mem_pool_host
     kw = dict(
         host_to_device_ratio=primary.size / pool.size,
         host_size=0,

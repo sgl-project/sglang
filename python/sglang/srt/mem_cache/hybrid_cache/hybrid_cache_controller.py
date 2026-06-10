@@ -371,6 +371,10 @@ class HybridCacheController(BaseHiCacheController):
                 layer_id if layer_id < draft_layer_num else None
             ),
         )
+        if PoolName.DRAFT in self.mem_pool_host.entry_map:
+            old_entry = self.mem_pool_host.entry_map[PoolName.DRAFT]
+            if old_entry in self.mem_pool_host.entries:
+                self.mem_pool_host.entries.remove(old_entry)
         self.mem_pool_host.entries.append(draft_entry)
         self.mem_pool_host.entry_map[PoolName.DRAFT] = draft_entry
         self.extra_host_mem_release_queues[PoolName.DRAFT] = Queue()

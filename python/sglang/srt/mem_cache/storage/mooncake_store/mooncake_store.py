@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
     HostKVCache,
     HostTensorAllocator,
     MLATokenToKVPoolHost,
@@ -634,7 +635,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
+            for buf in self._iter_host_pool_buffers(host_pool):
+                super().register_buffer(buf)
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
@@ -675,7 +677,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # tag is what keeps these keys from colliding with target's
             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
-            if isinstance(draft_pool, MLATokenToKVPoolHost):
+            if isinstance(draft_pool, DeepSeekV4PagedHostPool):
+                suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}"]
+            elif isinstance(draft_pool, MLATokenToKVPoolHost):
                 suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
             else:
                 suffixes = [
