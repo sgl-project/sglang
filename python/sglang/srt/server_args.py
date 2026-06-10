@@ -378,6 +378,7 @@ class ServerArgs:
     tokenizer_worker_num: int = 1
     detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
+    tokenizer_only: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -950,6 +951,10 @@ class ServerArgs:
 
         # Allow OOT platform plugins to apply server args defaults.
         current_platform.apply_server_args_defaults(self)
+
+        if self.tokenizer_only:
+            self.skip_server_warmup = True
+            return
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -4533,6 +4538,12 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--tokenizer-only",
+            action="store_true",
+            help="If set, start a tokenizer-only server (no GPU, no KV cache, no scheduler). "
+            "Enables the /v1/tokenize endpoints for chat-template + tokenization.",
         )
         parser.add_argument(
             "--load-format",

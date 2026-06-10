@@ -715,5 +715,15 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestTokenizerOnlyFlag(unittest.TestCase):
+    """--tokenizer-only implies skip_server_warmup."""
+
+    def test_sets_skip_server_warmup(self):
+        args = ServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN, tokenizer_only=True
+        )
+        self.assertTrue(args.skip_server_warmup)
+
+
 if __name__ == "__main__":
     unittest.main()

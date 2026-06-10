@@ -526,6 +526,9 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    if _global_state.tokenizer_manager.server_args.tokenizer_only:
+        return Response(status_code=200)
+
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
@@ -2366,6 +2369,31 @@ def _setup_and_run_http_server(
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def launch_tokenizer_server(
+    server_args: ServerArgs,
+    init_tokenizer_manager_func: Callable = init_tokenizer_manager,
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """
+    Launch a headless tokenizer-only server.
+
+    Loads only the tokenizer (no model weights, no GPU, no scheduler subprocesses).
+    Serves /v1/tokenize and /v1/detokenize.
+    """
+    tokenizer_manager, template_manager = init_tokenizer_manager_func(server_args, None)
+    _setup_and_run_http_server(
+        server_args,
+        tokenizer_manager,
+        template_manager,
+        port_args=None,
+        scheduler_infos=[{"max_req_input_len": tokenizer_manager.max_req_input_len}],
+        subprocess_watchdog=None,
+        execute_warmup_func=execute_warmup_func,
+        launch_callback=launch_callback,
+    )
 
 
 def launch_server(

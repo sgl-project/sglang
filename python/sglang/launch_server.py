@@ -43,6 +43,10 @@ def run_server(server_args):
             )
 
         launch_server(server_args)
+    elif server_args.tokenizer_only:
+        from sglang.srt.entrypoints.http_server import launch_tokenizer_server
+
+        launch_tokenizer_server(server_args)
     else:
         # Default mode: HTTP mode.
         from sglang.srt.entrypoints.http_server import launch_server
