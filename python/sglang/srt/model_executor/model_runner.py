@@ -2158,6 +2158,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        del named_tensors
+        # Release cached CUDA-IPC imports so the colocated trainer's pending
+        # frees (the per-round conversion transients it shared with us) can be
+        # reaped on its side; without this they accumulate as unpausable
+        # memory under torch_memory_saver offload.
+        torch.cuda.ipc_collect()
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
