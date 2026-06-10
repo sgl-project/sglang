@@ -8,6 +8,7 @@ register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 import json
 import unittest
 from array import array
+from unittest import mock
 from unittest.mock import MagicMock
 
 import torch
@@ -443,30 +444,42 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         self.assertEqual(result[1, 4].item(), 0.0)
 
 
-# apply_custom_logit_processor — sampler-side fan-out under speculative decoding
+# apply_custom_logit_processor — sampler-side fan-out (incl. spec decoding)
 class _DummySamplingBatchInfo:
     """Minimal stand-in for SamplingBatchInfo used by apply_custom_logit_processor."""
 
-    def __init__(self, custom_params, custom_logit_processor):
+    def __init__(
+        self,
+        custom_params,
+        custom_logit_processor,
+        custom_logit_processor_params=None,
+        custom_logit_processor_indices=None,
+        custom_logit_processor_indices_device=None,
+    ):
         self.custom_params = custom_params
         self.custom_logit_processor = custom_logit_processor
+        self.custom_logit_processor_params = custom_logit_processor_params
+        self.custom_logit_processor_indices = custom_logit_processor_indices
+        self.custom_logit_processor_indices_device = (
+            custom_logit_processor_indices_device
+        )
 
     def __len__(self):
         return len(self.custom_params)
 
 
-class TestApplyCustomLogitProcessorSpecDecoding(CustomTestCase):
-    """Regression test: params must be expanded per draft-token row.
-
-    With speculative decoding a request occupies num_tokens_in_batch consecutive
-    rows in the logits tensor. Previously the params list was not expanded to
-    match, so a row-consuming processor (e.g. the n-gram one) only saw params for
-    the first row of each request and silently skipped the trailing draft rows.
-    """
+class TestApplyCustomLogitProcessor(CustomTestCase):
+    """Cover apply_custom_logit_processor, especially spec decoding (num_tokens>1)."""
 
     vocab_size = 8
 
-    def test_params_expanded_to_every_draft_row(self):
+    def _ocr_params(self, req):
+        return {"__req__": req, "ngram_size": 2, "window_size": 100}
+
+    def test_spec_decoding_expands_params_to_every_draft_row(self):
+        """Each request spans num_tokens_in_batch rows; the processor must run on all
+        of them. Before the fix the params list was not expanded per token, so only the
+        first draft-token row of a masked request was processed."""
         from sglang.srt.layers.sampler import apply_custom_logit_processor
 
         draft_token_num = 2
@@ -476,10 +489,9 @@ class TestApplyCustomLogitProcessorSpecDecoding(CustomTestCase):
         )
         original = logits.clone()
 
-        # Repeated bigrams [1,2,3,1,2]; prefix (2) → DeepseekOCR bans token 3.
+        # Repeated bigrams [1,2,3,1,2] with prefix (2) → DeepseekOCR bans token 3.
         req = _make_req(origin_input_ids=[1, 2, 3, 1, 2])
-        ocr_params = {"__req__": req, "ngram_size": 2, "window_size": 100}
-        custom_params = [None, ocr_params, None]
+        custom_params = [None, self._ocr_params(req), None]
         batch_mask = torch.tensor([False, True, False])
         processor = DeepseekOCRNoRepeatNGramLogitProcessor()
         sampling_info = _DummySamplingBatchInfo(
@@ -492,11 +504,49 @@ class TestApplyCustomLogitProcessorSpecDecoding(CustomTestCase):
         )
 
         # Request at batch index 1 occupies rows 2 and 3 — BOTH must be banned.
-        for row in (2, 3):
+        banned_rows = [2, 3]
+        untouched_rows = [0, 1, 4, 5]
+        for row in banned_rows:
             self.assertTrue(torch.isinf(logits[row, 3]) and logits[row, 3] < 0)
-        # All other rows untouched.
-        untouched = [0, 1, 4, 5]
-        self.assertTrue(torch.equal(logits[untouched], original[untouched]))
+        self.assertTrue(torch.equal(logits[untouched_rows], original[untouched_rows]))
+
+    def test_uses_compact_params_without_mask_nonzero(self):
+        """When the compact params/indices metadata is present, the sampler must not
+        fall back to mask.nonzero() on the hot path."""
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        draft_token_num = 2
+        batch_size = 3
+        logits = torch.zeros(
+            (batch_size * draft_token_num, self.vocab_size), dtype=torch.float
+        )
+        original = logits.clone()
+
+        req = _make_req(origin_input_ids=[1, 2, 3, 1, 2])
+        params = self._ocr_params(req)
+        custom_params = [None, params, None]
+        batch_mask = torch.tensor([False, True, False])
+        processor = DeepseekOCRNoRepeatNGramLogitProcessor()
+        sampling_info = _DummySamplingBatchInfo(
+            custom_params=custom_params,
+            custom_logit_processor={1: (processor, batch_mask)},
+            custom_logit_processor_params={1: [params]},
+            custom_logit_processor_indices={1: [1]},
+            custom_logit_processor_indices_device={1: torch.tensor([1])},
+        )
+
+        with mock.patch.object(
+            torch.Tensor,
+            "nonzero",
+            side_effect=AssertionError("nonzero must not be called on the hot path"),
+        ):
+            apply_custom_logit_processor(
+                logits, sampling_info, num_tokens_in_batch=draft_token_num
+            )
+
+        for row in [2, 3]:
+            self.assertTrue(torch.isinf(logits[row, 3]) and logits[row, 3] < 0)
+        self.assertTrue(torch.equal(logits[[0, 1, 4, 5]], original[[0, 1, 4, 5]]))
 
 
 if __name__ == "__main__":
