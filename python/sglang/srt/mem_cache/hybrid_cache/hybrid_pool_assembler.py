@@ -438,6 +438,8 @@ def build_deepseek_v4_hicache_stack(
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
+        # C128 state pool is intentionally not registered with hicache.
+        # page_size=256 % 128 == 0, so state pool is not consumed on load.
         entries.extend(
             [
                 build_pool_entry(
