@@ -42,7 +42,6 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from openai.types.responses.tool import Tool as OpenAIResponsesToolType
 from pydantic import (
     BaseModel,
@@ -567,7 +566,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tools: Optional[List[OpenAIResponsesToolType]] = Field(
+        default=None, examples=[None]
+    )
 
     @field_validator("role", mode="before")
     @classmethod
