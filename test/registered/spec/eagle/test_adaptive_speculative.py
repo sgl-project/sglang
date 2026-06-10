@@ -272,36 +272,41 @@ class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
         if os.path.exists(cls.adaptive_config_path):
             os.unlink(cls.adaptive_config_path)
 
-    def test_zero_step_within_sequence_recovery(self):
-        """One long request batched with many short ones decodes at steps=0 while
-        the batch is large (BS>=8); as the short ones finish, BS drops and the long
-        request returns to steps=3. Its histogram must show drafting at steps=0
-        (hist[0]>0) and recovered acceptance afterwards (sum(hist[1:])>0), proving
-        draft_extend kept the draft KV synced while drafting was disabled."""
-        prompts = [self.COUNT_PROMPT] * 14
-        params = [{"temperature": 0, "max_new_tokens": 200, "ignore_eos": True}] * 13
-        params.append({"temperature": 0, "max_new_tokens": 700, "ignore_eos": True})
-
-        r = requests.post(
-            self.base_url + "/generate",
-            json={"text": prompts, "sampling_params": params},
-            timeout=600,
-        )
+    def _post(self, payload: dict):
+        r = requests.post(self.base_url + "/generate", json=payload, timeout=600)
         self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
 
-        long_out = r.json()[-1]
-        hist = long_out["meta_info"]["spec_correct_drafts_histogram"]
+    def test_zero_step_within_sequence_recovery(self):
+        """A long request shares a batch with many short ones: it decodes at
+        steps=0 while the batch is large (BS>=8), then returns to steps=3 for its
+        (dominant) tail as the short ones finish. Its accept length must recover
+        to ~the steps=3 baseline, proving draft_extend kept the draft KV synced
+        while drafting was off -- a stale KV would reject the recovered drafts and
+        collapse accept length toward 1.0."""
+        full = {"temperature": 0, "max_new_tokens": 600, "ignore_eos": True}
+
+        # Baseline: this request never leaves steps=3 (BS=1).
+        base_len = self._post({"text": self.COUNT_PROMPT, "sampling_params": full})[
+            "meta_info"
+        ]["spec_accept_length"]
+
+        # Crossing: 13 short requests pin BS>=8 (steps=0) only briefly; the long
+        # request spends its dominant tail back at steps=3.
+        short = {"temperature": 0, "max_new_tokens": 10, "ignore_eos": True}
+        long_meta = self._post(
+            {"text": [self.COUNT_PROMPT] * 14, "sampling_params": [short] * 13 + [full]}
+        )[-1]["meta_info"]
+
+        hist = long_meta["spec_correct_drafts_histogram"]
         self.assertGreater(
             hist[0], 0, f"long request never decoded at steps=0 (hist={hist})"
         )
         self.assertGreater(
-            sum(hist[1:]),
-            5,
-            f"no draft acceptance after returning to steps=3 -> draft KV likely "
-            f"stale during steps=0 (hist={hist})",
-        )
-        self.assertGreater(
-            len(long_out["text"].strip()), 0, "empty output across the excursion"
+            long_meta["spec_accept_length"],
+            0.8 * base_len,
+            f"accept length {long_meta['spec_accept_length']:.2f} did not recover to "
+            f"the steps=3 baseline {base_len:.2f} -> draft KV likely stale at steps=0",
         )
 
 
