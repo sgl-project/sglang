@@ -62,6 +62,7 @@ class ImageGenerationsRequest(BaseModel):
     # Performance profiling
     perf_dump_path: Optional[str] = None
 
+
 # Video API protocol models
 class VideoResponse(BaseModel):
     id: str

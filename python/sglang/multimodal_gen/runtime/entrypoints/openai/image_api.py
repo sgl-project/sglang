@@ -143,6 +143,7 @@ def _build_image_response_kwargs(
 
     return ret
 
+
 async def _stream_image_response(response: ImageResponse):
     for idx, item in enumerate(response.data):
         yield (
@@ -158,6 +159,7 @@ async def _stream_image_response(response: ImageResponse):
         )
 
     yield "data: [DONE]\n\n"
+
 
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
