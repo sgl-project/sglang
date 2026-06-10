@@ -10,17 +10,18 @@ ARG HOPPER_SBO=0
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.2.post2
+ARG SGL_KERNEL_VERSION=0.4.3
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.0
+ARG SGL_DEEP_GEMM_VERSION=0.1.2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.11.post1
+ARG FLASHINFER_VERSION=0.6.12
 ARG MOONCAKE_VERSION=0.3.11.post1
+ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -443,6 +444,7 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
+ARG MSCCLPP_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -523,6 +525,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
 
+# Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    && case "${CUDA_VERSION}" in \
+           12.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda12]"; \
+               ;; \
+           13.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda13]"; \
+               ;; \
+           *) \
+               echo "Unsupported CUDA version for MSCCL++: ${CUDA_VERSION}" && exit 1; \
+               ;; \
+       esac \
+    && rm -rf /tmp/mscclpp
+
 # Install essential Python packages (use constraints to prevent conflicts)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -c /sgl-workspace/constraints.txt \
@@ -548,20 +568,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
 # to avoid shipping wrong-CUDA libs on cu13 images.
-# The upstream flash-mla packages are required for running deepseek-v4 models
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nixl nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
-    cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
-    && cd flash-mla && git submodule update --init --recursive \
-    && pip install --no-build-isolation -v . ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
-    cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
-    && ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda \
-    && cd flash-mla && git submodule update --init --recursive \
-    && pip install --no-build-isolation -v . ; \
 fi
 
 # Add yank script
@@ -792,6 +804,9 @@ COPY --from=framework_final /sgl-workspace /sgl-workspace
 
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+
+# Copy sglang binary
+COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
 
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy

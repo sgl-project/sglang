@@ -74,10 +74,16 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    narrow_padded_param_and_loaded_weight,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -89,8 +95,10 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    is_cpu,
     is_cuda,
     is_non_idle_and_non_empty,
     is_npu,
@@ -100,6 +108,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
@@ -311,6 +321,20 @@ class MiniMaxM2RMSNormTP(nn.Module):
         """Custom weight loader that handles TP sharding."""
         shard_id = self.attn_tp_rank // self.num_head_replicas
         shard_size = param.data.shape[0]
+
+        if _is_cpu and _is_amx_available:
+            # Handle uneven TP sharding on CPU
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param.data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_id * shard_size,  # weight_start
+                0,  # shard_axis
+                shard_size,
+            )
+            param_data.copy_(loaded_weight)
+            return
+
         shard_end = (shard_id + 1) * shard_size
         assert shard_end <= loaded_weight.shape[0], (
             f"Weight shard out of bounds: shard [{shard_id * shard_size}:{shard_end}] "
@@ -394,6 +418,8 @@ class MiniMaxM2QKRMSNorm:
             if counter is not None:
                 self._counter = counter
                 self._forward_impl = self._forward_fused
+        elif _is_cpu and _is_amx_available:
+            self._forward_impl = self._forward_cpu
 
     @lru_cache
     @staticmethod
@@ -453,6 +479,12 @@ class MiniMaxM2QKRMSNorm:
             self._k_norm.weight,
             self._eps,
         )
+        return q, k
+
+    def _forward_cpu(self, q: torch.Tensor, k: torch.Tensor):
+        # TODO: add c++ kernel for cpu
+        q = self._q_norm(q.contiguous())
+        k = self._k_norm(k.contiguous())
         return q, k
 
 
@@ -606,7 +638,7 @@ class MiniMaxM2MoE(nn.Module):
         if router_logits is not None:
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(
                     self.layer_id
                 )
@@ -644,7 +676,7 @@ class MiniMaxM2MoE(nn.Module):
         if self.ep_size > 1:
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(
                     self.layer_id
                 )
@@ -1042,12 +1074,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
             )
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.block_sparse_moe(
-            hidden_states, state.forward_batch
-        )
-
     def op_comm_postprocess_layer(self, state):
         """Communication postprocess for layer - TBO operation"""
         hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1150,7 +1176,7 @@ class MiniMaxM2Model(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
-                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:

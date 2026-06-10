@@ -30,7 +30,12 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     parse_dflash_draft_config,
 )
+from sglang.srt.utils import is_npu
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+_is_npu = is_npu()
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
 
 
@@ -90,8 +95,7 @@ class DFlashAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
-        rope_theta = float(getattr(config, "rope_theta", 1000000))
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
@@ -118,6 +122,26 @@ class DFlashAttention(nn.Module):
             attn_type=AttentionType.ENCODER_ONLY,
         )
 
+    def forward_prepare_npu(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.attn.layer_id == 0:
+            self.rotary_emb.get_cos_sin_with_position(positions)
+        q, k, v = split_qkv_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            q_bias=getattr(self.q_norm, "bias", None),
+            k_bias=getattr(self.k_norm, "bias", None),
+        )
+        return q, k, v
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -125,9 +149,12 @@ class DFlashAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
-        q, k = self.rotary_emb(positions, q, k)
+        if _is_npu:
+            q, k, v = self.forward_prepare_npu(positions, hidden_states)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output

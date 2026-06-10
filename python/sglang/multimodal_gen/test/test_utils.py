@@ -21,6 +21,7 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -33,7 +34,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "b7455318873fc5af399c8447b3bb0d9471a5084c"
+SGL_TEST_FILES_CI_DATA_REVISION = "caa56302ccf2d289e4488ed06d952edf5d2314cf"
+
+if current_platform.is_npu():
+    SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"
+
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -45,10 +50,25 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
 SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = (
     f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated"
 )
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/official_generated/ascend"
+)
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated/ascend"
+)
+
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+
+if current_platform.is_npu():
+    SGL_TEST_FILES_CONSISTENCY_GT_BASE = (
+        SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND
+    )
+
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+    SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND,
+    SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND,
 )
 # LTX cases listed here compare against official-generated GT.
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
@@ -58,6 +78,7 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
         "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
+
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
 )
@@ -107,6 +128,9 @@ def _load_clip_processor_with_roberta_processing_compat(
 
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
 
+# Cosmos3 generation models
+DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"
+
 # Qwen image generation models
 DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image"
 DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2512"
@@ -141,6 +165,12 @@ DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers
 
 # MOVA video generation models
 DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
+
+# SANA-WM world model (TI2V with optional camera conditioning)
+DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirectional"
+DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/SANA-WM_streaming"
+)
 
 
 def print_value_formatted(description: str, value: int | float | str):
@@ -1000,7 +1030,7 @@ def _find_remote_consistency_gt_files(
         bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
     else:
         # Avoid accidentally comparing non-comparable CI cases against official GT.
-        bases = (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
+        bases = (SGL_TEST_FILES_CONSISTENCY_GT_BASE,)
     for base_url in bases:
         candidates = _remote_consistency_gt_candidates(
             base_url, case_id, num_gpus, is_video, output_format
