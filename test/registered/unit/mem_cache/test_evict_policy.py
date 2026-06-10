@@ -17,8 +17,8 @@ evict_policy.py 的单元测试。
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-# 注册为 CPU 测试，est_time=6 秒，放在 stage-a 阶段执行
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock

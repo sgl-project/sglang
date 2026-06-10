@@ -9,11 +9,16 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=8, suite="base-b-test-cpu")
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -76,7 +81,9 @@ class TestPrefillAdder(CustomTestCase):
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.retracted_stain = False
         req.finished.return_value = False
+        req.needs_host_load_back.return_value = False
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -379,7 +386,8 @@ class TestPrefillAdder(CustomTestCase):
         req1.extend_input_len = 56
         req1.host_hit_length = 0
         req1.prefix_indices = []
-        req1.fill_ids = list(range(56))
+        req1.full_untruncated_fill_ids = list(range(56))
+        req1.fill_len = 56
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
@@ -413,7 +421,8 @@ class TestPrefillAdder(CustomTestCase):
         req2.extend_input_len = 56
         req2.host_hit_length = 0
         req2.prefix_indices = []
-        req2.fill_ids = list(range(56))
+        req2.full_untruncated_fill_ids = list(range(56))
+        req2.fill_len = 56
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
@@ -430,7 +439,8 @@ class TestPrefillAdder(CustomTestCase):
         req3.extend_input_len = 3
         req3.host_hit_length = 0
         req3.prefix_indices = []
-        req3.fill_ids = list(range(3))
+        req3.full_untruncated_fill_ids = list(range(3))
+        req3.fill_len = 3
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
@@ -443,23 +453,31 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result3, AddReqResult.OTHER)
 
     def _build_hybrid_swa_chunked_req(
-        self, *, page_size, rem_swa, rem_chunk=2048, extend_input_len=500
+        self,
+        *,
+        page_size,
+        rem_swa,
+        rem_chunk=2048,
+        extend_input_len=500,
+        is_hybrid_swa=True,
+        full_available=100_000,
     ):
         self.mock_token_allocator.swa_available_size.return_value = rem_swa
-        self.mock_token_allocator.full_available_size.return_value = 100_000
-        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.full_available_size.return_value = full_available
+        self.mock_token_allocator.available_size.return_value = full_available
         self.mock_tree_cache.sliding_window_size = 128
         adder = self.create_adder(
             self.create_running_batch(),
             page_size=page_size,
             rem_chunk_tokens=rem_chunk,
         )
-        adder.is_hybrid_swa = True
+        adder.is_hybrid_swa = is_hybrid_swa
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
         req.extend_input_len = extend_input_len
         req.prefix_indices = []
-        req.fill_ids = list(range(extend_input_len))
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
+        req.fill_len = extend_input_len
         req.set_extend_input_len = MagicMock()
         return adder, req
 
@@ -498,6 +516,44 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_input_len.assert_not_called()
         self.assertEqual(req.extend_input_len, original_len)
         self.assertEqual(len(adder.can_run_list), 0)
+
+    def test_swa_budget_for_req(self):
+        cases = [
+            # (extend, rem_chunk, window, page, expected, label)
+            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
+            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
+            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
+            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
+            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
+            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
+        ]
+        for extend, rem_chunk, window, page, expected, label in cases:
+            with self.subTest(label=label):
+                self.mock_tree_cache.sliding_window_size = window
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=page,
+                    rem_chunk_tokens=rem_chunk,
+                )
+                self.assertEqual(adder._swa_budget_for_req(extend), expected)
+
+    def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
+        # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
+        # the fix would regress non-SWA models.
+        PAGE_SIZE = 16
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE,
+            rem_swa=10,
+            rem_chunk=500,
+            extend_input_len=200,
+            is_hybrid_swa=False,
+            full_available=300,
+        )
+
+        result = adder.add_chunked_req(req)
+        self.assertIsNone(result)
+        req.set_extend_input_len.assert_called_once_with(200)
+        self.assertIn(req, adder.can_run_list)
 
 
 if __name__ == "__main__":

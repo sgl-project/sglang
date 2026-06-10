@@ -2,9 +2,10 @@
 
 import base64
 import contextlib
+import json
 import os
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
+    flatten_extra_params,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -39,20 +41,37 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
-logger = init_logger(__name__)
 
 
 def _get_extra_field(request, field_name):
     """Get a field from model_extra, with fallback to nested extra_body dict."""
     extra = request.model_extra or {}
     value = extra.get(field_name)
-    if value is None and isinstance(extra.get("extra_body"), dict):
-        value = extra["extra_body"].get(field_name)
+    if value is not None:
+        return value
+    if field_name == "use_guardrails" and extra.get("guardrails") is not None:
+        return extra["guardrails"]
+
+    for container_name in ("extra_body", "extra_json", "extra_args", "extra_params"):
+        value = _parse_extra_container(extra.get(container_name)).get(field_name)
+        if value is not None:
+            return value
+
     return value
+
+
+def _parse_extra_container(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return {}
+    if isinstance(value, dict):
+        return flatten_extra_params(dict(value))
+    return {}
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -132,7 +151,12 @@ async def generations(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
-    ext = choose_output_image_ext(request.output_format, request.background)
+    is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
+    ext = (
+        "png"
+        if is_cosmos3 and request.output_format is None
+        else choose_output_image_ext(request.output_format, request.background)
+    )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = build_sampling_params(
@@ -144,20 +168,39 @@ async def generations(
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            num_frames=1,
             seed=request.seed,
             generator_device=request.generator_device,
             num_inference_steps=request.num_inference_steps,
             guidance_scale=request.guidance_scale,
             true_cfg_scale=request.true_cfg_scale,
             negative_prompt=request.negative_prompt,
+            max_sequence_length=(
+                request.max_sequence_length
+                if request.max_sequence_length is not None
+                else _get_extra_field(request, "max_sequence_length")
+            ),
+            flow_shift=(
+                request.flow_shift
+                if request.flow_shift is not None
+                else _get_extra_field(request, "flow_shift")
+            ),
+            use_duration_template=_get_extra_field(request, "use_duration_template"),
+            use_resolution_template=_get_extra_field(
+                request, "use_resolution_template"
+            ),
+            use_system_prompt=_get_extra_field(request, "use_system_prompt"),
+            use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
             output_compression=request.output_compression,
             output_quality=request.output_quality,
+            diffusers_kwargs=request.diffusers_kwargs,
             enable_upscaling=request.enable_upscaling,
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
             use_pe=_get_extra_field(request, "use_pe"),
+            preset=_get_extra_field(request, "preset"),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -174,6 +217,12 @@ async def generations(
         )
         save_file_path = save_file_path_list[0]
         resp_format = (request.response_format or "b64_json").lower()
+        if (
+            is_cosmos3
+            and "response_format" not in request.model_fields_set
+            and request.response_format == "url"
+        ):
+            resp_format = "b64_json"
 
         # read b64 before cloud upload may delete the local file
         b64_list = (

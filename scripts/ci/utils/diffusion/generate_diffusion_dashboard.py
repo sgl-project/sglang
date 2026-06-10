@@ -26,7 +26,7 @@ CI_DATA_REPO_OWNER = "sgl-project"
 CI_DATA_REPO_NAME = "ci-data"
 CI_DATA_BRANCH = "main"
 HISTORY_PREFIX = "diffusion-comparisons"
-MAX_HISTORY_RUNS = 14
+MAX_HISTORY_RUNS = 29
 
 # Base URL for chart images pushed to sgl-project/ci-data
 CHARTS_RAW_BASE_URL = (
