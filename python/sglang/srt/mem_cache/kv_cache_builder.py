@@ -224,6 +224,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        swa_checkpoint_interval=server_args.hicache_swa_checkpoint_interval,
     )
 
     tree_cache = create_tree_cache(

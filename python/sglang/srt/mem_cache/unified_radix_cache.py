@@ -100,6 +100,8 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # Absolute token offset of this node's key from the root.
+        self.seqlen_start: int = 0
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -964,6 +966,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         child.parent = new_node
         child.key = child.key[split_len:]
+        new_node.seqlen_start = child.seqlen_start
+        child.seqlen_start = new_node.seqlen_start + split_len
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
@@ -1005,6 +1009,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node = UnifiedTreeNode(self.tree_components, priority=priority)
         new_node.parent = parent
         new_node.key = key
+        new_node.seqlen_start = (
+            0 if parent is self.root_node else parent.seqlen_start + len(parent.key)
+        )
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -1184,6 +1191,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
+        new_node.seqlen_start = (
+            0 if node is self.root_node else node.seqlen_start + len(node.key)
+        )
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
