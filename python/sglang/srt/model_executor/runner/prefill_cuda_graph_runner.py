@@ -190,8 +190,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Initialize the slot to None BEFORE constructing the backend:
         # TcPiecewise runs its compile pass during __init__ which calls
         # _run_dummy_forward -> capture_prepare, and capture_prepare reads
-        # self._prefill_static_buffers.
+        # self._prefill_static_buffers. self.layer_model has the same
+        # ordering requirement: _run_forward checks `self.layer_model is
+        # not None` to decide whether to call the inner stack or outer
+        # model.forward, and that check fires inside TcPiecewise's
+        # _run_compile_pass before backend resolution returns.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self.layer_model = None
         self.backend = resolve_prefill_backend(self)
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
@@ -223,8 +228,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # layer_model.forward to replay the captured graph and return the
         # captured hidden states; the outer model.forward then runs
         # logits_processor eagerly on top with the live multi-req metadata.
-        # Mirrors main's BreakableCudaGraphRunner.
-        self.layer_model = None
+        # Mirrors main's BreakableCudaGraphRunner. (Slot pre-init lives
+        # above next to _prefill_static_buffers — TcPiecewise's compile
+        # pass runs during backend construction and reads self.layer_model.)
         if isinstance(self.backend, BreakableCudaGraphBackend):
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
