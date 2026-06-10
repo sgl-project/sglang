@@ -56,11 +56,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import (
-    assign_extend_cache_locs,
-    fill_accept_out_cache_loc,
-    fill_bonus_tokens,
-)
+from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -73,6 +69,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
+    move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
@@ -93,7 +90,6 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
     log_info_on_rank0,
-    next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -1414,66 +1410,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         downstream chain-layout code (draft-extend select_index, committed-KV reads)
         assumes. Returns compacted predict; mutates logits_output.hidden_states
         (moved only when present)."""
-        self.move_accept_tokens_to_target_kvcache(batch, accept_index, accept_lens - 1)
+        move_accept_tokens_to_target_kvcache(
+            batch, accept_index, accept_lens - 1, self.token_to_kv_pool_allocator
+        )
         predict = self._compact_accept_to_front(predict, accept_index, bs)
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = self._compact_accept_to_front(
                 logits_output.hidden_states, accept_index, bs
             )
         return predict
-
-    def move_accept_tokens_to_target_kvcache(
-        self,
-        batch: ScheduleBatch,
-        accept_index: torch.Tensor,
-        num_correct_drafts: torch.Tensor,
-    ):
-        """
-        Move accepted tokens (drafts + bonus) to the target KV cache.
-
-        Args:
-            batch: The batch to run.
-            accept_index: The index of the accepted tokens (incl. bonus).
-            num_correct_drafts: Per-req count of correct drafts (excludes bonus);
-                seq_lens is advanced by num_correct_drafts + 1 to cover the bonus slot.
-        """
-        bs = len(batch.seq_lens)
-        # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
-        # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
-        size = bs * accept_index.shape[1]
-
-        # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
-        maybe_detect_oob(
-            accept_index,
-            -1,
-            batch.out_cache_loc.size(0),
-            "eagle v2 move_accepted_tokens accept_index",
-        )
-
-        tgt_cache_loc = torch.zeros(
-            size,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=self.device)
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        fill_accept_out_cache_loc[(size,)](
-            accept_index,
-            batch.out_cache_loc,
-            accept_out_cache_loc,
-            next_power_of_2(size),
-        )
-        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accept_out_cache_loc
-        )
 
     def _compact_accept_to_front(
         self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
