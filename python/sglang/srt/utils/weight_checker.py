@@ -52,12 +52,12 @@ class WeightChecker:
         self._model_runner = model_runner
         self._snapshot_tensors = None
 
-    def handle(self, action: str) -> Optional[Dict]:
+    def handle(self, action: str, visited_storage=None) -> Optional[Dict]:
         logger.info(f"[WeightChecker] handle action={action}")
         if action == "snapshot":
             return self._snapshot()
         elif action == "reset_tensors":
-            return self._reset_tensors()
+            return self._reset_tensors(visited_storage)
         elif action == "compare":
             return self._compare()
         elif action == "checksum":
@@ -74,10 +74,21 @@ class WeightChecker:
             named_tensors
         ), f"should not have duplicated tensor name"
 
-    def _reset_tensors(self):
+    def _reset_tensors(self, visited_storage=None):
         for name, param in self._model_state():
             if _is_non_persistent_buffer_name(name):
                 continue
+            # Randomize each storage at most once when fanning out across runners
+            # that may share a tensor's storage (e.g. embed/head tied to target).
+            if visited_storage is not None:
+                try:
+                    storage = param.untyped_storage()
+                    key = (param.device, storage.data_ptr(), storage.nbytes())
+                except AttributeError:
+                    key = (param.device, param.data_ptr())
+                if key in visited_storage:
+                    continue
+                visited_storage.add(key)
             param.copy_(_random_like(param))
 
     def _compare(self):

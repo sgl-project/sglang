@@ -1669,6 +1669,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 @dataclass
 class CheckWeightsReqInput(BaseReq):
     action: str
+    selector: Optional[str] = None
 
 
 @dataclass

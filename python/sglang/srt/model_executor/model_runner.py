@@ -3648,8 +3648,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weights(self, action: str):
-        return self._weight_checker.handle(action=action)
+    def check_weights(self, action: str, visited_storage=None):
+        return self._weight_checker.handle(
+            action=action, visited_storage=visited_storage
+        )
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
