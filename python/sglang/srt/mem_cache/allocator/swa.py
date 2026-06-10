@@ -60,6 +60,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             elif current_platform.is_out_of_tree():
                 PagedTokenToKVPoolAllocatorClass = (
                     current_platform.get_paged_allocator_cls()
+                    or PagedTokenToKVPoolAllocator
                 )
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
