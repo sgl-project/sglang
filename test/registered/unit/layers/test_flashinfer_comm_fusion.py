@@ -7,7 +7,9 @@ import torch
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class _FakeWorkspace:
