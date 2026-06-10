@@ -14,13 +14,13 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-8-gpu-h200")
 
-DEEPSEEK_V3_BASE_MODEL_PATH = "deepseek-ai/DeepSeek-V3-Base"
+DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
 
 class TestTBOWithSharedExpertsFusion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V3_BASE_MODEL_PATH
+        cls.model = DEEPSEEK_V3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
