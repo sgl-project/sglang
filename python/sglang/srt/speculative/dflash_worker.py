@@ -358,7 +358,9 @@ class DFlashWorker:
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
 
-    def on_verify_complete_cpu(self, num_accepted_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
         pass
 
     def clear_cache_pool(self):
