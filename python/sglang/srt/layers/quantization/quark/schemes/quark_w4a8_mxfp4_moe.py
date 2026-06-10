@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
@@ -35,11 +36,12 @@ __all__ = ["QuarkW4A8MXFp4MoE"]
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
-    # Mirror the native MXFP4 path's gate-up-aware shuffle imports
-    # (added on the native path by PR #27201). Both w13 and w2 use the
-    # `_a16w4` family so the AITER `gate_mode=INTERLEAVE` kernel reads
-    # the bytes in the expected layout.
-    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+    from aiter.ops.shuffle import (
+        shuffle_scale,
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
 
 OCP_MX_BLOCK_SIZE = 32
 
@@ -240,38 +242,59 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Gate-up-aware preshuffle for weights and scales, mirroring the
-        # native MXFP4 path post-PR #27201 (`Mxfp4MoEMethod` in
-        # `python/sglang/srt/layers/quantization/mxfp4.py:792-832`) and the
-        # vLLM reference (`vllm/model_executor/layers/fused_moe/oracle/mxfp4.py`).
+        # Mirror native MXFP4 post-load shuffling. The default
+        # `SGLANG_USE_AITER_MOE_GU_ITLV=1` path uses the gate-up-aware
+        # a16w4 layout; the `=0` fallback keeps the separated gate/up layout.
         # The Quark loader (`_load_quark_experts_weights` in
         # `python/sglang/srt/models/gpt_oss.py`) already writes the
         # SEPARATED-layout `[g0..g_{N-1}, u0..u_{N-1}]` buffer per expert,
         # which is exactly the starting state the native path is in after
         # its post-load `.view(e, n//2, 2, k).permute(0, 2, 1, 3)` step.
-        # The `_a16w4` shuffles then reorganize this into the gate/up
-        # tile-interleaved layout the AITER `gate_mode=INTERLEAVE` kernel
-        # reads (`flydsl_moe1_*` + CK `preshuffle_on` families).
-        shuffled_w13_scale = shuffle_scale_a16w4(
-            layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-            self.num_experts,
-            True,  # gate_up
-        )
-        shuffled_w2_scale = shuffle_scale_a16w4(
-            layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-            self.num_experts,
-            False,
-        )
+        if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+            if _is_shuffle_moe_mxfp4:
+                layer.w13_weight.data = shuffle_weight_a16w4(
+                    layer.w13_weight.contiguous(), 16, True
+                )
+                layer.w2_weight.data = shuffle_weight_a16w4(
+                    layer.w2_weight.contiguous(), 16, False
+                )
+            shuffled_w13_scale = shuffle_scale_a16w4(
+                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                self.num_experts,
+                True,
+            )
+            shuffled_w2_scale = shuffle_scale_a16w4(
+                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                self.num_experts,
+                False,
+            )
+        else:
+            if _is_shuffle_moe_mxfp4:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(),
+                    is_guinterleave=False,
+                    gate_up=True,
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(),
+                    is_guinterleave=False,
+                    gate_up=False,
+                )
+            shuffled_w13_scale = shuffle_scale(
+                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                experts_cnt=self.num_experts,
+                is_guinterleave=False,
+                gate_up=True,
+            )
+            shuffled_w2_scale = shuffle_scale(
+                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                experts_cnt=self.num_experts,
+                is_guinterleave=False,
+                gate_up=False,
+            )
 
-        if _is_shuffle_moe_mxfp4:
-            layer.w13_weight.data = shuffle_weight_a16w4(
-                layer.w13_weight.contiguous(), 16, True
-            )
-            layer.w2_weight.data = shuffle_weight_a16w4(
-                layer.w2_weight.contiguous(), 16, False
-            )
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
 
         layer.w13_weight_scale = torch.nn.Parameter(
             shuffled_w13_scale, requires_grad=False
@@ -312,7 +335,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
+        if _use_aiter and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():

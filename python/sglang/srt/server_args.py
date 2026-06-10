@@ -4009,46 +4009,9 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
-            # Quark W4A8 MXFP4-FP8 (MXFP4 weights + static per-tensor FP8
-            # activations) is delivered as a per-expert Quark checkpoint and
-            # is routed to the AITER fused-MoE kernel by QuarkW4A8MXFp4MoE.
-            # Detect it from the Quark `global_quant_config` here (mirrors
-            # `_is_mx_w4a8` in quark.py) so auto backend selection can steer
-            # it onto the same AITER MXFP4 path as native GPT-OSS MXFP4.
-            quark_global_quant = (quantization_config or {}).get(
-                "global_quant_config"
-            ) or {}
-            quark_weight_quant = quark_global_quant.get("weight") or {}
-            quark_input_quant = quark_global_quant.get("input_tensors") or {}
-            is_quark_w4a8_mxfp4_format = (
-                (quantization_config or {}).get("quant_method") == "quark"
-                and quark_weight_quant.get("dtype") == "fp4"
-                and quark_weight_quant.get("qscheme") == "per_group"
-                and quark_weight_quant.get("group_size") == 32
-                and not quark_weight_quant.get("is_dynamic")
-                and quark_weight_quant.get("scale_format") == "e8m0"
-                and quark_input_quant.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
-                and quark_input_quant.get("qscheme") == "per_tensor"
-                and not quark_input_quant.get("is_dynamic")
-            )
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
-
-            # NOTE: A previous version of this block called
-            #   `envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)` to force the
-            # SEPARATED gate/up layout for the gpt-oss AITER MXFP4 path
-            # (both native and Quark W4A8). That was load-bearing while
-            # `Mxfp4MoEMethod.process_weights_after_loading` and
-            # `QuarkW4A8MXFp4MoE.process_weights_after_loading` produced
-            # SEPARATED-layout bytes via `shuffle_weight(w, (16, 16))` and
-            # the SEPARATED FlyDSL `flydsl_moe1_*` kernel was the only
-            # tuned dispatch. Both `process_weights_after_loading`
-            # implementations now use the gate-up-aware `shuffle_weight_a16w4`
-            # / `shuffle_scale_a16w4` family (PR #27201 for native MXFP4,
-            # follow-up for Quark W4A8) which matches the INTERLEAVE
-            # gate_mode kernel family. The auto-set is gone so the global
-            # default (INTERLEAVE) wins.
 
             if self.moe_runner_backend == "auto":
                 if is_sm100_supported() and is_mxfp4_quant_format:
@@ -4062,22 +4025,20 @@ class ServerArgs:
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
                     )
-                elif (is_hip() and envs.SGLANG_USE_AITER.get()) and (
-                    is_mxfp4_quant_format or is_quark_w4a8_mxfp4_format
-                ):
-                    # The Quark W4A8 MXFP4-FP8 MoE scheme only builds its
-                    # `self.runner` when the resolved backend is AITER, so we
-                    # must steer auto-resolution onto the aiter path here
-                    # (`MoeRunnerBackend.AITER` is picked downstream when the
-                    # backend is left at "auto" and AITER is supported).
+                elif (
+                    is_hip() and envs.SGLANG_USE_AITER.get()
+                ) and is_mxfp4_quant_format:
                     self.moe_runner_backend = "auto"
                     logger.warning(
-                        "Detected ROCm and MXFP4 (native or Quark W4A8) "
-                        "quantization format for GPT-OSS model, enabling "
-                        "aiter MXFP4 MOE kernel."
+                        "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
-                    # Keep the default gate/up INTERLEAVE layout selected by
-                    # the native MXFP4 AITER path.
+                    ## The AITER MXFP4 fused-MoE path for GPT-OSS expects the
+                    ## SEPARATED gate/up tile layout (matches the
+                    ## `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+                    ## Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
+                    ## callers default to INTERLEAVE; opt this path out
+                    ## unless the user explicitly overrode it.
+                    # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
