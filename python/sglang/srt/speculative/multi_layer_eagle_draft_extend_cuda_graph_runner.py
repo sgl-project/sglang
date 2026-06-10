@@ -576,7 +576,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             + (bs - raw_bs) * self.seq_len_fill_value,
             seq_lens_cpu=buffers.seq_lens_cpu,
             encoder_lens=None,
-            out_cache_loc=forward_batch.out_cache_loc,
+            # per-step write target (advanced in-graph by assign_new_state);
+            # forward_batch.out_cache_loc is frozen at step 0.
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
             spec_info=forward_batch.spec_info,
         )
         self.eagle_worker.draft_extend_attn_backend_list[

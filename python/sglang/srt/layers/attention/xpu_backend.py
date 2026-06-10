@@ -390,6 +390,12 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
+            if forward_batch.out_cache_loc is not None:
+                metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
+                )
 
         if self.use_mla:
             workspace_size = flash_mla_get_workspace_size(
@@ -416,6 +422,12 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
+            if forward_batch.out_cache_loc is not None:
+                metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
+                )
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
@@ -464,7 +476,17 @@ class XPUAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if not self.use_mla:
+                if self.use_sliding_window_kv_pool:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    )
+                elif not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
@@ -766,7 +788,17 @@ class XPUAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if not self.use_mla:
+                if self.use_sliding_window_kv_pool:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    )
+                elif not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )

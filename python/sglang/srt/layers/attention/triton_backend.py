@@ -82,6 +82,8 @@ class ForwardMetadata:
     window_kv_offsets: torch.Tensor
     # Separate attn_logits for SWA layers when v_head_dim differs
     swa_attn_logits: Optional[torch.Tensor] = None
+    # full->SWA translated out_cache_loc (SWA KV-store write target)
+    swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -124,6 +126,7 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -521,8 +524,9 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
+            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
-                bs, forward_mode, spec_info
+                bs, forward_mode, spec_info, swa_out_cache_loc
             )
         else:
             self._apply_cuda_graph_metadata(
@@ -532,6 +536,29 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
+            # Metadata view is reused from capture; just refill the buffer.
+            self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
+
+    def _fill_cuda_graph_swa_out_cache_loc(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """Refill the SWA write-target buffer from the live out_cache_loc and
+        return the [:n] view (None for non-SWA / multi-step draft), so the
+        captured store reads fresh slots on replay."""
+        if not self.use_sliding_window_kv_pool:
+            return None
+        out_cache_loc = forward_batch.out_cache_loc
+        if (
+            out_cache_loc is None
+            or out_cache_loc.shape[0] > self.cuda_graph_swa_out_cache_loc.shape[0]
+        ):
+            return None
+        n = out_cache_loc.shape[0]
+        self.cuda_graph_swa_out_cache_loc[n:].zero_()
+        self.cuda_graph_swa_out_cache_loc[:n].copy_(
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+        )
+        return self.cuda_graph_swa_out_cache_loc[:n]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -742,6 +769,12 @@ class TritonAttnBackend(AttentionBackend):
                 max_extend_len = int(forward_batch.extend_seq_lens.max())
             num_kv_splits = None
 
+        swa_out_cache_loc = None
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -757,6 +790,7 @@ class TritonAttnBackend(AttentionBackend):
             window_num_kv_splits,
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
+            swa_out_cache_loc=swa_out_cache_loc,
         )
 
     def init_cuda_graph_state(
@@ -839,11 +873,20 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.use_sliding_window_kv_pool:
+            # SWA write-target buffer; refilled at replay from out_cache_loc.
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
+                (max_num_tokens,),
+                dtype=torch.int64,
+                device=self.device,
+            )
+
     def _build_cuda_graph_forward_metadata(
         self,
         bs: int,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        swa_out_cache_loc: Optional[torch.Tensor] = None,
     ) -> ForwardMetadata:
         """Construct ForwardMetadata from the current cuda-graph buffer state.
 
@@ -851,7 +894,8 @@ class TritonAttnBackend(AttentionBackend):
         (either via replay or directly).  All fields reference the same
         self.cuda_graph_* tensors that the captured graph kernels will
         read — the Python object is rebuilt each capture, but the underlying
-        GPU memory addresses are stable.
+        GPU memory addresses are stable. ``swa_out_cache_loc`` is the
+        pre-allocated SWA write-target buffer view (or None for non-SWA).
         """
         swa = self.sliding_window_size is not None and self.sliding_window_size > 0
         if forward_mode.is_decode_or_idle():
@@ -872,6 +916,7 @@ class TritonAttnBackend(AttentionBackend):
                 ),
                 window_kv_offsets=None,
                 swa_attn_logits=self.cuda_graph_swa_attn_logits,
+                swa_out_cache_loc=swa_out_cache_loc,
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
@@ -896,6 +941,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.cuda_graph_window_num_kv_splits if swa else None
                 ),
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
+                swa_out_cache_loc=swa_out_cache_loc,
             )
         elif forward_mode.is_draft_extend(include_v2=True):
             return ForwardMetadata(
@@ -920,6 +966,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_indices=None,
                 window_num_kv_splits=None,
                 window_kv_offsets=None,
+                swa_out_cache_loc=swa_out_cache_loc,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
@@ -1006,7 +1053,27 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
-                if layer.k_scale is None:
+                if self.use_sliding_window_kv_pool:
+                    # SWA pool (never MLA); clone k,v when scaling, as below.
+                    if layer.k_scale is None:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.out_cache_loc,
+                            k,
+                            v,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        )
+                    else:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.out_cache_loc,
+                            k.clone(),
+                            v.clone(),
+                            layer.k_scale,
+                            layer.v_scale,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        )
+                elif layer.k_scale is None:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         forward_batch.out_cache_loc,
@@ -1269,6 +1336,16 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.out_cache_loc,
                     k,
                     v,
+                )
+            elif self.use_sliding_window_kv_pool:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    swa_loc=self.forward_metadata.swa_out_cache_loc,
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
