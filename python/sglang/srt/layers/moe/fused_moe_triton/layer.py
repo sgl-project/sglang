@@ -286,9 +286,17 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         self.supports_deferred_finalize = (
-            server_args.enable_moe_deferred_finalize
+            server_args.enable_moe_deferred_finalize_requested
+            and get_moe_runner_backend().is_flashinfer_trtllm()
             and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
         )
+        if server_args.enable_moe_deferred_finalize_requested:
+            print_info_once(
+                "FlashInfer TRTLLM MoE deferred finalize is "
+                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"(moe_runner_backend={server_args.moe_runner_backend}, "
+                f"quant_method={type(self.quant_method).__name__})."
+            )
 
         self.quant_method.create_weights(
             layer=self,
