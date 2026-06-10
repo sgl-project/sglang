@@ -38,10 +38,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.base import (
     RealtimeDiffusionStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.input_validation import (
     RealtimeInputValidationStage,
     RealtimeInputValidationState,
 )
@@ -74,8 +74,14 @@ class _State(BaseRealtimeState):
         self.disposed = True
 
 
+class _TestRealtimeDiffusionStage(RealtimeDiffusionStage):
+    def forward(self, batch, component_manager=None):
+        del batch, component_manager
+        raise NotImplementedError
+
+
 def test_realtime_diffusion_stage_declares_long_lived_components():
-    stage = RealtimeDiffusionStage()
+    stage = _TestRealtimeDiffusionStage()
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(dit_precision="bf16", vae_precision="fp32")
     )
@@ -93,7 +99,7 @@ def test_realtime_diffusion_stage_declares_long_lived_components():
 
 
 def test_realtime_diffusion_stage_requires_session():
-    stage = RealtimeDiffusionStage(default_height=480, default_width=832)
+    stage = _TestRealtimeDiffusionStage(default_height=480, default_width=832)
     req = _Req(session=None)
 
     try:
@@ -884,7 +890,7 @@ def test_realtime_chunk_latent_preparation_uses_chunk_spec():
 
     import torch
 
-    from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
         RealtimeChunkLatentPreparationStage,
     )
 
