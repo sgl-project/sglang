@@ -899,7 +899,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         return base_aligned and stride % page_size_bytes == 0
 
 
-class MiMoMHATokenToKVPoolHost(MHATokenToKVPoolHost):
+class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     """Host KV pool for MHA models whose K and V have different head dims
     (``head_dim != v_head_dim``), e.g. MiMo-V2.
 
@@ -1107,11 +1107,11 @@ class MiMoMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 def get_mha_host_pool_cls(device_pool: "MHATokenToKVPool") -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
 
-    Returns ``MiMoMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
+    Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
     if device_pool.head_dim != device_pool.v_head_dim:
-        return MiMoMHATokenToKVPoolHost
+        return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost
 
 

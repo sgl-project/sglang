@@ -451,7 +451,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         # Wrap the host-pool factory (not MHATokenToKVPoolHost directly)
         # because the assembler picks between MHATokenToKVPoolHost and
-        # MiMoMHATokenToKVPoolHost via get_mha_host_pool_cls(device_pool).
+        # AsymmetricMHATokenToKVPoolHost via get_mha_host_pool_cls(device_pool).
         orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
 
         def get_mha_host_pool_cls_wrapper(device_pool):
@@ -2287,7 +2287,7 @@ class UnifiedRadixCacheSuite:
 
         # See _init_hicache: wrap the factory rather than MHATokenToKVPoolHost
         # directly so the pin_memory=False override applies to both
-        # MHATokenToKVPoolHost and MiMoMHATokenToKVPoolHost.
+        # MHATokenToKVPoolHost and AsymmetricMHATokenToKVPoolHost.
         orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
         orig_mamba_host_pool = assembler.MambaPoolHost
 
