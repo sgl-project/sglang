@@ -362,9 +362,7 @@ class NGRAMWorker:
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
 
         verify_input: NgramVerifyInput = batch.spec_info
-        accept_lens = torch.tensor([1] * bs, dtype=torch.int32, device=self.device)
-        num_correct_drafts = 0
-        num_correct_drafts_per_req_cpu = None
+        accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
@@ -486,8 +484,6 @@ class NGRAMWorker:
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
-            num_correct_drafts=num_correct_drafts,
-            num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
             # Consumed by the non-overlap V2 scheduler branch to advance
