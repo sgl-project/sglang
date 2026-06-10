@@ -245,7 +245,7 @@ jobs:
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
-      runner: linux-aarch64-a3-0
+      runner: linux-amd64-cpu-8
       test_type: ${{ matrix.test_config.test_type }}
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
@@ -273,7 +273,7 @@ jobs:
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
-      runner: linux-aarch64-a3-0
+      runner: linux-amd64-cpu-8
       test_type: ${{ matrix.test_config.test_type }}
       test_config_name: ${{ matrix.test_config.name }}
       node_size: ${{ matrix.test_config.node_size }}
