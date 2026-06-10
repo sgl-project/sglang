@@ -661,6 +661,7 @@ class LTX2Attention(nn.Module):
         all_perturbed: bool = False,
         skip_sequence_parallel_override: bool = False,
         gather_context_kv_for_sp: bool = False,
+        context_replicated_prefix_len: int = 0,
     ) -> torch.Tensor:
         gate_input = x
         context_ = x if context is None else context
@@ -701,13 +702,38 @@ class LTX2Attention(nn.Module):
             k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
 
             if gather_context_kv_for_sp:
-                k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
-                v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
-                gathered_mask = None
-                if mask is not None:
-                    gathered_mask = sequence_model_parallel_all_gather(
-                        mask.contiguous(), dim=1
+                # Replicated prefix (e.g. JoyEcho memory) is identical on every rank; only gather the sharded suffix.
+                if context_replicated_prefix_len > 0:
+                    prefix = int(context_replicated_prefix_len)
+                    k_prefix, k_suffix = k[:, :prefix], k[:, prefix:]
+                    v_prefix, v_suffix = v[:, :prefix], v[:, prefix:]
+                    k_full = torch.cat(
+                        [
+                            k_prefix,
+                            sequence_model_parallel_all_gather(
+                                k_suffix.contiguous(), dim=1
+                            ),
+                        ],
+                        dim=1,
                     )
+                    v_full = torch.cat(
+                        [
+                            v_prefix,
+                            sequence_model_parallel_all_gather(
+                                v_suffix.contiguous(), dim=1
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    gathered_mask = mask
+                else:
+                    k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
+                    v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
+                    gathered_mask = None
+                    if mask is not None:
+                        gathered_mask = sequence_model_parallel_all_gather(
+                            mask.contiguous(), dim=1
+                        )
                 if self.use_local_attention:
                     out = self.attn(q, k_full, v_full, attn_mask=gathered_mask)
                 else:
@@ -1006,6 +1032,7 @@ class LTX2TransformerBlock(nn.Module):
         a2v_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
         v2a_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
         audio_replicated_for_sp: bool = False,
+        video_memory_prefix_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         batch_size = hidden_states.size(0)
@@ -1024,6 +1051,7 @@ class LTX2TransformerBlock(nn.Module):
             perturbation_mask=video_self_attn_perturbation_mask,
             all_perturbed=skip_video_self_attn,
             gather_context_kv_for_sp=audio_replicated_for_sp,
+            context_replicated_prefix_len=video_memory_prefix_len,
         )
         hidden_states = hidden_states + attn_hidden_states * vgate_msa
 
@@ -1208,6 +1236,7 @@ class LTX2TransformerBlock(nn.Module):
                 k_pe=ca_video_rotary_emb,
                 mask=v2a_cross_attention_mask,
                 gather_context_kv_for_sp=audio_replicated_for_sp,
+                context_replicated_prefix_len=video_memory_prefix_len,
             )
             if v2a_cross_attn_perturbation_mask is not None:
                 v2a_attn_hidden_states = (
@@ -1633,6 +1662,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         disable_a2v_cross_attn: bool = False,
         disable_v2a_cross_attn: bool = False,
         audio_replicated_for_sp: bool = False,
+        video_memory_prefix_len: int = 0,
         late_layer_ratio: float = 1.0,
         late_audio_self_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -1929,6 +1959,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 a2v_cross_attn_perturbation_mask=a2v_cross_attn_perturbation_mask,
                 v2a_cross_attn_perturbation_mask=v2a_cross_attn_perturbation_mask,
                 audio_replicated_for_sp=audio_replicated_for_sp,
+                video_memory_prefix_len=video_memory_prefix_len,
             )
 
         # 6. Output layers

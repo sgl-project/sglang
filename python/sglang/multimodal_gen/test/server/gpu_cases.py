@@ -437,19 +437,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
-        "joy_echo_t2v",
-        DiffusionServerArgs(
-            model_path="jdopensource/JoyAI-Echo",
-            env_vars={
-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            },
-        ),
-        JOY_ECHO_T2V_CI_sampling_params,
-        run_perf_check=False,
-        run_consistency_check=False,
-        run_component_accuracy_check=False,
-    ),
-    DiffusionTestCase(
         "lingbot_world_realtime_plastic_beach",
         DiffusionServerArgs(
             model_path="robbyant/lingbot-world-fast-diffusers",
@@ -645,6 +632,20 @@ TWO_GPU_CASES = [
             prompt=T2V_PROMPT,
             output_size="832x480",
         ),
+    ),
+    DiffusionTestCase(
+        "joy_echo_t2v_2gpu",
+        DiffusionServerArgs(
+            model_path="jdopensource/JoyAI-Echo",
+            extras=["--ulysses-degree=2"],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        JOY_ECHO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_cfg_parallel",

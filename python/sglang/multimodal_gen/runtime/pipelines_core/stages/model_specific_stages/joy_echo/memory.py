@@ -433,7 +433,15 @@ def build_memory_video_rope_coords(
     fps: float,
     memory_position_mode: str,
     memory_downscale_factor: int = 1,
+    sp_target_start_offset: int = 0,
 ) -> torch.Tensor:
+    """Build [memory | target] video RoPE coordinates.
+
+    Under sequence parallelism the target video latents are time-sharded, so
+    ``target_num_frames`` is the *local* shard frame count and
+    ``sp_target_start_offset`` is the global frame index of this rank's first
+    target frame. The memory prefix is replicated (full) on every rank.
+    """
     tokens_per_latent_frame = int(latent_height) * int(latent_width)
     if tokens_per_latent_frame <= 0:
         raise ValueError(
@@ -461,7 +469,7 @@ def build_memory_video_rope_coords(
 
     target_start_frame = (
         memory_latent_frames if position_mode == "prefix_continuous" else 0
-    )
+    ) + int(sp_target_start_offset)
     target_coords = rope.prepare_video_coords(
         batch_size=batch_size,
         num_frames=target_num_frames,

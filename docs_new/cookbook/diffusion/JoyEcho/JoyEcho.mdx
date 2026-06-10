@@ -16,6 +16,7 @@ Use `jdopensource/JoyAI-Echo` as `--model-path`. SGLang loads the monolithic rel
 | Pipeline | `LTX2Pipeline` / `LTX2TwoStageHQPipeline` | `JoyEchoPipeline` (default for this model) |
 | Denoising | Multi-step flow matching + CFG | LTX-2 DMD distilled path (8 steps, `guidance_scale=1.0`) |
 | Multi-shot | Not supported | Paired audio–video memory bank across shots |
+| Sequence parallelism | LTX-2 SP (video/audio sharded) | Ulysses SP (`ulysses_degree=2`): single-shot and multi-shot + memory bank |
 | Post-processing | Optional two-stage HQ upscaling | Per-shot mp4 output |
 
 <Warning>
@@ -47,7 +48,7 @@ Optional environment variable for long runs:
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
-For multi-GPU serving, tensor parallelism (TP) is supported. Sequence parallelism (SP / Ulysses) works for **single-shot runs with `enable_memory_bank=false`**. Multi-shot generation with SP is planned for a follow-up change.
+For multi-GPU serving, tensor parallelism (TP) and **Ulysses sequence parallelism (SP)** are supported. JoyEcho SP uses an **asymmetric layout**: video target latents are time-sharded across ranks, while audio (including memory tokens) is **replicated** on every rank so cross-attention stays temporally aligned. Multi-shot runs with `enable_memory_bank=true` are supported on SP.
 
 ```bash
 sglang serve \
@@ -55,6 +56,10 @@ sglang serve \
   --num-gpus 2 \
   --ulysses-degree 2
 ```
+
+<Note>
+JoyEcho SP currently targets **Ulysses-only** parallelism (`ulysses_degree=2`, `ring_degree=1`). Ring SP is not validated for this pipeline. For `sglang generate`, add `--num-gpus 2 --ulysses-degree 2` to the commands in section 4.
+</Note>
 
 ## 4. Model Invocation
 
@@ -163,5 +168,6 @@ Set `enable_memory_bank=false` when you want independent shots without cross-sho
 - Use `--num-inference-steps 8` and `--guidance-scale 1.0` to match the official JoyEcho DMD distilled path.
 - Multi-shot prompts can be passed as a `prompt` list, via `prompt_path`, or as sequential API calls on the same server instance.
 - The memory bank caps at **7 slots**; from shot 8 onward the oldest slots roll off.
-- For distributed inference today, prefer **TP** for multi-shot runs. Use **SP/Ulysses** only with `enable_memory_bank=false` on single-shot workloads until multi-shot SP support lands.
+- For **2-GPU latency**, try **Ulysses SP** (`--num-gpus 2 --ulysses-degree 2`) on both single-shot and multi-shot runs. Use **TP** when you need a different sharding strategy or more than two GPUs.
+- Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for long multi-shot SP sessions.
 - JoyEcho outputs per-shot mp4 files with synchronized audio. There is no built-in two-stage HQ upscaling path like LTX-2.3 HQ.

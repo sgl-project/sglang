@@ -34,22 +34,50 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         server_args: ServerArgs,
     ) -> LTX2DenoisingContext:
         ctx = super()._prepare_denoising_loop(batch, server_args)
-        if batch.enable_memory_bank or get_sp_world_size() <= 1:
+        if get_sp_world_size() <= 1:
             return ctx
-        if (
-            ctx.is_ltx23_variant
-            and server_args.pipeline_config.can_shard_audio_latents_for_sp(
-                batch.audio_latents
-            )
-        ):
-            (
-                batch.audio_latents,
-                batch.did_sp_shard_audio_latents,
-            ) = server_args.pipeline_config.shard_audio_latents_for_sp(
-                batch, batch.audio_latents
-            )
-            ctx.audio_latents = batch.audio_latents
+        # JoyEcho DMD: shard video on time, replicate full audio on every rank.
+        # Dual-sharding audio+video adds heavy a2v/v2a all_gather per layer; shot 1
+        # already uses this layout when memory is injected.
+        ctx.replicate_audio_for_sp = True
+        batch.ltx23_audio_replicated_for_sp = True
+        batch.did_sp_shard_audio_latents = False
         return ctx
+
+    @staticmethod
+    def _zero_sp_shard_padding(
+        latents: torch.Tensor,
+        *,
+        valid_token_count: int | None,
+    ) -> torch.Tensor:
+        if (
+            valid_token_count is None
+            or int(valid_token_count) >= int(latents.shape[1])
+        ):
+            return latents
+        latents = latents.clone()
+        latents[:, int(valid_token_count) :, :] = 0.0
+        return latents
+
+    @staticmethod
+    def _expand_sp_token_timestep(
+        timestep: torch.Tensor,
+        *,
+        batch_size: int,
+        seq_len: int,
+        valid_token_count: int | None,
+    ) -> torch.Tensor:
+        """Expand legacy [B] timesteps to [B, S] and zero SP padding tokens."""
+        if timestep.ndim >= 2 and int(timestep.shape[1]) == int(seq_len):
+            ts = timestep
+        elif timestep.ndim == 1:
+            ts = timestep.view(batch_size, 1).expand(batch_size, int(seq_len))
+        else:
+            ts = timestep
+        if valid_token_count is not None and int(valid_token_count) < int(seq_len):
+            ts = ts.clone()
+            ts[:, int(valid_token_count) :] = 0.0
+        return ts
 
     def _prepare_ltx2_model_inputs(
         self,
@@ -62,23 +90,18 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         model_inputs = super()._prepare_ltx2_model_inputs(
             ctx, step, batch, server_args, sigma
         )
-        if not getattr(batch, "did_sp_shard_audio_latents", False):
+        if not batch.did_sp_shard_latents:
             return model_inputs
 
         batch_size = int(model_inputs.latent_model_input.shape[0])
+        seq_v = int(model_inputs.latent_model_input.shape[1])
+        video_valid = batch.sp_video_valid_token_count
         video_self_attention_mask = self._build_ltx2_sp_padding_mask(
             batch,
-            seq_len=int(model_inputs.latent_model_input.shape[1]),
+            seq_len=seq_v,
             batch_size=batch_size,
             key="sp_video_valid_token_count",
             device=model_inputs.latent_model_input.device,
-        )
-        audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
-            batch,
-            seq_len=model_inputs.audio_num_frames_latent,
-            batch_size=batch_size,
-            key="sp_audio_valid_token_count",
-            device=model_inputs.audio_latent_model_input.device,
         )
         video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
             step.current_model,
@@ -88,20 +111,53 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             height=ctx.latent_height,
             width=ctx.latent_width,
         )
-        audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
-            step.current_model,
-            batch,
-            model_inputs.audio_latent_model_input,
-            num_frames=model_inputs.audio_num_frames_latent,
+        timestep_video = self._expand_sp_token_timestep(
+            model_inputs.timestep_video,
+            batch_size=batch_size,
+            seq_len=seq_v,
+            valid_token_count=int(video_valid) if video_valid is not None else None,
         )
+
+        audio_self_attention_mask = model_inputs.audio_self_attention_mask
+        audio_coords = model_inputs.audio_coords
+        timestep_audio = model_inputs.timestep_audio
+        a2v_cross_attention_mask = model_inputs.a2v_cross_attention_mask
+        v2a_cross_attention_mask = video_self_attention_mask
+
+        if batch.did_sp_shard_audio_latents:
+            seq_a = int(model_inputs.audio_num_frames_latent)
+            audio_valid = batch.sp_audio_valid_token_count
+            audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
+                batch,
+                seq_len=seq_a,
+                batch_size=batch_size,
+                key="sp_audio_valid_token_count",
+                device=model_inputs.audio_latent_model_input.device,
+            )
+            audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
+                step.current_model,
+                batch,
+                model_inputs.audio_latent_model_input,
+                num_frames=model_inputs.audio_num_frames_latent,
+            )
+            timestep_audio = self._expand_sp_token_timestep(
+                model_inputs.timestep_audio,
+                batch_size=batch_size,
+                seq_len=seq_a,
+                valid_token_count=int(audio_valid) if audio_valid is not None else None,
+            )
+            a2v_cross_attention_mask = audio_self_attention_mask
+
         return dataclasses.replace(
             model_inputs,
             video_coords=video_coords,
             audio_coords=audio_coords,
+            timestep_video=timestep_video,
+            timestep_audio=timestep_audio,
             video_self_attention_mask=video_self_attention_mask,
             audio_self_attention_mask=audio_self_attention_mask,
-            a2v_cross_attention_mask=audio_self_attention_mask,
-            v2a_cross_attention_mask=video_self_attention_mask,
+            a2v_cross_attention_mask=a2v_cross_attention_mask,
+            v2a_cross_attention_mask=v2a_cross_attention_mask,
         )
 
     def _build_ltx2_base_model_kwargs(
@@ -111,7 +167,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         model_inputs: LTX2ModelInputs,
     ) -> dict[str, object]:
         kwargs = super()._build_ltx2_base_model_kwargs(ctx, batch, model_inputs)
-        if not getattr(batch, "did_sp_shard_audio_latents", False):
+        if not batch.did_sp_shard_latents:
             return kwargs
         kwargs.update(
             {
@@ -119,7 +175,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 "audio_self_attention_mask": model_inputs.audio_self_attention_mask,
                 "a2v_cross_attention_mask": model_inputs.a2v_cross_attention_mask,
                 "v2a_cross_attention_mask": model_inputs.v2a_cross_attention_mask,
-                "audio_replicated_for_sp": False,
+                "audio_replicated_for_sp": bool(ctx.replicate_audio_for_sp),
                 "legacy_ltx23_one_stage_semantics": False,
             }
         )
@@ -137,6 +193,60 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         elif sigma_t.ndim == 2:
             sigma_t = sigma_t.reshape(*sigma_t.shape, *[1] * (original.ndim - 2))
         return (1.0 - sigma_t) * original + sigma_t * noise
+
+    def _sample_sp_consistent_noise(
+        self,
+        local_reference: torch.Tensor,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        shard_video: bool,
+        shard_audio: bool,
+    ) -> torch.Tensor:
+        """Sample renoise on the global latent layout, then shard for SP."""
+        if shard_video:
+            raw_shape = batch.raw_latent_shape
+            if not (isinstance(raw_shape, tuple) and len(raw_shape) == 3):
+                raise ValueError(
+                    "SP DMD renoise requires packed video `batch.raw_latent_shape`."
+                )
+            full_reference = torch.empty(
+                tuple(raw_shape),
+                device=local_reference.device,
+                dtype=local_reference.dtype,
+            )
+            full_noise = self._randn_like_with_batch_generators(
+                full_reference, batch
+            )
+            sharded_noise, _ = server_args.pipeline_config.shard_latents_for_sp(
+                batch, full_noise
+            )
+            return sharded_noise
+
+        if shard_audio:
+            orig_audio_len = batch.sp_audio_orig_num_frames
+            if orig_audio_len <= 0:
+                raise ValueError(
+                    "SP DMD renoise requires `batch.sp_audio_orig_num_frames`."
+                )
+            full_reference = torch.empty(
+                (
+                    int(local_reference.shape[0]),
+                    int(orig_audio_len),
+                    int(local_reference.shape[2]),
+                ),
+                device=local_reference.device,
+                dtype=local_reference.dtype,
+            )
+            full_noise = self._randn_like_with_batch_generators(
+                full_reference, batch
+            )
+            sharded_noise, _ = server_args.pipeline_config.shard_audio_latents_for_sp(
+                batch, full_noise
+            )
+            return sharded_noise
+
+        return self._randn_like_with_batch_generators(local_reference, batch)
 
     @staticmethod
     def _apply_memory_prefix_to_timestep(
@@ -230,7 +340,22 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
 
         device = latent_model_input.device
         batch_size = int(latent_model_input.shape[0])
-        # a2v: video queries attend to audio keys -> [B, V, A]
+
+        sp_world_size = get_sp_world_size()
+        sp_on = sp_world_size > 1 and batch.did_sp_shard_latents
+        if sp_on:
+            target_video_full_len = int(target_video_len) * int(sp_world_size)
+            raw_shape = batch.raw_latent_shape
+            if isinstance(raw_shape, tuple) and len(raw_shape) == 3:
+                target_video_valid_len = int(raw_shape[1])
+            else:
+                target_video_valid_len = target_video_full_len
+            sp_target_start_offset = batch.sp_video_start_frame
+        else:
+            target_video_full_len = target_video_len
+            target_video_valid_len = target_video_len
+            sp_target_start_offset = 0
+
         a2v_mask = build_paired_memory_cross_mask(
             batch_size=batch_size,
             query_memory_seq_len=memory_video_len,
@@ -241,17 +366,28 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             device=device,
             kv_segment_lengths=memory_info.get("memory_audio_segment_lengths"),
         )
-        # v2a: audio queries attend to video keys -> [B, A, V]
         v2a_mask = build_paired_memory_cross_mask(
             batch_size=batch_size,
             query_memory_seq_len=memory_audio_len,
             query_target_seq_len=target_audio_len,
             kv_memory_seq_len=memory_video_len,
-            kv_target_seq_len=target_video_len,
+            kv_target_seq_len=target_video_full_len,
             num_memory_slots=num_memory_slots,
             device=device,
             query_segment_lengths=memory_info.get("memory_audio_segment_lengths"),
         )
+        video_self_attention_mask = None
+        if sp_on and target_video_full_len > target_video_valid_len:
+            v2a_mask[:, :, memory_video_len + target_video_valid_len :] = False
+        if sp_on:
+            vself_len = memory_video_len + target_video_full_len
+            video_self_attention_mask = torch.ones(
+                (batch_size, vself_len), device=device, dtype=torch.bool
+            )
+            if target_video_full_len > target_video_valid_len:
+                video_self_attention_mask[
+                    :, memory_video_len + target_video_valid_len :
+                ] = False
         audio_self_attention_mask = build_memory_self_attention_block_mask(
             batch_size=batch_size,
             memory_seq_len=memory_audio_len,
@@ -279,6 +415,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 memory_info.get("memory_position_mode", memory_position_mode)
             ),
             memory_downscale_factor=int(memory_info.get("memory_downscale_factor", 1)),
+            sp_target_start_offset=sp_target_start_offset,
         )
         audio_coords = build_memory_audio_rope_coords(
             audio_rope=step_model.audio_rope,
@@ -302,7 +439,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 timestep_audio=timestep_audio,
                 prompt_timestep_video=model_inputs.prompt_timestep_video,
                 prompt_timestep_audio=model_inputs.prompt_timestep_audio,
-                video_self_attention_mask=None,
+                video_self_attention_mask=video_self_attention_mask,
                 audio_self_attention_mask=audio_self_attention_mask,
                 a2v_cross_attention_mask=a2v_mask,
                 v2a_cross_attention_mask=v2a_mask,
@@ -311,6 +448,8 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 "memory_video_len": memory_video_len,
                 "memory_audio_len": memory_audio_len,
                 "late_layer_ratio": late_layer_ratio,
+                "audio_replicated_for_sp": sp_on,
+                "video_memory_prefix_len": memory_video_len if sp_on else 0,
             },
         )
 
@@ -375,6 +514,12 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             model_kwargs["v2a_cross_attention_mask"] = (
                 model_inputs.v2a_cross_attention_mask
             )
+            model_kwargs["audio_replicated_for_sp"] = memory_meta[
+                "audio_replicated_for_sp"
+            ]
+            model_kwargs["video_memory_prefix_len"] = memory_meta[
+                "video_memory_prefix_len"
+            ]
 
         with self._ltx2_model_forward_context(ctx, step):
             model_video, model_audio = step.current_model(**model_kwargs)
@@ -395,11 +540,19 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         denoised_video = self._ltx2_apply_clean_latent_mask(denoised_video, ctx)
 
         if sigma_next_val > 0.0:
-            video_noise = self._randn_like_with_batch_generators(
-                ctx.latents, batch
+            video_noise = self._sample_sp_consistent_noise(
+                ctx.latents,
+                batch,
+                server_args,
+                shard_video=batch.did_sp_shard_latents,
+                shard_audio=False,
             ).float()
-            audio_noise = self._randn_like_with_batch_generators(
-                ctx.audio_latents, batch
+            audio_noise = self._sample_sp_consistent_noise(
+                ctx.audio_latents,
+                batch,
+                server_args,
+                shard_video=False,
+                shard_audio=batch.did_sp_shard_audio_latents,
             ).float()
             next_video_latents = self._dmd_add_noise(
                 denoised_video, video_noise, sigma_next
@@ -410,6 +563,17 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         else:
             next_video_latents = denoised_video.to(dtype=ctx.latents.dtype)
             next_audio_latents = denoised_audio.to(dtype=ctx.audio_latents.dtype)
+
+        if batch.did_sp_shard_latents:
+            next_video_latents = self._zero_sp_shard_padding(
+                next_video_latents,
+                valid_token_count=batch.sp_video_valid_token_count,
+            )
+        if batch.did_sp_shard_audio_latents:
+            next_audio_latents = self._zero_sp_shard_padding(
+                next_audio_latents,
+                valid_token_count=batch.sp_audio_valid_token_count,
+            )
 
         ctx.latents = next_video_latents
         ctx.audio_latents = next_audio_latents
