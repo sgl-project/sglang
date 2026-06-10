@@ -205,7 +205,6 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorkerV2
         elif self.is_ngram():
-            # NOTE: NgramWorker only supports spec v2, no longer supports spec v1
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
