@@ -732,6 +732,7 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    kv_sharing_fast_prefill: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -6472,6 +6473,14 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--kv-sharing-fast-prefill",
+            action="store_true",
+            help="Enable YOCO fast-prefill for KV-sharing models (Gemma4 "
+            "E2B/E4B): skip Q-side compute for non-last prefill tokens in the "
+            "KV-shared (cross-decoder) layers. No-op on models that do not "
+            "share KV layers.",
         )
         parser.add_argument(
             "--kv-canary",

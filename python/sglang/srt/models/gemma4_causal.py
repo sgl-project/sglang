@@ -52,6 +52,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -864,6 +865,22 @@ class Gemma4TextModel(PreTrainedModel):
         else:
             self.norm = PPMissingLayer()
         self.layers_to_capture = []
+
+        # Static part of the fast-prefill gate, evaluated once: the opt-in
+        # flag, KV-sharing config, PP, and speculative decoding. The
+        # batch-dependent conditions are checked per-forward in
+        # _enable_fast_prefill.
+        # NOTE: spec decoding (EAGLE3, FROZEN_KV_MTP) captures hidden states
+        # for tokens we would otherwise drop; disable for now.
+        num_kv_shared_layers = int(getattr(config, "num_kv_shared_layers", 0))
+        self.first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared_layers
+        self.fast_prefill_supported = (
+            get_global_server_args().kv_sharing_fast_prefill
+            and num_kv_shared_layers > 0
+            and self.pp_group.world_size == 1
+            and get_global_server_args().speculative_algorithm is None
+        )
+
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -940,6 +957,113 @@ class Gemma4TextModel(PreTrainedModel):
         # Combine: (projection + per_layer_inputs) * scale
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
+    # YOCO fast-prefill split (You Only Cache Once, arXiv:2405.05254).
+    #
+    # Gemma4 E2B / E4B set num_kv_shared_layers > 0: the last K of N
+    # decoder layers reuse KV state from earlier layers. During prefill
+    # they don't write KV, yet the baseline still runs full Q-side compute
+    # for every token. Only the last-token-per-request rows feed the LM
+    # head (logits read hidden_states[cumsum(extend_seq_lens) - 1]), so we
+    # truncate hidden_states / positions to those rows before the shared-KV
+    # layers. Attention still reads the full cached K/V; only the Q-side
+    # compute shrinks by extend_total / num_reqs.
+
+    def _enable_fast_prefill(self, forward_batch: ForwardBatch) -> bool:
+        if not self.fast_prefill_supported:
+            return False
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            return False
+        ex_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if ex_seq_lens_cpu is None or len(ex_seq_lens_cpu) == 0:
+            return False
+        if max(ex_seq_lens_cpu) <= 1:
+            # Decode-shaped batch; nothing to truncate.
+            return False
+        # Prompt-token logprobs need the full hidden states from every layer.
+        if getattr(forward_batch, "return_logprob", False):
+            logprob_starts = forward_batch.extend_logprob_start_lens_cpu
+            if logprob_starts is None:
+                return False
+            for start, slen in zip(logprob_starts, ex_seq_lens_cpu):
+                if start < slen:
+                    return False
+        return True
+
+    def _yoco_truncate_to_last_tokens(
+        self,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        per_layer_inputs: Optional[torch.Tensor],
+    ):
+        """Truncate `hidden_states`/`positions`/`per_layer_inputs` to the
+        last query token per request and rebuild attention metadata.
+
+        Returns `(hidden_states_t, positions_t, per_layer_inputs_t,
+        last_indices, restore_fn)`.
+        """
+        extend_seq_lens = forward_batch.extend_seq_lens
+        last_indices = torch.cumsum(extend_seq_lens, dim=0) - 1
+
+        hidden_states_t = hidden_states.index_select(0, last_indices)
+        positions_t = positions.index_select(0, last_indices)
+        per_layer_inputs_t = (
+            per_layer_inputs.index_select(0, last_indices)
+            if per_layer_inputs is not None
+            else None
+        )
+
+        # Snapshot fields we mutate so we can put them back exactly.
+        orig_extend_seq_lens = forward_batch.extend_seq_lens
+        orig_extend_prefix_lens = forward_batch.extend_prefix_lens
+        orig_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        orig_extend_prefix_lens_cpu = getattr(
+            forward_batch, "extend_prefix_lens_cpu", None
+        )
+        orig_extend_num_tokens = getattr(forward_batch, "extend_num_tokens", None)
+
+        num_reqs = extend_seq_lens.shape[0]
+        ones = torch.ones_like(orig_extend_seq_lens)
+        # seq_lens stays the same; the cross-decoder attends over the full
+        # cached sequence. The new prefix length is therefore seq_len - 1.
+        new_prefix = forward_batch.seq_lens - 1
+
+        forward_batch.extend_seq_lens = ones
+        forward_batch.extend_prefix_lens = new_prefix
+        forward_batch.extend_seq_lens_cpu = [1] * num_reqs
+        if orig_extend_prefix_lens_cpu is not None:
+            if forward_batch.seq_lens_cpu is not None:
+                forward_batch.extend_prefix_lens_cpu = [
+                    int(s) - 1 for s in forward_batch.seq_lens_cpu.tolist()
+                ]
+            else:
+                forward_batch.extend_prefix_lens_cpu = new_prefix.tolist()
+        if orig_extend_num_tokens is not None:
+            forward_batch.extend_num_tokens = num_reqs
+
+        attn_backend = get_attn_backend()
+        attn_backend.init_forward_metadata(forward_batch)
+
+        def restore_fn():
+            forward_batch.extend_seq_lens = orig_extend_seq_lens
+            forward_batch.extend_prefix_lens = orig_extend_prefix_lens
+            forward_batch.extend_seq_lens_cpu = orig_extend_seq_lens_cpu
+            if orig_extend_prefix_lens_cpu is not None:
+                forward_batch.extend_prefix_lens_cpu = orig_extend_prefix_lens_cpu
+            if orig_extend_num_tokens is not None:
+                forward_batch.extend_num_tokens = orig_extend_num_tokens
+            # Restore the full-batch attention metadata so anything that
+            # runs after this forward sees the original qo_indptr.
+            attn_backend.init_forward_metadata(forward_batch)
+
+        return (
+            hidden_states_t,
+            positions_t,
+            per_layer_inputs_t,
+            last_indices,
+            restore_fn,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -975,7 +1099,34 @@ class Gemma4TextModel(PreTrainedModel):
         aux_hidden_states = []
         num_layers = self.config.num_hidden_layers
 
+        first_kv_shared_layer_idx = self.first_kv_shared_layer_idx
+        yoco_active = self._enable_fast_prefill(forward_batch)
+        yoco_restore_fn = None
+        yoco_last_indices = None
+        yoco_full_shape = None
+
         for layer_idx in range(self.start_layer, self.end_layer):
+            # Truncate once, just before the first shared-KV layer.
+            if (
+                yoco_active
+                and yoco_restore_fn is None
+                and layer_idx == first_kv_shared_layer_idx
+                and layer_idx >= self.start_layer
+            ):
+                yoco_full_shape = hidden_states.shape
+                (
+                    hidden_states,
+                    positions,
+                    per_layer_inputs,
+                    yoco_last_indices,
+                    yoco_restore_fn,
+                ) = self._yoco_truncate_to_last_tokens(
+                    forward_batch,
+                    hidden_states,
+                    positions,
+                    per_layer_inputs,
+                )
+
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states)
 
@@ -994,6 +1145,14 @@ class Gemma4TextModel(PreTrainedModel):
             hidden_states = layer_outputs[0]
             # Gemma4DecoderLayer.forward always returns (hidden_states, None);
             # the residual is fused inside the layer, so nothing to thread.
+
+        # Scatter the truncated output back into a full-sized tensor at
+        # last_indices; the logits processor reads only those same rows.
+        if yoco_restore_fn is not None:
+            full_hidden = hidden_states.new_empty(yoco_full_shape)
+            full_hidden.index_copy_(0, yoco_last_indices, hidden_states)
+            hidden_states = full_hidden
+            yoco_restore_fn()
 
         if not self.pp_group.is_last_rank:
             # cuda_graph_runner allocates a fixed PP-proxy schema of
