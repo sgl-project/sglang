@@ -333,7 +333,9 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export GDN_ATTN_BACKEND_TRITON=1
 export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=1600
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -349,16 +351,14 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
-    --max-total-tokens 600000 \
-    --max-prefill-tokens 65536 \
+    --max-prefill-tokens 128000 \
     --disable-radix-cache \
     --trust-remote-code \
     --enable-prefill-delayer \
-    --max-running-requests 4 \
-    --max-mamba-cache-size 12 \
-    --mem-fraction-static 0.6 \
-    --max-mamba-cache-size 20 \
-    --disable-cuda-graph \
+    --max-running-requests 3 \
+    --max-mamba-cache-size 10 \
+    --mem-fraction-static 0.63 \
+    --cuda-graph-bs 1 2 3 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -379,10 +379,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 4 \
+    --max-concurrency 3 \
     --random-input-len 128000 \
     --random-output-len 1000 \
-    --num-prompts 16 \
+    --num-prompts 12 \
     --random-range-ratio 1
 ```
 
@@ -572,13 +572,12 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=lo
-export HCCL_BUFFSIZE=800
+export HCCL_BUFFSIZE=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -588,14 +587,15 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 35000 \
+    --max-prefill-tokens 43400 \
     --disable-radix-cache \
     --trust-remote-code \
     --enable-prefill-delayer \
-    --max-running-requests 110 \
-    --max-mamba-cache-size 115 \
-    --mem-fraction-static 0.78 \
-    --cuda-graph-bs 4 16 32 64 84 105 110 \
+    --prefill-delayer-max-delay-passes 50 \
+    --max-running-requests 124 \
+    --max-mamba-cache-size 124 \
+    --mem-fraction-static 0.8 \
+    --cuda-graph-bs 4 16 32 64 96 112 116 120 124 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -616,10 +616,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 110 \
+    --max-concurrency 124 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 440 \
+    --num-prompts 496 \
     --random-range-ratio 1
 ```
 

@@ -118,7 +118,7 @@ This section describes the best practice data for MiniMax-M2.5 on the Ascend NPU
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms-aime25">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
@@ -138,7 +138,7 @@ This section describes the best practice data for MiniMax-M2.5 on the Ascend NPU
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms-aime25">Optimal Configuration</a></td>
     </tr>
   </tbody>
 </table>
@@ -524,6 +524,7 @@ export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_BUFFSIZE=128
 export HCCL_SOCKET_IFNAME=lo
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -577,7 +578,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### minimax m2 5 w8a8 4p in64k out1k prefix90 50ms
+### minimax m2 5 w8a8 4p in64k out1k prefix90 50ms aime25
 
 **Model**: MiniMax-M2.5
 
@@ -604,39 +605,33 @@ unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
-export ASCEND_USE_FIA=0
-export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
-export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
-export ENABLE_PROFILING=0
+export ASCEND_USE_FIA=1
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=lo
-export HCCL_BUFFSIZE=1600
+export HCCL_BUFFSIZE=1024
 export HCCL_SOCKET_IFNAME=lo
-export PROFILING_BS=28
-export PROFILING_STAGE=decode
-export PROFILING_step=10
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=140000
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
-export SGLANG_NPU_DEEPEP_USE_FUSED_MOE_DECODE=1
 export SGLANG_NPU_FUSED_MOE_MODE=2
-export SGLANG_NPU_FUSEEP_DECODE_ONLY=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --tp-size 8 \
-    --enable-dp-attention \
-    --prefill-delayer-max-delay-passes 500 \
+    --mem-fraction-static 0.63 \
+    --max-running-requests 26 \
+    --reasoning-parser minimax-append-think \
+    --tool-call-parser minimax-m2 \
     --enable-prefill-delayer \
-    --mem-fraction-static 0.65 \
-    --max-running-requests 36 \
-    --chunked-prefill-size -1 \
-    --max-prefill-tokens 150000 \
-    --cuda-graph-bs 8 16 24 32 40 \
+    --prefill-max-requests 10 \
+    --chunked-prefill-size 67072 \
+    --max-prefill-token 67000 \
+    --cuda-graph-bs 2 4 8 12 16 18 20 22 24 26 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
     --quantization modelslim \
@@ -647,8 +642,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
     --dtype bfloat16 \
-    --trust-remote-code \
-    --tokenizer-worker-num 8
+    --trust-remote-code
 ```
 
 #### Benchmark
@@ -661,10 +655,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 36 \
+    --max-concurrency 26 \
     --random-input-len 65536 \
     --random-output-len 1024 \
-    --num-prompts 144 \
+    --num-prompts 104 \
     --random-range-ratio 1 \
     --request-rate float("inf")
 ```
@@ -707,6 +701,7 @@ export HCCL_SOCKET_IFNAME=lo
 export PROFILING_BS=28
 export PROFILING_STAGE=decode
 export PROFILING_step=10
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -800,6 +795,7 @@ export HCCL_SOCKET_IFNAME=lo
 export PROFILING_BS=28
 export PROFILING_STAGE=decode
 export PROFILING_step=10
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -884,30 +880,34 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=lo
-export HCCL_BUFFSIZE=1500
-export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_BUFFSIZE=2048
 export HCCL_SOCKET_IFNAME=lo
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=224000
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
 export SGLANG_NPU_FUSED_MOE_MODE=2
-export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --tp-size 16 \
-    --dp-size 16 \
     --enable-dp-attention \
-    --mem-fraction-static 0.75 \
-    --max-running-requests 256 \
+    --dp-size 16 \
+    --mem-fraction-static 0.53 \
+    --max-running-requests 96 \
     --disable-radix-cache \
+    --reasoning-parser minimax-append-think \
+    --tool-call-parser minimax-m2 \
+    --prefill-delayer-max-delay-passes 500 \
+    --enable-prefill-delayer \
+    --prefill-max-requests 3 \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 8192 \
-    --cuda-graph-bs 2 4 8 16 32 64 128 \
+    --max-prefill-token 8192 \
+    --cuda-graph-bs 1 2 3 4 5 6 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
     --quantization modelslim \
@@ -917,10 +917,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
-    --dtype bfloat16 \
-    --tokenizer-worker-num 2 \
-    --prefill-delayer-max-delay-passes 10 \
-    --enable-prefill-delayer
+    --dtype bfloat16
 ```
 
 #### Benchmark
@@ -933,14 +930,14 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 64 \
+    --max-concurrency 112 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 256 \
+    --num-prompts 448 \
     --random-range-ratio 1
 ```
 
-### minimax m2 5 w8a8 8p in3k5 out1k5 50ms
+### minimax m2 5 w8a8 8p in3k5 out1k5 50ms aime25
 
 **Model**: MiniMax-M2.5
 
@@ -970,8 +967,8 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_BUFFSIZE=1024
-export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -987,13 +984,15 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --enable-dp-attention \
     --dp-size 16 \
     --mem-fraction-static 0.75 \
-    --max-running-requests 480 \
+    --max-running-requests 320 \
     --disable-radix-cache \
+    --reasoning-parser minimax-append-think \
+    --tool-call-parser minimax-m2 \
     --prefill-delayer-max-delay-passes 500 \
     --enable-prefill-delayer \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 8192 \
-    --cuda-graph-bs 4 24 32 48 64 80 \
+    --max-prefill-token 8192 \
+    --cuda-graph-bs 1 2 4 8 12 16 20 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
     --quantization modelslim \

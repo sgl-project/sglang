@@ -50,7 +50,7 @@ This section describes the best practice data for Qwen3-8B on the Ascend NPU.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>6.1K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>11.79ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-8b-w8a8-1p-in6k-out1k5-bs16">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-8b-w8a8-1p-in6k-out1k5-bs16-gpqa">Optimal Configuration</a></td>
     </tr>
   </tbody>
 </table>
@@ -88,14 +88,14 @@ This section describes the best practice data for Qwen3-8B on the Ascend NPU.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>37ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-8b-w8a8-1p-in3k5-out1k5-50ms-gpqa">Optimal Configuration</a></td>
     </tr>
   </tbody>
 </table>
 
 ## Optimal Configuration
 
-### qwen3 8b w8a8 1p in3k5 out1k5 37ms
+### qwen3 8b w8a8 1p in3k5 out1k5 50ms gpqa
 
 **Model**: Qwen3-8B
 
@@ -247,7 +247,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 8b w8a8 1p in6k out1k5 bs16
+### qwen3 8b w8a8 1p in6k out1k5 bs16 gpqa
 
 **Model**: Qwen3-8B
 

@@ -50,7 +50,7 @@ This section describes the best practice data for Qwen3-Next-80B-A3B-Instruct on
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>6.1K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>15.62ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-next-80b-w8a8-2p-in6k-out1k5-bs16">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-next-80b-w8a8-2p-in6k-out1k5-bs16-aime25">Optimal Configuration</a></td>
     </tr>
   </tbody>
 </table>
@@ -215,11 +215,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
-export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-export ENABLE_PROFILING=0
 export FORCE_DRAFT_MODEL_NON_QUANT=1
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_BUFFSIZE=64
@@ -279,14 +275,14 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 220 \
+    --max-concurrency 300 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 220 \
+    --num-prompts 300 \
     --random-range-ratio 1
 ```
 
-### qwen3 next 80b w8a8 2p in6k out1k5 bs16
+### qwen3 next 80b w8a8 2p in6k out1k5 bs16 aime25
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
