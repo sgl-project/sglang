@@ -123,6 +123,12 @@ export const KimiK26Deployment = () => {
     setValues((prev) => {
       const next = { ...prev };
       for (const [key, option] of Object.entries(options)) {
+        if (typeof option.condition === 'function' && !option.condition(next)) {
+          const items = resolveItems(option, next);
+          const fallback = items.find((item) => item.default && !item.disabled) || items.find((item) => !item.disabled);
+          if (fallback) next[key] = fallback.id;
+          continue;
+        }
         if (typeof option.getDynamicItems !== 'function') continue;
         const items = option.getDynamicItems(next);
         const current = items.find((item) => item.id === next[key]);
@@ -145,6 +151,9 @@ export const KimiK26Deployment = () => {
     const isNVFP4 = quantization === 'nvfp4';
     const hwConfig = isNVFP4 ? nvfp4ModelConfigs[hardware] : modelConfigs[hardware];
     if (!hwConfig) return '# NVFP4 is only supported on NVIDIA Blackwell hardware.';
+    if (speculative === 'enabled' && isAMD) {
+      return '# Speculative Decoding for Kimi-K2.6 is only supported on NVIDIA GPUs (H200/B300/GB300)';
+    }
     const tpValue = hwConfig.tp;
     const modelName = isNVFP4 ? 'nvidia/Kimi-K2.6-NVFP4' : 'moonshotai/Kimi-K2.6';
 
@@ -210,6 +219,7 @@ export const KimiK26Deployment = () => {
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
+        if (typeof option.condition === 'function' && !option.condition(values)) return null;
         const items = resolveItems(option, values);
         return (
           <div key={key} style={cardStyle}>
