@@ -50,10 +50,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         *,
         valid_token_count: int | None,
     ) -> torch.Tensor:
-        if (
-            valid_token_count is None
-            or int(valid_token_count) >= int(latents.shape[1])
-        ):
+        if valid_token_count is None or int(valid_token_count) >= int(latents.shape[1]):
             return latents
         latents = latents.clone()
         latents[:, int(valid_token_count) :, :] = 0.0
@@ -215,9 +212,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 device=local_reference.device,
                 dtype=local_reference.dtype,
             )
-            full_noise = self._randn_like_with_batch_generators(
-                full_reference, batch
-            )
+            full_noise = self._randn_like_with_batch_generators(full_reference, batch)
             sharded_noise, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, full_noise
             )
@@ -238,9 +233,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 device=local_reference.device,
                 dtype=local_reference.dtype,
             )
-            full_noise = self._randn_like_with_batch_generators(
-                full_reference, batch
-            )
+            full_noise = self._randn_like_with_batch_generators(full_reference, batch)
             sharded_noise, _ = server_args.pipeline_config.shard_audio_latents_for_sp(
                 batch, full_noise
             )
