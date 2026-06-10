@@ -253,10 +253,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                # keep the weight as (N, K); aiter kernel handles alignment internally
+                # keep the weight as (N, K); (16, 16) is the aiter shuffle tile
+                # size, unrelated to the torch._scaled_mm alignment requirement
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (FP8_ALIGNMENT, FP8_ALIGNMENT)),
-                    requires_grad=False,
+                    shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
                 # required by torch.compile to be torch.nn.Parameter
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
