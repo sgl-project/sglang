@@ -74,29 +74,48 @@ def patch_model_npu(
 class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        *,
+        attn_backend=None,
+        speculative_num_steps: Optional[int] = None,
+        speculative_num_draft_tokens: Optional[int] = None,
+    ):
         sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
-        super().__init__(model_runner)
+        super().__init__(
+            model_runner,
+            attn_backend=attn_backend,
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.if_use_v2 = any(
+            arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            for arch in (model_runner.model_config.hf_config.architectures or [])
+        )
 
     def _init_arch_map(self):
         if self.is_dllm:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "actual_seq_lengths_kv",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         else:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "context_lens",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            "TARGET_VERIFY": [],
         }
 
     def _create_device_graph(self):
@@ -121,9 +140,13 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
+        if self.if_use_v2:
+            return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
+        if self.if_use_v2:
+            return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):
@@ -168,15 +191,22 @@ class NPUGraphRunner(CudaGraphRunner):
     def replay(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not skip_attn_backend_init:
+        if forward_batch.needs_forward_metadata_init():
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and forward_batch.input_embeds is not None
+            ):
+                self.buffers.input_embeds[: self.raw_num_token].copy_(
+                    forward_batch.input_embeds
+                )
             if (
                 envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
                 and forward_batch.mrope_positions is not None
@@ -207,10 +237,18 @@ class NPUGraphRunner(CudaGraphRunner):
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
-                full_logits = output.full_logits[: self.raw_num_token]
+                full_logits = (
+                    output.full_logits[: self.raw_num_token]
+                    if output.full_logits is not None
+                    else None
+                )
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = (
+                    output.next_token_logits[: self.raw_num_token]
+                    if output.next_token_logits is not None
+                    else None
+                )
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,

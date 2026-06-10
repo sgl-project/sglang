@@ -14,7 +14,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -42,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -126,10 +126,10 @@ class Cosmos3TokenizationStage(PipelineStage):
         device: torch.device,
         use_system_prompt: bool = False,
         system_prompt: str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Tokenize a prompt using Qwen2 chat template.
 
-        Returns (input_ids, attention_mask) as [1, S] tensors.
+        Returns (input_ids, attention_mask, seq_len) as [1, S] tensors.
         """
         conversations = []
         if use_system_prompt:
@@ -180,7 +180,7 @@ class Cosmos3TokenizationStage(PipelineStage):
 
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
         attention_mask = torch.tensor([attention_mask], dtype=torch.long, device=device)
-        return input_ids, attention_mask
+        return input_ids, attention_mask, seq_len
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Tokenize prompt and negative prompt."""
@@ -190,8 +190,16 @@ class Cosmos3TokenizationStage(PipelineStage):
 
         # Get parameters
         max_sequence_length = getattr(batch, "max_sequence_length", None) or 512
-        use_duration_template = getattr(batch, "use_duration_template", True)
-        use_system_prompt = getattr(batch, "use_system_prompt", False)
+        use_duration_template = getattr(batch, "use_duration_template", None)
+        if use_duration_template is None:
+            use_duration_template = getattr(
+                server_args.pipeline_config, "use_duration_template", True
+            )
+        use_system_prompt = getattr(batch, "use_system_prompt", None)
+        if use_system_prompt is None:
+            use_system_prompt = getattr(
+                server_args.pipeline_config, "use_system_prompt", False
+            )
         fps = batch.fps or 24.0
         num_frames = batch.num_frames
         is_image_gen = batch.data_type == DataType.IMAGE
@@ -207,22 +215,30 @@ class Cosmos3TokenizationStage(PipelineStage):
             self.log_info(f"Prompt with duration: '{prompt}'")
 
         # Tokenize prompts
-        cond_ids, cond_mask = self._tokenize_prompt(
+        cond_ids, cond_mask, cond_seq_len = self._tokenize_prompt(
             prompt, max_sequence_length, device, use_system_prompt, system_prompt
         )
-        uncond_ids, uncond_mask = self._tokenize_prompt(
+        uncond_ids, uncond_mask, uncond_seq_len = self._tokenize_prompt(
             negative_prompt,
             max_sequence_length,
             device,
             use_system_prompt,
             system_prompt,
         )
+        # official Cosmos3 consumes packed text; keep a shared length for CFG batching
+        shared_seq_len = max(cond_seq_len, uncond_seq_len)
+        cond_ids = cond_ids[:, :shared_seq_len]
+        cond_mask = cond_mask[:, :shared_seq_len]
+        uncond_ids = uncond_ids[:, :shared_seq_len]
+        uncond_mask = uncond_mask[:, :shared_seq_len]
 
         # Store in batch.extra for denoising stage
         batch.extra["cond_text_ids"] = cond_ids
         batch.extra["cond_text_mask"] = cond_mask
         batch.extra["uncond_text_ids"] = uncond_ids
         batch.extra["uncond_text_mask"] = uncond_mask
+        batch.extra["cond_text_seq_len"] = cond_seq_len
+        batch.extra["uncond_text_seq_len"] = uncond_seq_len
         batch.extra["fps"] = fps
 
         # Mark as processed (even though we don't use standard embeddings)
@@ -306,11 +322,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         if is_i2v:
             vae_dtype = next(self.vae.parameters()).dtype
-            pixel_video = (
-                batch.preprocessed_image.unsqueeze(2)
-                .expand(-1, -1, batch.num_frames, -1, -1)
-                .contiguous()
-                .to(device=device, dtype=vae_dtype)
+            pixel_video = batch.preprocessed_image.unsqueeze(2).to(
+                device=device, dtype=vae_dtype
             )
             with torch.no_grad():
                 cond_latent = self._vae_encode(pixel_video).to(dtype)
@@ -349,16 +362,28 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
     def __init__(self, scheduler):
         super().__init__()
         self.scheduler = scheduler
+        self.default_flow_shift = getattr(
+            getattr(scheduler, "config", None), "flow_shift", None
+        )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
+        flow_shift = getattr(batch, "flow_shift", None)
+        if flow_shift is None:
+            flow_shift = server_args.pipeline_config.flow_shift
+        if flow_shift is None:
+            flow_shift = self.default_flow_shift
+        if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
+            self.scheduler.set_shift(float(flow_shift))
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         batch.timesteps = self.scheduler.timesteps
 
-        self.log_info(f"Prepared {len(batch.timesteps)} timesteps")
+        self.log_info(
+            f"Prepared {len(batch.timesteps)} timesteps (flow_shift={flow_shift})"
+        )
         return batch
 
 
@@ -460,6 +485,11 @@ class Cosmos3DenoisingStage(PipelineStage):
         result.add_check("timesteps", batch.timesteps, V.is_tensor)
         return result
 
+    def step_profile(self):
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_denoising_step()
+
     def _run_transformer(
         self,
         latents: torch.Tensor,
@@ -470,6 +500,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         fps: float,
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
+        max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run transformer forward pass.
 
@@ -484,10 +516,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and "uncond" for unconditional to enable cache reuse across steps.
             noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V conditioning mask.
         """
-        with set_forward_context(
-            current_timestep=int(timestep.flatten()[0].item()),
-            attn_metadata=None,
-        ):
+        if current_timestep is None:
+            current_timestep = int(timestep.flatten()[0].item())
+        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -497,6 +528,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 fps=fps,
                 cache_key=cache_key,
                 noisy_frame_mask=noisy_frame_mask,
+                max_text_seq_len=max_text_seq_len,
             )
 
     def _manage_device_placement(self, server_args: ServerArgs):
@@ -580,7 +612,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             f"CFG_parallel={enable_cfg_parallel}, cfg_rank={cfg_rank}"
         )
 
-        progress_bar = tqdm(
+        progress_bar = self.progress_bar(
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
@@ -609,6 +641,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                         guidance_scale=effective_scale,
                         cfg_rank=cfg_rank,
                         noisy_frame_mask=velocity_mask,
+                        cond_text_seq_len=batch.extra["cond_text_seq_len"],
+                        uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
+                        current_timestep=i,
                     )
                 elif effective_scale == 1.0:
                     noise_pred = self._run_transformer(
@@ -620,6 +655,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         cache_key="cond",
                         noisy_frame_mask=velocity_mask,
+                        max_text_seq_len=batch.extra["cond_text_seq_len"],
+                        current_timestep=i,
                     )
                 else:
                     noise_pred = self._predict_noise_cfg_batched(
@@ -633,6 +670,11 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         guidance_scale=effective_scale,
                         noisy_frame_mask=velocity_mask,
+                        max_text_seq_len=max(
+                            batch.extra["cond_text_seq_len"],
+                            batch.extra["uncond_text_seq_len"],
+                        ),
+                        current_timestep=i,
                     )
             else:
                 noise_pred = self._run_transformer(
@@ -644,6 +686,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                     fps=fps,
                     cache_key="cond",
                     noisy_frame_mask=velocity_mask,
+                    max_text_seq_len=batch.extra["cond_text_seq_len"],
+                    current_timestep=i,
                 )
 
             # I2V: zero-velocity at conditioned frames so the scheduler keeps
@@ -662,6 +706,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             if image_latent is not None:
                 latents[:, :, 0:1, :, :] = image_latent
 
+            if batch.profile and not batch.is_warmup:
+                self.step_profile()
+
         batch.latents = latents
         self.log_info("Denoising complete")
         return batch
@@ -678,6 +725,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         fps: float,
         guidance_scale: float,
         noisy_frame_mask: torch.Tensor | None = None,
+        max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG by stacking both branches into a batch_size=2 forward.
 
@@ -704,6 +753,8 @@ class Cosmos3DenoisingStage(PipelineStage):
             fps=fps,
             cache_key="cfg_batched",
             noisy_frame_mask=mask_batched,
+            max_text_seq_len=max_text_seq_len,
+            current_timestep=current_timestep,
         )
 
         noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
@@ -725,6 +776,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         guidance_scale: float,
         cfg_rank: int,
         noisy_frame_mask: torch.Tensor | None = None,
+        cond_text_seq_len: int | None = None,
+        uncond_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG with one branch per CFG rank, combined by all-reduce.
 
@@ -744,6 +798,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                 fps=fps,
                 cache_key="cond",
                 noisy_frame_mask=noisy_frame_mask,
+                max_text_seq_len=cond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = guidance_scale * noise_pred
         else:
@@ -756,6 +812,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                 fps=fps,
                 cache_key="uncond",
                 noisy_frame_mask=noisy_frame_mask,
+                max_text_seq_len=uncond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = (1.0 - guidance_scale) * noise_pred
 
@@ -778,11 +836,6 @@ class Cosmos3DecodingStage(PipelineStage):
         self._latents_mean = None
         self._latents_std = None
         self._guardrails = guardrails
-        # Use VideoProcessor for postprocessing (same as other video pipelines)
-        from diffusers.video_processor import VideoProcessor
-
-        vae_scale_factor = getattr(vae.config, "scale_factor_spatial", 16)
-        self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
         if guardrails:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 _init_guardrails,
@@ -832,6 +885,16 @@ class Cosmos3DecodingStage(PipelineStage):
 
         return video
 
+    @staticmethod
+    def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
+        return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
+
+    @staticmethod
+    def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
+        if is_image_gen:
+            return video.squeeze(2).permute(0, 2, 3, 1).cpu().numpy()
+        return video.permute(0, 2, 3, 4, 1).cpu().numpy()
+
     def forward(self, batch: Req, server_args: ServerArgs):
         """Decode latents to video, or to a single image for T2I."""
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -856,25 +919,21 @@ class Cosmos3DecodingStage(PipelineStage):
             self.vae.to("cpu", non_blocking=True)
 
         self.log_info(f"Decoded tensor shape: {decoded.shape}")
+        output = self._postprocess_tensor(decoded)
 
-        if is_image_gen:
-            output = self.video_processor.postprocess(
-                decoded.squeeze(2), output_type="np"
-            )
-        else:
-            output = self.video_processor.postprocess_video(decoded, output_type="np")
-            self.log_info(f"Postprocessed video shape: {output.shape}")
-
-        if self._guardrails:
+        if self._guardrails and batch.use_guardrails is not False:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 check_video_safety,
             )
 
+            output = self._postprocess_video_np(output, is_image_gen)
             if is_image_gen:
                 # check_video_safety expects [B, T, H, W, C]; wrap then unwrap.
                 output = check_video_safety(output[:, np.newaxis, ...])[:, 0, ...]
             else:
                 output = check_video_safety(output)
+        elif not is_image_gen:
+            self.log_info(f"Postprocessed video tensor shape: {output.shape}")
 
         return OutputBatch(
             output=output,

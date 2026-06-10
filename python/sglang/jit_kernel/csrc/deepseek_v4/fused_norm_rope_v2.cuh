@@ -22,6 +22,20 @@ using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
+SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
+  const float ax = fminf(fabsf(x), 6.0f);
+  uint8_t idx = 0;
+  idx += ax > 0.25f;
+  idx += ax > 0.75f;
+  idx += ax > 1.25f;
+  idx += ax > 1.75f;
+  idx += ax > 2.5f;
+  idx += ax > 3.5f;
+  idx += ax > 5.0f;
+  if (x < 0.0f && idx != 0) idx |= 0x8;
+  return idx;
+}
+
 constexpr uint32_t kBlockSize = 256;
 constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
 
@@ -205,6 +219,150 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   }
 }
 
+template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNormRopeStoreParams params) {
+  using namespace device;
+  using enum ForwardMode;
+
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kRopeDim = 64;
+  constexpr int64_t kVecSize = 4;
+  constexpr uint32_t kRopeSize = kRopeDim / kVecSize;
+  constexpr int64_t kPageBytes = 68ll << kPageBits;
+  static_assert(kHeadDim == kWarpThreads * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * 2);
+  static_assert(kRopeSize <= kWarpThreads);
+  using Storage = AlignedVector<DType, kVecSize>;
+  using Float4 = AlignedVector<float, kVecSize>;
+
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto work_id = blockIdx.x * kNumWarps + warp_id;
+  const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+
+  if (work_id >= params.num_tokens) return;
+
+  const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
+  int32_t position;
+  int32_t out_loc;
+  if constexpr (kMode == CompressExtend) {
+    const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
+    if (plan.is_invalid()) return;
+    position = plan.seq_len - params.compress_ratio;
+    out_loc = params.out_loc[plan.ragged_id];
+  } else if constexpr (kMode == CompressDecode) {
+    const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
+    if (plan.seq_len % params.compress_ratio != 0) return;
+    position = plan.seq_len - params.compress_ratio;
+    out_loc = params.out_loc[work_id];
+  } else {
+    static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
+  }
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  PDLWaitPrimary<kUsePDL>();
+  Float4 data, freq;
+
+  {
+    Storage input_vec, weight_vec;
+    input_vec.load(input, lane_id);
+    weight_vec.load(params.weight, lane_id);
+    if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_input = cast<float>(input_vec[i]);
+      sum_of_squares += fp32_input * fp32_input;
+    }
+
+    sum_of_squares = warp::reduce_sum(sum_of_squares);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_input = cast<float>(input_vec[i]);
+      const auto fp32_weight = cast<float>(weight_vec[i]);
+      data[i] = fp32_input * norm_factor * fp32_weight;
+    }
+  }
+
+  if (is_rope_lane) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto y_real = data[2];
+    const auto y_imag = data[3];
+    const auto freq_x_real = freq[0];
+    const auto freq_x_imag = freq[1];
+    const auto freq_y_real = freq[2];
+    const auto freq_y_imag = freq[3];
+    data[0] = x_real * freq_x_real - x_imag * freq_x_imag;
+    data[1] = x_real * freq_x_imag + x_imag * freq_x_real;
+    data[2] = y_real * freq_y_real - y_imag * freq_y_imag;
+    data[3] = y_real * freq_y_imag + y_imag * freq_y_real;
+  }
+
+  {
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a1;
+      data[1] = a0 - a1;
+      data[2] = a2 + a3;
+      data[3] = a2 - a3;
+    }
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a2;
+      data[1] = a1 + a3;
+      data[2] = a0 - a2;
+      data[3] = a1 - a3;
+    }
+#pragma unroll
+    for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+#ifndef USE_ROCM
+        const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
+#else
+        const float other = __shfl_xor(data[i], mask, kWarpThreads);
+#endif
+        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
+      }
+    }
+    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] *= kHadamardScale;
+  }
+
+  {
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    local_max = warp::reduce_max<8>(local_max);
+
+    const auto scale_raw = fmaxf(1e-4f, local_max) / 6.0f;
+    const auto scale_ue8m0 = static_cast<uint8_t>(cast_to_ue8m0(scale_raw));
+    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+
+    const uint8_t packed0 = quant_fp4_e2m1(data[0] * inv_scale) | (quant_fp4_e2m1(data[1] * inv_scale) << 4);
+    const uint8_t packed1 = quant_fp4_e2m1(data[2] * inv_scale) | (quant_fp4_e2m1(data[3] * inv_scale) << 4);
+    const uint16_t packed = static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
+
+    const int32_t page = out_loc >> kPageBits;
+    const int32_t offset = out_loc & ((1 << kPageBits) - 1);
+    const auto page_ptr = params.kvcache + page * kPageBytes;
+    const auto value_ptr = page_ptr + offset * 64;
+    const auto scale_ptr = page_ptr + (64 << kPageBits) + offset * 4;
+
+    PDLTriggerSecondary<kUsePDL>();
+    reinterpret_cast<uint16_t*>(value_ptr)[lane_id] = packed;
+    if ((lane_id & 7) == 0) static_cast<uint8_t*>(scale_ptr)[lane_id >> 3] = scale_ue8m0;
+  }
+}
+
 // ----------------------------------------------------------------------------
 // FlashMLA variant: kHeadDim = 512, 1 token per *block* (256 threads).
 // Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
@@ -348,6 +506,12 @@ struct FusedNormRopeKernel {
     }
   }
 
+  template <ForwardMode kMode>
+  static constexpr auto select_fp4_kernel() {
+    static_assert(kIsIndexer, "FP4 fused store is only defined for the indexer");
+    return fused_norm_rope_indexer_fp4<DType, kMode, kLogPageSize, kUsePDL>;
+  }
+
   static void forward(
       const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView plan,
@@ -418,6 +582,64 @@ struct FusedNormRopeKernel {
     const uint32_t num_blocks = kIsIndexer ? div_ceil(num_tokens, kNumWarps) : num_tokens;
     const auto device = device_.unwrap();
     const auto kernel = mode == CompressExtend ? select_kernel<CompressExtend>() : select_kernel<CompressDecode>();
+    LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void forward_fp4(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView plan,
+      const tvm::ffi::TensorView weight,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      const bool is_decode,
+      const uint32_t compress_ratio) {
+    using namespace host;
+    using enum ForwardMode;
+
+    static_assert(kIsIndexer, "FP4 fused store is only defined for the indexer");
+    constexpr int64_t kFp4PageBytes = 68 * kPageSize;
+    const auto mode = static_cast<ForwardMode>(is_decode);
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({N, kHeadDim}).with_dtype<DType>().with_device(device_).verify(input);
+    TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(weight);
+    TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
+    TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(out_loc);
+    TensorMatcher({-1, -1}).with_strides({kFp4PageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
+
+    switch (mode) {
+      case CompressExtend:
+        compress::verify_plan_c(plan, N, device_);
+        RuntimeCheck(out_loc.size(0) >= N.unwrap());
+        break;
+      case CompressDecode:
+        compress::verify_plan_d(plan, N, device_);
+        RuntimeCheck(out_loc.size(0) == N.unwrap());
+        break;
+    }
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) return;
+    const auto params = FusedNormRopeStoreParams{
+        .input = input.data_ptr(),
+        .handle = plan.data_ptr(),
+        .weight = weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .eps = eps,
+        .compress_ratio = compress_ratio,
+        .num_tokens = num_tokens,
+    };
+    const uint32_t num_blocks = div_ceil(num_tokens, kNumWarps);
+    const auto device = device_.unwrap();
+    const auto kernel =
+        mode == CompressExtend ? select_fp4_kernel<CompressExtend>() : select_fp4_kernel<CompressDecode>();
     LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
   }
 };
