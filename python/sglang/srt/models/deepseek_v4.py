@@ -28,7 +28,6 @@ from sglang.jit_kernel.dsv4 import (
     fused_rope_inplace,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
@@ -84,20 +83,28 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
-    eager_on_graph,
-)
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
-    is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.cuda_graph_runner import (
-    compile_in_capture_mode,
-    get_is_capture_mode,
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
+)
+from sglang.srt.model_executor.runner import (
+    compile_in_capture_mode,
+    get_is_capture_mode,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -211,7 +218,7 @@ def deepseek_v4_attention_with_output(
     attn_sink: torch.Tensor,
     save_kv_cache: bool,
 ) -> None:
-    context = get_forward_context()
+    context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
@@ -1678,7 +1685,7 @@ class DeepseekV4Model(nn.Module):
             last_layer = layer
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
