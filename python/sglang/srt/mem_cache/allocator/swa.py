@@ -319,15 +319,41 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        #region debug-point dsv4-radix-double-free
+        debug_free_pages_before = None
+        if self.is_not_in_free_group:
+            debug_free_pages_before = torch.unique(free_index // self.page_size)
+        #endregion debug-point dsv4-radix-double-free
+
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
-        )
+        #region debug-point dsv4-radix-double-free
+        full_available = self.full_attn_allocator.available_size()
+        if full_available > self.full_attn_allocator.size:
+            free_pages = self.full_attn_allocator.free_pages
+            release_pages = self.full_attn_allocator.release_pages
+            free_pages_unique = torch.unique(free_pages).numel()
+            release_pages_unique = torch.unique(release_pages).numel()
+            free_index_unique = torch.unique(free_index).numel()
+            debug_message = (
+                "SWATokenToKVPoolAllocator full allocator over-free: "
+                f"full_available={full_available}, "
+                f"full_size={self.full_attn_allocator.size}, "
+                f"free_index_numel={free_index.numel()}, "
+                f"free_index_unique={free_index_unique}, "
+                f"free_page_numel={debug_free_pages_before.numel() if debug_free_pages_before is not None else 'grouped'}, "
+                f"free_pages_len={len(free_pages)}, "
+                f"free_pages_unique={free_pages_unique}, "
+                f"release_pages_len={len(release_pages)}, "
+                f"release_pages_unique={release_pages_unique}, "
+                f"need_sort={self.full_attn_allocator.need_sort}"
+            )
+            raise AssertionError(debug_message)
+        #endregion debug-point dsv4-radix-double-free
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def set_full_to_swa_mapping(
