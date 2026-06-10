@@ -291,25 +291,22 @@ at::Tensor build_draft_decode_metadata_cpu(
   return req_to_token_draft;
 }
 
-void fill_new_verified_id_cpu(
-    const at::Tensor& verified_id,
-    const at::Tensor& accept_lens,
-    at::Tensor new_verified_id,
-    int64_t num_draft_tokens) {
+void fill_bonus_tokens_cpu(
+    const at::Tensor& accept_tokens, const at::Tensor& accept_lens, at::Tensor bonus_tokens, int64_t accept_stride) {
   int64_t bs = accept_lens.size(0);
-  auto* vid_ptr = verified_id.data_ptr<int32_t>();
+  auto* accept_ptr = accept_tokens.data_ptr<int32_t>();
   auto* al_ptr = accept_lens.data_ptr<int32_t>();
-  auto* out_ptr = new_verified_id.data_ptr<int32_t>();
+  auto* out_ptr = bonus_tokens.data_ptr<int32_t>();
 
   at::parallel_for(0, bs, 0, [&](int64_t begin, int64_t end) {
     for (int64_t pid = begin; pid < end; ++pid) {
-      int64_t idx = num_draft_tokens * pid + al_ptr[pid] - 1;
-      out_ptr[pid] = vid_ptr[idx];
+      int64_t idx = accept_stride * pid + al_ptr[pid] - 1;
+      out_ptr[pid] = accept_ptr[idx];
     }
   });
 }
 
-void fill_accepted_out_cache_loc_cpu(
+void fill_accept_out_cache_loc_cpu(
     const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accepted_out_cache_loc, int64_t size) {
   auto* ai_ptr = accept_index.data_ptr<int32_t>();
   auto* ocl_ptr = out_cache_loc.data_ptr<int64_t>();
@@ -324,7 +321,7 @@ void fill_accepted_out_cache_loc_cpu(
   }
 }
 
-void assign_draft_cache_locs_page_size_1_cpu(
+void assign_draft_cache_locs_contiguous_cpu(
     const at::Tensor& req_pool_indices,
     const at::Tensor& req_to_token,
     const at::Tensor& seq_lens,

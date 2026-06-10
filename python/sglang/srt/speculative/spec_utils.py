@@ -70,7 +70,7 @@ elif _is_cpu:
     from sgl_kernel import (
         assign_extend_cache_locs_cpu,
         assign_req_to_token_pool_cpu,
-        fill_accepted_out_cache_loc_cpu,
+        fill_accept_out_cache_loc_cpu,
     )
 
     from sglang.srt.utils.common import fast_topk
@@ -564,7 +564,7 @@ def move_accept_tokens_to_target_kvcache(
             tgt_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
         )
-        fill_accepted_out_cache_loc_cpu(
+        fill_accept_out_cache_loc_cpu(
             accept_index,
             batch.out_cache_loc,
             accept_out_cache_loc,

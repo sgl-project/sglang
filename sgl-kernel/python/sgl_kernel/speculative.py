@@ -216,27 +216,27 @@ def build_draft_decode_metadata_cpu(
     )
 
 
-def fill_new_verified_id_cpu(
-    verified_id: torch.Tensor,
+def fill_bonus_tokens_cpu(
+    accept_tokens: torch.Tensor,
     accept_lens: torch.Tensor,
-    new_verified_id: torch.Tensor,
-    num_draft_tokens: int,
+    bonus_tokens: torch.Tensor,
+    accept_stride: int,
 ) -> None:
-    torch.ops.sgl_kernel.fill_new_verified_id_cpu(
-        verified_id,
+    torch.ops.sgl_kernel.fill_bonus_tokens_cpu(
+        accept_tokens,
         accept_lens,
-        new_verified_id,
-        num_draft_tokens,
+        bonus_tokens,
+        accept_stride,
     )
 
 
-def fill_accepted_out_cache_loc_cpu(
+def fill_accept_out_cache_loc_cpu(
     accept_index: torch.Tensor,
     out_cache_loc: torch.Tensor,
     accepted_out_cache_loc: torch.Tensor,
     size: int,
 ) -> None:
-    torch.ops.sgl_kernel.fill_accepted_out_cache_loc_cpu(
+    torch.ops.sgl_kernel.fill_accept_out_cache_loc_cpu(
         accept_index,
         out_cache_loc,
         accepted_out_cache_loc,
@@ -244,7 +244,7 @@ def fill_accepted_out_cache_loc_cpu(
     )
 
 
-def assign_draft_cache_locs_page_size_1_cpu(
+def assign_draft_cache_locs_contiguous_cpu(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -253,7 +253,7 @@ def assign_draft_cache_locs_page_size_1_cpu(
     topk: int,
     num_steps: int,
 ) -> None:
-    torch.ops.sgl_kernel.assign_draft_cache_locs_page_size_1_cpu(
+    torch.ops.sgl_kernel.assign_draft_cache_locs_contiguous_cpu(
         req_pool_indices,
         req_to_token,
         seq_lens,

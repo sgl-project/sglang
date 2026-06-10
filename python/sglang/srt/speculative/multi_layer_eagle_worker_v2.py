@@ -870,7 +870,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1].
-            fill_new_verified_id_func(
+            fill_bonus_tokens_func(
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,

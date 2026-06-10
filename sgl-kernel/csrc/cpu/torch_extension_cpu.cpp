@@ -97,13 +97,13 @@ at::Tensor build_draft_decode_metadata_cpu(
     int64_t num_steps,
     int64_t pool_len);
 
-void fill_new_verified_id_cpu(
-    const at::Tensor& verified_id, const at::Tensor& accept_lens, at::Tensor new_verified_id, int64_t num_draft_tokens);
+void fill_bonus_tokens_cpu(
+    const at::Tensor& accept_tokens, const at::Tensor& accept_lens, at::Tensor bonus_tokens, int64_t accept_stride);
 
-void fill_accepted_out_cache_loc_cpu(
+void fill_accept_out_cache_loc_cpu(
     const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accepted_out_cache_loc, int64_t size);
 
-void assign_draft_cache_locs_page_size_1_cpu(
+void assign_draft_cache_locs_contiguous_cpu(
     const at::Tensor& req_pool_indices,
     const at::Tensor& req_to_token,
     const at::Tensor& seq_lens,
@@ -609,19 +609,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("build_draft_decode_metadata_cpu", torch::kCPU, &build_draft_decode_metadata_cpu);
 
   m.def(
-      "fill_new_verified_id_cpu(Tensor verified_id, Tensor accept_lens, "
-      "Tensor(a!) new_verified_id, int num_draft_tokens) -> ()");
-  m.impl("fill_new_verified_id_cpu", torch::kCPU, &fill_new_verified_id_cpu);
+      "fill_bonus_tokens_cpu(Tensor accept_tokens, Tensor accept_lens, "
+      "Tensor(a!) bonus_tokens, int accept_stride) -> ()");
+  m.impl("fill_bonus_tokens_cpu", torch::kCPU, &fill_bonus_tokens_cpu);
 
   m.def(
-      "fill_accepted_out_cache_loc_cpu(Tensor accept_index, Tensor out_cache_loc, "
+      "fill_accept_out_cache_loc_cpu(Tensor accept_index, Tensor out_cache_loc, "
       "Tensor(a!) accepted_out_cache_loc, int size) -> ()");
-  m.impl("fill_accepted_out_cache_loc_cpu", torch::kCPU, &fill_accepted_out_cache_loc_cpu);
+  m.impl("fill_accept_out_cache_loc_cpu", torch::kCPU, &fill_accept_out_cache_loc_cpu);
 
   m.def(
-      "assign_draft_cache_locs_page_size_1_cpu(Tensor req_pool_indices, Tensor req_to_token, "
+      "assign_draft_cache_locs_contiguous_cpu(Tensor req_pool_indices, Tensor req_to_token, "
       "Tensor seq_lens, Tensor(a!) out_cache_loc, int pool_len, int topk, int num_steps) -> ()");
-  m.impl("assign_draft_cache_locs_page_size_1_cpu", torch::kCPU, &assign_draft_cache_locs_page_size_1_cpu);
+  m.impl("assign_draft_cache_locs_contiguous_cpu", torch::kCPU, &assign_draft_cache_locs_contiguous_cpu);
 
   m.def(
       "assign_extend_cache_locs_cpu(Tensor req_pool_indices, Tensor req_to_token, "

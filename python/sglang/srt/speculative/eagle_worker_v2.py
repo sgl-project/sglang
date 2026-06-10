@@ -1340,7 +1340,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_new_verified_id_func(
+            fill_bonus_tokens_func(
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,

@@ -80,10 +80,10 @@ if is_cuda() or is_musa():
 
 if _is_cpu:
     from sgl_kernel import (
-        assign_draft_cache_locs_page_size_1_cpu,
+        assign_draft_cache_locs_contiguous_cpu,
         assign_extend_cache_locs_cpu,
-        fill_accepted_out_cache_loc_cpu,
-        fill_new_verified_id_cpu,
+        fill_accept_out_cache_loc_cpu,
+        fill_bonus_tokens_cpu,
     )
 
 
@@ -134,16 +134,12 @@ def duplicate_prefix_tail_to_draft_branches(
         token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
 
-def fill_new_verified_id_func(
-    verified_id, accept_lens, new_verified_id, accept_stride, bs
-):
+def fill_bonus_tokens_func(accept_tokens, accept_lens, bonus_tokens, accept_stride, bs):
     if _is_cpu:
-        fill_new_verified_id_cpu(
-            verified_id, accept_lens, new_verified_id, accept_stride
-        )
+        fill_bonus_tokens_cpu(accept_tokens, accept_lens, bonus_tokens, accept_stride)
     else:
         _fill_bonus_tokens_triton[(bs,)](
-            verified_id, accept_lens, new_verified_id, accept_stride
+            accept_tokens, accept_lens, bonus_tokens, accept_stride
         )
 
 
@@ -151,7 +147,7 @@ def fill_accept_out_cache_loc_func(
     accept_index, out_cache_loc, accept_out_cache_loc, size
 ):
     if _is_cpu:
-        fill_accepted_out_cache_loc_cpu(
+        fill_accept_out_cache_loc_cpu(
             accept_index, out_cache_loc, accept_out_cache_loc, size
         )
     else:
@@ -324,7 +320,7 @@ class EagleDraftInputV2Mixin:
                 )
                 # FIXME(lsyin): align with the default code path
                 if _is_cpu:
-                    assign_draft_cache_locs_page_size_1_cpu(
+                    assign_draft_cache_locs_contiguous_cpu(
                         batch.req_pool_indices,
                         req_to_token_pool.req_to_token,
                         batch.seq_lens,

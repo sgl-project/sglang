@@ -112,15 +112,15 @@ else:
         top_p_renorm_prob,
     )
     from sgl_kernel.speculative import (
-        assign_draft_cache_locs_page_size_1_cpu,
+        assign_draft_cache_locs_contiguous_cpu,
         assign_extend_cache_locs_cpu,
         assign_new_state_cpu,
         assign_req_to_token_pool_cpu,
         build_draft_decode_metadata_cpu,
         build_tree_kernel_efficient,
         build_tree_kernel_efficient_cpu,
-        fill_accepted_out_cache_loc_cpu,
-        fill_new_verified_id_cpu,
+        fill_accept_out_cache_loc_cpu,
+        fill_bonus_tokens_cpu,
         reconstruct_indices_from_tree_mask,
         rotate_input_ids_cpu,
         segment_packbits,
