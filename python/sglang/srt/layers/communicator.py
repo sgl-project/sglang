@@ -796,6 +796,8 @@ class LayerCommunicator:
                     _use_aiter
                     and batch_size > 0
                     and get_parallel().tp_size != 6
+                    and not is_dp_attention_enabled()
+                    and get_moe_a2a_backend().is_none()
                     and get_global_server_args().enable_aiter_allreduce_fusion
                 )
             )
