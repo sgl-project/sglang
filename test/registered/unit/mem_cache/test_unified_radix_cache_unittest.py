@@ -1,7 +1,10 @@
 """Unit tests for UnifiedRadixCache"""
 
+import atexit
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -10,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 from unittest import mock
 
+import requests
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -63,9 +67,9 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 @dataclass(frozen=True)
@@ -153,6 +157,131 @@ class _FakeFullComponent(TreeComponent):
 
     def release_component_lock(self, node, params):
         return None
+
+
+class _MooncakeServiceManager:
+    """Start real Mooncake services, matching registered HiCache Mooncake tests."""
+
+    def __init__(self):
+        self.master_port = None
+        self.metadata_port = None
+        self.master_process = None
+        self.metadata_process = None
+        self.started = False
+        self.client_counter = 2
+
+    def start(self):
+        if self.started:
+            return
+        try:
+            import mooncake.http_metadata_server  # type: ignore  # noqa: F401
+            import mooncake.store  # type: ignore  # noqa: F401
+        except Exception as exc:
+            raise unittest.SkipTest(f"Mooncake is unavailable: {exc}") from exc
+
+        self.master_port = find_available_port(50051)
+        self.metadata_port = find_available_port(8080)
+        try:
+            self.metadata_process = subprocess.Popen(
+                [
+                    "python3",
+                    "-m",
+                    "mooncake.http_metadata_server",
+                    "--port",
+                    str(self.metadata_port),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError) as exc:
+            self.stop()
+            raise unittest.SkipTest(
+                f"Could not start Mooncake metadata service: {exc}"
+            ) from exc
+
+        try:
+            self.master_process = subprocess.Popen(
+                ["mooncake_master", "--port", str(self.master_port)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError) as exc:
+            self.stop()
+            raise unittest.SkipTest(f"Could not start mooncake_master: {exc}") from exc
+
+        if not self._wait_ready():
+            self.stop()
+            raise unittest.SkipTest("Mooncake services did not become ready in time")
+
+        self.started = True
+        atexit.register(self.stop)
+
+    def _wait_ready(self, timeout: int = 30) -> bool:
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            metadata_ready = False
+            master_ready = False
+
+            if self.metadata_process and self.metadata_process.poll() is None:
+                try:
+                    requests.get(
+                        f"http://127.0.0.1:{self.metadata_port}/metadata",
+                        timeout=2,
+                    )
+                    metadata_ready = True
+                except requests.RequestException:
+                    pass
+
+            if self.master_process and self.master_process.poll() is None:
+                master_ready = time.time() - start_time > 5
+
+            if metadata_ready and master_ready:
+                return True
+            time.sleep(1)
+        return False
+
+    def _next_local_hostname(self):
+        # These unit tests create several MooncakeStore clients in one pytest
+        # process against one metadata server. Give each client a distinct
+        # loopback identity so Mooncake's rpc_meta keys do not collide.
+        client_id = self.client_counter
+        self.client_counter += 1
+        return f"127.{client_id // 65536}.{(client_id // 256) % 256}.{client_id % 256}"
+
+    def config(self, extra_backend_tag: str, prefetch_threshold: Optional[int]):
+        self.start()
+        extra = {
+            "local_hostname": self._next_local_hostname(),
+            "master_server_address": f"127.0.0.1:{self.master_port}",
+            "metadata_server": f"http://127.0.0.1:{self.metadata_port}/metadata",
+            "global_segment_size": 33554432,
+            "protocol": "tcp",
+            "device_name": "",
+            "check_server": False,
+            "standalone_storage": False,
+            "extra_backend_tag": extra_backend_tag,
+        }
+        if prefetch_threshold is not None:
+            extra["prefetch_threshold"] = prefetch_threshold
+        return extra
+
+    def stop(self):
+        for proc in (self.metadata_process, self.master_process):
+            if proc is None:
+                continue
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+                proc.wait(timeout=5)
+            except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                pass
+        self.metadata_process = None
+        self.master_process = None
+        self.started = False
+
+
+_MOONCAKE_SERVICES = _MooncakeServiceManager()
 
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
@@ -1989,20 +2118,47 @@ class UnifiedRadixCacheSuite:
             hashes.extend(list(n.hash_value))
         return hashes
 
-    def test_hicache_l3_write_storage(self):
-        """D->H->L3 offload: every KV page lands in the file storage backend."""
+    def _storage_dir_for_backend(self, storage_backend: str):
+        if storage_backend == "mooncake":
+            return f"unified_tree_{self.__class__.__name__}_{time.time_ns()}"
+        if storage_backend != "file":
+            return None
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        return storage_dir
+
+    def _skip_non_representative_mooncake_l3_test(self, storage_backend: str):
+        if storage_backend != "mooncake":
+            return
+        # File backend keeps the full config matrix coverage. Mooncake is a real
+        # external service here; keep it to representative FULL/SWA fixtures to
+        # avoid creating dozens of in-process Mooncake transfer clients in one run.
+        if self.cfg.has_mamba:
+            self.skipTest("mamba L3 offload is out of scope for this unit fixture")
+        if not self.cfg.has_swa and self.cfg.page_size == 1:
+            return
+        if (
+            self.cfg.has_swa
+            and self.cfg.page_size == 4
+            and self.cfg.sliding_window_size == 4
+        ):
+            return
+        self.skipTest("Mooncake L3 coverage runs on representative FULL/SWA fixtures")
+
+    def _run_hicache_l3_write_storage(self, storage_backend: str):
+        """D->H->L3 offload: every KV page lands in the storage backend."""
         if self._skip_unsupported_hicache_test():
             return
+        self._skip_non_representative_mooncake_l3_test(storage_backend)
         if self.cfg.has_mamba:
             self.skipTest("mamba L3 offload is out of scope for this unit fixture")
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._storage_dir_for_backend(storage_backend)
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(
             tree,
-            storage_backend="file",
+            storage_backend=storage_backend,
             storage_dir=storage_dir,
             prefetch_threshold=1,
         )
@@ -2025,19 +2181,23 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(backend.batch_exists(page_hashes), len(page_hashes))
         tree.sanity_check()
 
-    def test_hicache_l3_prefetch(self):
-        """L3 round trip: write with one tree, prefetch into a fresh tree.
+    def test_hicache_l3_write_storage(self):
+        """D->H->L3 offload: every KV page lands in the file storage backend."""
+        self._run_hicache_l3_write_storage("file")
 
-        Uses two independent trees that share the same file storage dir so the
-        prefetch path genuinely reloads from L3 (no host/device residue).
-        """
+    def test_hicache_l3_mooncake_write_storage(self):
+        """D->H->L3 offload: every KV page lands in the mooncake storage backend."""
+        self._run_hicache_l3_write_storage("mooncake")
+
+    def _run_hicache_l3_prefetch(self, storage_backend: str):
+        """L3 round trip: write with one tree, prefetch into a fresh tree."""
         if self._skip_unsupported_hicache_test():
             return
+        self._skip_non_representative_mooncake_l3_test(storage_backend)
         if self.cfg.has_mamba:
             self.skipTest("mamba L3 prefetch is out of scope for this unit fixture")
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._storage_dir_for_backend(storage_backend)
         num_pages = 4
         if self.cfg.has_swa:
             # SWA L3 prefetch is all-or-nothing over one full sliding window.
@@ -2053,7 +2213,7 @@ class UnifiedRadixCacheSuite:
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
         self._init_hicache(
             prod,
-            storage_backend="file",
+            storage_backend=storage_backend,
             storage_dir=storage_dir,
             prefetch_threshold=1,
         )
@@ -2070,7 +2230,7 @@ class UnifiedRadixCacheSuite:
         cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
         self._init_hicache(
             cons,
-            storage_backend="file",
+            storage_backend=storage_backend,
             storage_dir=storage_dir,
             prefetch_threshold=1,
         )
@@ -2096,6 +2256,14 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
         cons.sanity_check()
+
+    def test_hicache_l3_prefetch(self):
+        """File L3 round trip through a fresh tree."""
+        self._run_hicache_l3_prefetch("file")
+
+    def test_hicache_l3_mooncake_prefetch(self):
+        """Mooncake L3 round trip through a fresh tree."""
+        self._run_hicache_l3_prefetch("mooncake")
 
     # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
 
@@ -2138,10 +2306,13 @@ class UnifiedRadixCacheSuite:
             node = node.parent
         return False
 
-    def _l3_produce(self, storage_dir, seq):
+    def _l3_produce(self, storage_backend, storage_dir, seq):
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
         self._init_hicache(
-            prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+            prod,
+            storage_backend=storage_backend,
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
         leaf = prod.match_prefix(
@@ -2151,10 +2322,13 @@ class UnifiedRadixCacheSuite:
         self._write_path_to_l3(prod, leaf)
         self._flush_l3_backups(prod)
 
-    def _l3_consumer(self, storage_dir):
+    def _l3_consumer(self, storage_backend, storage_dir):
         cons, _, _ = build_fixture(self.cfg)
         self._init_hicache(
-            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+            cons,
+            storage_backend=storage_backend,
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
         )
         return cons
 
@@ -2163,7 +2337,7 @@ class UnifiedRadixCacheSuite:
         self._run_prefetch_to_completion(cons, req_id)
         cons.drain_storage_control_queues()
 
-    def _setup_swa_tp_prefetch(self):
+    def _setup_swa_tp_prefetch(self, storage_backend="file"):
         """Skip non-SWA fixtures; produce one full SWA window+1 page to L3.
 
         Returns (storage_dir, seq) or None when this fixture cannot exercise
@@ -2171,6 +2345,7 @@ class UnifiedRadixCacheSuite:
         """
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("SWA-only fixture required")
+        self._skip_non_representative_mooncake_l3_test(storage_backend)
         if self._skip_unsupported_hicache_test():
             return None
         sw_pages = (
@@ -2178,13 +2353,12 @@ class UnifiedRadixCacheSuite:
         ) // self.cfg.page_size
         seq = self._make_seq(1, sw_pages + 1)
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        self._l3_produce(storage_dir, seq)
+        storage_dir = self._storage_dir_for_backend(storage_backend)
+        self._l3_produce(storage_backend, storage_dir, seq)
 
         # Baseline (single rank) must actually adopt SWA, else the TP assertions
         # below would be vacuous -> skip.
-        base = self._l3_consumer(storage_dir)
+        base = self._l3_consumer(storage_backend, storage_dir)
         self._consume_prefetch(base, seq, "base")
         if not self._swa_host_on_path(base, seq):
             self.skipTest("fixture does not exercise SWA L3 prefetch")
@@ -2198,7 +2372,7 @@ class UnifiedRadixCacheSuite:
             return
         storage_dir, seq = setup
 
-        cons = self._l3_consumer(storage_dir)
+        cons = self._l3_consumer("file", storage_dir)
         cons.tp_world_size = 2
         min_sizes = self._patch_tp_all_reduce(cons, drop_swa=True)
         self._consume_prefetch(cons, seq, "drop")
@@ -2222,10 +2396,51 @@ class UnifiedRadixCacheSuite:
             return
         storage_dir, seq = setup
 
-        cons = self._l3_consumer(storage_dir)
+        cons = self._l3_consumer("file", storage_dir)
         cons.tp_world_size = 2
         min_sizes = self._patch_tp_all_reduce(cons, drop_swa=False)  # peer == local
         self._consume_prefetch(cons, seq, "keep")
+
+        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.host_hit_length, len(seq))
+        self.assertTrue(
+            self._swa_host_on_path(cons, seq),
+            "SWA must be adopted when all ranks have it",
+        )
+        self.assertIn(2, min_sizes)
+        cons.sanity_check()
+
+    def test_tp_swa_mooncake_prefetch_dropped_when_peer_misses(self):
+        """Mooncake: a peer rank missing SWA drops the whole prefetch result."""
+        setup = self._setup_swa_tp_prefetch("mooncake")
+        if setup is None:
+            return
+        storage_dir, seq = setup
+
+        cons = self._l3_consumer("mooncake", storage_dir)
+        cons.tp_world_size = 2
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=True)
+        self._consume_prefetch(cons, seq, "mooncake-drop")
+
+        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.host_hit_length, 0)
+        self.assertFalse(
+            self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
+        )
+        self.assertIn(2, min_sizes)
+        cons.sanity_check()
+
+    def test_tp_swa_mooncake_prefetch_adopted_when_peer_present(self):
+        """Mooncake: when every rank has SWA, tp>1 adopts the prefetch result."""
+        setup = self._setup_swa_tp_prefetch("mooncake")
+        if setup is None:
+            return
+        storage_dir, seq = setup
+
+        cons = self._l3_consumer("mooncake", storage_dir)
+        cons.tp_world_size = 2
+        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=False)
+        self._consume_prefetch(cons, seq, "mooncake-keep")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         self.assertEqual(m.host_hit_length, len(seq))
@@ -2305,12 +2520,12 @@ class UnifiedRadixCacheSuite:
             self.addCleanup(patcher.stop)
 
         storage_extra_config = None
-        if storage_backend == "file":
+        if storage_backend is not None:
             import sglang.srt.managers.cache_controller as cache_controller
 
-            # The file-backend storage config records TP/PP rank/size.  These unit
-            # fixtures run without initializing distributed parallel state, so
-            # provide the local single-rank values that the fixture represents.
+            # The storage config records TP/PP rank/size. These unit fixtures run
+            # without initializing distributed parallel state, so provide the
+            # local single-rank values that the fixture represents.
             tp_rank_patcher = mock.patch.object(
                 cache_controller, "get_tensor_model_parallel_rank", return_value=0
             )
@@ -2334,6 +2549,7 @@ class UnifiedRadixCacheSuite:
             self.addCleanup(pp_rank_patcher.stop)
             self.addCleanup(pp_size_patcher.stop)
 
+        if storage_backend == "file":
             assert storage_dir is not None, "file backend needs a storage_dir"
             # HiCacheFile reads the directory from this env var.
             cm = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(storage_dir)
@@ -2344,10 +2560,21 @@ class UnifiedRadixCacheSuite:
                 extra["prefetch_threshold"] = prefetch_threshold
             storage_extra_config = json.dumps(extra) if extra else None
 
+        elif storage_backend == "mooncake":
+            assert storage_dir is not None, "mooncake backend needs a storage tag"
+            storage_extra_config = json.dumps(
+                _MOONCAKE_SERVICES.config(storage_dir, prefetch_threshold)
+            )
+
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
+            hicache_mem_layout=(
+                "page_first_direct"
+                if storage_backend == "mooncake"
+                else ServerArgs.hicache_mem_layout
+            ),
             hicache_write_policy=write_policy,
             hicache_storage_backend=storage_backend,
             hicache_storage_backend_extra_config=storage_extra_config,
