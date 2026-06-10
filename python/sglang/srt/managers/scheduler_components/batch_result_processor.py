@@ -154,20 +154,16 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
         )
 
-    def _maybe_insert_dsv4_decode_radix_prompt(
-        self, req: Req, *, is_prebuilt_batch: bool
-    ):
-        if not (
-            is_prebuilt_batch
-            and getattr(req, "dsv4_decode_radix_cache_prompt_once", False)
-        ):
+    def _maybe_insert_dsv4_decode_radix_prompt(self, req: Req):
+        if not getattr(req, "dsv4_decode_radix_cache_prompt_once", False):
             return
 
-        # process_prebuilt() runs before the prebuilt forward and the batch
-        # still references request-owned prompt pages via out_cache_loc. Insert
-        # only after forward completes so overlap insertion can safely free
-        # duplicate prompt KV. Keep the key bounded to the prefill-committed
-        # prompt snapshot so MTP accepted/draft deltas never enter the tree.
+        # process_batch_result_prebuilt() runs before the first real decode
+        # forward and the batch still references request-owned prompt pages via
+        # out_cache_loc. Insert only after a decode forward completes so overlap
+        # insertion can safely free duplicate prompt KV. Keep the key bounded to
+        # the prefill-committed prompt snapshot so MTP accepted/draft deltas
+        # never enter the tree.
         req.dsv4_decode_radix_cache_prompt_once = False
         req.allow_radix_cache_insert_once = True
         prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
@@ -179,6 +175,14 @@ class SchedulerBatchResultProcessor:
         req.fill_ids = old_fill_ids[:prompt_len]
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
+            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+                logger.info(
+                    "DSV4 decode radix prompt inserted: rid=%s "
+                    "prompt_len=%d fill_len=%d",
+                    req.rid,
+                    len(req.fill_ids),
+                    len(old_fill_ids),
+                )
         finally:
             req.fill_ids = old_fill_ids
 
@@ -657,8 +661,6 @@ class SchedulerBatchResultProcessor:
         # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
-        is_prebuilt_batch = batch.forward_mode.is_prebuilt()
-
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -669,9 +671,7 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-            self._maybe_insert_dsv4_decode_radix_prompt(
-                req, is_prebuilt_batch=is_prebuilt_batch
-            )
+            self._maybe_insert_dsv4_decode_radix_prompt(req)
 
             if is_spec_v1:
                 req.time_stats.set_last_decode_finish_time()

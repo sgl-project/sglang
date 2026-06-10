@@ -156,12 +156,8 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     tree_cache.cache_unfinished_req = cache_unfinished_req
     processor = SimpleNamespace(tree_cache=tree_cache)
 
-    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
-        processor, req, is_prebuilt_batch=True
-    )
-    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
-        processor, req, is_prebuilt_batch=True
-    )
+    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
+    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
 
     assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
     assert req.fill_ids == [1, 2, 3, 4, 5]
