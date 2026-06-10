@@ -960,6 +960,16 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
     # CLI / from_args validation
     # ------------------------------------------------------------------
 
+    def test_from_args_defaults_optional_distribution_fields(self):
+        args = make_args(dataset_name="generated-shared-prefix")
+        delattr(args, "gsp_group_distribution")
+        delattr(args, "gsp_zipf_alpha")
+
+        dataset = GeneratedSharedPrefixDataset.from_args(args)
+
+        self.assertEqual(dataset.group_distribution, "uniform")
+        self.assertIsNone(dataset.zipf_alpha)
+
     def test_from_args_rejects_invalid_distribution_and_alpha(self):
         # Defensive validation in from_args protects in-process callers
         # that build a Namespace by hand and bypass the argparse boundary
