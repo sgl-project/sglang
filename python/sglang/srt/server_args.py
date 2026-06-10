@@ -692,6 +692,7 @@ class ServerArgs:
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
+    hicache_numa_binding: Optional[str] = None
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -6312,6 +6313,12 @@ class ServerArgs:
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
+        )
+        parser.add_argument(
+            "--hicache-numa-binding",
+            type=str,
+            default=ServerArgs.hicache_numa_binding,
+            help="Comma-separated rank:numa bindings for HiCache storage threads, e.g. '0:7,1:5'.",
         )
         parser.add_argument(
             "--hicache-storage-backend",

@@ -106,6 +106,34 @@ class HiRadixCache(RadixCache):
         self.attn_tp_group = params.attn_tp_cache_group
         self.pp_group = params.pp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+
+        # Resolve NUMA binding for storage threads from rank:numa mapping
+        numa = None
+        if server_args.hicache_numa_binding:
+            tp_rank = torch.distributed.get_rank(self.tp_group)
+            try:
+                for entry in server_args.hicache_numa_binding.split(","):
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    r, n = entry.split(":", 1)
+                    if int(r.strip()) == tp_rank:
+                        numa = int(n.strip())
+                        break
+            except ValueError:
+                logger.exception(
+                    "Invalid format for --hicache-numa-binding: '%s'. "
+                    "Expected 'rank:numa,rank:numa,...'.",
+                    server_args.hicache_numa_binding,
+                )
+                raise
+            if numa is not None:
+                logger.info(
+                    "HiCache storage thread NUMA binding: rank=%d -> NUMA %d",
+                    tp_rank,
+                    numa,
+                )
+
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
@@ -154,6 +182,7 @@ class HiRadixCache(RadixCache):
                 model_name=server_args.served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=self.enable_storage_metrics,
+                numa=numa,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,

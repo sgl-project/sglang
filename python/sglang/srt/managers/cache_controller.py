@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
+from sglang.srt.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +265,7 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
+        numa: Optional[int] = None,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -285,6 +287,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        self._numa = numa
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -386,6 +389,14 @@ class HiCacheController:
     def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
         for group in self.prefetch_sync_groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def _bind_storage_thread(self):
+        """Bind current thread to remote NUMA node for storage I/O.
+
+        No-op when _numa is not configured (default).
+        """
+        if self._numa is not None:
+            numa_bind_to_node(self._numa)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -1008,6 +1019,7 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
+        self._bind_storage_thread()
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -1065,6 +1077,7 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        self._bind_storage_thread()
         self.prefetch_buffer = Queue()
         self.prefetch_io_aux_thread = threading.Thread(
             target=self.prefetch_io_aux_func, daemon=True
@@ -1234,6 +1247,7 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
+        self._bind_storage_thread()
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
