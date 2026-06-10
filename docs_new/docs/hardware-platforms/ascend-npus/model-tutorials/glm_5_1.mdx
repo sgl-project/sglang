@@ -132,12 +132,6 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 - Replace `${NAME}` with your own container name or remove `--name` to use default name.
 </Tip>
 
-Before running best practices, update transformers to version 5.3.0:
-
-```bash
-pip install transformers==5.3.0
-```
-
 ## Online service deployment
 
 ### Single-node online deployment
@@ -145,12 +139,12 @@ pip install transformers==5.3.0
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. The following command is based on the W4A8 quantized model.
 
+```bash Launch server
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
 #============================================================
 
-```bash Launch server
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -194,25 +188,126 @@ python3 -m sglang.launch_server \
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
 
-### Multi-node deployment
+### Multi-node online deployment
 
-Multi-node deployment distributes the model across multiple Atlas 800I A3 nodes using tensor parallelism, suitable for
-BF16 full-precision models that require more device memory. The following command is based on 2 x Atlas 800I A3 with
-BF16 weights.
+Multi-node deployment distributes the model across multiple Atlas 800I A3 nodes using tensor parallelism while keeping
+prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
+node can provide. The following command is based on the W4A8 quantized model.
 
-#### 2 x Atlas 800I A3
+#### 2 x Atlas 800I A3 (W4A8)
 
-The model will be distributed across 2 Atlas 800I A3 nodes (TP=32 across 2 nodes).
+The model will be distributed across 2 Atlas 800I A3 nodes (TP=32 across 2 nodes, DP=16).
 
 Modify the IP addresses of the 2 nodes, then run the same script on both nodes.
 
 ```bash Launch multi-node server
+#============================================================
+# Before running, update the following variables:
+#   P_IP: node IP addresses (2 nodes)
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+#============================================================
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export STREAMS_PER_DEVICE=32
+
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
+
+MODEL_PATH=/path/to/GLM-5.1-w4a8
+
+P_IP=(<your ip1> <your ip2>)
+P_MASTER="${P_IP[0]}:4567"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export HCCL_BUFFSIZE=2500
+        python -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --attention-backend ascend \
+        --device npu \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --tp-size 32 --nnodes 2 --node-rank $i \
+        --dp-size 16 --enable-dp-attention \
+        --chunked-prefill-size 131072 --max-prefill-tokens 280000 \
+        --trust-remote-code \
+        --host 127.0.0.1 \
+        --mem-fraction-static 0.65 \
+        --port 8000 \
+        --served-model-name glm-5.1 \
+        --cuda-graph-max-bs 8 \
+        --max-running-requests 128 \
+        --quantization modelslim \
+        --speculative-draft-model-quantization unquant \
+        --moe-a2a-backend deepep --deepep-mode auto \
+        --load-balance-method round_robin \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+### Multi-node PD disaggregation deployment
+
+PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
+throughput for high-concurrency scenarios. The following command is based on the W4A8 quantized model.
+
+#### 4 x Atlas 800I A3 (W4A8)
+
+The prefill and decode nodes will each run on 2 Atlas 800I A3 nodes (4 nodes total, 32 NPUs each group). Modify the
+IP addresses before running.
+
+1. Run the following command on prefill and decode nodes.
+
+```bash Prefill / Decode nodes
+#============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP addresses (2 nodes)
+#   D_IP: decode node IP addresses (2 nodes)
+#   ASCEND_MF_STORE_URL: prefill node IP with port (e.g., tcp://192.168.1.1:24707)
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+#============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+export SGLANG_SET_CPU_AFFINITY=1
+
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -220,48 +315,114 @@ unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib/:${LD_LIBRARY_PATH}
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://${P_IP[0]}:24707"
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_NPU_USE_MULTI_STREAM=1
-export HCCL_BUFFSIZE=1000
-export HCCL_OP_EXPANSION_MODE=AIV
 
-export HCCL_SOCKET_IFNAME=<network-interface>
-export GLOO_SOCKET_IFNAME=<network-interface>
+P_IP=(<your prefill ip1> <your prefill ip2>)
+D_IP=(<your decode ip1> <your decode ip2>)
 
-P_IP=('your ip1' 'your ip2')
-P_MASTER="${P_IP[0]}:your port"
-
-MODEL_PATH=/path/to/model-weights
+MODEL_PATH=/path/to/GLM-5.1-w4a8
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
 for i in "${!P_IP[@]}";
 do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        python3 -m sglang.launch_server \
-        --model-path ${MODEL_PATH} \
-        --attention-backend ascend \
-        --device npu \
-        --tp-size 32 --nnodes 2 --node-rank $i --dist-init-addr $P_MASTER \
-        --chunked-prefill-size 16384 --max-prefill-tokens 131072 \
-        --trust-remote-code \
-        --host 127.0.0.1 \
-        --mem-fraction-static 0.8 \
-        --port 8000 \
-        --served-model-name glm-5.1 \
-        --cuda-graph-max-bs 16 \
-        --disable-radix-cache
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export TASK_QUEUE_ENABLE=2
+        export ENABLE_PROFILING=0
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
+
+        export HCCL_BUFFSIZE=8
+        unset PYTORCH_NPU_ALLOC_CONF
+        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
+        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+        export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://${P_IP[0]}:24672"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 --trust-remote-code --nnodes 2 --node-rank $i \
+        --tp-size 32 --mem-fraction-static 0.75 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 64 \
+        --served-model-name glm-5.1 --chunked-prefill-size 524288 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
+        --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
+        --dp-size 4 --enable-dp-attention \
+        --load-balance-method round_robin \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 8 \
+        --enable-dp-lm-head --moe-dense-tp 1 \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=650
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+        export TASK_QUEUE_ENABLE=0
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
+
+        export SGLANG_NPU_USE_MULTI_STREAM=1
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8003 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --ep-size 32 \
+        --mem-fraction-static 0.87 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
+        --served-model-name glm-5.1 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
+        --cuda-graph-bs 1 2 3 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
         NODE_RANK=$i
         break
     fi
 done
 ```
+
+2. Launch the SGLang Router (on any reachable node):
+
+```bash Router
+#============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip1>: prefill node 1 IP address
+#   <your decode ip1>: decode node 1 IP address
+#============================================================
+
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy round_robin \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --decode http://<your decode ip1>:8003 \
+    --host 127.0.0.1 \
+    --port 6688
+```
+
+The full sglang server will serve on `http://127.0.0.1:6688`.
 
 ## Functional verification
 
@@ -297,15 +458,18 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 
 ### Best practice configuration reference
 
-For complete deployment examples and benchmark commands, see the
-[GLM-5 examples](/docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples) page.
+For complete optimal configurations with deployment scripts and benchmark commands, see the
+[GLM Series Models](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#glm-series-models) section on the Best Practice page.
 
 #### Scenario overview
 
-| Scenario                      | Deployment mode     | Total NPUs  | Weight version  |
-|-------------------------------|---------------------|-------------|-----------------|
-| Single-node deployment        | PD mixed            | 16 (A3)     | W4A8 INT8       |
-| Multi-node deployment         | TP across nodes     | 32 (A3)     | BF16            |
+| Scenario | Deployment mode | Total NPUs | Weight version |
+|----------|----------------|-------------|----------------|
+| High throughput (3.5K+1.5K) | PD mixed (single-node) | 16 (A3) | W4A8 |
+| High throughput (3.5K+1.5K) | PD mixed (multi-node) | 32 (A3) | W4A8 |
+| High throughput (16K+1K) | PD disaggregation | 32 (A3) | W4A8 |
+| High throughput (64K+1K, 90% cache hit) | PD disaggregation | 48 (A3) | W4A8 |
+| High throughput (128K+1K, 90% cache hit) | PD disaggregation | 48 (A3) | W4A8 |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.
 
@@ -318,13 +482,3 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
 This section only covers model-specific issues.
-
-### Q: Why do I need to update transformers to version 5.3.0?
-
-A: GLM-5.1 requires transformers 5.3.0 or later for proper model loading and tokenization. The Docker image may ship
-with an older version. Run `pip install transformers==5.3.0` after entering the container.
-
-### Q: Why does the model fail to load with an out-of-memory error on a single A3 node?
-
-A: The BF16 full-precision model requires at least 2 x Atlas 800I A3 nodes (32 cards total). For single-node deployment,
-use the W4A8 quantized version (`Eco-Tech/GLM-5.1-w4a8`) with 16 cards.
