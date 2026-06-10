@@ -17,7 +17,7 @@ import pprint
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 
 import PIL.Image
 import torch
@@ -25,6 +25,9 @@ import torch
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
+)
+from sglang.multimodal_gen.runtime.realtime.session import (
+    RealtimeSession,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -141,6 +144,7 @@ class Req:
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
+    c2ws_plucker_emb: torch.Tensor | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -179,6 +183,8 @@ class Req:
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
 
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+
     is_warmup: bool = False
 
     # STA parameters
@@ -197,6 +203,20 @@ class Req:
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
         default_factory=TraceNullContext
     )
+
+    # realtime
+    realtime_session_id: str | None = None
+    session: RealtimeSession | None = None
+    block_idx: int = 0
+    realtime_chunk_size: int | None = None
+    realtime_event_id: int | None = None
+    realtime_output_format: str | None = None
+    realtime_preview_max_width: int | None = None
+    realtime_output_pacing: bool = False
+    realtime_causal_sink_size: int | None = None
+    realtime_causal_kv_cache_num_frames: int | None = None
+    # return websocket-friendly raw RGB frame bytes instead of rwa tensors
+    return_raw_frames: bool = False
 
     # results
     output: torch.Tensor | None = None
@@ -386,7 +406,11 @@ class OutputBatch:
     Final output (after pipeline completion)
     """
 
-    output: Any | None = None
+    # tensors or numpy frames
+    output: Sequence[Any] | None = None
+    raw_frame_batches: list[list[bytes]] | None = None
+    raw_frame_content_type: str = "application/x-raw-rgb"
+    raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
@@ -412,4 +436,5 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.raw_frame_batches = None
         self.noise_pred = None

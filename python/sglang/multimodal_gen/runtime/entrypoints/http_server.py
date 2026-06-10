@@ -11,11 +11,18 @@ from typing import TYPE_CHECKING
 import httpx
 import torch
 from fastapi import APIRouter, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai import (
+    image_api,
+    video_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+    realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
@@ -66,6 +73,22 @@ async def _wait_until_http_ready(server_args: ServerArgs) -> None:
     raise RuntimeError(f"HTTP server did not become ready at {health_url}")
 
 
+def _is_realtime_serving(server_args: ServerArgs) -> bool:
+    """A realtime pipeline establishes per-session state over the WebSocket, so
+    the synthetic server-warmup request (which has no session) cannot run — it
+    would fail in the realtime stage and abort startup. Detect it via the
+    realtime-adapter registry and skip server warmup."""
+    try:
+        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+            get_realtime_model_adapter,
+        )
+
+        get_realtime_model_adapter(server_args)
+        return True
+    except Exception:
+        return False
+
+
 async def _run_server_warmup_after_http_ready(
     server_args: ServerArgs, warmup_done: asyncio.Event
 ) -> None:
@@ -74,6 +97,7 @@ async def _run_server_warmup_after_http_ready(
             not server_args.warmup
             or not server_args.server_warmup
             or server_args.warmup_resolutions is not None
+            or _is_realtime_serving(server_args)
         ):
             warmup_done.set()
             return
@@ -381,6 +405,13 @@ def create_app(server_args: ServerArgs):
     Create and configure the FastAPI application instance.
     """
     app = FastAPI(lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
@@ -401,6 +432,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(realtime_video_api.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)

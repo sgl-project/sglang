@@ -28,11 +28,11 @@ from torch.nn.parameter import Parameter
 # cutlass_fused_moe. Its C++ logger reads TLLM_LOG_LEVEL on first kernel launch;
 # setdefault preserves any explicit user override.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
-
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -154,6 +154,7 @@ if _is_hip:
     # import aiter
     try:
         from aiter.ops.shuffle import (
+            shuffle_scale,
             shuffle_scale_a16w4,
             shuffle_weight,
             shuffle_weight_a16w4,
@@ -795,27 +796,53 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(e, n, -1)
             )
-
-            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
-            shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-                self.num_experts,
-                True,
-            )
-
-            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
-            shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-                self.num_experts,
-                False,
-            )
-
             layer.w13_weight_bias.data = (
                 layer.w13_weight_bias.data.view(-1, n // 2, 2)
                 .permute(0, 2, 1)
                 .contiguous()
                 .view(-1, n)
             )
+
+            if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+                layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+                shuffled_w13_scale = shuffle_scale_a16w4(
+                    layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                    self.num_experts,
+                    True,
+                )
+
+                layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+                shuffled_w2_scale = shuffle_scale_a16w4(
+                    layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                    self.num_experts,
+                    False,
+                )
+            else:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight, is_guinterleave=False, gate_up=True
+                )
+                shuffled_w13_scale = shuffle_scale(
+                    layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                    experts_cnt=self.num_experts,
+                    is_guinterleave=False,
+                    gate_up=True,
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight, is_guinterleave=False, gate_up=False
+                )
+                shuffled_w2_scale = shuffle_scale(
+                    layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                    experts_cnt=self.num_experts,
+                    is_guinterleave=False,
+                    gate_up=False,
+                )
+
+            # shuffle_weight_a16w4(gate_up=True) above preshuffles w13 into aiter's
+            # preshuffle + gate/up-interleaved layout. Tag the Parameter so apply()
+            # can carry the metadata across .view(float4_e2m1fn_x2) and aiter's
+            # fused_moe selects the preshuffle_on kernel family.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 shuffled_w13_scale, requires_grad=False
@@ -1233,9 +1260,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight = layer.w13_weight
                 w2_weight = layer.w2_weight
 
-            x_padded = torch.nn.functional.pad(
-                x, (0, self.hidden_pad), mode="constant", value=0.0
-            )
+            # `.view()` creates a fresh tensor that drops the `is_shuffled`
+            # marker we set in process_weights_after_loading. Re-tag it so the
+            # downstream aiter.fused_moe selects preshuffle_on kernels.
+            if getattr(layer.w13_weight, "is_shuffled", False):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+
+            # Skip the explicit pad if x already arrives at the padded
+            # hidden_size (the upstream RMSNorm fused the pad into its
+            # output — see RMSNorm.x_pad_to_multiple). Saves a separate
+            # zero-pad kernel launch per layer.
+            if x.shape[-1] == self.hidden_size:
+                x_padded = x
+            else:
+                x_padded = torch.nn.functional.pad(
+                    x, (0, self.hidden_pad), mode="constant", value=0.0
+                )
             quant_info = AiterMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,
@@ -1248,6 +1289,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
+                # Triggers aiter's INTERLEAVE gate_mode dispatch (required for our
+                # preshuffled gate/up-interleaved weight layout) and applies the
+                # model's swiglu clamp. Models populate the same scalar under
+                # different MoeRunnerConfig fields: gpt-oss uses `gemm1_clamp_limit`
+                # (renamed in `models/gpt_oss.py` from `config.swiglu_limit`); DSv4
+                # / FP8 uses `swiglu_limit` directly. Accept either.
+                swiglu_limit=(
+                    self.moe_runner_config.gemm1_clamp_limit
+                    or self.moe_runner_config.swiglu_limit
+                    or 0.0
+                ),
             )
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
