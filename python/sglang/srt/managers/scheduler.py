@@ -2090,6 +2090,34 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # Uniform-state diffusion samples the canvas from the renoise schedule and
+        # bypasses logit post-processing, so request-level sampling controls have no
+        # effect. Reject them explicitly rather than ignore them silently. Masked
+        # diffusion keeps its existing behavior (this is gated to the uniform path).
+        if self.dllm_config is not None and self.dllm_config.is_uniform:
+            sp = req.sampling_params
+            unsupported = []
+            if req.return_logprob:
+                unsupported.append("logprobs")
+            if sp.regex or sp.json_schema or sp.ebnf or sp.structural_tag:
+                unsupported.append("structured output (regex/json_schema/ebnf/structural_tag)")
+            if sp.logit_bias:
+                unsupported.append("logit_bias")
+            if (
+                sp.frequency_penalty
+                or sp.presence_penalty
+                or sp.repetition_penalty != 1.0
+            ):
+                unsupported.append("presence/frequency/repetition penalties")
+            if unsupported:
+                req.set_finish_with_abort(
+                    "DiffusionGemma does not support "
+                    + ", ".join(unsupported)
+                    + " (sampling is governed by the renoise schedule)."
+                )
+                self._add_request_to_queue(req)
+                return
+
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1

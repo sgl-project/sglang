@@ -644,11 +644,17 @@ class PrefillAdder:
         # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
         # the diffusion unmask process may have some problems
         # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
+        if self.dllm_config.is_uniform:
+            # Uniform extends the actual remaining tokens (variable-length encode or
+            # the full canvas), not a forced page-aligned block.
+            available = len(req.fill_ids) - prefix_len
+            trunc_len = min(self.rem_dllm_tokens, self.dllm_block_size, available)
+        else:
+            trunc_len = (
+                min(self.rem_dllm_tokens, self.dllm_block_size)
+                // self.page_size
+                * self.page_size
+            )
 
         req.extend_input_len = trunc_len
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]

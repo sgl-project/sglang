@@ -4262,8 +4262,21 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
+        # DiffusionGemma (uniform): head_dim 512 exceeds flashinfer's cap, and the
+        # bidirectional canvas attention needs triton with cuda-graph and chunked
+        # prefill disabled (the allow_bidirectional_attention_in_extend gate). Force
+        # these so a default launch works. Masked dLLMs keep the handling below.
+        if self.dllm_algorithm == "Gemma4Renoise":
+            if self.attention_backend != "triton":
+                logger.warning(
+                    "Attention backend forced to triton for DiffusionGemma "
+                    "(head_dim 512 exceeds the flashinfer/fa3 cap)."
+                )
+                self.attention_backend = "triton"
+            self.disable_cuda_graph = True
+            self.chunked_prefill_size = -1
         # On AMD/HIP, disable cuda graph for DLLM and use triton backend
-        if is_hip():
+        elif is_hip():
             if not self.disable_cuda_graph:
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
