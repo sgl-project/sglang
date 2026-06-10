@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -44,8 +44,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
-        if is_hip():
-            raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
