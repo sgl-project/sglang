@@ -55,6 +55,29 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def _build_retrieve_parent_token(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    retrieve_parent_token: torch.Tensor,
+):
+    """CPU fallback for the parent-token table that the CUDA conv kernel
+    builds fused. Sequential: each sibling inherits the parent assigned to
+    the previous sibling in the chain, so the loop order is load-bearing."""
+    bs, seqlen = retrieve_next_token.shape
+    rnt = retrieve_next_token
+    rns = retrieve_next_sibling
+    rpt = retrieve_parent_token
+    rpt.zero_()
+    for n in range(bs):
+        for t in range(seqlen):
+            child = rnt[n, t].item()
+            if child >= 0 and child < seqlen:
+                rpt[n, child] = t
+            sibling = rns[n, t].item()
+            if sibling >= 0 and sibling < seqlen:
+                rpt[n, sibling] = rpt[n, t].item()
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -290,6 +313,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if (
+            is_cpu()
+            and forward_batch.forward_mode.is_target_verify()
+            and self.forward_metadata.retrieve_next_token is not None
+        ):
+            # Build the eagle-tree parent-token table once per verify step (it
+            # is shared by all layers); CUDA builds it fused inside the triton
+            # conv kernel instead. Built as int32 because the CPU gating kernel
+            # requires it.
+            retrieve_parent_token = torch.empty_like(
+                self.forward_metadata.retrieve_next_token, dtype=torch.int32
+            )
+            _build_retrieve_parent_token(
+                self.forward_metadata.retrieve_next_token,
+                self.forward_metadata.retrieve_next_sibling,
+                retrieve_parent_token,
+            )
+            self.forward_metadata.retrieve_parent_token = retrieve_parent_token
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -431,6 +472,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
+            if is_cpu():
+                mixed_qkv_reshaped = mixed_qkv_reshaped.contiguous()
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -444,7 +487,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2)
+            if is_cpu():
+                mixed_qkv = mixed_qkv.contiguous()
+            mixed_qkv = mixed_qkv.view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -488,8 +534,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            if is_cpu():
+                query = query.contiguous()
+                key = key.contiguous()
+                value = value.contiguous()
 
         if is_target_verify:
+            if is_cpu():
+                verify_cache_indices = cache_indices[:batch_size]
+                verify_state_indices = intermediate_state_indices[:batch_size]
+            else:
+                verify_cache_indices = cache_indices
+                verify_state_indices = intermediate_state_indices
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
@@ -499,10 +555,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a=a,
                 b=b,
                 ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                cache_indices=verify_cache_indices,
                 query_start_loc=query_start_loc,
                 intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
+                intermediate_state_indices=verify_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )

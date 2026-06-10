@@ -19,6 +19,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
@@ -198,8 +201,9 @@ class MiMoMTP(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if not _is_cpu:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
 
 EntryClass = MiMoMTP
