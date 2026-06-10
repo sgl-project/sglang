@@ -526,11 +526,12 @@ class TestCosmos3ActionLatentPrep(unittest.TestCase):
         batch = self._run(
             action_mode="forward_dynamics",
             domain_name="agibotworld",
-            action=[[0.1] * 7 for _ in range(16)],
+            action=[[0.1] * 29 for _ in range(16)],
         )
         # action_chunk_size = num_frames - 1 = 16; padded to action_dim 64.
         self.assertEqual(tuple(batch.action_latents.shape), (1, 16, 64))
-        self.assertEqual(batch.extra["raw_action_dim"], 7)
+        # raw_action_dim is derived from the embodiment (agibotworld -> 29).
+        self.assertEqual(batch.extra["raw_action_dim"], 29)
         self.assertEqual(batch.extra["action_start_frame_offset"], 1)
         self.assertEqual(
             int(batch.extra["action_domain_ids"][0]),
@@ -565,8 +566,16 @@ class TestCosmos3ActionLatentPrep(unittest.TestCase):
             self._run(action_mode="forward_dynamics", domain_name="agibotworld")
 
     def test_policy_requires_raw_action_dim(self):
+        # policy has no input action to infer from, so it needs raw_action_dim
+        # from either the embodiment or an explicit value. With only a numeric
+        # domain_id (no embodiment name) and no raw_action_dim, it must raise.
         with self.assertRaises(ValueError):
-            self._run(action_mode="policy", domain_name="droid_lerobot")
+            self._run(action_mode="policy", domain_id=0)
+
+    def test_policy_raw_action_dim_from_embodiment(self):
+        # droid_lerobot -> 10, so policy no longer needs an explicit raw dim.
+        batch = self._run(action_mode="policy", domain_name="droid_lerobot")
+        self.assertEqual(batch.extra["raw_action_dim"], 10)
 
     def test_unknown_action_mode_raises(self):
         with self.assertRaises(ValueError):

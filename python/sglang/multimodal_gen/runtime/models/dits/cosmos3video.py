@@ -994,22 +994,24 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             prefix="proj_out",
         )
 
+        self.sound_gen = arch.sound_gen
         self.sound_dim = arch.sound_dim
-        self.audio_proj_in = ReplicatedLinear(
-            self.sound_dim,
-            self.hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix="audio_proj_in",
-        )
-        self.audio_proj_out = ReplicatedLinear(
-            self.hidden_size,
-            self.sound_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix="audio_proj_out",
-        )
-        self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
+        if arch.sound_gen:
+            self.audio_proj_in = ReplicatedLinear(
+                self.sound_dim,
+                self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix="audio_proj_in",
+            )
+            self.audio_proj_out = ReplicatedLinear(
+                self.hidden_size,
+                self.sound_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix="audio_proj_out",
+            )
+            self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
         if arch.action_gen:
             self.action_dim = arch.action_dim

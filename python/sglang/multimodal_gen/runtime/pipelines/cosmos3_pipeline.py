@@ -44,6 +44,15 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         "sound_tokenizer",
     ]
 
+    def load_modules(self, server_args, loaded_modules=None):
+        # Visual-only Cosmos3 checkpoints ship no sound_tokenizer; require it
+        # only when the checkpoint actually provides one.
+        if "sound_tokenizer" not in self._load_config():
+            self._required_config_modules = [
+                m for m in self._required_config_modules if m != "sound_tokenizer"
+            ]
+        return super().load_modules(server_args, loaded_modules)
+
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         """Create Cosmos3 pipeline stages.
 

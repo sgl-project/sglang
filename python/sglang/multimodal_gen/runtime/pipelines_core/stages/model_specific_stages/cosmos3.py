@@ -41,6 +41,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     ACTION_MODE_INVERSE_DYNAMICS,
     ACTION_MODES,
     EMBODIMENT_TO_DOMAIN_ID,
+    build_action_prompt,
+    denormalize_action,
+    get_raw_action_dim,
+    load_action_stats,
+    normalize_action,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -66,6 +71,13 @@ COSMOS3_VIDEO_SYSTEM_PROMPT = (
 COSMOS3_IMAGE_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate images from a given prompt."
 )
+
+# Per-mode flow-shift defaults, applied only when the request and pipeline
+# config leave flow_shift unset. T2V/I2V fall back to the checkpoint scheduler
+# config instead of a hard-coded value.
+COSMOS3_T2I_FLOW_SHIFT = 3.0
+COSMOS3_V2V_FLOW_SHIFT = 10.0
+COSMOS3_ACTION_FLOW_SHIFT = 5.0
 
 
 def _resize_crop_pil(
@@ -300,6 +312,21 @@ class Cosmos3TokenizationStage(PipelineStage):
             COSMOS3_IMAGE_SYSTEM_PROMPT if is_image_gen else COSMOS3_VIDEO_SYSTEM_PROMPT
         )
 
+        # Action mode uses a structured JSON caption with neither a system
+        # prompt nor the duration suffix.
+        if getattr(batch.sampling_params, "action_mode", None) is not None:
+            prompt = build_action_prompt(
+                prompt,
+                getattr(batch.sampling_params, "action_view_point", "ego_view"),
+                num_frames,
+                fps,
+                batch.height,
+                batch.width,
+            )
+            use_system_prompt = False
+            use_duration_template = False
+            self.log_info(f"Action prompt: {prompt}")
+
         # Apply duration template if enabled (no temporal concept for T2I).
         if use_duration_template and not is_image_gen and num_frames > 1:
             duration = num_frames / fps
@@ -475,6 +502,12 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
         if sound_duration > 0.0:
+            if not getattr(self.transformer, "sound_gen", False):
+                raise ValueError(
+                    "sound generation was requested (sound_duration > 0) but the "
+                    "loaded Cosmos3 checkpoint has no sound modality (sound_gen is "
+                    "False)."
+                )
             sound_latent_fps = self.transformer.sound_latent_fps
             sound_latent_frames = max(1, round(sound_duration * sound_latent_fps))
             sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
@@ -549,6 +582,10 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         domain_id = self._resolve_domain_id(batch)
         raw_action_dim = getattr(sp, "raw_action_dim", None)
+        if raw_action_dim is None:
+            embodiment = getattr(sp, "domain_name", None)
+            if embodiment:
+                raw_action_dim = get_raw_action_dim(embodiment)
 
         if mode == ACTION_MODE_FORWARD_DYNAMICS:
             raw = getattr(sp, "action", None)
@@ -573,6 +610,10 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 action = action[:action_chunk_size]
             if raw_action_dim is None:
                 raw_action_dim = int(action.shape[-1])
+            stats_path = getattr(sp, "action_stats_path", None)
+            if stats_path is not None:
+                method = getattr(sp, "action_normalization", "quantile")
+                action = normalize_action(action, method, load_action_stats(stats_path))
             if action.shape[-1] < action_dim:
                 pad = torch.zeros(action.shape[0], action_dim - action.shape[-1])
                 action = torch.cat([action, pad], dim=-1)
@@ -641,6 +682,20 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
             getattr(scheduler, "config", None), "flow_shift", None
         )
 
+    def _default_flow_shift_for_mode(self, batch: Req) -> float | None:
+        """Resolve the per-mode default flow_shift for the request.
+
+        T2V and I2V keep the checkpoint scheduler's flow_shift; T2I, V2V, and
+        action use their own defaults.
+        """
+        if getattr(batch.sampling_params, "action_mode", None) is not None:
+            return COSMOS3_ACTION_FLOW_SHIFT
+        if batch.data_type == DataType.IMAGE:
+            return COSMOS3_T2I_FLOW_SHIFT
+        if batch.preprocessed_video is not None:
+            return COSMOS3_V2V_FLOW_SHIFT
+        return self.default_flow_shift
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
         device = get_local_torch_device()
@@ -649,7 +704,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         if flow_shift is None:
             flow_shift = server_args.pipeline_config.flow_shift
         if flow_shift is None:
-            flow_shift = self.default_flow_shift
+            flow_shift = self._default_flow_shift_for_mode(batch)
         if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
             self.scheduler.set_shift(float(flow_shift))
 
@@ -1390,6 +1445,14 @@ class Cosmos3DecodingStage(PipelineStage):
             action_pred = batch.action_latents.float().cpu()
             if raw_action_dim is not None:
                 action_pred = action_pred[:, :, :raw_action_dim]
+            stats_path = getattr(batch.sampling_params, "action_stats_path", None)
+            if stats_path is not None:
+                method = getattr(
+                    batch.sampling_params, "action_normalization", "quantile"
+                )
+                action_pred = denormalize_action(
+                    action_pred, method, load_action_stats(stats_path)
+                )
             self.log_info(f"Action predictions shape: {tuple(action_pred.shape)}")
 
         return OutputBatch(
