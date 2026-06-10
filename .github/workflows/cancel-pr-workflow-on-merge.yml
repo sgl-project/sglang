@@ -35,30 +35,79 @@ jobs:
             exit 0
           fi
 
+          FAILURES=0
+
           # `branch=` matches run.head_branch, which a fork PR shares with
           # same-named branches of other forks; filter by head repo id so
           # only this PR's runs are cancelled. Exclude this run itself --
           # pull_request_target runs also carry the PR's head branch.
-          run_ids=$(
-            for status in queued in_progress waiting; do
-              gh api -X GET "repos/$REPO/actions/runs" \
-                --paginate \
-                -f branch="$HEAD_BRANCH" \
-                -f status="$status" \
-                -F per_page=100 \
-                --jq ".workflow_runs[]
-                      | select(.head_repository.id == $HEAD_REPO_ID and .id != $GITHUB_RUN_ID)
-                      | .id"
-            done | sort -u
-          )
+          #
+          # The status filter accepts one value per request, so sweep every
+          # non-terminal state: pending (concurrency queue), waiting
+          # (deployment approval), and action_required (fork approval) runs
+          # would otherwise start after the PR is already closed.
+          #
+          # Two passes: the second catches runs that were still
+          # materializing (requested) during the first, and verifies that
+          # cancellations actually landed.
+          for pass in 1 2; do
+            run_ids=""
+            for status in queued in_progress waiting pending requested action_required; do
+              ids=""
+              for attempt in 1 2 3; do
+                if ids=$(gh api -X GET "repos/$REPO/actions/runs" \
+                  --paginate \
+                  -f branch="$HEAD_BRANCH" \
+                  -f status="$status" \
+                  -F per_page=100 \
+                  --jq ".workflow_runs[]
+                        | select(.head_repository.id == $HEAD_REPO_ID and .id != $GITHUB_RUN_ID)
+                        | .id"); then
+                  break
+                fi
+                ids=""
+                if [ "$attempt" -eq 3 ]; then
+                  echo "::error::Listing $status runs failed after 3 attempts"
+                  FAILURES=1
+                else
+                  sleep 5
+                fi
+              done
+              run_ids="$run_ids"$'\n'"$ids"
+            done
+            run_ids=$(echo "$run_ids" | sed '/^$/d' | sort -u)
 
-          if [ -z "$run_ids" ]; then
-            echo "No unfinished runs found"
-            exit 0
-          fi
+            if [ -z "$run_ids" ]; then
+              echo "Pass $pass: no unfinished runs found"
+              break
+            fi
+            echo "Pass $pass: cancelling $(echo "$run_ids" | wc -l | tr -d ' ') run(s)"
 
-          for run_id in $run_ids; do
-            echo "Cancelling https://github.com/$REPO/actions/runs/$run_id"
-            gh run cancel "$run_id" --repo "$REPO" \
-              || echo "  cancel failed (run may have just finished)"
+            for run_id in $run_ids; do
+              echo "Cancelling https://github.com/$REPO/actions/runs/$run_id"
+              if gh run cancel "$run_id" --repo "$REPO" 2>/dev/null; then
+                continue
+              fi
+              # Plain cancel fails for runs stuck behind approval /
+              # deployment protection rules; force-cancel handles those.
+              if gh api -X POST "repos/$REPO/actions/runs/$run_id/force-cancel" >/dev/null 2>&1; then
+                echo "  force-cancelled"
+                continue
+              fi
+              # A run that reached a terminal state between listing and
+              # cancelling is fine; anything else is a real failure.
+              state=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.status' 2>/dev/null || echo "unknown")
+              if [ "$state" = "completed" ]; then
+                echo "  already finished, nothing to cancel"
+              else
+                echo "::error::Failed to cancel run $run_id (status: $state)"
+                FAILURES=1
+              fi
+            done
+
+            if [ "$pass" -eq 1 ]; then
+              sleep 20
+            fi
           done
+
+          exit "$FAILURES"
