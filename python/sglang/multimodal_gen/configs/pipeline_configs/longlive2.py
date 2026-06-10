@@ -27,6 +27,7 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
 
     dit_config: DiTConfig = field(default_factory=LongLive2VideoConfig)
     def adjust_num_frames(self, num_frames: int) -> int:
+        num_frames = super().adjust_num_frames(num_frames)
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
         latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
         block_size = self.dit_config.arch_config.num_frames_per_block
