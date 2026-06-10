@@ -15,7 +15,6 @@ import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.lfm2 import Lfm2Config
@@ -25,8 +24,8 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -51,6 +50,22 @@ from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 
+def _mlp_intermediate_size(config: Lfm2Config) -> int:
+    intermediate_size = config.intermediate_size
+
+    if config.block_auto_adjust_ff_dim:
+        intermediate_size = int(2 * intermediate_size / 3)
+        if config.block_ffn_dim_multiplier is not None:
+            intermediate_size = int(
+                config.block_ffn_dim_multiplier * intermediate_size
+            )
+            intermediate_size = config.block_multiple_of * (
+                (intermediate_size + config.block_multiple_of - 1)
+                // config.block_multiple_of
+            )
+    return intermediate_size
+
+
 class Lfm2MLP(nn.Module):
     """MLP with SwiGLU activation."""
 
@@ -61,45 +76,27 @@ class Lfm2MLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        intermediate_size = config.intermediate_size
+        intermediate_size = _mlp_intermediate_size(config)
 
-        if config.block_auto_adjust_ff_dim:
-            intermediate_size = int(2 * intermediate_size / 3)
-            if config.block_ffn_dim_multiplier is not None:
-                intermediate_size = int(
-                    config.block_ffn_dim_multiplier * intermediate_size
-                )
-                intermediate_size = config.block_multiple_of * (
-                    (intermediate_size + config.block_multiple_of - 1)
-                    // config.block_multiple_of
-                )
-
-        self.w1 = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            intermediate_size,
+            [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("w1", prefix),
+            prefix=add_prefix("gate_up_proj", prefix),
         )
-        self.w3 = ColumnParallelLinear(
-            config.hidden_size,
-            intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("w3", prefix),
-        )
-        self.w2 = RowParallelLinear(
+        self.down_proj = RowParallelLinear(
             intermediate_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("w2", prefix),
+            prefix=add_prefix("down_proj", prefix),
         )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, _ = self.w1(x)
-        up, _ = self.w3(x)
-        out, _ = self.w2(F.silu(gate) * up)
+        gate_up, _ = self.gate_up_proj(x)
+        out, _ = self.down_proj(self.act_fn(gate_up))
         return out
 
 
@@ -461,6 +458,29 @@ class Lfm2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Return (input_dim, output_dim) of the module for LoRA buffer sizing."""
+        config = self.config
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        if module_name == "qkv_proj":
+            return config.hidden_size, head_dim * (
+                config.num_attention_heads + config.num_key_value_heads * 2
+            )
+        elif module_name == "out_proj":
+            # Both attention and ShortConv out_proj project back to hidden_size.
+            return head_dim * config.num_attention_heads, config.hidden_size
+        elif module_name == "gate_up_proj":
+            # config.intermediate_size may be auto-adjusted at module creation
+            return config.hidden_size, _mlp_intermediate_size(config) * 2
+        elif module_name == "down_proj":
+            return _mlp_intermediate_size(config), config.hidden_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
     @torch.no_grad()
     def forward(
         self,
@@ -482,6 +502,8 @@ class Lfm2ForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            (".gate_up_proj", ".w1", 0),
+            (".gate_up_proj", ".w3", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -501,6 +523,10 @@ class Lfm2ForCausalLM(nn.Module):
                 loaded_weight = loaded_weight.squeeze(1)  # (D, 1, K) -> (D, K)
             if ".conv.conv.bias" in name:
                 name = name.replace(".conv.conv.bias", ".conv.conv_bias")
+
+            # HF names the MLP down projection w2; we use down_proj
+            if ".w2." in name:
+                name = name.replace(".w2.", ".down_proj.")
 
             # Handle QKV stacking
             for param_name, weight_name, shard_id in stacked_params_mapping:
