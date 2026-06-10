@@ -1,7 +1,7 @@
 # Legacy-page inventory — remaining migrations
 
 Loaded on demand by the `cookbook-migrate-model` skill. Per-model quirks for
-the 18 in-scope legacy pages still to migrate (Qwen3.5 done — PR #27843).
+the 18 in-scope legacy pages still to migrate (Qwen3.5 done — PR #27848).
 Surveyed 2026-06-10 from the legacy generators + MDX §5 blocks; **re-verify
 against the live files at migration time** — pages keep receiving updates.
 

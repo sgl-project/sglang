@@ -16,7 +16,7 @@ Reuses the `cookbook-add-model` skill's assets (read them on demand):
 - `../cookbook-add-model/references/mintlify-authoring.md` (MDX rules)
 
 Migration-specific references in this skill:
-- [references/dimension-mapping.md](references/dimension-mapping.md) — legacy-control → new-dimension mapping rules, command rewrite table, per-family strategy sets, and the Qwen3.5 pilot as a worked example (PR #27843).
+- [references/dimension-mapping.md](references/dimension-mapping.md) — legacy-control → new-dimension mapping rules, command rewrite table, per-family strategy sets, and the Qwen3.5 pilot as a worked example (PR #27848).
 - [references/model-inventory.md](references/model-inventory.md) — per-model quirks for the remaining legacy pages (dimensions, hardware, env vars, measured-data inventory, batch order).
 
 ## Hard rules (non-negotiable)
