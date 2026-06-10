@@ -13,6 +13,15 @@ The documentation has been migrated. Please make documentation updates in the
 corresponding location under docs_new/ instead.
 """
 
+LEGACY_DOCS_ALLOWLIST = {
+    "docs/_static/css/custom_log.css",
+    "docs/_static/js/deprecation_banner.js",
+    "docs/conf.py",
+    # Has relative links into the source tree that the offline lychee check
+    # validates, so it must be updated when the linked source files move.
+    "docs/developer_guide/development_jit_kernel_guide.md",
+}
+
 
 def staged_paths() -> list[str]:
     result = subprocess.run(
@@ -33,7 +42,10 @@ def staged_paths() -> list[str]:
 def main() -> int:
     paths = sys.argv[1:] or staged_paths()
     docs_paths = sorted(
-        path for path in paths if path == "docs" or path.startswith("docs/")
+        path
+        for path in paths
+        if (path == "docs" or path.startswith("docs/"))
+        and path not in LEGACY_DOCS_ALLOWLIST
     )
 
     if not docs_paths:

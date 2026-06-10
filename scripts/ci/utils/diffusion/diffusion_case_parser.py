@@ -16,15 +16,21 @@ Usage:
 
 import ast
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
 # Mapping from list variable names to suite names
 CASE_LIST_TO_SUITE = {
+    "ONE_GPU_CASES": "1-gpu",
     "ONE_GPU_CASES_A": "1-gpu",
     "ONE_GPU_CASES_B": "1-gpu",
     "ONE_GPU_CASES_C": "1-gpu-b200",
+    "ONE_GPU_MODELOPT_FP8_CASES": "1-gpu",
+    "ONE_GPU_MODELOPT_CASES": "1-gpu-b200",
+    "ONE_GPU_B200_CASES": "1-gpu-b200",
+    "TWO_GPU_CASES": "2-gpu",
     "TWO_GPU_CASES_A": "2-gpu",
     "TWO_GPU_CASES_B": "2-gpu",
 }
@@ -38,6 +44,17 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 # Paths relative to repository root
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
+
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
+    BASELINE_REL_PATH = (
+        "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
+    )
+    CASE_LIST_TO_SUITE = {
+        "ONE_NPU_CASES": "1-npu",
+        "TWO_NPU_CASES": "2-npu",
+    }
 
 
 @dataclass
@@ -75,6 +92,21 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
 
     def __init__(self):
         self.cases: Dict[str, List[str]] = {}  # list_name -> [case_id, ...]
+        self.factory_case_ids: Dict[str, str] = {}
+
+    def visit_Module(self, node: ast.Module):
+        for stmt in node.body:
+            if not isinstance(stmt, ast.FunctionDef):
+                continue
+            case_id = self._extract_factory_case_id(stmt)
+            if case_id:
+                self.factory_case_ids[stmt.name] = case_id
+
+        for stmt in node.body:
+            if isinstance(stmt, ast.Expr):
+                self._process_expr(stmt.value)
+
+        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
         self._process_assignment(node.targets, node.value)
@@ -85,22 +117,86 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             self._process_assignment([node.target], node.value)
         self.generic_visit(node)
 
+    def visit_AugAssign(self, node: ast.AugAssign):
+        self._process_aug_assignment(node.target, node.op, node.value)
+        self.generic_visit(node)
+
     def _process_assignment(self, targets: List[ast.AST], value: ast.AST):
-        """Process an assignment to extract case IDs if it's a known list."""
+        """Process an assignment to extract case IDs."""
         for target in targets:
-            if isinstance(target, ast.Name) and target.id in CASE_LIST_TO_SUITE:
+            if isinstance(target, ast.Name):
                 list_name = target.id
-                case_ids = self._extract_case_ids_from_list(value)
+                case_ids = self._extract_case_ids(value)
                 if case_ids is not None:
                     self.cases[list_name] = case_ids
 
-    def _extract_case_ids_from_list(self, node: ast.AST) -> Optional[List[str]]:
-        """Extract case IDs from a literal list of DiffusionTestCase calls."""
-        if not isinstance(node, ast.List):
-            return None
+    def _process_aug_assignment(self, target: ast.AST, op: ast.AST, value: ast.AST):
+        """Process `+=` style assignment to merge case lists."""
+        if not isinstance(target, ast.Name) or not isinstance(op, ast.Add):
+            return
 
+        if isinstance(value, ast.Name):
+            target_suite = CASE_LIST_TO_SUITE.get(target.id)
+            value_suite = CASE_LIST_TO_SUITE.get(value.id)
+            if target_suite and value_suite and target_suite != value_suite:
+                return
+
+        rhs_case_ids = self._extract_case_ids(value)
+        if rhs_case_ids is None:
+            return
+
+        lhs_case_ids = self.cases.get(target.id, [])
+        self.cases[target.id] = [*lhs_case_ids, *rhs_case_ids]
+
+    def _process_expr(self, node: ast.AST):
+        """Process list mutation calls such as `ONE_GPU_CASES.append(...)`."""
+        if not isinstance(node, ast.Call):
+            return
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr != "append":
+            return
+        if not isinstance(node.func.value, ast.Name):
+            return
+        list_name = node.func.value.id
+        if list_name not in CASE_LIST_TO_SUITE:
+            return
+        if len(node.args) != 1:
+            return
+
+        case_id = self._extract_case_id_from_call(node.args[0])
+        if case_id:
+            self.cases.setdefault(list_name, []).append(case_id)
+
+    def _extract_case_ids(self, node: ast.AST) -> Optional[List[str]]:
+        """Extract case IDs from a supported expression."""
+        if isinstance(node, ast.List):
+            return self._extract_case_ids_from_list(node)
+
+        if isinstance(node, ast.Name):
+            # Reference to a previously parsed list variable.
+            if node.id not in self.cases:
+                return None
+            return list(self.cases[node.id])
+
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left_ids = self._extract_case_ids(node.left)
+            right_ids = self._extract_case_ids(node.right)
+            if left_ids is None or right_ids is None:
+                return None
+            return [*left_ids, *right_ids]
+
+        return None
+
+    def _extract_case_ids_from_list(self, node: ast.List) -> List[str]:
+        """Extract case IDs from a literal list of DiffusionTestCase calls."""
         case_ids = []
         for elt in node.elts:
+            if isinstance(elt, ast.Starred):
+                starred_case_ids = self._extract_case_ids(elt.value)
+                if starred_case_ids:
+                    case_ids.extend(starred_case_ids)
+                continue
             case_id = self._extract_case_id_from_call(elt)
             if case_id:
                 case_ids.append(case_id)
@@ -111,12 +207,25 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
         if not isinstance(node, ast.Call):
             return None
 
-        # Check if it's a DiffusionTestCase call
-        if isinstance(node.func, ast.Name) and node.func.id == "DiffusionTestCase":
-            # First positional argument is the case_id
+        # First positional argument is the case_id.
+        if isinstance(node.func, ast.Name) and node.func.id in {
+            "DiffusionTestCase",
+            "_make_modelopt_ci_case",
+        }:
             if node.args and isinstance(node.args[0], ast.Constant):
                 return node.args[0].value
+        if isinstance(node.func, ast.Name) and not node.args:
+            return self.factory_case_ids.get(node.func.id)
 
+        return None
+
+    def _extract_factory_case_id(self, node: ast.FunctionDef) -> Optional[str]:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Return) or child.value is None:
+                continue
+            case_id = self._extract_case_id_from_call(child.value)
+            if case_id:
+                return case_id
         return None
 
 
@@ -368,5 +477,16 @@ def collect_diffusion_suites(
                 ),
             )
         suites[suite].cases.extend(cases)
+
+    # Dedupe duplicated case IDs while preserving first-seen order.
+    for suite_info in suites.values():
+        seen_case_ids = set()
+        deduped_cases = []
+        for case in suite_info.cases:
+            if case.case_id in seen_case_ids:
+                continue
+            seen_case_ids.add(case.case_id)
+            deduped_cases.append(case)
+        suite_info.cases = deduped_cases
 
     return suites

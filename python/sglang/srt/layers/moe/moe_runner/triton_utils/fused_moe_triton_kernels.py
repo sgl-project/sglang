@@ -379,7 +379,9 @@ def fused_moe_kernel(
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
+    MASK_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
+    LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
 ):
     """
@@ -440,11 +442,9 @@ def fused_moe_kernel(
     off_experts = off_experts_i32.to(tl.int64)
 
     if filter_expert and off_experts == -1:
-        # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
-        if not FUSE_ADD_TO_OUTPUT:
-            # skip the zero-write to preserve existing values.
+        if not FUSE_ADD_TO_OUTPUT and not (FUSE_SUM_ALL_REDUCE and LORA_PRESERVE_BASE):
+            # Write zeros only when this kernel owns the full output; the experimental LoRA
+            # add path (LORA_PRESERVE_BASE) keeps the base output from the prior MoE kernel.
             write_zeros_to_output(
                 c_ptr,
                 stride_cm,
@@ -616,6 +616,18 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
         existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
         tl.store(c_ptrs, existing + accumulator, mask=c_mask)
+    # ===== TO BE REFACTORED ====
+    elif MASK_OUTPUT:
+        # Store a fresh output while zeroing rows whose request has no active LoRA.
+        offs_token_out = offs_token // ROUTER_TOPK
+        output_mask = tl.load(
+            add_mask_ptr + offs_token_out, mask=token_mask, other=False
+        )
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        accumulator = tl.where(output_mask[:, None], accumulator, 0.0)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
+    # ===== END TO BE REFACTORED ====
     elif FUSE_SUM_ALL_REDUCE:
         offs_token_out = offs_token // ROUTER_TOPK
         c_ptrs = (
@@ -731,6 +743,8 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
+    mask_output: bool = False,
+    lora_preserve_base: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -807,6 +821,18 @@ def invoke_fused_moe_kernel(
         assert (
             add_output_mask is not None
         ), "add_output_mask required when fuse_add_to_output=True"
+    # ===== TO BE REFACTORED ====
+    if mask_output:
+        assert (
+            not fuse_add_to_output
+        ), "mask_output and fuse_add_to_output are mutually exclusive"
+        assert (
+            not fuse_sum_all_reduce
+        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when mask_output=True"
+    # ===== END TO BE REFACTORED ====
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -924,6 +950,8 @@ def invoke_fused_moe_kernel(
             filter_expert=filter_expert,
             swap_ab=swap_ab,
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
+            MASK_OUTPUT=mask_output,
+            LORA_PRESERVE_BASE=lora_preserve_base,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             **config,
@@ -966,6 +994,8 @@ def act_and_mul_kernel(
     expert_step: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
 ):
     """
     Unified activation and multiply kernel that handles both sorted and unsorted routing,
@@ -994,6 +1024,10 @@ def act_and_mul_kernel(
         gate_output = tl.load(gate_output_ptr + offset, mask=mask)
         up_output = tl.load(up_output_ptr + offset, mask=mask)
 
+        if HAS_SWIGLU_LIMIT:
+            gate_output = tl.minimum(gate_output, SWIGLU_LIMIT)
+            up_output = tl.maximum(tl.minimum(up_output, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+
         gate_output_activated = _apply_activation(gate_output, ACTIVATION_TYPE)
         gate_output_activated = gate_output_activated.to(InDtype)
 
@@ -1010,6 +1044,7 @@ def act_and_mul_triton(
     expert_ids: Optional[torch.Tensor] = None,
     down_moe_use_tma: bool = False,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     """
     Args:
@@ -1020,11 +1055,14 @@ def act_and_mul_triton(
         expert_ids: Expert IDs for sorted routing (used when down_moe_use_tma=True)
         down_moe_use_tma: Whether to use sorted routing layout
         activation: Activation type ("silu" or "gelu")
+        swiglu_limit: if not None, clamp gate to [-inf, L] and up to [-L, L] before activation
+                      (compiles a separate kernel variant via tl.constexpr).
     """
     grid = (down_input.shape[0],)
     hidden_size = gateup_output.shape[1]
     expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
     expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
+    has_swiglu_limit = swiglu_limit is not None
     act_and_mul_kernel[grid](
         gateup_output,
         down_input,
@@ -1033,6 +1071,8 @@ def act_and_mul_triton(
         expert_step,
         BLOCK_SIZE=512,
         ACTIVATION_TYPE=activation,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
     )
 
 
