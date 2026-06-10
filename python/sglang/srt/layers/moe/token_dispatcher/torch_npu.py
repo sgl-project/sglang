@@ -109,9 +109,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         # Replace -1 (invalid) expert IDs with a valid expert index (e.g. 0)
         # and set the corresponding weight to zero.
         invalid_mask = topk_ids == -1
-        if topk_ids == -1:
-            print('+++++++++++++++++++++++++++++++')
-            print(topk_ids)
+        print(topk_ids)
         if invalid_mask.any():
             topk_ids = topk_ids.clone()              # avoid modifying original
             topk_weights = topk_weights.clone()
