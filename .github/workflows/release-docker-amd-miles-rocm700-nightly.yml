@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == "sgl-project/sglang"
+    if: github.repository == 'sgl-project/sglang'
     runs-on: amd-docker-scale
     environment: "prod"
     strategy:
@@ -71,7 +71,7 @@ jobs:
           retention-days: 1
 
   push_local_registry:
-    if: ${{ !cancelled() && github.repository == "sgl-project/sglang" }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
     runs-on: linux-mi300-1gpu-sglang
     environment: "prod"
     needs: publish
