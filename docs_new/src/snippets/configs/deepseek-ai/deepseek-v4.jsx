@@ -23,6 +23,7 @@ export const config = {
   quantizations: [
     { id: "fp8", label: "FP8" },
     { id: "fp4", label: "FP4" },
+    { id: "nvfp4", label: "NVFP4" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -40,6 +41,7 @@ export const config = {
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
+    "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
     // H200 FP8 needs the sgl-project repackaging (Hopper can't run FP4-mixed Instruct).
     "h200|flash|fp8": "sgl-project/DeepSeek-V4-Flash-FP8",
     "h200|pro|fp8":   "sgl-project/DeepSeek-V4-Pro-FP8",
@@ -577,6 +579,31 @@ sgl-eval run aime25 \\
         "--chunked-prefill-size 65536",
         "--tokenizer-worker-num 8",
         "--enable-prefill-delayer",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // B200 + NVFP4 (nvidia/DeepSeek-V4-Pro-NVFP4)
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
