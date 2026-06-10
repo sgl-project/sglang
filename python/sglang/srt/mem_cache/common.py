@@ -172,11 +172,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if (
-        page_size == 1
-        or spec_topk == 1
-        or not spec_algo.needs_per_topk_page_duplication()
-    ):
+    if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
         return max(spec_steps * spec_topk, spec_tokens)
     else:
         # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree

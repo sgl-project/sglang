@@ -118,12 +118,10 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
-    def needs_per_topk_page_duplication(self) -> bool:
-        """Whether the draft phase materializes topk divergent KV chains, so
-        that with page_size > 1 each branch needs its own copy of the partial
-        tail page (see get_alloc_len_per_decode). NGRAM has no draft-time KV
-        at all -- its tree lives only in the verify mask and the draft KV is
-        written as one contiguous extend at verify."""
+    def has_draft_kv(self) -> bool:
+        """Whether the draft phase writes KV chains. NGRAM does not (its tree
+        lives only in the verify mask), so per-decode KV sizing needs no
+        per-topk page rounding; see get_alloc_len_per_decode."""
         return not self.is_ngram()
 
     def create_future_map(

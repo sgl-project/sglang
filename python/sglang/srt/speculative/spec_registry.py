@@ -78,8 +78,8 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
-    def needs_per_topk_page_duplication(self) -> bool:
-        # Conservative default: reserve the larger paged-tree footprint.
+    def has_draft_kv(self) -> bool:
+        # Conservative default: the larger KV reserve.
         return True
 
     def supports_spec_v2(self) -> bool:
