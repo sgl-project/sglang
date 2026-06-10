@@ -92,6 +92,9 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    # Multi-turn only: turn_gaps_s[i] is a client-side pause (seconds) before
+    # round i is sent, modeling tool-call / think-time gaps between turns.
+    turn_gaps_s: Optional[List[float]] = None
 
 
 @dataclass
@@ -1171,10 +1174,16 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
         prompts = request_func_input.prompt
+        turn_gaps_s = request_func_input.turn_gaps_s or []
         prev_messages: List[Dict[str, str]] = []
         outputs = []
 
         for round_index in range(len(prompts)):
+            # Tool-call / think-time pause before this round. The session
+            # keeps holding its concurrency slot while sleeping, modeling a
+            # live agent session that is idle between turns.
+            if round_index < len(turn_gaps_s) and turn_gaps_s[round_index] > 0:
+                await asyncio.sleep(turn_gaps_s[round_index])
             normalized = _normalize_round_messages(prompts[round_index])
             if normalized is None:
                 raise ValueError(
@@ -1409,6 +1418,7 @@ async def benchmark(
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
+            turn_gaps_s=getattr(request, "turn_gaps_s", None),
         )
 
         tasks.append(
@@ -2424,6 +2434,40 @@ if __name__ == "__main__":
         "--gsp-ordered",
         action="store_true",
         help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
+    )
+    group.add_argument(
+        "--gsp-turn-gap-short-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Multi-turn only (--gsp-num-turns > 1): client-side pause in "
+            "seconds before each round after the first, modeling a fast "
+            "tool call between turns. Each round independently uses the "
+            "long gap instead with probability --gsp-turn-gap-long-prob. "
+            "A session keeps holding its concurrency slot while paused, "
+            "modeling a live agent session that is idle between turns. "
+            "Default 0 = no pause (unchanged behavior)."
+        ),
+    )
+    group.add_argument(
+        "--gsp-turn-gap-long-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Multi-turn only: pause in seconds used instead of "
+            "--gsp-turn-gap-short-s with probability "
+            "--gsp-turn-gap-long-prob, modeling a slow external tool call. "
+            "Gap choices are sampled deterministically from --seed."
+        ),
+    )
+    group.add_argument(
+        "--gsp-turn-gap-long-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Multi-turn only: probability in [0, 1] that a round's pause is "
+            "--gsp-turn-gap-long-s rather than --gsp-turn-gap-short-s."
+        ),
     )
     group.add_argument(
         "--gsp-group-distribution",

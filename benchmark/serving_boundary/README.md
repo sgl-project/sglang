@@ -17,10 +17,26 @@ Tracking issue: https://github.com/sgl-project/sglang/issues/27406
 | `long_decode` | ~1024 / 512 | decode / memory bandwidth |
 | `long_prefill_8k` | ~8192 / 64 | prefill / KV-cache allocation |
 | `repeated_prefix` | ~2048 / 128 (long shared prefix) | RadixAttention prefix reuse |
+| `agentic_session` | multi-turn: ~3072 prefix + ~512/turn / 256 | cache retention under interleaved sessions |
 
 `repeated_prefix` uses the `generated-shared-prefix` dataset so a long identical
 prefix is actually reused across requests (a real prefix-cache hit), rather than
 a short prefix that the cache would barely benefit from.
+
+`agentic_session` models interleaved agent sessions: each session is a
+multi-turn conversation (`--gsp-num-turns`) with a unique ~3072-token session
+prefix, a ~512-token appended suffix per turn (tool output), and a client-side
+tool-call pause before each turn — mostly short (`--agentic-gap-short-s`,
+default 0.5s), occasionally long (`--agentic-gap-long-s`, default 15s with
+probability `--agentic-gap-long-prob` 0.15). A session holds its concurrency
+slot during pauses, like a live agent that is idle mid-tool-call. Turn `k+1`
+either hits the session's prefix in the radix cache or re-prefills it after
+eviction, so the per-turn p95 TTFT spread is the cache-retention signal; the
+N ladder plus gaps control eviction pressure. Session count auto-scales as
+`2×N` (override with `--agentic-sessions`); turns default to 6
+(`--agentic-turns`). This workload runs on the `sglang-oai-chat` backend
+(multi-turn requires a chat backend) with real assistant responses carried
+across turns.
 
 ## Phases
 
@@ -52,6 +68,11 @@ python3 bench_boundary.py --model Qwen/Qwen2.5-7B-Instruct --port 30000
 python3 bench_boundary.py --model Qwen/Qwen2.5-7B-Instruct --port 30000 \
     --workloads long_decode,long_prefill_8k --phases scaling \
     --concurrency 1,8,32 --reps 1 --num-prompts 64
+
+# agentic sessions only (cache-retention boundary; scaling phase is the
+# primary signal -- gaps already pace the turns within each session)
+python3 bench_boundary.py --model Qwen/Qwen2.5-7B-Instruct --port 30000 \
+    --workloads agentic_session --phases scaling --concurrency 1,8,32 --reps 3
 
 # print the planned bench_serving commands without running
 python3 bench_boundary.py --port 30000 --dry-run

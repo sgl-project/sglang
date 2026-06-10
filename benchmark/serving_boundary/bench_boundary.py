@@ -11,6 +11,10 @@ Workloads (prompt / output tokens, approximate):
   long_decode      ~1024 / 512   decode / memory-bandwidth stress
   long_prefill_8k  ~8192 / 64    prefill / KV-allocation boundary
   repeated_prefix  ~2048 / 128   shared-prefix reuse (RadixAttention)
+  agentic_session  multi-turn    interleaved agent sessions with per-session
+                                 ~3072-token prefixes, ~512-token turn suffixes,
+                                 and tool-call gaps between turns (cache
+                                 retention / eviction-pressure boundary)
 
 Phases:
   scaling   requests issued as fast as accepted (``--request-rate inf``)
@@ -74,19 +78,59 @@ def _repeated_prefix_workload(num_prompts, range_ratio):
     ]
 
 
-def workload_flags(name, num_prompts, range_ratio):
+def _agentic_session_workload(args, n):
+    # Each gsp group is one agent session: a unique ~3k-token session prefix
+    # (system prompt + scaffold), played as a multi-turn conversation where
+    # every turn appends a ~512-token suffix (tool output) and pauses for a
+    # tool-call gap before the next turn. Sessions interleave under the
+    # concurrency ladder, so turn k+1 either hits the session prefix in cache
+    # or re-prefills it after eviction -- the p95 TTFT spread across turns is
+    # the retention signal. Session count auto-scales with N so cells stay
+    # comparable in wall-clock; lengths can be overridden via
+    # --extra-bench-args (later duplicate flags win).
+    sessions = args.agentic_sessions if args.agentic_sessions > 0 else max(2 * n, 8)
+    return [
+        "--dataset-name", "generated-shared-prefix",
+        "--gsp-num-groups", str(sessions),
+        "--gsp-prompts-per-group", "1",
+        "--gsp-num-turns", str(args.agentic_turns),
+        "--gsp-system-prompt-len", "3072",
+        "--gsp-question-len", "512",
+        "--gsp-output-len", "256",
+        "--gsp-range-ratio", str(args.random_range_ratio if args.random_range_ratio > 0 else 1.0),
+        "--gsp-turn-gap-short-s", str(args.agentic_gap_short_s),
+        "--gsp-turn-gap-long-s", str(args.agentic_gap_long_s),
+        "--gsp-turn-gap-long-prob", str(args.agentic_gap_long_prob),
+    ]
+
+
+def workload_flags(name, args, n):
     if name == "balanced_2k":
-        return _random_workload(2048, 128, num_prompts, range_ratio)
+        return _random_workload(2048, 128, args.num_prompts, args.random_range_ratio)
     if name == "long_decode":
-        return _random_workload(1024, 512, num_prompts, range_ratio)
+        return _random_workload(1024, 512, args.num_prompts, args.random_range_ratio)
     if name == "long_prefill_8k":
-        return _random_workload(8192, 64, num_prompts, range_ratio)
+        return _random_workload(8192, 64, args.num_prompts, args.random_range_ratio)
     if name == "repeated_prefix":
-        return _repeated_prefix_workload(num_prompts, range_ratio)
+        return _repeated_prefix_workload(args.num_prompts, args.random_range_ratio)
+    if name == "agentic_session":
+        return _agentic_session_workload(args, n)
     raise ValueError(f"unknown workload: {name}")
 
 
-ALL_WORKLOADS = ["balanced_2k", "long_decode", "long_prefill_8k", "repeated_prefix"]
+def workload_backend(name):
+    # agentic_session plays rounds sequentially with real assistant responses,
+    # which bench_serving only supports on chat backends.
+    return "sglang-oai-chat" if name == "agentic_session" else "sglang"
+
+
+ALL_WORKLOADS = [
+    "balanced_2k",
+    "long_decode",
+    "long_prefill_8k",
+    "repeated_prefix",
+    "agentic_session",
+]
 ALL_PHASES = ["scaling", "ttft"]
 TAG_SEP = ":"
 
@@ -229,7 +273,7 @@ def build_cmd(args, base_url, phase, workload, n, rep, raw_path):
 
     cmd = [
         sys.executable, "-m", "sglang.bench_serving",
-        "--backend", "sglang",
+        "--backend", workload_backend(workload),
         "--base-url", base_url,
         "--max-concurrency", str(n),
         "--request-rate", request_rate,
@@ -243,7 +287,7 @@ def build_cmd(args, base_url, phase, workload, n, rep, raw_path):
         cmd += ["--model", args.model]
     if args.flush_cache:
         cmd += ["--flush-cache"]
-    cmd += workload_flags(workload, args.num_prompts, args.random_range_ratio)
+    cmd += workload_flags(workload, args, n)
     if args.extra_bench_args:
         cmd += args.extra_bench_args.split()
     return tag, cmd
@@ -264,6 +308,11 @@ def main():
     p.add_argument("--ttft-request-rate", type=float, default=0.0, help="Paced arrival rate (req/s) for the ttft phase; 0 = use concurrency N.")
     p.add_argument("--flush-cache", action="store_true", default=True, help="Flush the server cache before each cell (default on).")
     p.add_argument("--no-flush-cache", dest="flush_cache", action="store_false", help="Do not flush between cells.")
+    p.add_argument("--agentic-sessions", type=int, default=0, help="agentic_session: number of concurrent agent sessions per cell; 0 = auto (2x concurrency, min 8).")
+    p.add_argument("--agentic-turns", type=int, default=6, help="agentic_session: turns played per session.")
+    p.add_argument("--agentic-gap-short-s", type=float, default=0.5, help="agentic_session: pause before a turn for a fast tool call (seconds).")
+    p.add_argument("--agentic-gap-long-s", type=float, default=15.0, help="agentic_session: pause before a turn for a slow external tool call (seconds).")
+    p.add_argument("--agentic-gap-long-prob", type=float, default=0.15, help="agentic_session: probability a turn's pause is the long gap.")
     p.add_argument("--server-config-label", type=str, default="default", help="Label for the server config (e.g. radix_on/radix_off); embedded in results so multiple configs can share one --output-dir.")
     p.add_argument("--output-dir", type=str, default="./boundary_results", help="Directory for raw + summary outputs.")
     p.add_argument("--seed", type=int, default=42, help="Base RNG seed (offset by rep index).")
@@ -275,7 +324,7 @@ def main():
     phases = [ph.strip() for ph in args.phases.split(",") if ph.strip()]
     concurrency = [int(n) for n in args.concurrency.split(",") if n.strip()]
     for w in workloads:
-        workload_flags(w, args.num_prompts, args.random_range_ratio)  # validate early
+        workload_flags(w, args, n=1)  # validate early
     for ph in phases:
         if ph not in ALL_PHASES:
             p.error(f"unknown phase: {ph}")

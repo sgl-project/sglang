@@ -29,6 +29,9 @@ class DatasetRow:
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
+    # Multi-turn only: turn_gaps_s[i] is a client-side pause (seconds) before
+    # round i is sent, modeling tool-call / think-time gaps between turns.
+    turn_gaps_s: Optional[List[float]] = None
 
     def __post_init__(self):
         if self.text_prompt_len is None:
