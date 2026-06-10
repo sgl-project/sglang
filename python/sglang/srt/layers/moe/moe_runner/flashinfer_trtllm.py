@@ -1093,15 +1093,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-            # flashinfer allocates the deferred expert_weights buffer with
-            # routing_logits.dtype, which is fp32 in the small-batch decode path
-            # (DSv3 router gemm emits fp32). But the C++ routing kernel writes the
-            # routing weights as bf16 packed contiguously into that buffer, leaving
-            # the back half uninitialized. Reading it as fp32 reinterprets two
-            # adjacent bf16 weights as one fp32 -> garbage routing weights (and the
-            # fused finalize then produces garbage / non-deterministic output).
-            # Reinterpret as bf16 and keep the live prefix so the weights are
-            # consumed correctly. Large-batch prefill already returns bf16 here.
+            # FIXME(kpham-sgl): flashinfer sizes this buffer from routing_logits
+            # dtype (fp32 in DSv3 decode) but always writes bf16 weights into it.
+            # Reinterpret the live bf16 prefix. Fix upstream alloc to drop this.
             if expert_weights.dtype == torch.float32:
                 n, k = expert_weights.shape
                 expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
