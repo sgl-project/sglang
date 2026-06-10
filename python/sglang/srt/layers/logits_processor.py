@@ -936,7 +936,7 @@ class LogitsProcessor(nn.Module):
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
-            if not _is_npu:
+            if not _is_npu and not _is_cpu:
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
                 logits = self.final_logit_softcapping * torch.tanh(
