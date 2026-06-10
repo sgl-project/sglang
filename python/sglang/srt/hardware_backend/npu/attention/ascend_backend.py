@@ -1120,9 +1120,6 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    # swa_out_cache_loc is the full->SWA write target, derived from
-                    # out_cache_loc; it must not be applied to cross-attention writes
-                    # (which target encoder_out_cache_loc) and is None for non-SWA pools.
                     swa_loc = (
                         self.forward_metadata.swa_out_cache_loc
                         if not layer.is_cross_attention
