@@ -470,7 +470,6 @@ class MambaPool:
                     ),
                     dtype=ssm_dtype,
                     device=device,
-                    # device="cuda",
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -1301,7 +1300,7 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
-        if enable_kv_cache_copy and not self.use_hnd:
+        if enable_kv_cache_copy and not self.use_hnd and not _is_cpu:
             # The tiled byte copy assumes NHD slot-rows; HND uses a (page, off)
             # gather in move_kv_cache instead, so skip the slot-row copy config.
             self._init_kv_copy_and_warmup()
@@ -1791,7 +1790,7 @@ class MHATokenToKVPool(KVCache):
                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
             return
 
-        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get() or _is_cpu:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
 

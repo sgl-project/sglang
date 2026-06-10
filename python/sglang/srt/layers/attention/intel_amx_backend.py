@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 import torch
 
@@ -12,7 +12,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 
 class IntelAMXAttnBackend(AttentionBackend):
@@ -25,6 +24,7 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         super().__init__()
         self.forward_metadata = None
+        self.draft_decode_metadata = None
         self.skip_prefill = skip_prefill
         self.device = model_runner.device
         # Pool refs — captured at construction so they survive deletion of the
@@ -57,7 +57,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         ).shape[-1]
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
-        
+
         # speculative decoding params
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
@@ -82,7 +82,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_target_verify():
             max_extend_len = self.num_draft_tokens
         elif forward_batch.forward_mode.is_draft_extend():
-            max_extend_len = torch.max(spec_info.accept_length).item()
+            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
         else:
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
         self.forward_metadata = (attn_logits, max_extend_len)
@@ -160,6 +160,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
         bs = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens
         if forward_batch.extend_seq_lens is None:
             # TARGET_VERIFY mode: infer extend_seq_lens from spec_info
             if forward_batch.spec_info is not None and hasattr(
@@ -169,6 +170,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 extend_seq_lens = torch.full(
                     (bs,), draft_token_num, dtype=torch.int32, device=self.device
                 )
+                seq_lens = forward_batch.seq_lens + draft_token_num
             else:
                 raise RuntimeError(
                     "extend_seq_lens is None but cannot infer from spec_info. "
@@ -177,6 +179,14 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             extend_seq_lens = forward_batch.extend_seq_lens
 
+        if forward_batch.extend_start_loc is None:
+            extend_start_loc = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            if bs > 1:
+                extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        else:
+            extend_start_loc = forward_batch.extend_start_loc
+
+        seq_lens = seq_lens.to(torch.int64)
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -187,10 +197,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            # forward_batch.extend_seq_lens,
+            seq_lens,
             extend_seq_lens,
-            forward_batch.extend_start_loc,
+            extend_start_loc,
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
@@ -213,6 +222,17 @@ class IntelAMXAttnBackend(AttentionBackend):
     ):
         attn_logits, _ = self.forward_metadata
 
+        if self.draft_decode_metadata is not None:
+            draft_meta = self.draft_decode_metadata
+            attn_logits = draft_meta["attn_logits"]
+            req_to_token = draft_meta["req_to_token"]
+            req_pool_indices = draft_meta["req_pool_indices"]
+            seq_lens = draft_meta["seq_lens"]
+        else:
+            req_to_token = self.req_to_token_pool.req_to_token
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
+
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
@@ -224,6 +244,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        seq_lens = seq_lens.to(torch.int64)
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -233,9 +254,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             v,
             cache_loc,
             attn_logits,
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
@@ -263,7 +284,6 @@ class IntelAMXMultiStepDraftBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        max_bs = model_runner.req_to_token_pool.size * self.topk
         self.attn_backends: List[IntelAMXAttnBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
@@ -279,8 +299,46 @@ class IntelAMXMultiStepDraftBackend:
         self.page_size = model_runner.server_args.page_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+        from sgl_kernel import build_draft_decode_metadata_cpu
+
+        num_seqs = forward_batch.batch_size
+        topk = self.topk
+        bs = num_seqs * topk
+        num_steps = self.speculative_num_steps
+        req_to_token = self.attn_backends[0].req_to_token_pool.req_to_token
+        seq_lens = forward_batch.seq_lens
+        pool_len = self.pool_len
+        num_head = self.attn_backends[0].num_head
+        v_head_dim = self.attn_backends[0].v_head_dim
+        device = self.device
+
+        # Build expanded req_to_token via C++ kernel
+        req_to_token_draft = build_draft_decode_metadata_cpu(
+            req_to_token,
+            forward_batch.req_pool_indices,
+            seq_lens,
+            topk,
+            num_steps,
+            pool_len,
+        )
+
+        req_pool_indices_expanded = torch.arange(bs, dtype=torch.int64, device=device)
+
+        for step in range(num_steps - 1):
+            # Each candidate sees prefix + (step + 1) draft tokens.
+            seq_lens_expanded = seq_lens.repeat_interleave(topk) + step + 1
+            attn_logits = torch.zeros(
+                (bs, num_head, 8, v_head_dim + 1),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.attn_backends[step].forward_metadata = (attn_logits, None)
+            self.attn_backends[step].draft_decode_metadata = {
+                "attn_logits": attn_logits,
+                "req_to_token": req_to_token_draft,
+                "seq_lens": seq_lens_expanded,
+                "req_pool_indices": req_pool_indices_expanded,
+            }
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         pass
@@ -296,5 +354,3 @@ class IntelAMXMultiStepDraftBackend:
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
             )
-
-

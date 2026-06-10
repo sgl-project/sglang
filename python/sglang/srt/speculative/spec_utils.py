@@ -43,14 +43,58 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_accept_out_cache_loc as fill_accept_out_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
+
+if not is_cpu():
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        assign_extend_cache_locs as assign_extend_cache_locs,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        assign_req_to_token_pool as assign_req_to_token_pool,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        create_extend_after_decode_spec_info as create_extend_after_decode_spec_info,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+    )
+    from sglang.srt.speculative.triton_ops.cache_locs import (
+        get_target_cache_loc as get_target_cache_loc,
+    )
+    from sglang.srt.speculative.triton_ops.eagle import (
+        fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+    )
+else:
+    align_evict_mask_to_page_size = None
+    assign_draft_cache_locs = None
+    assign_extend_cache_locs = None
+    assign_req_to_token_pool = None
+    create_extend_after_decode_spec_info = None
+    fill_accept_out_cache_loc = None
+    filter_finished_cache_loc_kernel = None
+    generate_draft_decode_kv_indices = None
+    get_src_tgt_cache_loc = None
+    get_target_cache_loc = None
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -65,6 +109,13 @@ if _is_cuda:
     from sgl_kernel import fast_topk
 elif _is_hip:
     from sgl_kernel import fast_topk
+elif _is_cpu:
+    from sgl_kernel import (
+        assign_extend_cache_locs_cpu,
+        fill_accept_out_cache_loc_cpu,
+    )
+
+    from sglang.srt.utils.common import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
 
@@ -328,7 +379,7 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
@@ -538,21 +589,37 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
-        tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
-    )
-    fill_accept_out_cache_loc[(size,)](
-        accept_index,
-        batch.out_cache_loc,
-        accept_out_cache_loc,
-        next_power_of_2(size),
-    )
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+        fill_accept_out_cache_loc_cpu(
+            accept_index,
+            batch.out_cache_loc,
+            accept_out_cache_loc,
+            size,
+        )
+    else:
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        fill_accept_out_cache_loc[(size,)](
+            accept_index,
+            batch.out_cache_loc,
+            accept_out_cache_loc,
+            next_power_of_2(size),
+        )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
     )
