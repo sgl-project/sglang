@@ -21,9 +21,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
-    NPUCudaGraphBackend,
-)
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleDraftExtendCudaGraphRunner,
@@ -45,13 +42,7 @@ class MultiLayerEagleDraftExtendNpuGraphRunner(
     def __init__(self, eagle_worker: MultiLayerEagleDraftWorker, step: int):
         super().__init__(eagle_worker, step)
 
-    def _create_backend(self):
-        return NPUCudaGraphBackend(
-            self,
-            enable_memory_saver=self.model_runner.server_args.enable_memory_saver,
-        )
-
-    def _run_backend(self, shape_key, forward_batch, buffers, raw_bs, bs):
+    def _replay_backend(self, shape_key, forward_batch, buffers, raw_bs, bs):
         # NPU: update seq_lens in captured graph before replay
         seq_lens = buffers.seq_lens_cpu[:raw_bs].tolist() + [0] * (bs - raw_bs)
         return self.backend.replay_with_input_update(
