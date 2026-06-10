@@ -147,6 +147,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         skip_radix_cache_insert=True,
         allow_radix_cache_insert_once=False,
         fill_ids=[1, 2, 3, 4, 5],
+        extra_key=None,
         cache_protected_len=0,
         swa_evicted_seqlen=4,
     )
@@ -155,6 +156,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         inserted_swa_evicted_seqlens=[],
         page_size=2,
         sliding_window_size=2,
+        is_eagle=True,
     )
 
     def cache_unfinished_req(inserted_req, **_kwargs):
@@ -169,7 +171,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
     SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
 
-    assert tree_cache.inserted_fill_ids == [[1, 2]]
+    assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
     assert tree_cache.inserted_swa_evicted_seqlens == [0]
     assert req.fill_ids == [1, 2, 3, 4, 5]
     assert req.cache_protected_len == 2

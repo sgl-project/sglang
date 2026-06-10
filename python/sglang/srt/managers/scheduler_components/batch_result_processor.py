@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -175,8 +176,15 @@ class SchedulerBatchResultProcessor:
             return
 
         page_size = getattr(self.tree_cache, "page_size", 1)
-        aligned_prompt_len = page_align_floor(prompt_len, page_size)
-        if aligned_prompt_len <= 0:
+        prompt_fill_ids = req.fill_ids[:prompt_len]
+        radix_key_len = len(
+            RadixKey(
+                prompt_fill_ids,
+                req.extra_key,
+                is_bigram=getattr(self.tree_cache, "is_eagle", False),
+            ).page_aligned(page_size)
+        )
+        if radix_key_len <= 0:
             req.allow_radix_cache_insert_once = False
             return
 
@@ -186,27 +194,27 @@ class SchedulerBatchResultProcessor:
         sliding_window_size = getattr(self.tree_cache, "sliding_window_size", None)
         swa_tail_len = page_align_floor(sliding_window_size or page_size, page_size)
         swa_tail_len = max(page_size, swa_tail_len)
-        swa_tail_len = min(aligned_prompt_len, swa_tail_len)
+        swa_tail_len = min(radix_key_len, swa_tail_len)
 
-        req.fill_ids = old_fill_ids[:aligned_prompt_len]
-        req.cache_protected_len = max(old_cache_protected_len, aligned_prompt_len)
+        req.fill_ids = prompt_fill_ids
+        req.cache_protected_len = max(old_cache_protected_len, radix_key_len)
         # If the request's SWA evicted seqlen already covers the whole prompt
         # key, the unified SWA component skips leaf creation entirely. Keep a
         # window-sized SWA tail for the donated prompt so the full radix leaf is
         # created and later matches can validate the SWA window.
         req.swa_evicted_seqlen = min(
             page_align_floor(old_swa_evicted_seqlen, page_size),
-            max(0, aligned_prompt_len - swa_tail_len),
+            max(0, radix_key_len - swa_tail_len),
         )
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "
-                    "prompt_len=%d aligned_prompt_len=%d fill_len=%d",
+                    "prompt_len=%d radix_key_len=%d fill_len=%d",
                     req.rid,
                     prompt_len,
-                    aligned_prompt_len,
+                    radix_key_len,
                     len(old_fill_ids),
                 )
         finally:
