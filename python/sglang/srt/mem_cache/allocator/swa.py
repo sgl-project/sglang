@@ -305,45 +305,41 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return alloc_full_indices
 
+    def _filter_unreleased_indices(
+        self, allocator, indices: torch.Tensor
+    ) -> torch.Tensor:
+        if indices.numel() == 0 or self.page_size == 1:
+            return indices
+
+        unavailable_pages = []
+        if allocator.free_pages.numel() > 0:
+            unavailable_pages.append(allocator.free_pages)
+        if allocator.release_pages.numel() > 0:
+            unavailable_pages.append(allocator.release_pages)
+        if not unavailable_pages:
+            return indices
+
+        pages = indices // self.page_size
+        unavailable_pages = torch.cat(unavailable_pages)
+        return indices[~torch.isin(pages, unavailable_pages)]
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
-        #region debug-point dsv4-radix-double-free
-        debug_free_pages_before = None
-        if self.is_not_in_free_group:
-            debug_free_pages_before = torch.unique(free_index // self.page_size)
-        #endregion debug-point dsv4-radix-double-free
-
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index)
+            full_free_index = self._filter_unreleased_indices(
+                self.full_attn_allocator, free_index
+            )
+            if full_free_index.numel() > 0:
+                self.full_attn_allocator.free(full_free_index)
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
-        #region debug-point dsv4-radix-double-free
-        full_available = self.full_attn_allocator.available_size()
-        if full_available > self.full_attn_allocator.size:
-            free_pages = self.full_attn_allocator.free_pages
-            release_pages = self.full_attn_allocator.release_pages
-            free_pages_unique = torch.unique(free_pages).numel()
-            release_pages_unique = torch.unique(release_pages).numel()
-            free_index_unique = torch.unique(free_index).numel()
-            debug_message = (
-                "SWATokenToKVPoolAllocator full allocator over-free: "
-                f"full_available={full_available}, "
-                f"full_size={self.full_attn_allocator.size}, "
-                f"free_index_numel={free_index.numel()}, "
-                f"free_index_unique={free_index_unique}, "
-                f"free_page_numel={debug_free_pages_before.numel() if debug_free_pages_before is not None else 'grouped'}, "
-                f"free_pages_len={len(free_pages)}, "
-                f"free_pages_unique={free_pages_unique}, "
-                f"release_pages_len={len(release_pages)}, "
-                f"release_pages_unique={release_pages_unique}, "
-                f"need_sort={self.full_attn_allocator.need_sort}"
-            )
-            raise AssertionError(debug_message)
-        #endregion debug-point dsv4-radix-double-free
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def set_full_to_swa_mapping(
@@ -366,7 +362,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        swa_indices = self._filter_unreleased_indices(
+            self.swa_attn_allocator, swa_indices
+        )
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
