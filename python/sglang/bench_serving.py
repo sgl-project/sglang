@@ -1006,6 +1006,7 @@ def calculate_metrics(
                 total_input_vision += input_requests[i].vision_prompt_len
             else:
                 total_input += outputs[i].prompt_len
+                total_input_text += outputs[i].prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
