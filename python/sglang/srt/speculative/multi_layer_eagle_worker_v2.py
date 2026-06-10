@@ -805,7 +805,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # prepare_for_v2_verify only plans when cuda-graph replay_prepare ran.
         # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
         # worker has not adopted that fix, so preserve its behavior verbatim.
-        verify_forward_batch.mark_forward_metadata_ready()
+        # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
+        # in forward_extend (post-pad); only mark ready for the cuda-graph path.
+        if not _is_npu or can_run_cuda_graph:
+            verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
