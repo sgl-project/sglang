@@ -568,8 +568,6 @@ class DeepseekV2WeightLoaderMixin:
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            # The case `w.dtype == torch.float8_e4m3fn` corresponds to the case where this layer
-            # is excluded from quantization.
             if (
                 _use_aiter_gfx95
                 and self.quant_config is not None

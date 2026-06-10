@@ -11,6 +11,7 @@ import time
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike, mxfp_supported
@@ -30,6 +31,11 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if torch.cuda.device_count() < cls.tp:
+            raise unittest.SkipTest(
+                f"test requires {cls.tp} devices, only {torch.cuda.device_count()} are available."
+            )
+
         if not mxfp_supported():
             raise unittest.SkipTest(
                 "online MXFP4 quantization requires an AMD ROCm device with "
