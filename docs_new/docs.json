@@ -1005,6 +1005,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Super"
@@ -1114,6 +1115,13 @@
                     ]
                   },
                   {
+                    "group": "Ideogram",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Ideogram/Ideogram4"
+                    ]
+                  },
+                  {
                     "group": "Wan",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
@@ -1140,6 +1148,12 @@
                     ]
                   },
                   {
+                    "group": "ERNIE-Image",
+                    "pages": [
+                      "cookbook/diffusion/Ernie-Image/Ernie-Image"
+                    ]
+                  },
+                  {
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
@@ -1150,6 +1164,13 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World"
+                    ]
+                  },
+                  {
+                    "group": "SANA-WM",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SANA-WM/SANA-WM"
                     ]
                   }
                 ]
@@ -1183,7 +1204,6 @@
               "docs/sglang-diffusion/installation",
               "docs/sglang-diffusion/compatibility_matrix",
               "docs/sglang-diffusion/disaggregation",
-              "docs/sglang-diffusion/quantization",
               {
                 "group": "Usage",
                 "pages": [
@@ -1196,31 +1216,35 @@
                 "group": "Performance Optimization",
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
-                  "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
+                  "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/dynamic_batching",
                   {
-                    "group": "Inference Batching",
+                    "group": "Caching Acceleration",
+                    "root": "docs/sglang-diffusion/caching-acceleration",
+                    "tag": "approx",
                     "pages": [
-                      "docs/sglang-diffusion/dynamic_batching"
+                      "docs/sglang-diffusion/cache_dit",
+                      "docs/sglang-diffusion/teacache"
                     ]
                   },
-                  "docs/sglang-diffusion/profiling",
-                  "docs/sglang-diffusion/ci_perf"
-                ]
-              },
-              {
-                "group": "Caching Strategies",
-                "pages": [
-                  "docs/sglang-diffusion/caching-acceleration",
-                  "docs/sglang-diffusion/cache_dit",
-                  "docs/sglang-diffusion/teacache"
+                  "docs/sglang-diffusion/progressive_resolution",
+                  "docs/sglang-diffusion/quantization",
+                  "docs/sglang-diffusion/profiling"
                 ]
               },
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment_variables",
+                  "docs/sglang-diffusion/environment_variables"
+                ]
+              },
+              {
+                "group": "Development",
+                "pages": [
                   "docs/sglang-diffusion/support_new_models",
+                  "docs/sglang-diffusion/ci_perf",
                   "docs/sglang-diffusion/contributing"
                 ]
               }

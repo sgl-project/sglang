@@ -306,7 +306,11 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
         elif server_args.disaggregation_mode == "decode":
@@ -722,7 +726,21 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
-                out = {"error": {"message": str(e)}}
+                # A client disconnect also surfaces here. It's a client-side
+                # cancellation, not a server error or bad input -- log it and
+                # stop (the request was already aborted upstream) instead of
+                # emitting a 400.
+                if request is not None and await request.is_disconnected():
+                    logger.info(f"[http_server] Client disconnected: {e}")
+                    return
+                out = {
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                        "code": 400,
+                        "retryable": False,
+                    }
+                }
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
@@ -1459,13 +1477,24 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
 
     # 2) Call the non-stream parsing method (non-stream)
-    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+    if getattr(obj, "return_blocks", False):
+        blocks = parser.parse_non_stream_blocks(obj.text)
+        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
+        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
+        reasoning_text = "".join(reasoning_blocks)
+        normal_text = "".join(text_blocks)
+    else:
+        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
         "reasoning_text": reasoning_text,
         "text": normal_text,
     }
+    if getattr(obj, "return_blocks", False):
+        response_data["reasoning_blocks"] = reasoning_blocks
+        response_data["text_blocks"] = text_blocks
+        response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
 

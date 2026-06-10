@@ -13,8 +13,8 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -148,6 +148,13 @@ class SwaDivergenceLog:
         if last_match is None:
             return None
         return cls(**json.loads(last_match.group(1))), last_match.group(0)
+
+    @classmethod
+    def find_all(cls, text: str) -> list[tuple["SwaDivergenceLog", str]]:
+        return [
+            (cls(**json.loads(match.group(1))), match.group(0))
+            for match in _SWA_DIVERGENCE_LINE_RE.finditer(text)
+        ]
 
 
 def compute_swa_out_of_window_tokens(
