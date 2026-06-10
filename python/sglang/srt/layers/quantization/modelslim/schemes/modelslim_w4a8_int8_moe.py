@@ -73,7 +73,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             in_features = hidden_size
             bias_last_dim = 1
         else:  # w2
-            out_features = hidden_size
+            out_features = hidden_size // 2
             in_features = intermediate_size_per_partition
             bias_last_dim = 16 // self.tp_size
 
