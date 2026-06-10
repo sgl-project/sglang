@@ -83,17 +83,22 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         layer.register_parameter(f"{prefix}_weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+        if self.is_per_channel_weight:
+            scale_last_dim = 1
+        else:
+            scale_last_dim = in_features // self.group_size
+
         # ---- scale ----
         scale = torch.nn.Parameter(
-            torch.empty(num_experts, out_features, 1, dtype=torch.float32),
+            torch.empty(num_experts, out_features, scale_last_dim, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight_scale", scale)
         set_weight_attrs(scale, extra_weight_attrs)
-
-        # ---- offset (always present) ----
+        
+        # ---- offset ----
         offset = torch.nn.Parameter(
-            torch.empty(num_experts, out_features, 1, dtype=torch.float32),
+            torch.empty(num_experts, out_features, scale_last_dim, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight_offset", offset)
