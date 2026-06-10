@@ -23,7 +23,16 @@ NEMOTRON_3_SUPER_NVFP4_ARGS = [
     "nemotron_3",
     "--tool-call-parser",
     "qwen3_coder",
-    "--disable-radix-cache",
+    # [DO NOT MERGE] debug: trtllm_mha full-attention + mamba extra_buffer
+    # (radix cache on -> dropped --disable-radix-cache; page_size divides
+    # mamba_track_interval=256). Tests whether the NaN is the flashinfer
+    # full-attention backend.
+    "--attention-backend",
+    "trtllm_mha",
+    "--mamba-scheduler-strategy",
+    "extra_buffer",
+    "--page-size",
+    "64",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true, "num_threads": 17}',
 ]
