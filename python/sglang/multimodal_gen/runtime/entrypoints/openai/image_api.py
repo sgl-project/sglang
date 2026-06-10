@@ -146,17 +146,15 @@ def _build_image_response_kwargs(
 
 async def _stream_image_response(response: ImageResponse):
     for idx, item in enumerate(response.data):
-        yield (
-            "data: "
-            + json.dumps(
-                {
-                    "type": "image_generation.partial_image",
-                    "partial_image_index": idx,
-                    "b64_json": item.b64_json,
-                }
-            )
-            + "\n\n"
-        )
+        payload = {
+            "type": "image_generation.partial_image",
+            "partial_image_index": idx,
+        }
+        if item.b64_json is not None:
+            payload["b64_json"] = item.b64_json
+        if item.url is not None:
+            payload["url"] = item.url
+        yield f"data: {json.dumps(payload)}\n\n"
 
     yield "data: [DONE]\n\n"
 
