@@ -17,6 +17,8 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -34,7 +36,8 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -50,6 +53,7 @@ if TYPE_CHECKING:
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
@@ -80,28 +84,30 @@ class ModelRunnerKVCacheMixin:
         server_args = self.server_args
         assert config is not None
 
-        # reserve the memory for the intermediate mamba states used for spec dec
-        if not self.spec_algorithm.is_none():
+        has_spec_dec = not self.spec_algorithm.is_none()
+        if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
-
-            max_running_requests = server_args.max_running_requests // (
-                self.dp_size if server_args.enable_dp_attention else 1
-            )
-            mamba_state_intermediate_size = (
-                config.mamba2_cache_params.mamba_cache_per_req
-                * max_running_requests
-                * server_args.speculative_num_draft_tokens
-            )
-            total_rest_memory = total_rest_memory - (
-                mamba_state_intermediate_size / (1 << 30)
-            )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+            # Reserve intermediate memory based on capped max_num_reqs
+            if has_spec_dec:
+                ratio = self._calculate_mamba_ratio()
+                capped_reqs = min(
+                    server_args.max_running_requests
+                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    server_args.max_mamba_cache_size // ratio,
+                )
+                intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * capped_reqs
+                    * server_args.speculative_num_draft_tokens
+                )
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
@@ -110,23 +116,64 @@ class ModelRunnerKVCacheMixin:
             server_args.max_mamba_cache_size = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+            # Reserve intermediate memory based on capped max_num_reqs
+            if has_spec_dec:
+                intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * server_args.max_mamba_cache_size
+                    * server_args.speculative_num_draft_tokens
+                )
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
-            # solve the equations:
-            # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
-            # 2. mamba_state_memory / full_kv_cache_memory == server_args.mamba_full_memory_ratio
-            mamba_state_memory_raw = (
+            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
+            # The mamba budget (from the ratio split) must cover both:
+            #   1. main mamba state: max_mamba_cache_size * per_req
+            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
+            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
                 / (1 + server_args.mamba_full_memory_ratio)
             )
-            # calculate the max_mamba_cache_size based on the given total mamba memory
-            server_args.max_mamba_cache_size = int(
-                (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
+            mamba_budget_bytes = mamba_budget * (1 << 30)
+
+            if has_spec_dec:
+                ratio = self._calculate_mamba_ratio()
+                D = server_args.speculative_num_draft_tokens
+                # Joint solve: main_state + intermediate = mamba_budget
+                server_args.max_mamba_cache_size = int(
+                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                )
+                # Intermediate memory is included in mamba_budget, subtract it
+                # so the return value only has main_state subtracted from total
+                capped_reqs = min(
+                    server_args.max_running_requests
+                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    server_args.max_mamba_cache_size // ratio,
+                )
+                intermediate_size = per_req * capped_reqs * D
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+            else:
+                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
+
+        # Validate: max_mamba_cache_size must be positive after memory allocation.
+        # A non-positive value means GPU memory is insufficient for the requested
+        # configuration. Fail fast with actionable advice instead of silently
+        # producing garbled output at runtime.
+        if server_args.max_mamba_cache_size <= 0:
+            raise RuntimeError(
+                f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
+                f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
+                f"(total_rest_memory={total_rest_memory:.2f} GB, "
+                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"Try: (1) reduce --max-running-requests, "
+                f"(2) increase --mem-fraction-static, "
+                f"(3) reduce --speculative-num-draft-tokens, or "
+                f"(4) use GPUs with more memory."
             )
 
         mamba_state_memory = (
@@ -190,9 +237,16 @@ class ModelRunnerKVCacheMixin:
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
+            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
             if not self.server_args.disable_overlap_schedule:
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+                if self.server_args.enable_mamba_extra_buffer_lazy():
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
+                else:
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
+                assert (
+                    not self.server_args.enable_mamba_extra_buffer_lazy()
+                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
@@ -241,13 +295,8 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
-            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
-            max_spec_draft_tokens = (
-                self.server_args.effective_max_speculative_num_draft_tokens()
-            )
-            extra_max_context_len = 4
-            if max_spec_draft_tokens is not None:
-                extra_max_context_len += max_spec_draft_tokens
+            max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
+            extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
@@ -311,6 +360,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
@@ -330,9 +380,6 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
-
-        # Out-of-tree platform plugin system — used by elif below
-        from sglang.srt.platforms import current_platform
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
@@ -361,6 +408,7 @@ class ModelRunnerKVCacheMixin:
                 c128_state_pool_size=self.c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
+                sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
                 state_dtype=self.state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
@@ -580,6 +628,9 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                     **kwargs,
                 )
             elif config := self.mambaish_config:
@@ -611,6 +662,9 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     **extra_args,
@@ -836,6 +890,19 @@ class ModelRunnerKVCacheMixin:
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
 
+            if max_num_reqs <= 0:
+                raise RuntimeError(
+                    f"Hybrid (mamba/linear-attention) state cache is too small to serve "
+                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
+                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
+                    f"Try: (1) reduce --max-running-requests, "
+                    f"(2) increase --mem-fraction-static, or "
+                    f"(3) use GPUs with more memory."
+                )
+        logger.info(
+            f"Max concurrent requests (per dp worker) from the finalized token capacity: "
+            f"max_num_reqs={max_num_reqs}."
+        )
         return max_num_reqs
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):

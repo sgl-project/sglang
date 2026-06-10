@@ -19,7 +19,9 @@ HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
+    "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
+    "xpu": HWBackend.XPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -27,7 +29,7 @@ HW_MAPPING = {
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
 # pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu"],
+    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu", "base-b-test-cpu-arm64"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -37,10 +39,12 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
+    HWBackend.MUSA: [],
     HWBackend.CUDA: [
         "base-a-test-1-gpu-small",
         "base-b-test-1-gpu-small",
@@ -53,13 +57,13 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-benchmark-1-gpu-large",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
-        "base-c-test-4-gpu-gb200",
+        "base-c-test-4-gpu-gb300",
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
         "base-c-test-deepep-4-gpu-h100",
-        "base-c-test-dsv4-4-gpu-b200",
-        "base-c-test-dsv4-8-gpu-h200",
+        "base-c-test-deepep-4-gpu-b200",
+        "base-c-test-deepep-8-gpu-h200",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
         # (tests still tagged per-commit but skipped on default PR runs).
         "extra-a-test-1-gpu-small",
@@ -68,6 +72,7 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-4-gpu-b200",
         "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
@@ -76,6 +81,10 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
         "stage-b-test-16-npu-a3",
+    ],
+    HWBackend.XPU: [
+        "stage-a-test-1-gpu-xpu",
+        "stage-b-test-1-gpu-xpu",
     ],
 }
 
@@ -108,11 +117,16 @@ NIGHTLY_SUITES = {
         "nightly-amd-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
+        "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
+    ],
+    HWBackend.MUSA: [
+        "nightly-musa-1-gpu",
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
@@ -127,6 +141,7 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
+    HWBackend.XPU: [],
 }
 
 
@@ -141,7 +156,12 @@ OTHER_SUITES = {
 }
 
 
-_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+_SUITE_CHECKED_BACKENDS = {
+    HWBackend.CUDA,
+    HWBackend.CPU,
+    HWBackend.MUSA,
+    HWBackend.XPU,
+}
 
 
 def _valid_suites_by_backend() -> dict:
@@ -278,15 +298,6 @@ def run_a_suite(args):
         and not f.endswith("/__init__.py")
         and not f.endswith("/cpu/utils.py")
     ]
-
-    # JIT kernel tests and benchmarks (live alongside kernel source)
-    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
-    )
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
-    )
 
     # Strict: all discovered files must have proper registration
     sanity_check = True

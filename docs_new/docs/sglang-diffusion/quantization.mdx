@@ -1,5 +1,6 @@
 ---
 title: "Quantization"
+tag: "approx"
 metatags:
     description: "SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep the base model and the quantized transformer override separate."
 ---
@@ -14,8 +15,10 @@ Use these paths:
 - `--model-path`: the base or original model
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
 - `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
+- `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
+- `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
-Recommended example:
+Recommended example for pre-quantized checkpoints:
 
 ```bash
 sglang generate \
@@ -65,7 +68,15 @@ backend.
   </thead>
   <tbody>
     <tr>
-      <td><code>fp8</code></td>
+      <td><code>fp8</code> / <code>mxfp4</code> (online quantization)</td>
+      <td>Unquantized checkpoint (offline via AMD Quark coming soon)</td>
+      <td><code>--quantization &#123;fp8,mxfp4&#125;</code></td>
+      <td>Z-Image-Turbo (validated), others likely work. More support coming soon.</td>
+      <td>MXFP4: <code>aiter</code> on ROCm</td>
+      <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically.</td>
+    </tr>
+    <tr>
+      <td><code>fp8</code> (offline quantization)</td>
       <td>Quantized transformer component folder, or safetensors with <code>quantization_config</code> metadata</td>
       <td><code>--transformer-path</code> or <code>--transformer-weights-path</code></td>
       <td>ALL</td>
@@ -102,10 +113,62 @@ backend.
       <td><code>--model-path</code></td>
       <td>Wan2.2 family</td>
       <td>None</td>
-      <td>Currently only compatible with the Ascend NPU family and supports <code>mxfp8</code>, <code>w8a8</code>, and <code>w4a4</code></td>
+      <td>Currently only compatible with the Ascend NPU family and supports <code>mxfp8</code>, <code>mxfp4</code>, <code>w8a8</code>, and <code>w4a4</code></td>
     </tr>
   </tbody>
 </table>
+
+## Online Quantization
+
+Online quantization applies quantization to unquantized models at load time. This is useful for when pre-quantized checkpoints are not available.
+
+### FP8 Online Quantization
+
+Apply FP8 quantization to any unquantized model:
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization fp8 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+### MXFP4 Online Quantization
+
+MXFP4 provides aggressive 4-bit compression with online quantization. **Note: Requires ROCm and MI350+ (gfx95x) GPU.**
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization mxfp4 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+**Note:** Requires `aiter` package with MXFP4 kernel support
+
+### Skipping Layers
+
+By default, online quantization quantizes every linear layer in
+the transformer. However, `--quantization-ignored-layers` can be used to keep specific layers in their original precision:
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization fp8 \
+  --quantization-ignored-layers attention.to_ \
+  --prompt "a beautiful sunset" \
+  --save-output
+
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization mxfp4 \
+  --quantization-ignored-layers attention.to_ \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantizd if its prefix contains any of the given patterns.
 
 ## Validated ModelOpt Checkpoints
 
@@ -210,7 +273,7 @@ official full Diffusers repos, and the FLUX.2 NVFP4 entry keeps the official
       <td><code>--model-path</code></td>
       <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code></td>
       <td>full Diffusers repo with ModelOpt NVFP4 Wan2.2 components</td>
-      <td>current B200/Blackwell bring-up uses <code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm</code></td>
+      <td>default FP4 GEMM backend is <code>flashinfer_trtllm</code></td>
     </tr>
   </tbody>
 </table>
@@ -327,7 +390,6 @@ sglang generate \
 For Wan2.2 NVFP4:
 
 ```bash
-SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm \
 sglang generate \
   --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
   --prompt "a fox walking through neon rain" \
@@ -340,23 +402,19 @@ sglang generate \
   directories that already include `config.json`.
 - Use `--transformer-weights-path` for raw NVFP4 exports, individual
   safetensors files, or repo layouts that should be treated as weights first.
-- For legacy mixed Wan2.2 transformer overrides, the primary
-  `--transformer-path` override targets only `transformer`. Use a per-component
-  override such as `--transformer-2-path` only when you intentionally want a
-  non-default `transformer_2`.
-- On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
-  FlashInfer FP4 GEMM via
-  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm`.
-- This environment-variable override selects the validated Wan2.2 NVFP4
-  full-repo path on Blackwell while the other NVFP4 CI cases continue to use
-  the generic `cudnn` backend.
+- For dual-transformer pipelines such as `Wan2.2-T2V-A14B-Diffusers`, the
+  primary `--transformer-path` override targets only `transformer`. Use a
+  per-component override such as `--transformer-2-path` only when you
+  intentionally want a non-default `transformer_2`.
+- On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
+  TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then
   falls back to loading from the directory.
-- To force the generic diffusion ModelOpt FP4 path onto a specific FlashInfer
+- To force the diffusion ModelOpt FP4 path onto a different FlashInfer
   backend, set `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND`. Supported values
   include `flashinfer_cudnn`, `flashinfer_cutlass`, and `flashinfer_trtllm`.
 - On disk, the quantization config stays `quant_method=modelopt` with
@@ -601,6 +659,8 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
     - [x]  ```W8A8_MXFP8``` linear with offline quantization (msmodelslim pre-quantized weights)
     - [x]  ```mxfp8``` linear with online quantization (`--quantization mxfp8`)
+    - [x]  ```W4A4_MXFP4``` / ```W4A4_MXFP4_DUALSCALE``` linear with offline quantization (msmodelslim pre-quantized weights)
+    - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
 
 ## MXFP8 Online Quantization
 
@@ -630,3 +690,46 @@ sglang generate \
   --prompt "a beautiful sunset" \
   --save-output
 ```
+
+## MXFP4 Online Quantization
+
+For online MXFP4 quantization on Ascend NPU, load the original FP16/BF16 model and add
+`--quantization mxfp4_npu`. The `mxfp4_npu` key is used for Ascend because `mxfp4`
+is reserved for the ROCm/aiter backend.
+
+Weights are quantized at load time via `npu_dynamic_dual_level_mx_quant`, and activations
+are quantized per-token during inference before `npu_dual_level_quant_matmul`. MXFP4 uses
+dual-level block scales with an L1 block size of 32 and an L0 block size of 512.
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp4_npu \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_dual_level_mx_quant`
+> and `npu_dual_level_quant_matmul` are not available on A2/A3.
+>
+> **Note:** Online MXFP4 weight quantization is experimental. The offline msmodelslim
+> flow uses pre-quantized weights and may produce different numerical results.
+
+## MXFP4 Offline Quantization (msmodelslim)
+
+Pre-quantized MXFP4 weights exported by msmodelslim are auto-detected via
+`quant_model_description.json` (`W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` scheme).
+Use `wan_repack.py` to convert the quantized weights to Diffusers format, then load
+the converted model with `--model-path`:
+
+```bash
+sglang generate \
+  --model-path {path_to_converted_mxfp4_model} \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+The offline MXFP4 checkpoint stores weights in an FP8 container and includes dual-level
+scales (`weight_scale`, `weight_dual_scale`). If exported with smooth quantization,
+`mul_scale` is loaded and applied before activation quantization to keep activations
+aligned with the calibrated weights.

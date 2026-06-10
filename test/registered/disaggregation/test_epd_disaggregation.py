@@ -36,7 +36,7 @@ DEFAULT_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 
 
-register_cuda_ci(est_time=97, suite="nightly-4-gpu", nightly=True)
+register_cuda_ci(est_time=97, stage="base-c", runner_config="4-gpu-h100")
 
 
 @unittest.skipIf(
@@ -1375,6 +1375,140 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
             recv_socket.close()
             context.term()
             channel.close()
+
+
+@unittest.skipIf(
+    is_in_ci(),
+    "TestEPDDisaggregationMooncake test requires RDMA hardware, skipping in CI",
+)
+class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
+    """Test EPD disaggregation with mooncake GPU→GPU transfer.
+
+    Validates the async VIT forward + GPU buffer pre-allocation +
+    GPU-to-GPU mooncake transfer pipeline using MMMU eval (multi-image).
+    """
+
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
+        cls.encode_port = f"{int(cls.lb_port) + 306}"
+        cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
+
+        print(
+            f"Setting up EPD Mooncake RDMA: encode={cls.encode_port}, "
+            f"prefill={cls.prefill_port}, decode={cls.decode_port}"
+        )
+
+        # Start servers in order: encode -> prefill/decode
+        cls.start_encode()
+        prefill_thread = threading.Thread(target=cls.start_prefill)
+        decode_thread = threading.Thread(target=cls.start_decode)
+        prefill_thread.start()
+        decode_thread.start()
+        prefill_thread.join()
+        decode_thread.join()
+
+        # Wait for all servers to be ready
+        cls.wait_server_ready(cls.encode_url + "/health", process=cls.process_encode)
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_encode(cls):
+        """Start encode server with mooncake transfer backend"""
+        encode_args = [
+            "--trust-remote-code",
+            "--encoder-only",
+            "--encoder-transfer-backend",
+            "mooncake",
+            "--tp",
+            "1",
+            "--port",
+            cls.encode_port,
+            "--enable-prefix-mm-cache",
+        ]
+        cls.process_encode = popen_launch_server(
+            cls.model,
+            base_url=cls.encode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=encode_args,
+        )
+
+    @classmethod
+    def start_prefill(cls):
+        """Start prefill server with mooncake transfer backend"""
+        prefill_args = [
+            "--trust-remote-code",
+            "--language-only",
+            "--encoder-urls",
+            cls.encode_url,
+            "--encoder-transfer-backend",
+            "mooncake",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+            "--port",
+            cls.prefill_port,
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_server(
+            cls.model,
+            base_url=cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        """Start decode server"""
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "2",
+            "--port",
+            cls.decode_port,
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_server(
+            cls.model,
+            base_url=cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up all processes"""
+        for process in [
+            cls.process_lb,
+            cls.process_decode,
+            cls.process_prefill,
+            cls.process_encode,
+        ]:
+            if process:
+                try:
+                    kill_process_tree(process.pid)
+                except Exception as e:
+                    print(f"Error killing process: {e}")
 
 
 if __name__ == "__main__":
