@@ -7,6 +7,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -295,12 +296,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            if self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, swa_loc=self.swa_out_cache_loc
-                )
-            else:
-                self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -366,12 +364,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            if self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, swa_loc=self.swa_out_cache_loc
-                )
-            else:
-                self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 

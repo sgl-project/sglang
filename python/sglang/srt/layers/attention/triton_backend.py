@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
 from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1053,30 +1054,14 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
-                if self.use_sliding_window_kv_pool:
-                    # SWA pool (never MLA); clone k,v when scaling, as below.
-                    if layer.k_scale is None:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            forward_batch.out_cache_loc,
-                            k,
-                            v,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            forward_batch.out_cache_loc,
-                            k.clone(),
-                            v.clone(),
-                            layer.k_scale,
-                            layer.v_scale,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                elif layer.k_scale is None:
+                loc_info = KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                )
+                if layer.k_scale is None:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        forward_batch.out_cache_loc,
+                        loc_info,
                         k,
                         v,
                     )
@@ -1087,14 +1072,14 @@ class TritonAttnBackend(AttentionBackend):
                     k_scaled = k.clone().div_(layer.k_scale)
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        forward_batch.out_cache_loc,
+                        loc_info,
                         k_scaled,
                         v,
                     )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        forward_batch.out_cache_loc,
+                        loc_info,
                         k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
                         v.clone(),
                         layer.k_scale,
@@ -1337,20 +1322,13 @@ class TritonAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
-            elif self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    forward_batch.out_cache_loc,
-                    k,
-                    v,
-                    layer.k_scale,
-                    layer.v_scale,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
-                )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    forward_batch.out_cache_loc,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     layer.k_scale,
