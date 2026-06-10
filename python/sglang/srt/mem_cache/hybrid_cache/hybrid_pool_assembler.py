@@ -1119,6 +1119,140 @@ def attach_hybrid_pool_to_unified_cache(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Draft pool strategy dispatch (mirrors StackStrategy pattern for target)
+# ---------------------------------------------------------------------------
+
+
+class DraftStrategy:
+    """Base class for draft KV pool registration strategies."""
+
+    def matches(self, draft_pool: Any) -> bool:
+        """Return True if this strategy handles the given draft pool."""
+        raise NotImplementedError
+
+    def build(
+        self,
+        *,
+        draft_pool: Any,
+        tree_cache: Any,
+        server_args: "ServerArgs",
+        page_size: int,
+    ) -> None:
+        """Build and register the draft host pool + sidecar."""
+        raise NotImplementedError
+
+
+class _DraftSwaStrategy(DraftStrategy):
+    """Matches specific SWA pool types that are verified to work with draft HiCache."""
+
+    def matches(self, draft_pool):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        return isinstance(draft_pool, DeepSeekV4TokenToKVPool)
+
+    def build(self, *, draft_pool, tree_cache, server_args, page_size):
+        primary = tree_cache.cache_controller.mem_pool_host
+        swa_entry = primary.entry_map.get(PoolName.SWA)
+        if swa_entry is None:
+            logger.warning("No SWA entry in HostPoolGroup for draft HiCache, skipping.")
+            return
+        target_swa_host = swa_entry.host_pool
+        swa_device_pool = draft_pool.swa_kv_pool
+        draft_host_pool = type(target_swa_host)(
+            pool_name=str(PoolName.DRAFT),
+            device_buffers=swa_device_pool.kv_buffer,
+            item_bytes=swa_device_pool.bytes_per_page_padded,
+            num_host_pages=target_swa_host.num_host_pages,
+            slot_page_size=target_swa_host.slot_page_size,
+            layout=target_swa_host.layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        tree_cache.cache_controller.set_draft_kv_pool(swa_device_pool, draft_host_pool)
+        tree_cache.register_sidecar_pool(
+            SidecarPoolSpec(
+                pool_name=PoolName.DRAFT,
+                indices_from_pool=PoolName.SWA,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+        )
+
+
+class _DraftPlainKvStrategy(DraftStrategy):
+    """Fallback for MHA/MLA pools without SWA sub-pool."""
+
+    def matches(self, draft_pool):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+        return isinstance(draft_pool, (MHATokenToKVPool, MLATokenToKVPool))
+
+    def build(self, *, draft_pool, tree_cache, server_args, page_size):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        primary = tree_cache.cache_controller.mem_pool_host
+        kv_entry = primary.entry_map.get(PoolName.KV)
+        if kv_entry is None:
+            logger.warning("No KV entry in HostPoolGroup for draft HiCache, skipping.")
+            return
+        target_kv_host = kv_entry.host_pool
+        use_mla = isinstance(draft_pool, MLATokenToKVPool)
+        kv_host_pool_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
+        draft_host_pool = kv_host_pool_cls(
+            draft_pool,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        tree_cache.cache_controller.set_draft_kv_pool(draft_pool, draft_host_pool)
+        tree_cache.register_sidecar_pool(
+            SidecarPoolSpec(
+                pool_name=PoolName.DRAFT,
+                indices_from_pool=PoolName.KV,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+        )
+
+
+_DRAFT_STRATEGIES: list[DraftStrategy] = [
+    _DraftSwaStrategy(),
+    _DraftPlainKvStrategy(),
+]
+
+
+def _select_draft_strategy(draft_pool: Any) -> DraftStrategy:
+    for strategy in _DRAFT_STRATEGIES:
+        if strategy.matches(draft_pool):
+            return strategy
+    raise AssertionError(
+        f"No matching draft HiCache strategy for pool={type(draft_pool).__name__}"
+    )
+
+
+def attach_draft_pool_to_unified_cache(
+    *,
+    tree_cache: Any,
+    draft_pool: Any,
+    server_args: "ServerArgs",
+    page_size: int,
+) -> None:
+    """Attach draft KV pool to UnifiedRadixCache via strategy dispatch."""
+    strategy = _select_draft_strategy(draft_pool)
+    strategy.build(
+        draft_pool=draft_pool,
+        tree_cache=tree_cache,
+        server_args=server_args,
+        page_size=page_size,
+    )
+    logger.info(
+        "Attached draft pool to UnifiedRadixCache via %s",
+        type(strategy).__name__,
+    )
+
+
 def attach_hybrid_dsa_pool_to_hiradix_cache(
     radix_cache: HiRadixCache,
     params: CacheInitParams,
