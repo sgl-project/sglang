@@ -774,19 +774,78 @@ def _prepare_dense_draft_replay_state(
         {"prefix_hidden": fixture.prefix_hidden},
         max_context_len=settings.max_context_len,
     )
+    # Fill the whole draft footprint (branch page runs included), mirroring
+    # the production allocator which assigns the full reserved range.
     for req_idx, prefix_len in enumerate(case.prefix_lens):
-        for branch in range(settings.topk):
-            for step in range(settings.speculative_num_steps):
-                position = prefix_len + branch * settings.speculative_num_steps + step
-                fixture.runner.req_to_token_pool.req_to_token[
+        footprint = _dense_draft_footprint(
+            prefix_len=prefix_len,
+            topk=settings.topk,
+            speculative_num_steps=settings.speculative_num_steps,
+            page_size=case.page_size,
+        )
+        for position in range(prefix_len, footprint):
+            fixture.runner.req_to_token_pool.req_to_token[
+                req_idx,
+                position,
+            ] = _dense_token_loc(
+                req_idx,
+                position,
+                page_size=case.page_size,
+                max_context_len=settings.max_context_len,
+            )
+    _duplicate_dense_prefix_tail_to_branches(fixture, case, settings)
+
+
+def _duplicate_dense_prefix_tail_to_branches(
+    fixture,
+    case: DenseAttentionCase,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    """Mirror eagle_info_v2.duplicate_prefix_tail_to_draft_branches: with
+    page_size > 1 and topk > 1, branch b >= 1's first page starts with
+    `last_page` hole slots that must hold the real prefix tail KV."""
+    page_size = case.page_size
+    if settings.topk <= 1 or page_size == 1:
+        return
+    pool = fixture.runner.token_to_kv_pool
+    device = fixture.runner.device
+    for req_idx, prefix_len in enumerate(case.prefix_lens):
+        last_page = prefix_len % page_size
+        if last_page == 0:
+            continue
+        prefix_base = prefix_len - last_page
+        num_new_pages = (
+            last_page + settings.speculative_num_steps + page_size - 1
+        ) // page_size
+        src_slots = [
+            _dense_token_loc(
+                req_idx,
+                prefix_base + offset,
+                page_size=page_size,
+                max_context_len=settings.max_context_len,
+            )
+            for offset in range(last_page)
+        ]
+        src = torch.tensor(src_slots, dtype=torch.int64, device=device)
+        for branch in range(1, settings.topk):
+            branch_base = prefix_base + branch * num_new_pages * page_size
+            tgt_slots = [
+                _dense_token_loc(
                     req_idx,
-                    position,
-                ] = _dense_token_loc(
-                    req_idx,
-                    position,
-                    page_size=case.page_size,
+                    branch_base + offset,
+                    page_size=page_size,
                     max_context_len=settings.max_context_len,
                 )
+                for offset in range(last_page)
+            ]
+            tgt = torch.tensor(tgt_slots, dtype=torch.int64, device=device)
+            # Direct buffer copy: the fixture pool is built without
+            # enable_kv_cache_copy, so move_kv_cache is unavailable.
+            for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
+                k_buffer = pool.get_key_buffer(layer_id)
+                v_buffer = pool.get_value_buffer(layer_id)
+                k_buffer[tgt] = k_buffer[src]
+                v_buffer[tgt] = v_buffer[src]
 
 
 def _dense_draft_cache_position(
@@ -796,30 +855,52 @@ def _dense_draft_cache_position(
     step: int,
     topk: int,
     speculative_num_steps: int,
+    page_size: int,
 ) -> int:
     if topk == 1:
         return prefix_len + step
-    return prefix_len + branch * speculative_num_steps + step
+    if page_size == 1:
+        return prefix_len + branch * speculative_num_steps + step
+    # spec-v2 paged tree layout (eagle_info_v2.prepare_for_v2_draft): each
+    # branch owns a page-aligned page run after the full prefix pages; the
+    # run's first `last_page` slots duplicate the prefix tail page.
+    last_page = prefix_len % page_size
+    prefix_base = prefix_len - last_page
+    num_new_pages = (last_page + speculative_num_steps + page_size - 1) // page_size
+    return prefix_base + branch * num_new_pages * page_size + last_page + step
+
+
+def _dense_draft_footprint(
+    *,
+    prefix_len: int,
+    topk: int,
+    speculative_num_steps: int,
+    page_size: int,
+) -> int:
+    """req_to_token row positions used by a request's prefix + draft tree."""
+    if topk == 1:
+        return prefix_len + speculative_num_steps
+    if page_size == 1:
+        return prefix_len + topk * speculative_num_steps
+    last_page = prefix_len % page_size
+    prefix_base = prefix_len - last_page
+    num_new_pages = (last_page + speculative_num_steps + page_size - 1) // page_size
+    return prefix_base + topk * num_new_pages * page_size
 
 
 def _check_dense_draft_cache_layout(
     case: DenseAttentionCase,
     settings: EagleDraftRunnerSettings,
 ) -> None:
-    if settings.topk > 1 and case.page_size != 1:
-        raise ValueError(
-            "The dense EAGLE draft runner fixture covers tree draft with "
-            "page_size=1, where branch cache slots are laid out linearly."
+    for prefix_len in case.prefix_lens:
+        footprint = _dense_draft_footprint(
+            prefix_len=prefix_len,
+            topk=settings.topk,
+            speculative_num_steps=settings.speculative_num_steps,
+            page_size=case.page_size,
         )
-    if settings.topk > 1:
-        for prefix_len in case.prefix_lens:
-            if (
-                prefix_len + settings.topk * settings.speculative_num_steps
-                > settings.max_context_len
-            ):
-                raise ValueError(
-                    "Draft cache layout exceeds the configured context len."
-                )
+        if footprint > settings.max_context_len:
+            raise ValueError("Draft cache layout exceeds the configured context len.")
 
 
 def _make_dense_eagle_draft_forward_batch(
@@ -837,6 +918,7 @@ def _make_dense_eagle_draft_forward_batch(
                     step=step,
                     topk=settings.topk,
                     speculative_num_steps=settings.speculative_num_steps,
+                    page_size=case.page_size,
                 )
                 out_cache_locs.append(
                     _dense_token_loc(
@@ -1129,6 +1211,7 @@ def _prepare_mla_draft_replay_state(
                     step=step,
                     topk=settings.topk,
                     speculative_num_steps=settings.speculative_num_steps,
+                    page_size=case.page_size,
                 )
                 fixture.runner.req_to_token_pool.req_to_token[
                     req_idx,
@@ -1176,6 +1259,7 @@ def _make_mla_eagle_draft_forward_batch(
                     step=step,
                     topk=settings.topk,
                     speculative_num_steps=settings.speculative_num_steps,
+                    page_size=case.page_size,
                 )
                 out_cache_locs.append(
                     _mla_token_loc(
