@@ -310,9 +310,7 @@ class TestChannelStrategyAlignment(CustomTestCase):
         output = scheme.apply_weights(layer, x).to(torch.float32)
 
         # Reference: x @ (W_fp8 * weight_scale)^T computed in fp32.
-        ref = x.to(torch.float32) @ (
-            weight.to(torch.float32) * weight_scale
-        ).t()
+        ref = x.to(torch.float32) @ (weight.to(torch.float32) * weight_scale).t()
 
         torch.testing.assert_close(output, ref, rtol=0.05, atol=0.1)
 
