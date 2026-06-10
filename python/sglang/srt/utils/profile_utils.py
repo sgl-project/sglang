@@ -13,6 +13,7 @@ from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
 if _is_npu:
@@ -23,7 +24,7 @@ if _is_npu:
         ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
         ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
     ]
-    torch_npu._apply_patches(patches)
+    apply_torch_npu_patches(torch_npu, patches)
 
 logger = logging.getLogger(__name__)
 

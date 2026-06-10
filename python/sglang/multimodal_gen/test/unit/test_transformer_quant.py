@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import save_file
 
 partial_json_parser = types.ModuleType("partial_json_parser")
 partial_json_parser_core = types.ModuleType("partial_json_parser.core")
@@ -58,6 +59,10 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    build_nvfp4_config_from_safetensors_list,
+    get_quant_config,
+)
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
 )
@@ -259,6 +264,99 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertFalse(config.swap_weight_nibbles)
+
+    def test_bitsandbytes_quant_config_resolves_from_hf_config(self):
+        config = get_quant_config(
+            {
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                    "bnb_4bit_quant_storage": "uint8",
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertEqual(config.get_name(), "bitsandbytes")
+        self.assertTrue(config.load_in_4bit)
+        self.assertEqual(config.bnb_4bit_quant_type, "nf4")
+
+    def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {
+                    "fallback.weight": torch.empty(
+                        (4, 4),
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    "fallback.weight_scale": torch.tensor(1.0, dtype=torch.float32),
+                    "layers.0.attention.qkv.weight": torch.zeros(
+                        (32, 8),
+                        dtype=torch.uint8,
+                    ),
+                    "layers.0.attention.qkv.weight_scale": torch.empty(
+                        (32, 1),
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    "layers.0.attention.qkv.weight_scale_2": torch.tensor(
+                        1.0,
+                        dtype=torch.float32,
+                    ),
+                },
+                f.name,
+            )
+
+            config = build_nvfp4_config_from_safetensors_list([f.name])
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertEqual(config.group_size, 16)
+        self.assertIn("fallback", config.exclude_modules)
+        self.assertNotIn("layers.0.attention.qkv", config.exclude_modules)
+        self.assertEqual(config.checkpoint_weight_scale_layout, "linear")
+        self.assertFalse(config.swap_weight_nibbles)
+
+    def test_nvfp4_safetensors_inference_uses_comfy_checkpoint_layout(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {
+                    "fallback.weight": torch.empty(
+                        (4, 4),
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    "fallback.weight_scale": torch.tensor(1.0, dtype=torch.float32),
+                    "fallback.comfy_quant": torch.tensor(
+                        list(b'{"format":"float8_e4m3fn"}'),
+                        dtype=torch.uint8,
+                    ),
+                    "layers.0.attention.qkv.weight": torch.zeros(
+                        (32, 8),
+                        dtype=torch.uint8,
+                    ),
+                    "layers.0.attention.qkv.weight_scale": torch.empty(
+                        (32, 1),
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    "layers.0.attention.qkv.weight_scale_2": torch.tensor(
+                        1.0,
+                        dtype=torch.float32,
+                    ),
+                    "layers.0.attention.qkv.comfy_quant": torch.tensor(
+                        list(b'{"format":"nvfp4"}'),
+                        dtype=torch.uint8,
+                    ),
+                },
+                f.name,
+            )
+
+            config = build_nvfp4_config_from_safetensors_list([f.name])
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertEqual(config.group_size, 16)
+        self.assertIn("fallback", config.exclude_modules)
+        self.assertNotIn("layers.0.attention.qkv", config.exclude_modules)
+        self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
+        self.assertTrue(config.swap_weight_nibbles)
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(

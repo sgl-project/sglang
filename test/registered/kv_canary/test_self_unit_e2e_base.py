@@ -69,16 +69,57 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
                 max_retries=1,
             )
 
-    def test_assert_swa_divergence_observed_uses_latest_line(self) -> None:
-        log = _GOOD_LINE + "\n" + _LATER_LINE + "\n"
-        harness, patcher = self._make_harness(log)
+    def test_assert_swa_divergence_observed_uses_peak_out_of_window(self) -> None:
+        diverged = SwaDivergenceLog(
+            forward_ct=120,
+            verify_full=10000,
+            verify_swa=4200,
+            swa_full_idx_divergence=512,
+            swa_out_of_window_tokens=8192,
+        ).format()
+        trailing_zero = SwaDivergenceLog(
+            forward_ct=240,
+            verify_full=20000,
+            verify_swa=8400,
+            swa_full_idx_divergence=0,
+            swa_out_of_window_tokens=0,
+        ).format()
+        harness, patcher = self._make_harness(diverged + "\n" + trailing_zero + "\n")
         with patcher:
             harness.assert_swa_divergence_observed(
-                min_swa_full_idx_divergence=1000,
+                min_swa_out_of_window_tokens=1,
+                min_swa_full_idx_divergence=1,
                 require_verify_lag=True,
                 flush_wait_seconds=0.0,
                 max_retries=1,
             )
+
+    def test_assert_swa_divergence_observed_checks_verify_lag_on_latest_line(
+        self,
+    ) -> None:
+        lagging = SwaDivergenceLog(
+            forward_ct=120,
+            verify_full=10000,
+            verify_swa=4200,
+            swa_full_idx_divergence=512,
+            swa_out_of_window_tokens=8192,
+        ).format()
+        no_lag = SwaDivergenceLog(
+            forward_ct=240,
+            verify_full=20000,
+            verify_swa=20000,
+            swa_full_idx_divergence=1024,
+            swa_out_of_window_tokens=16384,
+        ).format()
+        harness, patcher = self._make_harness(lagging + "\n" + no_lag + "\n")
+        with patcher:
+            with self.assertRaisesRegex(AssertionError, "verify_swa=20000"):
+                harness.assert_swa_divergence_observed(
+                    min_swa_full_idx_divergence=1,
+                    require_verify_lag=True,
+                    flush_wait_seconds=0.0,
+                    max_retries=1,
+                )
 
     def test_assert_swa_divergence_observed_raises_when_below_threshold(self) -> None:
         zero_mapping_line = SwaDivergenceLog(
