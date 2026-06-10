@@ -527,7 +527,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    ln -sv /usr/lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so && \
+    ln -sv /usr/lib/$(uname -m)-linux-gnu/libibverbs.so.1 /usr/lib/$(uname -m)-linux-gnu/libibverbs.so && \
     git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
     && case "${CUDA_VERSION}" in \
            12.*) \
