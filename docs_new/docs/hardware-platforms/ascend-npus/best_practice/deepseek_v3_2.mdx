@@ -1,0 +1,570 @@
+---
+title: "Best Practice for DeepSeek-V3.2 on Ascend NPU"
+metatags:
+  description: "Best Practice for DeepSeek-V3.2 on Ascend NPU"
+---
+
+This section describes the best practice data for DeepSeek-V3.2 on the Ascend NPU.
+
+### Low Latency
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-V3.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-V3.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+### High Throughput
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-V3.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>107ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+
+## Optimal Configuration
+
+### deepseek v3 2 w8a8 1p1d 32p in128k out1k 26ms
+
+**Model**: DeepSeek-V3.2
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 26ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1' 'your prefill ip2')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_BUFFSIZE=1200
+        export HCCL_SOCKET_IFNAME=lo
+        export TASK_QUEUE_ENABLE=2
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --nnodes 2 \
+        --tp 32 \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.73 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 1 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-mode prefill \
+        --disable-cuda-graph \
+        --moe-dense-tp-size 1 \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 32 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        export GLOO_SOCKET_IFNAME=xxx
+        export HCCL_BUFFSIZE=400
+        export HCCL_SOCKET_IFNAME=xxx
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export TASK_QUEUE_ENABLE=0
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --nnodes 2 \
+        --tp 32 \
+        --dp 8 \
+        --ep 32 \
+        --moe-dense-tp-size 1 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.79 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 32 \
+        --cuda-graph-max-bs 4 \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --quantization modelslim \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-mode decode
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 8 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 8 \
+    --random-range-ratio 1
+```
+
+### deepseek v3 2 w8a8 1p1d 32p in128k out1k bs16
+
+**Model**: DeepSeek-V3.2
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 107ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1' 'your prefill ip2')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_BUFFSIZE=1200
+        export HCCL_SOCKET_IFNAME=lo
+        export TASK_QUEUE_ENABLE=2
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --nnodes 2 \
+        --tp 32 \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.73 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 1 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-mode prefill \
+        --disable-cuda-graph \
+        --moe-dense-tp-size 1 \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 32 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        export GLOO_SOCKET_IFNAME=xxx
+        export HCCL_BUFFSIZE=400
+        export HCCL_SOCKET_IFNAME=xxx
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export TASK_QUEUE_ENABLE=0
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --nnodes 2 \
+        --tp 32 \
+        --dp 8 \
+        --ep 32 \
+        --moe-dense-tp-size 1 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.79 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 32 \
+        --cuda-graph-max-bs 4 \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --quantization modelslim \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-mode decode
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 16 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 16 \
+    --random-range-ratio 1
+```
+
+### deepseek v3 2 w8a8 1p1d 32p in128k out1k bs8
+
+**Model**: DeepSeek-V3.2
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 26ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1' 'your prefill ip2')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_BUFFSIZE=1200
+        export HCCL_SOCKET_IFNAME=lo
+        export TASK_QUEUE_ENABLE=2
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --nnodes 2 \
+        --tp 32 \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.73 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 1 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-mode prefill \
+        --disable-cuda-graph \
+        --moe-dense-tp-size 1 \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 32 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        export GLOO_SOCKET_IFNAME=xxx
+        export HCCL_BUFFSIZE=400
+        export HCCL_SOCKET_IFNAME=xxx
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export TASK_QUEUE_ENABLE=0
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --nnodes 2 \
+        --tp 32 \
+        --dp 8 \
+        --ep 32 \
+        --moe-dense-tp-size 1 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.79 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 32 \
+        --cuda-graph-max-bs 4 \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --quantization modelslim \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-mode decode
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 8 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 8 \
+    --random-range-ratio 1
+```

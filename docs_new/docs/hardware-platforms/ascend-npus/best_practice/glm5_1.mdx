@@ -1,0 +1,897 @@
+---
+title: "Best Practice for GLM-5.1 on Ascend NPU"
+metatags:
+  description: "Best Practice for GLM-5.1 on Ascend NPU"
+---
+
+This section describes the best practice data for GLM-5.1 on the Ascend NPU.
+
+### Low Latency
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-1p1d-32p-in64k-out1k-20ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>66.6K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+### High Throughput
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-16p-in3k5-out1k5-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-1p1d-32p-in128k-out1k">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16.4K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-1p1d-32p-in16k-out1k-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>48</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-1p1d-48p-in128k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>48</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-1p1d-48p-in64k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-5.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>48</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>66.6K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>33ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+
+## Optimal Configuration
+
+### glm5 1 w4a8 16p in3k5 out1k5 50ms
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 16
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export HCCL_BUFFSIZE=2500
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 32 \
+    --nnodes 2 \
+    --dp-size 16 \
+    --enable-dp-attention \
+    --chunked-prefill-size 65536 \
+    --max-prefill-tokens 280000 \
+    --trust-remote-code \
+    --mem-fraction-static 0.65 \
+    --served-model-name glm-5 \
+    --cuda-graph-max-bs 8 \
+    --max-running-requests 128 \
+    --quantization modelslim \
+    --speculative-draft-model-quantization unquant \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --load-balance-method round_robin \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 128 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 512 \
+    --random-range-ratio 1
+```
+
+### glm5 1 w4a8 1p1d 32p in128k out1k
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 1 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 1 \
+    --random-range-ratio 1
+```
+
+### glm5 1 w4a8 1p1d 32p in16k out1k 50ms
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 16.4K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 128 \
+    --random-input-len 16384 \
+    --random-output-len 1024 \
+    --num-prompts 512 \
+    --random-range-ratio 1
+```
+
+### glm5 1 w4a8 1p1d 32p in64k out1k 20ms
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 65.5K+1K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 1 \
+    --random-input-len 65536 \
+    --random-output-len 1024 \
+    --num-prompts 1 \
+    --random-range-ratio 1
+```
+
+### glm5 1 w4a8 1p1d 32p in65k out1k5 prefix90 25ms
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 66.6K+1.5K
+
+**TPOT**: 25ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 100 \
+    --random-input-len 66560 \
+    --random-output-len 1536 \
+    --num-prompts 480 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### glm5 1 w4a8 1p1d 48p in128k out1k prefix90 50ms
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 48
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 144 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 576 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### glm5 1 w4a8 1p1d 48p in64k out1k prefix90 50ms
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 48
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 65.5K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 320 \
+    --random-input-len 65536 \
+    --random-output-len 1024 \
+    --num-prompts 1280 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### glm5 1 w4a8 1p1d 48p in65k out1k5 prefix100 33ms
+
+**Model**: GLM-5.1
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 48
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 66.6K+1.5K
+
+**TPOT**: 33ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 128 \
+    --random-input-len 66560 \
+    --random-output-len 1536 \
+    --num-prompts 512 \
+    --random-range-ratio 1
+```

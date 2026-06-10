@@ -1,0 +1,1024 @@
+---
+title: "Best Practice for MiniMax-M2.5 on Ascend NPU"
+metatags:
+  description: "Best Practice for MiniMax-M2.5 on Ascend NPU"
+---
+
+This section describes the best practice data for MiniMax-M2.5 on the Ascend NPU.
+
+### Low Latency
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-20ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-8p-in3k5-out1k5-20ms">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+### High Throughput
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-1p1d-16p-in128k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-1p1d-16p-in64k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32.8K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-4p-in32k-out1k-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-M2.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+
+## Optimal Configuration
+
+### minimax m2 5 w8a8 1p1d 16p in128k out1k prefix90 50ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 16
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        export ASCEND_USE_FIA=1
+        export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export ENABLE_PROFILING=0
+        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_BUFFSIZE=2500
+        export HCCL_SOCKET_IFNAME=lo
+        export PROFILING_BS=8
+        export PROFILING_STAGE=prefill
+        export PROFILING_step=30
+        export TASK_QUEUE_ENABLE=2
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --trust-remote-code \
+        --tp-size 16 \
+        --mem-fraction-static 0.43 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --max-running-requests 128 \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 130000 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --tokenizer-worker-num 16 \
+        --dp-size 2 \
+        --enable-dp-attention \
+        --dtype bfloat16 \
+        --load-balance-method round_robin \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+        --speculative-num-steps 2 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 3 \
+        --speculative-draft-model-quantization unquant \
+        --skip-server-warmup
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        export GLOO_SOCKET_IFNAME=xxx
+        export HCCL_BUFFSIZE=1600
+        export HCCL_SOCKET_IFNAME=xxx
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
+        export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=96
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_NPU_FUSED_MOE_MODE=2
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --trust-remote-code \
+        --tp-size 16 \
+        --mem-fraction-static 0.76 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --max-running-requests 80 \
+        --chunked-prefill-size -1 \
+        --moe-a2a-backend ascend_fuseep \
+        --deepep-mode low_latency \
+        --tokenizer-worker-num 8 \
+        --dp-size 2 \
+        --enable-dp-attention \
+        --dtype bfloat16 \
+        --load-balance-method round_robin \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+        --speculative-num-steps 2 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 3 \
+        --speculative-draft-model-quantization unquant \
+        --skip-server-warmup \
+        --cuda-graph-bs 2 4 8
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 8 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 32 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### minimax m2 5 w8a8 1p1d 16p in64k out1k prefix90 50ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 16
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 65.5K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTHONPATH={MINIMAX_M2_5_EAGLE3_MODEL_PATH}:
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+
+        export ASCEND_USE_FIA=1
+        export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export ENABLE_PROFILING=0
+        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_BUFFSIZE=2500
+        export HCCL_SOCKET_IFNAME=lo
+        export PROFILING_BS=8
+        export PROFILING_STAGE=prefill
+        export PROFILING_step=30
+        export TASK_QUEUE_ENABLE=2
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --trust-remote-code \
+        --tp-size 16 \
+        --mem-fraction-static 0.43 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --max-running-requests 128 \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 58000 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --tokenizer-worker-num 16 \
+        --dp-size 2 \
+        --enable-dp-attention \
+        --dtype bfloat16 \
+        --load-balance-method round_robin \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --speculative-draft-model-quantization unquant \
+        --skip-server-warmup
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+
+        export GLOO_SOCKET_IFNAME=xxx
+        export HCCL_BUFFSIZE=1600
+        export HCCL_SOCKET_IFNAME=xxx
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
+        export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=96
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_NPU_FUSED_MOE_MODE=2
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --trust-remote-code \
+        --tp-size 16 \
+        --mem-fraction-static 0.76 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --max-running-requests 80 \
+        --chunked-prefill-size -1 \
+        --moe-a2a-backend ascend_fuseep \
+        --deepep-mode low_latency \
+        --tokenizer-worker-num 16 \
+        --dp-size 2 \
+        --enable-dp-attention \
+        --dtype bfloat16 \
+        --load-balance-method round_robin \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --speculative-draft-model-quantization unquant \
+        --skip-server-warmup \
+        --cuda-graph-bs 2 4 8 16 24 32 40
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy round_robin --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 160 \
+    --random-input-len 65536 \
+    --random-output-len 1024 \
+    --num-prompts 640 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### minimax m2 5 w8a8 4p in32k out1k 50ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 4
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 32.8K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=128
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=60184
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_HCCL_OP=allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --tp-size 8 \
+    --disable-radix-cache \
+    --mem-fraction-static 0.74 \
+    --max-running-requests 24 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 32768 \
+    --cuda-graph-bs 4 8 12 16 20 24 \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --quantization modelslim \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --dtype bfloat16 \
+    --trust-remote-code \
+    --tokenizer-worker-num 8
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 24 \
+    --random-input-len 32768 \
+    --random-output-len 1024 \
+    --num-prompts 96 \
+    --random-range-ratio 1
+```
+
+### minimax m2 5 w8a8 4p in64k out1k prefix90 50ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 4
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 65.5K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=0
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
+export ENABLE_PROFILING=0
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=1600
+export HCCL_SOCKET_IFNAME=lo
+export PROFILING_BS=28
+export PROFILING_STAGE=decode
+export PROFILING_step=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_DEEPEP_USE_FUSED_MOE_DECODE=1
+export SGLANG_NPU_FUSED_MOE_MODE=2
+export SGLANG_NPU_FUSEEP_DECODE_ONLY=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --tp-size 8 \
+    --enable-dp-attention \
+    --prefill-delayer-max-delay-passes 500 \
+    --enable-prefill-delayer \
+    --mem-fraction-static 0.65 \
+    --max-running-requests 36 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 150000 \
+    --cuda-graph-bs 8 16 24 32 40 \
+    --moe-a2a-backend ascend_fuseep \
+    --deepep-mode auto \
+    --quantization modelslim \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --dtype bfloat16 \
+    --trust-remote-code \
+    --tokenizer-worker-num 8
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 36 \
+    --random-input-len 65536 \
+    --random-output-len 1024 \
+    --num-prompts 144 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### minimax m2 5 w8a8 8p in128k out1k prefix90 20ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
+export ENABLE_PROFILING=0
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=1600
+export HCCL_SOCKET_IFNAME=lo
+export PROFILING_BS=28
+export PROFILING_STAGE=decode
+export PROFILING_step=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_DEEPEP_USE_FUSED_MOE_DECODE=1
+export SGLANG_NPU_FUSED_MOE_MODE=2
+export SGLANG_NPU_FUSEEP_DECODE_ONLY=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --tp-size 16 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --prefill-delayer-max-delay-passes 100 \
+    --enable-prefill-delayer \
+    --mem-fraction-static 0.65 \
+    --max-running-requests 8 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 130000 \
+    --cuda-graph-bs 8 16 \
+    --moe-a2a-backend ascend_fuseep \
+    --deepep-mode auto \
+    --quantization modelslim \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --dtype bfloat16 \
+    --trust-remote-code \
+    --tokenizer-worker-num 8
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 2 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 8 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### minimax m2 5 w8a8 8p in128k out1k prefix90 50ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
+export ENABLE_PROFILING=0
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=1600
+export HCCL_SOCKET_IFNAME=lo
+export PROFILING_BS=28
+export PROFILING_STAGE=decode
+export PROFILING_step=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_DEEPEP_USE_FUSED_MOE_DECODE=1
+export SGLANG_NPU_FUSED_MOE_MODE=2
+export SGLANG_NPU_FUSEEP_DECODE_ONLY=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --tp-size 16 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --prefill-delayer-max-delay-passes 100 \
+    --enable-prefill-delayer \
+    --mem-fraction-static 0.65 \
+    --max-running-requests 36 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 130000 \
+    --cuda-graph-bs 8 16 24 \
+    --moe-a2a-backend ascend_fuseep \
+    --deepep-mode auto \
+    --quantization modelslim \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --dtype bfloat16 \
+    --trust-remote-code \
+    --tokenizer-worker-num 8
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 8 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 32 \
+    --random-range-ratio 1 \
+    --request-rate float("inf")
+```
+
+### minimax m2 5 w8a8 8p in3k5 out1k5 20ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=1500
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=224000
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_FUSED_MOE_MODE=2
+export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --tp-size 16 \
+    --dp-size 16 \
+    --enable-dp-attention \
+    --mem-fraction-static 0.75 \
+    --max-running-requests 256 \
+    --disable-radix-cache \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 8192 \
+    --cuda-graph-bs 2 4 8 16 32 64 128 \
+    --moe-a2a-backend ascend_fuseep \
+    --deepep-mode auto \
+    --quantization modelslim \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --dtype bfloat16 \
+    --tokenizer-worker-num 2 \
+    --prefill-delayer-max-delay-passes 10 \
+    --enable-prefill-delayer
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 64 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 256 \
+    --random-range-ratio 1
+```
+
+### minimax m2 5 w8a8 8p in3k5 out1k5 50ms
+
+**Model**: MiniMax-M2.5
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=1024
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_FUSED_MOE_MODE=2
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --tp-size 16 \
+    --enable-dp-attention \
+    --dp-size 16 \
+    --mem-fraction-static 0.75 \
+    --max-running-requests 480 \
+    --disable-radix-cache \
+    --prefill-delayer-max-delay-passes 500 \
+    --enable-prefill-delayer \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 8192 \
+    --cuda-graph-bs 4 24 32 48 64 80 \
+    --moe-a2a-backend ascend_fuseep \
+    --deepep-mode auto \
+    --quantization modelslim \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path MINIMAX_M2_5_EAGLE3_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --dtype bfloat16
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 320 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 1280 \
+    --random-range-ratio 1
+```

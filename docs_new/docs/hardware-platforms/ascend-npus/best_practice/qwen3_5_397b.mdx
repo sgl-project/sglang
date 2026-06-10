@@ -1,0 +1,1123 @@
+---
+title: "Best Practice for Qwen3.5-397B on Ascend NPU"
+metatags:
+  description: "Best Practice for Qwen3.5-397B on Ascend NPU"
+---
+
+This section describes the best practice data for Qwen3.5-397B on the Ascend NPU.
+
+### Low Latency
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in128k-out1k-20ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16.4K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in16k-out1k-20ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in3k5-out1k5-20ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in64k-out1k-20ms">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+### High Throughput
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>131.1K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16.4K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in3k5-out1k5-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms">Optimal Configuration</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>65.5K+1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms">Optimal Configuration</a></td>
+    </tr>
+  </tbody>
+</table>
+
+## Optimal Configuration
+
+### qwen3 5 397b w4a8 8p in128k out1k 20ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=60672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 131072 \
+    --prefill-max-requests 1 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 16 \
+    --mem-fraction-static 0.6 \
+    --cuda-graph-bs 2 3 4 5 6 8 10 12 14 16 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 3 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 3 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 2
+```
+
+### qwen3 5 397b w4a8 8p in128k out1k 50ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=60672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 131072 \
+    --prefill-max-requests 1 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 16 \
+    --mem-fraction-static 0.6 \
+    --cuda-graph-bs 2 4 6 8 12 14 16 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 10 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 10 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 8
+```
+
+### qwen3 5 397b w4a8 8p in128k out1k prefix90 50ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 131.1K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 131072 \
+    --max-mamba-cache-size 320 \
+    --prefill-max-requests 10 \
+    --mamba-scheduler-strategy extra_buffer \
+    --trust-remote-code \
+    --max-running-requests 64 \
+    --mem-fraction-static 0.6 \
+    --cuda-graph-bs 2 4 6 8 10 12 16 20 24 32 40 48 56 64 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 40 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 40 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 0
+```
+
+### qwen3 5 397b w4a8 8p in16k out1k 20ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 16.4K+1K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 50000 \
+    --prefill-max-requests 4 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 48 \
+    --mem-fraction-static 0.8 \
+    --max-total-tokens 210000 \
+    --cuda-graph-bs 2 4 6 8 10 12 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --dp-size 4 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 40 \
+    --random-input-len 16384 \
+    --random-output-len 1024 \
+    --num-prompts 40 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 32
+```
+
+### qwen3 5 397b w4a8 8p in16k out1k 50ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 16.4K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 65536 \
+    --prefill-max-requests 4 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 144 \
+    --mem-fraction-static 0.8 \
+    --max-total-tokens 635000 \
+    --cuda-graph-bs 2 4 6 8 12 14 16 18 20 24 26 28 30 32 34 36 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --dp-size 4 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 144 \
+    --random-input-len 16384 \
+    --random-output-len 1024 \
+    --num-prompts 144 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 8
+```
+
+### qwen3 5 397b w4a8 8p in3k5 out1k5 20ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=6
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 35000 \
+    --max-total-tokens 128000 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 160 \
+    --mem-fraction-static 0.8 \
+    --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --dp-size 8 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 160 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 160 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 64
+```
+
+### qwen3 5 397b w4a8 8p in3k5 out1k5 50ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=6
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 17500 \
+    --max-total-tokens 280000 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 432 \
+    --mem-fraction-static 0.8 \
+    --cuda-graph-bs 2 4 6 8 12 16 20 24 28 32 36 40 44 48 50 52 54 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --dp-size 8 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 432 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 432 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 16
+```
+
+### qwen3 5 397b w4a8 8p in64k out1k 20ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 65.5K+1K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 65536 \
+    --prefill-max-requests 1 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 16 \
+    --mem-fraction-static 0.6 \
+    --max-total-tokens 1065000 \
+    --cuda-graph-bs 2 4 6 8 10 12 14 16 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 8 \
+    --random-input-len 65536 \
+    --random-output-len 1024 \
+    --num-prompts 8 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 8
+```
+
+### qwen3 5 397b w4a8 8p in64k out1k 50ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 65.5K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 65536 \
+    --prefill-max-requests 1 \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --max-running-requests 32 \
+    --mem-fraction-static 0.6 \
+    --max-total-tokens 1065000 \
+    --cuda-graph-bs 2 4 6 8 12 14 16 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 28 \
+    --random-input-len 65536 \
+    --random-output-len 1024 \
+    --num-prompts 28 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 8
+```
+
+### qwen3 5 397b w4a8 8p in64k out1k prefix90 50ms
+
+**Model**: Qwen3.5-397B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 8
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 65.5K+1K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GDN_ATTN_BACKEND_TRITON=1
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_BUFFSIZE=0
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58672
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 65536 \
+    --max-mamba-cache-size 640 \
+    --mamba-scheduler-strategy extra_buffer \
+    --trust-remote-code \
+    --max-running-requests 128 \
+    --mem-fraction-static 0.6 \
+    --max-total-tokens 1310720 \
+    --cuda-graph-bs 2 4 6 8 10 12 16 20 24 32 40 48 56 64 \
+    --quantization modelslim \
+    --enable-multimodal \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --mm-attention-backend ascend_attn \
+    --dtype bfloat16 \
+    --mamba-ssm-dtype bfloat16 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 128 \
+    --random-input-len 65536 \
+    --random-output-len 1024 \
+    --num-prompts 128 \
+    --random-range-ratio 1 \
+    --request-rate float("inf") \
+    --warmup-requests 0
+```
