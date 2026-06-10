@@ -408,7 +408,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         item = self.layer_mapping[layer_id]
         ratio = item.compress_ratio
-        if ratio in (0, 1):
+        if ratio == 0:
             return self.swa_kv_pool.kv_buffer[item.compress_layer_id]
         if ratio == 4:
             return self.c4_kv_pool.kv_buffer[item.compress_layer_id]
@@ -451,7 +451,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """Return the compressed KV buffer for a c4 / c128 layer.
 
         Routes to c4 / c128 kv_pool by layer compression ratio. Returns
-        ``None`` for ratio in (0, 1) (no compress KV exists). The
+        ``None`` for ratio == 0 (no compress KV exists). The
         from_indexer=True branch returns the dedicated int8 K buffer that
         ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
         """

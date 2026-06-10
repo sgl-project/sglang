@@ -934,3 +934,65 @@ def mhc_post(
         residual.shape[-1],
     )
     return out
+
+
+def npu_hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    hc_sinkhorn_iters: int,
+    rms_norm_eps: float,
+    hc_eps: float,
+    forward_batch=None,
+) -> tuple:
+    """NPU-accelerated hc_pre via the custom_ops kernel.
+
+    Returns (y, post, comb, norm_fused).  norm_fused is always False
+    because npu_hc_pre does not fold input_layernorm — the caller must
+    apply it separately.
+    """
+    shape, dtype = x.size(), x.dtype
+
+    # IDLE / empty short-circuit, mirroring the dsv4-flash source.
+    # The kernel emits post/comb in fp32 (sinkhorn iterates in fp32),
+    # so the dummies must too — otherwise downstream comb/post-aware
+    # ops see a silent fp32 ↔ bf16 split between idle and non-idle
+    # batches.
+    is_idle = (
+        forward_batch is not None
+        and forward_batch.forward_mode.is_idle()
+    )
+    if is_idle or x.shape[0] == 0:
+        bs = x.shape[0]
+        y = torch.empty((bs, shape[-1]), dtype=dtype, device=x.device)
+        post = torch.empty(
+            (bs, hc_mult), dtype=torch.float32, device=x.device
+        )
+        comb = torch.empty(
+            (bs, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        return y, post, comb, False
+
+    # Note the return order: (y, post, comb) — y is the (T, hidden)
+    # mixed activation, post / comb are the hc_post inputs. The
+    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
+    # cast back to the input dtype before the downstream
+    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    y, post, comb = torch.ops.custom.npu_hc_pre(
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=hc_sinkhorn_iters,
+        norm_eps=rms_norm_eps,
+        hc_eps=hc_eps,
+    )
+    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
+    # not fold input_layernorm. Return norm_fused=False so the caller
+    # applies the layernorm itself, matching the deepgemm/torch paths.
+    return y.to(dtype), post, comb, False
