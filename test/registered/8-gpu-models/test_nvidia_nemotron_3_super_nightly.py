@@ -7,6 +7,7 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both Hopper and Blackwell via nightly-8-gpu-common suite
+# [DO NOT MERGE] Debug-only touch to trigger CI rerun on release/v0.5.13
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
 NEMOTRON_3_SUPER_BF16_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
