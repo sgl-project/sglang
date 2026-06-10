@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 # Triton implementation
