@@ -7,7 +7,7 @@
 
 export const benchmarks = [
   {
-    match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "mtp", nodes: "single" },
+    match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
     sglang_version: "main branch",
     speed: [
       { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 1, num_prompts: 10 },

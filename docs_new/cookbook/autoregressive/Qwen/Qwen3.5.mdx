@@ -48,10 +48,10 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware + recipe to generate the launch command. The two strategies cover the legacy widget's speculative-decoding toggle:
+Pick your hardware + recipe to generate the launch command. The two serving strategies cover the legacy widget's speculative-decoding toggle:
 
-- **MTP** — multi-token prediction (speculative decoding) on, the recommended default. Lower latency for interactive use; on a few H100 recipes it also changes the TP layout.
-- **No MTP** — plain decoding. Pick when speculative decoding misbehaves on your build or your workload is saturation-throughput-bound.
+- **Low-Latency** — MTP (multi-token prediction speculative decoding) on, the recommended default. Fastest replies for interactive use; on a few H100 recipes it also changes the TP layout.
+- **High-Throughput** — MTP off. At saturation the speculative verify step costs more than it saves; also pick this when speculative decoding misbehaves on your build.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/qwen/qwen3.5.jsx";
@@ -158,7 +158,7 @@ Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
 
 **Speculative decoding (MTP)**
 
-- The **MTP** strategy bakes in the speculative-decoding preset; it significantly reduces latency for interactive use cases. The **No MTP** strategy is the same recipe with speculative decoding off — on H100 a few combos also change TP (35B/27B BF16 run TP=2 with MTP vs TP=1 without; 122B FP8 runs TP=4 with MTP vs TP=2 without), which is why this lives in the Deploy matrix rather than only in the Playground.
+- The **Low-Latency** strategy bakes in the MTP speculative-decoding preset; it significantly reduces latency for interactive use cases. The **High-Throughput** strategy is the same recipe with speculative decoding off — on H100 a few combos also change TP (35B/27B BF16 run TP=2 with MTP vs TP=1 without; 122B FP8 runs TP=4 with MTP vs TP=2 without), which is why this lives in the Deploy matrix rather than only in the Playground.
 - Two MTP algorithms appear on this page: the **verified H200 / 397B / BF16 recipe was benchmarked with `NEXTN`**, while the remaining (not yet re-verified) cells carry the legacy generator's `EAGLE` preset. Use the **Speculative Decoding** card in the [Playground above](#playground) to swap one for the other on any cell, and submit your results.
 
 **Mamba Radix Cache**
@@ -166,7 +166,7 @@ Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
 Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
 
 - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs and Xeon.
-- **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64). MTP requires V2 — the NVIDIA MTP cells set it automatically.
+- **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64). MTP requires V2 — the NVIDIA Low-Latency cells set it automatically.
 
 **Hardware-specific notes**
 
