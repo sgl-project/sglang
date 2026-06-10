@@ -249,7 +249,10 @@ class NGRAMWorker:
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_extend():
+        # Decode-only: extend goes through the plain target forward, and an
+        # IDLE batch must keep its forward_mode instead of being rewritten to
+        # TARGET_VERIFY below (relevant once DP attention support lands).
+        if not batch.forward_mode.is_decode():
             return
 
         bs = len(batch.reqs)
