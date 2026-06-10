@@ -7,10 +7,9 @@ Defines CacheConfig for validation and socket message protocol helpers.
 import hashlib
 import json
 import logging
-import os
 import pickle
 import struct
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)

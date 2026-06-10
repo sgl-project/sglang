@@ -29,24 +29,18 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.model_executor.cuda_graph_inspector import (
     BufferAddressRegistry,
-    CUGraphNodeType,
     CUFunctionRegistry,
     GraphMetadata,
     KernelNodeInfo,
-    KernelParamInfo,
     MemcpyNodeInfo,
     MemsetNodeInfo,
     PointerCategory,
-    checkCudaErrorsDriver,
-    get_global_registry,
-    inspect_cuda_graph,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +69,7 @@ SERIALIZABLE_CATEGORIES = {
 class GraphCacheKey:
     """Cache key for a CUDA graph. Includes all factors that affect the
     graph structure or kernel selection."""
+
     model_hash: str
     batch_size: int
     num_tokens_per_bs: int
@@ -100,6 +95,7 @@ class GraphCacheKey:
 @dataclass
 class SerializableKernelParam:
     """JSON-serializable kernel parameter."""
+
     index: int
     is_device_pointer: bool
     raw_value: int
@@ -115,6 +111,7 @@ class SerializableKernelParam:
 @dataclass
 class SerializableKernelNode:
     """JSON-serializable kernel node."""
+
     node_index: int
     func_ptr: int
     kernel_name: str
@@ -129,6 +126,7 @@ class SerializableKernelNode:
 @dataclass
 class SerializableMemcpyNode:
     """JSON-serializable memcpy node."""
+
     node_index: int
     src_ptr: int
     dst_ptr: int
@@ -139,6 +137,7 @@ class SerializableMemcpyNode:
 @dataclass
 class SerializableMemsetNode:
     """JSON-serializable memset node."""
+
     node_index: int
     dst_ptr: int
     value: int
@@ -149,13 +148,14 @@ class SerializableMemsetNode:
 @dataclass
 class SerializableGraphMetadata:
     """JSON-serializable graph metadata."""
+
     version: int = CACHE_VERSION
     cache_key: str = ""
     num_nodes: int = 0
     nodes: List[Dict] = field(default_factory=list)
     # Address maps at capture time (for debugging / validation)
-    buffer_map: Dict[str, str] = field(default_factory=dict)   # ptr_hex -> "name:size"
-    weight_map: Dict[str, str] = field(default_factory=dict)   # ptr_hex -> "fqn"
+    buffer_map: Dict[str, str] = field(default_factory=dict)  # ptr_hex -> "name:size"
+    weight_map: Dict[str, str] = field(default_factory=dict)  # ptr_hex -> "fqn"
     # Pool base address for intermediate tensor address translation.
     # All intermediate tensors from the same pool shift by a single constant
     # offset across process restarts. Recording the pool base enables computing
@@ -211,7 +211,11 @@ def serialize_graph_metadata(
                         index=p.index,
                         is_device_pointer=p.is_device_pointer,
                         raw_value=p.raw_value,
-                        category=p.category.value if isinstance(p.category, PointerCategory) else str(p.category),
+                        category=(
+                            p.category.value
+                            if isinstance(p.category, PointerCategory)
+                            else str(p.category)
+                        ),
                         symbolic_name=p.symbolic_name,
                         offset=p.offset,
                         base_addr=p.base_addr,
@@ -401,8 +405,13 @@ def reconstruct_cuda_graph(
 
             if node_type == "kernel":
                 handle = _add_kernel_node(
-                    graph, node_data, translation, func_registry,
-                    node_handles, param_memory, pool_offset
+                    graph,
+                    node_data,
+                    translation,
+                    func_registry,
+                    node_handles,
+                    param_memory,
+                    pool_offset,
                 )
                 if handle is None:
                     # Failed to add a kernel node - cannot reconstruct
@@ -411,14 +420,18 @@ def reconstruct_cuda_graph(
                 node_handles.append(handle)
 
             elif node_type == "memcpy":
-                handle = _add_memcpy_node(graph, node_data, translation, node_handles, pool_offset)
+                handle = _add_memcpy_node(
+                    graph, node_data, translation, node_handles, pool_offset
+                )
                 if handle is None:
                     cu.cuGraphDestroy(graph)
                     return None
                 node_handles.append(handle)
 
             elif node_type == "memset":
-                handle = _add_memset_node(graph, node_data, translation, node_handles, pool_offset)
+                handle = _add_memset_node(
+                    graph, node_data, translation, node_handles, pool_offset
+                )
                 if handle is None:
                     cu.cuGraphDestroy(graph)
                     return None
@@ -430,7 +443,9 @@ def reconstruct_cuda_graph(
 
         # 4. Instantiate the graph
         instantiate_params = cu.CUDA_GRAPH_INSTANTIATE_PARAMS()
-        instantiate_params.flags = cu.CUgraphInstantiate_flags.CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+        instantiate_params.flags = (
+            cu.CUgraphInstantiate_flags.CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+        )
         instantiate_params.hUploadStream = 0  # NULL stream
         result = cu.cuGraphInstantiateWithParams(graph, instantiate_params)
         if result[0] != cu.CUresult.CUDA_SUCCESS:
@@ -473,7 +488,7 @@ class _ReconstructedCUDAGraph:
     def replay(self):
         """Replay the reconstructed CUDA graph."""
         stream = torch.cuda.current_stream()
-        stream_ptr = stream.stream if hasattr(stream, 'stream') else stream.cuda_stream
+        stream_ptr = stream.stream if hasattr(stream, "stream") else stream.cuda_stream
         result = cu.cuGraphLaunch(self._graph_exec, cu.CUstream(stream_ptr))
         # cuda.bindings returns a tuple (CUresult,) for some functions
         if isinstance(result, tuple):
@@ -559,10 +574,14 @@ def _add_kernel_node(
                 # For intermediate/unknown pool-allocated tensors,
                 # apply the pool offset (all such tensors shift by a
                 # single constant across process restarts).
-                if category in (
-                    PointerCategory.INTERMEDIATE.value,
-                    PointerCategory.UNKNOWN.value,
-                ) and pool_offset != 0:
+                if (
+                    category
+                    in (
+                        PointerCategory.INTERMEDIATE.value,
+                        PointerCategory.UNKNOWN.value,
+                    )
+                    and pool_offset != 0
+                ):
                     new_value = raw_value + pool_offset
                 elif category not in (
                     PointerCategory.UNKNOWN.value,
@@ -620,14 +639,14 @@ def _add_kernel_node(
     node_params.blockDimY = block[1]
     node_params.blockDimZ = block[2]
     node_params.sharedMemBytes = node_data["shared_mem_bytes"]
-    node_params.kernelParams = ctypes.cast(kernel_params, ctypes.POINTER(ctypes.c_void_p))
+    node_params.kernelParams = ctypes.cast(
+        kernel_params, ctypes.POINTER(ctypes.c_void_p)
+    )
     node_params.extra = 0
 
     if deps:
         dep_array = (cu.CUgraphNode * len(deps))(*deps)
-        result = cu.cuGraphAddKernelNode(
-            graph, dep_array, len(deps), node_params
-        )
+        result = cu.cuGraphAddKernelNode(graph, dep_array, len(deps), node_params)
     else:
         result = cu.cuGraphAddKernelNode(graph, None, 0, node_params)
 
@@ -638,21 +657,32 @@ def _add_kernel_node(
     return result[1]
 
 
-def _add_memcpy_node(graph, node_data: Dict, translation: Dict[int, int], existing_nodes: list, pool_offset: int = 0):
+def _add_memcpy_node(
+    graph,
+    node_data: Dict,
+    translation: Dict[int, int],
+    existing_nodes: list,
+    pool_offset: int = 0,
+):
     """Add a memcpy node to the graph being reconstructed."""
-    import ctypes
 
     src_ptr = node_data.get("src_ptr", 0)
     dst_ptr = node_data.get("dst_ptr", 0)
     copy_size = node_data.get("copy_size", 0)
 
     if copy_size == 0:
-        logger.warning(f"Memcpy node {node_data['node_index']} has zero copy size, skipping")
+        logger.warning(
+            f"Memcpy node {node_data['node_index']} has zero copy size, skipping"
+        )
         return None
 
     # Translate addresses (apply pool_offset for untranslated pointers)
-    new_src = translation.get(src_ptr, src_ptr + pool_offset if pool_offset else src_ptr)
-    new_dst = translation.get(dst_ptr, dst_ptr + pool_offset if pool_offset else dst_ptr)
+    new_src = translation.get(
+        src_ptr, src_ptr + pool_offset if pool_offset else src_ptr
+    )
+    new_dst = translation.get(
+        dst_ptr, dst_ptr + pool_offset if pool_offset else dst_ptr
+    )
 
     # Build CUDA_MEMCPY3D structure for the copy parameters
     copy_params = cu.CUDA_MEMCPY3D(
@@ -695,7 +725,9 @@ def _add_memcpy_node(graph, node_data: Dict, translation: Dict[int, int], existi
 
     if deps:
         dep_array = (cu.CUgraphNode * len(deps))(*deps)
-        result = cu.cuGraphAddMemcpyNode(graph, dep_array, len(deps), memcpy_params, None)
+        result = cu.cuGraphAddMemcpyNode(
+            graph, dep_array, len(deps), memcpy_params, None
+        )
     else:
         result = cu.cuGraphAddMemcpyNode(graph, None, 0, memcpy_params, None)
 
@@ -706,9 +738,14 @@ def _add_memcpy_node(graph, node_data: Dict, translation: Dict[int, int], existi
     return result[1]
 
 
-def _add_memset_node(graph, node_data: Dict, translation: Dict[int, int], existing_nodes: list, pool_offset: int = 0):
+def _add_memset_node(
+    graph,
+    node_data: Dict,
+    translation: Dict[int, int],
+    existing_nodes: list,
+    pool_offset: int = 0,
+):
     """Add a memset node to the graph being reconstructed."""
-    import ctypes
 
     dst_ptr = node_data.get("dst_ptr", 0)
     value = node_data.get("value", 0)
@@ -719,7 +756,9 @@ def _add_memset_node(graph, node_data: Dict, translation: Dict[int, int], existi
         return None
 
     # Translate address (apply pool_offset for untranslated pointers)
-    new_dst = translation.get(dst_ptr, dst_ptr + pool_offset if pool_offset else dst_ptr)
+    new_dst = translation.get(
+        dst_ptr, dst_ptr + pool_offset if pool_offset else dst_ptr
+    )
 
     # Build CUDA_MEMSET_NODE_PARAMS structure
     memset_params = cu.CUDA_MEMSET_NODE_PARAMS(
@@ -741,7 +780,9 @@ def _add_memset_node(graph, node_data: Dict, translation: Dict[int, int], existi
 
     if deps:
         dep_array = (cu.CUgraphNode * len(deps))(*deps)
-        result = cu.cuGraphAddMemsetNode(graph, dep_array, len(deps), memset_params, None)
+        result = cu.cuGraphAddMemsetNode(
+            graph, dep_array, len(deps), memset_params, None
+        )
     else:
         result = cu.cuGraphAddMemsetNode(graph, None, 0, memset_params, None)
 

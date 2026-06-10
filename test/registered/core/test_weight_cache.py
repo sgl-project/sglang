@@ -17,19 +17,14 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.utils import MultiprocessingSerializer
-from sglang.srt.weight_cache.daemon import WeightCacheDaemon
 from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 from sglang.srt.weight_cache.protocol import (
     CacheConfig,
-    get_ready_path,
-    get_socket_path,
     hash_quant_config,
     recv_msg,
     send_msg,
 )
-
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-a", runner_config="1-gpu-small")
 
@@ -39,60 +34,105 @@ class TestCacheConfig(unittest.TestCase):
 
     def test_matching_configs(self):
         c1 = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         c2 = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         self.assertTrue(c1.matches(c2))
 
     def test_mismatch_tp_size(self):
         c1 = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         c2 = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=2, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=2,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         self.assertFalse(c1.matches(c2))
 
     def test_mismatch_model_path(self):
         c1 = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         c2 = CacheConfig(
-            model_path="/b", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/b",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         self.assertFalse(c1.matches(c2))
 
     def test_mismatch_quant(self):
         c1 = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         c2 = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="gptq", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="gptq",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         self.assertFalse(c1.matches(c2))
 
     def test_to_dict_roundtrip(self):
         c = CacheConfig(
-            model_path="/a", model_arch="Llama", tp_size=4, tp_rank=0,
-            dp_size=1, quant_method="fp8", quant_config_hash="abc",
+            model_path="/a",
+            model_arch="Llama",
+            tp_size=4,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="fp8",
+            quant_config_hash="abc",
             dtype="torch.float16",
         )
         c2 = CacheConfig.from_dict(c.to_dict())
@@ -207,8 +247,14 @@ class TestCrossProcessCUDAIPC(unittest.TestCase):
 
     def test_fetch_state_ok(self):
         config = CacheConfig(
-            model_path="/test/model", model_arch="Llama", tp_size=1, tp_rank=0,
-            dp_size=1, quant_method="", quant_config_hash="", dtype="torch.float16",
+            model_path="/test/model",
+            model_arch="Llama",
+            tp_size=1,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="",
+            quant_config_hash="",
+            dtype="torch.float16",
         )
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(10)
@@ -221,8 +267,14 @@ class TestCrossProcessCUDAIPC(unittest.TestCase):
 
     def test_ipc_import_tensors(self):
         config = CacheConfig(
-            model_path="/test/model", model_arch="Llama", tp_size=1, tp_rank=0,
-            dp_size=1, quant_method="", quant_config_hash="", dtype="torch.float16",
+            model_path="/test/model",
+            model_arch="Llama",
+            tp_size=1,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="",
+            quant_config_hash="",
+            dtype="torch.float16",
         )
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(10)
@@ -240,8 +292,14 @@ class TestCrossProcessCUDAIPC(unittest.TestCase):
 
     def test_config_mismatch_rejected(self):
         wrong_config = CacheConfig(
-            model_path="/test/model", model_arch="Llama", tp_size=2, tp_rank=0,
-            dp_size=1, quant_method="", quant_config_hash="", dtype="torch.float16",
+            model_path="/test/model",
+            model_arch="Llama",
+            tp_size=2,
+            tp_rank=0,
+            dp_size=1,
+            quant_method="",
+            quant_config_hash="",
+            dtype="torch.float16",
         )
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(10)
@@ -264,10 +322,14 @@ class TestCrossProcessCUDAIPC(unittest.TestCase):
 
 def _run_ipc_daemon(socket_path, ready_path, done_path):
     """Simple daemon process for unit testing."""
-    import torch as _torch
-    from sglang.srt.utils import MultiprocessingSerializer as _MS
-    from sglang.srt.weight_cache.protocol import send_msg as _send, recv_msg as _recv, CacheConfig as _CC
     import socket as _sock
+
+    import torch as _torch
+
+    from sglang.srt.utils import MultiprocessingSerializer as _MS
+    from sglang.srt.weight_cache.protocol import CacheConfig as _CC
+    from sglang.srt.weight_cache.protocol import recv_msg as _recv
+    from sglang.srt.weight_cache.protocol import send_msg as _send
 
     _torch.cuda.set_device(0)
     tensors = {
@@ -285,8 +347,14 @@ def _run_ipc_daemon(socket_path, ready_path, done_path):
         }
 
     config = _CC(
-        model_path="/test/model", model_arch="Llama", tp_size=1, tp_rank=0,
-        dp_size=1, quant_method="", quant_config_hash="", dtype="torch.float16",
+        model_path="/test/model",
+        model_arch="Llama",
+        tp_size=1,
+        tp_rank=0,
+        dp_size=1,
+        quant_method="",
+        quant_config_hash="",
+        dtype="torch.float16",
     )
 
     if os.path.exists(socket_path):
@@ -309,9 +377,22 @@ def _run_ipc_daemon(socket_path, ready_path, done_path):
                     elif req.get("type") == "fetch_state":
                         ec = _CC.from_dict(req["config"])
                         if config.matches(ec):
-                            _send(conn, {"status": "ok", "config": config.to_dict(), "entries": entries})
+                            _send(
+                                conn,
+                                {
+                                    "status": "ok",
+                                    "config": config.to_dict(),
+                                    "entries": entries,
+                                },
+                            )
                         else:
-                            _send(conn, {"status": "mismatch", "daemon_config": config.to_dict()})
+                            _send(
+                                conn,
+                                {
+                                    "status": "mismatch",
+                                    "daemon_config": config.to_dict(),
+                                },
+                            )
                     elif req.get("type") == "ping":
                         _send(conn, {"status": "ok"})
                 except Exception:

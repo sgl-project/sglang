@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import tqdm
@@ -87,14 +87,11 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 try:
     from sglang.srt.model_executor.cuda_graph_inspector import (
         BufferAddressRegistry,
-        CUFunctionRegistry,
-        GraphMetadata,
         get_global_registry,
         inspect_cuda_graph,
     )
     from sglang.srt.model_executor.cuda_graph_serializer import (
         GraphCacheKey,
-        compute_pool_offset,
         load_graph_cache,
         reconstruct_cuda_graph,
         save_graph_cache,
@@ -918,9 +915,11 @@ class CudaGraphRunner:
         # After the first capture initializes the CUDA graph memory pool,
         # we compare the current pool base with the cached one to compute
         # a single offset that translates all intermediate tensor addresses.
-        cached_pool_base = self._load_cached_pool_base() if (
-            _CUDA_GRAPH_CACHE_AVAILABLE and self.cuda_graph_cache_dir
-        ) else None
+        cached_pool_base = (
+            self._load_cached_pool_base()
+            if (_CUDA_GRAPH_CACHE_AVAILABLE and self.cuda_graph_cache_dir)
+            else None
+        )
 
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
@@ -943,7 +942,8 @@ class CudaGraphRunner:
                 if self._pool_offset is not None:
                     try:
                         graph = self._try_load_from_cache(
-                            bs, pool_offset=self._pool_offset,
+                            bs,
+                            pool_offset=self._pool_offset,
                             stream_idx=stream_idx,
                         )
                         if graph is not None:
@@ -1499,7 +1499,9 @@ class CudaGraphRunner:
             # Reconstruct the graph with pool offset for intermediate tensors
             func_registry = get_global_registry()
             graph = reconstruct_cuda_graph(
-                cached, address_registry, func_registry,
+                cached,
+                address_registry,
+                func_registry,
                 pool_offset=pool_offset,
             )
 
@@ -1569,8 +1571,7 @@ class CudaGraphRunner:
             save_graph_cache(metadata, cache_key, self.cuda_graph_cache_dir)
             log_info_on_rank0(
                 logger,
-                f"Saved CUDA graph cache for bs={bs} "
-                f"({metadata.num_nodes} nodes)",
+                f"Saved CUDA graph cache for bs={bs} " f"({metadata.num_nodes} nodes)",
             )
 
         except Exception as e:
