@@ -582,6 +582,7 @@ def eagle_sample(
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
+    from sglang.srt.layers.sampler import apply_custom_logit_processor
     from sglang.srt.runtime_context import get_server_args
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
@@ -605,6 +606,17 @@ def eagle_sample(
     next_token_logits = logits_output.next_token_logits
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
+
+    # Apply the custom logit processors if registered in the sampling info.
+    # Done before penalties and the grammar mask, matching the other spec
+    # backends (eagle_info / ngram_info / dflash_utils) so a custom processor
+    # cannot override tokens the grammar mask has already forbidden.
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=verify_input.draft_token_num,
+        )
 
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
