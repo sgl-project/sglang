@@ -371,7 +371,11 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
 def can_fuse(switch_mlp) -> bool:
     """Cheap structural check: does this SwitchGLU match the Path B v1 regime?"""
     try:
-        from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+        from mlx_lm.models.switch_layers import (
+            QuantizedSwitchLinear,
+            SwiGLU,
+            SwitchGLU,
+        )
     except ImportError:
         return False
     up = switch_mlp.up_proj
@@ -386,6 +390,11 @@ def can_fuse(switch_mlp) -> bool:
     # the forward is not the stock SwitchGLU.__call__ (evaluated at patch time,
     # before the class swap, so this sees the model's real class).
     if type(switch_mlp).__call__ is not SwitchGLU.__call__:
+        return False
+    # fused_forward bakes silu into both the kernel and its fallback, and a
+    # swapped activation= leaves __call__ stock, so the check above cannot see
+    # it. Exact type, fail closed: a SwiGLU subclass may change the math.
+    if type(getattr(switch_mlp, "activation", None)) is not SwiGLU:
         return False
     # Learned per-expert bias, added after the matmul in
     # QuantizedSwitchLinear.__call__ as ``x + bias[indices]`` whenever

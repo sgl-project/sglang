@@ -251,6 +251,37 @@ def test_can_fuse_declines_nonstock_call():
     assert can_fuse(sw_custom) is False, "non-stock __call__ must fall back"
 
 
+def test_can_fuse_declines_non_silu_activation():
+    """can_fuse: False for a non SiLU activation (the kernel and the fallback
+    both bake in silu, which would silently replace the module's formula),
+    True for the stock SwiGLU control."""
+    import types
+
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
+        can_fuse,
+        patch_switch_glu_with_fused_swiglu,
+    )
+
+    # Same build as _quantized_switch_glu, but the activation kwarg is the
+    # subject under test, so construct directly.
+    sw = SwitchGLU(512, 64, 4, activation=nn.gelu, bias=False)
+    for name in ("up_proj", "gate_proj", "down_proj"):
+        proj = getattr(sw, name)
+        setattr(sw, name, proj.to_quantized(group_size=64, bits=4, mode="affine"))
+    assert can_fuse(sw) is False, "non SiLU activation must fall back"
+
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=4)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+    assert patch_switch_glu_with_fused_swiglu(model) == 0, "gelu module must not patch"
+
+    sw_stock = _quantized_switch_glu(512, 64, 4, gate_bias=False)
+    assert can_fuse(sw_stock) is True, "stock SwiGLU activation should fuse"
+
+
 def test_fused_forward_falls_back_on_dtype_mismatch():
     """A runtime activation dtype the fused kernel rejects but gather_qmm
     tolerates (bf16 gate params, fp16 activations) must fall back, not crash,
