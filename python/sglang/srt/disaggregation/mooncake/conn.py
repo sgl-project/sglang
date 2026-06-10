@@ -10,6 +10,8 @@ import time
 from collections import defaultdict
 from typing import List, Optional, Tuple, Union
 
+import zmq
+
 import numpy as np
 import numpy.typing as npt
 from prometheus_client import Counter
@@ -360,10 +362,8 @@ class MooncakeKVManager(CommonKVManager):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
             na = NetworkAddress(req.endpoint, req.dst_port)
-            self._connect(
-                na.to_tcp(),
-                is_ipv6=na.is_ipv6,
-            ).send_multipart(
+            endpoint = na.to_tcp()
+            self._connect(endpoint, is_ipv6=na.is_ipv6).send_multipart(
                 [
                     b"CHUNK_READY",
                     str(req.room).encode("ascii"),
@@ -374,8 +374,8 @@ class MooncakeKVManager(CommonKVManager):
                     str(prefill_unique_rank).encode("ascii"),
                 ]
             )
-        except Exception:
-            pass
+        except zmq.Again:
+            self.disconnect_endpoint(endpoint)
 
     def _do_staging_transfer(
         self,
@@ -879,18 +879,20 @@ class MooncakeKVManager(CommonKVManager):
         data: bytes,
     ):
         na = NetworkAddress(remote, dst_port)
-        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
-
-        socket.send_multipart(
-            [
-                MooncakeKVManager.AUX_DATA_HEADER,
-                str(room).encode("ascii"),
-                str(buffer_index).encode("ascii"),
-                str(aux_index).encode("ascii"),
-                struct.pack(">I", len(data)),
-                data,
-            ]
-        )
+        endpoint = na.to_tcp()
+        try:
+            self._connect(endpoint, is_ipv6=na.is_ipv6).send_multipart(
+                [
+                    MooncakeKVManager.AUX_DATA_HEADER,
+                    str(room).encode("ascii"),
+                    str(buffer_index).encode("ascii"),
+                    str(aux_index).encode("ascii"),
+                    struct.pack(">I", len(data)),
+                    data,
+                ]
+            )
+        except zmq.Again:
+            self.disconnect_endpoint(endpoint)
 
     def _handle_aux_data(self, msg: List[bytes]):
         """Handle AUX_DATA messages received by the decode thread."""
@@ -1135,13 +1137,17 @@ class MooncakeKVManager(CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ]
-        )
+        endpoint = na.to_tcp()
+        try:
+            self._connect(endpoint, is_ipv6=na.is_ipv6).send_multipart(
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ]
+            )
+        except zmq.Again:
+            self.disconnect_endpoint(endpoint)
 
     def transfer_worker(
         self,

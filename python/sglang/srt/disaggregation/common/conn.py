@@ -6,7 +6,6 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -137,6 +136,8 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+        self._push_socket_cache: Dict[str, zmq.Socket] = {}
+        self._push_socket_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
@@ -425,13 +426,25 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
-        if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
+        with self._push_socket_lock:
+            if endpoint in self._push_socket_cache:
+                return self._push_socket_cache[endpoint]
+            sock = zmq.Context().socket(zmq.PUSH)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.SNDTIMEO, 10000)
+            sock.setsockopt(zmq.RECONNECT_IVL_MAX, 30000)
+            if is_ipv6:
+                sock.setsockopt(zmq.IPV6, 1)
+            sock.connect(endpoint)
+            self._push_socket_cache[endpoint] = sock
+            return sock
+
+    def disconnect_endpoint(self, endpoint: str):
+        with self._push_socket_lock:
+            sock = self._push_socket_cache.pop(endpoint, None)
+        if sock:
+            sock.close()
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -656,6 +669,15 @@ class CommonKVManager(BaseKVManager):
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
+            # Collect TCP endpoints from cached bootstrap_infos before deletion
+            stale_endpoints = set()
+            for k in keys_to_remove:
+                for info in self.connection_pool[k]:
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        na = NetworkAddress(ip, int(port))
+                        stale_endpoints.add(na.to_tcp())
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
@@ -664,6 +686,9 @@ class CommonKVManager(BaseKVManager):
                 failed_bootstrap_addr, []
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
 
         affected_rooms = []
         for room in possible_affected_rooms:
@@ -1020,12 +1045,22 @@ class CommonKVReceiver(BaseKVReceiver):
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.setsockopt(zmq.RECONNECT_IVL_MAX, 30000)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+
+    @classmethod
+    def disconnect_endpoint(cls, endpoint: str):
+        with cls._global_lock:
+            sock = cls._socket_cache.pop(endpoint, None)
+            cls._socket_locks.pop(endpoint, None)
+        if sock:
+            sock.close()
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
