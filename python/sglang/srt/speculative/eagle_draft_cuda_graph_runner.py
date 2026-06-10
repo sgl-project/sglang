@@ -37,7 +37,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
 @dataclass
@@ -62,7 +62,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
 class EAGLEDraftCudaGraphRunner:
     def __init__(
         self,
-        eagle_worker: EAGLEWorker,
+        eagle_worker: EagleDraftWorker,
         *,
         draft_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
@@ -352,9 +352,6 @@ class EAGLEDraftCudaGraphRunner:
         )
 
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
 
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -380,6 +377,9 @@ class EAGLEDraftCudaGraphRunner:
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
+            # The capture batch is planned here (out-of-forward), so the
+            # per-step forwards inside draft_forward must not re-plan.
+            forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
             self._capture_init(run_once)
             out = self._capture_graph(

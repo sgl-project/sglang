@@ -16,7 +16,11 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+from sglang.srt.speculative.spec_utils import (
+    draft_kv_indices_buffer_width,
+    draft_kv_indices_used_len,
+    generate_draft_decode_kv_indices,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
@@ -430,7 +434,13 @@ class TritonAttnBackend(AttentionBackend):
         Returns ``(qo_indptr, kv_indptr, num_tokens_per_bs)``.
         """
         seq_lens = seq_lens[:bs]
-        num_tokens_per_bs = self.speculative_num_steps + 1
+        # V2 draft-extend fills num_draft_tokens per req (the cuda-graph runner's
+        # token layout); num_steps+1 only equals that when topk == 1.
+        num_tokens_per_bs = (
+            self.num_draft_tokens
+            if forward_mode.is_draft_extend_v2()
+            else self.speculative_num_steps + 1
+        )
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -534,9 +544,15 @@ class TritonAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None:
+            if spec_info is None or spec_info.kv_indptr is None:
+                # kv_indptr is None for draft-extend's idle batch (no tree
+                # indices); build plain metadata from seq_lens.
+                # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+                seq_lens_sum = forward_batch.seq_lens_sum
+                if seq_lens_sum is None:
+                    seq_lens_sum = bs * self.max_context_len
                 kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
+                    seq_lens_sum, dtype=torch.int64, device=self.device
                 )
                 kv_indptr = self._fill_kv_indptr_and_indices(
                     bs,
@@ -884,7 +900,15 @@ class TritonAttnBackend(AttentionBackend):
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
-                max_extend_len=self.speculative_num_steps + 1,
+                # Must match the per-req query count (num_tokens_per_bs) used to
+                # build qo_indptr above, else the extend kernel grid is too small
+                # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
+                # blocks.
+                max_extend_len=(
+                    self.num_draft_tokens
+                    if forward_mode.is_draft_extend_v2()
+                    else self.speculative_num_steps + 1
+                ),
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
                 kv_indices=self.cuda_graph_kv_indices,
@@ -1387,16 +1411,16 @@ class TritonMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
+                : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
             ]
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            forward_batch.batch_size, self.topk, self.max_context_len
+        )
         kv_indices = torch.empty(
-            (
-                self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * self.max_context_len,
-            ),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int64,
             device=self.device,
         )
@@ -1413,8 +1437,11 @@ class TritonMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        kv_indices_width = draft_kv_indices_buffer_width(
+            max_bs, self.topk, self.max_context_len
+        )
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
+            (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int64,
             device=self.device,
         )
@@ -1513,12 +1540,9 @@ def update_sliding_window_buffer(
     )
     if hasattr(token_to_kv_pool, "translate_loc_from_full_to_swa"):
         kv_last_index = window_kv_indptr[-1]
-        # Flush before+after: window_kv_indices is a different tensor than out_cache_loc.
-        token_to_kv_pool.invalidate_loc_cache()
         window_kv_indices[:kv_last_index] = (
             token_to_kv_pool.translate_loc_from_full_to_swa(
                 window_kv_indices[:kv_last_index]
             )
         )
-        token_to_kv_pool.invalidate_loc_cache()
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx

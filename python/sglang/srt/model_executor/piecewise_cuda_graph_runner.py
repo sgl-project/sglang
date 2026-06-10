@@ -20,8 +20,7 @@ import gc
 import logging
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
@@ -52,6 +51,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_prefill_registry
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -59,15 +59,18 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
+    is_hip,
     is_musa,
     is_npu,
     log_info_on_rank0,
     require_gathered_buffer,
 )
 
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
@@ -76,18 +79,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_musa = is_musa()
-
-
-@dataclass
-class PrefillInputBuffers(ForwardInputBuffers):
-    input_ids: torch.Tensor
-    out_cache_loc: torch.Tensor
-    mamba_track_indices: Optional[torch.Tensor]
-    mamba_track_mask: Optional[torch.Tensor]
-    mamba_track_seqlens: Optional[torch.Tensor]
-    positions: torch.Tensor
-    input_embeds: Optional[torch.Tensor]
-    mrope_positions: Optional[torch.Tensor]
 
 
 @contextmanager
@@ -226,8 +217,12 @@ class PiecewiseCudaGraphRunner:
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
 
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
+        # If returning hidden states is enabled, or if speculative prefill needs
+        # aux hidden states (DFLASH), capture the FULL variant up front.
+        if (
+            model_runner.server_args.enable_return_hidden_states
+            or model_runner.spec_algorithm.is_dflash()
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.max_num_tokens = (
@@ -241,59 +236,22 @@ class PiecewiseCudaGraphRunner:
         # CUDA graph capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
-        # Graph inputs
         with torch.device(self.device):
-            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
-            )
-            mamba_track_indices = (
-                torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_mask = (
-                torch.zeros((self.max_bs,), dtype=torch.bool)
-                if self.mamba_track_enabled
-                else None
-            )
-            mamba_track_seqlens = (
-                torch.zeros((self.max_bs,), dtype=torch.int32)
-                if self.mamba_track_enabled
-                else None
-            )
-            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-            if (
-                self.is_multimodal
-            ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
-                # 1. In multimodal, we only compile and capture the language model part.
-                # 2. The embedder is outside of the graph, but cuda graph requires the input embeds to have a fixed memory address.
-                # 3. Input embeds is a pre-allocated buffer. In model.forward, we copy the embed output to this buffer.
-                input_embeds = torch.zeros(
-                    (self.max_num_tokens, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                )
-                mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
-            else:
-                input_embeds = None
-                mrope_positions = None
-
-        self.buffers = PrefillInputBuffers(
-            input_ids=input_ids,
-            out_cache_loc=out_cache_loc,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
-            positions=positions,
-            input_embeds=input_embeds,
-            mrope_positions=mrope_positions,
+        # Registry owns (allocates + pools) the token-axis input buffers.
+        self.buffer_registry = build_prefill_registry(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_tokens,
+            cache_loc_dtype=self._cache_loc_dtype(),
+            is_multimodal=self.is_multimodal,
+            hidden_size=self.model_runner.model_config.hidden_size,
+            embed_dtype=self.model_runner.dtype,
+            enable_mamba_track=self.mamba_track_enabled,
+            share_pool=not is_npu(),
+            source=None,
         )
-        self.buffers.share_buffers()
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
@@ -330,21 +288,32 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with enable_piecewise_cuda_graph_compile():
-                    compile_range = (
-                        tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                        if get_tensor_model_parallel_rank() == 0
-                        else reversed(self.capture_num_tokens)
-                    )
-                    for _, num_tokens in enumerate(compile_range):
-                        if get_tensor_model_parallel_rank() == 0:
-                            compile_range.set_description(
-                                f"Compiling num tokens ({num_tokens=})"
-                            )
-                        self.warmup_compile(num_tokens=num_tokens)
+                if _is_hip:
+                    # AMD: single Dynamo trace is sufficient; the capture
+                    # phase does per-shape JIT kernel warmup before each
+                    # CUDA graph recording.  The N-iteration loop is
+                    # redundant and extremely slow on ROCm (~30 min).
+                    with enable_piecewise_cuda_graph_compile():
+                        self.warmup_compile(num_tokens=self.capture_num_tokens[-1])
+                else:
+                    with enable_piecewise_cuda_graph_compile():
+                        compile_range = (
+                            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                            if get_tensor_model_parallel_rank() == 0
+                            else reversed(self.capture_num_tokens)
+                        )
+                        for _, num_tokens in enumerate(compile_range):
+                            if get_tensor_model_parallel_rank() == 0:
+                                compile_range.set_description(
+                                    f"Compiling num tokens ({num_tokens=})"
+                                )
+                            self.warmup_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
+
+                if _use_aiter:
+                    self._pre_warm_aiter_chip_info()
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
@@ -353,29 +322,69 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
+    _aiter_chip_info_cached = False
+
+    @classmethod
+    def _pre_warm_aiter_chip_info(cls):
+        """Pre-populate aiter chip info env vars before CUDA graph capture.
+
+        aiter's get_cu_num_custom_op and get_gfx_custom_op call
+        subprocess.run(rocminfo) to query GPU info. During CUDA graph capture
+        the GPU context is locked, so rocminfo hangs indefinitely. Pre-calling
+        them here caches the results as environment variables so the subprocess
+        is never invoked during capture. Only runs once per process.
+        """
+        if cls._aiter_chip_info_cached:
+            return
+        cls._aiter_chip_info_cached = True
+
+        import os
+
+        try:
+            from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+            if not os.environ.get("CU_NUM"):
+                cu_num = get_cu_num()
+                os.environ["CU_NUM"] = str(cu_num)
+                logger.info(f"Pre-warmed aiter CU_NUM={cu_num}")
+
+            if not os.environ.get("GPU_ARCHS"):
+                gfx = get_gfx()
+                os.environ["GPU_ARCHS"] = gfx
+                logger.info(f"Pre-warmed aiter GPU_ARCHS={gfx}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm aiter chip info: {e}")
+
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
-        buffers = self.buffers
-        input_ids = buffers.input_ids[:num_tokens]
-        input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
-        positions = buffers.positions[:num_tokens]
-        mrope_positions = (
-            buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+        registry = self.buffer_registry
+        bs = 1
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
+        input_embeds = (
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        mrope_positions = (
+            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
+        )
         mamba_track_indices = (
-            buffers.mamba_track_indices[:1]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:1]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:1]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
         )
         with torch.device(self.device):
@@ -411,7 +420,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -508,32 +517,35 @@ class PiecewiseCudaGraphRunner:
                     self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
-        buffers = self.buffers
+        registry = self.buffer_registry
         bs = 1
 
-        # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
-        input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+        # Graph inputs — views into the registry's (adopted) graph-resident
+        # slots; capture burns these addresses into the graph.
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
 
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
+        input_embeds = (
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
+        )
+        mrope_positions = (
+            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
+        )
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
-        )
-        positions = buffers.positions[:num_tokens]
-        mrope_positions = (
-            buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
 
         global_dp_buffer_len = None
@@ -579,7 +591,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -600,10 +612,6 @@ class PiecewiseCudaGraphRunner:
 
             # Run and capture
             def run_once():
-                # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
-                if self.model_runner.is_hybrid_swa:
-                    self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
                 # Clean intermediate result cache for DP attention
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -649,72 +657,51 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        buffers = self.buffers
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
-        if static_num_tokens != num_tokens:
-            buffers.out_cache_loc.zero_()
-            buffers.input_ids[num_tokens:static_num_tokens].zero_()
-            buffers.positions[num_tokens:static_num_tokens].zero_()
-            if self.is_multimodal:
-                buffers.input_embeds[num_tokens:static_num_tokens].zero_()
-            if forward_batch.mrope_positions is not None:
-                buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
-
         bs = forward_batch.batch_size
+        registry = self.buffer_registry
+        # Reset the padded token tail (ZERO) + copy the [:num_tokens] head for
+        # every graph-resident slot in one grouped pass. input_embeds is
+        # reset-only (the model writes embeds into it inside the graph).
+        registry.fill_from(
+            forward_batch,
+            raw_bs=bs,
+            padded_bs=bs,
+            raw_num_tokens=num_tokens,
+            padded_num_tokens=static_num_tokens,
+        )
 
-        buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, static_num_tokens)
 
-        if (
-            buffers.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            buffers.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            buffers.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            buffers.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            buffers.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            buffers.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
-
-        input_ids = buffers.input_ids[:static_num_tokens]
-        positions = buffers.positions[:static_num_tokens]
-        out_cache_loc = buffers.out_cache_loc[:static_num_tokens]
-
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
         )
-        if forward_batch.mrope_positions is not None:
-            buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
-
-        input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
-            buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
-
         mrope_positions = (
-            buffers.mrope_positions[:, :static_num_tokens]
-            if forward_batch.mrope_positions is not None
+            _slot("mrope_positions")
+            if (
+                registry.has_slot("mrope_positions")
+                and forward_batch.mrope_positions is not None
+            )
             else None
         )
 
@@ -790,6 +777,8 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_num_tokens = len(static_forward_batch.input_ids)
+            raw_num_tokens = self.raw_num_tokens
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -798,6 +787,8 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
+                num_tokens=static_num_tokens,
+                raw_num_tokens=raw_num_tokens,
             ):
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
