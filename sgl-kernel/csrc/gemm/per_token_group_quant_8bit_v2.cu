@@ -265,7 +265,9 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int hidden_dim_num_groups,
     // TODO can this be removed?
     const int scale_expert_stride,
+    const int scale_token_stride,
     const int scale_hidden_stride,
+    const int scale_outer_dim_size,
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   // When row-major + SCALE_UE8M0, scale is still stored as float (value is power-of-2)
@@ -319,17 +321,27 @@ __global__ void per_token_group_quant_8bit_kernel(
         constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
-          constexpr int scale_token_stride = 1;
+          constexpr int column_major_scale_token_stride = 1;
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
           scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                          (expert_idx * scale_expert_stride * num_elems_per_pack +
                           hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+                          token_idx * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
+          int64_t scale_offset;
+          if (scale_outer_dim_size > 0) {
+            const int outer_idx = token_idx / scale_outer_dim_size;
+            const int token_idx_in_outer = token_idx % scale_outer_dim_size;
+            scale_offset = outer_idx * scale_expert_stride + token_idx_in_outer * scale_token_stride +
+                           hidden_dim_group_idx * scale_hidden_stride;
+          } else {
+            scale_offset = expert_idx * scale_expert_stride + token_idx * scale_token_stride +
+                           hidden_dim_group_idx * scale_hidden_stride;
+          }
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) + scale_offset;
         }
 
         // can speed up if too slow
@@ -438,6 +450,7 @@ void sgl_per_token_group_quant_8bit_v2(
     const std::optional<torch::Tensor>& masked_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
+  CHECK_CUDA(output_s);
   TORCH_CHECK(input.numel() > 0);
 
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
@@ -446,7 +459,8 @@ void sgl_per_token_group_quant_8bit_v2(
   const int num_groups = static_cast<int>(input.numel()) / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = masked_m.has_value();
-  TORCH_CHECK(output_s.dim() == (masked_layout ? 3 : 2));
+  TORCH_CHECK(output_s.dim() == 2 || output_s.dim() == 3);
+  TORCH_CHECK(!masked_layout || output_s.dim() == 3);
 
   const int num_local_experts = masked_layout ? input.size(0) : 1;
 
@@ -457,8 +471,12 @@ void sgl_per_token_group_quant_8bit_v2(
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
   const int hidden_dim_num_groups = static_cast<int>(output_q.size(-1)) / group_size;
   const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
-  const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
+  const int scale_expert_stride =
+      (masked_layout || output_s.dim() == 3) ? static_cast<int>(output_s.stride(-3)) : 0;
+  const int scale_token_stride = static_cast<int>(output_s.stride(-2));
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
+  const int scale_outer_dim_size =
+      (!masked_layout && output_s.dim() == 3) ? static_cast<int>(output_s.size(-2)) : 0;
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)           \
   do {                                                                                                               \
@@ -487,7 +505,9 @@ void sgl_per_token_group_quant_8bit_v2(
         subwarps_per_block,                                                                                          \
         hidden_dim_num_groups,                                                                                       \
         scale_expert_stride,                                                                                         \
+        scale_token_stride,                                                                                          \
         scale_hidden_stride,                                                                                         \
+        scale_outer_dim_size,                                                                                        \
         num_tokens_per_expert);                                                                                      \
   } while (0)
 

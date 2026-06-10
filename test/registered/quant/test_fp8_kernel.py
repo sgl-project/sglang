@@ -131,6 +131,40 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
         torch.testing.assert_close(A_quant_fused, A_quant_manual, rtol=0, atol=0)
         torch.testing.assert_close(scale_fused, scale_manual, rtol=0, atol=0)
 
+    def test_per_token_group_quant_fp8_ue8m0_group_major_scale_layout(self):
+        if not _is_cuda:
+            return
+
+        torch.manual_seed(0)
+        num_tokens, num_groups, hidden_size = 2, 8, 256
+        A = torch.randn(
+            num_tokens, num_groups, hidden_size, device=device, dtype=torch.bfloat16
+        )
+
+        A_quant_fused, scale_fused = per_token_group_quant_fp8(
+            x=A,
+            group_size=self.group_size,
+            scale_ue8m0=True,
+            scale_group_major=True,
+        )
+        A_quant_manual, scale_manual = per_token_group_quant_fp8(
+            x=A.reshape(num_tokens * num_groups, hidden_size).contiguous(),
+            group_size=self.group_size,
+            scale_ue8m0=True,
+        )
+        scale_manual = (
+            scale_manual.view(num_tokens, num_groups, -1)
+            .transpose(0, 1)
+            .contiguous()
+            .transpose(0, 1)
+        )
+
+        torch.testing.assert_close(
+            A_quant_fused, A_quant_manual.view_as(A_quant_fused), rtol=0, atol=0
+        )
+        torch.testing.assert_close(scale_fused, scale_manual, rtol=0, atol=0)
+        self.assertEqual(scale_fused.stride(), scale_manual.stride())
+
 
 class TestW8A8BlockFP8Matmul(TestFP8Base):
     def test_w8a8_block_fp8_matmul(self):
