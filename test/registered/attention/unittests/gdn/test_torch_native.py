@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
     make_gdn_cases,
@@ -21,6 +21,7 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
