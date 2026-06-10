@@ -168,7 +168,16 @@ class DiffusionBreakableCudaGraphRunner:
     def _capture(self, kwargs: dict[str, Any], key: tuple) -> _CaptureEntry:
         # Persistent static buffers at every tensor leaf; bake non-tensors.
         def _to_static(t: torch.Tensor) -> torch.Tensor:
-            buf = torch.empty_like(t)
+            # Static buffers live on the capture device. A CPU input (e.g. a
+            # scalar timestep/sigma or an index tensor built on the host)
+            # would otherwise force a CPU->CUDA copy inside the captured
+            # region, which is illegal; place its buffer on the device so the
+            # only host->device copy happens here, before capture, and replay
+            # is device-to-device.
+            if t.device.type == "cpu":
+                buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
+            else:
+                buf = torch.empty_like(t)
             buf.copy_(t)
             return buf
 

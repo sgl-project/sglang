@@ -105,6 +105,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self._bcg_runner = None
 
     @property
     def role_affinity(self) -> RoleType:
@@ -127,6 +128,27 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 memory_intensive=True,
             )
         ]
+
+    def _dit_callable(self, server_args):
+        """Return the DiT callable, wrapped in a breakable CUDA graph runner
+        when BCG is enabled. Text conditioning enters via cross-attention, so
+        a single captured graph replays across prompts (cond/uncond share it).
+        """
+        if server_args is not None and getattr(
+            server_args, "enable_breakable_cuda_graph", False
+        ):
+            if self._bcg_runner is None:
+                from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
+                    DiffusionBreakableCudaGraphRunner,
+                )
+                from sglang.multimodal_gen.runtime.distributed import (
+                    get_local_torch_device,
+                )
+                self._bcg_runner = DiffusionBreakableCudaGraphRunner(
+                    self.transformer, get_local_torch_device()
+                )
+            return self._bcg_runner
+        return self.transformer
 
     def _denoise_one_chunk(
         self,
@@ -155,6 +177,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         """Denoise a single chunk with full timestep loop."""
         batch_size = latents.shape[0]
         do_cfg = guidance_scale > 1.0
+        _dit = self._dit_callable(server_args)
 
         for i, t in enumerate(timesteps):
             with StageProfiler(
@@ -165,7 +188,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     batch.perf_dump_path is not None if batch is not None else False
                 ),
             ):
-                timestep = t.expand(batch_size)
+                timestep = t.expand(batch_size).to(device)
                 latent_model_input = latents.to(target_dtype)
 
                 with set_forward_context(
@@ -173,7 +196,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     forward_batch=batch,
                     attn_metadata=None,
                 ):
-                    noise_pred = self.transformer(
+                    noise_pred = _dit(
                         hidden_states=latent_model_input,
                         timestep=timestep,
                         encoder_hidden_states=prompt_embeds,
@@ -204,7 +227,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         forward_batch=batch,
                         attn_metadata=None,
                     ):
-                        noise_uncond = self.transformer(
+                        noise_uncond = _dit(
                             hidden_states=latent_model_input,
                             timestep=timestep,
                             encoder_hidden_states=negative_prompt_embeds,
@@ -285,6 +308,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
     ):
         """Denoise a single chunk using pyramid super-resolution (Stage 2)."""
         batch_size, num_channel, num_frames, height, width = latents.shape
+        _dit = self._dit_callable(server_args)
         patch_size = self.transformer.patch_size
 
         # Downsample to lowest pyramid level
@@ -363,7 +387,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         batch.perf_dump_path is not None if batch is not None else False
                     ),
                 ):
-                    timestep = t.expand(batch_size)
+                    timestep = t.expand(batch_size).to(device)
                     latent_model_input = latents.to(target_dtype)
 
                     with set_forward_context(
@@ -371,7 +395,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         forward_batch=batch,
                         attn_metadata=None,
                     ):
-                        noise_pred = self.transformer(
+                        noise_pred = _dit(
                             hidden_states=latent_model_input,
                             timestep=timestep,
                             encoder_hidden_states=prompt_embeds,
@@ -402,7 +426,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                             forward_batch=batch,
                             attn_metadata=None,
                         ):
-                            noise_uncond = self.transformer(
+                            noise_uncond = _dit(
                                 hidden_states=latent_model_input,
                                 timestep=timestep,
                                 encoder_hidden_states=negative_prompt_embeds,
