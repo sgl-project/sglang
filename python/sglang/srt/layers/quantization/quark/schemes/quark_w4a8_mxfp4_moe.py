@@ -82,7 +82,6 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 f"Found {self.input_quant}."
             )
 
-
         self.with_bias = False
 
     @classmethod
@@ -344,8 +343,9 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 moe_runner_backend, replace(moe_runner_config, activation="swiglu")
             )
         else:
-            # TODO: add non-AITER W4A8 MXFP4-FP8 MoE kernels.
-            pass
+            raise NotImplementedError(
+                "QuarkW4A8MXFp4MoE is currently only supported with AITER."
+            )
 
     def apply_weights(
         self,
