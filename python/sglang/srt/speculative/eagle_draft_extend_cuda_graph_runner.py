@@ -30,6 +30,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
