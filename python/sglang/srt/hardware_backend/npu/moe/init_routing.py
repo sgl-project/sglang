@@ -21,7 +21,7 @@ class BaseInitRouting(ABC):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]: ...
 
 
 class NPUMoEInitRouting_v1(BaseInitRouting):
