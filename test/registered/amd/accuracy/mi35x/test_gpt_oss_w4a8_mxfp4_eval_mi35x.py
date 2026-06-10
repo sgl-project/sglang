@@ -64,9 +64,7 @@ MI35X_GPT_OSS_W4A8_MXFP4_MODELS = [
         tp_size=8,
         # Match the peer `openai/gpt-oss-120b` GSM8K threshold in
         # `test_gpt_oss_eval_mi35x.py` (0.79). The AMD Quark W4A8 MXFP4-FP8
-        # checkpoint runs the same gate-up-INTERLEAVE AITER MoE path
-        # (`shuffle_weight_a16w4` + `shuffle_scale_a16w4` post-PR #27201)
-        # and measures ~0.855 on this host, comfortably above 0.79.
+        # measures ~0.855 on this host, comfortably above 0.79.
         accuracy_threshold=0.79,
         timeout=900,
         other_args=[
@@ -80,13 +78,12 @@ MI35X_GPT_OSS_W4A8_MXFP4_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        # AITER MXFP4 fused-MoE for gpt-oss uses the gate/up-INTERLEAVE
-        # tile layout (matches `Mxfp4MoEMethod` post-PR #27201 and the
-        # `QuarkW4A8MXFp4MoE.process_weights_after_loading` shuffle, both of
-        # which use `shuffle_weight_a16w4` + `shuffle_scale_a16w4`). The
-        # `flydsl_moe1_*_fp4` / CK `preshuffle_on` kernels dispatched in
-        # this mode are the well-tested family; the legacy SEPARATED
-        # FlyDSL fp4x2 path is numerically broken (see PR #27201).
+        # AITER MXFP4 fused-MoE for gpt-oss uses the SEPARATED gate/up tile
+        # layout (matches `gptoss_fp4_tuned_fmoe.csv` flydsl entries, the
+        # `QuarkW4A8MXFp4MoE.process_weights_after_loading` shuffle and the 
+        # Mxfp4MoEMethod weight shuffle, both uses `shuffle_weight_a16w4` 
+        # and + `shuffle_scale_a16w4`) Other AITER MXFP4 callers default
+        # to INTERLEAVE, so opt out explicitly here.
         env_vars={
             "SGLANG_USE_AITER": "1",
             "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
