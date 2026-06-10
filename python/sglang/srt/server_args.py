@@ -3402,10 +3402,16 @@ class ServerArgs:
                 "compressed-tensors",
                 None,
             ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
-            self.disable_shared_experts_fusion = True
-            logger.warning(
-                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-            )
+            # FP8 block-scale (fp8, mxfp8) supports fused shared experts via
+            # num_fused_shared_experts in trtllm_fp8_block_scale_moe; other
+            # quant types (BF16, FP4, per-tensor FP8) do not. The kernel also
+            # does not support expert parallel (EP > 1), so fusion must be
+            # disabled in that case as well.
+            if self.quantization not in ["fp8", "mxfp8"] or self.ep_size > 1:
+                self.disable_shared_experts_fusion = True
+                logger.info(
+                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+                )
 
         if self.moe_runner_backend == "flashinfer_trtllm_routed":
             assert self.quantization in [
