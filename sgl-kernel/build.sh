@@ -60,6 +60,10 @@ echo "BUILD_JOBS:     ${BUILD_JOBS:-auto}"
 echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
+echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
+echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl}"
+echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
+echo "YUM_MIRROR:         ${YUM_MIRROR:-(upstream)}"
 echo "----------------------------------------"
 
 # Optional build-args (empty string disables)
@@ -69,6 +73,10 @@ BUILD_ARGS=()
 [ -n "${USE_CCACHE:-}" ]           && BUILD_ARGS+=(--build-arg USE_CCACHE="${USE_CCACHE}")
 [ -n "${BUILD_JOBS:-}" ]           && BUILD_ARGS+=(--build-arg BUILD_JOBS="${BUILD_JOBS}")
 [ -n "${NVCC_THREADS:-}" ]         && BUILD_ARGS+=(--build-arg NVCC_THREADS="${NVCC_THREADS}")
+[ -n "${GITHUB_ARTIFACTORY:-}" ]   && BUILD_ARGS+=(--build-arg GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY}")
+[ -n "${PYTORCH_INDEX_BASE:-}" ]   && BUILD_ARGS+=(--build-arg PYTORCH_INDEX_BASE="${PYTORCH_INDEX_BASE}")
+[ -n "${PIP_DEFAULT_INDEX:-}" ]    && BUILD_ARGS+=(--build-arg PIP_DEFAULT_INDEX="${PIP_DEFAULT_INDEX}")
+[ -n "${YUM_MIRROR:-}" ]           && BUILD_ARGS+=(--build-arg YUM_MIRROR="${YUM_MIRROR}")
 
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
@@ -96,6 +104,7 @@ echo "Deps image ready: ${DEPS_TAG}"
 CCACHE_FLAG="${USE_CCACHE:-1}"
 BUILD_JOBS_FLAG="${BUILD_JOBS:-0}"
 NVCC_THREADS_FLAG="${NVCC_THREADS:-32}"
+GITHUB_ARTIFACTORY_FLAG="${GITHUB_ARTIFACTORY:-github.com}"
 
 docker run --rm \
   --network=host \
@@ -103,6 +112,7 @@ docker run --rm \
   -v "${CCACHE_HOST_DIR}:/ccache" \
   -w /sgl-kernel \
   -e ARCH="${ARCH}" \
+  -e GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY_FLAG}" \
   "${DEPS_TAG}" \
   bash -c '
 set -eux
@@ -137,8 +147,9 @@ else
   export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk "{print (\$1 < \$2) ? \$1 : \$2}")
 fi
 
-export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}"
+export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} -DGITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"
 echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"
+echo "GitHub mirror: GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"
 
 ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation
 PYTHON=${PYTHON_ROOT_PATH}/bin/python ./rename_wheels.sh
